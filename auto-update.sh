@@ -18,7 +18,7 @@ else
 fi
 
 GIT_TIMEOUT="${GIT_TIMEOUT:-5}"
-LOG_FILE="${AUTO_UPDATE_LOG:-/var/log/auto-update.log}"
+LOG_FILE="${AUTO_UPDATE_LOG}"
 
 log() {
     echo "$(date): $1" | tee -a "$LOG_FILE"

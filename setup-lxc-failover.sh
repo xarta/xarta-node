@@ -20,7 +20,7 @@ else
 fi
 
 # Validate required variables are set
-for var in IF_PRIMARY IF_SECONDARY GW_PRIMARY GW_SECONDARY TEST_IP; do
+for var in IF_PRIMARY IF_SECONDARY GW_PRIMARY GW_SECONDARY TEST_IP REPO_OUTER_PATH REPO_INNER_PATH AUTO_UPDATE_LOG; do
     if [ -z "${!var}" ]; then
         echo "Error: Required variable $var is not set in .env"
         exit 1
@@ -181,6 +181,7 @@ fi
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl \
+    git \
     iptables \
     iptables-persistent \
     iproute2 \
@@ -235,6 +236,18 @@ if ! command -v tailscale >/dev/null 2>&1; then
     curl -fsSL https://tailscale.com/install.sh | sh
 else
     echo "Tailscale is already installed."
+fi
+
+# --- SSH / Git Setup ---
+# Infrastructure details are kept out of this public script.
+# If the private companion script exists alongside this repo, run it.
+SSH_GIT_SETUP="$SCRIPT_DIR/.xarta/ssh-git-setup.sh"
+if [ -f "$SSH_GIT_SETUP" ]; then
+    echo "Running SSH and git setup..."
+    bash "$SSH_GIT_SETUP"
+else
+    echo "Warning: SSH/git setup script not found at $SSH_GIT_SETUP"
+    echo "Automated git pulls will not work until SSH is configured."
 fi
 
 # --- Auto-update Script ---
