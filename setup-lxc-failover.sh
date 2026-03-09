@@ -307,12 +307,33 @@ chmod +x "$AUTO_UPDATE_SCRIPT"
 echo "Auto-update script created."
 
 # --- Cron Job Setup ---
-echo "Setting up cron jobs..."
+echo "Setting up cron job..."
 CRON_FILE="/etc/cron.d/gateway-failover"
 cat > "$CRON_FILE" <<EOF
 * * * * * root $FAILOVER_SCRIPT
-*/5 * * * * root $AUTO_UPDATE_SCRIPT
 EOF
+
+# --- Systemd Boot Service for Auto-update ---
+# Pulls latest config on startup, then exits. Not a recurring job.
+echo "Installing auto-update boot service..."
+cat > /etc/systemd/system/auto-update.service <<EOF
+[Unit]
+Description=Pull latest config from git repos on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$AUTO_UPDATE_SCRIPT
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable auto-update.service
+echo "Auto-update boot service installed and enabled."
 
 # --- Finalize ---
 echo "Setup complete."
