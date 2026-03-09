@@ -301,11 +301,11 @@ log "=== Auto-update started ==="
 
 # Wait for network with a short retry loop — LXC containers can reach
 # network-online.target before interfaces are fully ready.
-for attempt in 1 2 3 4 5; do
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
     if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
         break
     fi
-    log "[network] Not ready, waiting 5s (attempt \$attempt/5)..."
+    log "[network] Not ready, waiting 5s (attempt \$attempt/10)..."
     sleep 5
 done
 
