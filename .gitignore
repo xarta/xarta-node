@@ -1,0 +1,29 @@
+# Secrets and local deploy config — never commit these
+.env
+.xarta/
+
+# gui/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Build artefacts
+*.tar.gz
+*.zip
+
+# SQLite databases (runtime data, never source)
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.certs/
