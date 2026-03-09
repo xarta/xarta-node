@@ -237,11 +237,68 @@ else
     echo "Tailscale is already installed."
 fi
 
+# --- Auto-update Script ---
+AUTO_UPDATE_SCRIPT="/usr/local/bin/auto-update.sh"
+REPO_OUTER_PATH="${REPO_OUTER_PATH}"
+REPO_INNER_PATH="${REPO_INNER_PATH}"
+GIT_TIMEOUT_VAL="${GIT_TIMEOUT:-5}"
+AUTO_UPDATE_LOG_FILE="${AUTO_UPDATE_LOG}"
+
+echo "Creating auto-update script..."
+cat > "$AUTO_UPDATE_SCRIPT" <<EOF
+#!/bin/bash
+# auto-update.sh — deployed by setup-lxc-failover.sh
+# Pulls latest config from git repos with a hard timeout.
+# Values were baked in at deploy time from .env — re-run setup to change them.
+
+REPO_OUTER_PATH="$REPO_OUTER_PATH"
+REPO_INNER_PATH="$REPO_INNER_PATH"
+GIT_TIMEOUT="$GIT_TIMEOUT_VAL"
+LOG_FILE="$AUTO_UPDATE_LOG_FILE"
+
+log() {
+    echo "\$(date): \$1" >> "\$LOG_FILE"
+}
+
+pull_repo() {
+    local name="\$1"
+    local path="\$2"
+
+    [ -z "\$path" ] && return
+
+    if [ ! -d "\$path/.git" ]; then
+        log "[\$name] Not a git repo at \$path — skipping."
+        return
+    fi
+
+    local output exit_code
+    output=\$(timeout "\$GIT_TIMEOUT" git -C "\$path" pull --ff-only 2>&1)
+    exit_code=\$?
+
+    if [ "\$exit_code" -eq 124 ]; then
+        log "[\$name] Timed out after \${GIT_TIMEOUT}s — continuing."
+    elif [ "\$exit_code" -ne 0 ]; then
+        log "[\$name] Pull failed (exit \$exit_code): \$output — continuing."
+    else
+        log "[\$name] \$output"
+    fi
+}
+
+log "=== Auto-update started ==="
+pull_repo "outer-repo" "\$REPO_OUTER_PATH"
+pull_repo "inner-repo" "\$REPO_INNER_PATH"
+log "=== Auto-update complete ==="
+EOF
+
+chmod +x "$AUTO_UPDATE_SCRIPT"
+echo "Auto-update script created."
+
 # --- Cron Job Setup ---
-echo "Setting up cron job..."
+echo "Setting up cron jobs..."
 CRON_FILE="/etc/cron.d/gateway-failover"
 cat > "$CRON_FILE" <<EOF
 * * * * * root $FAILOVER_SCRIPT
+*/5 * * * * root $AUTO_UPDATE_SCRIPT
 EOF
 
 # --- Finalize ---
