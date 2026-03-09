@@ -298,6 +298,17 @@ pull_repo() {
 }
 
 log "=== Auto-update started ==="
+
+# Wait for network with a short retry loop — LXC containers can reach
+# network-online.target before interfaces are fully ready.
+for attempt in 1 2 3 4 5; do
+    if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+        break
+    fi
+    log "[network] Not ready, waiting 5s (attempt \$attempt/5)..."
+    sleep 5
+done
+
 pull_repo "outer-repo" "\$REPO_OUTER_PATH"
 pull_repo "inner-repo" "\$REPO_INNER_PATH"
 log "=== Auto-update complete ==="
