@@ -49,7 +49,7 @@ SYNC_BATCH_SIZE: int = 50           # actions posted per drain cycle
 
 # ── Git repos (bare-systemd nodes only) ───────────────────────────────────────
 # Paths on the local filesystem where the outer / inner repos are checked out.
-# On bare-systemd nodes (e.g. thunderbird-1) these point to the xarta-node
+# On bare-systemd nodes these point to the xarta-node
 # clone and its .xarta private inner repo.
 # On Docker nodes these are left empty — git-pull actions become no-ops.
 REPO_OUTER_PATH: str = os.environ.get("REPO_OUTER_PATH", "")
