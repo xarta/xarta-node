@@ -1,6 +1,7 @@
 # Secrets and local deploy config — never commit these
 .env
 .xarta/
+fleet-hosts.conf
 
 # gui/
 
