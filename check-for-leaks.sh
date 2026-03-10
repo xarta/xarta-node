@@ -23,7 +23,9 @@ SKIP_KEYS=(
     "REPO_INNER_PATH"       # paths appear in docs/templates — not secrets
     "SERVICE_RESTART_CMD"
     "BLUEPRINTS_DB_DIR"
-    "GIT_USER_NAME"       # value matches the public repo name — not a secret leak
+    "GIT_USER_NAME"         # value matches the public repo name — not a secret leak
+    "TAILSCALE_ACCEPT_DNS"  # value is "false" — too generic to scan for
+    "TAILSCALE_EXIT_NODE"   # value is "true" — too generic to scan for
 )
 
 # Colours

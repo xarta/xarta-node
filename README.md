@@ -13,6 +13,63 @@
 Scripts and configuration for setting up an LXC container with dual-WAN
 gateway failover and Tailscale exit-node functionality.
 
+## Assumed Environment
+
+These scripts are developed and tested against the following environment.
+Behaviour on other configurations is not guaranteed.
+
+### Software
+
+| Component | Version |
+|-----------|---------|
+| **Container type** | Proxmox LXC (unprivileged) |
+| **OS** | Debian GNU/Linux 12 (bookworm) |
+| **Kernel** | 6.8.12-pve (Proxmox host kernel) |
+| **Shell** | Bash 5.2 |
+| **Python** | 3.11.2 |
+| **systemd** | 252 |
+
+The scripts assume they are run as **root** inside the LXC container.
+
+### Proxmox LXC configuration
+
+The container requires specific Proxmox config to support Tailscale and IP
+forwarding. Key settings in the `.conf` file on the Proxmox host:
+
+```ini
+# Required for Tailscale (TUN device access)
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net dev/net none bind,create=dir
+
+# Required for nested networking / keyctl
+features: keyctl=1,nesting=1
+
+# Recommended: start on boot
+onboot: 1
+```
+
+> Without the `lxc.cgroup2.devices.allow` and `lxc.mount.entry` lines,
+> `/dev/net/tun` will not be accessible inside the container and Tailscale
+> will fail to start.
+
+### Network interfaces
+
+The expected network topology is multiple interfaces mapped to different
+bridges/VLANs on the Proxmox host — one per subnet you want to advertise
+through Tailscale. Typical setup:
+
+```ini
+net0: name=eth0,bridge=<main-bridge>,ip=<mgmt-ip>/24          # management
+net1: name=net1,bridge=<bridge>,ip=<vlan1-ip>/24              # VLAN 1
+net2: name=net2,bridge=<bridge>,ip=<vlan2-ip>/24,tag=<vlan>   # VLAN 2 (tagged)
+# ... additional VLANs as needed
+```
+
+Interface names, bridges, IPs, and VLAN tags are all site-specific and
+configured in `.env` — not committed to this repo.
+
+---
+
 ## Usage
 
 1. Copy `.env.example` to `.env` and fill in your site-specific values:
@@ -30,6 +87,35 @@ gateway failover and Tailscale exit-node functionality.
    ```
 
 The script is idempotent — it is safe to run more than once.
+
+3. **Activate Tailscale:**
+
+   `setup-lxc-failover.sh` installs Tailscale but does not run `tailscale up`
+   — route configuration is site-specific. Set the `TAILSCALE_*` values in
+   `.env`, then run:
+
+   ```bash
+   chmod +x setup-tailscale-up.sh
+   ./setup-tailscale-up.sh
+   ```
+
+   The script builds and runs `tailscale up` from your `.env` values. If this
+   is a new node without a pre-auth key, it will print a login URL — open it
+   in a browser to authenticate, then re-run the script.
+
+   > `TAILSCALE_ACCEPT_DNS=false` is intentional for gateway nodes — the
+   > node uses its own resolvers (set via `nameserver` in the Proxmox LXC
+   > config), not ones pushed by the control server.
+
+4. **Approve advertised routes** in your Tailscale/Headscale admin panel.
+
+   After `tailscale up`, routes are pending until approved in the control
+   plane (e.g. `https://<your-headscale-host>/web`). The script will remind
+   you of this after a successful run.
+
+   > **DNS note:** If your control plane's DNS resolver needs to reach subnets
+   > advertised by this node, ensure the resolver's access control list permits
+   > those subnets before approving the routes.
 
 ## Configuration
 
