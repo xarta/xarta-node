@@ -239,15 +239,12 @@ else
 fi
 
 # --- SSH / Git Setup ---
-# Infrastructure details are kept out of this public script.
-# If the private companion script exists alongside this repo, run it.
-SSH_GIT_SETUP="$SCRIPT_DIR/.xarta/ssh-git-setup.sh"
+SSH_GIT_SETUP="$SCRIPT_DIR/setup-ssh-and-git.sh"
 if [ -f "$SSH_GIT_SETUP" ]; then
     echo "Running SSH and git setup..."
     bash "$SSH_GIT_SETUP"
 else
-    echo "Warning: SSH/git setup script not found at $SSH_GIT_SETUP"
-    echo "Automated git pulls will not work until SSH is configured."
+    echo "Warning: $SSH_GIT_SETUP not found — automated git pulls will not work until SSH is configured."
 fi
 
 # --- Auto-update Script ---

@@ -22,6 +22,7 @@ SKIP_KEYS=(
     "REPO_OUTER_PATH"
     "SERVICE_RESTART_CMD"
     "BLUEPRINTS_DB_DIR"
+    "GIT_USER_NAME"       # value matches the public repo name — not a secret leak
 )
 
 # Colours
