@@ -48,8 +48,10 @@ echo "Data     : $DATA_DIR"
 echo ""
 
 # ── 1. Data directories ───────────────────────────────────────────────────────
+# DB lives in /opt/blueprints/data/db (not in git — persisted separately).
+# GUI assets live in .xarta/gui/ (private inner repo) — no directory needed here.
 echo "--- creating data directories..."
-mkdir -p "$DATA_DIR/db" "$DATA_DIR/gui"
+mkdir -p "$DATA_DIR/db"
 echo "    ok"
 
 # ── 2. Install env file ───────────────────────────────────────────────────────
