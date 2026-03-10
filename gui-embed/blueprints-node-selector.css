@@ -1,0 +1,88 @@
+/**
+ * blueprints-node-selector.css
+ * Styles for the embedded node-selector dropdown component.
+ * Embed in any page with:
+ *   <link rel="stylesheet" href="https://<node>/ui/embed/blueprints-node-selector.css">
+ */
+
+blueprints-node-selector,
+.bp-node-selector {
+  display: inline-block;
+  position: relative;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 13px;
+  user-select: none;
+}
+
+/* Collapsed button */
+.bp-ns-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 5px;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: #c8cedf;
+  white-space: nowrap;
+  transition: background .15s, border-color .15s;
+}
+.bp-ns-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); }
+
+/* Health dot */
+.bp-ns-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #4caf7d;
+  flex-shrink: 0;
+  transition: background .3s;
+}
+.bp-ns-dot.checking { background: #e6a817; animation: bp-pulse .9s ease-in-out infinite; }
+.bp-ns-dot.down      { background: #e05c5c; }
+@keyframes bp-pulse { 50% { opacity: .4; } }
+
+.bp-ns-name { font-weight: 600; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.bp-ns-caret { opacity: .5; font-size: 10px; }
+
+/* Dropdown panel */
+.bp-ns-panel {
+  display: none;
+  position: absolute;
+  right: 0; top: calc(100% + 6px);
+  background: #1a1d27;
+  border: 1px solid #2d3148;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  min-width: 260px;
+  z-index: 9999;
+  overflow: hidden;
+}
+.bp-ns-panel.open { display: block; }
+
+.bp-ns-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  color: #5b6080;
+  border-bottom: 1px solid #2d3148;
+}
+
+.bp-ns-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  transition: background .12s;
+  border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.bp-ns-node:last-child { border-bottom: none; }
+.bp-ns-node:hover { background: rgba(91,156,246,.08); }
+.bp-ns-node.active { background: rgba(91,156,246,.12); }
+.bp-ns-node.active .bp-ns-node-name { color: #5b9cf6; }
+
+.bp-ns-node-name { font-weight: 600; color: #e2e6f3; }
+.bp-ns-node-url  { font-size: 11px; color: #5b6080; margin-left: auto; max-width: 140px;
+                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-ns-node-unavail .bp-ns-node-name { color: #5b6080; }

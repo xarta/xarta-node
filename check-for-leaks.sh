@@ -20,6 +20,7 @@ MIN_LEN=5
 # not be treated as leaks (e.g. paths baked into templates, service names in scripts).
 SKIP_KEYS=(
     "REPO_OUTER_PATH"
+    "REPO_INNER_PATH"       # paths appear in docs/templates — not secrets
     "SERVICE_RESTART_CMD"
     "BLUEPRINTS_DB_DIR"
     "GIT_USER_NAME"       # value matches the public repo name — not a secret leak

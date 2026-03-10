@@ -67,7 +67,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Mount GUI static files (GUI dir must exist before mounting)
     if os.path.isdir(cfg.GUI_DIR):
         application.mount(
-            "/ui", StaticFiles(directory=cfg.GUI_DIR, html=True), name="gui"
+            "/ui", StaticFiles(directory=cfg.GUI_DIR, html=True, follow_symlink=True), name="gui"
         )
         log.info("serving GUI from %s at /ui", cfg.GUI_DIR)
 

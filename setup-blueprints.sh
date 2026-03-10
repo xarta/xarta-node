@@ -47,12 +47,27 @@ echo "Venv     : $VENV_DIR"
 echo "Data     : $DATA_DIR"
 echo ""
 
+# Source .env to pick up BLUEPRINTS_GUI_DIR (needed for the embed symlink below)
+# shellcheck source=.env
+source "$ENV_FILE"
+BLUEPRINTS_GUI_DIR="${BLUEPRINTS_GUI_DIR:-/data/gui}"
+
 # ── 1. Data directories ───────────────────────────────────────────────────────
 # DB lives in /opt/blueprints/data/db (not in git — persisted separately).
 # GUI assets live in .xarta/gui/ (private inner repo) — no directory needed here.
 echo "--- creating data directories..."
 mkdir -p "$DATA_DIR/db"
 echo "    ok"
+
+# ── 1b. Link gui-embed/ into the GUI directory ───────────────────────────────
+# gui-embed/ lives in the public outer repo. The app serves it at /ui/embed/
+# via a symlink so there is only one copy of the source files.
+echo "--- linking gui-embed into GUI directory..."
+mkdir -p "$BLUEPRINTS_GUI_DIR"
+# Remove any existing embed/ dir or stale symlink before (re-)creating it
+rm -rf "$BLUEPRINTS_GUI_DIR/embed"
+ln -s "$SCRIPT_DIR/gui-embed" "$BLUEPRINTS_GUI_DIR/embed"
+echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $SCRIPT_DIR/gui-embed"
 
 # ── 2. Install env file ───────────────────────────────────────────────────────
 echo "--- installing .env to $OPT_DIR/.env..."
