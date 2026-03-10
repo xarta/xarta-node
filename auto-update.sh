@@ -45,6 +45,15 @@ pull_repo() {
         log "[$name] Pull failed (exit $exit_code): $output — continuing."
     else
         log "[$name] $output"
+        # If the outer repo changed and a restart command is configured, restart the service.
+        # The inner repo (GUI/config) doesn't need a service restart.
+        if [ "$name" = "outer-repo" ] && \
+           [ -n "${SERVICE_RESTART_CMD:-}" ] && \
+           [[ "$output" != *"Already up to date"* ]]; then
+            log "[$name] New commits detected — restarting service: $SERVICE_RESTART_CMD"
+            eval "$SERVICE_RESTART_CMD" >> "$LOG_FILE" 2>&1 || \
+                log "[$name] Service restart failed."
+        fi
     fi
 }
 
