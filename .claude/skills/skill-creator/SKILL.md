@@ -24,7 +24,7 @@ Skills are auto-discovered by Claude — no registration needed.
   - No IP addresses, hostnames, LXC IDs, port numbers, tailnet names, auth keys
   - No node names assigned to specific machines
   - Use generic placeholders (`<node-id>`, `<peer-ip>`, `my-node`) in examples
-- Node-specific config and secrets → `.xarta/` (gitignored, private inner repo)
+- Node-specific config and secrets → `.xarta/.secrets/` (gitignored, private inner repo)
 
 ## Writing a skill
 
