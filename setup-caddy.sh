@@ -152,6 +152,15 @@ ${HTTPS_NAMES} {
     # Redirect bare root to the GUI.
     redir / /ui/ permanent
 
+    # Fallback UI — frozen public copy of the GUI, served directly by Caddy.
+    # Intentionally separate from /ui (which is served by uvicorn).
+    # This copy is not updated when the private GUI is overhauled.
+    redir /fallback-ui /fallback-ui/ permanent
+    handle_path /fallback-ui/* {
+        root * ${REPO_OUTER_PATH}/gui-fallback
+        file_server
+    }
+
     # Reverse proxy all traffic to the local uvicorn process.
     # Includes /health, /api/v1/*, and /ui/* (GUI + embed component).
     reverse_proxy localhost:8080

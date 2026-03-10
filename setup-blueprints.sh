@@ -69,6 +69,14 @@ rm -rf "$BLUEPRINTS_GUI_DIR/embed"
 ln -s "$SCRIPT_DIR/gui-embed" "$BLUEPRINTS_GUI_DIR/embed"
 echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $SCRIPT_DIR/gui-embed"
 
+# ── 1c. Link gui-embed/ into the gui-fallback directory ─────────────────────
+# gui-fallback/ is the frozen public copy of the UI, served by Caddy at
+# /fallback-ui.  It needs the same embed component symlink.
+echo "--- linking gui-embed into gui-fallback directory..."
+rm -rf "$SCRIPT_DIR/gui-fallback/embed"
+ln -s "$SCRIPT_DIR/gui-embed" "$SCRIPT_DIR/gui-fallback/embed"
+echo "    ok: $SCRIPT_DIR/gui-fallback/embed -> $SCRIPT_DIR/gui-embed"
+
 # ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."
 if ! dpkg -l python3.11-venv >/dev/null 2>&1; then

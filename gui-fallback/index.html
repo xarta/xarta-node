@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blueprints</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2d3148;
+      --accent: #5b9cf6;
+      --accent-dim: #2d4a7a;
+      --text: #e2e6f3;
+      --text-dim: #7b82a0;
+      --ok: #4caf7d;
+      --warn: #e6a817;
+      --err: #e05c5c;
+      --radius: 6px;
+      --font: 'Segoe UI', system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: var(--font);
+           font-size: 14px; min-height: 100vh; }
+
+    /* ── Layout ── */
+    header { background: var(--surface); border-bottom: 1px solid var(--border);
+             padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; font-weight: 600; letter-spacing: .4px; flex: 1; }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    section { margin-bottom: 32px; }
+    h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
+         letter-spacing: .8px; color: var(--text-dim); margin-bottom: 12px; }
+
+    /* ── Node banner ── */
+    #node-banner { background: var(--surface); border: 1px solid var(--border);
+                   border-radius: var(--radius); padding: 14px 18px;
+                   display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 24px; }
+    .node-stat { display: flex; flex-direction: column; gap: 2px; }
+    .node-stat .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; }
+    .node-stat .value { font-size: 16px; font-weight: 600; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 3px;
+             font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .badge-ok  { background: #1a3d2a; color: var(--ok); }
+    .badge-err { background: #3d1a1a; color: var(--err); }
+
+    /* ── Services table ── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th { background: var(--surface); color: var(--text-dim); font-size: 11px;
+               text-transform: uppercase; letter-spacing: .6px; padding: 8px 10px;
+               text-align: left; border-bottom: 1px solid var(--border); }
+    tbody tr { border-bottom: 1px solid var(--border); }
+    tbody tr:hover { background: rgba(91,156,246,.06); }
+    tbody td { padding: 9px 10px; vertical-align: top; }
+    .tag { display: inline-block; background: var(--accent-dim); color: var(--accent);
+           border-radius: 3px; padding: 1px 6px; font-size: 11px; margin: 1px; }
+    .link-badge { display: inline-block; background: #1a2a1a; color: #6ecf8e;
+                  border: 1px solid #2d4a2d; border-radius: 3px; padding: 1px 7px;
+                  font-size: 11px; margin: 1px; text-decoration: none; cursor: pointer; }
+    .link-badge:hover { background: #2a402a; color: #9be0b0; }
+    .name-link { color: var(--text); text-decoration: none; }
+    .name-link:hover { color: var(--accent); text-decoration: underline; }
+    .status-deployed { color: var(--ok); }
+    .status-wip      { color: var(--warn); }
+    .status-planned  { color: var(--text-dim); }
+    .empty-row td { text-align: center; color: var(--text-dim); padding: 32px; }
+
+    /* ── Sync panel ── */
+    #sync-panel { background: var(--surface); border: 1px solid var(--border);
+                  border-radius: var(--radius); padding: 14px 18px; }
+    .sync-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr));
+                 gap: 12px; }
+    .sync-item { display: flex; justify-content: space-between; padding: 6px 0;
+                 border-bottom: 1px solid var(--border); }
+    .sync-item:last-child { border-bottom: none; }
+
+    /* ── Toolbar ── */
+    .toolbar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; }
+    input[type=text] { background: var(--surface); border: 1px solid var(--border);
+                       color: var(--text); border-radius: var(--radius); padding: 6px 10px;
+                       font-size: 13px; flex: 1; max-width: 300px; }
+    input[type=text]:focus { outline: none; border-color: var(--accent); }
+    button { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-dim);
+             border-radius: var(--radius); padding: 6px 14px; font-size: 13px;
+             cursor: pointer; transition: background .15s; }
+    button:hover { background: var(--accent); color: #fff; }
+    button.secondary { background: transparent; border-color: var(--border);
+                       color: var(--text-dim); }
+    button.secondary:hover { color: var(--text); border-color: var(--text-dim); }
+
+    /* ── Loading / error states ── */
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+               border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-msg { color: var(--err); font-size: 12px; margin-top: 6px; }
+
+    /* ── Backup section ── */
+    .backup-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .backup-table th { text-align: left; padding: 6px 10px;
+      border-bottom: 1px solid var(--border); color: var(--text-dim); font-weight: 500; }
+    .backup-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+    .backup-table tr:last-child td { border-bottom: none; }
+    .btn-restore  { font-size: 12px; padding: 4px 10px; }
+    .btn-force    { font-size: 12px; padding: 4px 10px;
+      background: var(--err); border-color: var(--err); color: #fff; }
+    .btn-force:hover { opacity: .85; }
+    .warn-box { margin: 12px 0; padding: 10px 14px;
+      background: rgba(255,180,0,.08); border: 1px solid var(--warn);
+      border-radius: var(--radius); font-size: 13px; color: var(--warn); }
+    .force-box { margin: 12px 0; padding: 10px 14px;
+      background: rgba(210,50,50,.08); border: 1px solid var(--err);
+      border-radius: var(--radius); font-size: 13px; color: var(--err); }
+    .restore-result { margin-top: 10px; padding: 10px 14px;
+      background: rgba(60,210,100,.08); border: 1px solid var(--ok);
+      border-radius: var(--radius); font-size: 13px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>&#9670; Blueprints</h1>
+  <blueprints-node-selector></blueprints-node-selector>
+</header>
+
+<main>
+
+  <!-- Node identity banner -->
+  <div id="node-banner">
+    <div class="node-stat">
+      <span class="label">Node</span>
+      <span class="value" id="nn-name">—</span>
+    </div>
+    <div class="node-stat">
+      <span class="label">Host</span>
+      <span class="value" id="nn-host">—</span>
+    </div>
+    <div class="node-stat">
+      <span class="label">Generation</span>
+      <span class="value" id="nn-gen">—</span>
+    </div>
+    <div class="node-stat">
+      <span class="label">Integrity</span>
+      <span class="value" id="nn-integrity">—</span>
+    </div>
+    <div class="node-stat">
+      <span class="label">Peers</span>
+      <span class="value" id="nn-peers">—</span>
+    </div>
+  </div>
+
+  <!-- Services -->
+  <section>
+    <h2>Services</h2>
+    <div class="toolbar">
+      <input type="text" id="search-input" placeholder="Filter services…" oninput="renderServices()" />
+      <button onclick="openAddModal()">+ Add service</button>
+      <button class="secondary" onclick="loadServices()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Host / LXC</th>
+            <th>Status</th>
+            <th>Tags</th>
+            <th>Links</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody id="services-tbody"></tbody>
+      </table>
+    </div>
+    <p id="services-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Sync status -->
+  <section>
+    <h2>Sync status</h2>
+    <div id="sync-panel">
+      <div class="sync-grid" id="sync-grid">
+        <div><span class="spinner"></span> loading…</div>
+      </div>
+    </div>
+    <p id="sync-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Backups -->
+  <section>
+    <h2>Backups</h2>
+    <div class="toolbar" style="margin-bottom:12px;">
+      <button onclick="createBackup(this)">&#128190; Create backup</button>
+      <button class="secondary" onclick="loadBackups()">&#8635; Refresh</button>
+    </div>
+    <div class="warn-box">
+      &#9888; Restoring only updates <strong>this node</strong>.
+      Other nodes are not automatically updated — their gen will remain higher,
+      so they will push their state back to this node on the next sync cycle,
+      overwriting the restore. Use <strong>Force Restore</strong> to propagate
+      the restored state to all peers (disaster recovery only).
+    </div>
+    <div class="table-wrap">
+      <table class="backup-table">
+        <thead><tr>
+          <th>Filename</th>
+          <th>Size</th>
+          <th>Created</th>
+          <th>Actions</th>
+        </tr></thead>
+        <tbody id="backup-tbody"><tr class="empty-row"><td colspan="4">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <p id="backup-error" class="error-msg" hidden></p>
+  </section>
+
+</main>
+
+<!-- Quick-add service modal (minimal) -->
+<dialog id="add-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;">
+  <h2 style="margin-bottom:16px;">Add service</h2>
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <label>ID <input type="text" id="m-id" placeholder="e.g. my-service" style="width:100%;margin-top:4px;" /></label>
+    <label>Name <input type="text" id="m-name" placeholder="Display name" style="width:100%;margin-top:4px;" /></label>
+    <label>Host machine <input type="text" id="m-host" placeholder="e.g. my-server" style="width:100%;margin-top:4px;" /></label>
+    <label>VM / LXC <input type="text" id="m-lxc" placeholder="e.g. my-container" style="width:100%;margin-top:4px;" /></label>
+    <label>Description <input type="text" id="m-desc" placeholder="Short description" style="width:100%;margin-top:4px;" /></label>
+    <label>URL <input type="text" id="m-url" placeholder="https://… (optional)" style="width:100%;margin-top:4px;" /></label>
+  </div>
+  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('add-modal').close()">Cancel</button>
+    <button onclick="submitAddService()">Save</button>
+  </div>
+  <p id="modal-error" class="error-msg" hidden></p>
+</dialog>
+
+<script>
+  /* ── State ────────────────────────────────────────────────────────────── */
+  let _services = [];
+
+  /* ── Bootstrap ────────────────────────────────────────────────────────── */
+  document.addEventListener('DOMContentLoaded', () => {
+    loadHealth();
+    loadServices();
+    loadSyncStatus();
+    loadBackups();
+    setInterval(loadHealth, 15_000);
+    setInterval(loadSyncStatus, 30_000);
+  });
+
+  /* ── Health / node banner ─────────────────────────────────────────────── */
+  async function loadHealth() {
+    try {
+      const r = await fetch('/health');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      document.getElementById('nn-name').textContent = d.node_name || d.node_id;
+      document.getElementById('nn-gen').textContent  = d.gen ?? '—';
+      const ok = d.integrity_ok;
+      document.getElementById('nn-integrity').innerHTML =
+        `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${ok ? 'OK' : 'FAILED'}</span>`;
+    } catch (e) {
+      console.warn('health check failed:', e);
+    }
+  }
+
+  /* ── Services ─────────────────────────────────────────────────────────── */
+  async function loadServices() {
+    const err = document.getElementById('services-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/services');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _services = await r.json();
+      renderServices();
+    } catch (e) {
+      err.textContent = `Failed to load services: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderServices() {
+    const q = (document.getElementById('search-input').value || '').toLowerCase();
+    const tbody = document.getElementById('services-tbody');
+    const visible = _services.filter(s =>
+      !q || s.name.toLowerCase().includes(q) ||
+      (s.description || '').toLowerCase().includes(q) ||
+      (s.service_id || '').toLowerCase().includes(q) ||
+      (s.vm_or_lxc || '').toLowerCase().includes(q)
+    );
+    if (!visible.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="7">' +
+        (_services.length ? 'No matching services.' : 'No services — add one above.') + '</td></tr>';
+      return;
+    }
+    tbody.innerHTML = visible.map(s => {
+      const tags = (s.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+      const statusCls = `status-${(s.project_status||'').replace(/[^a-z]/g,'')}`;
+      const links = (s.links || []);
+      const primaryUrl = links.length ? (links[0].url || links[0].href || '') : '';
+      const linkBadges = links.map(l => {
+        const href = l.url || l.href || '#';
+        const label = l.label || l.name || href;
+        return `<a class="link-badge" href="${esc(href)}" target="_blank" rel="noopener">${esc(label)}</a>`;
+      }).join('');
+      const nameHtml = primaryUrl
+        ? `<a class="name-link" href="${esc(primaryUrl)}" target="_blank" rel="noopener"><strong>${esc(s.name)}</strong></a>`
+        : `<strong>${esc(s.name)}</strong>`;
+      return `<tr>
+        <td><code style="font-size:12px;color:var(--text-dim)">${esc(s.service_id)}</code></td>
+        <td>${nameHtml}</td>
+        <td>${esc(s.host_machine||'')}${s.vm_or_lxc ? ' / '+esc(s.vm_or_lxc) : ''}</td>
+        <td><span class="${statusCls}">${esc(s.project_status||'')}</span></td>
+        <td>${tags}</td>
+        <td>${linkBadges}</td>
+        <td style="color:var(--text-dim);font-size:13px">${esc(s.description||'')}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ── Sync status ──────────────────────────────────────────────────────── */
+  async function loadSyncStatus() {
+    const grid = document.getElementById('sync-grid');
+    const err = document.getElementById('sync-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/sync/status');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      document.getElementById('nn-peers').textContent = d.peer_count;
+      const qs = d.queue_depths || {};
+      const items = [
+        ['Gen', d.gen],
+        ['Last write by', d.last_write_by],
+        ['Last write at', (d.last_write_at||'').replace('T',' ').slice(0,19)],
+      ];
+      Object.entries(qs).forEach(([peer, depth]) => {
+        items.push([`Queue → ${peer}`, depth === 0 ? '✓ clear' : `${depth} pending`]);
+      });
+      if (!Object.keys(qs).length) items.push(['Peers', '(none registered)']);
+      grid.innerHTML = items.map(([k,v]) => `
+        <div class="sync-item"><span style="color:var(--text-dim)">${esc(String(k))}</span>
+          <strong>${esc(String(v))}</strong></div>`).join('');
+    } catch (e) {
+      err.textContent = `Sync status unavailable: ${e.message}`;
+      err.hidden = false;
+      grid.innerHTML = '';
+    }
+  }
+
+  /* ── Add service modal ────────────────────────────────────────────────── */
+  function openAddModal() {
+    ['m-id','m-name','m-host','m-lxc','m-desc','m-url'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+    document.getElementById('modal-error').hidden = true;
+    document.getElementById('add-modal').showModal();
+  }
+
+  async function submitAddService() {
+    const id   = document.getElementById('m-id').value.trim();
+    const name = document.getElementById('m-name').value.trim();
+    const err  = document.getElementById('modal-error');
+    if (!id || !name) { err.textContent='ID and Name are required'; err.hidden=false; return; }
+    try {
+      const r = await fetch('/api/v1/services', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          service_id:    id,
+          name,
+          host_machine:  document.getElementById('m-host').value.trim() || null,
+          vm_or_lxc:     document.getElementById('m-lxc').value.trim()  || null,
+          description:   document.getElementById('m-desc').value.trim() || null,
+          project_status: 'deployed',
+          links: (() => {
+            const u = document.getElementById('m-url').value.trim();
+            return u ? [{ label: 'Open', url: u }] : null;
+          })(),
+        }),
+      });
+      if (!r.ok) { const t=await r.text(); throw new Error(t); }
+      document.getElementById('add-modal').close();
+      await loadServices();
+    } catch (e) {
+      err.textContent = `Error: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  /* ── Utilities ────────────────────────────────────────────────────────── */
+  const esc = s => String(s).replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+  /* ── Backups ───────────────────────────────────────────────────────────── */
+  async function loadBackups() {
+    const tbody = document.getElementById('backup-tbody');
+    const err   = document.getElementById('backup-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/backup');
+      if (!r.ok) {
+        if (r.status === 503) {
+          tbody.innerHTML = '<tr class="empty-row"><td colspan="4">Backups not configured on this node.</td></tr>';
+          return;
+        }
+        throw new Error(`HTTP ${r.status}`);
+      }
+      const d = await r.json();
+      const list = d.backups || [];
+      if (!list.length) {
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No backups yet — create one above.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = list.map(b => {
+        const kb = (b.size_bytes / 1024).toFixed(1);
+        const ts = (b.created_at || '').replace('T', ' ').slice(0, 19) + ' UTC';
+        return `<tr>
+          <td><code style="font-size:12px">${esc(b.filename)}</code></td>
+          <td style="white-space:nowrap">${esc(kb)} KB</td>
+          <td style="white-space:nowrap;color:var(--text-dim)">${esc(ts)}</td>
+          <td style="white-space:nowrap">
+            <button class="btn-restore secondary" onclick="confirmRestore('${esc(b.filename)}', false)">Restore</button>
+            <button class="btn-force"              onclick="confirmRestore('${esc(b.filename)}', true)">&#9888; Force restore</button>
+          </td>
+        </tr>`;
+      }).join('');
+    } catch (e) {
+      err.textContent = `Failed to load backups: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  async function createBackup(btn) {
+    const origText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    const err = document.getElementById('backup-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/backup', { method: 'POST' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      await loadBackups();
+      // Flash a brief confirmation
+      btn.textContent = '✓ Done';
+      setTimeout(() => { btn.textContent = origText; btn.disabled = false; }, 2000);
+    } catch (e) {
+      err.textContent = `Backup failed: ${e.message}`;
+      err.hidden = false;
+      btn.textContent = origText;
+      btn.disabled = false;
+    }
+  }
+
+  function confirmRestore(filename, force) {
+    document.getElementById('restore-filename').textContent = filename;
+    document.getElementById('restore-warn-normal').hidden = force;
+    document.getElementById('restore-warn-force').hidden  = !force;
+    document.getElementById('restore-result').hidden = true;
+    document.getElementById('restore-result').textContent = '';
+    document.getElementById('restore-modal').dataset.filename = filename;
+    document.getElementById('restore-modal').dataset.force = force ? 'true' : 'false';
+    document.getElementById('restore-modal').showModal();
+  }
+
+  async function submitRestore() {
+    const modal    = document.getElementById('restore-modal');
+    const filename = modal.dataset.filename;
+    const force    = modal.dataset.force === 'true';
+    const btn      = document.getElementById('restore-confirm-btn');
+    const resultEl = document.getElementById('restore-result');
+    btn.disabled = true;
+    btn.textContent = 'Restoring…';
+    resultEl.hidden = true;
+    try {
+      const url = `/api/v1/backup/restore/${encodeURIComponent(filename)}${force ? '?force=true' : ''}`;
+      const r = await fetch(url, { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      let msg = `✓ Restored from ${d.restored_from}. Gen: ${d.gen_before} → ${d.gen_after}.`;
+      if (d.warning) msg += `\n⚠ ${d.warning}`;
+      resultEl.textContent = msg;
+      resultEl.className = 'restore-result';
+      resultEl.hidden = false;
+      btn.textContent = 'Done';
+      // Refresh health + sync after restore
+      setTimeout(() => { loadHealth(); loadSyncStatus(); loadBackups(); }, 500);
+    } catch (e) {
+      resultEl.textContent = `Error: ${e.message}`;
+      resultEl.className = 'restore-result force-box';
+      resultEl.hidden = false;
+      btn.textContent = 'Restore';
+      btn.disabled = false;
+    }
+  }
+</script>
+
+<!-- Restore confirmation modal -->
+<dialog id="restore-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:400px;max-width:520px;">
+  <h2 style="margin-bottom:12px;">⚠ Restore backup</h2>
+  <p style="margin-bottom:6px;">Restoring: <code id="restore-filename" style="color:var(--accent)"></code></p>
+
+  <div id="restore-warn-normal" class="warn-box">
+    This will replace the live DB on <strong>this node only</strong>.
+    Other nodes are NOT updated. Their gen is higher, so they will push
+    their current state back to this node on the next sync, overwriting
+    this restore.  Use <strong>Force Restore</strong> to propagate to peers.
+  </div>
+
+  <div id="restore-warn-force" class="force-box">
+    ⚠ FORCE RESTORE — this node's gen will be set above all peer gens.
+    On the next sync drain, this node will push the restored state to
+    ALL peers, overwriting their current data.
+    Only use this for disaster recovery or corruption fixes.
+  </div>
+
+  <div id="restore-result" hidden></div>
+
+  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('restore-modal').close()">Cancel</button>
+    <button id="restore-confirm-btn" onclick="submitRestore()">Restore</button>
+  </div>
+</dialog>
+
+<!-- Node-selector component — source lives in gui-embed/ (public outer repo).
+     Served here via a symlink created by setup-blueprints.sh. -->
+<link  rel="stylesheet" href="embed/blueprints-node-selector.css" />
+<script src="embed/blueprints-node-selector.js"></script>
+
+</body>
+</html>

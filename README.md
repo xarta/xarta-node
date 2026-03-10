@@ -1,4 +1,4 @@
-# xarta-node
+# xarta-node - Proxmox LXC
 
 > ⚠️ **AI-GENERATED CODE — DO NOT USE IN PRODUCTION WITHOUT REVIEW**
 >
@@ -12,6 +12,21 @@
 
 Scripts and configuration for setting up an LXC container with dual-WAN
 gateway failover and Tailscale exit-node functionality.
+
+Also - a simple SQL Lite database with automatic distribution of updates to peers.
+Intended to support things like links to other services in a homelab context.
+
+Actions also distributable via the database FIFO queue including triggering git pull.
+This repo assumes there's an "inner repo" for private assets.  
+Assuming the main GUI served by Caddy will go in the private inner repo as could reveal 
+secrets about the homelab if looking to optimise the GUI to represent homelab structure.
+
+Very basic fallback GUI on /fallback-ui for basic interaction with database.
+
+**WARNING** - THIS REPO DOES NOT FOLLOW MANY SECURE PRACTICES.
+
+In the xarta homelab environment these nodes will work on isolated tailnets and 
+local VLAN accessibility will be strictly firewalled using the tools Proxmox provides.
 
 ## Assumed Environment
 
