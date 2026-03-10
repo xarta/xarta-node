@@ -23,6 +23,14 @@ APP_PORT: int = 8080
 _peers_raw: str = os.environ.get("BLUEPRINTS_PEERS", "")
 PEER_URLS: list[str] = [p.strip() for p in _peers_raw.split(",") if p.strip()]
 
+# Comma-separated list of origins (scheme+host+port) allowed to make cross-origin
+# requests to this API from a browser.  Include every hostname that may serve a page
+# with the node-selector embed widget.  Peer node ui_urls are also added automatically
+# from the DB at runtime, so registering a new node covers it without editing this list.
+# No trailing slashes. Example: "http://mynode.tailnet:8080,http://dashboard.lan"
+_cors_raw: str = os.environ.get("BLUEPRINTS_CORS_ORIGINS", "")
+CORS_ORIGINS: list[str] = [o.strip().rstrip("/") for o in _cors_raw.split(",") if o.strip()]
+
 # External address other nodes use to reach THIS node's app (e.g. its Tailscale IP:port).
 # Stored in the nodes table so peers can route sync traffic back to this node.
 # For Docker nodes this defaults to localhost (Caddy handles external routing).

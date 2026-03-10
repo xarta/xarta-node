@@ -22,11 +22,11 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import db
+from .cors import DynamicCORSMiddleware
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_machines import router as machines_router
@@ -334,15 +334,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS — allow any origin; Blueprints runs on an isolated tailnet/LAN, not
-    # on the public internet. Needed so the node-selector component can call
-    # /health and /api/v1/nodes when embedded in pages on other origins.
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],
-    )
+    # CORS — origin allowlist loaded from config + dynamic peer node ui_urls from DB.
+    # Requests from unlisted origins are blocked by the browser (server still receives
+    # the request but the browser withholds the response from the calling page).
+    application.add_middleware(DynamicCORSMiddleware)
 
     # ── Routers ───────────────────────────────────────────────────────────────
     application.include_router(health_router)
