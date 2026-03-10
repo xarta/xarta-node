@@ -16,7 +16,27 @@ gateway failover and Tailscale exit-node functionality.
 Also - a simple SQL Lite database with automatic distribution of updates to peers.
 Intended to support things like links to other services in a homelab context.
 
-Actions also distributable via the database FIFO queue including triggering git pull.
+My home setup comprises two ISP's and their routers since I like to keep my experimentation
+mostly separate from my partner's stable internet connection.  Vendor routers connected
+to a switch which then trunks them as VLANs.  I used to use a pfsense router for both 
+ISP connections more directly but I worry about if something happens to me, what would my
+non-technical partner do so I keep some things "standard".
+
+I then have a standard hardware failover router,
+but also a high-availabily pfsense pair of routers all using those ISP router vlans 
+for failover.  I prioritise one ISP for myself, while my partner is on the ISP's router's
+LAN direct.  For my stuff I introduce double NAT which isn't a problem mostly.  
+But for reliabiliy and simpler tailscale routing, I'm using LXC's set-up to
+connect to the ISP vlans direct with scripting to failover, with a tailscale client
+setup to use either and then advertise itself as an exit node onto my vlans.
+Obviously ACL's limit access to this exit!  This avoids double-nat, and I can
+deploy such LXC's on different hardware with different UPS set-ups etc.  There's no
+reason why a 3rd failover ISP vlan couldn't be added e.g. 4G LTE / 5G etc.  And 
+I can use different "nodes" with different tailnets for multiple ways of improving
+connectivity reliability.  It makes sense to use these LXC's for other key services
+that would benefit from that connectivity reliability and LXC distribution.
+
+Actions are distributable via the database FIFO queue including triggering git pull.
 This repo assumes there's an "inner repo" for private assets.  
 Assuming the main GUI served by Caddy will go in the private inner repo as could reveal 
 secrets about the homelab if looking to optimise the GUI to represent homelab structure.
