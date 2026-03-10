@@ -41,6 +41,9 @@ SELF_ADDRESS: str = os.environ.get("BLUEPRINTS_SELF_ADDRESS", f"http://localhost
 DB_DIR: str = os.environ.get("BLUEPRINTS_DB_DIR", "/data/db")
 DB_PATH: str = os.path.join(DB_DIR, "blueprints.db")
 
+# Directory where local DB backups are saved.  Empty string = feature disabled.
+BACKUP_DIR: str = os.environ.get("BLUEPRINTS_BACKUP_DIR", "")
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 GUI_DIR: str = os.environ.get("BLUEPRINTS_GUI_DIR", "/data/gui")
 

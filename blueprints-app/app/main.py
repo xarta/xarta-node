@@ -32,6 +32,7 @@ from .routes_health import router as health_router
 from .routes_machines import router as machines_router
 from .routes_nodes import router as nodes_router
 from .routes_services import router as services_router
+from .routes_backup import router as backup_router
 from .routes_sync import router as sync_router
 from .sync.drain import start_drain_loop
 from .sync.restore import apply_restore
@@ -345,6 +346,7 @@ def create_app() -> FastAPI:
     application.include_router(machines_router, prefix="/api/v1")
     application.include_router(nodes_router,    prefix="/api/v1")
     application.include_router(sync_router,     prefix="/api/v1")
+    application.include_router(backup_router,   prefix="/api/v1")
     application.include_router(gui_sync_router, prefix="/api/v1")
 
     return application
