@@ -23,10 +23,13 @@ secrets about the homelab if looking to optimise the GUI to represent homelab st
 
 Very basic fallback GUI on /fallback-ui for basic interaction with database.
 
-**WARNING** - THIS REPO DOES NOT FOLLOW MANY SECURE PRACTICES.
+**WARNING** - THIS REPO DOES NOT FOLLOW MANY SECURE PRACTICES. IT CURRENTLY ASSUMES ROOT
+ACCESS AND SERVICES WEAKLY MITIGATED BY BEING BASED ON UNPRIVILEDGED LXC'S BUT IT WOULD
+STILL BE WISE TO REFACTOR TO A NON-ROOT INFRASTRUCTURE ESPECIALLY TO PROTECT KEYS ETC.
+THAT COULD BE EXPLOITED ELSEWHERE.
 
-In the xarta homelab environment these nodes will work on isolated tailnets and 
-local VLAN accessibility will be strictly firewalled using the tools Proxmox provides.
+In the xarta homelab environment these nodes will work on isolated tailnets / ACL protected, and local VLAN accessibility will be strictly firewalled using the tools Proxmox provides.
+Nonetheless using root as we use it in this repo is somewhat risky.
 
 ## Assumed Environment
 
