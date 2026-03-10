@@ -8,7 +8,7 @@ description: Onboard a new xarta-node LXC into the Blueprints fleet. Use when th
 ## What you need first
 
 Ask for (or locate) the **Proxmox LXC config** for the target container. Read
-[references/lxc-conf-guide.md](references/lxc-conf-guide.md) to extract:
+[references/lxc-conf-guide.md](./references/lxc-conf-guide.md) to extract:
 - Admin VLAN IP (the always-reachable local management IP from `eth0`)
 - Tailscale IP (if the node is already on the tailnet)
 - `hostname` → becomes NODE_ID, NODE_NAME, TAILSCALE_HOSTNAME, CADDY_EXTRA_NAMES subdomain
