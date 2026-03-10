@@ -69,12 +69,7 @@ rm -rf "$BLUEPRINTS_GUI_DIR/embed"
 ln -s "$SCRIPT_DIR/gui-embed" "$BLUEPRINTS_GUI_DIR/embed"
 echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $SCRIPT_DIR/gui-embed"
 
-# ── 2. Install env file ───────────────────────────────────────────────────────
-echo "--- installing .env to $OPT_DIR/.env..."
-cp "$ENV_FILE" "$OPT_DIR/.env"
-echo "    ok"
-
-# ── 3. Ensure Python 3.11 venv support is available ──────────────────────────
+# ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."
 if ! dpkg -l python3.11-venv >/dev/null 2>&1; then
     echo "    installing python3.11-venv..."
@@ -82,7 +77,7 @@ if ! dpkg -l python3.11-venv >/dev/null 2>&1; then
 fi
 echo "    ok"
 
-# ── 4. Create venv ────────────────────────────────────────────────────────────
+# ── 3. Create venv ────────────────────────────────────────────────────────────
 # Remove broken venv (created before python3-venv package was available)
 if [[ -d "$VENV_DIR" && ! -f "$VENV_DIR/bin/pip" ]]; then
     echo "--- removing broken venv..."
@@ -99,23 +94,24 @@ echo "--- installing Python requirements..."
 echo "    ok: $("$VENV_DIR/bin/pip" show fastapi uvicorn httpx 2>/dev/null \
     | grep -E '^Name:|^Version:' | paste - - | awk '{print $2"="$4}' | tr '\n' ' ')"
 
-# ── 5. Install systemd service ────────────────────────────────────────────────
+# ── 4. Install systemd service ────────────────────────────────────────────────
 echo "--- installing systemd service..."
-# Substitute the actual clone path into the template so it works regardless of
+# Substitute the actual paths into the template so it works regardless of
 # where xarta-node was cloned (not everyone clones to /root/xarta-node).
-sed "s|/root/xarta-node/blueprints-app|$APP_DIR|g" \
+sed -e "s|/root/xarta-node/blueprints-app|$APP_DIR|g" \
+    -e "s|__ENV_FILE__|$ENV_FILE|g" \
     "$APP_DIR/blueprints-app.service.template" \
     > /etc/systemd/system/blueprints-app.service
 systemctl daemon-reload
 echo "    ok"
 
-# ── 6. Enable + start ─────────────────────────────────────────────────────────
+# ── 5. Enable + start ─────────────────────────────────────────────────────────
 echo "--- enabling + starting blueprints-app..."
 systemctl enable blueprints-app
 systemctl restart blueprints-app
 sleep 3
 
-# ── 7. Health check ───────────────────────────────────────────────────────────
+# ── 6. Health check ───────────────────────────────────────────────────────────
 echo ""
 echo "--- health check..."
 if curl -sf http://127.0.0.1:8080/health | python3 -m json.tool; then
