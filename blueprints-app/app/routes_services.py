@@ -30,6 +30,7 @@ def _dumps(val) -> str | None:
 
 
 def _row_to_out(row) -> ServiceOut:
+    keys = row.keys()
     return ServiceOut(
         service_id=row["service_id"],
         name=row["name"],
@@ -44,6 +45,12 @@ def _row_to_out(row) -> ServiceOut:
         project_status=row["project_status"] or "deployed",
         tags=_loads(row["tags"]),
         links=_loads(row["links"]),
+        host_machine_id=row["host_machine_id"] if "host_machine_id" in keys else None,
+        service_kind=row["service_kind"] if "service_kind" in keys else None,
+        exposure_level=row["exposure_level"] if "exposure_level" in keys else None,
+        health_path=row["health_path"] if "health_path" in keys else None,
+        health_expected_status=row["health_expected_status"] if "health_expected_status" in keys else None,
+        runtime_notes_json=_loads(row["runtime_notes_json"]) if "runtime_notes_json" in keys else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -76,8 +83,10 @@ async def create_service(body: ServiceCreate) -> ServiceOut:
             INSERT INTO services
                 (service_id, name, description, host_machine, vm_or_lxc,
                  ports, caddy_routes, dns_info, credential_hints, dependencies,
-                 project_status, tags, links)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 project_status, tags, links,
+                 host_machine_id, service_kind, exposure_level,
+                 health_path, health_expected_status, runtime_notes_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 body.service_id,
@@ -93,6 +102,12 @@ async def create_service(body: ServiceCreate) -> ServiceOut:
                 body.project_status,
                 _dumps(body.tags),
                 _dumps(body.links),
+                body.host_machine_id,
+                body.service_kind,
+                body.exposure_level,
+                body.health_path,
+                body.health_expected_status,
+                _dumps(body.runtime_notes_json),
             ),
         )
         row = conn.execute(
@@ -129,7 +144,7 @@ async def update_service(service_id: str, body: ServiceUpdate) -> ServiceOut:
             return _row_to_out(existing)
 
         # Build dynamic SET clause
-        json_fields = {"ports", "caddy_routes", "dependencies", "tags", "links"}
+        json_fields = {"ports", "caddy_routes", "dependencies", "tags", "links", "runtime_notes_json"}
         set_parts = []
         values = []
         for field, val in update_data.items():

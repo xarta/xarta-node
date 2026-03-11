@@ -20,6 +20,11 @@ class MachineCreate(BaseModel):
     parent_machine_id: Optional[str] = None
     ip_addresses: Optional[list[str]] = None
     description: Optional[str] = None
+    machine_kind: Optional[str] = None      # baremetal/proxmox/vm/lxc/docker/switch/router/firewall/pikvm
+    platform: Optional[str] = None           # proxmox/docker/kvm/pfsense/caddy/linux
+    status: str = "active"                  # active/maintenance/offline/decommissioned
+    labels: Optional[list[str]] = None       # freeform tags
+    properties_json: Optional[dict] = None  # extensible metadata bag
 
 
 class MachineUpdate(BaseModel):
@@ -28,6 +33,11 @@ class MachineUpdate(BaseModel):
     parent_machine_id: Optional[str] = None
     ip_addresses: Optional[list[str]] = None
     description: Optional[str] = None
+    machine_kind: Optional[str] = None
+    platform: Optional[str] = None
+    status: Optional[str] = None
+    labels: Optional[list[str]] = None
+    properties_json: Optional[dict] = None
 
 
 class MachineOut(BaseModel):
@@ -37,6 +47,11 @@ class MachineOut(BaseModel):
     parent_machine_id: Optional[str] = None
     ip_addresses: Optional[list[str]] = None
     description: Optional[str] = None
+    machine_kind: Optional[str] = None
+    platform: Optional[str] = None
+    status: Optional[str] = None
+    labels: Optional[list[str]] = None
+    properties_json: Optional[dict] = None
     created_at: str
     updated_at: str
 
@@ -57,6 +72,12 @@ class ServiceCreate(BaseModel):
     project_status: str = "deployed"
     tags: Optional[list[str]] = None
     links: Optional[list[dict[str, str]]] = None
+    host_machine_id: Optional[str] = None       # FK to machines.machine_id
+    service_kind: str = "app"                   # app/api/web/db/proxy/dns/infra-ui
+    exposure_level: str = "internal"             # internal/tailnet/lan/public/restricted
+    health_path: Optional[str] = None            # e.g. /health or /api/v1/health
+    health_expected_status: int = 200
+    runtime_notes_json: Optional[dict] = None    # extensible metadata bag
 
 
 class ServiceUpdate(BaseModel):
@@ -72,6 +93,12 @@ class ServiceUpdate(BaseModel):
     project_status: Optional[str] = None
     tags: Optional[list[str]] = None
     links: Optional[list[dict[str, str]]] = None
+    host_machine_id: Optional[str] = None
+    service_kind: Optional[str] = None
+    exposure_level: Optional[str] = None
+    health_path: Optional[str] = None
+    health_expected_status: Optional[int] = None
+    runtime_notes_json: Optional[dict] = None
 
 
 class ServiceOut(BaseModel):
@@ -88,6 +115,12 @@ class ServiceOut(BaseModel):
     project_status: str
     tags: Optional[list[str]] = None
     links: Optional[list[dict[str, str]]] = None
+    host_machine_id: Optional[str] = None
+    service_kind: Optional[str] = None
+    exposure_level: Optional[str] = None
+    health_path: Optional[str] = None
+    health_expected_status: Optional[int] = None
+    runtime_notes_json: Optional[dict] = None
     created_at: str
     updated_at: str
 
@@ -101,6 +134,7 @@ class NodeCreate(BaseModel):
     tailnet: Optional[str] = None
     addresses: Optional[list[str]] = None
     ui_url: Optional[str] = None   # browser-facing HTTPS URL for this node
+    machine_id: Optional[str] = None  # canonical FK to machines.machine_id
 
 
 class NodeOut(BaseModel):
@@ -110,6 +144,7 @@ class NodeOut(BaseModel):
     tailnet: Optional[str] = None
     addresses: Optional[list[str]] = None
     ui_url: Optional[str] = None   # browser-facing HTTPS URL for this node
+    machine_id: Optional[str] = None  # canonical FK to machines.machine_id
     last_seen: Optional[str] = None
     created_at: str
 
