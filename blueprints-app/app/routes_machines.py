@@ -23,6 +23,7 @@ def _loads(val: str | None) -> list | None:
 
 
 def _row_to_out(row) -> MachineOut:
+    keys = row.keys()
     return MachineOut(
         machine_id=row["machine_id"],
         name=row["name"],
@@ -30,6 +31,11 @@ def _row_to_out(row) -> MachineOut:
         parent_machine_id=row["parent_machine_id"],
         ip_addresses=_loads(row["ip_addresses"]),
         description=row["description"],
+        machine_kind=row["machine_kind"] if "machine_kind" in keys else None,
+        platform=row["platform"] if "platform" in keys else None,
+        status=row["status"] if "status" in keys else None,
+        labels=_loads(row["labels"]) if "labels" in keys else None,
+        properties_json=_loads(row["properties_json"]) if "properties_json" in keys else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -59,8 +65,9 @@ async def create_machine(body: MachineCreate) -> MachineOut:
         conn.execute(
             """
             INSERT INTO machines
-                (machine_id, name, type, parent_machine_id, ip_addresses, description)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (machine_id, name, type, parent_machine_id, ip_addresses, description,
+                 machine_kind, platform, status, labels, properties_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 body.machine_id,
@@ -69,6 +76,11 @@ async def create_machine(body: MachineCreate) -> MachineOut:
                 body.parent_machine_id,
                 json.dumps(body.ip_addresses) if body.ip_addresses else None,
                 body.description,
+                body.machine_kind,
+                body.platform,
+                body.status,
+                json.dumps(body.labels) if body.labels else None,
+                json.dumps(body.properties_json) if body.properties_json else None,
             ),
         )
         row = conn.execute(
@@ -106,9 +118,10 @@ async def update_machine(machine_id: str, body: MachineUpdate) -> MachineOut:
 
         set_parts = []
         values = []
+        json_fields = {"ip_addresses", "labels", "properties_json"}
         for field, val in update_data.items():
             set_parts.append(f"{field}=?")
-            values.append(json.dumps(val) if field == "ip_addresses" else val)
+            values.append(json.dumps(val) if field in json_fields else val)
         set_parts.append("updated_at=datetime('now')")
         values.append(machine_id)
 

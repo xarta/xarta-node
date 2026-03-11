@@ -29,13 +29,15 @@ router = APIRouter(prefix="/nodes", tags=["nodes"])
 
 def _row_to_out(row) -> NodeOut:
     addrs = row["addresses"]
+    keys = row.keys()
     return NodeOut(
         node_id=row["node_id"],
         display_name=row["display_name"],
         host_machine=row["host_machine"],
         tailnet=row["tailnet"],
         addresses=json.loads(addrs) if addrs else None,
-        ui_url=row["ui_url"] if "ui_url" in row.keys() else None,
+        ui_url=row["ui_url"] if "ui_url" in keys else None,
+        machine_id=row["machine_id"] if "machine_id" in keys else None,
         last_seen=row["last_seen"],
         created_at=row["created_at"],
     )
@@ -87,13 +89,14 @@ async def register_node(body: NodeCreate) -> NodeOut:
             # Update addresses + last_seen on re-registration
             conn.execute(
                 "UPDATE nodes SET display_name=?, host_machine=?, tailnet=?, "
-                "addresses=?, ui_url=?, last_seen=datetime('now') WHERE node_id=?",
+                "addresses=?, ui_url=?, machine_id=?, last_seen=datetime('now') WHERE node_id=?",
                 (
                     body.display_name,
                     body.host_machine,
                     body.tailnet,
                     json.dumps(body.addresses) if body.addresses else None,
                     body.ui_url,
+                    body.machine_id,
                     body.node_id,
                 ),
             )
@@ -103,8 +106,8 @@ async def register_node(body: NodeCreate) -> NodeOut:
             conn.execute(
                 """
                 INSERT INTO nodes
-                    (node_id, display_name, host_machine, tailnet, addresses, ui_url, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                    (node_id, display_name, host_machine, tailnet, addresses, ui_url, machine_id, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
                 (
                     body.node_id,
@@ -113,6 +116,7 @@ async def register_node(body: NodeCreate) -> NodeOut:
                     body.tailnet,
                     json.dumps(body.addresses) if body.addresses else None,
                     body.ui_url,
+                    body.machine_id,
                 ),
             )
             log.info(

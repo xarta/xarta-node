@@ -98,7 +98,23 @@ INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_primary_at',   '');
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after initial deploy."""
     migrations = [
-        ("nodes", "ui_url", "TEXT"),
+        ("nodes",    "ui_url",                "TEXT"),
+        # ── Phase-1 schema evolution (2026-03-11) ─────────────────────────
+        # services: structured hosting, classification, health, flexibility
+        ("services", "host_machine_id",       "TEXT"),
+        ("services", "service_kind",          "TEXT DEFAULT 'app'"),
+        ("services", "exposure_level",        "TEXT DEFAULT 'internal'"),
+        ("services", "health_path",           "TEXT"),
+        ("services", "health_expected_status", "INTEGER DEFAULT 200"),
+        ("services", "runtime_notes_json",    "TEXT"),
+        # machines: richer type taxonomy, platform, status, extensibility
+        ("machines", "machine_kind",          "TEXT"),
+        ("machines", "platform",              "TEXT"),
+        ("machines", "status",                "TEXT DEFAULT 'active'"),
+        ("machines", "labels",                "TEXT"),
+        ("machines", "properties_json",       "TEXT"),
+        # nodes: canonical machine mapping
+        ("nodes",    "machine_id",            "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
