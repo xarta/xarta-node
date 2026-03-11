@@ -8,8 +8,8 @@
 #   2. Installs Caddy from the official apt repo (if not present).
 #   3. Creates a systemd drop-in so Caddy runs as root (required to read
 #      certs stored in the private inner repo under /root/).
-#   4. Writes a Caddyfile to $REPO_INNER_PATH/Caddyfile.
-#   5. Symlinks /etc/caddy/Caddyfile → $REPO_INNER_PATH/Caddyfile.
+#   4. Writes a Caddyfile to $REPO_CADDY_PATH/Caddyfile.
+#   5. Symlinks /etc/caddy/Caddyfile → $REPO_CADDY_PATH/Caddyfile.
 #   6. Validates the Caddyfile, then enables and (re)starts Caddy.
 #   7. Runs a basic health check via HTTPS.
 #
@@ -107,12 +107,12 @@ echo ""
 # ── Step 4 — Write Caddyfile ─────────────────────────────────────────────────
 echo "Step 4: Writing Caddyfile..."
 
-if [[ -z "${REPO_INNER_PATH:-}" ]]; then
-    echo -e "${RED}Error:${NC} REPO_INNER_PATH is not set in .env." >&2
+if [[ -z "${REPO_CADDY_PATH:-}" ]]; then
+    echo -e "${RED}Error:${NC} REPO_CADDY_PATH is not set in .env." >&2
     exit 1
 fi
 
-CADDYFILE="$REPO_INNER_PATH/Caddyfile"
+CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
 UI_HOST=$(url_host "${BLUEPRINTS_UI_URL:-localhost}")
 
 # Build the full comma-separated hostname list for the Caddy site blocks.

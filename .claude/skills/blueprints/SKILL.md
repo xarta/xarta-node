@@ -90,7 +90,7 @@ POST /api/v1/backup/restore/{filename}   → restore (add ?force=true to propaga
 
 ## Caddy (HTTPS reverse proxy)
 
-`setup-caddy.sh` installs Caddy, writes `.xarta/Caddyfile` from `.env` values, symlinks it to `/etc/caddy/Caddyfile`, and restarts. Key points:
+`setup-caddy.sh` installs Caddy, writes `$REPO_CADDY_PATH/Caddyfile` (a **node-local** git repo, separate from the fleet's shared private repo) from `.env` values, symlinks it to `/etc/caddy/Caddyfile`, and restarts. The Caddyfile is node-specific (hostnames differ per node), so each node keeps its own independent repo. Key points:
 - Uses `auto_https off` + `admin off` — always `systemctl restart caddy`, never `caddy reload`
 - Caddy runs as root (drop-in at `/etc/systemd/system/caddy.service.d/run-as-root.conf`) to read certs from `/root/`
 - Primary hostname comes from `BLUEPRINTS_UI_URL`; additional hostnames from `CADDY_EXTRA_NAMES` (comma-separated)
@@ -129,6 +129,7 @@ BLUEPRINTS_GUI_DIR=<path-to-xarta-node>/.xarta/gui
 BLUEPRINTS_BACKUP_DIR=<path-to-xarta-node>/.xarta/db-backups
 REPO_OUTER_PATH=<path-to-xarta-node>
 REPO_INNER_PATH=<path-to-xarta-node>/.xarta
+REPO_CADDY_PATH=<path-to-node-local-caddy-repo>  # node-specific repo; required by setup-caddy.sh
 
 # Service restart (used by auto-update and git-sync)
 SERVICE_RESTART_CMD=systemctl restart blueprints-app

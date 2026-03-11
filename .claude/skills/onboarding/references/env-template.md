@@ -19,6 +19,7 @@ TEST_IP="1.1.1.1"
 # -----------------------------------------------------------------------------
 REPO_OUTER_PATH="/root/xarta-node"
 REPO_INNER_PATH="/root/xarta-node/.xarta"
+REPO_CADDY_PATH="/root/xarta-node/<node-local-caddy-repo>"  # each node has its own independent git repo here
 GIT_TIMEOUT=5
 AUTO_UPDATE_LOG="/var/log/auto-update.log"
 SERVICE_RESTART_CMD="systemctl restart blueprints-app"
@@ -77,6 +78,8 @@ TAILSCALE_AUTH_KEY=
 # -----------------------------------------------------------------------------
 # Caddy
 # -----------------------------------------------------------------------------
+# REPO_CADDY_PATH (above) must be set and that directory must be git-initialised
+# before running setup-caddy.sh — it writes the Caddyfile into that repo.
 CADDY_EXTRA_NAMES=<HOSTNAME>.<your-domain>
 ENVEOF
 ```
