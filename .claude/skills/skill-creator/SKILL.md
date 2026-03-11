@@ -1,9 +1,11 @@
 ---
 name: skill-creator
-description: Create, edit, and improve skills in this xarta-node repo. Use when the user wants to add a new skill, update an existing skill, or improve how a skill triggers. Skills live in .claude/skills/ (public repo — no secrets). Node-specific config and secrets belong in .xarta/ (gitignored private inner repo).
+description: Create new skills and refactor existing skills in the public xarta-node repo, then validate conformance (frontmatter, structure, and script/path references). Use whenever a user asks to add, improve, migrate, or standardize skills under .claude/skills.
 ---
 
-# Skill Creator
+# Skill Creator (Public)
+
+Use this skill to create or refactor skills in `/root/xarta-node/.claude/skills`.
 
 ## Skill structure
 
@@ -11,11 +13,12 @@ description: Create, edit, and improve skills in this xarta-node repo. Use when 
 .claude/skills/
 └── <skill-name>/
     ├── SKILL.md         ← required: YAML frontmatter (name, description) + instructions
+  ├── scripts/         ← executable helper scripts for deterministic/repetitive tasks
     ├── references/      ← large docs loaded on demand
     └── assets/          ← templates, static files
 ```
 
-Skills are auto-discovered by Claude — no registration needed.
+Keep `SKILL.md` concise (target under 500 lines). Move heavy guidance to `references/`.
 
 ## Rules for this repo (PUBLIC — read before writing anything)
 
@@ -26,13 +29,34 @@ Skills are auto-discovered by Claude — no registration needed.
   - Use generic placeholders (`<node-id>`, `<peer-ip>`, `my-node`) in examples
 - Node-specific config and secrets → `.xarta/.secrets/` (gitignored, private inner repo)
 
-## Writing a skill
+## Workflow
 
-1. **SKILL.md frontmatter** — `name` + `description` (description drives when the skill triggers — make it specific)
-2. **Body under 500 lines** — move large reference material to `references/`
-3. **Reference files** — link clearly from SKILL.md with a note on when to read them
-4. **Keep generic** — skills describe *how* to work with the system, not *this specific deployment's* values
+1. Capture intent: what the skill does, and when it should trigger.
+2. Write or refactor `SKILL.md` with strong trigger description.
+3. Place deterministic helpers in `scripts/` and reference them from `SKILL.md`.
+4. Move long guidance/examples into `references/`.
+5. Run conformance audit before finalizing.
+
+## Conformance audit script
+
+Use:
+
+```bash
+bash /root/xarta-node/.claude/skills/skill-creator/scripts/audit-skills.sh /root/xarta-node/.claude/skills
+```
+
+The audit checks:
+
+- `SKILL.md` has YAML frontmatter with `name` and `description`
+- line count target (`<= 500`)
+- absolute filesystem paths referenced in `SKILL.md` exist
+
+## References
+
+- `references/skill-patterns.md` for recommended anatomy and migration guidance.
 
 ## Updating an existing skill
 
-Read the current SKILL.md first. Make targeted edits — don't rewrite unless asked. After editing, check: would this file be safe in a public GitHub repo right now?
+Read current files first, then make targeted edits. Preserve behavior unless the user asked for structural change.
+
+After edits, verify the result is safe for a public repository and run the audit script.
