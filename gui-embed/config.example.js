@@ -12,3 +12,26 @@ window.BLUEPRINTS_API_BASE = 'http://<node-ip-or-hostname>:8080';
 window.BLUEPRINTS_SEED_NODES = [
   // { id: '<node-id>', name: '<display-name>', url: 'http://<ip>:8080' },
 ];
+
+// Optional: selector action buttons rendered next to the dropdown.
+// Valid button keys:
+// - 'fallback-ui'
+// - 'ui'
+// - 'database-tables'
+// - 'database-diagram'
+// - 'paging-button'  (cycles button pages in a round-robin)
+window.BLUEPRINTS_SELECTOR_BUTTONS = {
+  // Preferred: explicit page mapping (each nested array is one page).
+  pages: [
+    ['ui', 'fallback-ui'],
+    ['database-tables', 'database-diagram']
+  ],
+  showPagingButton: true,
+
+  // Back-compat alternative (auto-chunked pages):
+  // enabledButtons: ['ui', 'fallback-ui', 'database-tables', 'database-diagram', 'paging-button'],
+  // pageSize: 2,
+
+  side: 'left',          // 'left' | 'right' of the dropdown
+  nodeSwitchPath: '/ui/' // '/ui/' or 'current' to keep same page when changing node
+};

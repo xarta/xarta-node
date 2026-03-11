@@ -7,11 +7,40 @@
 
 blueprints-node-selector,
 .bp-node-selector {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   position: relative;
   font-family: 'Segoe UI', system-ui, sans-serif;
   font-size: 13px;
   user-select: none;
+}
+
+.bp-ns-actions {
+  display: none;
+  align-items: center;
+  gap: 6px;
+}
+.bp-ns-actions.show { display: inline-flex; }
+
+.bp-ns-action-btn {
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 5px;
+  background: rgba(255,255,255,.05);
+  color: #c8cedf;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  transition: background .15s, border-color .15s;
+}
+.bp-ns-action-btn:hover {
+  background: rgba(255,255,255,.1);
+  border-color: rgba(255,255,255,.2);
 }
 
 /* Collapsed button */

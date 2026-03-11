@@ -69,6 +69,13 @@ rm -rf "$BLUEPRINTS_GUI_DIR/embed"
 ln -s "$SCRIPT_DIR/gui-embed" "$BLUEPRINTS_GUI_DIR/embed"
 echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $SCRIPT_DIR/gui-embed"
 
+# ── 1bb. Link shared gui-db/ into the GUI directory ──────────────────────────
+# gui-db/ lives in the public outer repo and is shared by /ui and /fallback-ui.
+echo "--- linking gui-db into GUI directory..."
+rm -rf "$BLUEPRINTS_GUI_DIR/db"
+ln -s "$SCRIPT_DIR/gui-db" "$BLUEPRINTS_GUI_DIR/db"
+echo "    ok: $BLUEPRINTS_GUI_DIR/db -> $SCRIPT_DIR/gui-db"
+
 # ── 1c. Link gui-embed/ into the gui-fallback directory ─────────────────────
 # gui-fallback/ is the frozen public copy of the UI, served by Caddy at
 # /fallback-ui.  It needs the same embed component symlink.
@@ -76,6 +83,12 @@ echo "--- linking gui-embed into gui-fallback directory..."
 rm -rf "$SCRIPT_DIR/gui-fallback/embed"
 ln -s "$SCRIPT_DIR/gui-embed" "$SCRIPT_DIR/gui-fallback/embed"
 echo "    ok: $SCRIPT_DIR/gui-fallback/embed -> $SCRIPT_DIR/gui-embed"
+
+# Also expose shared db pages under /fallback-ui/db.
+echo "--- linking gui-db into gui-fallback directory..."
+rm -rf "$SCRIPT_DIR/gui-fallback/db"
+ln -s "$SCRIPT_DIR/gui-db" "$SCRIPT_DIR/gui-fallback/db"
+echo "    ok: $SCRIPT_DIR/gui-fallback/db -> $SCRIPT_DIR/gui-db"
 
 # ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."

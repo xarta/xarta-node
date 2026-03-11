@@ -57,6 +57,29 @@ the API base is temporarily unreachable:
 </script>
 ```
 
+### 3. Optional: selector action buttons
+
+You can add icon buttons next to the dropdown and control which side they
+appear on, which buttons show, and how paging works.
+
+```html
+<script>
+  window.BLUEPRINTS_SELECTOR_BUTTONS = {
+    enabledButtons: ['ui', 'fallback-ui', 'database-tables', 'database-diagram', 'paging-button'],
+    side: 'left',
+    pageSize: 4,
+    nodeSwitchPath: 'current'
+  };
+</script>
+```
+
+Supported button keys:
+- `ui`
+- `fallback-ui`
+- `database-tables`
+- `database-diagram`
+- `paging-button` (cycles to next button page)
+
 ---
 
 ## Using embed.html locally
@@ -98,3 +121,11 @@ this repo without any extra copy step.
 
 The Blueprints GUI (`index.html`) also references the component via this path,
 so there is only one copy of the source files.
+
+Shared database UI pages now live in the public folder `gui-db/` and are served
+at:
+- `/ui/db/...` (via `.xarta/gui/db` symlink)
+- `/fallback-ui/db/...` (via `gui-fallback/db` symlink)
+
+This keeps database table/diagram pages single-sourced in the public repo while
+allowing `/ui` and `/fallback-ui` main pages to diverge independently.
