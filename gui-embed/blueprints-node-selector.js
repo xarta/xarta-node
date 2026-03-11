@@ -45,6 +45,7 @@
 
   const LS_NODES = 'bp_nodes_v2';
   const LS_CURRENT = 'bp_current_v2';
+  const LS_BUTTON_PAGE = 'bp_button_page_v1';
 
   const HEALTH_INTERVAL = 10_000;
   const DOWN_RETRY = 60_000;
@@ -57,6 +58,15 @@
 
   function lsGet(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
   function lsSet(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
+
+  function loadButtonPage() {
+    const page = lsGet(LS_BUTTON_PAGE);
+    _buttonPage = Number.isInteger(page) && page >= 0 ? page : 0;
+  }
+
+  function saveButtonPage() {
+    lsSet(LS_BUTTON_PAGE, _buttonPage);
+  }
 
   function applySelectorConfigFromWindow() {
     const raw = (typeof window !== 'undefined' && window.BLUEPRINTS_SELECTOR_BUTTONS) || {};
@@ -268,6 +278,8 @@
   }
 
   function init() {
+    loadButtonPage();
+
     const cached = lsGet(LS_NODES);
     if (cached && cached.nodes && (Date.now() - cached.ts) < LS_TTL) {
       _nodes = cached.nodes;
@@ -406,6 +418,7 @@
 
     const pageCount = pages.length;
     _buttonPage = ((_buttonPage % pageCount) + pageCount) % pageCount;
+    saveButtonPage();
     const currentPageButtons = pages[_buttonPage];
 
     const target = SELECTOR_CFG.side === 'left' ? left : right;
