@@ -47,14 +47,22 @@
   const LS_CURRENT = 'bp_current_v2';
   const LS_BUTTON_PAGE = 'bp_button_page_v1';
 
-  const HEALTH_INTERVAL = 10_000;
-  const DOWN_RETRY = 60_000;
+  const POLL_INTERVAL = 2_000;
+  const REQUEST_TIMEOUT = Math.max(400, POLL_INTERVAL - 250);
+  const NO_RESPONSE_WINDOW = 10_000;
+  const PRUNE_UNSEEN_MS = 48 * 60 * 60 * 1000;
+  const HEART_WINDOW_RATIO = 0.95;
+  const HEART_STEPS = 20;
   const LIST_REFRESH = 60_000;
   const LS_TTL = 5 * 60_000;
 
   let _nodes = [];
   let _current = null;
   let _buttonPage = 0;
+  let _polling = false;
+  let _lastPollTick = 0;
+  let _heartTimer = null;
+  let _heartToken = 0;
 
   function lsGet(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
   function lsSet(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
@@ -188,9 +196,21 @@
 
     const byId = Object.fromEntries(_nodes.map(n => [n.id, n]));
     _nodes = fresh.map(n => Object.assign(
-      { available: true, lastChecked: 0 },
+      {
+        latencyMs: null,
+        lastSeenAt: 0,
+        lastPolledAt: 0,
+        discoveredAt: Date.now(),
+      },
       n,
-      byId[n.id] ? { available: byId[n.id].available, lastChecked: byId[n.id].lastChecked } : {},
+      byId[n.id]
+        ? {
+            latencyMs: byId[n.id].latencyMs,
+            lastSeenAt: byId[n.id].lastSeenAt,
+            lastPolledAt: byId[n.id].lastPolledAt,
+            discoveredAt: byId[n.id].discoveredAt || Date.now(),
+          }
+        : {},
     ));
 
     if (!_current || !_nodes.find(n => n.id === _current)) {
@@ -205,76 +225,147 @@
   }
 
   async function pingNode(node) {
+    const start = performance.now();
     try {
       const r = await fetch(node.healthUrl, {
         method: 'GET',
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT),
       });
-      return r.ok;
-    } catch { return false; }
+      if (!r.ok) return { ok: false, latencyMs: null };
+      return { ok: true, latencyMs: Math.round(performance.now() - start) };
+    } catch {
+      return { ok: false, latencyMs: null };
+    }
   }
 
-  async function checkCurrent() {
-    const node = _nodes.find(n => n.id === _current);
-    if (!node) { await electNew(); return; }
+  function pulseHeart() {
+    const heart = document.getElementById('bp-ns-heart');
+    if (!heart) return;
+    if (_heartTimer) {
+      clearInterval(_heartTimer);
+      _heartTimer = null;
+    }
+    _heartToken += 1;
+    const token = _heartToken;
 
-    setDot('checking');
-    const ok = await pingNode(node);
-    node.available = ok;
-    node.lastChecked = Date.now();
-    lsSet(LS_NODES, { ts: Date.now(), nodes: _nodes });
+    const totalMs = Math.max(100, Math.floor(POLL_INTERVAL * HEART_WINDOW_RATIO));
+    const stepMs = Math.max(8, Math.floor((totalMs / 2) / HEART_STEPS));
+    const totalFrames = HEART_STEPS * 2;
+    let frame = 0;
 
-    if (ok) { setDot('ok'); }
-    else { setDot('down'); await electNew(); }
-  }
+    setHeartIllumination(0);
+    heart.classList.remove('stopped');
 
-  async function electNew() {
-    for (const node of _nodes) {
-      if (node.id === _current) continue;
-      if (!node.available && (Date.now() - node.lastChecked) < DOWN_RETRY) continue;
-      setDot('checking');
-      const ok = await pingNode(node);
-      node.available = ok;
-      node.lastChecked = Date.now();
-      if (ok) {
-        _current = node.id;
-        lsSet(LS_CURRENT, _current);
-        lsSet(LS_NODES, { ts: Date.now(), nodes: _nodes });
-        setDot('ok');
-        renderBtn();
-        renderActionButtons();
-        renderPanel();
+    _heartTimer = setInterval(() => {
+      if (token !== _heartToken) {
+        clearInterval(_heartTimer);
+        _heartTimer = null;
         return;
       }
-    }
-    setDot('down');
-    lsSet(LS_NODES, { ts: Date.now(), nodes: _nodes });
+
+      frame += 1;
+      let illumination = 0;
+      if (frame <= HEART_STEPS) {
+        illumination = frame / HEART_STEPS;
+      } else {
+        illumination = Math.max(0, (totalFrames - frame) / HEART_STEPS);
+      }
+      setHeartIllumination(illumination);
+
+      if (frame >= totalFrames) {
+        clearInterval(_heartTimer);
+        _heartTimer = null;
+        setHeartIllumination(0);
+      }
+    }, stepMs);
   }
 
-  function recheckDown() {
-    const now = Date.now();
-    _nodes.forEach(n => {
-      if (!n.available && (now - n.lastChecked) >= DOWN_RETRY) {
-        pingNode(n).then(ok => {
-          n.available = ok;
-          n.lastChecked = Date.now();
-          if (ok && !isCurrentOk()) {
-            _current = n.id;
-            lsSet(LS_CURRENT, _current);
-            setDot('ok');
-            renderBtn();
-            renderActionButtons();
-          }
-          lsSet(LS_NODES, { ts: Date.now(), nodes: _nodes });
-          renderPanel();
-        });
+  function updateHeartDeadman() {
+    const heart = document.getElementById('bp-ns-heart');
+    if (!heart) return;
+    const stalled = !_lastPollTick || (Date.now() - _lastPollTick) > (POLL_INTERVAL * 2.5);
+    if (stalled) {
+      if (_heartTimer) {
+        clearInterval(_heartTimer);
+        _heartTimer = null;
       }
+      _heartToken += 1;
+      setHeartIllumination(0);
+      heart.classList.add('stopped');
+    } else {
+      heart.classList.remove('stopped');
+    }
+  }
+
+  function setHeartIllumination(value) {
+    const heart = document.getElementById('bp-ns-heart');
+    if (!heart) return;
+    const normalized = Math.min(1, Math.max(0, Number(value) || 0));
+    heart.style.setProperty('--bp-heart-illum', normalized.toFixed(3));
+  }
+
+  function pickBestCurrent() {
+    if (_current && _nodes.find(n => n.id === _current)) return;
+    const best = _nodes
+      .filter(n => Number.isFinite(n.latencyMs))
+      .sort((a, b) => a.latencyMs - b.latencyMs)[0];
+    _current = (best && best.id) || (_nodes[0] && _nodes[0].id) || null;
+    lsSet(LS_CURRENT, _current);
+  }
+
+  function pruneUnseenNodes() {
+    const now = Date.now();
+    _nodes = _nodes.filter(node => {
+      const base = node.lastSeenAt || node.discoveredAt || now;
+      return (now - base) <= PRUNE_UNSEEN_MS;
     });
   }
 
-  function isCurrentOk() {
-    const n = _nodes.find(n => n.id === _current);
-    return n ? n.available : false;
+  async function pollNodes() {
+    if (_polling || !_nodes.length) return;
+    _polling = true;
+    _lastPollTick = Date.now();
+    pulseHeart();
+
+    await Promise.all(_nodes.map(async node => {
+      const result = await pingNode(node);
+      const now = Date.now();
+      node.lastPolledAt = now;
+      if (result.ok) {
+        node.latencyMs = result.latencyMs;
+        node.lastSeenAt = now;
+      } else {
+        node.latencyMs = null;
+      }
+    }));
+
+    pruneUnseenNodes();
+    pickBestCurrent();
+
+    updateSelectedDot();
+
+    lsSet(LS_NODES, { ts: Date.now(), nodes: _nodes });
+    renderBtn();
+    renderActionButtons();
+    renderPanel();
+    _polling = false;
+  }
+
+  function updateSelectedDot() {
+    const selected = _nodes.find(n => n.id === _current);
+    if (!selected || !Number.isFinite(selected.latencyMs)) {
+      setDot('down');
+      return;
+    }
+    if (selected.latencyMs < 30) {
+      setDot('ok');
+      return;
+    }
+    if (selected.latencyMs <= 60) {
+      setDot('checking');
+      return;
+    }
+    setDot('down');
   }
 
   function init() {
@@ -303,11 +394,10 @@
     renderActionButtons();
     renderPanel();
 
-    refreshNodeList();
-    checkCurrent().then(() => renderPanel());
+    refreshNodeList().then(() => pollNodes());
 
-    setInterval(() => checkCurrent().then(() => renderPanel()), HEALTH_INTERVAL);
-    setInterval(recheckDown, 15_000);
+    setInterval(pollNodes, POLL_INTERVAL);
+    setInterval(updateHeartDeadman, 1_000);
     setInterval(refreshNodeList, LIST_REFRESH);
   }
 
@@ -323,7 +413,7 @@
           </button>
           <div class="bp-ns-actions bp-ns-actions-right" id="bp-ns-actions-right"></div>
           <div class="bp-ns-panel" id="bp-ns-panel">
-            <div class="bp-ns-header">Blueprints nodes</div>
+            <div class="bp-ns-header">Blueprints nodes <span id="bp-ns-heart" class="bp-ns-heart" aria-hidden="true">❤️</span></div>
             <div id="bp-ns-list"></div>
           </div>
         </div>`;
@@ -460,16 +550,16 @@
     const list = document.getElementById('bp-ns-list');
     if (!list) return;
     if (!_nodes.length) {
-      list.innerHTML = '<div class="bp-ns-node" style="color:#5b6080">Discovering nodes…</div>';
+      list.innerHTML = '<div class="bp-ns-node bp-ns-node-empty">Discovering nodes…</div>';
       return;
     }
 
+    const now = Date.now();
     list.innerHTML = _nodes.map(n => `
-      <div class="bp-ns-node${n.id === _current ? ' active' : ''}${!n.available ? ' bp-ns-node-unavail' : ''}"
+      <div class="bp-ns-node${n.id === _current ? ' active' : ''}"
            data-id="${esc(n.id)}" data-url="${esc(n.uiUrl)}">
-        <span class="bp-ns-dot${n.available ? '' : ' down'}"></span>
         <span class="bp-ns-node-name">${esc(n.name)}</span>
-        <span class="bp-ns-node-url">${esc(n.uiUrl)}</span>
+        <span class="bp-ns-node-metric ${esc(metricClass(n, now))}">${esc(metricText(n, now))}</span>
       </div>`).join('');
 
     list.querySelectorAll('.bp-ns-node').forEach(el => {
@@ -498,6 +588,36 @@
   function closePanel() {
     const p = document.getElementById('bp-ns-panel');
     if (p) p.classList.remove('open');
+  }
+
+  function metricClass(node, now) {
+    if (Number.isFinite(node.latencyMs)) {
+      if (node.latencyMs < 30) return 'ms-good';
+      if (node.latencyMs <= 60) return 'ms-warn';
+      return 'ms-bad';
+    }
+    if (node.lastSeenAt && (now - node.lastSeenAt) > NO_RESPONSE_WINDOW) return 'ms-stale';
+    return 'ms-pending';
+  }
+
+  function metricText(node, now) {
+    if (Number.isFinite(node.latencyMs)) return `${node.latencyMs} ms`;
+    if (node.lastSeenAt && (now - node.lastSeenAt) > NO_RESPONSE_WINDOW) {
+      return `last seen ${formatAge(now - node.lastSeenAt)}`;
+    }
+    if (node.lastSeenAt) return `last seen ${formatAge(now - node.lastSeenAt)}`;
+    return 'no response';
+  }
+
+  function formatAge(ageMs) {
+    const totalSeconds = Math.max(0, Math.floor(ageMs / 1000));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    if (totalMinutes < 60) return `${totalMinutes}m`;
+    const totalHours = Math.floor(totalMinutes / 60);
+    if (totalHours < 24) return `${totalHours}h`;
+    const totalDays = Math.floor(totalHours / 24);
+    return `${totalDays}d`;
   }
 
   function esc(s) {

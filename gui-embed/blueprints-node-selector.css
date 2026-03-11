@@ -97,10 +97,26 @@ blueprints-node-selector,
   border-bottom: 1px solid #2d3148;
 }
 
+.bp-ns-heart {
+  --bp-heart-illum: 0;
+  display: inline-block;
+  margin-left: 6px;
+  opacity: calc(0.25 + (var(--bp-heart-illum) * 0.75));
+  transform: scale(calc(1 + (var(--bp-heart-illum) * 0.18)));
+  filter: drop-shadow(0 0 calc(2px + (var(--bp-heart-illum) * 7px)) rgba(224,92,92, calc(0.2 + (var(--bp-heart-illum) * 0.75))));
+  transition: none;
+}
+.bp-ns-heart.stopped {
+  opacity: .18;
+  filter: grayscale(.8);
+  transform: scale(1);
+}
+
 .bp-ns-node {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   padding: 9px 12px;
   cursor: pointer;
   transition: background .12s;
@@ -112,6 +128,14 @@ blueprints-node-selector,
 .bp-ns-node.active .bp-ns-node-name { color: #5b9cf6; }
 
 .bp-ns-node-name { font-weight: 600; color: #e2e6f3; }
-.bp-ns-node-url  { font-size: 11px; color: #5b6080; margin-left: auto; max-width: 140px;
-                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bp-ns-node-unavail .bp-ns-node-name { color: #5b6080; }
+.bp-ns-node-metric { font-size: 11px; font-weight: 600; white-space: nowrap; text-align: right; }
+.bp-ns-node-metric.ms-good { color: #4caf7d; }
+.bp-ns-node-metric.ms-warn { color: #e6a817; }
+.bp-ns-node-metric.ms-bad { color: #e05c5c; }
+.bp-ns-node-metric.ms-stale { color: #7b82a0; }
+.bp-ns-node-metric.ms-pending { color: #5b6080; }
+
+.bp-ns-node-empty {
+  color: #5b6080;
+  cursor: default;
+}
