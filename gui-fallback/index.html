@@ -114,6 +114,31 @@
     .restore-result { margin-top: 10px; padding: 10px 14px;
       background: rgba(60,210,100,.08); border: 1px solid var(--ok);
       border-radius: var(--radius); font-size: 13px; }
+
+    /* ── Table nav tabs ── */
+    .table-nav { display: flex; gap: 2px; margin-bottom: 20px;
+                 border-bottom: 2px solid var(--border); }
+    .table-nav button { background: transparent; border: none; border-bottom: 2px solid transparent;
+                        color: var(--text-dim); font-size: 13px; font-weight: 600;
+                        text-transform: uppercase; letter-spacing: .6px; padding: 10px 18px;
+                        cursor: pointer; margin-bottom: -2px; transition: all .15s;
+                        font-family: var(--font); }
+    .table-nav button:hover { color: var(--text); background: rgba(91,156,246,.06); }
+    .table-nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Machines / Nodes tables ── */
+    .ip-chip { display: inline-block; background: var(--surface); border: 1px solid var(--border);
+               border-radius: 3px; padding: 1px 6px; font-size: 11px; margin: 1px;
+               font-family: monospace; }
+    .kind-badge { display: inline-block; border-radius: 3px; padding: 1px 7px;
+                  font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .kind-proxmox { background: #2a1f3d; color: #c49cf6; }
+    .kind-lxc     { background: #1a2d3d; color: #5bc0f6; }
+    .kind-vm      { background: #1a3d2a; color: #5bf69c; }
+    .kind-docker  { background: #1a2a3d; color: #5b9cf6; }
+    .kind-default { background: var(--surface); color: var(--text-dim); }
   </style>
 </head>
 <body>
@@ -149,8 +174,15 @@
     </div>
   </div>
 
+  <!-- Table navigation -->
+  <nav class="table-nav">
+    <button class="active" onclick="switchTab('services')">Services</button>
+    <button onclick="switchTab('machines')">Machines</button>
+    <button onclick="switchTab('nodes')">Nodes</button>
+  </nav>
+
   <!-- Services -->
-  <section>
+  <section id="tab-services" class="tab-panel active">
     <h2>Services</h2>
     <div class="toolbar">
       <input type="text" id="search-input" placeholder="Filter services…" oninput="renderServices()" />
@@ -174,6 +206,56 @@
       </table>
     </div>
     <p id="services-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Machines -->
+  <section id="tab-machines" class="tab-panel">
+    <h2>Machines</h2>
+    <div class="toolbar">
+      <input type="text" id="machine-search" placeholder="Filter machines…" oninput="renderMachines()" />
+      <button class="secondary" onclick="loadMachines()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Kind</th>
+            <th>Platform</th>
+            <th>Parent</th>
+            <th>Status</th>
+            <th>IPs</th>
+          </tr>
+        </thead>
+        <tbody id="machines-tbody"></tbody>
+      </table>
+    </div>
+    <p id="machines-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Nodes -->
+  <section id="tab-nodes" class="tab-panel">
+    <h2>Fleet Nodes</h2>
+    <div class="toolbar">
+      <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Node ID</th>
+            <th>Display Name</th>
+            <th>Machine</th>
+            <th>Addresses</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="nodes-tbody"></tbody>
+      </table>
+    </div>
+    <p id="nodes-error" class="error-msg" hidden></p>
   </section>
 
   <!-- Sync status -->
@@ -239,6 +321,19 @@
 <script>
   /* ── State ────────────────────────────────────────────────────────────── */
   let _services = [];
+  let _machines = [];
+  let _nodes = [];
+
+  /* ── Tab switching ───────────────────────────────────────────────────── */
+  function switchTab(tab) {
+    document.querySelectorAll('.table-nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelector(`.table-nav button[onclick*="${tab}"]`).classList.add('active');
+    document.getElementById(`tab-${tab}`).classList.add('active');
+    // Lazy-load data on first view
+    if (tab === 'machines' && !_machines.length) loadMachines();
+    if (tab === 'nodes' && !_nodes.length) loadNodes();
+  }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
   document.addEventListener('DOMContentLoaded', () => {
@@ -316,6 +411,90 @@
         <td>${tags}</td>
         <td>${linkBadges}</td>
         <td style="color:var(--text-dim);font-size:13px">${esc(s.description||'')}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ── Machines ─────────────────────────────────────────────────────────── */
+  async function loadMachines() {
+    const err = document.getElementById('machines-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/machines');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _machines = await r.json();
+      renderMachines();
+    } catch (e) {
+      err.textContent = `Failed to load machines: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderMachines() {
+    const q = (document.getElementById('machine-search').value || '').toLowerCase();
+    const tbody = document.getElementById('machines-tbody');
+    const visible = _machines.filter(m =>
+      !q || (m.machine_id || '').toLowerCase().includes(q) ||
+      (m.name || '').toLowerCase().includes(q) ||
+      (m.type || '').toLowerCase().includes(q) ||
+      (m.machine_kind || '').toLowerCase().includes(q) ||
+      (m.description || '').toLowerCase().includes(q) ||
+      JSON.stringify(m.ip_addresses || []).toLowerCase().includes(q)
+    );
+    if (!visible.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="8">' +
+        (_machines.length ? 'No matching machines.' : 'No machines registered.') + '</td></tr>';
+      return;
+    }
+    tbody.innerHTML = visible.map(m => {
+      const ips = (m.ip_addresses || []).map(ip => `<span class="ip-chip">${esc(ip)}</span>`).join(' ');
+      const kind = (m.machine_kind || '').toLowerCase();
+      const kindCls = ['proxmox','lxc','vm','docker'].includes(kind) ? `kind-${kind}` : 'kind-default';
+      const statusCls = (m.status||'') === 'active' ? 'status-deployed' :
+                        (m.status||'') === 'stopped' ? 'status-planned' : '';
+      return `<tr>
+        <td><code style="font-size:12px;color:var(--text-dim)">${esc(m.machine_id)}</code></td>
+        <td><strong>${esc(m.name || '')}</strong></td>
+        <td>${esc(m.type || '')}</td>
+        <td><span class="kind-badge ${kindCls}">${esc(m.machine_kind || '—')}</span></td>
+        <td>${esc(m.platform || '')}</td>
+        <td><code style="font-size:11px;color:var(--text-dim)">${esc(m.parent_machine_id || '—')}</code></td>
+        <td><span class="${statusCls}">${esc(m.status || '')}</span></td>
+        <td>${ips || '<span style="color:var(--text-dim)">—</span>'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ── Nodes ────────────────────────────────────────────────────────────── */
+  async function loadNodes() {
+    const err = document.getElementById('nodes-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/nodes');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _nodes = await r.json();
+      renderNodes();
+    } catch (e) {
+      err.textContent = `Failed to load nodes: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderNodes() {
+    const tbody = document.getElementById('nodes-tbody');
+    if (!_nodes.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No nodes registered.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = _nodes.map(n => {
+      const addrs = (n.addresses || []).map(a => `<span class="ip-chip">${esc(a)}</span>`).join(' ');
+      const seen = (n.last_seen_at || '').replace('T', ' ').slice(0, 19);
+      return `<tr>
+        <td><code style="font-size:12px;color:var(--text-dim)">${esc(n.node_id)}</code></td>
+        <td><strong>${esc(n.display_name || n.node_id)}</strong></td>
+        <td><code style="font-size:11px;color:var(--text-dim)">${esc(n.machine_id || '—')}</code></td>
+        <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
+        <td style="color:var(--text-dim);font-size:13px">${esc(seen || '—')}</td>
       </tr>`;
     }).join('');
   }
