@@ -420,6 +420,217 @@ async def probe_proxmox_config() -> dict:
     }
 
 
+# ── Probe VM services via SSH ─────────────────────────────────────────────────
+
+_PROBE_SERVICES_CMD = r"""
+has_docker=0; has_portainer=0; portainer_method=""; dockge_dir=""; has_caddy=0; caddy_path=""
+if which docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  has_docker=1
+  running=$(docker ps --format '{{.Names}}' 2>/dev/null || echo "")
+  if echo "$running" | grep -qi portainer; then
+    has_portainer=1; portainer_method=docker
+  fi
+  if echo "$running" | grep -qi dockge; then
+    for d in /opt/dockge/stacks /root/dockge/stacks /home/dockge/stacks; do
+      test -d "$d" && dockge_dir="$d" && break
+    done
+    test -z "$dockge_dir" && dockge_dir=/opt/dockge/stacks
+  fi
+fi
+if [ "$has_portainer" = "0" ]; then
+  systemctl is-active --quiet portainer 2>/dev/null && has_portainer=1 && portainer_method=service
+fi
+if which caddy >/dev/null 2>&1 || systemctl is-active --quiet caddy 2>/dev/null || systemctl is-active --quiet caddy2 2>/dev/null; then
+  has_caddy=1
+  caddy_path=$(find /etc/caddy /root /opt -name "Caddyfile" -maxdepth 4 2>/dev/null | head -1)
+fi
+printf "PROBE_RESULT:has_docker=%s;has_portainer=%s;portainer_method=%s;dockge_dir=%s;has_caddy=%s;caddy_path=%s\n" \
+  "$has_docker" "$has_portainer" "$portainer_method" "$dockge_dir" "$has_caddy" "$caddy_path"
+"""
+
+
+# Infrastructure details (VLAN source IPs, citadel identity) are kept in .env —
+# nothing site-specific belongs in this public file.
+
+def _load_vlan_source_map() -> dict[str, str]:
+    """Parse VLAN_SOURCE_MAP env var: 'prefix:src_ip,prefix:src_ip,...'"""
+    raw = os.environ.get("VLAN_SOURCE_MAP", "")
+    result: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            prefix, src = entry.split(":", 1)
+            result[prefix.strip()] = src.strip()
+    return result
+
+
+def _pick_source_ip(target_ip: str) -> str | None:
+    """Return the local source interface IP on the same /24 as target_ip, or None."""
+    prefix = ".".join(target_ip.split(".")[:3])
+    return _load_vlan_source_map().get(prefix)
+
+
+def _is_citadel(vmid, pve_host: str) -> bool:
+    """True if vmid+pve_host matches the citadel identity defined in .env."""
+    cid_vmid = os.environ.get("CITADEL_VMID", "")
+    cid_pve  = os.environ.get("CITADEL_PVE_HOST", "")
+    if not cid_vmid or not cid_pve:
+        return False
+    try:
+        return int(vmid) == int(cid_vmid) and pve_host == cid_pve
+    except (ValueError, TypeError):
+        return False
+
+
+@router.post("/probe-services", response_model=dict)
+async def probe_vm_services() -> dict:
+    """
+    SSH (as root) into all running proxmox_config entries that have a known IP
+    and detect docker, portainer, dockge, caddy.
+
+    Key selection:
+      - Citadel host (vmid=_CITADEL_VMID on _CITADEL_PVE): CITADEL_SSH_KEY only
+      - All other VMs: VM_SSH_KEY
+
+    Source interface: always bound to the same VLAN as the target IP.
+    This node has a NIC on every VLAN for exactly this purpose.
+
+    Updates has_docker/has_portainer/dockge_stacks_dir/has_caddy and enqueues
+    fleet sync. Runs up to 10 concurrent SSH sessions.
+    """
+    vm_key_path      = os.environ.get("VM_SSH_KEY", "")
+    citadel_key_path = os.environ.get("CITADEL_SSH_KEY", "")
+    if not vm_key_path or not os.path.isfile(vm_key_path):
+        raise HTTPException(503, "VM_SSH_KEY not configured or key file missing")
+    if not citadel_key_path or not os.path.isfile(citadel_key_path):
+        raise HTTPException(503, "CITADEL_SSH_KEY not configured or key file missing")
+
+    with get_conn() as conn:
+        targets = conn.execute(
+            """
+            SELECT c.config_id, c.name, c.vmid, c.pve_host,
+                   COALESCE(NULLIF(c.ip_address,''), n.ip_address) AS ip
+            FROM proxmox_config c
+            LEFT JOIN (
+                SELECT config_id, MIN(ip_address) AS ip_address
+                FROM proxmox_nets
+                WHERE ip_address IS NOT NULL AND ip_address != ''
+                GROUP BY config_id
+            ) n ON n.config_id = c.config_id
+            WHERE c.status = 'running'
+              AND COALESCE(NULLIF(c.ip_address,''), n.ip_address) IS NOT NULL
+            """
+        ).fetchall()
+
+    if not targets:
+        return {"checked": 0, "updated": 0, "skipped": 0,
+                "message": "No running VMs with known IPs found"}
+
+    sem = asyncio.Semaphore(10)
+    results: list[dict] = []
+
+    async def _probe(config_id: str, name: str, ip: str, vmid, pve_host: str) -> None:
+        key = citadel_key_path if _is_citadel(vmid, pve_host) else vm_key_path
+        src = _pick_source_ip(ip)
+        ssh_cmd = ["ssh", "-i", key,
+                   "-o", "StrictHostKeyChecking=no",
+                   "-o", "ConnectTimeout=8",
+                   "-o", "BatchMode=yes",
+                   "-o", "LogLevel=ERROR"]
+        if src:
+            ssh_cmd += ["-b", src]
+        ssh_cmd += [f"root@{ip}", _PROBE_SERVICES_CMD.strip()]
+
+        async with sem:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *ssh_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            except Exception as exc:
+                results.append({"config_id": config_id, "name": name, "ip": ip,
+                                 "ok": False, "error": str(exc)})
+                return
+
+            out = stdout.decode(errors="replace")
+            line = next((l for l in out.splitlines() if l.startswith("PROBE_RESULT:")), None)
+            if not line:
+                results.append({"config_id": config_id, "name": name, "ip": ip,
+                                 "ok": False, "error": "no probe result"})
+                return
+
+            pairs: dict[str, str] = {}
+            for kv in line[len("PROBE_RESULT:"):].split(";"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    pairs[k.strip()] = v.strip()
+            results.append({
+                "config_id":         config_id,
+                "name":              name,
+                "ip":                ip,
+                "ok":                True,
+                "has_docker":        1 if pairs.get("has_docker") == "1" else 0,
+                "has_portainer":     1 if pairs.get("has_portainer") == "1" else 0,
+                "portainer_method":  pairs.get("portainer_method") or None,
+                "dockge_stacks_dir": pairs.get("dockge_dir") or None,
+                "has_caddy":         1 if pairs.get("has_caddy") == "1" else 0,
+                "caddy_conf_path":   pairs.get("caddy_path") or None,
+            })
+
+    await asyncio.gather(*[
+        _probe(t["config_id"], t["name"] or t["config_id"], t["ip"],
+               t["vmid"], t["pve_host"])
+        for t in targets
+    ])
+
+    updated = 0
+    with get_conn() as conn:
+        gen = increment_gen(conn, "service-probe")
+        for r in results:
+            if not r["ok"]:
+                continue
+            conn.execute(
+                """UPDATE proxmox_config SET
+                       has_docker=?, has_portainer=?, portainer_method=?,
+                       dockge_stacks_dir=?, has_caddy=?, caddy_conf_path=?,
+                       updated_at=datetime('now')
+                   WHERE config_id=?""",
+                (r["has_docker"], r["has_portainer"], r["portainer_method"],
+                 r["dockge_stacks_dir"], r["has_caddy"], r["caddy_conf_path"],
+                 r["config_id"]),
+            )
+            row = conn.execute(
+                "SELECT * FROM proxmox_config WHERE config_id=?", (r["config_id"],)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "proxmox_config",
+                                  r["config_id"], dict(row), gen)
+            updated += 1
+
+    skipped = sum(1 for r in results if not r["ok"])
+    checked = len(results)
+    msg = (f"Checked {checked} VM{'s' if checked != 1 else ''} — "
+           f"{updated} updated, {skipped} unreachable/failed")
+    return {
+        "checked": checked,
+        "updated": updated,
+        "skipped": skipped,
+        "message": msg,
+        "details": [
+            {"name": r["name"], "ip": r["ip"],
+             "status": "ok" if r["ok"] else r.get("error", "?"),
+             "detected": (
+                 [k for k, v in [("docker", r.get("has_docker")),
+                                  ("portainer", r.get("has_portainer")),
+                                  ("caddy", r.get("has_caddy"))] if v]
+                 + (["dockge"] if r.get("dockge_stacks_dir") else [])
+             )}
+            for r in results
+        ],
+    }
+
+
 # ── Single-record CRUD ────────────────────────────────────────────────────────
 
 @router.get("/{config_id}", response_model=ProxmoxConfigOut)
