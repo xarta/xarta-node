@@ -292,8 +292,10 @@ def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
     Idempotent: ensure every vlan_tag in proxmox_nets has a row in vlans.
     Runs at startup so the vlans table survives a full-DB restore from a peer
     that had proxmox_nets data but not vlans.
-    Also applies VLAN_CIDRS env var to fill in any NULL cidrs.
+    Also infers /24 CIDRs from known IPs and applies VLAN_CIDRS env var.
     """
+    import ipaddress as _ip
+
     conn.execute(
         """
         INSERT OR IGNORE INTO vlans (vlan_id, cidr_inferred)
@@ -306,7 +308,32 @@ def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
     if seeded:
         log.info("startup: seeded %d vlans row(s) from proxmox_nets", seeded)
 
-    # Apply VLAN_CIDRS env var to fill in missing CIDRs
+    # Infer /24 CIDR from first real IP seen for each vlan that still has no CIDR
+    no_cidr = conn.execute(
+        "SELECT vlan_id FROM vlans WHERE cidr IS NULL OR cidr = ''"
+    ).fetchall()
+    for row in no_cidr:
+        vid = row[0]
+        ip_row = conn.execute(
+            """SELECT ip_address FROM proxmox_nets
+               WHERE vlan_tag=? AND ip_address IS NOT NULL AND ip_address != ''
+                 AND ip_address != 'dhcp'
+               LIMIT 1""",
+            (vid,),
+        ).fetchone()
+        if not ip_row:
+            continue
+        try:
+            net = _ip.ip_network(f"{ip_row[0]}/24", strict=False)
+            cidr = str(net)
+            conn.execute(
+                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                (cidr, vid),
+            )
+        except ValueError:
+            pass
+
+    # Apply VLAN_CIDRS env var to fill in or override any remaining NULL cidrs
     vlan_cidrs_raw = os.environ.get("VLAN_CIDRS", "")
     if vlan_cidrs_raw:
         for part in vlan_cidrs_raw.split(","):

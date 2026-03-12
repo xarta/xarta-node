@@ -44,6 +44,7 @@ from .routes_settings   import router as settings_router
 from .routes_pve_hosts  import router as pve_hosts_router
 from .routes_sync import router as sync_router
 from .sync.drain import start_drain_loop
+from .sync.queue import enqueue_for_all_peers
 from .sync.restore import apply_restore
 
 logging.basicConfig(
@@ -93,6 +94,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Boot catch-up: compare gen with known peers; request backup if behind or degraded
     asyncio.create_task(_boot_catchup())
 
+    # Enqueue any vlans rows that were seeded locally but not yet distributed
+    asyncio.create_task(_enqueue_seeded_vlans())
+
     # Bootstrap: contact configured peers, exchange identities, trigger initial sync
     if cfg.PEER_URLS:
         asyncio.create_task(_bootstrap_peers())
@@ -131,6 +135,28 @@ def _self_register() -> None:
                 (cfg.NODE_ID, cfg.NODE_NAME, cfg.HOST_MACHINE, addresses_json, cfg.UI_URL or None),
             )
     log.info("self-registered node=%s ui_url=%s", cfg.NODE_ID, cfg.UI_URL or "(none)")
+
+
+async def _enqueue_seeded_vlans() -> None:
+    """
+    After startup (including after a boot-catchup restore), ensure any vlans
+    rows that were seeded locally from proxmox_nets are distributed to peers.
+
+    Waits 12 s to let boot-catchup complete first — if this node restored from
+    a peer, the vlans it has are already theirs so nothing extra will be sent.
+    Peers that are missing vlans rows (e.g. they have fewer proxmox_nets entries)
+    will receive any extras.
+    """
+    await asyncio.sleep(12)
+    with db.get_conn() as conn:
+        gen = db.get_gen(conn)
+        rows = conn.execute("SELECT * FROM vlans").fetchall()
+        if not rows:
+            return
+        for row in rows:
+            enqueue_for_all_peers(conn, "UPDATE", "vlans", str(row["vlan_id"]), dict(row), gen)
+    if rows:
+        log.info("startup: re-enqueued %d vlans rows for peers", len(rows))
 
 
 async def _boot_catchup() -> None:
