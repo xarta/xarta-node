@@ -462,7 +462,7 @@ for vt in need_vlans:
     net = ipaddress.ip_network(cidr, strict=False)
     for host_ip in net.hosts():
         res = subprocess.run(
-            ["arping", "-c", "1", "-w", "1", str(host_ip)],
+            ["arping", "-c", "1", "-w", "0.3", str(host_ip)],
             capture_output=True, text=True
         )
         m = re.search(r'\[([0-9A-Fa-f:]{17})\]', res.stdout)
@@ -650,11 +650,11 @@ async def find_ips_by_arp() -> dict:
         """Returns (ip, mac_upper) or (ip, None) if no reply."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "arping", "-c", "1", "-w", "1", ip,
+                "arping", "-c", "1", "-w", "0.3", ip,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1)
             text = stdout.decode(errors="replace")
             # arping output: "Unicast reply from 10.0.0.1 [AA:BB:CC:DD:EE:FF]  0.787ms"
             m = re.search(r"\[([0-9A-Fa-f:]{17})\]", text)
@@ -717,6 +717,303 @@ async def find_ips_by_arp() -> dict:
         "found": found,
         "vlans_hit": sorted(vlans_hit),
         "message": f"arping'd {len(all_ips)} IPs across {len(vlan_cidrs)} VLANs, matched {found} MAC(s)",
+    }
+
+
+@router.post("/find-ips-via-qemu-agent", response_model=dict)
+async def find_ips_via_qemu_agent() -> dict:
+    """
+    For each running VM with a missing IP, SSH to its PVE host and call
+    'qm agent <vmid> network-get-interfaces' to retrieve IPs directly from
+    the QEMU guest agent.  Matches results by MAC address.
+    """
+    import asyncio
+    import json as _json
+    import os
+
+    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
+    if not key_path or not os.path.isfile(key_path):
+        raise HTTPException(503, "PROXMOX_SSH_KEY not configured or key file missing")
+
+    with get_conn() as conn:
+        missing = conn.execute(
+            """
+            SELECT pn.net_id, pn.pve_host, pn.vmid, pn.net_key, pn.mac_address, pn.vlan_tag
+            FROM proxmox_nets pn
+            JOIN proxmox_config pc ON pc.config_id = pn.config_id
+            WHERE (pn.ip_address IS NULL OR pn.ip_address = '')
+              AND pn.mac_address IS NOT NULL
+              AND pc.status = 'running'
+            """
+        ).fetchall()
+
+    if not missing:
+        return {"found": 0, "checked": 0, "message": "No running VMs with missing IPs"}
+
+    # Group by pve_host → vmid → [rows]
+    by_host: dict[str, dict[int, list]] = {}
+    for row in missing:
+        by_host.setdefault(row["pve_host"], {}).setdefault(row["vmid"], []).append(dict(row))
+
+    async def query_agent(pve_ip: str, vmid: int) -> dict:
+        """Returns {mac_upper: ip} from the QEMU guest agent."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-i", key_path,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                "-o", "BatchMode=yes",
+                f"root@{pve_ip}",
+                f"qm agent {vmid} network-get-interfaces 2>/dev/null",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            data = _json.loads(stdout.decode(errors="replace"))
+            ifaces = data.get("result", data) if isinstance(data, dict) else data
+            mac_to_ip: dict[str, str] = {}
+            for iface in ifaces:
+                mac = (iface.get("hardware-address") or "").upper()
+                if not mac or mac == "00:00:00:00:00:00":
+                    continue
+                for addr in iface.get("ip-addresses", []):
+                    if addr.get("ip-address-type") == "ipv4":
+                        ip = addr.get("ip-address", "")
+                        if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+                            mac_to_ip[mac] = ip
+                            break
+            return mac_to_ip
+        except Exception:
+            return {}
+
+    tasks = []
+    task_keys = []
+    for pve_ip, vmid_map in by_host.items():
+        for vmid in vmid_map:
+            tasks.append(query_agent(pve_ip, vmid))
+            task_keys.append((pve_ip, vmid))
+
+    results = await asyncio.gather(*tasks)
+
+    found = 0
+    with get_conn() as conn:
+        gen = increment_gen(conn, "qemu-agent")
+        for (pve_ip, vmid), mac_to_ip in zip(task_keys, results):
+            for row in by_host[pve_ip][vmid]:
+                mac = (row["mac_address"] or "").upper()
+                ip  = mac_to_ip.get(mac)
+                if not ip:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE proxmox_nets SET
+                        ip_address=?, ip_source='qemu-agent',
+                        updated_at=datetime('now')
+                    WHERE net_id=?
+                    """,
+                    (ip, row["net_id"]),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+                ).fetchone()
+                enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated), gen)
+                found += 1
+        fill_vlan_tags_from_cidrs(conn, gen)
+
+    return {
+        "found":   found,
+        "checked": len(missing),
+        "message": f"Queried {len(tasks)} VM(s) via QEMU guest agent, found {found} IP(s)",
+    }
+
+
+@router.post("/find-ips-via-pfsense-sweep", response_model=dict)
+async def find_ips_via_pfsense_sweep() -> dict:
+    """
+    SSH to pfSense (which has a leg on every VLAN) and:
+    1. Discover all VLAN interface CIDRs from ifconfig
+    2. Ping-sweep each needed subnet (background pings, 2s wait) to populate ARP cache
+    3. Read arp -a to collect MAC→IP mappings
+    4. Match against proxmox_nets rows missing IPs and update DB
+
+    Uses PHP (available on pfSense/FreeBSD) sent via base64 to avoid quoting issues.
+    """
+    import asyncio
+    import base64
+    import ipaddress
+    import json as _json
+    import os
+    import re
+
+    ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
+    key_path   = os.environ.get("PFSENSE_SSH_KEY", "")
+    if not ssh_target or not key_path or not os.path.isfile(key_path):
+        raise HTTPException(503, "PFSENSE_SSH_TARGET or PFSENSE_SSH_KEY not configured")
+
+    if "@" in ssh_target:
+        ssh_user, ssh_host = ssh_target.split("@", 1)
+    else:
+        ssh_user, ssh_host = "root", ssh_target
+
+    with get_conn() as conn:
+        missing = conn.execute(
+            """
+            SELECT net_id, vlan_tag, mac_address
+            FROM proxmox_nets
+            WHERE (ip_address IS NULL OR ip_address = '')
+              AND mac_address IS NOT NULL
+            """
+        ).fetchall()
+        known_cidrs: dict[int, str] = {
+            row["vlan_id"]: row["cidr"]
+            for row in conn.execute(
+                "SELECT vlan_id, cidr FROM vlans WHERE cidr IS NOT NULL AND cidr != ''"
+            ).fetchall()
+        }
+
+    if not missing:
+        return {"found": 0, "message": "No proxmox_nets rows with missing IPs"}
+
+    need_vlans = sorted({row["vlan_tag"] for row in missing if row["vlan_tag"] is not None})
+    vlans_json = _json.dumps(need_vlans)
+    cidrs_json = _json.dumps({str(k): v for k, v in known_cidrs.items()})
+
+    # PHP script — data embedded to avoid shell quoting issues
+    # Sent via: echo <base64> | b64decode -r | php
+    PHP_TEMPLATE = r"""<?php
+$need_vlans  = json_decode(VLANS_JSON, true);
+$known_cidrs = json_decode(CIDRS_JSON, true);
+
+// Discover VLAN CIDRs from ifconfig
+$ifc = []; exec('ifconfig', $ifc);
+$vlan_to_cidr = $known_cidrs;
+$current = null;
+foreach ($ifc as $line) {
+    if (preg_match('/^(\S+):/', $line, $m)) { $current = $m[1]; continue; }
+    if ($current && preg_match('/inet (\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-f]+)/i', $line, $m)) {
+        $mask_long = hexdec($m[2]);
+        $prefix = substr_count(sprintf('%032b', $mask_long), '1');
+        $net = long2ip(ip2long($m[1]) & $mask_long);
+        $cidr = "$net/$prefix";
+        if (preg_match('/[._](\d+)$/', $current, $vm)) {
+            $vid = (int)$vm[1];
+            if (!isset($vlan_to_cidr[$vid])) $vlan_to_cidr[$vid] = $cidr;
+        }
+    }
+}
+
+// Ping-sweep needed VLANs in background to populate ARP cache
+foreach ($need_vlans as $vt) {
+    $cidr = $vlan_to_cidr[$vt] ?? null;
+    if (!$cidr) continue;
+    list($net_addr, $pfx) = explode('/', $cidr);
+    $total = min(1 << (32 - (int)$pfx), 254);
+    $base = ip2long($net_addr);
+    for ($i = 1; $i <= $total; $i++) {
+        exec('ping -c 1 -t 1 ' . escapeshellarg(long2ip($base + $i)) . ' > /dev/null 2>&1 &');
+    }
+}
+sleep(2);
+
+// Read ARP cache
+$arp = []; exec('arp -a', $arp);
+echo "##SWEEPRESULT##" . json_encode([
+    'vlan_to_cidr' => $vlan_to_cidr,
+    'arp_output'   => implode("\n", $arp),
+]) . "\n";
+"""
+
+    php_script = PHP_TEMPLATE \
+        .replace("VLANS_JSON", "'" + vlans_json + "'") \
+        .replace("CIDRS_JSON", "'" + cidrs_json + "'")
+
+    encoded = base64.b64encode(php_script.encode()).decode()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-i", key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            f"{ssh_user}@{ssh_host}",
+            f"echo {encoded} | b64decode -r | php",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except Exception as exc:
+        raise HTTPException(502, f"SSH to pfSense failed: {exc}")
+
+    res: dict = {}
+    for line in stdout.decode(errors="replace").splitlines():
+        if line.startswith("##SWEEPRESULT##"):
+            res = _json.loads(line[len("##SWEEPRESULT##"):])
+            break
+
+    if not res:
+        return {"found": 0, "message": "pfSense PHP script returned no output"}
+
+    arp_mac_to_ip: dict[str, str] = {}
+    for line in res.get("arp_output", "").splitlines():
+        m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-f:]{17})", line, re.I)
+        if m:
+            arp_mac_to_ip[m.group(2).upper()] = m.group(1)
+
+    new_vlan_cidrs: dict[int, str] = {int(k): v for k, v in res.get("vlan_to_cidr", {}).items()}
+    found = 0
+    vlans_hit: set[int] = set()
+
+    with get_conn() as conn:
+        gen = increment_gen(conn, "pfsense-sweep")
+        for vid, cidr in new_vlan_cidrs.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)", (vid, cidr)
+            )
+            conn.execute(
+                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                (cidr, vid),
+            )
+            vlan_row = conn.execute("SELECT * FROM vlans WHERE vlan_id=?", (vid,)).fetchone()
+            if vlan_row:
+                enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
+
+        all_cidrs = {**known_cidrs, **new_vlan_cidrs}
+        for row in missing:
+            mac = (row["mac_address"] or "").upper()
+            ip  = arp_mac_to_ip.get(mac)
+            if not ip:
+                continue
+            vt     = row["vlan_tag"]
+            prefix = 24
+            if vt is not None and vt in all_cidrs:
+                try:
+                    prefix = ipaddress.ip_network(all_cidrs[vt], strict=False).prefixlen
+                except ValueError:
+                    pass
+            conn.execute(
+                """
+                UPDATE proxmox_nets SET
+                    ip_address=?, ip_cidr=?, ip_source='pfsense-sweep',
+                    updated_at=datetime('now')
+                WHERE net_id=?
+                """,
+                (ip, f"{ip}/{prefix}", row["net_id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated), gen)
+            found += 1
+            if vt is not None:
+                vlans_hit.add(vt)
+
+        fill_vlan_tags_from_cidrs(conn, gen)
+
+    return {
+        "found":       found,
+        "arp_entries": len(arp_mac_to_ip),
+        "vlans_hit":   sorted(vlans_hit),
+        "message":     f"pfSense sweep: {len(arp_mac_to_ip)} ARP entries, matched {found} MAC(s) across {len(need_vlans)} VLAN(s)",
     }
 
 
