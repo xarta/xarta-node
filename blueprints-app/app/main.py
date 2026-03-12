@@ -35,6 +35,11 @@ from .routes_schema import router as schema_router
 from .routes_services import router as services_router
 from .routes_backup import router as backup_router
 from .routes_pfsense_dns import router as pfsense_dns_router
+from .routes_proxmox_config import router as proxmox_config_router
+from .routes_dockge_stacks import router as dockge_stacks_router
+from .routes_caddy_configs import router as caddy_configs_router
+from .routes_settings   import router as settings_router
+from .routes_pve_hosts  import router as pve_hosts_router
 from .routes_sync import router as sync_router
 from .sync.drain import start_drain_loop
 from .sync.restore import apply_restore
@@ -350,8 +355,13 @@ def create_app() -> FastAPI:
     application.include_router(schema_router,   prefix="/api/v1")
     application.include_router(sync_router,     prefix="/api/v1")
     application.include_router(backup_router,   prefix="/api/v1")
-    application.include_router(pfsense_dns_router, prefix="/api/v1")
-    application.include_router(gui_sync_router, prefix="/api/v1")
+    application.include_router(pfsense_dns_router,    prefix="/api/v1")
+    application.include_router(proxmox_config_router, prefix="/api/v1")
+    application.include_router(dockge_stacks_router,  prefix="/api/v1")
+    application.include_router(caddy_configs_router,  prefix="/api/v1")
+    application.include_router(settings_router,       prefix="/api/v1")
+    application.include_router(pve_hosts_router,      prefix="/api/v1")
+    application.include_router(gui_sync_router,       prefix="/api/v1")
 
     return application
 

@@ -192,6 +192,211 @@ class PfSenseDnsOut(BaseModel):
     updated_at: str
 
 
+# ── Proxmox Config ────────────────────────────────────────────────────────────
+
+class ProxmoxConfigCreate(BaseModel):
+    config_id: str                          # "{pve_name}_{vmid}"
+    pve_host: str
+    pve_name: Optional[str] = None
+    vmid: int
+    vm_type: str                            # 'lxc' | 'qemu'
+    name: Optional[str] = None
+    status: Optional[str] = None
+    cores: Optional[int] = None
+    memory_mb: Optional[int] = None
+    rootfs: Optional[str] = None
+    ip_config: Optional[str] = None
+    ip_address: Optional[str] = None
+    gateway: Optional[str] = None
+    mac_address: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    tags: Optional[str] = None
+    mountpoints_json: Optional[str] = None
+    raw_conf: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class ProxmoxConfigUpdate(BaseModel):
+    pve_host: Optional[str] = None
+    pve_name: Optional[str] = None
+    vmid: Optional[int] = None
+    vm_type: Optional[str] = None
+    name: Optional[str] = None
+    status: Optional[str] = None
+    cores: Optional[int] = None
+    memory_mb: Optional[int] = None
+    rootfs: Optional[str] = None
+    ip_config: Optional[str] = None
+    ip_address: Optional[str] = None
+    gateway: Optional[str] = None
+    mac_address: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    tags: Optional[str] = None
+    mountpoints_json: Optional[str] = None
+    raw_conf: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class ProxmoxConfigOut(BaseModel):
+    config_id: str
+    pve_host: str
+    pve_name: Optional[str] = None
+    vmid: int
+    vm_type: str
+    name: Optional[str] = None
+    status: Optional[str] = None
+    cores: Optional[int] = None
+    memory_mb: Optional[int] = None
+    rootfs: Optional[str] = None
+    ip_config: Optional[str] = None
+    ip_address: Optional[str] = None
+    gateway: Optional[str] = None
+    mac_address: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    tags: Optional[str] = None
+    mountpoints_json: Optional[str] = None
+    raw_conf: Optional[str] = None
+    last_probed: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+# ── Dockge Stacks ─────────────────────────────────────────────────────────────
+
+class DockgeStackCreate(BaseModel):
+    stack_id: str                           # "{source_vmid}_{stack_name}"
+    pve_host: str
+    source_vmid: int
+    source_lxc_name: Optional[str] = None
+    stack_name: str
+    status: Optional[str] = None
+    compose_content: Optional[str] = None
+    services_json: Optional[str] = None
+    ports_json: Optional[str] = None
+    volumes_json: Optional[str] = None
+    env_file_exists: int = 0
+    stacks_dir: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class DockgeStackUpdate(BaseModel):
+    pve_host: Optional[str] = None
+    source_vmid: Optional[int] = None
+    source_lxc_name: Optional[str] = None
+    stack_name: Optional[str] = None
+    status: Optional[str] = None
+    compose_content: Optional[str] = None
+    services_json: Optional[str] = None
+    ports_json: Optional[str] = None
+    volumes_json: Optional[str] = None
+    env_file_exists: Optional[int] = None
+    stacks_dir: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class DockgeStackOut(BaseModel):
+    stack_id: str
+    pve_host: str
+    source_vmid: int
+    source_lxc_name: Optional[str] = None
+    stack_name: str
+    status: Optional[str] = None
+    compose_content: Optional[str] = None
+    services_json: Optional[str] = None
+    ports_json: Optional[str] = None
+    volumes_json: Optional[str] = None
+    env_file_exists: int = 0
+    stacks_dir: Optional[str] = None
+    last_probed: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+# ── Caddy Configs ─────────────────────────────────────────────────────────────
+
+class CaddyConfigCreate(BaseModel):
+    caddy_id: str                           # "{source_vmid}_{path_slug}"
+    pve_host: Optional[str] = None
+    source_vmid: Optional[int] = None
+    source_lxc_name: Optional[str] = None
+    caddyfile_path: Optional[str] = None
+    caddyfile_content: Optional[str] = None
+    domains_json: Optional[str] = None
+    upstreams_json: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class CaddyConfigUpdate(BaseModel):
+    pve_host: Optional[str] = None
+    source_vmid: Optional[int] = None
+    source_lxc_name: Optional[str] = None
+    caddyfile_path: Optional[str] = None
+    caddyfile_content: Optional[str] = None
+    domains_json: Optional[str] = None
+    upstreams_json: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class CaddyConfigOut(BaseModel):
+    caddy_id: str
+    pve_host: Optional[str] = None
+    source_vmid: Optional[int] = None
+    source_lxc_name: Optional[str] = None
+    caddyfile_path: Optional[str] = None
+    caddyfile_content: Optional[str] = None
+    domains_json: Optional[str] = None
+    upstreams_json: Optional[str] = None
+    last_probed: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+class SettingUpsert(BaseModel):
+    value: str
+    description: Optional[str] = None
+
+class SettingOut(BaseModel):
+    key: str
+    value: str
+    description: Optional[str] = None
+    updated_at: str
+
+
+# ── PVE Hosts ─────────────────────────────────────────────────────────────────
+
+class PveHostCreate(BaseModel):
+    pve_id: str          # IP address used as primary key
+    ip_address: str
+    hostname: Optional[str] = None
+    pve_name: Optional[str] = None   # short label e.g. "pve1" (user-editable)
+    version: Optional[str] = None
+    port: int = 8006
+    ssh_reachable: int = 0
+    last_scanned: Optional[str] = None
+
+class PveHostUpdate(BaseModel):
+    hostname: Optional[str] = None
+    pve_name: Optional[str] = None
+    version: Optional[str] = None
+    port: Optional[int] = None
+    ssh_reachable: Optional[int] = None
+    last_scanned: Optional[str] = None
+
+class PveHostOut(BaseModel):
+    pve_id: str
+    ip_address: str
+    hostname: Optional[str] = None
+    pve_name: Optional[str] = None
+    version: Optional[str] = None
+    port: int = 8006
+    ssh_reachable: int = 0
+    last_scanned: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):
