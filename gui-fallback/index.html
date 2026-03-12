@@ -201,6 +201,7 @@
     <button onclick="switchTab('nodes')">Nodes</button>
     <button onclick="switchTab('pfsense-dns')">pfSense DNS</button>
     <button onclick="switchTab('proxmox-config')" id="tab-btn-proxmox-config">Proxmox Config</button>
+    <button onclick="switchTab('vlans')" id="tab-btn-vlans" hidden>VLANs</button>
     <button onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
     <button onclick="switchTab('caddy-configs')">Caddy Configs</button>
     <button onclick="switchTab('pve-hosts')">PVE Hosts</button>
@@ -327,6 +328,7 @@
       <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
       <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
       <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()" hidden>⇑ Fill IPs from pfSense</button>
+      <button class="secondary" id="pve-findips-btn" onclick="findIpsByArp()" hidden>&#128270; Find IPs by ARP</button>
       <button class="secondary" id="pve-expand-all-btn" onclick="setAllNets(true)" hidden>&#9660; Expand all</button>
       <button class="secondary" id="pve-collapse-all-btn" onclick="setAllNets(false)" hidden>&#9650; Collapse all</button>
     </div>
@@ -409,6 +411,27 @@
     <p id="pve-hosts-error" class="error-msg" hidden></p>
   </section>
 
+  <!-- VLANs -->
+  <section id="tab-vlans" class="tab-panel">
+    <h2>VLANs</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
+      Inferred from Proxmox Config probe. CIDRs marked <em>inferred</em> are guessed as /24 from IP data
+      — correct them here if needed. These are also used as scan ranges by <em>Find IPs by ARP</em>.
+    </p>
+    <div class="toolbar">
+      <button class="secondary" onclick="loadVlans()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>VLAN</th><th>CIDR</th><th>Source</th><th>Description</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="vlans-tbody"></tbody>
+      </table>
+    </div>
+    <p id="vlans-error" class="error-msg" hidden></p>
+  </section>
+
   <!-- Sync status -->
   <section>
     <h2>Sync status</h2>
@@ -480,6 +503,7 @@
   let _dockgeStacks = [];
   let _caddyConfigs = [];
   let _pveHosts = [];
+  let _vlans = [];
 
   /* ── Tab switching ───────────────────────────────────────────────────── */
   function switchTab(tab) {
@@ -495,6 +519,7 @@
     if (tab === 'dockge-stacks'  && !_dockgeStacks.length)  loadDockgeStacks();
     if (tab === 'caddy-configs'  && !_caddyConfigs.length)  loadCaddyConfigs();
     if (tab === 'pve-hosts'       && !_pveHosts.length)      loadPveHosts();
+    if (tab === 'vlans'           && !_vlans.length)         loadVlans();
   }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
@@ -806,6 +831,95 @@
   }
 
   /* ── Proxmox Config ───────────────────────────────────────────────────── */
+  async function loadVlans() {
+    const err = document.getElementById('vlans-error');
+    if (err) err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/vlans');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _vlans = await r.json();
+      const vlanTabBtn = document.getElementById('tab-btn-vlans');
+      if (vlanTabBtn) vlanTabBtn.hidden = _vlans.length === 0;
+      renderVlans();
+    } catch (e) {
+      if (err) { err.textContent = `Failed to load VLANs: ${e.message}`; err.hidden = false; }
+    }
+  }
+
+  function renderVlans() {
+    const tbody = document.getElementById('vlans-tbody');
+    if (!tbody) return;
+    if (!_vlans.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No VLANs discovered yet — run a Proxmox Config probe first.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = _vlans.map(v => {
+      const srcTag = v.cidr_inferred
+        ? '<span style="color:#94a3b8;font-size:11px">inferred</span>'
+        : '<span style="color:#4ade80;font-size:11px">confirmed</span>';
+      return `<tr>
+        <td><strong>${esc(String(v.vlan_id))}</strong></td>
+        <td><code>${esc(v.cidr || '—')}</code></td>
+        <td>${srcTag}</td>
+        <td><span id="vlan-desc-${v.vlan_id}">${esc(v.description || '')}</span></td>
+        <td>
+          <button class="secondary" style="padding:1px 6px;font-size:11px"
+            onclick="editVlan(${v.vlan_id}, '${esc(v.cidr || '')}', '${esc(v.description || '')}')">
+            ✎ Edit
+          </button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function editVlan(vlan_id, currentCidr, currentDesc) {
+    const cidr = prompt(`VLAN ${vlan_id} — CIDR:`, currentCidr);
+    if (cidr === null) return;
+    const description = prompt(`VLAN ${vlan_id} — Description (optional):`, currentDesc);
+    if (description === null) return;
+    try {
+      const r = await fetch(`/api/v1/vlans/${vlan_id}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ cidr: cidr || null, description: description || null }),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+      await loadVlans();
+    } catch (e) {
+      alert(`Failed to save VLAN: ${e.message}`);
+    }
+  }
+
+  async function findIpsByArp() {
+    const btn    = document.getElementById('pve-findips-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Scanning…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-nets/find-ips-by-arp', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      if (d.scanned === 0) {
+        status.textContent = `⚠ ${d.message}`;
+        status.style.color = 'var(--text-dim)';
+      } else {
+        status.textContent = `✓ ARP scan complete — found ${d.found} IP(s) across ${d.scanned} VLAN(s)`;
+        status.style.color = 'var(--accent)';
+        await loadProxmoxNets();
+        renderProxmoxConfig();
+      }
+      status.hidden = false;
+    } catch (e) {
+      status.textContent = `✗ ARP scan failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🔎 Find IPs by ARP';
+    }
+  }
+
   async function loadProxmoxConfig() {
     const err = document.getElementById('pve-error');
     err.hidden = true;
@@ -816,6 +930,7 @@
       _proxmoxConfig = await r.json();
       await loadProxmoxNets();
       renderProxmoxConfig();
+      loadVlans(); // refresh VLAN tab whenever proxmox config is loaded
     } catch (e) {
       err.textContent = `Failed to load Proxmox config: ${e.message}`;
       err.hidden = false;
@@ -853,17 +968,21 @@
     );
     const tbody = document.getElementById('pve-tbody');
     const enrichBtn      = document.getElementById('pve-enrich-btn');
+    const findIpsBtn     = document.getElementById('pve-findips-btn');
     const expandAllBtn   = document.getElementById('pve-expand-all-btn');
     const collapseAllBtn = document.getElementById('pve-collapse-all-btn');
     if (!rows.length) {
       tbody.innerHTML = `<tr class="empty-row"><td colspan="11">No Proxmox configs found.</td></tr>`;
       if (enrichBtn)      enrichBtn.hidden      = true;
+      if (findIpsBtn)     findIpsBtn.hidden     = true;
       if (expandAllBtn)   expandAllBtn.hidden   = true;
       if (collapseAllBtn) collapseAllBtn.hidden = true;
       return;
     }
-    const hasAnyNets = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
+    const hasAnyNets    = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
+    const hasMissingIps = Object.values(_proxmoxNetsMap).flat().some(n => !n.ip_address);
     if (enrichBtn)      enrichBtn.hidden      = false;
+    if (findIpsBtn)     findIpsBtn.hidden     = !hasMissingIps;
     if (expandAllBtn)   expandAllBtn.hidden   = !hasAnyNets;
     if (collapseAllBtn) collapseAllBtn.hidden = !hasAnyNets;
     tbody.innerHTML = rows.flatMap(d => {
