@@ -226,6 +226,17 @@ CREATE TABLE IF NOT EXISTS pve_hosts (
     created_at    TEXT DEFAULT (datetime('now')),
     updated_at    TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS arp_manual (
+    entry_id    TEXT PRIMARY KEY,   -- UUID
+    ip_address  TEXT NOT NULL,
+    mac_address TEXT NOT NULL,
+    notes       TEXT,               -- optional human label
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_arp_manual_mac ON arp_manual(mac_address);
+CREATE INDEX IF NOT EXISTS idx_arp_manual_ip  ON arp_manual(ip_address);
 """
 
 _SEED_SQL = """

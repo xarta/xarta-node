@@ -31,6 +31,7 @@ _ALLOWED_TABLES = {
     "pfsense_dns",
     "proxmox_config", "proxmox_nets", "vlans", "dockge_stacks", "caddy_configs",
     "settings", "pve_hosts",
+    "arp_manual",
 }
 
 # Action types that trigger local execution rather than a DB write
