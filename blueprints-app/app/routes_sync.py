@@ -122,6 +122,7 @@ def _pk_for_table(table: str) -> str:
         "caddy_configs":  "caddy_id",
         "settings":       "key",
         "pve_hosts":      "pve_id",
+        "arp_manual":     "entry_id",
     }
     return pk_map.get(table, "id")
 
@@ -163,6 +164,7 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                 "request a full restore instead",
             )
 
+        failures = []
         for action in db_actions:
             try:
                 _apply_action(conn, action)
@@ -170,12 +172,18 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                 _ = increment_gen(conn, "sync")
             except Exception:
                 log.exception(
-                    "failed to apply sync action %s/%s from %s",
+                    "failed to apply sync action %s/%s from %s — skipping",
                     action.table_name,
                     action.row_id,
                     payload.source_node_id,
                 )
-                raise HTTPException(500, "failed to apply one or more sync actions")
+                failures.append(f"{action.table_name}/{action.row_id}")
+
+        if failures:
+            log.warning(
+                "skipped %d action(s) from %s due to errors: %s",
+                len(failures), payload.source_node_id, ", ".join(failures),
+            )
 
         # Update last_seen for the source node
         conn.execute(
