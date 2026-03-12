@@ -98,6 +98,18 @@ if ! dpkg -l python3.11-venv >/dev/null 2>&1; then
 fi
 echo "    ok"
 
+# ── 2b. Ensure network + DB tools are available ───────────────────────────
+echo "--- checking network/db tools (sqlite3, arping, net-tools)..."
+TOOLS_NEEDED=()
+dpkg -l sqlite3          >/dev/null 2>&1 || TOOLS_NEEDED+=(sqlite3)
+dpkg -l iputils-arping   >/dev/null 2>&1 || TOOLS_NEEDED+=(iputils-arping)
+dpkg -l net-tools        >/dev/null 2>&1 || TOOLS_NEEDED+=(net-tools)
+if [[ ${#TOOLS_NEEDED[@]} -gt 0 ]]; then
+    echo "    installing: ${TOOLS_NEEDED[*]}"
+    apt-get install -y --no-install-recommends "${TOOLS_NEEDED[@]}"
+fi
+echo "    ok"
+
 # ── 3. Create venv ────────────────────────────────────────────────────────────
 # Remove broken venv (created before python3-venv package was available)
 if [[ -d "$VENV_DIR" && ! -f "$VENV_DIR/bin/pip" ]]; then
