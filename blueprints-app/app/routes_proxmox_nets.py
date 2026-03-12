@@ -181,6 +181,38 @@ async def enrich_nets_from_pfsense() -> dict:
                 """,
                 (ip, net_id),
             )
+
+            # Infer vlan_tag from VLAN_CIDRS env if still NULL
+            import ipaddress, os
+            current_vlan = conn.execute(
+                "SELECT vlan_tag FROM proxmox_nets WHERE net_id=?", (net_id,)
+            ).fetchone()["vlan_tag"]
+            if current_vlan is None:
+                for vc in os.environ.get("VLAN_CIDRS", "").split(","):
+                    vc = vc.strip()
+                    if ":" not in vc:
+                        continue
+                    vid_str, _, cidr_str = vc.partition(":")
+                    try:
+                        if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr_str, strict=False):
+                            vid = int(vid_str)
+                            conn.execute(
+                                "UPDATE proxmox_nets SET vlan_tag=? WHERE net_id=?",
+                                (vid, net_id),
+                            )
+                            conn.execute(
+                                "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
+                                (vid, cidr_str),
+                            )
+                            vlan_row = conn.execute(
+                                "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
+                            ).fetchone()
+                            if vlan_row:
+                                enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
+                            break
+                    except ValueError:
+                        pass
+
             updated_row = conn.execute(
                 "SELECT * FROM proxmox_nets WHERE net_id=?", (net_id,)
             ).fetchone()
@@ -188,6 +220,343 @@ async def enrich_nets_from_pfsense() -> dict:
             enriched += 1
 
     return {"enriched": enriched, "checked": checked}
+
+
+@router.post("/enrich-from-pfsense-arp", response_model=dict)
+async def enrich_nets_from_pfsense_arp() -> dict:
+    """
+    SSH to pfSense, read the full ARP table (arp -an), and match MAC addresses
+    against proxmox_nets rows that are still missing an IP address.
+
+    This catches hosts on VLANs that neither this node nor the pve hosts have
+    L3 interfaces on (e.g. management/isolated VLANs).  Also seeds the vlans
+    table: when a match is found, the IP+vlan_tag of the proxmox_nets row is
+    used to infer the CIDR.
+
+    Uses PFSENSE_SSH_TARGET (user@host) and PFSENSE_SSH_KEY from the environment.
+    """
+    import asyncio
+    import ipaddress
+    import os
+    import re
+
+    ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
+    key_path   = os.environ.get("PFSENSE_SSH_KEY", "")
+    if not ssh_target or not key_path or not os.path.isfile(key_path):
+        raise HTTPException(503, "PFSENSE_SSH_TARGET or PFSENSE_SSH_KEY not configured")
+
+    # Parse user@host
+    if "@" in ssh_target:
+        ssh_user, ssh_host = ssh_target.split("@", 1)
+    else:
+        ssh_user, ssh_host = "root", ssh_target
+
+    # ── Fetch full ARP table from pfSense ─────────────────────────────────────
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ssh", "-i", key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            f"{ssh_user}@{ssh_host}",
+            "arp -an",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except Exception as exc:
+        raise HTTPException(502, f"SSH to pfSense failed: {exc}")
+
+    # BSD arp -an format: ? (ip) at mac on iface [flags]
+    pfsense_mac_to_ip: dict[str, str] = {}
+    for line in stdout.decode(errors="replace").splitlines():
+        m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-f:]{17})", line, re.I)
+        if m:
+            pfsense_mac_to_ip[m.group(2).upper()] = m.group(1)
+
+    if not pfsense_mac_to_ip:
+        return {"enriched": 0, "checked": 0, "message": "pfSense ARP table empty or SSH failed"}
+
+    # ── Match against missing proxmox_nets rows ────────────────────────────────
+    with get_conn() as conn:
+        missing = conn.execute(
+            """
+            SELECT net_id, vlan_tag, mac_address
+            FROM proxmox_nets
+            WHERE mac_address IS NOT NULL
+              AND (ip_address IS NULL OR ip_address = '')
+            """
+        ).fetchall()
+        if not missing:
+            return {"enriched": 0, "checked": 0, "message": "No proxmox_nets rows with missing IPs"}
+
+        gen      = increment_gen(conn, "pfsense-arp")
+        enriched = 0
+
+        for row in missing:
+            mac = (row["mac_address"] or "").upper()
+            ip  = pfsense_mac_to_ip.get(mac)
+            if not ip:
+                continue
+
+            vt     = row["vlan_tag"]
+            prefix = 24
+            if vt is not None:
+                # Infer CIDR from the found IP and seed vlans table
+                try:
+                    net    = ipaddress.ip_network(f"{ip}/24", strict=False)
+                    cidr   = str(net)
+                    prefix = net.prefixlen
+                    existing_vlan = conn.execute(
+                        "SELECT cidr FROM vlans WHERE vlan_id=?", (vt,)
+                    ).fetchone()
+                    if not existing_vlan:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
+                            (vt, cidr),
+                        )
+                        vlan_row = conn.execute(
+                            "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
+                        ).fetchone()
+                        if vlan_row:
+                            enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
+                except ValueError:
+                    pass
+
+            ip_cidr = f"{ip}/{prefix}"
+            conn.execute(
+                """
+                UPDATE proxmox_nets SET
+                    ip_address=?, ip_cidr=?, ip_source='pfsense-arp',
+                    updated_at=datetime('now')
+                WHERE net_id=?
+                """,
+                (ip, ip_cidr, row["net_id"]),
+            )
+            updated_row = conn.execute(
+                "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated_row), gen)
+            enriched += 1
+
+    return {
+        "enriched": enriched,
+        "checked":  len(missing),
+        "arp_entries": len(pfsense_mac_to_ip),
+        "message":  f"Read {len(pfsense_mac_to_ip)} ARP entries from pfSense, enriched {enriched} row(s)",
+    }
+
+
+@router.post("/find-ips-via-pve", response_model=dict)
+async def find_ips_via_pve() -> dict:
+    """
+    SSH to each pve_host, discover VLAN CIDRs from its network interfaces,
+    seed the vlans table with any newly found CIDRs, then arping-sweep for
+    each proxmox_nets row that is still missing an IP.
+
+    Installs iputils-arping on the pve host if not already present.
+    All pve hosts are processed concurrently.
+    """
+    import asyncio
+    import ipaddress
+    import json as _json
+    import os
+
+    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
+    if not key_path or not os.path.isfile(key_path):
+        raise HTTPException(503, "PROXMOX_SSH_KEY not configured or key file missing")
+
+    with get_conn() as conn:
+        pve_hosts = [
+            dict(r) for r in conn.execute(
+                "SELECT pve_id, ip_address FROM pve_hosts WHERE ssh_reachable=1"
+            ).fetchall()
+        ]
+        missing_rows = conn.execute(
+            """
+            SELECT net_id, pve_host, vlan_tag, mac_address
+            FROM proxmox_nets
+            WHERE (ip_address IS NULL OR ip_address = '')
+              AND mac_address IS NOT NULL
+            """
+        ).fetchall()
+        known_cidrs = {
+            row["vlan_id"]: row["cidr"]
+            for row in conn.execute(
+                "SELECT vlan_id, cidr FROM vlans WHERE cidr IS NOT NULL AND cidr != ''"
+            ).fetchall()
+        }
+
+    if not pve_hosts:
+        return {"found": 0, "message": "No ssh_reachable pve hosts"}
+    if not missing_rows:
+        return {"found": 0, "message": "No proxmox_nets rows with missing IPs"}
+
+    # Group missing rows by pve_host
+    by_host: dict[str, list] = {}
+    for row in missing_rows:
+        by_host.setdefault(row["pve_host"], []).append(dict(row))
+
+    # Remote script: discovers CIDRs via ip-addr, arping-sweeps for target MACs
+    REMOTE_SCRIPT = r"""
+import subprocess, json, sys, ipaddress, re, shutil
+
+payload   = json.loads(sys.argv[1])
+targets   = payload["targets"]   # [{net_id, vlan_tag, mac_address}, ...]
+known     = {int(k): v for k, v in payload["known_cidrs"].items()}
+
+# ── Ensure arping available ───────────────────────────────────────────────
+if not shutil.which("arping"):
+    subprocess.run(["apt-get", "install", "-y", "iputils-arping"],
+                   capture_output=True)
+
+# ── Discover VLAN CIDRs from host interfaces ─────────────────────────────
+raw = subprocess.check_output(["ip", "-o", "-4", "addr", "show"],
+                               stderr=subprocess.DEVNULL).decode()
+vlan_to_cidr: dict[int, str] = dict(known)
+for line in raw.splitlines():
+    # e.g. "5: vmbr0.43    inet 10.0.43.1/24 ..."
+    m = re.search(r'\S+\.(\d+)\s+inet\s+(\S+)', line)
+    if m:
+        vid  = int(m.group(1))
+        cidr = str(ipaddress.ip_network(m.group(2), strict=False))
+        if vid not in vlan_to_cidr:
+            vlan_to_cidr[vid] = cidr
+
+# ── arping each IP in each needed CIDR looking for target MACs ───────────
+mac_to_ip: dict[str, str] = {}
+need_vlans = {t["vlan_tag"] for t in targets if t["vlan_tag"] is not None}
+for vt in need_vlans:
+    cidr = vlan_to_cidr.get(vt)
+    if not cidr:
+        continue
+    net = ipaddress.ip_network(cidr, strict=False)
+    for host_ip in net.hosts():
+        res = subprocess.run(
+            ["arping", "-c", "1", "-w", "1", str(host_ip)],
+            capture_output=True, text=True
+        )
+        m = re.search(r'\[([0-9A-Fa-f:]{17})\]', res.stdout)
+        if m:
+            mac_to_ip[m.group(1).upper()] = str(host_ip)
+
+result = {
+    "mac_to_ip":    mac_to_ip,
+    "vlan_to_cidr": {str(k): v for k, v in vlan_to_cidr.items()},
+}
+print("##ARPRESULT##" + json.dumps(result))
+"""
+
+    async def probe_host(host_ip: str, rows: list) -> dict:
+        payload = _json.dumps({
+            "targets": rows,
+            "known_cidrs": {str(k): v for k, v in known_cidrs.items()},
+        })
+        # Escape single-quotes in payload for shell
+        payload_esc = payload.replace("'", "'\"'\"'")
+        cmd = (
+            f"python3 -c '{REMOTE_SCRIPT}' '{payload_esc}'"
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-i", key_path,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                "-o", "BatchMode=yes",
+                f"root@{host_ip}",
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+            text = stdout.decode(errors="replace")
+            for line in text.splitlines():
+                if line.startswith("##ARPRESULT##"):
+                    return _json.loads(line[len("##ARPRESULT##"):])
+        except Exception:
+            pass
+        return {}
+
+    # Run all pve hosts concurrently
+    host_ips  = [h["ip_address"] for h in pve_hosts if h["ip_address"] in by_host]
+    coros     = [probe_host(ip, by_host[ip]) for ip in host_ips]
+    responses = await asyncio.gather(*coros)
+    host_results = dict(zip(host_ips, responses))
+
+    # Merge all vlan_to_cidr discoveries and mac_to_ip results
+    found       = 0
+    vlans_added : set[int] = set()
+    vlans_hit   : set[int] = set()
+
+    with get_conn() as conn:
+        gen = increment_gen(conn, "pve-arp-scan")
+
+        for host_ip, res in host_results.items():
+            new_cidrs  = res.get("vlan_to_cidr", {})
+            mac_to_ip  = res.get("mac_to_ip", {})
+
+            # Seed any newly discovered VLAN CIDRs
+            for vid_str, cidr in new_cidrs.items():
+                try:
+                    vid = int(vid_str)
+                    ipaddress.ip_network(cidr, strict=False)  # validate
+                except ValueError:
+                    continue
+                existing = conn.execute(
+                    "SELECT cidr FROM vlans WHERE vlan_id=?", (vid,)
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
+                        (vid, cidr),
+                    )
+                    vlan_row = conn.execute(
+                        "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
+                    ).fetchone()
+                    if vlan_row:
+                        enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
+                    vlans_added.add(vid)
+
+            # Match MACs and update proxmox_nets
+            for row in by_host.get(host_ip, []):
+                mac = (row["mac_address"] or "").upper()
+                ip  = mac_to_ip.get(mac)
+                if not ip:
+                    continue
+                vt     = row["vlan_tag"]
+                prefix = 24
+                all_cidrs = {**known_cidrs, **{int(k): v for k, v in new_cidrs.items()}}
+                if vt is not None and vt in all_cidrs:
+                    try:
+                        prefix = ipaddress.ip_network(all_cidrs[vt], strict=False).prefixlen
+                    except ValueError:
+                        pass
+                ip_cidr = f"{ip}/{prefix}"
+                conn.execute(
+                    """
+                    UPDATE proxmox_nets SET
+                        ip_address=?, ip_cidr=?, ip_source='pve-arp',
+                        updated_at=datetime('now')
+                    WHERE net_id=?
+                    """,
+                    (ip, ip_cidr, row["net_id"]),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+                ).fetchone()
+                enqueue_for_all_peers(
+                    conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated), gen
+                )
+                found += 1
+                if vt is not None:
+                    vlans_hit.add(vt)
+
+    return {
+        "found":       found,
+        "vlans_added": sorted(vlans_added),
+        "vlans_hit":   sorted(vlans_hit),
+        "message":     f"Scanned {len(host_ips)} PVE host(s), matched {found} IP(s), added {len(vlans_added)} new VLAN CIDR(s)",
+    }
 
 
 @router.post("/find-ips-by-arp", response_model=dict)
