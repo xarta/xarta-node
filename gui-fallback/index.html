@@ -332,7 +332,7 @@
       <table>
         <thead><tr>
           <th>PVE</th><th>VMID</th><th>Type</th><th>Name</th><th>Status</th>
-          <th>Cores</th><th>RAM MB</th><th>IP</th><th>MAC</th><th>VLAN</th><th>Tags</th><th>Last Probed</th>
+          <th>Cores</th><th>RAM MB</th><th>IP</th><th>MAC</th><th>VLANs</th><th>Detected</th><th>Tags</th><th>Last Probed</th>
         </tr></thead>
         <tbody id="pve-tbody"></tbody>
       </table>
@@ -848,11 +848,24 @@
     );
     const tbody = document.getElementById('pve-tbody');
     if (!rows.length) {
-      tbody.innerHTML = `<tr class="empty-row"><td colspan="12">No Proxmox configs found.</td></tr>`;
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="13">No Proxmox configs found.</td></tr>`;
       return;
     }
     tbody.innerHTML = rows.map(d => {
       const probed = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      // VLANs: prefer vlans_json array, fall back to vlan_tag
+      let vlanDisplay = '—';
+      try {
+        const tags = d.vlans_json ? JSON.parse(d.vlans_json) : (d.vlan_tag ? [d.vlan_tag] : []);
+        vlanDisplay = tags.length ? tags.join(', ') : '—';
+      } catch(e) { vlanDisplay = esc(d.vlan_tag || '—'); }
+      // Detected services badges
+      const badges = [];
+      if (d.has_docker)    badges.push('<span class="tag" style="background:#1d4ed8;color:#fff">docker</span>');
+      if (d.has_portainer) badges.push(`<span class="tag" style="background:#0f766e;color:#fff">portainer${d.portainer_method ? ' ('+esc(d.portainer_method)+')' : ''}</span>`);
+      if (d.has_caddy)     badges.push('<span class="tag" style="background:#15803d;color:#fff">caddy</span>');
+      if (d.dockge_stacks_dir) badges.push(`<span class="tag" style="background:#92400e;color:#fff" title="${esc(d.dockge_stacks_dir)}">dockge</span>`);
+      const detectedHtml = badges.length ? badges.join(' ') : '<span style="color:var(--text-dim)">—</span>';
       return `<tr>
         <td><code>${esc(d.pve_name || '')}</code></td>
         <td>${esc(d.vmid || '')}</td>
@@ -863,7 +876,8 @@
         <td style="text-align:right">${d.memory_mb ?? '—'}</td>
         <td><code>${esc(d.ip_address || '—')}</code></td>
         <td><code>${esc(d.mac_address || '—')}</code></td>
-        <td>${esc(d.vlan_tag || '—')}</td>
+        <td style="white-space:nowrap">${vlanDisplay}</td>
+        <td>${detectedHtml}</td>
         <td>${esc(d.tags || '—')}</td>
         <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
       </tr>`;
