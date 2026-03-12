@@ -26,6 +26,7 @@ SKIP_KEYS=(
     "GIT_USER_NAME"         # value matches the public repo name — not a secret leak
     "TAILSCALE_ACCEPT_DNS"  # value is "false" — too generic to scan for
     "TAILSCALE_EXIT_NODE"   # value is "true" — too generic to scan for
+    "PROXMOX_SSH_KEY"       # standard path convention, present in onboarding templates
 )
 
 # Colours
@@ -129,9 +130,17 @@ else
 
         [ "${#pattern}" -lt "$MIN_LEN" ] && continue
 
-        matches=$(grep -rn --fixed-strings -- "$pattern" "${SCAN_FILES[@]}" 2>/dev/null)
+        # Lines starting with ~ are treated as extended regex patterns
+        if [[ "$pattern" == ~* ]]; then
+            regex="${pattern:1}"
+            matches=$(grep -rn -E -- "$regex" "${SCAN_FILES[@]}" 2>/dev/null)
+            label="~${regex}"
+        else
+            matches=$(grep -rn --fixed-strings -- "$pattern" "${SCAN_FILES[@]}" 2>/dev/null)
+            label="$pattern"
+        fi
         if [ -n "$matches" ]; then
-            echo -e "${RED}LEAK${NC}: \"$pattern\""
+            echo -e "${RED}LEAK${NC}: \"$label\""
             echo "$matches" | while IFS= read -r match; do
                 rel="${match/$REPO_DIR\//}"
                 echo "       $rel"

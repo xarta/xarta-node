@@ -139,6 +139,15 @@
     .kind-vm      { background: #1a3d2a; color: #5bf69c; }
     .kind-docker  { background: #1a2a3d; color: #5b9cf6; }
     .kind-default { background: var(--surface); color: var(--text-dim); }
+    /* ── Settings panel ── */
+    .settings-panel { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px; }
+    .settings-panel summary { cursor: pointer; font-size: 13px; font-weight: 600;
+      color: var(--text-dim); user-select: none; }
+    .settings-panel[open] summary { color: var(--text); }
+    .settings-panel .srow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+    .settings-panel input[type=text] { flex: 1; }
+    .settings-panel .sinfo { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
   </style>
 </head>
 <body>
@@ -174,12 +183,27 @@
     </div>
   </div>
 
+  <!-- Settings panel -->
+  <details id="settings-panel" class="settings-panel">
+    <summary>⚙ Settings</summary>
+    <div class="srow">
+      <label style="font-size:13px;white-space:nowrap;">Management CIDR</label>
+      <input type="text" id="settings-cidr" placeholder="e.g. 192.168.1.0/24" style="max-width:220px;" />
+      <button onclick="saveCidr()">Save</button>
+    </div>
+    <p id="settings-status" class="sinfo" hidden></p>
+  </details>
+
   <!-- Table navigation -->
   <nav class="table-nav">
     <button class="active" onclick="switchTab('services')">Services</button>
     <button onclick="switchTab('machines')">Machines</button>
     <button onclick="switchTab('nodes')">Nodes</button>
     <button onclick="switchTab('pfsense-dns')">pfSense DNS</button>
+    <button onclick="switchTab('proxmox-config')">Proxmox Config</button>
+    <button onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
+    <button onclick="switchTab('caddy-configs')">Caddy Configs</button>
+    <button onclick="switchTab('pve-hosts')">PVE Hosts</button>
   </nav>
 
   <!-- Services -->
@@ -295,6 +319,93 @@
     <p id="dns-error" class="error-msg" hidden></p>
   </section>
 
+  <!-- Proxmox Config -->
+  <section id="tab-proxmox-config" class="tab-panel">
+    <h2>Proxmox Config</h2>
+    <div class="toolbar">
+      <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
+      <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
+      <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
+    </div>
+    <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>PVE</th><th>VMID</th><th>Type</th><th>Name</th><th>Status</th>
+          <th>Cores</th><th>RAM MB</th><th>IP</th><th>MAC</th><th>VLAN</th><th>Tags</th><th>Last Probed</th>
+        </tr></thead>
+        <tbody id="pve-tbody"></tbody>
+      </table>
+    </div>
+    <p id="pve-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Dockge Stacks -->
+  <section id="tab-dockge-stacks" class="tab-panel">
+    <h2>Dockge Stacks</h2>
+    <div class="toolbar">
+      <input type="text" id="dockge-search" placeholder="Filter stacks…" oninput="renderDockgeStacks()" />
+      <button class="secondary" onclick="loadDockgeStacks()">&#8635; Refresh</button>
+      <button id="dockge-probe-btn" onclick="probeDockgeStacks()">&#9654; Probe Dockge</button>
+    </div>
+    <p id="dockge-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>PVE</th><th>VMID</th><th>LXC</th><th>Stack</th><th>Status</th>
+          <th>Services</th><th>Ports</th><th>.ENV</th><th>Dir</th><th>Last Probed</th>
+        </tr></thead>
+        <tbody id="dockge-tbody"></tbody>
+      </table>
+    </div>
+    <p id="dockge-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Caddy Configs -->
+  <section id="tab-caddy-configs" class="tab-panel">
+    <h2>Caddy Configs</h2>
+    <div class="toolbar">
+      <input type="text" id="caddy-search" placeholder="Filter configs…" oninput="renderCaddyConfigs()" />
+      <button class="secondary" onclick="loadCaddyConfigs()">&#8635; Refresh</button>
+      <button id="caddy-probe-btn" onclick="probeCaddyConfigs()">&#9654; Probe Caddy</button>
+    </div>
+    <p id="caddy-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>PVE</th><th>VMID</th><th>LXC</th><th>Path</th>
+          <th>Domains</th><th>Upstreams</th><th>Last Probed</th>
+        </tr></thead>
+        <tbody id="caddy-tbody"></tbody>
+      </table>
+    </div>
+    <p id="caddy-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- PVE Hosts -->
+  <section id="tab-pve-hosts" class="tab-panel">
+    <h2>PVE Hosts</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
+      Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in Settings above,
+      then click <em>Scan for Proxmox</em>.
+    </p>
+    <div class="toolbar">
+      <button class="secondary" onclick="loadPveHosts()">↺ Refresh</button>
+      <button id="pve-scan-btn" onclick="scanPveHosts()">▶ Scan for Proxmox</button>
+    </div>
+    <p id="pve-scan-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>IP</th><th>Name</th><th>Version</th><th>Port</th>
+          <th>SSH</th><th>Last Scanned</th>
+        </tr></thead>
+        <tbody id="pve-hosts-tbody"></tbody>
+      </table>
+    </div>
+    <p id="pve-hosts-error" class="error-msg" hidden></p>
+  </section>
+
   <!-- Sync status -->
   <section>
     <h2>Sync status</h2>
@@ -361,6 +472,10 @@
   let _machines = [];
   let _nodes = [];
   let _pfsenseDns = [];
+  let _proxmoxConfig = [];
+  let _dockgeStacks = [];
+  let _caddyConfigs = [];
+  let _pveHosts = [];
 
   /* ── Tab switching ───────────────────────────────────────────────────── */
   function switchTab(tab) {
@@ -371,7 +486,11 @@
     // Lazy-load data on first view
     if (tab === 'machines' && !_machines.length) loadMachines();
     if (tab === 'nodes' && !_nodes.length) loadNodes();
-    if (tab === 'pfsense-dns' && !_pfsenseDns.length) loadPfSenseDns();
+    if (tab === 'pfsense-dns'    && !_pfsenseDns.length)    loadPfSenseDns();
+    if (tab === 'proxmox-config' && !_proxmoxConfig.length) loadProxmoxConfig();
+    if (tab === 'dockge-stacks'  && !_dockgeStacks.length)  loadDockgeStacks();
+    if (tab === 'caddy-configs'  && !_caddyConfigs.length)  loadCaddyConfigs();
+    if (tab === 'pve-hosts'       && !_pveHosts.length)      loadPveHosts();
   }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
@@ -380,6 +499,7 @@
     loadServices();
     loadSyncStatus();
     loadBackups();
+    loadSettingsCidr();
     setInterval(loadHealth, 15_000);
     setInterval(loadSyncStatus, 30_000);
   });
@@ -678,6 +798,382 @@
     } finally {
       btn.disabled = false;
       btn.textContent = '▶ Ping Sweep';
+    }
+  }
+
+  /* ── Proxmox Config ───────────────────────────────────────────────────── */
+  async function loadProxmoxConfig() {
+    const err = document.getElementById('pve-error');
+    err.hidden = true;
+    checkProxmoxProbeStatus();
+    try {
+      const r = await fetch('/api/v1/proxmox-config');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _proxmoxConfig = await r.json();
+      renderProxmoxConfig();
+    } catch (e) {
+      err.textContent = `Failed to load Proxmox config: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  async function checkProxmoxProbeStatus() {
+    const btn = document.getElementById('pve-probe-btn');
+    const status = document.getElementById('pve-probe-status');
+    try {
+      const r = await fetch('/api/v1/proxmox-config/probe/status');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      btn.disabled = !d.configured;
+      if (!d.configured) {
+        btn.title = d.reason;
+        status.textContent = `⚠ Probe unavailable: ${d.reason}`;
+        status.style.color = 'var(--text-dim)';
+        status.hidden = false;
+      }
+    } catch (e) {
+      btn.disabled = true;
+      btn.title = `Could not check probe status: ${e.message}`;
+    }
+  }
+
+  function renderProxmoxConfig() {
+    const q = (document.getElementById('pve-search').value || '').toLowerCase();
+    const rows = _proxmoxConfig.filter(d =>
+      (d.pve_name || '').toLowerCase().includes(q) ||
+      (d.vmid     || '').toLowerCase().includes(q) ||
+      (d.name     || '').toLowerCase().includes(q) ||
+      (d.ip_address || '').toLowerCase().includes(q) ||
+      (d.tags     || '').toLowerCase().includes(q)
+    );
+    const tbody = document.getElementById('pve-tbody');
+    if (!rows.length) {
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="12">No Proxmox configs found.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map(d => {
+      const probed = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      return `<tr>
+        <td><code>${esc(d.pve_name || '')}</code></td>
+        <td>${esc(d.vmid || '')}</td>
+        <td>${esc(d.vm_type || '')}</td>
+        <td>${esc(d.name || '')}</td>
+        <td>${esc(d.status || '—')}</td>
+        <td style="text-align:right">${d.cores ?? '—'}</td>
+        <td style="text-align:right">${d.memory_mb ?? '—'}</td>
+        <td><code>${esc(d.ip_address || '—')}</code></td>
+        <td><code>${esc(d.mac_address || '—')}</code></td>
+        <td>${esc(d.vlan_tag || '—')}</td>
+        <td>${esc(d.tags || '—')}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function probeProxmoxConfig() {
+    const btn    = document.getElementById('pve-probe-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⟳ Probing…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-config/probe', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ Done — created: ${d.created ?? 0}, updated: ${d.updated ?? 0}, hosts: ${d.pve_hosts_probed ?? 0}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      _proxmoxConfig = [];
+      await loadProxmoxConfig();
+    } catch (e) {
+      status.textContent = `✗ Probe failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '▶ Probe PVE';
+    }
+  }
+
+  /* ── Dockge Stacks ────────────────────────────────────────────────────── */
+  async function loadDockgeStacks() {
+    const err = document.getElementById('dockge-error');
+    err.hidden = true;
+    checkDockgeProbeStatus();
+    try {
+      const r = await fetch('/api/v1/dockge-stacks');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _dockgeStacks = await r.json();
+      renderDockgeStacks();
+    } catch (e) {
+      err.textContent = `Failed to load Dockge stacks: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  async function checkDockgeProbeStatus() {
+    const btn = document.getElementById('dockge-probe-btn');
+    const status = document.getElementById('dockge-probe-status');
+    try {
+      const r = await fetch('/api/v1/dockge-stacks/probe/status');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      btn.disabled = !d.configured;
+      if (!d.configured) {
+        btn.title = d.reason;
+        status.textContent = `⚠ Probe unavailable: ${d.reason}`;
+        status.style.color = 'var(--text-dim)';
+        status.hidden = false;
+      }
+    } catch (e) {
+      btn.disabled = true;
+    }
+  }
+
+  function renderDockgeStacks() {
+    const q = (document.getElementById('dockge-search').value || '').toLowerCase();
+    const rows = _dockgeStacks.filter(d =>
+      (d.source_vmid      || '').toLowerCase().includes(q) ||
+      (d.source_lxc_name  || '').toLowerCase().includes(q) ||
+      (d.stack_name       || '').toLowerCase().includes(q) ||
+      (d.status           || '').toLowerCase().includes(q)
+    );
+    const tbody = document.getElementById('dockge-tbody');
+    if (!rows.length) {
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="10">No Dockge stacks found.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map(d => {
+      const probed   = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      let svcs = '—';
+      try { const a = JSON.parse(d.services_json || ''); svcs = Array.isArray(a) ? a.join(', ') : '—'; } catch(_) {}
+      let ports = '—';
+      try { const a = JSON.parse(d.ports_json || ''); ports = Array.isArray(a) ? a.join(', ') : '—'; } catch(_) {}
+      const envBadge = d.env_file_exists ? '<span style="color:var(--ok)">✓</span>' : '<span style="color:var(--text-dim)">✗</span>';
+      return `<tr>
+        <td><code>${esc(d.pve_host || '')}</code></td>
+        <td>${esc(d.source_vmid || '')}</td>
+        <td>${esc(d.source_lxc_name || '—')}</td>
+        <td><strong>${esc(d.stack_name || '')}</strong></td>
+        <td>${esc(d.status || '—')}</td>
+        <td style="font-size:12px">${esc(svcs)}</td>
+        <td style="font-size:12px">${esc(ports)}</td>
+        <td style="text-align:center">${envBadge}</td>
+        <td style="font-size:11px;color:var(--text-dim)">${esc(d.stacks_dir || '—')}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function probeDockgeStacks() {
+    const btn    = document.getElementById('dockge-probe-btn');
+    const status = document.getElementById('dockge-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⟳ Probing…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/dockge-stacks/probe', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ Done — created: ${d.created ?? 0}, updated: ${d.updated ?? 0}, stacks: ${d.stacks_found ?? 0}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      _dockgeStacks = [];
+      await loadDockgeStacks();
+    } catch (e) {
+      status.textContent = `✗ Probe failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '▶ Probe Dockge';
+    }
+  }
+
+  /* ── Caddy Configs ────────────────────────────────────────────────────── */
+  async function loadCaddyConfigs() {
+    const err = document.getElementById('caddy-error');
+    err.hidden = true;
+    checkCaddyProbeStatus();
+    try {
+      const r = await fetch('/api/v1/caddy-configs');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _caddyConfigs = await r.json();
+      renderCaddyConfigs();
+    } catch (e) {
+      err.textContent = `Failed to load Caddy configs: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  async function checkCaddyProbeStatus() {
+    const btn = document.getElementById('caddy-probe-btn');
+    const status = document.getElementById('caddy-probe-status');
+    try {
+      const r = await fetch('/api/v1/caddy-configs/probe/status');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      btn.disabled = !d.configured;
+      if (!d.configured) {
+        btn.title = d.reason;
+        status.textContent = `⚠ Probe unavailable: ${d.reason}`;
+        status.style.color = 'var(--text-dim)';
+        status.hidden = false;
+      }
+    } catch (e) {
+      btn.disabled = true;
+    }
+  }
+
+  function renderCaddyConfigs() {
+    const q = (document.getElementById('caddy-search').value || '').toLowerCase();
+    const rows = _caddyConfigs.filter(d =>
+      (d.pve_host         || '').toLowerCase().includes(q) ||
+      (d.source_lxc_name  || '').toLowerCase().includes(q) ||
+      (d.source_vmid      || '').toLowerCase().includes(q) ||
+      (d.domains_json     || '').toLowerCase().includes(q) ||
+      (d.upstreams_json   || '').toLowerCase().includes(q)
+    );
+    const tbody = document.getElementById('caddy-tbody');
+    if (!rows.length) {
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="7">No Caddy configs found.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map(d => {
+      const probed = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      let domains = '—';
+      try { const a = JSON.parse(d.domains_json || ''); domains = Array.isArray(a) ? a.join(', ') : '—'; } catch(_) {}
+      let upstreams = '—';
+      try { const a = JSON.parse(d.upstreams_json || ''); upstreams = Array.isArray(a) ? a.join(', ') : '—'; } catch(_) {}
+      return `<tr>
+        <td><code>${esc(d.pve_host || '')}</code></td>
+        <td>${esc(d.source_vmid || '')}</td>
+        <td>${esc(d.source_lxc_name || '—')}</td>
+        <td style="font-size:11px;color:var(--text-dim)">${esc(d.caddyfile_path || '—')}</td>
+        <td style="font-size:12px">${esc(domains)}</td>
+        <td style="font-size:12px">${esc(upstreams)}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function probeCaddyConfigs() {
+    const btn    = document.getElementById('caddy-probe-btn');
+    const status = document.getElementById('caddy-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⟳ Probing…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/caddy-configs/probe', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ Done — created: ${d.created ?? 0}, updated: ${d.updated ?? 0}, hosts: ${d.pve_hosts_probed ?? 0}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      _caddyConfigs = [];
+      await loadCaddyConfigs();
+    } catch (e) {
+      status.textContent = `✗ Probe failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '▶ Probe Caddy';
+    }
+  }
+
+  /* ── Settings ─────────────────────────────────────────────────────────── */
+  async function loadSettingsCidr() {
+    try {
+      const r = await fetch('/api/v1/settings/mgmt_cidr');
+      if (r.ok) {
+        const d = await r.json();
+        document.getElementById('settings-cidr').value = d.value || '';
+      }
+    } catch (_) {}
+  }
+
+  async function saveCidr() {
+    const input  = document.getElementById('settings-cidr');
+    const status = document.getElementById('settings-status');
+    const cidr   = input.value.trim();
+    if (!cidr) { status.textContent = '⚠ Enter a CIDR first'; status.hidden = false; return; }
+    try {
+      const r = await fetch('/api/v1/settings/mgmt_cidr', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: cidr, description: 'Management network CIDR for PVE host scanning' }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      status.textContent = '✓ Saved';
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      setTimeout(() => { status.hidden = true; }, 3000);
+    } catch (e) {
+      status.textContent = `✗ ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    }
+  }
+
+  /* ── PVE Hosts ─────────────────────────────────────────────────────────── */
+  async function loadPveHosts() {
+    const err = document.getElementById('pve-hosts-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/pve-hosts');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _pveHosts = await r.json();
+      renderPveHosts();
+    } catch (e) {
+      err.textContent = `Failed to load PVE hosts: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderPveHosts() {
+    const tbody = document.getElementById('pve-hosts-tbody');
+    if (!_pveHosts.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No PVE hosts found — run the scan first.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = _pveHosts.map(h => {
+      const scanned = (h.last_scanned || '—').replace('T',' ').slice(0,19);
+      const ssh     = h.ssh_reachable ? '✅' : '—';
+      const name    = esc(h.pve_name || h.pve_id);
+      return `<tr>
+        <td><code>${esc(h.ip_address)}</code></td>
+        <td>${name}</td>
+        <td>${esc(h.version || '—')}</td>
+        <td>${h.port || 8006}</td>
+        <td>${ssh}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(scanned)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function scanPveHosts() {
+    const btn    = document.getElementById('pve-scan-btn');
+    const status = document.getElementById('pve-scan-status');
+    btn.disabled = true;
+    btn.textContent = '⟳ Scanning…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/pve-hosts/scan', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ Scanned ${d.ips_checked} IPs — found: ${d.found} (created: ${d.created}, updated: ${d.updated})`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      _pveHosts = [];
+      await loadPveHosts();
+    } catch (e) {
+      status.textContent = `✗ Scan failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '▶ Scan for Proxmox';
     }
   }
 

@@ -102,7 +102,7 @@ bash scripts/bp-scan-lock.sh release
 [
   {
     "ip": "10.0.50.100",
-    "hostname": "pve239",
+    "hostname": "pve-host",
     "ports": [
       {"port": 8006, "proto": "tcp", "state": "open", "service": "https", "banner": "Proxmox VE API"},
       {"port": 22, "proto": "tcp", "state": "open", "service": "ssh", "banner": "OpenSSH 9.2"}

@@ -26,7 +26,12 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
-_ALLOWED_TABLES = {"services", "machines", "nodes", "pfsense_dns"}
+_ALLOWED_TABLES = {
+    "services", "machines", "nodes",
+    "pfsense_dns",
+    "proxmox_config", "dockge_stacks", "caddy_configs",
+    "settings", "pve_hosts",
+}
 
 # Action types that trigger local execution rather than a DB write
 _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner"}
@@ -104,7 +109,17 @@ def _apply_action(conn, action) -> None:
 
 
 def _pk_for_table(table: str) -> str:
-    pk_map = {"services": "service_id", "machines": "machine_id", "nodes": "node_id", "pfsense_dns": "dns_entry_id"}
+    pk_map = {
+        "services":       "service_id",
+        "machines":       "machine_id",
+        "nodes":          "node_id",
+        "pfsense_dns":    "dns_entry_id",
+        "proxmox_config": "config_id",
+        "dockge_stacks":  "stack_id",
+        "caddy_configs":  "caddy_id",
+        "settings":       "key",
+        "pve_hosts":      "pve_id",
+    }
     return pk_map.get(table, "id")
 
 

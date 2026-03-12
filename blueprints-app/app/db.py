@@ -99,6 +99,91 @@ CREATE INDEX IF NOT EXISTS idx_pfsense_dns_ip
     ON pfsense_dns(ip_address);
 CREATE INDEX IF NOT EXISTS idx_pfsense_dns_fqdn
     ON pfsense_dns(fqdn);
+
+CREATE TABLE IF NOT EXISTS proxmox_config (
+    config_id       TEXT PRIMARY KEY,       -- "{pve_name}_{vmid}" e.g. "pve1_100"
+    pve_host        TEXT NOT NULL,           -- PVE host IP address
+    pve_name        TEXT,                    -- short label e.g. "pve1"
+    vmid            INTEGER NOT NULL,
+    vm_type         TEXT NOT NULL,           -- 'lxc' | 'qemu'
+    name            TEXT,                    -- hostname from conf
+    status          TEXT,                    -- 'running' | 'stopped'
+    cores           INTEGER,
+    memory_mb       INTEGER,
+    rootfs          TEXT,                    -- raw rootfs line
+    ip_config       TEXT,                    -- raw net0 line
+    ip_address      TEXT,                    -- parsed IP (no CIDR)
+    gateway         TEXT,
+    mac_address     TEXT,
+    vlan_tag        INTEGER,
+    tags            TEXT,                    -- comma-separated tags
+    mountpoints_json TEXT,                   -- JSON array
+    raw_conf        TEXT,                    -- full conf file content
+    last_probed     TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_proxmox_config_pve
+    ON proxmox_config(pve_host, vmid);
+
+CREATE TABLE IF NOT EXISTS dockge_stacks (
+    stack_id         TEXT PRIMARY KEY,       -- "{source_vmid}_{stack_name}"
+    pve_host         TEXT NOT NULL,
+    source_vmid      INTEGER NOT NULL,
+    source_lxc_name  TEXT,
+    stack_name       TEXT NOT NULL,
+    status           TEXT,                   -- 'running' | 'stopped' | 'unknown' | 'partial'
+    compose_content  TEXT,                   -- raw compose.yaml content
+    services_json    TEXT,                   -- JSON array of service names
+    ports_json       TEXT,                   -- JSON array of "host:container" strings
+    volumes_json     TEXT,                   -- JSON array of volume mounts
+    env_file_exists  INTEGER DEFAULT 0,      -- 1 if .env present (content not stored)
+    stacks_dir       TEXT,                   -- base dir e.g. "/opt/stacks"
+    last_probed      TEXT,
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_dockge_stacks_vmid
+    ON dockge_stacks(source_vmid);
+
+CREATE TABLE IF NOT EXISTS caddy_configs (
+    caddy_id          TEXT PRIMARY KEY,      -- "{source_vmid}_{path_slug}"
+    pve_host          TEXT,
+    source_vmid       INTEGER,
+    source_lxc_name   TEXT,
+    caddyfile_path    TEXT,                  -- e.g. "/etc/caddy/Caddyfile"
+    caddyfile_content TEXT,                  -- full Caddyfile content
+    domains_json      TEXT,                  -- JSON array of parsed domain/host tokens
+    upstreams_json    TEXT,                  -- JSON array of parsed upstream addresses
+    last_probed       TEXT,
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_caddy_configs_vmid
+    ON caddy_configs(source_vmid);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL DEFAULT '',
+    description TEXT,
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pve_hosts (
+    pve_id        TEXT PRIMARY KEY,   -- IP address — stable, no external config needed
+    ip_address    TEXT NOT NULL,
+    hostname      TEXT,               -- parsed from Proxmox web response
+    pve_name      TEXT,               -- short label e.g. "pve1" (user-editable)
+    version       TEXT,               -- Proxmox version string
+    port          INTEGER DEFAULT 8006,
+    ssh_reachable INTEGER DEFAULT 0,  -- updated by proxmox-config probe after SSH attempt
+    last_scanned  TEXT,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
 """
 
 _SEED_SQL = """
@@ -223,6 +308,39 @@ def increment_gen(conn: sqlite3.Connection, source: str = "human") -> int:
         "SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'"
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+# ── Settings helpers ─────────────────────────────────────────────────────────
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    """Return the current value for *key*, or *default* if not set."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str,
+                description: str | None = None) -> None:
+    """Upsert a setting.  Preserves existing description when none supplied."""
+    conn.execute(
+        """
+        INSERT INTO settings (key, value, description, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value       = excluded.value,
+            description = COALESCE(excluded.description, description),
+            updated_at  = datetime('now')
+        """,
+        (key, value, description),
+    )
+
+
+def get_setting_or_raise(conn: sqlite3.Connection, key: str, hint: str = "") -> str:
+    """Return the value for *key* or raise ValueError with a helpful message."""
+    val = get_setting(conn, key)
+    if not val:
+        extra = f" — {hint}" if hint else ""
+        raise ValueError(f"Setting '{key}' is not configured{extra}")
+    return val
 
 
 def get_gen(conn: sqlite3.Connection) -> int:
