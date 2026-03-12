@@ -107,7 +107,7 @@ async def _check_proxmox(
             if dns_server:
                 hostname = await _reverse_dns(ip, dns_server)
                 if hostname:
-                    # Use the first label (e.g. "pve239" from "pve239.infra.example.com")
+                    # Use the first label (e.g. "pve1" from "pve1.infra.example.com")
                     pve_name = hostname.split(".")[0]
             return {
                 "pve_id":        ip,

@@ -117,11 +117,18 @@ CREATE TABLE IF NOT EXISTS proxmox_config (
     mac_address     TEXT,
     vlan_tag        INTEGER,
     tags            TEXT,                    -- comma-separated tags
-    mountpoints_json TEXT,                   -- JSON array
-    raw_conf        TEXT,                    -- full conf file content
-    last_probed     TEXT,
-    created_at      TEXT DEFAULT (datetime('now')),
-    updated_at      TEXT DEFAULT (datetime('now'))
+    mountpoints_json  TEXT,                   -- JSON array
+    raw_conf          TEXT,                    -- full conf file content
+    vlans_json        TEXT,                    -- JSON array of all VLAN tags across all net interfaces
+    has_docker        INTEGER DEFAULT 0,       -- docker detected in running LXC
+    dockge_stacks_dir TEXT,                   -- stacks dir if dockge detected
+    has_portainer     INTEGER DEFAULT 0,       -- portainer container detected via docker ps
+    portainer_method  TEXT,                    -- how portainer was detected: 'docker'
+    has_caddy         INTEGER DEFAULT 0,       -- caddy detected in LXC or on PVE host
+    caddy_conf_path   TEXT,                    -- path to caddy binary
+    last_probed       TEXT,
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_proxmox_config_pve
@@ -220,8 +227,16 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # nodes: canonical machine mapping
         ("nodes",    "machine_id",            "TEXT"),
         # pfsense_dns: local ping sweep enrichment (2026-03-12)
-        ("pfsense_dns", "ping_ms",         "REAL"),
-        ("pfsense_dns", "last_ping_check", "TEXT"),
+        ("pfsense_dns", "ping_ms",                  "REAL"),
+        ("pfsense_dns", "last_ping_check",           "TEXT"),
+        # proxmox_config: multi-VLAN + service detection (2026-03-12)
+        ("proxmox_config", "vlans_json",        "TEXT"),
+        ("proxmox_config", "has_docker",        "INTEGER DEFAULT 0"),
+        ("proxmox_config", "dockge_stacks_dir", "TEXT"),
+        ("proxmox_config", "has_portainer",     "INTEGER DEFAULT 0"),
+        ("proxmox_config", "portainer_method",  "TEXT"),
+        ("proxmox_config", "has_caddy",         "INTEGER DEFAULT 0"),
+        ("proxmox_config", "caddy_conf_path",   "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

@@ -54,6 +54,13 @@ def _row_to_out(row) -> ProxmoxConfigOut:
         tags=row["tags"],
         mountpoints_json=row["mountpoints_json"],
         raw_conf=row["raw_conf"],
+        vlans_json=row["vlans_json"],
+        has_docker=_int(row["has_docker"]),
+        dockge_stacks_dir=row["dockge_stacks_dir"],
+        has_portainer=_int(row["has_portainer"]),
+        portainer_method=row["portainer_method"],
+        has_caddy=_int(row["has_caddy"]),
+        caddy_conf_path=row["caddy_conf_path"],
         last_probed=row["last_probed"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -85,14 +92,18 @@ async def create_proxmox_config(body: ProxmoxConfigCreate) -> ProxmoxConfigOut:
             INSERT INTO proxmox_config
                 (config_id, pve_host, pve_name, vmid, vm_type, name, status,
                  cores, memory_mb, rootfs, ip_config, ip_address, gateway,
-                 mac_address, vlan_tag, tags, mountpoints_json, raw_conf, last_probed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
+                 vlans_json, has_docker, dockge_stacks_dir, has_portainer,
+                 portainer_method, has_caddy, caddy_conf_path, last_probed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (body.config_id, body.pve_host, body.pve_name, body.vmid, body.vm_type,
              body.name, body.status, body.cores, body.memory_mb, body.rootfs,
              body.ip_config, body.ip_address, body.gateway, body.mac_address,
              body.vlan_tag, body.tags, body.mountpoints_json, body.raw_conf,
-             body.last_probed),
+             body.vlans_json, body.has_docker, body.dockge_stacks_dir,
+             body.has_portainer, body.portainer_method, body.has_caddy,
+             body.caddy_conf_path, body.last_probed),
         )
         row = conn.execute(
             "SELECT * FROM proxmox_config WHERE config_id=?", (body.config_id,)
@@ -119,16 +130,22 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                         pve_host=?, pve_name=?, vmid=?, vm_type=?, name=?, status=?,
                         cores=?, memory_mb=?, rootfs=?, ip_config=?, ip_address=?,
                         gateway=?, mac_address=?, vlan_tag=?, tags=?,
-                        mountpoints_json=?, raw_conf=?, last_probed=?,
-                        updated_at=datetime('now')
+                        mountpoints_json=?, raw_conf=?,
+                        vlans_json=?, has_docker=?, dockge_stacks_dir=?,
+                        has_portainer=?, portainer_method=?,
+                        has_caddy=?, caddy_conf_path=?,
+                        last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
                     (body.pve_host, body.pve_name, body.vmid, body.vm_type,
                      body.name, body.status, body.cores, body.memory_mb,
                      body.rootfs, body.ip_config, body.ip_address, body.gateway,
                      body.mac_address, body.vlan_tag, body.tags,
-                     body.mountpoints_json, body.raw_conf, body.last_probed,
-                     body.config_id),
+                     body.mountpoints_json, body.raw_conf,
+                     body.vlans_json, body.has_docker, body.dockge_stacks_dir,
+                     body.has_portainer, body.portainer_method,
+                     body.has_caddy, body.caddy_conf_path,
+                     body.last_probed, body.config_id),
                 )
                 updated += 1
             else:
@@ -137,14 +154,19 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                     INSERT INTO proxmox_config
                         (config_id, pve_host, pve_name, vmid, vm_type, name, status,
                          cores, memory_mb, rootfs, ip_config, ip_address, gateway,
-                         mac_address, vlan_tag, tags, mountpoints_json, raw_conf, last_probed)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
+                         vlans_json, has_docker, dockge_stacks_dir, has_portainer,
+                         portainer_method, has_caddy, caddy_conf_path, last_probed)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (body.config_id, body.pve_host, body.pve_name, body.vmid,
                      body.vm_type, body.name, body.status, body.cores,
                      body.memory_mb, body.rootfs, body.ip_config, body.ip_address,
                      body.gateway, body.mac_address, body.vlan_tag, body.tags,
-                     body.mountpoints_json, body.raw_conf, body.last_probed),
+                     body.mountpoints_json, body.raw_conf,
+                     body.vlans_json, body.has_docker, body.dockge_stacks_dir,
+                     body.has_portainer, body.portainer_method,
+                     body.has_caddy, body.caddy_conf_path, body.last_probed),
                 )
                 created += 1
             row = conn.execute(
@@ -240,8 +262,11 @@ async def probe_proxmox_config() -> dict:
                         pve_host=?, pve_name=?, vmid=?, vm_type=?, name=?, status=?,
                         cores=?, memory_mb=?, rootfs=?, ip_config=?, ip_address=?,
                         gateway=?, mac_address=?, vlan_tag=?, tags=?,
-                        mountpoints_json=?, raw_conf=?, last_probed=?,
-                        updated_at=datetime('now')
+                        mountpoints_json=?, raw_conf=?,
+                        vlans_json=?, has_docker=?, dockge_stacks_dir=?,
+                        has_portainer=?, portainer_method=?,
+                        has_caddy=?, caddy_conf_path=?,
+                        last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
                     (entry.get("pve_host"), entry.get("pve_name"), entry.get("vmid"),
@@ -250,7 +275,10 @@ async def probe_proxmox_config() -> dict:
                      entry.get("ip_config"), entry.get("ip_address"), entry.get("gateway"),
                      entry.get("mac_address"), entry.get("vlan_tag"), entry.get("tags"),
                      entry.get("mountpoints_json"), entry.get("raw_conf"),
-                     entry.get("last_probed"), cid),
+                     entry.get("vlans_json"), entry.get("has_docker"),
+                     entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
+                     entry.get("portainer_method"), entry.get("has_caddy"),
+                     entry.get("caddy_conf_path"), entry.get("last_probed"), cid),
                 )
                 updated += 1
             else:
@@ -259,8 +287,10 @@ async def probe_proxmox_config() -> dict:
                     INSERT INTO proxmox_config
                         (config_id, pve_host, pve_name, vmid, vm_type, name, status,
                          cores, memory_mb, rootfs, ip_config, ip_address, gateway,
-                         mac_address, vlan_tag, tags, mountpoints_json, raw_conf, last_probed)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
+                         vlans_json, has_docker, dockge_stacks_dir, has_portainer,
+                         portainer_method, has_caddy, caddy_conf_path, last_probed)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (cid, entry.get("pve_host"), entry.get("pve_name"), entry.get("vmid"),
                      entry.get("vm_type"), entry.get("name"), entry.get("status"),
@@ -268,7 +298,10 @@ async def probe_proxmox_config() -> dict:
                      entry.get("ip_config"), entry.get("ip_address"), entry.get("gateway"),
                      entry.get("mac_address"), entry.get("vlan_tag"), entry.get("tags"),
                      entry.get("mountpoints_json"), entry.get("raw_conf"),
-                     entry.get("last_probed")),
+                     entry.get("vlans_json"), entry.get("has_docker"),
+                     entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
+                     entry.get("portainer_method"), entry.get("has_caddy"),
+                     entry.get("caddy_conf_path"), entry.get("last_probed")),
                 )
                 created += 1
             row = conn.execute(

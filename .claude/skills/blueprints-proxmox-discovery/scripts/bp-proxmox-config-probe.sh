@@ -48,13 +48,67 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # Receives via stdin when called as: ssh host python3 /dev/stdin ARGS < script
 REMOTE_PY="$WORK_DIR/remote_probe.py"
 cat > "$REMOTE_PY" << 'PYEOF'
-import sys, os, json, re
+import sys, os, json, re, subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 pve_ip   = sys.argv[1]
 pve_name = sys.argv[2]
 ts       = sys.argv[3]
 
+# ── Get VM/LXC statuses from local PVE API ───────────────────────────────────
+def _pvesh_statuses(vm_type_arg):
+    try:
+        r = subprocess.run(
+            ['pvesh', 'get', f'/nodes/localhost/{vm_type_arg}', '--output-format=json'],
+            capture_output=True, text=True, timeout=10
+        )
+        return {str(e['vmid']): e.get('status', '') for e in json.loads(r.stdout)}
+    except Exception:
+        return {}
+
+lxc_statuses  = _pvesh_statuses('lxc')
+qemu_statuses = _pvesh_statuses('qemu')
+
+# ── Service detection inside a running LXC via pct exec ─────────────────────
+_DETECT_SH = (
+    "HAS_DOCKER=0; HAS_DOCKGE=0; DOCKGE_DIR=''; HAS_PORTAINER=0; PORTAINER_METHOD=''; HAS_CADDY=0; CADDY_PATH=''\n"
+    "which docker >/dev/null 2>&1 && HAS_DOCKER=1 || true\n"
+    "if [ \"$HAS_DOCKER\" = '1' ]; then\n"
+    "  docker ps --format '{{.Names}}' 2>/dev/null | grep -qi portainer && HAS_PORTAINER=1 && PORTAINER_METHOD='docker' || true\n"
+    "fi\n"
+    "for _d in /opt/stacks /opt/dockge/data/stacks /home/dockge/stacks; do\n"
+    "  [ -d \"$_d\" ] && HAS_DOCKGE=1 && DOCKGE_DIR=\"$_d\" && break\n"
+    "done\n"
+    "which caddy >/dev/null 2>&1 && HAS_CADDY=1 && CADDY_PATH=$(which caddy) || true\n"
+    "printf '%s|%s|%s|%s|%s|%s|%s' \"$HAS_DOCKER\" \"$HAS_DOCKGE\" \"$DOCKGE_DIR\" "
+    "\"$HAS_PORTAINER\" \"$PORTAINER_METHOD\" \"$HAS_CADDY\" \"$CADDY_PATH\"\n"
+)
+
+def _detect_lxc(vmid_str):
+    """Run service detection inside a running LXC. Returns dict or {}."""
+    try:
+        r = subprocess.run(
+            ['pct', 'exec', vmid_str, '--', 'bash', '-c', _DETECT_SH],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0 and '|' in r.stdout:
+            parts = r.stdout.strip().split('|')
+            if len(parts) >= 7:
+                return {
+                    'has_docker':        1 if parts[0] == '1' else 0,
+                    'dockge_stacks_dir': parts[2] or None,
+                    'has_portainer':     1 if parts[3] == '1' else 0,
+                    'portainer_method':  parts[4] or None,
+                    'has_caddy':         1 if parts[5] == '1' else 0,
+                    'caddy_conf_path':   parts[6] or None,
+                }
+    except Exception:
+        pass
+    return {}
+
 entries = []
+running_lxc_vmids = []
+
 for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-server")]:
     if not os.path.isdir(conf_dir):
         continue
@@ -68,11 +122,17 @@ for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-serve
         except Exception:
             continue
 
-        # Parse key: value lines
+        # Parse key: value lines (skip snapshot sections after [snapshot] headers)
         p = {}
+        in_snapshot = False
         for line in raw_conf.splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
+                continue
+            if line.startswith('['):
+                in_snapshot = True
+                continue
+            if in_snapshot:
                 continue
             if ':' in line:
                 k, _, v = line.partition(':')
@@ -81,27 +141,31 @@ for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-serve
         def g(key):
             return p.get(key) or ""
 
-        name = g("hostname") or g("name")
+        name   = g("hostname") or g("name")
+        status = (lxc_statuses if vm_type == "lxc" else qemu_statuses).get(vmid, "")
 
-        # net0: hwaddr=MAC,ip=x.x.x.x/24,gw=x.x.x.x,tag=N,bridge=vmbrN,...
-        net0_str    = g("net0")
-        ip_config   = net0_str
-        ip_address  = ""
-        gateway     = ""
-        mac_address = ""
-        vlan_tag    = ""
-        if net0_str:
-            for part in net0_str.split(','):
+        # ── Parse ALL netN for IPs, MACs, and ALL VLAN tags ──────────────────
+        net_keys = sorted([k for k in p if re.match(r'^net\d+$', k)])
+        all_vlan_tags = []
+        ip_address = gateway = mac_address = ip_config = ""
+        for netkey in net_keys:
+            net_str = p.get(netkey, "")
+            for part in net_str.split(','):
                 part = part.strip()
-                if part.startswith("ip=") and not part.startswith("ip6="):
+                if part.startswith("ip=") and not part.startswith("ip6=") and not ip_address:
                     ip_config  = part[3:]
                     ip_address = ip_config.split('/')[0]
-                elif part.startswith("gw="):
+                elif part.startswith("gw=") and not gateway:
                     gateway = part[3:]
-                elif re.match(r'^(hwaddr|virtio|e1000|rtl8139|vmxnet3)=', part):
+                elif re.match(r'^(hwaddr|virtio|e1000|e1000e|rtl8139|vmxnet3|ne2k_pci)=', part) and not mac_address:
                     mac_address = part.split('=', 1)[1].split(',')[0].upper()
                 elif part.startswith("tag="):
-                    vlan_tag = part[4:]
+                    tag = part[4:].strip()
+                    if tag and tag not in all_vlan_tags:
+                        all_vlan_tags.append(tag)
+
+        vlan_tag   = all_vlan_tags[0] if all_vlan_tags else ""
+        vlans_json = json.dumps([int(t) for t in all_vlan_tags if t.isdigit()]) if all_vlan_tags else None
 
         try:
             cores = int(g("cores") or g("sockets") or 0) or None
@@ -118,14 +182,14 @@ for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-serve
         mountpoints = {k: v for k, v in p.items() if re.match(r'^mp\d+$', k)}
         mountpoints_json = json.dumps(mountpoints) if mountpoints else None
 
-        entries.append({
+        entry = {
             "config_id":        f"{pve_name}_{vmid}",
             "pve_host":         pve_ip,
             "pve_name":         pve_name,
             "vmid":             vmid,
             "vm_type":          vm_type,
             "name":             name,
-            "status":           "",
+            "status":           status,
             "cores":            cores,
             "memory_mb":        memory_mb,
             "rootfs":           rootfs,
@@ -134,11 +198,39 @@ for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-serve
             "gateway":          gateway,
             "mac_address":      mac_address,
             "vlan_tag":         vlan_tag,
+            "vlans_json":       vlans_json,
             "tags":             tags,
             "mountpoints_json": mountpoints_json,
             "raw_conf":         raw_conf,
+            "has_docker":       0,
+            "dockge_stacks_dir": None,
+            "has_portainer":    0,
+            "portainer_method": None,
+            "has_caddy":        0,
+            "caddy_conf_path":  None,
             "last_probed":      ts,
-        })
+        }
+        entries.append(entry)
+        if vm_type == "lxc" and status == "running":
+            running_lxc_vmids.append(vmid)
+
+# ── Parallel service detection for running LXCs ───────────────────────────────
+if running_lxc_vmids:
+    sys.stderr.write(f"  [detect] checking {len(running_lxc_vmids)} running LXC(s) for Docker/Dockge/Portainer/Caddy\n")
+    idx = {e["vmid"]: e for e in entries if e["vm_type"] == "lxc"}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_detect_lxc, vmid): vmid for vmid in running_lxc_vmids}
+        for fut in as_completed(futures):
+            vmid   = futures[fut]
+            result = fut.result()
+            if result and vmid in idx:
+                e = idx[vmid]
+                e["has_docker"]        = result.get("has_docker", 0)
+                e["dockge_stacks_dir"] = result.get("dockge_stacks_dir")
+                e["has_portainer"]     = result.get("has_portainer", 0)
+                e["portainer_method"]  = result.get("portainer_method")
+                e["has_caddy"]         = result.get("has_caddy", 0)
+                e["caddy_conf_path"]   = result.get("caddy_conf_path")
 
 print(json.dumps(entries))
 PYEOF

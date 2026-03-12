@@ -213,6 +213,13 @@ class ProxmoxConfigCreate(BaseModel):
     tags: Optional[str] = None
     mountpoints_json: Optional[str] = None
     raw_conf: Optional[str] = None
+    vlans_json: Optional[str] = None
+    has_docker: Optional[int] = None
+    dockge_stacks_dir: Optional[str] = None
+    has_portainer: Optional[int] = None
+    portainer_method: Optional[str] = None
+    has_caddy: Optional[int] = None
+    caddy_conf_path: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -234,6 +241,13 @@ class ProxmoxConfigUpdate(BaseModel):
     tags: Optional[str] = None
     mountpoints_json: Optional[str] = None
     raw_conf: Optional[str] = None
+    vlans_json: Optional[str] = None
+    has_docker: Optional[int] = None
+    dockge_stacks_dir: Optional[str] = None
+    has_portainer: Optional[int] = None
+    portainer_method: Optional[str] = None
+    has_caddy: Optional[int] = None
+    caddy_conf_path: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -256,6 +270,13 @@ class ProxmoxConfigOut(BaseModel):
     tags: Optional[str] = None
     mountpoints_json: Optional[str] = None
     raw_conf: Optional[str] = None
+    vlans_json: Optional[str] = None
+    has_docker: Optional[int] = None
+    dockge_stacks_dir: Optional[str] = None
+    has_portainer: Optional[int] = None
+    portainer_method: Optional[str] = None
+    has_caddy: Optional[int] = None
+    caddy_conf_path: Optional[str] = None
     last_probed: Optional[str] = None
     created_at: str
     updated_at: str
