@@ -204,6 +204,10 @@ async def enrich_nets_from_pfsense() -> dict:
                                 "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
                                 (vid, cidr_str),
                             )
+                            conn.execute(
+                                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                                (cidr_str, vid),
+                            )
                             vlan_row = conn.execute(
                                 "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
                             ).fetchone()
@@ -315,11 +319,16 @@ async def enrich_nets_from_pfsense_arp() -> dict:
                             "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
                             (vt, cidr),
                         )
-                        vlan_row = conn.execute(
-                            "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
-                        ).fetchone()
-                        if vlan_row:
-                            enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
+                    elif not existing_vlan["cidr"]:
+                        conn.execute(
+                            "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=?",
+                            (cidr, vt),
+                        )
+                    vlan_row = conn.execute(
+                        "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
+                    ).fetchone()
+                    if vlan_row:
+                        enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
                 except ValueError:
                     pass
 
@@ -505,16 +514,20 @@ print("##ARPRESULT##" + json.dumps(result))
                 existing = conn.execute(
                     "SELECT cidr FROM vlans WHERE vlan_id=?", (vid,)
                 ).fetchone()
+                conn.execute(
+                    "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
+                    (vid, cidr),
+                )
+                conn.execute(
+                    "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                    (cidr, vid),
+                )
+                vlan_row = conn.execute(
+                    "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
+                ).fetchone()
+                if vlan_row:
+                    enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
                 if not existing:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
-                        (vid, cidr),
-                    )
-                    vlan_row = conn.execute(
-                        "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
-                    ).fetchone()
-                    if vlan_row:
-                        enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
                     vlans_added.add(vid)
 
             # Match MACs and update proxmox_nets
