@@ -103,13 +103,17 @@ async def _check_proxmox(
                 version = m.group(1)
             # Best-effort reverse DNS (only if pfSense IP is known)
             hostname = None
+            pve_name = None
             if dns_server:
                 hostname = await _reverse_dns(ip, dns_server)
+                if hostname:
+                    # Use the first label (e.g. "pve239" from "pve239.infra.example.com")
+                    pve_name = hostname.split(".")[0]
             return {
                 "pve_id":        ip,
                 "ip_address":    ip,
                 "hostname":      hostname,
-                "pve_name":      None,
+                "pve_name":      pve_name,
                 "version":       version,
                 "port":          port,
                 "ssh_reachable": 0,
@@ -221,9 +225,12 @@ async def scan_for_proxmox() -> dict:
             if existing:
                 conn.execute(
                     """UPDATE pve_hosts
-                       SET version=?, last_scanned=?, updated_at=datetime('now')
+                       SET version=?, last_scanned=?, updated_at=datetime('now'),
+                           hostname=COALESCE(hostname, ?),
+                           pve_name=COALESCE(pve_name, ?)
                        WHERE pve_id=?""",
-                    (candidate["version"], timestamp, cid),
+                    (candidate["version"], timestamp,
+                     candidate["hostname"], candidate["pve_name"], cid),
                 )
                 updated += 1
             else:
