@@ -134,6 +134,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("machines", "properties_json",       "TEXT"),
         # nodes: canonical machine mapping
         ("nodes",    "machine_id",            "TEXT"),
+        # pfsense_dns: local ping sweep enrichment (2026-03-12)
+        ("pfsense_dns", "ping_ms",         "REAL"),
+        ("pfsense_dns", "last_ping_check", "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

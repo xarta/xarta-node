@@ -172,6 +172,8 @@ class PfSenseDnsUpdate(BaseModel):
     active: Optional[int] = None
     last_seen: Optional[str] = None
     last_probed: Optional[str] = None
+    ping_ms: Optional[float] = None
+    last_ping_check: Optional[str] = None
 
 
 class PfSenseDnsOut(BaseModel):
@@ -184,6 +186,8 @@ class PfSenseDnsOut(BaseModel):
     active: Optional[int] = 1
     last_seen: Optional[str] = None
     last_probed: Optional[str] = None
+    ping_ms: Optional[float] = None
+    last_ping_check: Optional[str] = None
     created_at: str
     updated_at: str
 
