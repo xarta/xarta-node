@@ -60,8 +60,9 @@ Required in `.env` (private — do not add to `.env.example`):
 | `PROXMOX_SSH_KEY` | Path to SSH key for Proxmox hosts |
 | `PFSENSE_SSH_KEY` | Path to SSH key for pfSense hosts |
 | `PFSENSE_SSH_TARGET` | `user@host` for primary pfSense |
-| `PFSENSE_CLOUSEAU_SSH_TARGET` | `user@host` for a separate pfSense appliance (use for appliances not reachable as the primary firewall). Uses the same `PFSENSE_SSH_KEY`. |
-
+| `PFSENSE_CLOUSEAU_SSH_TARGET` | `user@host` for a separate pfSense appliance (use for appliances not reachable as the primary firewall). Uses the same `PFSENSE_SSH_KEY`. || `VM_SSH_KEY` | Path to key for probe-services SSH into general VMs/LXCs |
+| `CITADEL_SSH_KEY` | Path to key for the dedicated secure-host probe (see private skill for details) |
+| Additional probe-services vars | Documented in the private skill (citadel identity, VLAN source map) |
 ---
 
 ## API Endpoints
