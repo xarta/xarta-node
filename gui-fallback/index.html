@@ -201,7 +201,7 @@
     <button onclick="switchTab('nodes')">Nodes</button>
     <button onclick="switchTab('pfsense-dns')">pfSense DNS</button>
     <button onclick="switchTab('proxmox-config')" id="tab-btn-proxmox-config">Proxmox Config</button>
-    <button onclick="switchTab('vlans')" id="tab-btn-vlans" hidden>VLANs</button>
+    <button onclick="switchTab('vlans')" id="tab-btn-vlans">VLANs</button>
     <button onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
     <button onclick="switchTab('caddy-configs')">Caddy Configs</button>
     <button onclick="switchTab('pve-hosts')">PVE Hosts</button>
@@ -838,8 +838,6 @@
       const r = await fetch('/api/v1/vlans');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _vlans = await r.json();
-      const vlanTabBtn = document.getElementById('tab-btn-vlans');
-      if (vlanTabBtn) vlanTabBtn.hidden = _vlans.length === 0;
       renderVlans();
     } catch (e) {
       if (err) { err.textContent = `Failed to load VLANs: ${e.message}`; err.hidden = false; }

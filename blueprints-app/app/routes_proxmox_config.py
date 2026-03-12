@@ -395,6 +395,11 @@ async def probe_proxmox_config() -> dict:
                 "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
                 (vt, inferred),
             )
+            vlan_row = conn.execute(
+                "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
+            ).fetchone()
+            if vlan_row:
+                enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
 
     return {
         "created": created,
