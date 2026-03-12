@@ -483,6 +483,27 @@ class PveHostOut(BaseModel):
     updated_at: str
 
 
+# ── ARP Manual ───────────────────────────────────────────────────────────────
+
+class ArpManualCreate(BaseModel):
+    ip_address: str
+    mac_address: str
+    notes: Optional[str] = None
+
+class ArpManualUpdate(BaseModel):
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+    notes: Optional[str] = None
+
+class ArpManualOut(BaseModel):
+    entry_id: str
+    ip_address: str
+    mac_address: str
+    notes: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):
