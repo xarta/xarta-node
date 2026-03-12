@@ -1,6 +1,7 @@
 """routes_proxmox_config.py — CRUD + probe for /api/v1/proxmox-config"""
 
 import asyncio
+import ipaddress
 import json
 import os
 import subprocess
@@ -333,19 +334,19 @@ async def probe_proxmox_config() -> dict:
                     """
                     UPDATE proxmox_nets SET
                         config_id=?, pve_host=?, vmid=?, net_key=?,
-                        mac_address=?, ip_address=?, ip_cidr=?, gateway=?,
+                        mac_address=?,
+                        ip_address = CASE WHEN ip_source != 'conf' THEN ip_address ELSE ? END,
+                        ip_cidr    = CASE WHEN ip_source != 'conf' THEN ip_cidr    ELSE ? END,
+                        gateway    = CASE WHEN ip_source != 'conf' THEN gateway    ELSE ? END,
                         vlan_tag=?, bridge=?, model=?, raw_str=?,
-                        ip_source=coalesce(
-                            CASE WHEN ip_source='pfsense' THEN 'pfsense' END,
-                            ?
-                        ),
-                        updated_at=datetime('now')
+                        ip_source  = CASE WHEN ip_source != 'conf' THEN ip_source  ELSE ? END,
+                        updated_at = datetime('now')
                     WHERE net_id=?
                     """,
                     (net.get("config_id"), net.get("pve_host"), net.get("vmid"),
-                     net.get("net_key"), net.get("mac_address"), net.get("ip_address"),
-                     net.get("ip_cidr"), net.get("gateway"), net.get("vlan_tag"),
-                     net.get("bridge"), net.get("model"), net.get("raw_str"),
+                     net.get("net_key"), net.get("mac_address"),
+                     net.get("ip_address"), net.get("ip_cidr"), net.get("gateway"),
+                     net.get("vlan_tag"), net.get("bridge"), net.get("model"), net.get("raw_str"),
                      net.get("ip_source", "conf"), nid),
                 )
                 nets_updated += 1
@@ -372,6 +373,27 @@ async def probe_proxmox_config() -> dict:
                 conn,
                 "UPDATE" if net_existing else "INSERT",
                 "proxmox_nets", nid, dict(net_row), gen,
+            )
+
+        # ── Auto-populate vlans from inferred CIDRs ──────────────────────────
+        # For each unique vlan_tag+IP pair, infer /24 CIDR and INSERT OR IGNORE
+        # so manually confirmed CIDRs are never overwritten.
+        seen_vlans: set[int] = set()
+        for net in nets_raw:
+            vt = net.get("vlan_tag")
+            ip = net.get("ip_address")
+            if vt is None or not ip:
+                continue
+            if vt in seen_vlans:
+                continue
+            seen_vlans.add(vt)
+            try:
+                inferred = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+            except ValueError:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
+                (vt, inferred),
             )
 
     return {

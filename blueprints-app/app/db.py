@@ -196,6 +196,17 @@ CREATE INDEX IF NOT EXISTS idx_proxmox_nets_config
 CREATE INDEX IF NOT EXISTS idx_proxmox_nets_mac
     ON proxmox_nets(mac_address);
 
+CREATE TABLE IF NOT EXISTS vlans (
+    vlan_id       INTEGER PRIMARY KEY,   -- VLAN tag number (e.g. 42)
+    cidr          TEXT,                  -- CIDR range e.g. "10.0.42.0/24"
+    cidr_inferred INTEGER DEFAULT 1,     -- 1=auto-inferred from IP data, 0=manually confirmed
+    description   TEXT,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_vlans_cidr
+    ON vlans(cidr);
+
 CREATE TABLE IF NOT EXISTS settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL DEFAULT '',
@@ -262,6 +273,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("proxmox_config", "has_caddy",         "INTEGER DEFAULT 0"),
         ("proxmox_config", "caddy_conf_path",   "TEXT"),
         # proxmox_nets: per-interface network rows (2026-03-12)
+        # (table created in DDL above; no ALTER TABLE needed for it)
+        # vlans: VLAN CIDR map (2026-03-12)
         # (table created in DDL above; no ALTER TABLE needed for it)
     ]
     existing_cols: dict[str, set[str]] = {}

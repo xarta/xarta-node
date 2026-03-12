@@ -331,6 +331,22 @@ class ProxmoxNetOut(BaseModel):
     updated_at: str
 
 
+# ── VLANs ─────────────────────────────────────────────────────────────────────
+
+class VlanUpdate(BaseModel):
+    cidr: Optional[str] = None
+    description: Optional[str] = None
+
+
+class VlanOut(BaseModel):
+    vlan_id: int
+    cidr: Optional[str] = None
+    cidr_inferred: int = 1
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 # ── Dockge Stacks ─────────────────────────────────────────────────────────────
 
 class DockgeStackCreate(BaseModel):

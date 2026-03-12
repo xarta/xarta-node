@@ -190,6 +190,125 @@ async def enrich_nets_from_pfsense() -> dict:
     return {"enriched": enriched, "checked": checked}
 
 
+@router.post("/find-ips-by-arp", response_model=dict)
+async def find_ips_by_arp() -> dict:
+    """
+    Parallel ARP scan per VLAN: for each proxmox_nets row missing an IP address
+    that has a known vlan_tag, look up the CIDR from the vlans table and run
+    'nmap -sn <cidr>' to discover MAC→IP mappings.  Matching rows are updated
+    with ip_source='arp-scan'.
+
+    All VLAN scans run concurrently.
+    """
+    import asyncio
+    import ipaddress
+    import re
+
+    with get_conn() as conn:
+        missing = conn.execute(
+            """
+            SELECT net_id, vlan_tag, mac_address
+            FROM proxmox_nets
+            WHERE (ip_address IS NULL OR ip_address = '')
+              AND vlan_tag IS NOT NULL
+              AND mac_address IS NOT NULL
+            """
+        ).fetchall()
+        if not missing:
+            return {"scanned": 0, "found": 0, "message": "No missing IPs with known VLANs"}
+
+        vlan_cidrs: dict[int, str] = {
+            row["vlan_id"]: row["cidr"]
+            for row in conn.execute(
+                "SELECT vlan_id, cidr FROM vlans WHERE cidr IS NOT NULL AND cidr != ''"
+            ).fetchall()
+        }
+
+    # Group missing nets by vlan_tag (only those with a known CIDR)
+    by_vlan: dict[int, list[dict]] = {}
+    for row in missing:
+        vt = row["vlan_tag"]
+        if vt not in vlan_cidrs:
+            continue
+        by_vlan.setdefault(vt, []).append(
+            {"net_id": row["net_id"], "mac": (row["mac_address"] or "").upper()}
+        )
+
+    if not by_vlan:
+        return {"scanned": 0, "found": 0, "message": "No VLANs with known CIDRs for missing IPs"}
+
+    async def scan_vlan(cidr: str) -> dict[str, str]:
+        """Returns {MAC_UPPER: ip_address} discovered by nmap ARP scan."""
+        mac_to_ip: dict[str, str] = {}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nmap", "-sn", cidr,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            text = stdout.decode(errors="replace")
+            current_ip: str | None = None
+            for line in text.splitlines():
+                m_ip = re.search(
+                    r"Nmap scan report for (?:\S+ \()?(\d+\.\d+\.\d+\.\d+)\)?", line
+                )
+                if m_ip:
+                    current_ip = m_ip.group(1)
+                    continue
+                m_mac = re.search(r"MAC Address:\s+([0-9A-Fa-f:]{17})", line)
+                if m_mac and current_ip:
+                    mac_to_ip[m_mac.group(1).upper()] = current_ip
+                    current_ip = None
+        except Exception:
+            pass
+        return mac_to_ip
+
+    # Run all VLAN scans in parallel
+    vlan_ids = list(by_vlan.keys())
+    scan_results = await asyncio.gather(*[scan_vlan(vlan_cidrs[vt]) for vt in vlan_ids])
+    results: dict[int, dict[str, str]] = dict(zip(vlan_ids, scan_results))
+
+    # Update matching rows
+    found = 0
+    with get_conn() as conn:
+        gen = increment_gen(conn, "arp-scan")
+        for vt in vlan_ids:
+            mac_to_ip = results.get(vt, {})
+            cidr_str  = vlan_cidrs[vt]
+            try:
+                prefix = ipaddress.ip_network(cidr_str, strict=False).prefixlen
+            except ValueError:
+                prefix = 24
+            for net in by_vlan[vt]:
+                ip = mac_to_ip.get(net["mac"])
+                if not ip:
+                    continue
+                ip_cidr = f"{ip}/{prefix}"
+                conn.execute(
+                    """
+                    UPDATE proxmox_nets SET
+                        ip_address=?, ip_cidr=?, ip_source='arp-scan',
+                        updated_at=datetime('now')
+                    WHERE net_id=?
+                    """,
+                    (ip, ip_cidr, net["net_id"]),
+                )
+                row = conn.execute(
+                    "SELECT * FROM proxmox_nets WHERE net_id=?", (net["net_id"],)
+                ).fetchone()
+                enqueue_for_all_peers(
+                    conn, "UPDATE", "proxmox_nets", net["net_id"], dict(row), gen
+                )
+                found += 1
+
+    return {
+        "scanned": len(by_vlan),
+        "found": found,
+        "vlan_details": {str(vt): len(nets) for vt, nets in by_vlan.items()},
+    }
+
+
 @router.put("/{net_id}", response_model=ProxmoxNetOut)
 async def update_proxmox_net(net_id: str, body: ProxmoxNetUpdate) -> ProxmoxNetOut:
     updates = {k: v for k, v in body.model_dump().items() if v is not None}

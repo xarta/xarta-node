@@ -29,7 +29,7 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 _ALLOWED_TABLES = {
     "services", "machines", "nodes",
     "pfsense_dns",
-    "proxmox_config", "proxmox_nets", "dockge_stacks", "caddy_configs",
+    "proxmox_config", "proxmox_nets", "vlans", "dockge_stacks", "caddy_configs",
     "settings", "pve_hosts",
 }
 
@@ -116,6 +116,7 @@ def _pk_for_table(table: str) -> str:
         "pfsense_dns":    "dns_entry_id",
         "proxmox_config": "config_id",
         "proxmox_nets":   "net_id",
+        "vlans":          "vlan_id",
         "dockge_stacks":  "stack_id",
         "caddy_configs":  "caddy_id",
         "settings":       "key",
