@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from .db import get_conn, increment_gen
 from .models import ProxmoxConfigCreate, ProxmoxConfigOut, ProxmoxConfigUpdate
 from .sync.queue import enqueue_for_all_peers
+from .routes_proxmox_nets import fill_vlan_tags_from_cidrs
 
 router = APIRouter(prefix="/proxmox-config", tags=["proxmox-config"])
 
@@ -404,6 +405,9 @@ async def probe_proxmox_config() -> dict:
             ).fetchone()
             if vlan_row:
                 enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
+
+        # Infer vlan_tag for proxmox_nets rows with IP but no vlan_tag (e.g. untagged bridge)
+        fill_vlan_tags_from_cidrs(conn, gen)
 
     return {
         "created": created,

@@ -8,6 +8,9 @@ to fill in ip_address for interfaces where the conf file had no static IP
 (common for DHCP-assigned containers and for QEMU VMs that use cloud-init).
 """
 
+import ipaddress
+import os
+
 from fastapi import APIRouter, HTTPException
 
 from .db import get_conn, increment_gen
@@ -47,6 +50,53 @@ def _row_to_out(row) -> ProxmoxNetOut:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+# ── Shared helper ────────────────────────────────────────────────────────────
+
+def fill_vlan_tags_from_cidrs(conn, gen: int) -> int:
+    """
+    For every proxmox_nets row that has an IP but no vlan_tag, look up the
+    matching VLAN by checking the IP against all known CIDRs in the vlans table.
+    Updates vlan_tag in-place and enqueues changes to peers.
+    Returns the number of rows updated.
+    """
+    vlan_cidrs = [
+        (r["vlan_id"], ipaddress.ip_network(r["cidr"], strict=False))
+        for r in conn.execute(
+            "SELECT vlan_id, cidr FROM vlans WHERE cidr IS NOT NULL AND cidr != ''"
+        ).fetchall()
+    ]
+    if not vlan_cidrs:
+        return 0
+
+    rows = conn.execute(
+        """
+        SELECT net_id, ip_address FROM proxmox_nets
+        WHERE (vlan_tag IS NULL OR vlan_tag = 0)
+          AND ip_address IS NOT NULL AND ip_address != '' AND ip_address != 'dhcp'
+        """
+    ).fetchall()
+
+    updated = 0
+    for row in rows:
+        try:
+            ip_obj = ipaddress.ip_address(row["ip_address"])
+        except ValueError:
+            continue
+        for vlan_id, network in vlan_cidrs:
+            if ip_obj in network:
+                conn.execute(
+                    "UPDATE proxmox_nets SET vlan_tag=?, updated_at=datetime('now') WHERE net_id=?",
+                    (vlan_id, row["net_id"]),
+                )
+                updated_row = conn.execute(
+                    "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+                ).fetchone()
+                enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated_row), gen)
+                updated += 1
+                break
+    return updated
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -181,47 +231,14 @@ async def enrich_nets_from_pfsense() -> dict:
                 """,
                 (ip, net_id),
             )
-
-            # Infer vlan_tag from VLAN_CIDRS env if still NULL
-            import ipaddress, os
-            current_vlan = conn.execute(
-                "SELECT vlan_tag FROM proxmox_nets WHERE net_id=?", (net_id,)
-            ).fetchone()["vlan_tag"]
-            if current_vlan is None:
-                for vc in os.environ.get("VLAN_CIDRS", "").split(","):
-                    vc = vc.strip()
-                    if ":" not in vc:
-                        continue
-                    vid_str, _, cidr_str = vc.partition(":")
-                    try:
-                        if ipaddress.ip_address(ip) in ipaddress.ip_network(cidr_str, strict=False):
-                            vid = int(vid_str)
-                            conn.execute(
-                                "UPDATE proxmox_nets SET vlan_tag=? WHERE net_id=?",
-                                (vid, net_id),
-                            )
-                            conn.execute(
-                                "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
-                                (vid, cidr_str),
-                            )
-                            conn.execute(
-                                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
-                                (cidr_str, vid),
-                            )
-                            vlan_row = conn.execute(
-                                "SELECT * FROM vlans WHERE vlan_id=?", (vid,)
-                            ).fetchone()
-                            if vlan_row:
-                                enqueue_for_all_peers(conn, "UPDATE", "vlans", vid, dict(vlan_row), gen)
-                            break
-                    except ValueError:
-                        pass
-
             updated_row = conn.execute(
                 "SELECT * FROM proxmox_nets WHERE net_id=?", (net_id,)
             ).fetchone()
             enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", net_id, dict(updated_row), gen)
             enriched += 1
+
+        # Infer vlan_tag from known CIDR map for any rows still missing it
+        fill_vlan_tags_from_cidrs(conn, gen)
 
     return {"enriched": enriched, "checked": checked}
 
@@ -347,6 +364,9 @@ async def enrich_nets_from_pfsense_arp() -> dict:
             ).fetchone()
             enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated_row), gen)
             enriched += 1
+
+        # Infer vlan_tag from known CIDR map for any rows still missing it
+        fill_vlan_tags_from_cidrs(conn, gen)
 
     return {
         "enriched": enriched,
