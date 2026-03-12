@@ -282,6 +282,55 @@ class ProxmoxConfigOut(BaseModel):
     updated_at: str
 
 
+# ── Proxmox Nets ──────────────────────────────────────────────────────────────
+
+class ProxmoxNetCreate(BaseModel):
+    net_id: str                             # "{config_id}_net{N}"
+    config_id: str
+    pve_host: str
+    vmid: int
+    net_key: str                            # "net0", "net1" …
+    mac_address: Optional[str] = None
+    ip_address: Optional[str] = None
+    ip_cidr: Optional[str] = None
+    gateway: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    bridge: Optional[str] = None
+    model: Optional[str] = None
+    raw_str: Optional[str] = None
+    ip_source: Optional[str] = "conf"
+
+
+class ProxmoxNetUpdate(BaseModel):
+    ip_address: Optional[str] = None
+    ip_cidr: Optional[str] = None
+    gateway: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    bridge: Optional[str] = None
+    model: Optional[str] = None
+    raw_str: Optional[str] = None
+    ip_source: Optional[str] = None
+
+
+class ProxmoxNetOut(BaseModel):
+    net_id: str
+    config_id: str
+    pve_host: str
+    vmid: int
+    net_key: str
+    mac_address: Optional[str] = None
+    ip_address: Optional[str] = None
+    ip_cidr: Optional[str] = None
+    gateway: Optional[str] = None
+    vlan_tag: Optional[int] = None
+    bridge: Optional[str] = None
+    model: Optional[str] = None
+    raw_str: Optional[str] = None
+    ip_source: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 # ── Dockge Stacks ─────────────────────────────────────────────────────────────
 
 class DockgeStackCreate(BaseModel):

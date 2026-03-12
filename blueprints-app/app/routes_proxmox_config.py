@@ -199,7 +199,7 @@ async def probe_status() -> dict:
 @router.post("/probe", response_model=dict)
 async def probe_proxmox_config() -> dict:
     """
-    Run bp-proxmox-config-probe.sh, parse ##ENTRIES## from stdout,
+    Run bp-proxmox-config-probe.sh, parse ##ENTRIES## and ##NETS## from stdout,
     upsert all records in-process (no re-entrant HTTP call).
     """
     script = os.path.realpath(_PROBE_SCRIPT)
@@ -229,11 +229,17 @@ async def probe_proxmox_config() -> dict:
 
     text = stdout.decode(errors="replace")
     entries_raw: list = []
+    nets_raw: list = []
     stats_raw: dict = {}
     for line in text.splitlines():
         if line.startswith("##ENTRIES##"):
             try:
                 entries_raw = json.loads(line[len("##ENTRIES##"):].strip())
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("##NETS##"):
+            try:
+                nets_raw = json.loads(line[len("##NETS##"):].strip())
             except json.JSONDecodeError:
                 pass
         elif line.startswith("##STATS##"):
@@ -313,10 +319,67 @@ async def probe_proxmox_config() -> dict:
                 "proxmox_config", cid, dict(row), gen,
             )
 
+        # ── Upsert proxmox_nets ────────────────────────────────────────────
+        nets_created = nets_updated = 0
+        for net in nets_raw:
+            nid = net.get("net_id")
+            if not nid:
+                continue
+            net_existing = conn.execute(
+                "SELECT net_id FROM proxmox_nets WHERE net_id=?", (nid,)
+            ).fetchone()
+            if net_existing:
+                conn.execute(
+                    """
+                    UPDATE proxmox_nets SET
+                        config_id=?, pve_host=?, vmid=?, net_key=?,
+                        mac_address=?, ip_address=?, ip_cidr=?, gateway=?,
+                        vlan_tag=?, bridge=?, model=?, raw_str=?,
+                        ip_source=coalesce(
+                            CASE WHEN ip_source='pfsense' THEN 'pfsense' END,
+                            ?
+                        ),
+                        updated_at=datetime('now')
+                    WHERE net_id=?
+                    """,
+                    (net.get("config_id"), net.get("pve_host"), net.get("vmid"),
+                     net.get("net_key"), net.get("mac_address"), net.get("ip_address"),
+                     net.get("ip_cidr"), net.get("gateway"), net.get("vlan_tag"),
+                     net.get("bridge"), net.get("model"), net.get("raw_str"),
+                     net.get("ip_source", "conf"), nid),
+                )
+                nets_updated += 1
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO proxmox_nets
+                        (net_id, config_id, pve_host, vmid, net_key,
+                         mac_address, ip_address, ip_cidr, gateway,
+                         vlan_tag, bridge, model, raw_str, ip_source)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (nid, net.get("config_id"), net.get("pve_host"), net.get("vmid"),
+                     net.get("net_key"), net.get("mac_address"), net.get("ip_address"),
+                     net.get("ip_cidr"), net.get("gateway"), net.get("vlan_tag"),
+                     net.get("bridge"), net.get("model"), net.get("raw_str"),
+                     net.get("ip_source", "conf")),
+                )
+                nets_created += 1
+            net_row = conn.execute(
+                "SELECT * FROM proxmox_nets WHERE net_id=?", (nid,)
+            ).fetchone()
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE" if net_existing else "INSERT",
+                "proxmox_nets", nid, dict(net_row), gen,
+            )
+
     return {
         "created": created,
         "updated": updated,
         "total": created + updated,
+        "nets_created": nets_created,
+        "nets_updated": nets_updated,
         "pve_hosts_probed": stats_raw.get("pve_hosts_probed", 0),
         "conf_files_read": stats_raw.get("conf_files_read", 0),
     }
