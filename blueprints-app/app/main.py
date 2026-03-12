@@ -36,6 +36,7 @@ from .routes_services import router as services_router
 from .routes_backup import router as backup_router
 from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_proxmox_config import router as proxmox_config_router
+from .routes_proxmox_nets   import router as proxmox_nets_router
 from .routes_dockge_stacks import router as dockge_stacks_router
 from .routes_caddy_configs import router as caddy_configs_router
 from .routes_settings   import router as settings_router
@@ -357,6 +358,7 @@ def create_app() -> FastAPI:
     application.include_router(backup_router,   prefix="/api/v1")
     application.include_router(pfsense_dns_router,    prefix="/api/v1")
     application.include_router(proxmox_config_router, prefix="/api/v1")
+    application.include_router(proxmox_nets_router,   prefix="/api/v1")
     application.include_router(dockge_stacks_router,  prefix="/api/v1")
     application.include_router(caddy_configs_router,  prefix="/api/v1")
     application.include_router(settings_router,       prefix="/api/v1")

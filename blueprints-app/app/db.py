@@ -172,6 +172,30 @@ CREATE TABLE IF NOT EXISTS caddy_configs (
 CREATE INDEX IF NOT EXISTS idx_caddy_configs_vmid
     ON caddy_configs(source_vmid);
 
+CREATE TABLE IF NOT EXISTS proxmox_nets (
+    net_id        TEXT PRIMARY KEY,   -- "{config_id}_net{N}" e.g. "pve1_100_net0"
+    config_id     TEXT NOT NULL,      -- FK → proxmox_config.config_id
+    pve_host      TEXT NOT NULL,
+    vmid          INTEGER NOT NULL,
+    net_key       TEXT NOT NULL,      -- "net0", "net1" …
+    mac_address   TEXT,
+    ip_address    TEXT,               -- parsed (no CIDR); may be filled from pfsense
+    ip_cidr       TEXT,               -- raw "x.x.x.x/24"
+    gateway       TEXT,
+    vlan_tag      INTEGER,
+    bridge        TEXT,               -- "vmbr0" etc.
+    model         TEXT,               -- "virtio", "e1000" etc.
+    raw_str       TEXT,               -- full raw net line value
+    ip_source     TEXT DEFAULT 'conf', -- 'conf' | 'pfsense' | 'manual'
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_proxmox_nets_config
+    ON proxmox_nets(config_id);
+CREATE INDEX IF NOT EXISTS idx_proxmox_nets_mac
+    ON proxmox_nets(mac_address);
+
 CREATE TABLE IF NOT EXISTS settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL DEFAULT '',
@@ -237,6 +261,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("proxmox_config", "portainer_method",  "TEXT"),
         ("proxmox_config", "has_caddy",         "INTEGER DEFAULT 0"),
         ("proxmox_config", "caddy_conf_path",   "TEXT"),
+        # proxmox_nets: per-interface network rows (2026-03-12)
+        # (table created in DDL above; no ALTER TABLE needed for it)
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

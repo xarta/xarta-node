@@ -214,6 +214,61 @@ for vm_type, conf_dir in [("lxc", "/etc/pve/lxc"), ("qemu", "/etc/pve/qemu-serve
         if vm_type == "lxc" and status == "running":
             running_lxc_vmids.append(vmid)
 
+# ── Build per-interface nets records ─────────────────────────────────────────
+nets = []
+for e in entries:
+    e_id   = e["config_id"]
+    e_host = e["pve_host"]
+    e_vmid = e["vmid"]
+    raw    = e.get("raw_conf", "")
+    # Re-parse net lines from raw_conf (already in p but we rebuild per-entry)
+    net_p = {}
+    in_snap = False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'): continue
+        if line.startswith('['): in_snap = True; continue
+        if in_snap: continue
+        if ':' in line:
+            k, _, v = line.partition(':')
+            net_p[k.strip()] = v.strip()
+    net_keys = sorted([k for k in net_p if re.match(r'^net\d+$', k)])
+    for nk in net_keys:
+        raw_str  = net_p[nk]
+        n_mac = n_ip = n_cidr = n_gw = n_bridge = n_model = ""
+        n_vlan = None
+        for part in raw_str.split(','):
+            part = part.strip()
+            if part.startswith("ip=") and not part.startswith("ip6="):
+                n_cidr = part[3:]
+                n_ip   = n_cidr.split('/')[0]
+            elif part.startswith("gw="):
+                n_gw = part[3:]
+            elif re.match(r'^(hwaddr|virtio|e1000|e1000e|rtl8139|vmxnet3|ne2k_pci)=', part):
+                n_model = part.split('=',1)[0]
+                n_mac   = part.split('=',1)[1].split(',')[0].upper()
+            elif part.startswith("bridge="):
+                n_bridge = part[7:]
+            elif part.startswith("tag="):
+                try: n_vlan = int(part[4:])
+                except ValueError: pass
+        nets.append({
+            "net_id":      f"{e_id}_{nk}",
+            "config_id":   e_id,
+            "pve_host":    e_host,
+            "vmid":        e_vmid,
+            "net_key":     nk,
+            "mac_address": n_mac or None,
+            "ip_address":  n_ip or None,
+            "ip_cidr":     n_cidr or None,
+            "gateway":     n_gw or None,
+            "vlan_tag":    n_vlan,
+            "bridge":      n_bridge or None,
+            "model":       n_model or None,
+            "raw_str":     raw_str,
+            "ip_source":   "conf",
+        })
+
 # ── Parallel service detection for running LXCs ───────────────────────────────
 if running_lxc_vmids:
     sys.stderr.write(f"  [detect] checking {len(running_lxc_vmids)} running LXC(s) for Docker/Dockge/Portainer/Caddy\n")
@@ -232,7 +287,7 @@ if running_lxc_vmids:
                 e["has_caddy"]         = result.get("has_caddy", 0)
                 e["caddy_conf_path"]   = result.get("caddy_conf_path")
 
-print(json.dumps(entries))
+print(json.dumps({"entries": entries, "nets": nets}))
 PYEOF
 
 TOTAL_HOSTS=0
@@ -267,7 +322,7 @@ for host_entry in "${PVE_HOSTS[@]}"; do
             || echo "  [pve-hosts] warn: could not PATCH ${PVE_IP} — API unreachable?" >&2
     fi
 
-    COUNT=$(python3 -c "import json; print(len(json.load(open('${OUTFILE}'))))" 2>/dev/null || echo 0)
+    COUNT=$(python3 -c "import json; d=json.load(open('${OUTFILE}')); print(len(d.get('entries',d) if isinstance(d,dict) else d))" 2>/dev/null || echo 0)
     echo "  -> ${COUNT} VM/LXC configs from ${PVE_NAME}" >&2
     (( TOTAL_HOSTS += 1 )) || true
     (( TOTAL_FILES += COUNT )) || true
@@ -276,24 +331,35 @@ done
 echo "" >&2
 echo "[merge] ${TOTAL_HOSTS} host(s) probed — combining..." >&2
 
-FINAL_JSON=$(python3 - "$WORK_DIR" << 'PYEOF'
+COMBINED=$(python3 - "$WORK_DIR" << 'PYEOF'
 import json, os, sys
 tmpdir   = sys.argv[1]
-combined = []
+entries  = []
+nets     = []
 for fname in sorted(os.listdir(tmpdir)):
     if not fname.endswith('.json'):
         continue
     fpath = os.path.join(tmpdir, fname)
     try:
-        combined.extend(json.load(open(fpath)))
+        d = json.load(open(fpath))
+        if isinstance(d, dict):
+            entries.extend(d.get('entries', []))
+            nets.extend(d.get('nets', []))
+        else:
+            entries.extend(d)  # legacy plain list
     except Exception:
         pass
-print(json.dumps(combined))
+print(json.dumps({'entries': entries, 'nets': nets}))
 PYEOF
 )
 
+FINAL_JSON=$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d['entries']))" <<< "$COMBINED")
+FINAL_NETS=$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d['nets']))"   <<< "$COMBINED")
+
 TOTAL=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$FINAL_JSON" 2>/dev/null || echo 0)
-echo "  Total: ${TOTAL} entries" >&2
+TOTAL_NETS=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$FINAL_NETS" 2>/dev/null || echo 0)
+echo "  Total: ${TOTAL} entries, ${TOTAL_NETS} net interfaces" >&2
 
 echo "##ENTRIES## ${FINAL_JSON}"
-printf '##STATS## {"pve_hosts_probed":%d,"conf_files_read":%d}\n' "$TOTAL_HOSTS" "$TOTAL_FILES"
+echo "##NETS## ${FINAL_NETS}"
+printf '##STATS## {"pve_hosts_probed":%d,"conf_files_read":%d,"net_interfaces":%d}\n' "$TOTAL_HOSTS" "$TOTAL_FILES" "$TOTAL_NETS"
