@@ -179,6 +179,7 @@
     <button class="active" onclick="switchTab('services')">Services</button>
     <button onclick="switchTab('machines')">Machines</button>
     <button onclick="switchTab('nodes')">Nodes</button>
+    <button onclick="switchTab('pfsense-dns')">pfSense DNS</button>
   </nav>
 
   <!-- Services -->
@@ -258,6 +259,33 @@
     <p id="nodes-error" class="error-msg" hidden></p>
   </section>
 
+  <!-- pfSense DNS -->
+  <section id="tab-pfsense-dns" class="tab-panel">
+    <h2>pfSense DNS</h2>
+    <div class="toolbar">
+      <input type="text" id="dns-search" placeholder="Filter DNS entries…" oninput="renderPfSenseDns()" />
+      <button class="secondary" onclick="loadPfSenseDns()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>IP Address</th>
+            <th>FQDN</th>
+            <th>Type</th>
+            <th>Source</th>
+            <th>MAC</th>
+            <th>Active</th>
+            <th>Last Seen</th>
+            <th>Last Probed</th>
+          </tr>
+        </thead>
+        <tbody id="dns-tbody"></tbody>
+      </table>
+    </div>
+    <p id="dns-error" class="error-msg" hidden></p>
+  </section>
+
   <!-- Sync status -->
   <section>
     <h2>Sync status</h2>
@@ -323,6 +351,7 @@
   let _services = [];
   let _machines = [];
   let _nodes = [];
+  let _pfsenseDns = [];
 
   /* ── Tab switching ───────────────────────────────────────────────────── */
   function switchTab(tab) {
@@ -333,6 +362,7 @@
     // Lazy-load data on first view
     if (tab === 'machines' && !_machines.length) loadMachines();
     if (tab === 'nodes' && !_nodes.length) loadNodes();
+    if (tab === 'pfsense-dns' && !_pfsenseDns.length) loadPfSenseDns();
   }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
@@ -495,6 +525,52 @@
         <td><code style="font-size:11px;color:var(--text-dim)">${esc(n.machine_id || '—')}</code></td>
         <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
         <td style="color:var(--text-dim);font-size:13px">${esc(seen || '—')}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ── pfSense DNS ──────────────────────────────────────────────────────── */
+  async function loadPfSenseDns() {
+    const err = document.getElementById('dns-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/pfsense-dns');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _pfsenseDns = await r.json();
+      renderPfSenseDns();
+    } catch (e) {
+      err.textContent = `Failed to load DNS entries: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderPfSenseDns() {
+    const q = (document.getElementById('dns-search').value || '').toLowerCase();
+    const rows = _pfsenseDns.filter(d =>
+      (d.ip_address || '').toLowerCase().includes(q) ||
+      (d.fqdn || '').toLowerCase().includes(q) ||
+      (d.record_type || '').toLowerCase().includes(q) ||
+      (d.source || '').toLowerCase().includes(q) ||
+      (d.mac_address || '').toLowerCase().includes(q)
+    );
+    const tbody = document.getElementById('dns-tbody');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No DNS entries found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(d => {
+      const active = d.active ? '✓' : '✗';
+      const seen = (d.last_seen || '—').replace('T',' ').slice(0,19);
+      const probed = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      return `<tr>
+        <td><code>${esc(d.ip_address || '')}</code></td>
+        <td>${esc(d.fqdn || '')}</td>
+        <td>${esc(d.record_type || '')}</td>
+        <td>${esc(d.source || '')}</td>
+        <td><code>${esc(d.mac_address || '—')}</code></td>
+        <td style="text-align:center">${active}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(seen)}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
       </tr>`;
     }).join('');
   }

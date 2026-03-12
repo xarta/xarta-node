@@ -149,6 +149,45 @@ class NodeOut(BaseModel):
     created_at: str
 
 
+# ── pfSense DNS ───────────────────────────────────────────────────────────────
+
+class PfSenseDnsCreate(BaseModel):
+    dns_entry_id: str               # composite key: "{ip}:{fqdn}"
+    ip_address: str
+    fqdn: str
+    record_type: Optional[str] = None   # host_override | host_override_alias | dhcp_lease | domain_override
+    source: Optional[str] = None        # config file name or source identifier
+    mac_address: Optional[str] = None
+    active: int = 1
+    last_seen: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class PfSenseDnsUpdate(BaseModel):
+    ip_address: Optional[str] = None
+    fqdn: Optional[str] = None
+    record_type: Optional[str] = None
+    source: Optional[str] = None
+    mac_address: Optional[str] = None
+    active: Optional[int] = None
+    last_seen: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class PfSenseDnsOut(BaseModel):
+    dns_entry_id: str
+    ip_address: str
+    fqdn: str
+    record_type: Optional[str] = None
+    source: Optional[str] = None
+    mac_address: Optional[str] = None
+    active: Optional[int] = 1
+    last_seen: Optional[str] = None
+    last_probed: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):

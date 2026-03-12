@@ -80,6 +80,25 @@ CREATE TABLE IF NOT EXISTS sync_queue (
 
 CREATE INDEX IF NOT EXISTS idx_sync_queue_target
     ON sync_queue(target_node_id, sent, queue_id);
+
+CREATE TABLE IF NOT EXISTS pfsense_dns (
+    dns_entry_id  TEXT PRIMARY KEY,
+    ip_address    TEXT NOT NULL,
+    fqdn          TEXT NOT NULL,
+    record_type   TEXT,
+    source        TEXT,
+    mac_address   TEXT,
+    active        INTEGER DEFAULT 1,
+    last_seen     TEXT DEFAULT (datetime('now')),
+    last_probed   TEXT DEFAULT (datetime('now')),
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pfsense_dns_ip
+    ON pfsense_dns(ip_address);
+CREATE INDEX IF NOT EXISTS idx_pfsense_dns_fqdn
+    ON pfsense_dns(fqdn);
 """
 
 _SEED_SQL = """
