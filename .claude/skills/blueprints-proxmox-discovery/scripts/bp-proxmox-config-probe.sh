@@ -159,6 +159,22 @@ for host_entry in "${PVE_HOSTS[@]}"; do
         < "$REMOTE_PY" > "$OUTFILE" \
         || { echo "  WARNING: SSH/python3 failed for ${PVE_IP} — skipping" >&2; rm -f "$OUTFILE"; continue; }
 
+    # ── Patch pve_hosts record now that we know SSH works ────────────────
+    # Fetch pveversion and hostname in one ssh call; gracefully skip on error
+    PVE_META=$(ssh "${SSH_OPTS[@]}" "root@${PVE_IP}" \
+        'printf "%s\t%s\n" "$(pveversion --verbose 2>/dev/null | head -1 || pveversion 2>/dev/null | head -1)" "$(hostname -s 2>/dev/null)"' \
+        2>/dev/null || echo "")
+    if [[ -n "$PVE_META" ]]; then
+        PVE_VER=$(echo "$PVE_META" | cut -f1 | sed 's/^proxmox-ve: //' | xargs)
+        PVE_HOSTNAME=$(echo "$PVE_META" | cut -f2 | xargs)
+        PATCH_BODY=$(python3 -c "import json; print(json.dumps({'ssh_reachable':1,'version':'''${PVE_VER}''','hostname':'''${PVE_HOSTNAME}'''}))")
+        curl -sf -X PUT "${API_BASE}/api/v1/pve-hosts/${PVE_IP}" \
+            -H "Content-Type: application/json" \
+            -d "$PATCH_BODY" > /dev/null \
+            && echo "  [pve-hosts] patched ${PVE_IP}: version=${PVE_VER} hostname=${PVE_HOSTNAME} ssh=1" >&2 \
+            || echo "  [pve-hosts] warn: could not PATCH ${PVE_IP} — API unreachable?" >&2
+    fi
+
     COUNT=$(python3 -c "import json; print(len(json.load(open('${OUTFILE}'))))" 2>/dev/null || echo 0)
     echo "  -> ${COUNT} VM/LXC configs from ${PVE_NAME}" >&2
     (( TOTAL_HOSTS += 1 )) || true
