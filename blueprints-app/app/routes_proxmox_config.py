@@ -395,6 +395,10 @@ async def probe_proxmox_config() -> dict:
                 "INSERT OR IGNORE INTO vlans (vlan_id, cidr, cidr_inferred) VALUES (?,?,1)",
                 (vt, inferred),
             )
+            conn.execute(
+                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                (inferred, vt),
+            )
             vlan_row = conn.execute(
                 "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
             ).fetchone()
