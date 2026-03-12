@@ -326,7 +326,9 @@
       <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
       <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
       <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
-      <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()">⇑ Fill IPs from pfSense</button>
+      <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()" hidden>⇑ Fill IPs from pfSense</button>
+      <button class="secondary" id="pve-expand-all-btn" onclick="setAllNets(true)" hidden>&#9660; Expand all</button>
+      <button class="secondary" id="pve-collapse-all-btn" onclick="setAllNets(false)" hidden>&#9650; Collapse all</button>
     </div>
     <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
@@ -850,10 +852,20 @@
       (d.tags     || '').toLowerCase().includes(q)
     );
     const tbody = document.getElementById('pve-tbody');
+    const enrichBtn      = document.getElementById('pve-enrich-btn');
+    const expandAllBtn   = document.getElementById('pve-expand-all-btn');
+    const collapseAllBtn = document.getElementById('pve-collapse-all-btn');
     if (!rows.length) {
       tbody.innerHTML = `<tr class="empty-row"><td colspan="11">No Proxmox configs found.</td></tr>`;
+      if (enrichBtn)      enrichBtn.hidden      = true;
+      if (expandAllBtn)   expandAllBtn.hidden   = true;
+      if (collapseAllBtn) collapseAllBtn.hidden = true;
       return;
     }
+    const hasAnyNets = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
+    if (enrichBtn)      enrichBtn.hidden      = false;
+    if (expandAllBtn)   expandAllBtn.hidden   = !hasAnyNets;
+    if (collapseAllBtn) collapseAllBtn.hidden = !hasAnyNets;
     tbody.innerHTML = rows.flatMap(d => {
       const probed  = (d.last_probed || '—').replace('T',' ').slice(0,19);
       const safeid  = d.config_id.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -929,6 +941,17 @@
     const open = detail.style.display !== 'none';
     detail.style.display = open ? 'none' : 'table-row';
     if (btn) btn.textContent = btn.textContent.replace(open ? '▼' : '▶', open ? '▶' : '▼');
+  }
+
+  function setAllNets(open) {
+    document.querySelectorAll('[id^="nets-detail-"]').forEach(detail => {
+      const safeid = detail.id.replace('nets-detail-', '');
+      const btn    = document.getElementById(`nets-btn-${safeid}`);
+      detail.style.display = open ? 'table-row' : 'none';
+      if (btn) {
+        btn.textContent = btn.textContent.replace(open ? '▶' : '▼', open ? '▼' : '▶');
+      }
+    });
   }
 
   async function loadProxmoxNets() {

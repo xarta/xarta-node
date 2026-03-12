@@ -48,12 +48,23 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # Receives via stdin when called as: ssh host python3 /dev/stdin ARGS < script
 REMOTE_PY="$WORK_DIR/remote_probe.py"
 cat > "$REMOTE_PY" << 'PYEOF'
-import sys, os, json, re, subprocess
+import sys, os, json, re, subprocess, ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 pve_ip   = sys.argv[1]
 pve_name = sys.argv[2]
 ts       = sys.argv[3]
+
+# ── Known VLAN → CIDR map (passed from caller's env) ─────────────────────────
+# Format: "<vlan_id>:<cidr>[,<vlan_id>:<cidr>…]"  e.g. "10:10.0.10.0/24,20:10.0.20.0/24"
+_vlan_cidrs_raw = sys.argv[4] if len(sys.argv) > 4 else ""
+_known_vlan_cidrs = {}  # {vlan_id_int: IPv4Network}
+for _vc in _vlan_cidrs_raw.split(','):
+    _vc = _vc.strip()
+    if ':' not in _vc: continue
+    _vid, _, _cidr = _vc.partition(':')
+    try: _known_vlan_cidrs[int(_vid)] = ipaddress.ip_network(_cidr, strict=False)
+    except ValueError: pass
 
 # ── Get VM/LXC statuses from local PVE API ───────────────────────────────────
 def _pvesh_statuses(vm_type_arg):
@@ -252,6 +263,16 @@ for e in entries:
             elif part.startswith("tag="):
                 try: n_vlan = int(part[4:])
                 except ValueError: pass
+        # If no VLAN tag in config, infer from known VLAN CIDRs by IP
+        if n_vlan is None and n_ip and _known_vlan_cidrs:
+            try:
+                addr = ipaddress.ip_address(n_ip)
+                for _vid, _net in _known_vlan_cidrs.items():
+                    if addr in _net:
+                        n_vlan = _vid
+                        break
+            except ValueError:
+                pass
         nets.append({
             "net_id":      f"{e_id}_{nk}",
             "config_id":   e_id,
@@ -302,7 +323,7 @@ for host_entry in "${PVE_HOSTS[@]}"; do
 
     # python3 /dev/stdin reads the script from stdin; argv goes after --
     ssh "${SSH_OPTS[@]}" "root@${PVE_IP}" \
-        python3 /dev/stdin "$PVE_IP" "$PVE_NAME" "$TIMESTAMP" \
+        python3 /dev/stdin "$PVE_IP" "$PVE_NAME" "$TIMESTAMP" "${VLAN_CIDRS:-}" \
         < "$REMOTE_PY" > "$OUTFILE" \
         || { echo "  WARNING: SSH/python3 failed for ${PVE_IP} — skipping" >&2; rm -f "$OUTFILE"; continue; }
 
