@@ -328,7 +328,9 @@
       <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
       <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
       <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()" hidden>⇑ Fill IPs from pfSense</button>
+      <button class="secondary" id="pve-enrich-arp-btn" onclick="enrichFromPfsenseArp()" hidden>⇑ Fill IPs from pfSense ARP</button>
       <button class="secondary" id="pve-findips-btn" onclick="findIpsByArp()" hidden>&#128270; Find IPs by ARP</button>
+      <button class="secondary" id="pve-findips-pve-btn" onclick="findIpsViaPve()" hidden>&#128270; Find IPs via PVE</button>
       <button class="secondary" id="pve-expand-all-btn" onclick="setAllNets(true)" hidden>&#9660; Expand all</button>
       <button class="secondary" id="pve-collapse-all-btn" onclick="setAllNets(false)" hidden>&#9650; Collapse all</button>
     </div>
@@ -918,6 +920,62 @@
     }
   }
 
+  async function findIpsViaPve() {
+    const btn    = document.getElementById('pve-findips-pve-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Scanning via PVE…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-pve', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ PVE scan complete — ${d.message}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      if (d.found > 0 || d.vlans_added?.length) {
+        await loadProxmoxNets();
+        renderProxmoxConfig();
+        await loadVlans();
+      }
+    } catch (e) {
+      status.textContent = `✗ PVE scan failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🔎 Find IPs via PVE';
+    }
+  }
+
+  async function enrichFromPfsenseArp() {
+    const btn    = document.getElementById('pve-enrich-arp-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Reading pfSense ARP…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-nets/enrich-from-pfsense-arp', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ pfSense ARP — ${d.message}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      if (d.enriched > 0) {
+        await loadProxmoxNets();
+        renderProxmoxConfig();
+        await loadVlans();
+      }
+    } catch (e) {
+      status.textContent = `✗ pfSense ARP failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⇑ Fill IPs from pfSense ARP';
+    }
+  }
+
   async function loadProxmoxConfig() {
     const err = document.getElementById('pve-error');
     err.hidden = true;
@@ -966,13 +1024,17 @@
     );
     const tbody = document.getElementById('pve-tbody');
     const enrichBtn      = document.getElementById('pve-enrich-btn');
+    const enrichArpBtn   = document.getElementById('pve-enrich-arp-btn');
     const findIpsBtn     = document.getElementById('pve-findips-btn');
+    const findIpsPveBtn  = document.getElementById('pve-findips-pve-btn');
     const expandAllBtn   = document.getElementById('pve-expand-all-btn');
     const collapseAllBtn = document.getElementById('pve-collapse-all-btn');
     if (!rows.length) {
       tbody.innerHTML = `<tr class="empty-row"><td colspan="11">No Proxmox configs found.</td></tr>`;
       if (enrichBtn)      enrichBtn.hidden      = true;
+      if (enrichArpBtn)   enrichArpBtn.hidden   = true;
       if (findIpsBtn)     findIpsBtn.hidden     = true;
+      if (findIpsPveBtn)  findIpsPveBtn.hidden  = true;
       if (expandAllBtn)   expandAllBtn.hidden   = true;
       if (collapseAllBtn) collapseAllBtn.hidden = true;
       return;
@@ -980,7 +1042,9 @@
     const hasAnyNets    = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
     const hasMissingIps = Object.values(_proxmoxNetsMap).flat().some(n => !n.ip_address);
     if (enrichBtn)      enrichBtn.hidden      = false;
+    if (enrichArpBtn)   enrichArpBtn.hidden   = !hasMissingIps;
     if (findIpsBtn)     findIpsBtn.hidden     = !hasMissingIps;
+    if (findIpsPveBtn)  findIpsPveBtn.hidden  = !hasMissingIps;
     if (expandAllBtn)   expandAllBtn.hidden   = !hasAnyNets;
     if (collapseAllBtn) collapseAllBtn.hidden = !hasAnyNets;
     tbody.innerHTML = rows.flatMap(d => {

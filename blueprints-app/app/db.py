@@ -287,6 +287,44 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             log.info("migration: added column %s.%s", table, column)
 
 
+def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
+    """
+    Idempotent: ensure every vlan_tag in proxmox_nets has a row in vlans.
+    Runs at startup so the vlans table survives a full-DB restore from a peer
+    that had proxmox_nets data but not vlans.
+    Also applies VLAN_CIDRS env var to fill in any NULL cidrs.
+    """
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO vlans (vlan_id, cidr_inferred)
+        SELECT DISTINCT vlan_tag, 0
+        FROM proxmox_nets
+        WHERE vlan_tag IS NOT NULL
+        """
+    )
+    seeded = conn.execute("SELECT changes()").fetchone()[0]
+    if seeded:
+        log.info("startup: seeded %d vlans row(s) from proxmox_nets", seeded)
+
+    # Apply VLAN_CIDRS env var to fill in missing CIDRs
+    vlan_cidrs_raw = os.environ.get("VLAN_CIDRS", "")
+    if vlan_cidrs_raw:
+        for part in vlan_cidrs_raw.split(","):
+            part = part.strip()
+            if ":" not in part:
+                continue
+            tag_str, cidr = part.split(":", 1)
+            try:
+                tag = int(tag_str.strip())
+            except ValueError:
+                continue
+            cidr = cidr.strip()
+            conn.execute(
+                "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
+                (cidr, tag),
+            )
+
+
 def init_db() -> None:
     """Create schema, run migrations, and seed sync_meta on first use."""
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -294,6 +332,7 @@ def init_db() -> None:
         conn.executescript(_SCHEMA_SQL)
         conn.executescript(_SEED_SQL)
         _run_migrations(conn)
+        _seed_vlans_from_proxmox_nets(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 
 
