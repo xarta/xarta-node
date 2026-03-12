@@ -193,29 +193,40 @@ async def enrich_nets_from_pfsense() -> dict:
 @router.post("/find-ips-by-arp", response_model=dict)
 async def find_ips_by_arp() -> dict:
     """
-    Parallel ARP scan per VLAN: for each proxmox_nets row missing an IP address
-    that has a known vlan_tag, look up the CIDR from the vlans table and run
-    'nmap -sn <cidr>' to discover MAC→IP mappings.  Matching rows are updated
-    with ip_source='arp-scan'.
+    For every IP in every known VLAN CIDR, send a live ARP request via
+    'arping -c 1 -w 1 <ip>' (Layer 2 probe — not a cache read).  Collect
+    the MAC from each reply and match against proxmox_nets rows missing an IP.
 
-    All VLAN scans run concurrently.
+    arping (iputils-arping) is auto-installed if not present.
+    All probes run concurrently.
     """
     import asyncio
     import ipaddress
     import re
+    import shutil
+    import subprocess
 
+    # ── Ensure arping is present ──────────────────────────────────────────────
+    if not shutil.which("arping"):
+        subprocess.run(
+            ["apt-get", "install", "-y", "iputils-arping"],
+            capture_output=True,
+        )
+    if not shutil.which("arping"):
+        return {"scanned": 0, "found": 0, "message": "arping not available and could not be installed"}
+
+    # ── Load missing rows and known VLAN CIDRs from DB ───────────────────────
     with get_conn() as conn:
         missing = conn.execute(
             """
             SELECT net_id, vlan_tag, mac_address
             FROM proxmox_nets
             WHERE (ip_address IS NULL OR ip_address = '')
-              AND vlan_tag IS NOT NULL
               AND mac_address IS NOT NULL
             """
         ).fetchall()
         if not missing:
-            return {"scanned": 0, "found": 0, "message": "No missing IPs with known VLANs"}
+            return {"scanned": 0, "found": 0, "message": "No proxmox_nets rows have missing IPs"}
 
         vlan_cidrs: dict[int, str] = {
             row["vlan_id"]: row["cidr"]
@@ -224,88 +235,86 @@ async def find_ips_by_arp() -> dict:
             ).fetchall()
         }
 
-    # Group missing nets by vlan_tag (only those with a known CIDR)
-    by_vlan: dict[int, list[dict]] = {}
-    for row in missing:
-        vt = row["vlan_tag"]
-        if vt not in vlan_cidrs:
-            continue
-        by_vlan.setdefault(vt, []).append(
-            {"net_id": row["net_id"], "mac": (row["mac_address"] or "").upper()}
-        )
+    if not vlan_cidrs:
+        return {"scanned": 0, "found": 0, "message": "No VLANs with known CIDRs configured"}
 
-    if not by_vlan:
-        return {"scanned": 0, "found": 0, "message": "No VLANs with known CIDRs for missing IPs"}
+    # Build index of MAC → missing row for fast lookup
+    mac_to_row: dict[str, dict] = {
+        (row["mac_address"] or "").upper(): row for row in missing
+    }
 
-    async def scan_vlan(cidr: str) -> dict[str, str]:
-        """Returns {MAC_UPPER: ip_address} discovered by nmap ARP scan."""
-        mac_to_ip: dict[str, str] = {}
+    # ── arping every IP in every VLAN CIDR concurrently ──────────────────────
+    async def arping_ip(ip: str) -> tuple[str, str | None]:
+        """Returns (ip, mac_upper) or (ip, None) if no reply."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "nmap", "-sn", cidr,
+                "arping", "-c", "1", "-w", "0.3", ip,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1)
             text = stdout.decode(errors="replace")
-            current_ip: str | None = None
-            for line in text.splitlines():
-                m_ip = re.search(
-                    r"Nmap scan report for (?:\S+ \()?(\d+\.\d+\.\d+\.\d+)\)?", line
-                )
-                if m_ip:
-                    current_ip = m_ip.group(1)
-                    continue
-                m_mac = re.search(r"MAC Address:\s+([0-9A-Fa-f:]{17})", line)
-                if m_mac and current_ip:
-                    mac_to_ip[m_mac.group(1).upper()] = current_ip
-                    current_ip = None
+            # arping output: "Unicast reply from 10.0.0.1 [AA:BB:CC:DD:EE:FF]  0.787ms"
+            m = re.search(r"\[([0-9A-Fa-f:]{17})\]", text)
+            if m:
+                return ip, m.group(1).upper()
         except Exception:
             pass
-        return mac_to_ip
+        return ip, None
 
-    # Run all VLAN scans in parallel
-    vlan_ids = list(by_vlan.keys())
-    scan_results = await asyncio.gather(*[scan_vlan(vlan_cidrs[vt]) for vt in vlan_ids])
-    results: dict[int, dict[str, str]] = dict(zip(vlan_ids, scan_results))
+    all_ips: list[str] = []
+    for cidr in vlan_cidrs.values():
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            all_ips.extend(str(h) for h in net.hosts())
+        except ValueError:
+            pass
 
-    # Update matching rows
+    results = await asyncio.gather(*[arping_ip(ip) for ip in all_ips])
+
+    # ── Match replies against missing rows and update DB ─────────────────────
     found = 0
+    vlans_hit: set[int] = set()
+
     with get_conn() as conn:
         gen = increment_gen(conn, "arp-scan")
-        for vt in vlan_ids:
-            mac_to_ip = results.get(vt, {})
-            cidr_str  = vlan_cidrs[vt]
-            try:
-                prefix = ipaddress.ip_network(cidr_str, strict=False).prefixlen
-            except ValueError:
-                prefix = 24
-            for net in by_vlan[vt]:
-                ip = mac_to_ip.get(net["mac"])
-                if not ip:
-                    continue
-                ip_cidr = f"{ip}/{prefix}"
-                conn.execute(
-                    """
-                    UPDATE proxmox_nets SET
-                        ip_address=?, ip_cidr=?, ip_source='arp-scan',
-                        updated_at=datetime('now')
-                    WHERE net_id=?
-                    """,
-                    (ip, ip_cidr, net["net_id"]),
-                )
-                row = conn.execute(
-                    "SELECT * FROM proxmox_nets WHERE net_id=?", (net["net_id"],)
-                ).fetchone()
-                enqueue_for_all_peers(
-                    conn, "UPDATE", "proxmox_nets", net["net_id"], dict(row), gen
-                )
-                found += 1
+        for ip, mac in results:
+            if mac is None:
+                continue
+            row = mac_to_row.get(mac)
+            if row is None:
+                continue
+            # Derive prefix from VLAN CIDR
+            vt = row["vlan_tag"]
+            prefix = 24
+            if vt is not None and vt in vlan_cidrs:
+                try:
+                    prefix = ipaddress.ip_network(vlan_cidrs[vt], strict=False).prefixlen
+                except ValueError:
+                    pass
+            ip_cidr = f"{ip}/{prefix}"
+            conn.execute(
+                """
+                UPDATE proxmox_nets SET
+                    ip_address=?, ip_cidr=?, ip_source='arp-scan',
+                    updated_at=datetime('now')
+                WHERE net_id=?
+                """,
+                (ip, ip_cidr, row["net_id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM proxmox_nets WHERE net_id=?", (row["net_id"],)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "proxmox_nets", row["net_id"], dict(updated), gen)
+            found += 1
+            if vt is not None:
+                vlans_hit.add(vt)
 
     return {
-        "scanned": len(by_vlan),
+        "scanned": len(all_ips),
         "found": found,
-        "vlan_details": {str(vt): len(nets) for vt, nets in by_vlan.items()},
+        "vlans_hit": sorted(vlans_hit),
+        "message": f"arping'd {len(all_ips)} IPs across {len(vlan_cidrs)} VLANs, matched {found} MAC(s)",
     }
 
 
