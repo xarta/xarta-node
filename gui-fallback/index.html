@@ -1140,7 +1140,7 @@
     tbody.innerHTML = _pveHosts.map(h => {
       const scanned = (h.last_scanned || '—').replace('T',' ').slice(0,19);
       const ssh     = h.ssh_reachable ? '✅' : '—';
-      const name    = esc(h.pve_name || h.pve_id);
+      const name    = esc(h.pve_name || h.hostname || h.pve_id);
       return `<tr>
         <td><code>${esc(h.ip_address)}</code></td>
         <td>${name}</td>
