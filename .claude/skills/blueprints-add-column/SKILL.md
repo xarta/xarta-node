@@ -42,7 +42,7 @@ SQLite `ALTER TABLE ADD COLUMN` rules:
 - Use `TEXT` for strings, JSON arrays/objects (stored as JSON text), and optional flags.
 - Use `INTEGER` for numeric or boolean (0/1) values.
 - `PRIMARY KEY` and `UNIQUE` constraints are not supported via ALTER — those need
-  a new table migration (out of scope here).
+  a new table migration. See the **blueprints-add-table** skill for that.
 
 ---
 
