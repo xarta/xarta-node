@@ -21,6 +21,39 @@ firewall rules, etc.).
 - The `pfsense_dns` table must exist in the schema (created automatically on
   app startup via `db.py` DDL).
 
+## pfSense Runtime Constraint — No Python
+
+**pfSense runs FreeBSD and has no Python interpreter.** Never try to run Python
+scripts remotely on pfSense. Remote scripts must be written in **PHP** (always
+available on pfSense) or POSIX shell.
+
+The standard pattern for sending a multi-line PHP script over SSH:
+
+```python
+import base64, subprocess
+
+script = r"""
+<?php
+// your PHP here
+"""
+enc = base64.b64encode(script.encode()).decode()
+result = subprocess.run(
+    ["ssh", "-i", key_path, "-o", "StrictHostKeyChecking=no",
+     ssh_target, f"echo '{enc}' | b64decode -r | php"],
+    capture_output=True, text=True, timeout=60
+)
+```
+
+## Environment Variables
+
+Set in `.env` on the node running probes (do **not** add to `.env.example`):
+
+| Variable | Purpose |
+|----------|---------|
+| `PFSENSE_SSH_TARGET` | `user@host` for primary pfSense. Same key as below. |
+| `PFSENSE_SSH_KEY` | Path to SSH private key for pfSense authentication |
+| `PFSENSE_CLOUSEAU_SSH_TARGET` | `user@host` for a separate pfSense appliance (e.g. a HA pair member or secondary unit not reachable as the primary). Uses the same `PFSENSE_SSH_KEY`. Only set on nodes that need to probe it. |
+
 ## Safety Rules
 
 1. **DO NOT** overwrite, edit, or lock any files on pfSense.
@@ -156,12 +189,46 @@ The pfSense DNS tab is available in both the fallback UI (`gui-fallback/index.ht
 and private UI (`.xarta/gui/index.html`). It displays all columns with search
 filtering.
 
+## Feature 2 — ARP Table Harvest (proxmox_nets enrichment)
+
+SSHes pfSense and reads the live ARP table to find IP↔MAC mappings, then
+updates `ip_address` on matching `proxmox_nets` rows.
+
+Endpoint: `POST /api/v1/proxmox-nets/enrich-from-pfsense-arp`
+
+The remote command run on pfSense:
+```bash
+arp -an
+```
+
+Output format (FreeBSD): `? (192.168.x.y) at aa:bb:cc:dd:ee:ff on vmx0 ...`
+
+Parsed with regex to extract IP and MAC. Each MAC is looked up in
+`proxmox_nets`; if a match without an IP is found, the IP is set and
+`ip_source` is tagged as `'arp'`. Calls `fill_vlan_tags_from_cidrs` after
+updating.
+
+Note: Only finds hosts that have **recently communicated** through pfSense
+(ARP cache is time-limited). Run after a pfSense sweep to maximise coverage.
+
+## Feature 3 — pfSense Subnet Sweep (proxmox_nets enrichment)
+
+The most powerful IP discovery method. pfSense has a leg on every VLAN.
+
+Endpoint: `POST /api/v1/proxmox-nets/find-ips-via-pfsense-sweep`
+
+A **PHP script** is base64-encoded and sent to pfSense via SSH (see PHP
+constraint above). The script:
+1. Runs `ifconfig -a` locally on pfSense to discover all VLAN CIDRs
+2. Background-pings every IP in each subnet to populate the ARP cache
+3. Reads `arp -a` to collect all discovered IP↔MAC pairs
+4. Returns JSON
+
+Results are matched against `proxmox_nets` MACs. Discovered CIDRs are also
+seeded into the `vlans` table. Calls `fill_vlan_tags_from_cidrs` at the end.
+
 ## Future Features (Planned)
 
-These are not yet implemented but the skill is designed to accommodate them:
-
-- **ARP Table Harvest** — `arp -an` on pfSense to map IP↔MAC, could enrich
-  `pfsense_dns.mac_address` or populate a new `pfsense_arp` table
 - **DHCP Leases** — parse `/var/dhcpd/var/db/dhcpd.leases` for active leases
   with MAC, IP, hostname, expiry
 - **Firewall Rules** — export active rules for documentation
