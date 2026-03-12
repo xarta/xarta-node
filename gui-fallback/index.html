@@ -904,7 +904,7 @@
         status.textContent = `⚠ ${d.message}`;
         status.style.color = 'var(--text-dim)';
       } else {
-        status.textContent = `✓ ARP scan complete — found ${d.found} IP(s) across ${d.scanned} VLAN(s)`;
+        status.textContent = `✓ ARP scan complete — ${d.message}`;
         status.style.color = 'var(--accent)';
         await loadProxmoxNets();
         renderProxmoxConfig();

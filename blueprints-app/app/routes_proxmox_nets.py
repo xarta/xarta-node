@@ -248,11 +248,11 @@ async def find_ips_by_arp() -> dict:
         """Returns (ip, mac_upper) or (ip, None) if no reply."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "arping", "-c", "1", "-w", "0.3", ip,
+                "arping", "-c", "1", "-w", "1", ip,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
             text = stdout.decode(errors="replace")
             # arping output: "Unicast reply from 10.0.0.1 [AA:BB:CC:DD:EE:FF]  0.787ms"
             m = re.search(r"\[([0-9A-Fa-f:]{17})\]", text)
