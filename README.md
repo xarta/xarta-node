@@ -10,21 +10,33 @@
 
 ## Overview
 
-Scripts and configuration for setting up an LXC container with dual-WAN
+This repo is for me and my system.  I'm sharing in case it's useful for
+anyone else too in terms of ideas.  It's unpolished, likely to mutate often,
+and relies on some skills etc. that I keep in an inner "private" repo. I might
+occasionally rebase/squash some commits where GitHub Copilot keeps revealing 
+too much information about my infrastructure - I should do a git pre-commit hook
+really ... another thing I just haven't got around to.
+
+Here we have scripts and configuration for setting up an LXC container with dual-WAN
 gateway failover and Tailscale exit-node functionality.
 
 Also - a simple SQL Lite database with automatic distribution of updates to peers.
 Intended to support things like links to other services in a homelab context.
 
+I'm still developing probes that work with the stuff I like - pfsense, docker/dockge/caddy.
+Along with LXC's and VMs.  Basic building blocks that I want to make more AI-friendly over
+time so I can give more tasks to AI so I can build the things I'm interested in when I
+have little time spread thin over many interests and projects.
+
 My home setup comprises two ISP's and their routers since I like to keep my experimentation
-mostly separate from my partner's stable internet connection.  Vendor routers connected
+mostly separate from my partner's stable/vital internet connection.  Vendor routers connected
 to a switch which then trunks them as VLANs.  I used to use a pfsense router for both 
 ISP connections more directly but I worry about if something happens to me, what would my
 non-technical partner do so I keep some things "standard".
 
 I then have a standard hardware failover router,
 but also a high-availabily pfsense pair of routers all using those ISP router vlans 
-for failover.  I prioritise one ISP for myself, while my partner is on the ISP's router's
+for failover.  I prioritise one ISP for myself, while my partner is on her ISP's router's
 LAN direct.  For my stuff I introduce double NAT which isn't a problem mostly.  
 But for reliabiliy and simpler tailscale routing, I'm using LXC's set-up to
 connect to the ISP vlans direct with scripting to failover, with a tailscale client
@@ -37,16 +49,23 @@ connectivity reliability.  It makes sense to use these LXC's for other key servi
 that would benefit from that connectivity reliability and LXC distribution.
 
 Actions are distributable via the database FIFO queue including triggering git pull.
-This repo assumes there's an "inner repo" for private assets.  
-Assuming the main GUI served by Caddy will go in the private inner repo as could reveal 
-secrets about the homelab if looking to optimise the GUI to represent homelab structure.
+This repo assumes there's an "inner repo" for private assets e.g. scripts/skills especially
+detailed with my homelab infrastructure that I'm uncomfortable sharing.  Even there some 
+"secrets" stay off of GitHub Repos.
+
+Also assuming the main GUI served by Caddy will go in the private inner repo as could reveal 
+secrets about the homelab if looking to optimise the GUI to represent homelab structure,
+but that might change if I have time to do the job better with abstraction.
 
 Very basic fallback GUI on /fallback-ui for basic interaction with database.
+SQL Lite for the basic database ... I'll be adding a separate SeekDB database later
+for more agentic capability, connecting to my local LLM, embeedings, reranker endpoints etc.
 
 **WARNING** - THIS REPO DOES NOT FOLLOW MANY SECURE PRACTICES. IT CURRENTLY ASSUMES ROOT
 ACCESS AND SERVICES WEAKLY MITIGATED BY BEING BASED ON UNPRIVILEDGED LXC'S BUT IT WOULD
 STILL BE WISE TO REFACTOR TO A NON-ROOT INFRASTRUCTURE ESPECIALLY TO PROTECT KEYS ETC.
-THAT COULD BE EXPLOITED ELSEWHERE.
+THAT COULD BE EXPLOITED ELSEWHERE.  I'LL PROBABLY TASK AN AI TO DO THAT EVENTUALLY, BUT
+COULD BE SOME TIME IN THE FUTURE.
 
 In the xarta homelab environment these nodes will work on isolated tailnets / ACL protected, and local VLAN accessibility will be strictly firewalled using the tools Proxmox provides.
 Nonetheless using root as we use it in this repo is somewhat risky.
