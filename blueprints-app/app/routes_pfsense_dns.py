@@ -150,22 +150,21 @@ _PROBE_SCRIPT = "/root/xarta-node/.claude/skills/blueprints-pfsense/scripts/bp-p
 
 def _probe_config() -> dict:
     """Return probe configuration status — used by both /probe and /probe/status."""
+    from .ssh import probe_status_for_host_type
     ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "").strip()
-    ssh_key    = os.environ.get("PFSENSE_SSH_KEY", "").strip()
-    key_present = bool(ssh_key and os.path.isfile(ssh_key))
-    configured  = bool(ssh_target and key_present)
-    reason = ""
     if not ssh_target:
-        reason = "PFSENSE_SSH_TARGET is not set in .env"
-    elif not ssh_key:
-        reason = "PFSENSE_SSH_KEY is not set in .env"
-    elif not key_present:
-        reason = f"SSH key file not found: {ssh_key} (this node may not be the probe node)"
+        return {
+            "configured":      False,
+            "ssh_target_set":  False,
+            "ssh_key_present": False,
+            "reason": "PFSENSE_SSH_TARGET is not set in .env",
+        }
+    status = probe_status_for_host_type("pfsense")
     return {
-        "configured":      configured,
-        "ssh_target_set":  bool(ssh_target),
-        "ssh_key_present": key_present,
-        "reason":          reason,
+        "configured":      status["configured"],
+        "ssh_target_set":  True,
+        "ssh_key_present": status["ssh_key_present"],
+        "reason":          status["reason"],
     }
 
 
