@@ -41,8 +41,11 @@ def _nested_proxmox_names() -> set[str]:
 
 
 def _vlan_order_case() -> str:
-    """SQL CASE fragment for VLAN-preference ordering — derived from VLAN_SOURCE_MAP."""
+    """SQL CASE fragment for VLAN-preference ordering — derived from VLAN_SOURCE_MAP.
+    Falls back to ordering by ip_address when the map is not configured."""
     vsmap = _vlan_source_map()
+    if not vsmap:
+        return "ip_address"
     parts = [f"WHEN ip_address LIKE '{p}.%' THEN {i}" for i, p in enumerate(vsmap)]
     return "CASE " + " ".join(parts) + f" ELSE {len(vsmap)} END"
 
