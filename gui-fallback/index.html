@@ -25,20 +25,26 @@
 
     /* ── Layout ── */
     header { background: var(--surface); border-bottom: 1px solid var(--border);
-             padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
-    header h1 { font-size: 18px; font-weight: 600; letter-spacing: .4px; flex: 1; }
+             padding: 10px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; }
+    header .brand { font-size: 15px; font-weight: 700; letter-spacing: .3px; white-space: nowrap;
+                    color: var(--text); flex-shrink: 0; }
     main { max-width: 1100px; margin: 0 auto; padding: 24px; }
     section { margin-bottom: 32px; }
     h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
          letter-spacing: .8px; color: var(--text-dim); margin-bottom: 12px; }
 
-    /* ── Node banner ── */
-    #node-banner { background: var(--surface); border: 1px solid var(--border);
-                   border-radius: var(--radius); padding: 14px 18px;
-                   display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 24px; }
-    .node-stat { display: flex; flex-direction: column; gap: 2px; }
-    .node-stat .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; }
-    .node-stat .value { font-size: 16px; font-weight: 600; }
+    /* ── Group tabs (top-level nav in header) ── */
+    .group-tabs { display: flex; gap: 2px; flex-shrink: 0; }
+    .group-tab { background: transparent; border: none; border-radius: var(--radius);
+                 color: var(--text-dim); font-size: 13px; font-weight: 700;
+                 text-transform: uppercase; letter-spacing: .6px; padding: 6px 12px;
+                 cursor: pointer; transition: all .15s; font-family: var(--font); }
+    .group-tab:hover { color: var(--text); background: rgba(91,156,246,.1); }
+    .group-tab.active { color: var(--accent); background: rgba(91,156,246,.12); }
+    .node-meta { display: flex; gap: 14px; align-items: center; flex-shrink: 0; margin-left: 4px; }
+    .nm-item { display: flex; align-items: center; gap: 4px; }
+    .nm-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .4px; }
+    .nm-val { font-size: 13px; font-weight: 600; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 3px;
              font-size: 11px; font-weight: 600; text-transform: uppercase; }
     .badge-ok  { background: #1a3d2a; color: var(--ok); }
@@ -139,73 +145,77 @@
     .kind-vm      { background: #1a3d2a; color: #5bf69c; }
     .kind-docker  { background: #1a2a3d; color: #5b9cf6; }
     .kind-default { background: var(--surface); color: var(--text-dim); }
-    /* ── Settings panel ── */
-    .settings-panel { background: var(--surface); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px; }
-    .settings-panel summary { cursor: pointer; font-size: 13px; font-weight: 600;
-      color: var(--text-dim); user-select: none; }
-    .settings-panel[open] summary { color: var(--text); }
-    .settings-panel .srow { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-    .settings-panel input[type=text] { flex: 1; }
-    .settings-panel .sinfo { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
   </style>
 </head>
 <body>
 
 <header>
-  <h1>&#9670; Blueprints</h1>
+  <span id="header-host" class="brand">&#9670; —</span>
+  <nav class="group-tabs">
+    <button class="group-tab active" onclick="switchGroup('synthesis')">Synthesis</button>
+    <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
+    <button class="group-tab" onclick="switchGroup('settings')">&#9881;</button>
+  </nav>
   <blueprints-node-selector></blueprints-node-selector>
+  <div class="node-meta">
+    <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
+    <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
+    <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
+  </div>
 </header>
 
 <main>
 
-  <!-- Node identity banner -->
-  <div id="node-banner">
-    <div class="node-stat">
-      <span class="label">Node</span>
-      <span class="value" id="nn-name">—</span>
-    </div>
-    <div class="node-stat">
-      <span class="label">Host</span>
-      <span class="value" id="nn-host">—</span>
-    </div>
-    <div class="node-stat">
-      <span class="label">Generation</span>
-      <span class="value" id="nn-gen">—</span>
-    </div>
-    <div class="node-stat">
-      <span class="label">Integrity</span>
-      <span class="value" id="nn-integrity">—</span>
-    </div>
-    <div class="node-stat">
-      <span class="label">Peers</span>
-      <span class="value" id="nn-peers">—</span>
-    </div>
-  </div>
 
-  <!-- Settings panel -->
-  <details id="settings-panel" class="settings-panel">
-    <summary>⚙ Settings</summary>
-    <div class="srow">
-      <label style="font-size:13px;white-space:nowrap;">Management CIDR</label>
-      <input type="text" id="settings-cidr" placeholder="e.g. 192.168.1.0/24" style="max-width:220px;" />
-      <button onclick="saveCidr()">Save</button>
-    </div>
-    <p id="settings-status" class="sinfo" hidden></p>
-  </details>
 
-  <!-- Table navigation -->
+
+
+  <!-- Secondary navigation — tabs shown change with active top-level group -->
   <nav class="table-nav">
-    <button class="active" onclick="switchTab('services')">Services</button>
-    <button onclick="switchTab('machines')">Machines</button>
-    <button onclick="switchTab('nodes')">Nodes</button>
-    <button onclick="switchTab('pfsense-dns')">pfSense DNS</button>
-    <button onclick="switchTab('proxmox-config')" id="tab-btn-proxmox-config">Proxmox Config</button>
-    <button onclick="switchTab('vlans')" id="tab-btn-vlans">VLANs</button>
-    <button onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
-    <button onclick="switchTab('caddy-configs')">Caddy Configs</button>
-    <button onclick="switchTab('pve-hosts')">PVE Hosts</button>
+    <!-- SYNTHESIS group -->
+    <button data-group="synthesis" class="active" onclick="switchTab('services')">Services</button>
+    <button data-group="synthesis" onclick="switchTab('machines')">Machines</button>
+    <!-- SETTINGS group -->
+    <button data-group="settings" style="display:none" onclick="switchTab('settings')">Settings</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('pve-hosts')">PVE Hosts</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('arp-manual')">Manual ARP</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('nodes')">Nodes</button>
+    <!-- PROBES group -->
+    <button data-group="probes" style="display:none" onclick="switchTab('pfsense-dns')">pfSense DNS</button>
+    <button data-group="probes" style="display:none" id="tab-btn-proxmox-config" onclick="switchTab('proxmox-config')">Proxmox Config</button>
+    <button data-group="probes" style="display:none" id="tab-btn-vlans" onclick="switchTab('vlans')">VLANs</button>
+    <button data-group="probes" style="display:none" onclick="switchTab('ssh-targets')">SSH Targets</button>
+    <button data-group="probes" style="display:none" onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
+    <button data-group="probes" style="display:none" onclick="switchTab('caddy-configs')">Caddy Configs</button>
   </nav>
+
+  <!-- Settings -->
+  <section id="tab-settings" class="tab-panel">
+    <h2>Settings</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Key-value configuration store. Changes sync automatically to all fleet nodes.</p>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="font-size:13px;font-weight:600;white-space:nowrap;">Management CIDR</label>
+        <input type="text" id="settings-cidr" placeholder="e.g. 192.168.1.0/24" style="max-width:220px;" />
+        <button onclick="saveCidr()">Save</button>
+        <span id="settings-status" style="font-size:12px;color:var(--text-dim)" hidden></span>
+      </div>
+      <p style="font-size:11px;color:var(--text-dim);margin-top:6px;">Used for PVE host scanning (port 8006 sweep).</p>
+    </div>
+    <div class="toolbar">
+      <button onclick="openAddSettingModal()">+ Add setting</button>
+      <button class="secondary" onclick="loadSettings()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Key</th><th>Value</th><th>Description</th><th>Updated</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="settings-tbody"></tbody>
+      </table>
+    </div>
+    <p id="settings-error" class="error-msg" hidden></p>
+  </section>
 
   <!-- Services -->
   <section id="tab-services" class="tab-panel active">
@@ -326,13 +336,20 @@
     <div class="toolbar">
       <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
       <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
-      <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
-      <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()" hidden>⇑ Fill IPs from pfSense</button>
-      <button class="secondary" id="pve-enrich-arp-btn" onclick="enrichFromPfsenseArp()" hidden>⇑ Fill IPs from pfSense ARP</button>
-      <button class="secondary" id="pve-findips-btn" onclick="findIpsByArp()" hidden>&#128270; Find IPs by ARP</button>
-      <button class="secondary" id="pve-findips-pve-btn" onclick="findIpsViaPve()" hidden>&#128270; Find IPs via PVE</button>
+      <button id="pve-full-probe-btn" onclick="fullProbeProxmox()">&#9889; Full Probe</button>
+      <button class="secondary" id="pve-steps-toggle-btn" onclick="togglePveSteps()" hidden>&#9881; Steps &#9663;</button>
       <button class="secondary" id="pve-expand-all-btn" onclick="setAllNets(true)" hidden>&#9660; Expand all</button>
       <button class="secondary" id="pve-collapse-all-btn" onclick="setAllNets(false)" hidden>&#9650; Collapse all</button>
+    </div>
+    <div id="pve-steps-panel" style="display:none;flex-wrap:wrap;gap:4px;padding:4px 0 6px;border-bottom:1px solid var(--border,#30363d);margin-bottom:2px">
+      <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
+      <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()">&#8657; Fill IPs from pfSense</button>
+      <button class="secondary" id="pve-enrich-arp-btn" onclick="enrichFromPfsenseArp()">&#8657; Fill IPs from pfSense ARP</button>
+      <button class="secondary" id="pve-findips-btn" onclick="findIpsByArp()">&#128270; Find IPs by ARP</button>
+      <button class="secondary" id="pve-findips-pve-btn" onclick="findIpsViaPve()">&#128270; Find IPs via PVE</button>
+      <button class="secondary" id="pve-findips-qemu-btn" onclick="findIpsViaQemuAgent()">&#128279; Find IPs via QEMU Agent</button>
+      <button class="secondary" id="pve-findips-pfsense-sweep-btn" onclick="findIpsViaPfsenseSweep()">&#128270; Find IPs via pfSense sweep</button>
+      <button class="secondary" id="pve-probe-services-btn" onclick="probeVmServices()">&#128065; Probe VM Services</button>
     </div>
     <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
@@ -393,7 +410,7 @@
   <section id="tab-pve-hosts" class="tab-panel">
     <h2>PVE Hosts</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
-      Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in Settings above,
+      Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in the Settings tab (&#9881; group),
       then click <em>Scan for Proxmox</em>.
     </p>
     <div class="toolbar">
@@ -434,7 +451,47 @@
     <p id="vlans-error" class="error-msg" hidden></p>
   </section>
 
-  <!-- Sync status -->
+  <!-- Manual ARP -->
+  <section id="tab-arp-manual" class="tab-panel">
+    <h2>Manual ARP</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
+      Hand-entered IP ↔ MAC records for hosts that automated discovery can't reach
+      (e.g. CARP backup appliances, offline machines, odd devices).
+      Entries sync automatically to all fleet nodes.
+    </p>
+    <div class="toolbar">
+      <button onclick="addArpManualEntry()">+ Add entry</button>
+      <button class="secondary" onclick="loadArpManual()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>IP Address</th><th>MAC Address</th><th>Notes</th><th>Updated</th><th>Actions</th>
+        </tr></thead>
+        <tbody id="arp-manual-tbody"></tbody>
+      </table>
+    </div>
+    <p id="arp-manual-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- SSH Targets -->
+  <section id="tab-ssh-targets" class="tab-panel">
+    <h2>SSH Targets</h2>
+    <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+      <button id="ssh-targets-rebuild-btn" onclick="rebuildSshTargets()">&#x21BA; Rebuild from config</button>
+      <span id="ssh-targets-status" style="font-size:13px;color:var(--text-dim)"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>IP Address</th><th>Host Name</th><th>Type</th><th>Key Env Var</th><th>Source IP</th><th>Notes</th><th>Updated</th><th></th>
+        </tr></thead>
+        <tbody id="ssh-targets-tbody"></tbody>
+      </table>
+    </div>
+    <p id="ssh-targets-error" class="error-msg" hidden></p>
+  </section>
   <section>
     <h2>Sync status</h2>
     <div id="sync-panel">
@@ -494,11 +551,30 @@
   <p id="modal-error" class="error-msg" hidden></p>
 </dialog>
 
+<!-- Add / Edit setting modal -->
+<dialog id="setting-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;max-width:480px;">
+  <h2 id="setting-modal-title" style="margin-bottom:16px;">Add setting</h2>
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <label>Key <input type="text" id="setting-key" placeholder="e.g. mgmt_cidr" style="width:100%;margin-top:4px;" /></label>
+    <label>Value <input type="text" id="setting-val" placeholder="Setting value" style="width:100%;margin-top:4px;" /></label>
+    <label>Description <input type="text" id="setting-desc" placeholder="Optional description" style="width:100%;margin-top:4px;" /></label>
+  </div>
+  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('setting-modal').close()">Cancel</button>
+    <button onclick="submitSetting()">Save</button>
+  </div>
+  <p id="setting-error" class="error-msg" hidden></p>
+</dialog>
+
 <script>
   /* ── State ────────────────────────────────────────────────────────────── */
   let _services = [];
   let _machines = [];
-  let _nodes = [];
+  let _nodes    = [];
+  let _settings = [];
+  let _nodeName   = '';
+  let _activeGroup = 'synthesis';
   let _pfsenseDns = [];
   let _proxmoxConfig = [];
   let _proxmoxNetsMap = {};  // config_id -> [net, ...]
@@ -506,22 +582,43 @@
   let _caddyConfigs = [];
   let _pveHosts = [];
   let _vlans = [];
+  let _arpManual = [];
+  let _sshTargets = [];
 
-  /* ── Tab switching ───────────────────────────────────────────────────── */
+  /* ── Group + tab switching ───────────────────────────────────────────── */
+  function switchGroup(group) {
+    _activeGroup = group;
+    document.querySelectorAll('.group-tab').forEach(b =>
+      b.classList.toggle('active', b.getAttribute('onclick').includes(`'${group}'`)));
+    document.querySelectorAll('.table-nav button[data-group]').forEach(b => {
+      b.style.display = b.dataset.group === group ? '' : 'none';
+    });
+    const firstBtn = document.querySelector(`.table-nav button[data-group="${group}"]`);
+    if (firstBtn) {
+      const m = firstBtn.getAttribute('onclick').match(/switchTab\('([^']+)'\)/);
+      if (m) switchTab(m[1]);
+    }
+  }
+
   function switchTab(tab) {
     document.querySelectorAll('.table-nav button').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-    document.querySelector(`.table-nav button[onclick*="${tab}"]`).classList.add('active');
-    document.getElementById(`tab-${tab}`).classList.add('active');
+    const btn = document.querySelector(`.table-nav button[onclick*="'${tab}'"]`);
+    if (btn) btn.classList.add('active');
+    const panel = document.getElementById(`tab-${tab}`);
+    if (panel) panel.classList.add('active');
     // Lazy-load data on first view
-    if (tab === 'machines' && !_machines.length) loadMachines();
-    if (tab === 'nodes' && !_nodes.length) loadNodes();
+    if (tab === 'machines'       && !_machines.length)      loadMachines();
+    if (tab === 'nodes'          && !_nodes.length)         loadNodes();
     if (tab === 'pfsense-dns'    && !_pfsenseDns.length)    loadPfSenseDns();
     if (tab === 'proxmox-config' && !_proxmoxConfig.length) loadProxmoxConfig();
     if (tab === 'dockge-stacks'  && !_dockgeStacks.length)  loadDockgeStacks();
     if (tab === 'caddy-configs'  && !_caddyConfigs.length)  loadCaddyConfigs();
-    if (tab === 'pve-hosts'       && !_pveHosts.length)      loadPveHosts();
-    if (tab === 'vlans'           && !_vlans.length)         loadVlans();
+    if (tab === 'pve-hosts'      && !_pveHosts.length)      loadPveHosts();
+    if (tab === 'vlans'          && !_vlans.length)         loadVlans();
+    if (tab === 'arp-manual'     && !_arpManual.length)     loadArpManual();
+    if (tab === 'ssh-targets'    && !_sshTargets.length)    loadSshTargets();
+    if (tab === 'settings'       && !_settings.length)      loadSettings();
   }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
@@ -530,24 +627,43 @@
     loadServices();
     loadSyncStatus();
     loadBackups();
-    loadSettingsCidr();
     setInterval(loadHealth, 15_000);
     setInterval(loadSyncStatus, 30_000);
   });
 
-  /* ── Health / node banner ─────────────────────────────────────────────── */
+  /* ── Health / header stats ────────────────────────────────────────────── */
   async function loadHealth() {
     try {
       const r = await fetch('/health');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
-      document.getElementById('nn-name').textContent = d.node_name || d.node_id;
-      document.getElementById('nn-gen').textContent  = d.gen ?? '—';
+      _nodeName = d.node_name || d.node_id || '';
+      document.getElementById('nn-gen').textContent = d.gen ?? '—';
       const ok = d.integrity_ok;
       document.getElementById('nn-integrity').innerHTML =
         `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${ok ? 'OK' : 'FAILED'}</span>`;
+      lookupHostParent(_nodeName);
     } catch (e) {
       console.warn('health check failed:', e);
+    }
+  }
+
+  let _hostLookedUp = false;
+  async function lookupHostParent(nodeName) {
+    if (_hostLookedUp) return;
+    _hostLookedUp = true;
+    try {
+      if (!_machines.length) {
+        const r = await fetch('/api/v1/machines');
+        if (r.ok) _machines = await r.json();
+      }
+      const name = (nodeName || '').toLowerCase();
+      const m = _machines.find(m =>
+        (m.hostname || m.name || '').toLowerCase() === name);
+      const parent = (m && m.parent) ? m.parent : 'Unknown';
+      document.getElementById('header-host').textContent = `\u25C6 ${parent}`;
+    } catch (_) {
+      document.getElementById('header-host').textContent = '\u25C6 Unknown';
     }
   }
 
@@ -833,6 +949,152 @@
   }
 
   /* ── Proxmox Config ───────────────────────────────────────────────────── */
+  async function loadArpManual() {
+    const err = document.getElementById('arp-manual-error');
+    if (err) err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/arp-manual');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _arpManual = await r.json();
+      renderArpManual();
+    } catch (e) {
+      if (err) { err.textContent = `Failed to load Manual ARP: ${e.message}`; err.hidden = false; }
+    }
+  }
+
+  function renderArpManual() {
+    const tbody = document.getElementById('arp-manual-tbody');
+    if (!tbody) return;
+    if (!_arpManual.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No entries yet — click “+ Add entry” to add one.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = _arpManual.map(e => `<tr>
+      <td><code>${esc(e.ip_address)}</code></td>
+      <td><code>${esc(e.mac_address)}</code></td>
+      <td>${esc(e.notes || '')}</td>
+      <td style="color:var(--text-dim);font-size:11px">${esc((e.updated_at || '').slice(0,16).replace('T',' '))}</td>
+      <td style="white-space:nowrap">
+        <button class="secondary" style="padding:1px 6px;font-size:11px" onclick="editArpManualEntry('${esc(e.entry_id)}','${esc(e.ip_address)}','${esc(e.mac_address)}','${esc(e.notes||'')}')">✎ Edit</button>
+        <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteArpManualEntry('${esc(e.entry_id)}','${esc(e.ip_address)}')">&#x2715;</button>
+      </td>
+    </tr>`).join('');
+  }
+
+  async function addArpManualEntry() {
+    const ip  = prompt('IP Address:');
+    if (!ip) return;
+    const mac = prompt('MAC Address:');
+    if (!mac) return;
+    const notes = prompt('Notes (optional):', '') ?? '';
+    try {
+      const r = await fetch('/api/v1/arp-manual', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ ip_address: ip, mac_address: mac, notes: notes || null }),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+      _arpManual = [];
+      await loadArpManual();
+    } catch (e) { alert(`Failed to add entry: ${e.message}`); }
+  }
+
+  async function editArpManualEntry(entry_id, currentIp, currentMac, currentNotes) {
+    const ip  = prompt('IP Address:', currentIp);
+    if (ip === null) return;
+    const mac = prompt('MAC Address:', currentMac);
+    if (mac === null) return;
+    const notes = prompt('Notes (optional):', currentNotes);
+    if (notes === null) return;
+    try {
+      const r = await fetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ ip_address: ip || null, mac_address: mac || null, notes: notes || null }),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+      await loadArpManual();
+    } catch (e) { alert(`Failed to update entry: ${e.message}`); }
+  }
+
+  async function deleteArpManualEntry(entry_id, ip) {
+    if (!confirm(`Delete manual ARP entry for ${ip}?`)) return;
+    try {
+      const r = await fetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+      _arpManual = _arpManual.filter(e => e.entry_id !== entry_id);
+      renderArpManual();
+    } catch (e) { alert(`Failed to delete entry: ${e.message}`); }
+  }
+
+  /* ── SSH Targets ───────────────────────────────────────────────────────── */
+  async function loadSshTargets() {
+    const err = document.getElementById('ssh-targets-error');
+    if (err) err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/ssh-targets');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _sshTargets = await r.json();
+      renderSshTargets();
+    } catch (e) {
+      if (err) { err.textContent = `Failed to load SSH Targets: ${e.message}`; err.hidden = false; }
+    }
+  }
+
+  function renderSshTargets() {
+    const tbody = document.getElementById('ssh-targets-tbody');
+    if (!tbody) return;
+    if (!_sshTargets.length) {
+      tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-dim);text-align:center">No entries — click Rebuild to populate from config</td></tr>';
+      return;
+    }
+    const TYPE_COLOURS = {
+      'lxc-fleet': '#1d4ed8', 'lxc': '#0f766e', 'qemu': '#7c3aed',
+      'citadel': '#b91c1c', 'pve': '#92400e', 'pfsense': '#15803d'
+    };
+    tbody.innerHTML = _sshTargets.map(e => {
+      const colour = TYPE_COLOURS[e.host_type] || '#555';
+      return `<tr>
+        <td><code>${esc(e.ip_address)}</code></td>
+        <td>${esc(e.host_name || '\u2014')}</td>
+        <td><span class="tag" style="background:${colour};color:#fff">${esc(e.host_type || '?')}</span></td>
+        <td><code style="font-size:11px">${esc(e.key_env_var)}</code></td>
+        <td><code>${esc(e.source_ip || '\u2014')}</code></td>
+        <td style="font-size:11px;color:var(--text-dim)">${esc(e.notes || '\u2014')}</td>
+        <td style="font-size:11px">${esc((e.updated_at||'').slice(0,16).replace('T',' '))}</td>
+        <td><button class="secondary" onclick="deleteSshTarget('${esc(e.ip_address)}')" style="padding:2px 7px;font-size:11px">✕</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function rebuildSshTargets() {
+    const btn = document.getElementById('ssh-targets-rebuild-btn');
+    const status = document.getElementById('ssh-targets-status');
+    btn.disabled = true; btn.textContent = '\u23F3 Rebuilding\u2026';
+    try {
+      const r = await fetch('/api/v1/ssh-targets/rebuild', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `\u2713 ${d.message}`;
+      _sshTargets = [];
+      await loadSshTargets();
+    } catch (e) {
+      status.textContent = `\u2717 Rebuild failed: ${e.message}`;
+    } finally {
+      btn.disabled = false; btn.textContent = '\u21BA Rebuild from config';
+    }
+  }
+
+  async function deleteSshTarget(ip) {
+    if (!confirm(`Remove ssh_target for ${ip}?`)) return;
+    try {
+      const r = await fetch(`/api/v1/ssh-targets/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+      _sshTargets = _sshTargets.filter(e => e.ip_address !== ip);
+      renderSshTargets();
+    } catch (e) { alert(`Failed to delete: ${e.message}`); }
+  }
+
   async function loadVlans() {
     const err = document.getElementById('vlans-error');
     if (err) err.hidden = true;
@@ -976,6 +1238,66 @@
     }
   }
 
+  async function findIpsViaQemuAgent() {
+    const btn    = document.getElementById('pve-findips-qemu-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Querying QEMU agents…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-qemu-agent', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ QEMU agent — ${d.message}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      if (d.found > 0) { await loadProxmoxNets(); renderProxmoxConfig(); }
+    } catch (e) {
+      status.textContent = `✗ QEMU agent failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '\uD83D\uDD17 Find IPs via QEMU Agent';
+    }
+  }
+
+  async function findIpsViaPfsenseSweep() {
+    const btn    = document.getElementById('pve-findips-pfsense-sweep-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ pfSense sweep…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-pfsense-sweep', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ pfSense sweep — ${d.message}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      if (d.found > 0) { await loadProxmoxNets(); renderProxmoxConfig(); await loadVlans(); }
+    } catch (e) {
+      status.textContent = `✗ pfSense sweep failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '\uD83D\uDD0E Find IPs via pfSense sweep';
+    }
+  }
+
+  async function deleteProxmoxNet(net_id, net_key) {
+    if (!confirm(`Delete NIC "${net_key}" (${net_id})?\nThis removes it from Blueprints only — not from Proxmox.`)) return;
+    try {
+      const r = await fetch(`/api/v1/proxmox-nets/${encodeURIComponent(net_id)}`, { method: 'DELETE' });
+      if (!r.ok && r.status !== 204) { const d = await r.json().catch(()=>{}); throw new Error(d?.detail || `HTTP ${r.status}`); }
+      await loadProxmoxNets();
+      renderProxmoxConfig();
+    } catch (e) {
+      alert(`Failed to delete NIC: ${e.message}`);
+    }
+  }
+
   async function loadProxmoxConfig() {
     const err = document.getElementById('pve-error');
     err.hidden = true;
@@ -1023,28 +1345,18 @@
       (d.tags     || '').toLowerCase().includes(q)
     );
     const tbody = document.getElementById('pve-tbody');
-    const enrichBtn      = document.getElementById('pve-enrich-btn');
-    const enrichArpBtn   = document.getElementById('pve-enrich-arp-btn');
-    const findIpsBtn     = document.getElementById('pve-findips-btn');
-    const findIpsPveBtn  = document.getElementById('pve-findips-pve-btn');
-    const expandAllBtn   = document.getElementById('pve-expand-all-btn');
-    const collapseAllBtn = document.getElementById('pve-collapse-all-btn');
+    const stepsToggleBtn     = document.getElementById('pve-steps-toggle-btn');
+    const expandAllBtn       = document.getElementById('pve-expand-all-btn');
+    const collapseAllBtn     = document.getElementById('pve-collapse-all-btn');
     if (!rows.length) {
       tbody.innerHTML = `<tr class="empty-row"><td colspan="11">No Proxmox configs found.</td></tr>`;
-      if (enrichBtn)      enrichBtn.hidden      = true;
-      if (enrichArpBtn)   enrichArpBtn.hidden   = true;
-      if (findIpsBtn)     findIpsBtn.hidden     = true;
-      if (findIpsPveBtn)  findIpsPveBtn.hidden  = true;
+      if (stepsToggleBtn) stepsToggleBtn.hidden = true;
       if (expandAllBtn)   expandAllBtn.hidden   = true;
       if (collapseAllBtn) collapseAllBtn.hidden = true;
       return;
     }
     const hasAnyNets    = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
-    const hasMissingIps = Object.values(_proxmoxNetsMap).flat().some(n => !n.ip_address);
-    if (enrichBtn)      enrichBtn.hidden      = false;
-    if (enrichArpBtn)   enrichArpBtn.hidden   = !hasMissingIps;
-    if (findIpsBtn)     findIpsBtn.hidden     = !hasMissingIps;
-    if (findIpsPveBtn)  findIpsPveBtn.hidden  = !hasMissingIps;
+    if (stepsToggleBtn) stepsToggleBtn.hidden = false;
     if (expandAllBtn)   expandAllBtn.hidden   = !hasAnyNets;
     if (collapseAllBtn) collapseAllBtn.hidden = !hasAnyNets;
     tbody.innerHTML = rows.flatMap(d => {
@@ -1059,12 +1371,15 @@
         const firstIp = nets[0].ip_address || '—';
         netsCell = `<button class="secondary" style="padding:1px 5px;font-size:11px;margin-right:4px" onclick="toggleNets('${safeid}')" id="nets-btn-${safeid}">▶ ${nets.length}</button><code>${esc(firstIp)}</code>`;
       }
-      // Detected services badges
+      // Detected services badges — driven from JSON columns
       const badges = [];
-      if (d.has_docker)        badges.push('<span class="tag" style="background:#1d4ed8;color:#fff">docker</span>');
-      if (d.has_portainer)     badges.push(`<span class="tag" style="background:#0f766e;color:#fff">portainer${d.portainer_method ? ' ('+esc(d.portainer_method)+')' : ''}</span>`);
-      if (d.has_caddy)         badges.push('<span class="tag" style="background:#15803d;color:#fff">caddy</span>');
-      if (d.dockge_stacks_dir) badges.push(`<span class="tag" style="background:#92400e;color:#fff" title="${esc(d.dockge_stacks_dir)}">dockge</span>`);
+      const _dockge    = (() => { try { return JSON.parse(d.dockge_json    || '[]'); } catch(e) { return []; } })();
+      const _portainer = (() => { try { return JSON.parse(d.portainer_json || '[]'); } catch(e) { return []; } })();
+      const _caddy     = (() => { try { return JSON.parse(d.caddy_json     || '[]'); } catch(e) { return []; } })();
+      if (d.has_docker) badges.push('<span class="tag" style="background:#1d4ed8;color:#fff">docker</span>');
+      _portainer.forEach(p => badges.push(`<span class="tag" style="background:#0f766e;color:#fff" title="${esc(p.data_dir||p.method||'')}">portainer</span>`));
+      _caddy.forEach(c    => badges.push(`<span class="tag" style="background:#15803d;color:#fff" title="${esc(c.caddyfile||'')}">caddy</span>`));
+      _dockge.forEach(g   => badges.push(`<span class="tag" style="background:#92400e;color:#fff" title="${esc(g.stacks_dir||g.container||'')}">dockge</span>`));
       const detectedHtml = badges.length ? badges.join(' ') : '<span style="color:var(--text-dim)">—</span>';
       const mainRow = `<tr>
         <td><code>${esc(d.pve_name || '')}</code></td>
@@ -1085,7 +1400,7 @@
           const srcTag = n.ip_source && n.ip_source !== 'conf'
             ? ` <span style="color:#94a3b8;font-size:10px">(${esc(n.ip_source)})</span>` : '';
           return `<tr style="background:var(--bg-alt,#161b22)">
-            <td style="padding:2px 4px 2px 16px;color:var(--text-dim);font-size:11px">${esc(n.net_key)}</td>
+            <td style="padding:2px 4px 2px 16px;color:var(--text-dim);font-size:11px;white-space:nowrap">${esc(n.net_key)} <button class="secondary" style="padding:1px 5px;font-size:10px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteProxmoxNet('${esc(n.net_id)}','${esc(n.net_key)}')">&#x2715;</button></td>
             <td colspan="2"><code style="font-size:11px">${esc(n.ip_address || '—')}</code>${srcTag}</td>
             <td><code style="font-size:11px">${esc(n.mac_address || '—')}</code></td>
             <td style="font-size:11px">${n.vlan_tag ?? '—'}</td>
@@ -1168,6 +1483,84 @@
       status.hidden = false;
     } finally {
       btn.disabled = false;
+    }
+  }
+
+  function togglePveSteps() {
+    const panel = document.getElementById('pve-steps-panel');
+    const btn   = document.getElementById('pve-steps-toggle-btn');
+    const open  = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'flex';
+    if (btn) btn.innerHTML = open ? '&#9881; Steps &#9663;' : '&#9881; Steps &#9652;';
+  }
+
+  async function fullProbeProxmox() {
+    const btn    = document.getElementById('pve-full-probe-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Running…';
+    status.style.color = 'var(--text-dim)';
+    status.hidden = false;
+
+    // [label, url, refreshNets after step]
+    const STEPS = [
+      ['1/8 Probing PVE configs',        '/api/v1/proxmox-config/probe',                    false],
+      ['2/8 Fill IPs from pfSense',      '/api/v1/proxmox-nets/enrich-from-pfsense',         true],
+      ['3/8 Fill IPs from pfSense ARP',  '/api/v1/proxmox-nets/enrich-from-pfsense-arp',     true],
+      ['4/8 Find IPs by ARP scan',       '/api/v1/proxmox-nets/find-ips-by-arp',             true],
+      ['5/8 Find IPs via PVE API',       '/api/v1/proxmox-nets/find-ips-via-pve',            true],
+      ['6/8 Find IPs via QEMU agents',   '/api/v1/proxmox-nets/find-ips-via-qemu-agent',     true],
+      ['7/8 Find IPs via pfSense sweep', '/api/v1/proxmox-nets/find-ips-via-pfsense-sweep',  true],
+      ['8/8 Probe VM services via SSH',  '/api/v1/proxmox-config/probe-services',            false],
+    ];
+
+    const stepResults = [];
+    for (const [label, url, refreshNets] of STEPS) {
+      status.textContent = `⏳ ${label}…`;
+      try {
+        const r = await fetch(url, { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          stepResults.push(`⚠ ${label}: ${d.detail || 'HTTP ' + r.status}`);
+        } else {
+          const msg = d.message || '';
+          stepResults.push(`✓ ${label}${msg ? ': ' + msg : ''}`);
+          if (refreshNets) { await loadProxmoxNets(); renderProxmoxConfig(); }
+        }
+      } catch (e) {
+        stepResults.push(`✗ ${label}: ${e.message}`);
+      }
+    }
+    await loadProxmoxConfig();
+    const ok = stepResults.filter(s => s.startsWith('✓')).length;
+    status.textContent = `⚡ Full probe done — ${ok}/${STEPS.length} steps succeeded`;
+    status.style.color = ok >= STEPS.length - 1 ? 'var(--accent)' : '#f59e0b';
+    btn.disabled = false;
+    btn.textContent = '⚡ Full Probe';
+    console.log('Full probe results:', stepResults);
+  }
+
+  async function probeVmServices() {
+    const btn    = document.getElementById('pve-probe-services-btn');
+    const status = document.getElementById('pve-probe-status');
+    btn.disabled = true;
+    btn.textContent = '⏳ Probing VM services…';
+    status.hidden = true;
+    try {
+      const r = await fetch('/api/v1/proxmox-config/probe-services', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
+      status.textContent = `✓ VM services — ${d.message}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      if (d.updated > 0) { await loadProxmoxConfig(); }
+    } catch (e) {
+      status.textContent = `✗ VM services probe failed: ${e.message}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '&#128065; Probe VM Services';
     }
   }
 
@@ -1386,6 +1779,101 @@
   }
 
   /* ── Settings ─────────────────────────────────────────────────────────── */
+  async function loadSettings() {
+    await loadSettingsCidr();
+    const err = document.getElementById('settings-error');
+    err.hidden = true;
+    try {
+      const r = await fetch('/api/v1/settings');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _settings = await r.json();
+      renderSettings();
+    } catch (e) {
+      err.textContent = `Failed to load settings: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  function renderSettings() {
+    const tbody = document.getElementById('settings-tbody');
+    if (!_settings.length) {
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No settings yet — add one above.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = _settings.map(s => {
+      const updated = (s.updated_at || '—').replace('T', ' ').slice(0, 19);
+      const keyEsc  = esc(s.key);
+      const valEsc  = esc(s.value || '');
+      const descEsc = esc(s.description || '');
+      return `<tr>
+        <td><code style="font-size:12px">${keyEsc}</code></td>
+        <td>${valEsc}</td>
+        <td style="color:var(--text-dim)">${descEsc}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(updated)}</td>
+        <td style="white-space:nowrap">
+          <button class="secondary" style="font-size:12px;padding:3px 10px"
+            onclick="editSetting('${keyEsc}','${valEsc}','${descEsc}')">Edit</button>
+          <button style="font-size:12px;padding:3px 10px;background:var(--err);border-color:var(--err);color:#fff"
+            onclick="deleteSetting('${keyEsc}')">&#10005;</button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  function openAddSettingModal() {
+    ['setting-key','setting-val','setting-desc'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+    document.getElementById('setting-modal-title').textContent = 'Add setting';
+    document.getElementById('setting-key').readOnly = false;
+    document.getElementById('setting-error').hidden = true;
+    document.getElementById('setting-modal').showModal();
+  }
+
+  function editSetting(key, value, description) {
+    document.getElementById('setting-key').value  = key;
+    document.getElementById('setting-val').value  = value;
+    document.getElementById('setting-desc').value = description;
+    document.getElementById('setting-modal-title').textContent = 'Edit setting';
+    document.getElementById('setting-key').readOnly = true;
+    document.getElementById('setting-error').hidden = true;
+    document.getElementById('setting-modal').showModal();
+  }
+
+  async function submitSetting() {
+    const key  = document.getElementById('setting-key').value.trim();
+    const val  = document.getElementById('setting-val').value.trim();
+    const desc = document.getElementById('setting-desc').value.trim();
+    const err  = document.getElementById('setting-error');
+    if (!key) { err.textContent = 'Key is required'; err.hidden = false; return; }
+    try {
+      const r = await fetch(`/api/v1/settings/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: val, description: desc || null }),
+      });
+      if (!r.ok) { const t = await r.text(); throw new Error(t); }
+      document.getElementById('setting-modal').close();
+      _settings = [];
+      await loadSettings();
+    } catch (e) {
+      err.textContent = `Error: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+
+  async function deleteSetting(key) {
+    if (!confirm(`Delete setting "${key}"?`)) return;
+    try {
+      const r = await fetch(`/api/v1/settings/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
+      _settings = [];
+      await loadSettings();
+    } catch (e) {
+      alert(`Delete failed: ${e.message}`);
+    }
+  }
+
   async function loadSettingsCidr() {
     try {
       const r = await fetch('/api/v1/settings/mgmt_cidr');
@@ -1428,9 +1916,6 @@
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _pveHosts = await r.json();
       renderPveHosts();
-      // Show/hide Proxmox Config tab based on whether any PVE hosts exist
-      const pcBtn = document.getElementById('tab-btn-proxmox-config');
-      if (pcBtn) pcBtn.style.display = _pveHosts.length ? '' : 'none';
     } catch (e) {
       err.textContent = `Failed to load PVE hosts: ${e.message}`;
       err.hidden = false;
