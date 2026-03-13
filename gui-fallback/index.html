@@ -53,7 +53,7 @@
     .badge-err { background: #3d1a1a; color: var(--err); }
 
     /* ── Services table ── */
-    .table-wrap { overflow-x: auto; }
+    .table-wrap { overflow-x: auto; overflow-y: auto; max-height: calc(100vh - 220px); }
     table { width: 100%; border-collapse: collapse; }
     thead th { background: var(--surface); color: var(--text-dim); font-size: 11px;
                text-transform: uppercase; letter-spacing: .6px; padding: 8px 10px;
@@ -165,7 +165,7 @@
     <nav class="group-tabs">
       <button class="group-tab active" onclick="switchGroup('synthesis')">Synthesis</button>
       <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
-      <button class="group-tab" onclick="switchGroup('settings')">&#9881;</button>
+      <button class="group-tab" onclick="switchGroup('settings')">Settings</button>
     </nav>
     <blueprints-node-selector></blueprints-node-selector>
   </div>
