@@ -375,6 +375,8 @@ class DockgeStackCreate(BaseModel):
     ip_address: Optional[str] = None       # IP we SSH'd into for this probe
     parent_context: Optional[str] = None   # dockge-stack | docker-compose | docker-run | portainer-stack | native
     parent_stack_name: Optional[str] = None  # if parent_context==dockge-stack
+    obsolete: int = 0                        # 1 = user-marked obsolete; probe never overwrites
+    notes: Optional[str] = None             # free-text user notes
     last_probed: Optional[str] = None
 
 
@@ -394,6 +396,8 @@ class DockgeStackUpdate(BaseModel):
     ip_address: Optional[str] = None
     parent_context: Optional[str] = None
     parent_stack_name: Optional[str] = None
+    obsolete: Optional[int] = None          # None = don't update; 0/1 to set
+    notes: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -414,6 +418,8 @@ class DockgeStackOut(BaseModel):
     ip_address: Optional[str] = None
     parent_context: Optional[str] = None
     parent_stack_name: Optional[str] = None
+    obsolete: int = 0
+    notes: Optional[str] = None
     last_probed: Optional[str] = None
     created_at: str
     updated_at: str

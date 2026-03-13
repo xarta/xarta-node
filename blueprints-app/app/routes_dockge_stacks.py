@@ -41,6 +41,8 @@ def _row_to_out(row) -> DockgeStackOut:
         ip_address=row["ip_address"],
         parent_context=row["parent_context"],
         parent_stack_name=row["parent_stack_name"],
+        obsolete=row["obsolete"] or 0,
+        notes=row["notes"],
         last_probed=row["last_probed"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -93,14 +95,15 @@ def _upsert_stack(conn, body: DockgeStackCreate, gen: int) -> dict:
                 (stack_id, pve_host, source_vmid, source_lxc_name, stack_name,
                  status, compose_content, services_json, ports_json, volumes_json,
                  env_file_exists, stacks_dir, vm_type, ip_address,
-                 parent_context, parent_stack_name, last_probed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 parent_context, parent_stack_name, obsolete, notes, last_probed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (body.stack_id, body.pve_host, body.source_vmid, body.source_lxc_name,
              body.stack_name, body.status, body.compose_content, body.services_json,
              body.ports_json, body.volumes_json, body.env_file_exists,
              body.stacks_dir, body.vm_type, body.ip_address,
-             body.parent_context, body.parent_stack_name, body.last_probed),
+             body.parent_context, body.parent_stack_name,
+             body.obsolete, body.notes, body.last_probed),
         )
     row = conn.execute("SELECT * FROM dockge_stacks WHERE stack_id=?", (body.stack_id,)).fetchone()
     enqueue_for_all_peers(
