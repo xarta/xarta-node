@@ -220,6 +220,9 @@ class ProxmoxConfigCreate(BaseModel):
     portainer_method: Optional[str] = None
     has_caddy: Optional[int] = None
     caddy_conf_path: Optional[str] = None
+    dockge_json: Optional[str] = None
+    portainer_json: Optional[str] = None
+    caddy_json: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -248,6 +251,9 @@ class ProxmoxConfigUpdate(BaseModel):
     portainer_method: Optional[str] = None
     has_caddy: Optional[int] = None
     caddy_conf_path: Optional[str] = None
+    dockge_json: Optional[str] = None
+    portainer_json: Optional[str] = None
+    caddy_json: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -277,6 +283,9 @@ class ProxmoxConfigOut(BaseModel):
     portainer_method: Optional[str] = None
     has_caddy: Optional[int] = None
     caddy_conf_path: Optional[str] = None
+    dockge_json: Optional[str] = None
+    portainer_json: Optional[str] = None
+    caddy_json: Optional[str] = None
     last_probed: Optional[str] = None
     created_at: str
     updated_at: str
