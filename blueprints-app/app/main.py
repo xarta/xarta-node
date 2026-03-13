@@ -43,6 +43,7 @@ from .routes_caddy_configs import router as caddy_configs_router
 from .routes_settings   import router as settings_router
 from .routes_pve_hosts   import router as pve_hosts_router
 from .routes_arp_manual  import router as arp_manual_router
+from .routes_ssh_targets import router as ssh_targets_router
 from .routes_sync import router as sync_router
 from .sync.drain import start_drain_loop
 from .sync.queue import enqueue_for_all_peers
@@ -393,6 +394,7 @@ def create_app() -> FastAPI:
     application.include_router(settings_router,       prefix="/api/v1")
     application.include_router(pve_hosts_router,      prefix="/api/v1")
     application.include_router(arp_manual_router,     prefix="/api/v1")
+    application.include_router(ssh_targets_router,    prefix="/api/v1")
     application.include_router(gui_sync_router,       prefix="/api/v1")
 
     return application

@@ -32,6 +32,7 @@ _ALLOWED_TABLES = {
     "proxmox_config", "proxmox_nets", "vlans", "dockge_stacks", "caddy_configs",
     "settings", "pve_hosts",
     "arp_manual",
+    "ssh_targets",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -123,6 +124,7 @@ def _pk_for_table(table: str) -> str:
         "settings":       "key",
         "pve_hosts":      "pve_id",
         "arp_manual":     "entry_id",
+        "ssh_targets":    "ip_address",
     }
     return pk_map.get(table, "id")
 
