@@ -197,15 +197,8 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
 @router.get("/probe/status", response_model=dict)
 async def probe_status() -> dict:
     """Return whether the Proxmox probe key is configured on this node."""
-    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
-    key_present = bool(key_path) and os.path.isfile(key_path)
-    if not key_present:
-        reason = (
-            "PROXMOX_SSH_KEY not set" if not key_path
-            else f"key file not found: {key_path}"
-        )
-        return {"configured": False, "ssh_key_present": False, "reason": reason}
-    return {"configured": True, "ssh_key_present": True, "reason": ""}
+    from .ssh import probe_status_for_host_type
+    return probe_status_for_host_type("pve")
 
 
 @router.post("/probe", response_model=dict)
@@ -218,9 +211,14 @@ async def probe_proxmox_config() -> dict:
     if not os.path.isfile(script):
         raise HTTPException(500, f"Probe script not found: {script}")
 
-    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
-    if not key_path or not os.path.isfile(key_path):
-        raise HTTPException(503, "PROXMOX_SSH_KEY not configured or key file missing")
+    from .ssh import probe_status_for_host_type, resolve_env_key, SshKeyMissing
+    status = probe_status_for_host_type("pve")
+    if not status["configured"]:
+        raise HTTPException(503, status["reason"])
+    try:
+        key_path = resolve_env_key("PROXMOX_SSH_KEY")
+    except SshKeyMissing as exc:
+        raise HTTPException(503, str(exc))
 
     env = {**os.environ, "PROXMOX_SSH_KEY": key_path}
 

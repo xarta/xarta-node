@@ -261,10 +261,10 @@ async def enrich_nets_from_pfsense_arp() -> dict:
     import os
     import re
 
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
     ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
-    key_path   = os.environ.get("PFSENSE_SSH_KEY", "")
-    if not ssh_target or not key_path or not os.path.isfile(key_path):
-        raise HTTPException(503, "PFSENSE_SSH_TARGET or PFSENSE_SSH_KEY not configured")
+    if not ssh_target:
+        raise HTTPException(503, "PFSENSE_SSH_TARGET is not set in .env")
 
     # Parse user@host
     if "@" in ssh_target:
@@ -272,13 +272,15 @@ async def enrich_nets_from_pfsense_arp() -> dict:
     else:
         ssh_user, ssh_host = "root", ssh_target
 
+    try:
+        _pfsense_ssh_args = make_ssh_args(ssh_host, connect_timeout=10)
+    except (SshTargetNotFound, SshKeyMissing) as exc:
+        raise HTTPException(503, str(exc))
+
     # ── Fetch full ARP table from pfSense ─────────────────────────────────────
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ssh", "-i", key_path,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
+            "ssh", *_pfsense_ssh_args,
             f"{ssh_user}@{ssh_host}",
             "arp -an",
             stdout=asyncio.subprocess.PIPE,
@@ -391,9 +393,7 @@ async def find_ips_via_pve() -> dict:
     import json as _json
     import os
 
-    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
-    if not key_path or not os.path.isfile(key_path):
-        raise HTTPException(503, "PROXMOX_SSH_KEY not configured or key file missing")
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
 
     with get_conn() as conn:
         pve_hosts = [
@@ -487,11 +487,12 @@ print("##ARPRESULT##" + json.dumps(result))
             f"python3 -c '{REMOTE_SCRIPT}' '{payload_esc}'"
         )
         try:
+            _pve_ssh_args = make_ssh_args(host_ip, connect_timeout=10)
+        except (SshTargetNotFound, SshKeyMissing):
+            return {}
+        try:
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-i", key_path,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                "-o", "BatchMode=yes",
+                "ssh", *_pve_ssh_args,
                 f"root@{host_ip}",
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -731,9 +732,7 @@ async def find_ips_via_qemu_agent() -> dict:
     import json as _json
     import os
 
-    key_path = os.environ.get("PROXMOX_SSH_KEY", "")
-    if not key_path or not os.path.isfile(key_path):
-        raise HTTPException(503, "PROXMOX_SSH_KEY not configured or key file missing")
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
 
     with get_conn() as conn:
         missing = conn.execute(
@@ -758,11 +757,12 @@ async def find_ips_via_qemu_agent() -> dict:
     async def query_agent(pve_ip: str, vmid: int) -> dict:
         """Returns {mac_upper: ip} from the QEMU guest agent."""
         try:
+            _pve_ssh_args = make_ssh_args(pve_ip, connect_timeout=10)
+        except (SshTargetNotFound, SshKeyMissing):
+            return {}
+        try:
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-i", key_path,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                "-o", "BatchMode=yes",
+                "ssh", *_pve_ssh_args,
                 f"root@{pve_ip}",
                 f"qm agent {vmid} network-get-interfaces 2>/dev/null",
                 stdout=asyncio.subprocess.PIPE,
@@ -845,15 +845,20 @@ async def find_ips_via_pfsense_sweep() -> dict:
     import os
     import re
 
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
     ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
-    key_path   = os.environ.get("PFSENSE_SSH_KEY", "")
-    if not ssh_target or not key_path or not os.path.isfile(key_path):
-        raise HTTPException(503, "PFSENSE_SSH_TARGET or PFSENSE_SSH_KEY not configured")
+    if not ssh_target:
+        raise HTTPException(503, "PFSENSE_SSH_TARGET is not set in .env")
 
     if "@" in ssh_target:
         ssh_user, ssh_host = ssh_target.split("@", 1)
     else:
         ssh_user, ssh_host = "root", ssh_target
+
+    try:
+        _pfsense_ssh_args = make_ssh_args(ssh_host, connect_timeout=10)
+    except (SshTargetNotFound, SshKeyMissing) as exc:
+        raise HTTPException(503, str(exc))
 
     with get_conn() as conn:
         missing = conn.execute(
@@ -931,10 +936,7 @@ echo "##SWEEPRESULT##" . json_encode([
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ssh", "-i", key_path,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
+            "ssh", *_pfsense_ssh_args,
             f"{ssh_user}@{ssh_host}",
             f"echo {encoded} | b64decode -r | php",
             stdout=asyncio.subprocess.PIPE,

@@ -47,6 +47,15 @@ fi
 SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 [[ -n "$SSH_KEY_FILE" ]] && SSH_OPTS+=(-i "$SSH_KEY_FILE")
 
+# ── VLAN source binding from ssh_targets ─────────────────────────────────────
+_ssh_host_part="${SSH_TARGET##*@}"
+_db="${BLUEPRINTS_DB:-/opt/blueprints/data/db/blueprints.db}"
+if [[ -f "$_db" ]]; then
+    _src=$(sqlite3 "$_db" "SELECT COALESCE(source_ip,'') FROM ssh_targets WHERE ip_address='${_ssh_host_part}' LIMIT 1;" 2>/dev/null) || true
+    [[ -n "$_src" ]] && SSH_OPTS+=(-b "$_src")
+fi
+unset _ssh_host_part _db _src
+
 echo "=== pfSense DNS probe ==="
 echo "Target:    ${SSH_TARGET}"
 echo "API:       ${API_BASE}"

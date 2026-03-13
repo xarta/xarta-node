@@ -40,6 +40,20 @@ fi
 
 SSH_OPTS=(-i "$KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
+# ── VLAN source binding from ssh_targets ─────────────────────────────────────
+_bp_pve_ssh() {
+    # Usage: _bp_pve_ssh <pve_ip> [cmd...]
+    # Wraps ssh "${SSH_OPTS[@]}" with optional -b <source_ip> from ssh_targets
+    local _ip="$1"; shift
+    local _db="${BLUEPRINTS_DB:-/opt/blueprints/data/db/blueprints.db}"
+    local _src="" _bind=()
+    if [[ -f "$_db" ]]; then
+        _src=$(sqlite3 "$_db" "SELECT COALESCE(source_ip,'') FROM ssh_targets WHERE ip_address='${_ip}' LIMIT 1;" 2>/dev/null) || true
+    fi
+    [[ -n "$_src" ]] && _bind=(-b "$_src")
+    ssh "${SSH_OPTS[@]}" "${_bind[@]+${_bind[@]}}" "root@${_ip}" "$@"
+}
+
 echo "=== Caddy Configs Probe ===" >&2
 echo "Timestamp: ${TIMESTAMP}" >&2
 
@@ -170,7 +184,7 @@ for host_entry in "${PVE_HOSTS[@]}"; do
     echo "[probe] root@${PVE_IP} (${PVE_NAME}) — scanning running LXCs for Caddy" >&2
     OUTFILE="${WORK_DIR}/${PVE_NAME}.json"
 
-    ssh "${SSH_OPTS[@]}" "root@${PVE_IP}" \
+    _bp_pve_ssh "${PVE_IP}" \
         python3 /dev/stdin "$PVE_IP" "$PVE_NAME" "$TIMESTAMP" \
         < "$REMOTE_PY" > "$OUTFILE" \
         || { echo "  WARNING: SSH/python3 failed for ${PVE_IP} — skipping" >&2; rm -f "$OUTFILE"; continue; }

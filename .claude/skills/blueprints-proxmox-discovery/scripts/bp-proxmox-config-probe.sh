@@ -37,7 +37,19 @@ fi
 
 SSH_OPTS=(-i "$KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 
-echo "=== Proxmox Config Probe ===" >&2
+# ── VLAN source binding from ssh_targets ─────────────────────────────────────
+_bp_pve_ssh() {
+    # Usage: _bp_pve_ssh <pve_ip> [cmd...]
+    # Wraps ssh "${SSH_OPTS[@]}" with optional -b <source_ip> from ssh_targets
+    local _ip="$1"; shift
+    local _db="${BLUEPRINTS_DB:-/opt/blueprints/data/db/blueprints.db}"
+    local _src="" _bind=()
+    if [[ -f "$_db" ]]; then
+        _src=$(sqlite3 "$_db" "SELECT COALESCE(source_ip,'') FROM ssh_targets WHERE ip_address='${_ip}' LIMIT 1;" 2>/dev/null) || true
+    fi
+    [[ -n "$_src" ]] && _bind=(-b "$_src")
+    ssh "${SSH_OPTS[@]}" "${_bind[@]+${_bind[@]}}" "root@${_ip}" "$@"
+} >&2
 echo "Timestamp: ${TIMESTAMP}" >&2
 
 WORK_DIR=$(mktemp -d)
@@ -322,14 +334,14 @@ for host_entry in "${PVE_HOSTS[@]}"; do
     OUTFILE="${WORK_DIR}/${PVE_NAME}.json"
 
     # python3 /dev/stdin reads the script from stdin; argv goes after --
-    ssh "${SSH_OPTS[@]}" "root@${PVE_IP}" \
+    _bp_pve_ssh "${PVE_IP}" \
         python3 /dev/stdin "$PVE_IP" "$PVE_NAME" "$TIMESTAMP" "${VLAN_CIDRS:-}" \
         < "$REMOTE_PY" > "$OUTFILE" \
         || { echo "  WARNING: SSH/python3 failed for ${PVE_IP} — skipping" >&2; rm -f "$OUTFILE"; continue; }
 
     # ── Patch pve_hosts record now that we know SSH works ────────────────
     # Fetch pveversion and hostname in one ssh call; gracefully skip on error
-    PVE_META=$(ssh "${SSH_OPTS[@]}" "root@${PVE_IP}" \
+    PVE_META=$(_bp_pve_ssh "${PVE_IP}" \
         'printf "%s\t%s\n" "$(pveversion --verbose 2>/dev/null | head -1 || pveversion 2>/dev/null | head -1)" "$(hostname -s 2>/dev/null)"' \
         2>/dev/null || echo "")
     if [[ -n "$PVE_META" ]]; then
