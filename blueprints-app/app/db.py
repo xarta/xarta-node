@@ -328,6 +328,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("dockge_stacks", "ip_address",        "TEXT"),
         ("dockge_stacks", "parent_context",    "TEXT"),
         ("dockge_stacks", "parent_stack_name", "TEXT"),
+        # dockge_stacks: user-managed fields — obsolete flag + notes (2026-03-13)
+        ("dockge_stacks", "obsolete",          "INTEGER DEFAULT 0"),
+        ("dockge_stacks", "notes",             "TEXT"),
         # dockge_stack_services: relational per-container rows (2026-03-13)
         # (table created in DDL above; no ALTER TABLE needed for it)
     ]

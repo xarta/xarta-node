@@ -54,6 +54,8 @@ This supports machines with **multiple Dockge instances** (different stacks_dirs
 | `ip_address` | TEXT | IP we SSH'd into for this probe |
 | `parent_context` | TEXT | How Dockge itself is running: `dockge-stack` \| `docker-compose` \| `docker-run` \| `portainer-stack` \| `native` \| `unknown` |
 | `parent_stack_name` | TEXT | If `parent_context=dockge-stack`, the stack name |
+| `obsolete` | INTEGER | 1 = user-marked obsolete; probe never overwrites this |
+| `notes` | TEXT | Free-text user notes (editable in GUI; probe never overwrites) |
 | `last_probed` | TEXT | ISO timestamp |
 
 ### `dockge_stack_services`
