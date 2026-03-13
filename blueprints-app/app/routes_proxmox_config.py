@@ -63,6 +63,9 @@ def _row_to_out(row) -> ProxmoxConfigOut:
         portainer_method=row["portainer_method"],
         has_caddy=_int(row["has_caddy"]),
         caddy_conf_path=row["caddy_conf_path"],
+        dockge_json=row["dockge_json"],
+        portainer_json=row["portainer_json"],
+        caddy_json=row["caddy_json"],
         last_probed=row["last_probed"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -96,8 +99,9 @@ async def create_proxmox_config(body: ProxmoxConfigCreate) -> ProxmoxConfigOut:
                  cores, memory_mb, rootfs, ip_config, ip_address, gateway,
                  mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
                  vlans_json, has_docker, dockge_stacks_dir, has_portainer,
-                 portainer_method, has_caddy, caddy_conf_path, last_probed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 portainer_method, has_caddy, caddy_conf_path,
+                 dockge_json, portainer_json, caddy_json, last_probed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (body.config_id, body.pve_host, body.pve_name, body.vmid, body.vm_type,
              body.name, body.status, body.cores, body.memory_mb, body.rootfs,
@@ -105,7 +109,8 @@ async def create_proxmox_config(body: ProxmoxConfigCreate) -> ProxmoxConfigOut:
              body.vlan_tag, body.tags, body.mountpoints_json, body.raw_conf,
              body.vlans_json, body.has_docker, body.dockge_stacks_dir,
              body.has_portainer, body.portainer_method, body.has_caddy,
-             body.caddy_conf_path, body.last_probed),
+             body.caddy_conf_path, body.dockge_json, body.portainer_json,
+             body.caddy_json, body.last_probed),
         )
         row = conn.execute(
             "SELECT * FROM proxmox_config WHERE config_id=?", (body.config_id,)
@@ -136,6 +141,7 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                         vlans_json=?, has_docker=?, dockge_stacks_dir=?,
                         has_portainer=?, portainer_method=?,
                         has_caddy=?, caddy_conf_path=?,
+                        dockge_json=?, portainer_json=?, caddy_json=?,
                         last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
@@ -147,6 +153,7 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                      body.vlans_json, body.has_docker, body.dockge_stacks_dir,
                      body.has_portainer, body.portainer_method,
                      body.has_caddy, body.caddy_conf_path,
+                     body.dockge_json, body.portainer_json, body.caddy_json,
                      body.last_probed, body.config_id),
                 )
                 updated += 1
@@ -158,8 +165,9 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                          cores, memory_mb, rootfs, ip_config, ip_address, gateway,
                          mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
                          vlans_json, has_docker, dockge_stacks_dir, has_portainer,
-                         portainer_method, has_caddy, caddy_conf_path, last_probed)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         portainer_method, has_caddy, caddy_conf_path,
+                         dockge_json, portainer_json, caddy_json, last_probed)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (body.config_id, body.pve_host, body.pve_name, body.vmid,
                      body.vm_type, body.name, body.status, body.cores,
@@ -168,7 +176,9 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                      body.mountpoints_json, body.raw_conf,
                      body.vlans_json, body.has_docker, body.dockge_stacks_dir,
                      body.has_portainer, body.portainer_method,
-                     body.has_caddy, body.caddy_conf_path, body.last_probed),
+                     body.has_caddy, body.caddy_conf_path,
+                     body.dockge_json, body.portainer_json, body.caddy_json,
+                     body.last_probed),
                 )
                 created += 1
             row = conn.execute(
@@ -274,6 +284,7 @@ async def probe_proxmox_config() -> dict:
                         vlans_json=?, has_docker=?, dockge_stacks_dir=?,
                         has_portainer=?, portainer_method=?,
                         has_caddy=?, caddy_conf_path=?,
+                        dockge_json=?, portainer_json=?, caddy_json=?,
                         last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
@@ -286,7 +297,9 @@ async def probe_proxmox_config() -> dict:
                      entry.get("vlans_json"), entry.get("has_docker"),
                      entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
                      entry.get("portainer_method"), entry.get("has_caddy"),
-                     entry.get("caddy_conf_path"), entry.get("last_probed"), cid),
+                     entry.get("caddy_conf_path"),
+                     entry.get("dockge_json"), entry.get("portainer_json"),
+                     entry.get("caddy_json"), entry.get("last_probed"), cid),
                 )
                 updated += 1
             else:
@@ -297,8 +310,9 @@ async def probe_proxmox_config() -> dict:
                          cores, memory_mb, rootfs, ip_config, ip_address, gateway,
                          mac_address, vlan_tag, tags, mountpoints_json, raw_conf,
                          vlans_json, has_docker, dockge_stacks_dir, has_portainer,
-                         portainer_method, has_caddy, caddy_conf_path, last_probed)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         portainer_method, has_caddy, caddy_conf_path,
+                         dockge_json, portainer_json, caddy_json, last_probed)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (cid, entry.get("pve_host"), entry.get("pve_name"), entry.get("vmid"),
                      entry.get("vm_type"), entry.get("name"), entry.get("status"),
@@ -309,7 +323,9 @@ async def probe_proxmox_config() -> dict:
                      entry.get("vlans_json"), entry.get("has_docker"),
                      entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
                      entry.get("portainer_method"), entry.get("has_caddy"),
-                     entry.get("caddy_conf_path"), entry.get("last_probed")),
+                     entry.get("caddy_conf_path"),
+                     entry.get("dockge_json"), entry.get("portainer_json"),
+                     entry.get("caddy_json"), entry.get("last_probed")),
                 )
                 created += 1
             row = conn.execute(
@@ -423,73 +439,82 @@ async def probe_proxmox_config() -> dict:
 # ── Probe VM services via SSH ─────────────────────────────────────────────────
 
 _PROBE_SERVICES_CMD = r"""
-has_docker=0; has_portainer=0; portainer_method=""; dockge_dir=""; has_caddy=0; caddy_path=""
-docker_usable=0
+has_docker=0; docker_usable=0
+dockge_json='[]'; portainer_json='[]'; caddy_json='[]'
 
-# ── Docker: detect by socket, binary, or daemon response ─────────────────────
+# append a JSON object to a compact JSON array (no jq needed)
+json_append() {
+  local arr="$1" obj="$2"
+  [ "$arr" = "[]" ] && echo "[${obj}]" && return
+  echo "${arr%]},${obj}]"
+}
+
+# ── Docker ────────────────────────────────────────────────────────────────────
 if [ -S /var/run/docker.sock ]; then
-  has_docker=1
-  docker info >/dev/null 2>&1 && docker_usable=1
+  has_docker=1; docker info >/dev/null 2>&1 && docker_usable=1
 elif command -v docker >/dev/null 2>&1; then
-  has_docker=1
-  docker info >/dev/null 2>&1 && docker_usable=1
+  has_docker=1; docker info >/dev/null 2>&1 && docker_usable=1
 fi
 
-# ── Container-based discovery (image-matching, not name-matching) ─────────────
+# ── Container-based discovery ─────────────────────────────────────────────────
 if [ "$docker_usable" = "1" ]; then
   containers=$(docker ps --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null || true)
-
-  # Portainer: match by image regardless of container name
-  if echo "$containers" | grep -qiE 'portainer/portainer|portainer-ce|portainer-ee'; then
-    has_portainer=1; portainer_method=docker
-  fi
-
-  # Dockge: find every instance by image, discover stacks path by inspecting mounts
   while IFS='|' read -r cid cname cimage; do
     [ -z "$cid" ] && continue
-    echo "$cimage" | grep -qiE 'dockge' || continue
-    # stacks are mounted at /opt/stacks inside the container
-    host_stacks=$(docker inspect "$cid" --format \
-      '{{range .Mounts}}{{if eq .Destination "/opt/stacks"}}{{.Source}}{{end}}{{end}}' \
-      2>/dev/null | tr -d '[:space:]')
-    # data dir also useful if stacks not separately mounted
-    [ -z "$host_stacks" ] && host_stacks=$(docker inspect "$cid" --format \
-      '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' \
-      2>/dev/null | tr -d '[:space:]')
-    [ -z "$host_stacks" ] && continue
-    if [ -z "$dockge_dir" ]; then
-      dockge_dir="$host_stacks"
-    else
-      echo "$dockge_dir" | grep -qF "$host_stacks" || dockge_dir="${dockge_dir},${host_stacks}"
+
+    # Dockge: find stacks host path from /opt/stacks mount, fallback /app/data
+    if echo "$cimage" | grep -qiE 'louislam/dockge'; then
+      stacks=$(docker inspect "$cid" --format \
+        '{{range .Mounts}}{{if eq .Destination "/opt/stacks"}}{{.Source}}{{end}}{{end}}' \
+        2>/dev/null | tr -d '[:space:]')
+      [ -z "$stacks" ] && stacks=$(docker inspect "$cid" --format \
+        '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' \
+        2>/dev/null | tr -d '[:space:]')
+      if [ -n "$stacks" ]; then
+        dockge_json=$(json_append "$dockge_json" \
+          "{\"container\":\"${cname}\",\"stacks_dir\":\"${stacks}\"}") 
+      fi
+    fi
+
+    # Portainer: find data dir from /data mount
+    if echo "$cimage" | grep -qiE 'portainer/portainer|portainer-ce|portainer-ee'; then
+      data_dir=$(docker inspect "$cid" --format \
+        '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' \
+        2>/dev/null | tr -d '[:space:]')
+      portainer_json=$(json_append "$portainer_json" \
+        "{\"container\":\"${cname}\",\"data_dir\":\"${data_dir:-unknown}\",\"method\":\"docker\"}")
+    fi
+
+    # Caddy: detect container by image, find Caddyfile in mounts
+    if echo "$cimage" | grep -qiE '(^|/)caddy:|lucaslorentz/caddy-docker-proxy'; then
+      caddyfile=$(docker inspect "$cid" --format \
+        '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null | tr ' ' '\n' | \
+        xargs -I{} find {} -maxdepth 2 -name "Caddyfile" 2>/dev/null | head -1)
+      caddy_json=$(json_append "$caddy_json" \
+        "{\"container\":\"${cname}\",\"method\":\"docker\",\"caddyfile\":\"${caddyfile:-}\"}")
     fi
   done <<< "$containers"
-
-  # Caddy: detect container by image
-  if echo "$containers" | grep -qiE '(^|/)caddy:|lucaslorentz/caddy-docker-proxy'; then
-    has_caddy=1
-    caddy_cid=$(echo "$containers" | grep -iE '(^|/)caddy:|lucaslorentz/caddy' | head -1 | cut -d'|' -f1)
-    caddy_path=$(docker inspect "$caddy_cid" --format \
-      '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null | tr ' ' '\n' | \
-      xargs -I{} find {} -maxdepth 2 -name "Caddyfile" 2>/dev/null | head -1)
-  fi
 fi
 
 # ── Host-level fallbacks ──────────────────────────────────────────────────────
-if [ "$has_portainer" = "0" ]; then
+if [ "$portainer_json" = "[]" ]; then
   systemctl is-active --quiet portainer 2>/dev/null \
-    && has_portainer=1 && portainer_method=service
+    && portainer_json='[{"method":"service"}]'
 fi
-if [ "$has_caddy" = "0" ]; then
-  if command -v caddy >/dev/null 2>&1 \
-    || systemctl is-active --quiet caddy 2>/dev/null \
-    || systemctl is-active --quiet caddy2 2>/dev/null; then
-    has_caddy=1
-    caddy_path=$(find /etc/caddy /root /opt /home -name "Caddyfile" -maxdepth 5 2>/dev/null | head -1)
+
+if [ "$caddy_json" = "[]" ]; then
+  caddy_running=0
+  command -v caddy  >/dev/null 2>&1 && caddy_running=1
+  systemctl is-active --quiet caddy  2>/dev/null && caddy_running=1
+  systemctl is-active --quiet caddy2 2>/dev/null && caddy_running=1
+  if [ "$caddy_running" = "1" ]; then
+    caddyfile=$(find /etc/caddy /root /opt /home -name "Caddyfile" -maxdepth 5 2>/dev/null | head -1)
+    caddy_json="[{\"method\":\"host\",\"caddyfile\":\"${caddyfile:-}\"}]"
   fi
 fi
 
-printf "PROBE_RESULT:has_docker=%s;has_portainer=%s;portainer_method=%s;dockge_dir=%s;has_caddy=%s;caddy_path=%s\n" \
-  "$has_docker" "$has_portainer" "$portainer_method" "$dockge_dir" "$has_caddy" "$caddy_path"
+printf 'PROBE_RESULT:{"has_docker":%s,"dockge_json":%s,"portainer_json":%s,"caddy_json":%s}\n' \
+  "$has_docker" "$dockge_json" "$portainer_json" "$caddy_json"
 """
 
 
@@ -619,22 +644,21 @@ async def probe_vm_services() -> dict:
                                  "ok": False, "error": "no probe result"})
                 return
 
-            pairs: dict[str, str] = {}
-            for kv in line[len("PROBE_RESULT:"):].split(";"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    pairs[k.strip()] = v.strip()
+            try:
+                payload = json.loads(line[len("PROBE_RESULT:"):])
+            except Exception:
+                results.append({"config_id": config_id, "name": name, "ip": ip,
+                                 "ok": False, "error": "malformed probe result"})
+                return
             results.append({
-                "config_id":         config_id,
-                "name":              name,
-                "ip":                ip,
-                "ok":                True,
-                "has_docker":        1 if pairs.get("has_docker") == "1" else 0,
-                "has_portainer":     1 if pairs.get("has_portainer") == "1" else 0,
-                "portainer_method":  pairs.get("portainer_method") or None,
-                "dockge_stacks_dir": pairs.get("dockge_dir") or None,
-                "has_caddy":         1 if pairs.get("has_caddy") == "1" else 0,
-                "caddy_conf_path":   pairs.get("caddy_path") or None,
+                "config_id":      config_id,
+                "name":           name,
+                "ip":             ip,
+                "ok":             True,
+                "has_docker":     1 if payload.get("has_docker") == 1 else 0,
+                "dockge_json":    json.dumps(payload.get("dockge_json", [])),
+                "portainer_json": json.dumps(payload.get("portainer_json", [])),
+                "caddy_json":     json.dumps(payload.get("caddy_json", [])),
             })
 
     await asyncio.gather(*[
@@ -651,13 +675,11 @@ async def probe_vm_services() -> dict:
                 continue
             conn.execute(
                 """UPDATE proxmox_config SET
-                       has_docker=?, has_portainer=?, portainer_method=?,
-                       dockge_stacks_dir=?, has_caddy=?, caddy_conf_path=?,
-                       updated_at=datetime('now')
+                       has_docker=?, dockge_json=?, portainer_json=?, caddy_json=?,
+                       last_probed=datetime('now'), updated_at=datetime('now')
                    WHERE config_id=?""",
-                (r["has_docker"], r["has_portainer"], r["portainer_method"],
-                 r["dockge_stacks_dir"], r["has_caddy"], r["caddy_conf_path"],
-                 r["config_id"]),
+                (r["has_docker"], r["dockge_json"], r["portainer_json"],
+                 r["caddy_json"], r["config_id"]),
             )
             row = conn.execute(
                 "SELECT * FROM proxmox_config WHERE config_id=?", (r["config_id"],)
@@ -679,10 +701,10 @@ async def probe_vm_services() -> dict:
             {"name": r["name"], "ip": r["ip"],
              "status": "ok" if r["ok"] else r.get("error", "?"),
              "detected": (
-                 [k for k, v in [("docker", r.get("has_docker")),
-                                  ("portainer", r.get("has_portainer")),
-                                  ("caddy", r.get("has_caddy"))] if v]
-                 + (["dockge"] if r.get("dockge_stacks_dir") else [])
+                 (["docker"] if r.get("has_docker") else [])
+                 + (["portainer"] if r.get("portainer_json", "[]") not in ("[]", None, "") else [])
+                 + (["dockge"]    if r.get("dockge_json",    "[]") not in ("[]", None, "") else [])
+                 + (["caddy"]     if r.get("caddy_json",     "[]") not in ("[]", None, "") else [])
              )}
             for r in results
         ],

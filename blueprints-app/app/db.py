@@ -121,11 +121,14 @@ CREATE TABLE IF NOT EXISTS proxmox_config (
     raw_conf          TEXT,                    -- full conf file content
     vlans_json        TEXT,                    -- JSON array of all VLAN tags across all net interfaces
     has_docker        INTEGER DEFAULT 0,       -- docker detected in running LXC
-    dockge_stacks_dir TEXT,                   -- stacks dir if dockge detected
-    has_portainer     INTEGER DEFAULT 0,       -- portainer container detected via docker ps
-    portainer_method  TEXT,                    -- how portainer was detected: 'docker'
-    has_caddy         INTEGER DEFAULT 0,       -- caddy detected in LXC or on PVE host
-    caddy_conf_path   TEXT,                    -- path to caddy binary
+    dockge_stacks_dir TEXT,                   -- stacks dir if dockge detected (legacy)
+    has_portainer     INTEGER DEFAULT 0,       -- portainer detected (legacy)
+    portainer_method  TEXT,                    -- how portainer was detected (legacy)
+    has_caddy         INTEGER DEFAULT 0,       -- caddy detected (legacy)
+    caddy_conf_path   TEXT,                    -- caddy binary path (legacy)
+    dockge_json       TEXT,                    -- JSON array [{container, stacks_dir}]
+    portainer_json    TEXT,                    -- JSON array [{container, data_dir, method}]
+    caddy_json        TEXT,                    -- JSON array [{method, caddyfile, container?}]
     last_probed       TEXT,
     created_at        TEXT DEFAULT (datetime('now')),
     updated_at        TEXT DEFAULT (datetime('now'))
@@ -283,6 +286,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("proxmox_config", "portainer_method",  "TEXT"),
         ("proxmox_config", "has_caddy",         "INTEGER DEFAULT 0"),
         ("proxmox_config", "caddy_conf_path",   "TEXT"),
+        # proxmox_config: JSON service paths (2026-03-13)
+        ("proxmox_config", "dockge_json",       "TEXT"),
+        ("proxmox_config", "portainer_json",    "TEXT"),
+        ("proxmox_config", "caddy_json",        "TEXT"),
         # proxmox_nets: per-interface network rows (2026-03-12)
         # (table created in DDL above; no ALTER TABLE needed for it)
         # vlans: VLAN CIDR map (2026-03-12)
