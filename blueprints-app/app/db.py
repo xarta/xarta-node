@@ -158,6 +158,23 @@ CREATE TABLE IF NOT EXISTS dockge_stacks (
 CREATE INDEX IF NOT EXISTS idx_dockge_stacks_vmid
     ON dockge_stacks(source_vmid);
 
+CREATE TABLE IF NOT EXISTS dockge_stack_services (
+    service_id      TEXT PRIMARY KEY,   -- "{stack_id}_{service_name}"
+    stack_id        TEXT NOT NULL,       -- FK → dockge_stacks
+    service_name    TEXT NOT NULL,
+    image           TEXT,
+    ports_json      TEXT,               -- JSON array of "host:container/proto" strings
+    volumes_json    TEXT,               -- JSON array of volume mounts
+    container_state TEXT,               -- running|stopped|restarting|etc
+    container_id    TEXT,               -- short Docker container ID
+    last_probed     TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_dockge_stack_services_stack_id
+    ON dockge_stack_services(stack_id);
+
 CREATE TABLE IF NOT EXISTS caddy_configs (
     caddy_id          TEXT PRIMARY KEY,      -- "{source_vmid}_{path_slug}"
     pve_host          TEXT,
@@ -305,6 +322,13 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # proxmox_nets: per-interface network rows (2026-03-12)
         # (table created in DDL above; no ALTER TABLE needed for it)
         # vlans: VLAN CIDR map (2026-03-12)
+        # (table created in DDL above; no ALTER TABLE needed for it)
+        # dockge_stacks: parentage + direct SSH metadata (2026-03-13)
+        ("dockge_stacks", "vm_type",          "TEXT"),
+        ("dockge_stacks", "ip_address",        "TEXT"),
+        ("dockge_stacks", "parent_context",    "TEXT"),
+        ("dockge_stacks", "parent_stack_name", "TEXT"),
+        # dockge_stack_services: relational per-container rows (2026-03-13)
         # (table created in DDL above; no ALTER TABLE needed for it)
     ]
     existing_cols: dict[str, set[str]] = {}
