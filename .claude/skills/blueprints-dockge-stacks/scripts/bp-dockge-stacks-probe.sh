@@ -1,209 +1,439 @@
 #!/usr/bin/env bash
-# bp-dockge-stacks-probe.sh — Probe Dockge instances via pct exec and collect
-# compose stacks for the dockge_stacks table.
+# bp-dockge-stacks-probe.sh — v2
 #
-# stdout: ##ENTRIES## [...] and ##STATS## {...}
+# Probes Dockge stacks across the fleet using:
+#   - proxmox_config.dockge_json  to know which machines have Dockge + stacks paths
+#   - proxmox_nets + ssh_targets  to find the right IP and SSH key per machine
+#   - Direct SSH into each machine (not pct exec via PVE, except as LXC fallback)
+#
+# stdout: ##ENTRIES## [...stacks] ##SERVICES## [...services] ##STATS## {...}
 # stderr: progress messages
 #
-# Requires: PROXMOX_SSH_KEY env var (ed25519 key for root@pve)
-# LXC inventory is read from Blueprints proxmox_config table (run bp-proxmox-config-probe first)
-
+# Required env vars (pass whichever keys you have):
+#   PROXMOX_SSH_KEY, VM_SSH_KEY, LXC_SSH_KEY, CITADEL_SSH_KEY, XARTA_NODE_SSH_KEY
 set -uo pipefail
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S")
+DB="${BLUEPRINTS_DB:-/opt/blueprints/data/db/blueprints.db}"
 
-# ── Discover LXC instances from Blueprints API ────────────────────────────────
-# Reads all LXC VMIDs from proxmox_config table (populated by bp-proxmox-config-probe).
-# Each entry is PVE_HOST:VMID:PVE_NAME — the remote python checks for Dockge stacks
-# in each LXC and returns [] when none are found, so this is safe to run exhaustively.
-API_BASE="${BLUEPRINTS_API:-http://localhost:8080}"
-echo "[instances] Fetching LXC inventory from Blueprints API ..." >&2
-PVE_CONFIG_RAW=$(curl -sf "${API_BASE}/api/v1/proxmox-config?vm_type=lxc" 2>/dev/null || echo "[]")
-if [[ "$PVE_CONFIG_RAW" == "[]" ]] || [[ -z "$PVE_CONFIG_RAW" ]]; then
-    echo "ERROR: No LXC records in proxmox_config — run bp-proxmox-config-probe first" >&2
+if [[ ! -f "$DB" ]]; then
+    echo "ERROR: Blueprints DB not found: $DB" >&2
     exit 1
 fi
-# PVE_HOST:VMID:PVE_NAME format
-mapfile -t DOCKGE_INSTANCES < <(python3 -c "
-import json, sys
-seen = set()
-for r in json.loads(sys.stdin.read()):
-    key = (r['pve_host'], r['vmid'])
-    if key in seen:
+
+# ── Build machine inventory from DB ──────────────────────────────────────────
+echo "[inventory] Building Dockge machine list from DB..." >&2
+
+MACHINES_JSON=$(python3 - "$DB" << 'INNERPY'
+import json, sqlite3, sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+
+rows = conn.execute("""
+    SELECT
+        pc.config_id, pc.pve_host, pc.vmid, pc.name, pc.vm_type,
+        pc.dockge_json,
+        pn.ip_address, pn.vlan_tag,
+        COALESCE(st.key_env_var, '') AS key_env_var,
+        COALESCE(st.source_ip,   '') AS source_ip
+    FROM proxmox_config pc
+    JOIN proxmox_nets pn ON pn.config_id = pc.config_id AND pn.ip_address IS NOT NULL
+    LEFT JOIN ssh_targets st ON st.ip_address = pn.ip_address
+    WHERE pc.dockge_json IS NOT NULL
+      AND pc.dockge_json NOT IN ('[]', 'null', '')
+    ORDER BY
+        pc.config_id,
+        CASE WHEN st.key_env_var IS NOT NULL AND st.key_env_var != '' THEN 0 ELSE 1 END,
+        CASE pn.vlan_tag WHEN 42 THEN 0 WHEN 33 THEN 1 ELSE 2 END
+""").fetchall()
+
+best = {}
+for r in rows:
+    cid = r['config_id']
+    try:
+        dj = json.loads(r['dockge_json'] or '[]')
+    except Exception:
+        dj = []
+    if not dj:
         continue
-    seen.add(key)
-    name = r.get('pve_name') or r['pve_host']
-    print(f\"{r['pve_host']}:{r['vmid']}:{name}\")
-" <<< "$PVE_CONFIG_RAW")
-echo "[instances] ${#DOCKGE_INSTANCES[@]} LXC(s) to check for Dockge" >&2
+    if cid not in best:
+        best[cid] = dict(r)
+        best[cid]['dockge_instances'] = dj
 
-KEY="${PROXMOX_SSH_KEY:-}"
-if [[ -z "$KEY" || ! -f "$KEY" ]]; then
-    echo "ERROR: PROXMOX_SSH_KEY not set or key file missing: ${KEY:-<unset>}" >&2
+print(json.dumps(list(best.values())))
+INNERPY
+)
+
+MACHINE_COUNT=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$MACHINES_JSON" 2>/dev/null || echo 0)
+echo "[inventory] ${MACHINE_COUNT} machine(s) with Dockge to probe" >&2
+
+if [[ "$MACHINE_COUNT" -eq 0 ]]; then
+    echo "ERROR: No machines with dockge_json found — run Proxmox Config probe first" >&2
     exit 1
 fi
 
-SSH_OPTS=(-i "$KEY" -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# ── VLAN source binding from ssh_targets ─────────────────────────────────────
-_bp_pve_ssh() {
-    # Usage: _bp_pve_ssh <pve_ip> [cmd...]
-    # Wraps ssh "${SSH_OPTS[@]}" with optional -b <source_ip> from ssh_targets
-    local _ip="$1"; shift
-    local _db="${BLUEPRINTS_DB:-/opt/blueprints/data/db/blueprints.db}"
-    local _src="" _bind=()
-    if [[ -f "$_db" ]]; then
-        _src=$(sqlite3 "$_db" "SELECT COALESCE(source_ip,'') FROM ssh_targets WHERE ip_address='${_ip}' LIMIT 1;" 2>/dev/null) || true
-    fi
-    [[ -n "$_src" ]] && _bind=(-b "$_src")
-    ssh "${SSH_OPTS[@]}" "${_bind[@]+${_bind[@]}}" "root@${_ip}" "$@"
+_resolve_key() {
+    # Return path if env var is set and file exists, else empty string
+    local varname="$1"
+    local path="${!varname:-}"
+    [[ -n "$path" && -f "$path" ]] && echo "$path" || echo ""
 }
 
-echo "=== Dockge Stacks Probe ===" >&2
-echo "Timestamp: ${TIMESTAMP}" >&2
+_direct_ssh() {
+    # _direct_ssh <key_path> <source_ip> <target_ip> [cmd...]
+    local key="$1"; local src="$2"; local tgt="$3"; shift 3
+    local bind_args=()
+    [[ -n "$src" ]] && bind_args=(-b "$src")
+    ssh -i "$key" "${bind_args[@]+"${bind_args[@]}"}" \
+        -o ConnectTimeout=10 -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        "root@${tgt}" "$@"
+}
+
+_pve_key_for() {
+    # Get key path for a PVE host (falls back to PROXMOX_SSH_KEY)
+    local pve_ip="$1"
+    local kv
+    kv=$(sqlite3 "$DB" "SELECT COALESCE(key_env_var,'PROXMOX_SSH_KEY') FROM ssh_targets WHERE ip_address='${pve_ip}' LIMIT 1;" 2>/dev/null) || kv="PROXMOX_SSH_KEY"
+    [[ -z "$kv" ]] && kv="PROXMOX_SSH_KEY"
+    _resolve_key "$kv"
+}
+
+_pve_src_for() {
+    local pve_ip="$1"
+    sqlite3 "$DB" "SELECT COALESCE(source_ip,'') FROM ssh_targets WHERE ip_address='${pve_ip}' LIMIT 1;" 2>/dev/null || echo ""
+}
+
+# ── Work directory ────────────────────────────────────────────────────────────
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Python script to run on the PVE host via SSH (uses pct exec to reach the LXC)
-# Args: pve_host vmid pve_name timestamp
-REMOTE_PY="$WORK_DIR/remote_probe.py"
-cat > "$REMOTE_PY" << 'PYEOF'
-import sys, os, json, re, subprocess
+# ── Remote probe Python script ────────────────────────────────────────────────
+# This single script runs on the target machine (via SSH stdin or pct exec).
+# It receives its argument as env var PROBE_ARG_B64 (base64-encoded JSON).
 
-pve_host = sys.argv[1]
-vmid     = sys.argv[2]
-pve_name = sys.argv[3]
-ts       = sys.argv[4]
+cat > "$WORK_DIR/remote_probe.py" << 'REMPY'
+#!/usr/bin/env python3
+"""
+Remote Dockge probe. Receives config via env var PROBE_ARG_B64 (base64 JSON).
+Arg schema: {vmid, pve_host, vm_type, ip, timestamp, name, instances:[{container,stacks_dir}]}
+Output: JSON {stacks:[...], services:[...]}
+"""
+import base64, json, os, re, subprocess, sys
 
-def pct_exec(cmd_list, vmid=vmid):
-    """Run a command inside the LXC via pct exec. Returns stdout string or None."""
+raw = os.environ.get("PROBE_ARG_B64", "")
+if not raw:
+    print(json.dumps({"stacks": [], "services": []})); sys.exit(0)
+
+arg       = json.loads(base64.b64decode(raw).decode())
+vmid      = str(arg.get("vmid", ""))
+pve_host  = arg.get("pve_host", "")
+vm_type   = arg.get("vm_type", "")
+ip        = arg.get("ip", "")
+ts        = arg.get("timestamp", "")
+vm_name   = arg.get("name", "")
+instances = arg.get("instances", [])
+
+
+def run(cmd, timeout=15):
     try:
-        result = subprocess.run(
-            ["pct", "exec", vmid, "--"] + cmd_list,
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            return result.stdout
-        return None
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
     except Exception:
         return None
 
-# Try common stacks directories
-STACKS_CANDIDATES = ["/opt/stacks", "/opt/dockge/data/stacks"]
-stacks_dir = None
-for candidate in STACKS_CANDIDATES:
-    out = pct_exec(["ls", candidate])
-    if out is not None:
-        stacks_dir = candidate
-        break
 
-if stacks_dir is None:
-    # Output empty list — no stacks found
-    print(json.dumps([]))
-    sys.exit(0)
+def detect_parent_context(container_name, all_stacks_dirs):
+    """Inspect Docker container labels to determine how Dockge was started."""
+    out = run(["docker", "inspect", container_name, "--format", "{{json .Config.Labels}}"])
+    if out is None:
+        return "unknown", None
+    try:
+        labels = json.loads(out.strip())
+    except Exception:
+        return "unknown", None
+    if not labels:
+        return "docker-run", None
+    working_dir = labels.get("com.docker.compose.project.working_dir", "")
+    project     = labels.get("com.docker.compose.project", "")
+    if working_dir:
+        for sdir in all_stacks_dirs:
+            sdir_n = sdir.rstrip("/")
+            if working_dir.startswith(sdir_n + "/"):
+                subdir = working_dir[len(sdir_n)+1:].split("/")[0]
+                return "dockge-stack", subdir or project or None
+        return "docker-compose", project or None
+    return "docker-run", None
 
-stacks_listing = pct_exec(["ls", "-1", stacks_dir]) or ""
-stack_names = [s.strip() for s in stacks_listing.splitlines() if s.strip()]
 
-entries = []
-for stack_name in stack_names:
-    stack_path = f"{stacks_dir}/{stack_name}"
+def parse_compose(content):
+    """Extract services with image, ports, volumes from compose YAML text."""
+    services = {}
+    in_services = False
+    cur_svc = None
+    for line in content.splitlines():
+        s = line.rstrip()
+        if re.match(r'^services\s*:', s):
+            in_services = True; continue
+        if in_services:
+            if s and not s.startswith((" ", "\t")) and re.match(r'^[a-zA-Z0-9_-]', s):
+                in_services = False; continue
+            m = re.match(r'^  ([a-zA-Z0-9_][a-zA-Z0-9_.:-]*):\s*$', s)
+            if m:
+                cur_svc = m.group(1)
+                services[cur_svc] = {"image": None, "ports": [], "volumes": []}
+                continue
+            if cur_svc and s.strip():
+                im = re.match(r'^\s+image\s*:\s*(.+)', s)
+                if im:
+                    services[cur_svc]["image"] = im.group(1).strip().strip('"\'')
+                pm = re.match(r'^\s+-\s+["\']?(\d+:\d+(?:/\w+)?)["\']?\s*$', s)
+                if pm:
+                    services[cur_svc]["ports"].append(pm.group(1))
+                vm = re.match(r'^\s+-\s+["\']?([./~][^:\s"\']+:[^:\s"\']+)["\']?\s*$', s)
+                if vm:
+                    services[cur_svc]["volumes"].append(vm.group(1))
+    return services
 
-    # Try compose.yaml or compose.yml or docker-compose.yaml
+
+def probe_stack(stack_path, sname, stack_id, ts):
     compose_content = None
     for fname in ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]:
-        content = pct_exec(["cat", f"{stack_path}/{fname}"])
-        if content is not None:
-            compose_content = content
-            break
+        c = run(["cat", f"{stack_path}/{fname}"])
+        if c is not None:
+            compose_content = c; break
+    if not compose_content:
+        return None, []
 
-    if compose_content is None:
-        continue
+    env_file = (run(["sh", "-c", f"test -f {stack_path}/.env && echo yes || echo no"]) or "").strip() == "yes"
 
-    # Check for .env file
-    env_check = pct_exec(["sh", "-c", f"test -f {stack_path}/.env && echo yes || echo no"])
-    env_file_exists = (env_check or "").strip() == "yes"
+    services_defined = parse_compose(compose_content)
 
-    # Get docker compose status
-    status = ""
-    ps_json = pct_exec(["docker", "compose", "-f", f"{stack_path}/compose.yaml", "ps", "--format", "json"])
-    if ps_json:
-        try:
-            ps_data = [json.loads(line) for line in ps_json.strip().splitlines() if line.strip()]
-            statuses = list(set(c.get("State", "") or c.get("Status", "") for c in ps_data))
-            status = statuses[0] if len(statuses) == 1 else ("running" if "running" in statuses else ", ".join(statuses))
-        except Exception:
-            status = "unknown"
+    # Live container state from docker compose ps
+    ps_out = run(["docker", "compose", "-f", f"{stack_path}/compose.yaml", "ps", "--format", "json"], timeout=20)
+    container_data = {}
+    if ps_out:
+        for pline in ps_out.strip().splitlines():
+            pline = pline.strip()
+            if not pline: continue
+            try:
+                c = json.loads(pline)
+                svc   = c.get("Service") or c.get("service") or ""
+                state = (c.get("State") or c.get("Status") or "").lower()
+                cid   = (c.get("ID") or c.get("Id") or "")[:12]
+                if svc:
+                    container_data[svc] = {"state": state, "id": cid}
+            except Exception:
+                pass
 
-    # Parse compose for services, ports, volumes (regex based — no PyYAML needed)
-    services = re.findall(r'^  ([a-zA-Z0-9_-]+):\s*$', compose_content, re.MULTILINE)
-    ports    = re.findall(r'["\']?(\d+:\d+)["\']?', compose_content)
-    volumes  = re.findall(r'["\']?([./~][^:\s"\']*:[^:\s"\']+)["\']?', compose_content)
+    states = [v["state"] for v in container_data.values()]
+    if not states:              stack_status = "unknown"
+    elif all(s == "running" for s in states):   stack_status = "running"
+    elif all(s in ("exited","stopped","") for s in states): stack_status = "stopped"
+    elif any(s == "running" for s in states):   stack_status = "partial"
+    else:                       stack_status = states[0]
 
-    entries.append({
-        "stack_id":        f"{vmid}_{stack_name}",
-        "pve_host":        pve_host,
-        "source_vmid":     vmid,
-        "source_lxc_name": "",
-        "stack_name":      stack_name,
-        "status":          status,
+    svc_rows = []
+    all_ports = []
+    for svc_n, svc_def in services_defined.items():
+        cd = container_data.get(svc_n, {})
+        svc_rows.append({
+            "service_id":      f"{stack_id}_{svc_n}",
+            "stack_id":        stack_id,
+            "service_name":    svc_n,
+            "image":           svc_def["image"],
+            "ports_json":      json.dumps(svc_def["ports"])   if svc_def["ports"]   else None,
+            "volumes_json":    json.dumps(svc_def["volumes"]) if svc_def["volumes"] else None,
+            "container_state": cd.get("state"),
+            "container_id":    cd.get("id"),
+            "last_probed":     ts,
+        })
+        all_ports.extend(svc_def["ports"])
+
+    stack_entry = {
+        "stack_status":    stack_status,
         "compose_content": compose_content,
-        "services_json":   json.dumps(services) if services else None,
-        "ports_json":      json.dumps(list(set(ports))) if ports else None,
-        "volumes_json":    json.dumps(list(set(volumes))) if volumes else None,
-        "env_file_exists": env_file_exists,
-        "stacks_dir":      stacks_dir,
-        "last_probed":     ts,
-    })
+        "services_json":   json.dumps(list(services_defined.keys())) if services_defined else None,
+        "ports_json":      json.dumps(list(set(all_ports))) if all_ports else None,
+        "env_file_exists": 1 if env_file else 0,
+    }
+    return stack_entry, svc_rows
 
-print(json.dumps(entries))
-PYEOF
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+all_stacks_dirs = [inst.get("stacks_dir","") for inst in instances if inst.get("stacks_dir")]
+stacks_out = []; services_out = []
+
+for inst in instances:
+    container_name = inst.get("container", "")
+    stacks_dir     = inst.get("stacks_dir", "")
+    if not stacks_dir: continue
+
+    dir_slug        = stacks_dir.strip("/").replace("/", "_")
+    pve_safe        = pve_host.replace(".", "_")
+    instance_prefix = f"{pve_safe}_{vmid}_{dir_slug}"
+
+    parent_ctx, parent_stack = detect_parent_context(container_name, all_stacks_dirs)
+
+    listing = run(["ls", "-1", stacks_dir])
+    if listing is None: continue
+    stack_names = [s.strip() for s in listing.splitlines() if s.strip()]
+
+    for sname in stack_names:
+        stack_id = f"{instance_prefix}_{sname}"
+        entry, svcs = probe_stack(f"{stacks_dir}/{sname}", sname, stack_id, ts)
+        if entry is None: continue
+        stacks_out.append({
+            "stack_id":          stack_id,
+            "pve_host":          pve_host,
+            "source_vmid":       vmid,
+            "source_lxc_name":   vm_name,
+            "stack_name":        sname,
+            "status":            entry["stack_status"],
+            "compose_content":   entry["compose_content"],
+            "services_json":     entry["services_json"],
+            "ports_json":        entry["ports_json"],
+            "volumes_json":      None,
+            "env_file_exists":   entry["env_file_exists"],
+            "stacks_dir":        stacks_dir,
+            "vm_type":           vm_type,
+            "ip_address":        ip,
+            "parent_context":    parent_ctx,
+            "parent_stack_name": parent_stack,
+            "last_probed":       ts,
+        })
+        services_out.extend(svcs)
+
+print(json.dumps({"stacks": stacks_out, "services": services_out}))
+REMPY
+
+# ── PVE fallback for LXCs without direct SSH ─────────────────────────────────
+
+_fallback_lxc() {
+    # Run remote_probe.py inside an LXC via pct exec piped through PVE SSH
+    local pve_ip="$1" vmid_in="$2" arg_b64="$3"
+    local pve_key pve_src pve_bind=()
+    pve_key=$(_pve_key_for "$pve_ip")
+    [[ -z "$pve_key" ]] && { echo "  SKIP: no PVE key for ${pve_ip}" >&2; return 1; }
+    pve_src=$(_pve_src_for "$pve_ip")
+    [[ -n "$pve_src" ]] && pve_bind=(-b "$pve_src")
+
+    local py_b64
+    py_b64=$(base64 -w0 "$WORK_DIR/remote_probe.py")
+
+    ssh -i "$pve_key" "${pve_bind[@]+"${pve_bind[@]}"}" \
+        -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        "root@${pve_ip}" \
+        "echo '${py_b64}' | base64 -d > /tmp/_dp_${vmid_in}.py && \
+         pct exec ${vmid_in} -- bash -c 'PROBE_ARG_B64=${arg_b64} python3 /dev/stdin' \
+             < /tmp/_dp_${vmid_in}.py ; \
+         rm -f /tmp/_dp_${vmid_in}.py" 2>/dev/null
+}
+
+# ── Main probe loop ───────────────────────────────────────────────────────────
+
+TOTAL_MACHINES=0
 TOTAL_INSTANCES=0
-TOTAL_STACKS=0
+ALL_STACKS='[]'
+ALL_SVCS='[]'
 
-for inst in "${DOCKGE_INSTANCES[@]}"; do
-    PVE_IP="${inst%%:*}"
-    rest="${inst#*:}"
-    VMID="${rest%%:*}"
-    PVE_NAME="${rest##*:}"
+while IFS= read -r M; do
+    PVE_HOST=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['pve_host'])" "$M")
+    VMID=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['vmid'])" "$M")
+    VM_NAME=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name',''))" "$M")
+    VM_TYPE=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vm_type',''))" "$M")
+    IP=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('ip_address',''))" "$M")
+    KEY_VAR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key_env_var',''))" "$M")
+    SRC_IP=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_ip',''))" "$M")
+    INST_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('dockge_instances',[])))" "$M")
 
-    echo "[probe] pct exec ${VMID} on ${PVE_IP} (${PVE_NAME})" >&2
-    OUTFILE="${WORK_DIR}/${PVE_NAME}_${VMID}.json"
+    echo "[probe] vmid=${VMID} (${VM_NAME}) type=${VM_TYPE} ip=${IP} key=${KEY_VAR}" >&2
+    (( TOTAL_MACHINES+=1 )) || true
+    (( TOTAL_INSTANCES+=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$INST_JSON") )) || true
 
-    _bp_pve_ssh "${PVE_IP}" \
-        python3 /dev/stdin "$PVE_IP" "$VMID" "$PVE_NAME" "$TIMESTAMP" \
-        < "$REMOTE_PY" > "$OUTFILE" \
-        || { echo "  WARNING: failed for ${PVE_IP} vmid=${VMID} — skipping" >&2; rm -f "$OUTFILE"; continue; }
+    # Build probe arg and base64-encode it
+    PROBE_ARG=$(python3 -c "
+import base64, json, sys
+d = {
+    'vmid':      sys.argv[1],
+    'pve_host':  sys.argv[2],
+    'vm_type':   sys.argv[3],
+    'ip':        sys.argv[4],
+    'timestamp': sys.argv[5],
+    'name':      sys.argv[6],
+    'instances': json.loads(sys.argv[7]),
+}
+# Print as base64 to avoid shell quoting issues
+print(base64.b64encode(json.dumps(d).encode()).decode())
+" "$VMID" "$PVE_HOST" "$VM_TYPE" "$IP" "$TIMESTAMP" "$VM_NAME" "$INST_JSON")
 
-    COUNT=$(python3 -c "import json; print(len(json.load(open('${OUTFILE}'))))" 2>/dev/null || echo 0)
-    echo "  -> ${COUNT} stacks from vmid=${VMID}" >&2
-    (( TOTAL_INSTANCES += 1 )) || true
-    (( TOTAL_STACKS += COUNT )) || true
-done
+    OUTFILE="$WORK_DIR/${VMID}_result.json"
+    PROBED=0
+
+    # Try direct SSH
+    if [[ -n "$IP" && -n "$KEY_VAR" ]]; then
+        KEY_PATH=$(_resolve_key "$KEY_VAR")
+        if [[ -n "$KEY_PATH" ]]; then
+            _direct_ssh "$KEY_PATH" "$SRC_IP" "$IP" \
+                "PROBE_ARG_B64=${PROBE_ARG} python3 /dev/stdin" \
+                < "$WORK_DIR/remote_probe.py" > "$OUTFILE" 2>/dev/null \
+                && PROBED=1 \
+                || echo "  WARNING: direct SSH failed for ${IP} (${KEY_VAR})" >&2
+        else
+            echo "  WARNING: key env var '${KEY_VAR}' not set or file missing — skipping direct SSH" >&2
+        fi
+    fi
+
+    # Fallback: pct exec via PVE (LXCs only)
+    if [[ "$PROBED" -eq 0 && "$VM_TYPE" == "lxc" ]]; then
+        echo "  FALLBACK: pct exec for LXC ${VMID} via ${PVE_HOST}" >&2
+        _fallback_lxc "$PVE_HOST" "$VMID" "$PROBE_ARG" > "$OUTFILE" 2>/dev/null || true
+        [[ -s "$OUTFILE" ]] && PROBED=1
+    elif [[ "$PROBED" -eq 0 && "$VM_TYPE" == "qemu" ]]; then
+        echo "  SKIP: QEMU vmid=${VMID} has no accessible SSH target — add to ssh_targets table" >&2
+    fi
+
+    if [[ "$PROBED" -eq 0 || ! -s "$OUTFILE" ]]; then
+        echo "  WARNING: no output from vmid=${VMID} — skipping" >&2
+        continue
+    fi
+
+    ALL_STACKS=$(python3 -c "
+import json, sys
+a  = json.loads(sys.argv[1])
+nd = json.load(open(sys.argv[2]))
+a.extend(nd.get('stacks',[]))
+print(json.dumps(a))
+" "$ALL_STACKS" "$OUTFILE" 2>/dev/null || echo "$ALL_STACKS")
+
+    ALL_SVCS=$(python3 -c "
+import json, sys
+a  = json.loads(sys.argv[1])
+nd = json.load(open(sys.argv[2]))
+a.extend(nd.get('services',[]))
+print(json.dumps(a))
+" "$ALL_SVCS" "$OUTFILE" 2>/dev/null || echo "$ALL_SVCS")
+
+    SC=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('stacks',[])))" "$OUTFILE" 2>/dev/null || echo 0)
+    echo "  -> ${SC} stacks from vmid=${VMID}" >&2
+
+done < <(python3 -c "
+import json, sys
+for m in json.loads(sys.stdin.read()):
+    print(json.dumps(m))
+" <<< "$MACHINES_JSON")
 
 echo "" >&2
-echo "[merge] ${TOTAL_INSTANCES} instance(s) probed — combining..." >&2
+FS=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$ALL_STACKS" 2>/dev/null || echo 0)
+SS=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$ALL_SVCS" 2>/dev/null || echo 0)
+echo "[done] ${TOTAL_MACHINES} machine(s), ${TOTAL_INSTANCES} Dockge instance(s), ${FS} stacks, ${SS} services" >&2
 
-FINAL_JSON=$(python3 - "$WORK_DIR" << 'PYEOF'
-import json, os, sys
-tmpdir   = sys.argv[1]
-combined = []
-for fname in sorted(os.listdir(tmpdir)):
-    if not fname.endswith('.json') or 'remote_probe' in fname:
-        continue
-    fpath = os.path.join(tmpdir, fname)
-    try:
-        combined.extend(json.load(open(fpath)))
-    except Exception:
-        pass
-print(json.dumps(combined))
-PYEOF
-)
-
-TOTAL=$(python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" <<< "$FINAL_JSON" 2>/dev/null || echo 0)
-echo "  Total: ${TOTAL} stacks" >&2
-
-echo "##ENTRIES## ${FINAL_JSON}"
-printf '##STATS## {"dockge_instances_probed":%d,"stacks_found":%d}\n' "$TOTAL_INSTANCES" "$TOTAL_STACKS"
+echo "##ENTRIES## ${ALL_STACKS}"
+echo "##SERVICES## ${ALL_SVCS}"
+printf '##STATS## {"machines_probed":%d,"dockge_instances_probed":%d,"stacks_found":%d,"services_found":%d}\n' \
+    "$TOTAL_MACHINES" "$TOTAL_INSTANCES" "$FS" "$SS"

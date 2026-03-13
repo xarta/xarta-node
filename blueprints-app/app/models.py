@@ -359,18 +359,22 @@ class VlanOut(BaseModel):
 # ── Dockge Stacks ─────────────────────────────────────────────────────────────
 
 class DockgeStackCreate(BaseModel):
-    stack_id: str                           # "{source_vmid}_{stack_name}"
+    stack_id: str                           # "{source_vmid}_{stacks_dir_slug}_{stack_name}"
     pve_host: str
     source_vmid: int
     source_lxc_name: Optional[str] = None
     stack_name: str
     status: Optional[str] = None
     compose_content: Optional[str] = None
-    services_json: Optional[str] = None
-    ports_json: Optional[str] = None
+    services_json: Optional[str] = None    # legacy: JSON array of service names
+    ports_json: Optional[str] = None       # legacy: JSON array of port strings
     volumes_json: Optional[str] = None
     env_file_exists: int = 0
     stacks_dir: Optional[str] = None
+    vm_type: Optional[str] = None          # lxc | qemu
+    ip_address: Optional[str] = None       # IP we SSH'd into for this probe
+    parent_context: Optional[str] = None   # dockge-stack | docker-compose | docker-run | portainer-stack | native
+    parent_stack_name: Optional[str] = None  # if parent_context==dockge-stack
     last_probed: Optional[str] = None
 
 
@@ -386,6 +390,10 @@ class DockgeStackUpdate(BaseModel):
     volumes_json: Optional[str] = None
     env_file_exists: Optional[int] = None
     stacks_dir: Optional[str] = None
+    vm_type: Optional[str] = None
+    ip_address: Optional[str] = None
+    parent_context: Optional[str] = None
+    parent_stack_name: Optional[str] = None
     last_probed: Optional[str] = None
 
 
@@ -402,6 +410,47 @@ class DockgeStackOut(BaseModel):
     volumes_json: Optional[str] = None
     env_file_exists: int = 0
     stacks_dir: Optional[str] = None
+    vm_type: Optional[str] = None
+    ip_address: Optional[str] = None
+    parent_context: Optional[str] = None
+    parent_stack_name: Optional[str] = None
+    last_probed: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+# ── Dockge Stack Services ──────────────────────────────────────────────────────
+
+class DockgeStackServiceCreate(BaseModel):
+    service_id: str                         # "{stack_id}_{service_name}"
+    stack_id: str
+    service_name: str
+    image: Optional[str] = None
+    ports_json: Optional[str] = None        # JSON array of "host:container/proto"
+    volumes_json: Optional[str] = None
+    container_state: Optional[str] = None   # running|stopped|restarting|etc
+    container_id: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class DockgeStackServiceUpdate(BaseModel):
+    image: Optional[str] = None
+    ports_json: Optional[str] = None
+    volumes_json: Optional[str] = None
+    container_state: Optional[str] = None
+    container_id: Optional[str] = None
+    last_probed: Optional[str] = None
+
+
+class DockgeStackServiceOut(BaseModel):
+    service_id: str
+    stack_id: str
+    service_name: str
+    image: Optional[str] = None
+    ports_json: Optional[str] = None
+    volumes_json: Optional[str] = None
+    container_state: Optional[str] = None
+    container_id: Optional[str] = None
     last_probed: Optional[str] = None
     created_at: str
     updated_at: str
