@@ -240,6 +240,18 @@ CREATE TABLE IF NOT EXISTS arp_manual (
 );
 CREATE INDEX IF NOT EXISTS idx_arp_manual_mac ON arp_manual(mac_address);
 CREATE INDEX IF NOT EXISTS idx_arp_manual_ip  ON arp_manual(ip_address);
+
+CREATE TABLE IF NOT EXISTS ssh_targets (
+    ip_address   TEXT PRIMARY KEY,   -- target IP (authoritative lookup key)
+    key_env_var  TEXT NOT NULL,       -- VM_SSH_KEY | LXC_SSH_KEY | XARTA_NODE_SSH_KEY | CITADEL_SSH_KEY | PROXMOX_SSH_KEY | PFSENSE_SSH_KEY
+    source_ip    TEXT,                -- local bind IP (same VLAN as target)
+    host_name    TEXT,                -- friendly label (from proxmox_config.name or env)
+    host_type    TEXT,                -- lxc-fleet | lxc | qemu | citadel | pve | pfsense
+    notes        TEXT,
+    created_at   TEXT DEFAULT (datetime('now')),
+    updated_at   TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_targets_host_type ON ssh_targets(host_type);
 """
 
 _SEED_SQL = """

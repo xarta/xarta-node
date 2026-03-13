@@ -557,22 +557,25 @@ async def probe_vm_services() -> dict:
     SSH (as root) into all running proxmox_config entries that have a known IP
     and detect docker, portainer, dockge, caddy.
 
-    Key selection:
-      - Citadel host (vmid=_CITADEL_VMID on _CITADEL_PVE): CITADEL_SSH_KEY only
-      - All other VMs: VM_SSH_KEY
-
-    Source interface: always bound to the same VLAN as the target IP.
-    This node has a NIC on every VLAN for exactly this purpose.
-
-    Updates has_docker/has_portainer/dockge_stacks_dir/has_caddy and enqueues
-    fleet sync. Runs up to 10 concurrent SSH sessions.
+    Key selection is fully deterministic: looks up each target IP in the
+    ssh_targets table. If an IP is not in the table, it is skipped with a
+    clear message. Run POST /api/v1/ssh-targets/rebuild first to populate
+    the table from proxmox_config + pve_hosts + pfSense env vars.
     """
-    vm_key_path      = os.environ.get("VM_SSH_KEY", "")
-    citadel_key_path = os.environ.get("CITADEL_SSH_KEY", "")
-    if not vm_key_path or not os.path.isfile(vm_key_path):
-        raise HTTPException(503, "VM_SSH_KEY not configured or key file missing")
-    if not citadel_key_path or not os.path.isfile(citadel_key_path):
-        raise HTTPException(503, "CITADEL_SSH_KEY not configured or key file missing")
+    # Load all ssh_targets into memory once for fast lookup
+    with get_conn() as conn:
+        _ssh_rows = conn.execute(
+            "SELECT ip_address, key_env_var, source_ip FROM ssh_targets"
+        ).fetchall()
+    ssh_lookup: dict[str, dict] = {
+        r["ip_address"]: {"key_env_var": r["key_env_var"], "source_ip": r["source_ip"]}
+        for r in _ssh_rows
+    }
+    if not ssh_lookup:
+        raise HTTPException(
+            503,
+            "ssh_targets table is empty — run POST /api/v1/ssh-targets/rebuild first"
+        )
 
     with get_conn() as conn:
         targets = conn.execute(
@@ -613,9 +616,21 @@ async def probe_vm_services() -> dict:
     results: list[dict] = []
 
     async def _probe(config_id: str, name: str, ip: str, vmid, pve_host: str) -> None:
-        key = citadel_key_path if _is_citadel(vmid, pve_host) else vm_key_path
-        src = _pick_source_ip(ip)
-        ssh_cmd = ["ssh", "-i", key,
+        target = ssh_lookup.get(ip)
+        if not target:
+            results.append({"config_id": config_id, "name": name, "ip": ip,
+                             "ok": False,
+                             "error": f"no ssh_targets entry for {ip} — run /api/v1/ssh-targets/rebuild"})
+            return
+        key_env  = target["key_env_var"]
+        key_path = os.environ.get(key_env, "")
+        if not key_path or not os.path.isfile(key_path):
+            results.append({"config_id": config_id, "name": name, "ip": ip,
+                             "ok": False,
+                             "error": f"key file missing for {key_env}"})
+            return
+        src = target["source_ip"]
+        ssh_cmd = ["ssh", "-i", key_path,
                    "-o", "StrictHostKeyChecking=no",
                    "-o", "ConnectTimeout=8",
                    "-o", "BatchMode=yes",

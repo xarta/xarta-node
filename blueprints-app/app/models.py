@@ -513,6 +513,34 @@ class ArpManualOut(BaseModel):
     updated_at: str
 
 
+# ── SSH Targets ───────────────────────────────────────────────────────────────
+
+class SshTargetCreate(BaseModel):
+    ip_address: str
+    key_env_var: str                 # e.g. VM_SSH_KEY, LXC_SSH_KEY
+    source_ip: Optional[str] = None  # bind source IP (same VLAN)
+    host_name: Optional[str] = None
+    host_type: Optional[str] = None  # lxc-fleet | lxc | qemu | citadel | pve | pfsense
+    notes: Optional[str] = None
+
+class SshTargetUpdate(BaseModel):
+    key_env_var: Optional[str] = None
+    source_ip: Optional[str] = None
+    host_name: Optional[str] = None
+    host_type: Optional[str] = None
+    notes: Optional[str] = None
+
+class SshTargetOut(BaseModel):
+    ip_address: str
+    key_env_var: str
+    source_ip: Optional[str] = None
+    host_name: Optional[str] = None
+    host_type: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):
