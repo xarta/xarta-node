@@ -512,10 +512,24 @@ async def probe_vm_services() -> dict:
                    COALESCE(NULLIF(c.ip_address,''), n.ip_address) AS ip
             FROM proxmox_config c
             LEFT JOIN (
-                SELECT config_id, MIN(ip_address) AS ip_address
-                FROM proxmox_nets
-                WHERE ip_address IS NOT NULL AND ip_address != ''
-                GROUP BY config_id
+                -- Prefer VLAN42 (.42.) then VLAN33 (.33.) when host has multiple IPs
+                SELECT config_id, ip_address
+                FROM (
+                    SELECT config_id, ip_address,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY config_id
+                               ORDER BY
+                                   CASE
+                                       WHEN ip_address LIKE '192.168.42.%' THEN 0
+                                       WHEN ip_address LIKE '192.168.33.%' THEN 1
+                                       ELSE 2
+                                   END,
+                                   ip_address
+                           ) AS rn
+                    FROM proxmox_nets
+                    WHERE ip_address IS NOT NULL AND ip_address != ''
+                )
+                WHERE rn = 1
             ) n ON n.config_id = c.config_id
             WHERE c.status = 'running'
               AND COALESCE(NULLIF(c.ip_address,''), n.ip_address) IS NOT NULL
