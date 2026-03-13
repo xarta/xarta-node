@@ -25,9 +25,11 @@
 
     /* ── Layout ── */
     header { background: var(--surface); border-bottom: 1px solid var(--border);
-             padding: 10px 20px; display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; }
+             padding: 10px 20px; display: flex; align-items: center; gap: 0; flex-wrap: nowrap; }
     header .brand { font-size: 15px; font-weight: 700; letter-spacing: .3px; white-space: nowrap;
-                    color: var(--text); flex-shrink: 0; }
+                    color: var(--text); flex-shrink: 0; margin-right: 14px; }
+    .header-left  { display: flex; align-items: center; gap: 0; flex: 1; min-width: 0; }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: 16px; }
     main { max-width: 1100px; margin: 0 auto; padding: 24px; }
     section { margin-bottom: 32px; }
     h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
@@ -55,7 +57,8 @@
     table { width: 100%; border-collapse: collapse; }
     thead th { background: var(--surface); color: var(--text-dim); font-size: 11px;
                text-transform: uppercase; letter-spacing: .6px; padding: 8px 10px;
-               text-align: left; border-bottom: 1px solid var(--border); }
+               text-align: left; border-bottom: 1px solid var(--border);
+               position: sticky; top: 0; z-index: 1; }
     tbody tr { border-bottom: 1px solid var(--border); }
     tbody tr:hover { background: rgba(91,156,246,.06); }
     tbody td { padding: 9px 10px; vertical-align: top; }
@@ -150,17 +153,21 @@
 <body>
 
 <header>
-  <span id="header-host" class="brand">&#9670; —</span>
-  <nav class="group-tabs">
-    <button class="group-tab active" onclick="switchGroup('synthesis')">Synthesis</button>
-    <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
-    <button class="group-tab" onclick="switchGroup('settings')">&#9881;</button>
-  </nav>
-  <blueprints-node-selector></blueprints-node-selector>
-  <div class="node-meta">
-    <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
-    <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
-    <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
+  <div class="header-left">
+    <span id="header-host" class="brand">&#9670; —</span>
+    <div class="node-meta">
+      <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
+      <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
+      <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
+    </div>
+  </div>
+  <div class="header-right">
+    <nav class="group-tabs">
+      <button class="group-tab active" onclick="switchGroup('synthesis')">Synthesis</button>
+      <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
+      <button class="group-tab" onclick="switchGroup('settings')">&#9881;</button>
+    </nav>
+    <blueprints-node-selector></blueprints-node-selector>
   </div>
 </header>
 
@@ -658,9 +665,8 @@
         if (r.ok) _machines = await r.json();
       }
       const name = (nodeName || '').toLowerCase();
-      const m = _machines.find(m =>
-        (m.hostname || m.name || '').toLowerCase() === name);
-      const parent = (m && m.parent) ? m.parent : 'Unknown';
+      const m = _machines.find(m => (m.name || '').toLowerCase() === name);
+      const parent = (m && m.parent_machine_id) ? m.parent_machine_id : 'Unknown';
       document.getElementById('header-host').textContent = `\u25C6 ${parent}`;
     } catch (_) {
       document.getElementById('header-host').textContent = '\u25C6 Unknown';
