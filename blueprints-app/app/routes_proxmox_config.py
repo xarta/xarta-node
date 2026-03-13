@@ -424,26 +424,70 @@ async def probe_proxmox_config() -> dict:
 
 _PROBE_SERVICES_CMD = r"""
 has_docker=0; has_portainer=0; portainer_method=""; dockge_dir=""; has_caddy=0; caddy_path=""
-if which docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+docker_usable=0
+
+# ── Docker: detect by socket, binary, or daemon response ─────────────────────
+if [ -S /var/run/docker.sock ]; then
   has_docker=1
-  running=$(docker ps --format '{{.Names}}' 2>/dev/null || echo "")
-  if echo "$running" | grep -qi portainer; then
+  docker info >/dev/null 2>&1 && docker_usable=1
+elif command -v docker >/dev/null 2>&1; then
+  has_docker=1
+  docker info >/dev/null 2>&1 && docker_usable=1
+fi
+
+# ── Container-based discovery (image-matching, not name-matching) ─────────────
+if [ "$docker_usable" = "1" ]; then
+  containers=$(docker ps --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null || true)
+
+  # Portainer: match by image regardless of container name
+  if echo "$containers" | grep -qiE 'portainer/portainer|portainer-ce|portainer-ee'; then
     has_portainer=1; portainer_method=docker
   fi
-  if echo "$running" | grep -qi dockge; then
-    for d in /opt/dockge/stacks /root/dockge/stacks /home/dockge/stacks; do
-      test -d "$d" && dockge_dir="$d" && break
-    done
-    test -z "$dockge_dir" && dockge_dir=/opt/dockge/stacks
+
+  # Dockge: find every instance by image, discover stacks path by inspecting mounts
+  while IFS='|' read -r cid cname cimage; do
+    [ -z "$cid" ] && continue
+    echo "$cimage" | grep -qiE 'dockge' || continue
+    # stacks are mounted at /opt/stacks inside the container
+    host_stacks=$(docker inspect "$cid" --format \
+      '{{range .Mounts}}{{if eq .Destination "/opt/stacks"}}{{.Source}}{{end}}{{end}}' \
+      2>/dev/null | tr -d '[:space:]')
+    # data dir also useful if stacks not separately mounted
+    [ -z "$host_stacks" ] && host_stacks=$(docker inspect "$cid" --format \
+      '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Source}}{{end}}{{end}}' \
+      2>/dev/null | tr -d '[:space:]')
+    [ -z "$host_stacks" ] && continue
+    if [ -z "$dockge_dir" ]; then
+      dockge_dir="$host_stacks"
+    else
+      echo "$dockge_dir" | grep -qF "$host_stacks" || dockge_dir="${dockge_dir},${host_stacks}"
+    fi
+  done <<< "$containers"
+
+  # Caddy: detect container by image
+  if echo "$containers" | grep -qiE '(^|/)caddy:|lucaslorentz/caddy-docker-proxy'; then
+    has_caddy=1
+    caddy_cid=$(echo "$containers" | grep -iE '(^|/)caddy:|lucaslorentz/caddy' | head -1 | cut -d'|' -f1)
+    caddy_path=$(docker inspect "$caddy_cid" --format \
+      '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null | tr ' ' '\n' | \
+      xargs -I{} find {} -maxdepth 2 -name "Caddyfile" 2>/dev/null | head -1)
   fi
 fi
+
+# ── Host-level fallbacks ──────────────────────────────────────────────────────
 if [ "$has_portainer" = "0" ]; then
-  systemctl is-active --quiet portainer 2>/dev/null && has_portainer=1 && portainer_method=service
+  systemctl is-active --quiet portainer 2>/dev/null \
+    && has_portainer=1 && portainer_method=service
 fi
-if which caddy >/dev/null 2>&1 || systemctl is-active --quiet caddy 2>/dev/null || systemctl is-active --quiet caddy2 2>/dev/null; then
-  has_caddy=1
-  caddy_path=$(find /etc/caddy /root /opt -name "Caddyfile" -maxdepth 4 2>/dev/null | head -1)
+if [ "$has_caddy" = "0" ]; then
+  if command -v caddy >/dev/null 2>&1 \
+    || systemctl is-active --quiet caddy 2>/dev/null \
+    || systemctl is-active --quiet caddy2 2>/dev/null; then
+    has_caddy=1
+    caddy_path=$(find /etc/caddy /root /opt /home -name "Caddyfile" -maxdepth 5 2>/dev/null | head -1)
+  fi
 fi
+
 printf "PROBE_RESULT:has_docker=%s;has_portainer=%s;portainer_method=%s;dockge_dir=%s;has_caddy=%s;caddy_path=%s\n" \
   "$has_docker" "$has_portainer" "$portainer_method" "$dockge_dir" "$has_caddy" "$caddy_path"
 """
@@ -562,7 +606,7 @@ async def probe_vm_services() -> dict:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             except Exception as exc:
                 results.append({"config_id": config_id, "name": name, "ip": ip,
                                  "ok": False, "error": str(exc)})
