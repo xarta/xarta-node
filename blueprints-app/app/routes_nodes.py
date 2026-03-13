@@ -30,16 +30,27 @@ router = APIRouter(prefix="/nodes", tags=["nodes"])
 def _row_to_out(row) -> NodeOut:
     addrs = row["addresses"]
     keys = row.keys()
+    addr_list: list[str] = json.loads(addrs) if addrs else []
+
+    # A node is a fleet peer if it is self, or if any of its addresses appears
+    # in the configured PEER_URLS (these are the nodes this instance syncs to).
+    _peer_set = {u.rstrip('/') for u in cfg.PEER_URLS}
+    fleet_peer: bool = (
+        row["node_id"] == cfg.NODE_ID
+        or any(a.rstrip('/') in _peer_set for a in addr_list)
+    )
+
     return NodeOut(
         node_id=row["node_id"],
         display_name=row["display_name"],
         host_machine=row["host_machine"],
         tailnet=row["tailnet"],
-        addresses=json.loads(addrs) if addrs else None,
+        addresses=addr_list or None,
         ui_url=row["ui_url"] if "ui_url" in keys else None,
         machine_id=row["machine_id"] if "machine_id" in keys else None,
         last_seen=row["last_seen"],
         created_at=row["created_at"],
+        fleet_peer=fleet_peer,
     )
 
 

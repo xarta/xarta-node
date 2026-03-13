@@ -177,6 +177,7 @@
         name: p.display_name || p.node_id,
         uiUrl,
         healthUrl: `${uiUrl}/health`,
+        fleetPeer: p.fleet_peer ?? true,
       });
     }
 
@@ -558,7 +559,7 @@
     list.innerHTML = _nodes.map(n => `
       <div class="bp-ns-node${n.id === _current ? ' active' : ''}"
            data-id="${esc(n.id)}" data-url="${esc(n.uiUrl)}">
-        <span class="bp-ns-node-name">${esc(n.name)}</span>
+        <span class="bp-ns-node-name"${n.fleetPeer === false ? ' style="text-decoration:line-through;opacity:0.55"' : ''}>${esc(n.name)}</span>
         <span class="bp-ns-node-metric ${esc(metricClass(n, now))}">${esc(metricText(n, now))}</span>
       </div>`).join('');
 

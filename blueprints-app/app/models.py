@@ -147,6 +147,7 @@ class NodeOut(BaseModel):
     machine_id: Optional[str] = None  # canonical FK to machines.machine_id
     last_seen: Optional[str] = None
     created_at: str
+    fleet_peer: bool = True  # False if node is in DB but not a configured sync peer
 
 
 # ── pfSense DNS ───────────────────────────────────────────────────────────────
