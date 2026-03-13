@@ -81,9 +81,10 @@ def get_ssh_params(ip: str) -> dict:
 def make_ssh_args(ip: str, *, connect_timeout: int = 8) -> list[str]:
     """Build the ssh argv fragment for connecting to ip.
 
-    Returns e.g.:
+    Returns e.g.::
+
         ["-i", "/root/.ssh/id_ed25519_vm",
-         "-b", "192.168.33.19",
+         "-b", "10.0.0.1",   # source_ip from ssh_targets row (omitted when NULL)
          "-o", "StrictHostKeyChecking=no",
          "-o", "BatchMode=yes",
          "-o", "ConnectTimeout=8"]
