@@ -582,22 +582,20 @@ async def probe_vm_services() -> dict:
                    COALESCE(NULLIF(c.ip_address,''), n.ip_address) AS ip
             FROM proxmox_config c
             LEFT JOIN (
-                -- Prefer VLAN42 (.42.) then VLAN33 (.33.) when host has multiple IPs
+                -- Prefer IPs that have a source_ip in ssh_targets (VLAN-matched),
+                -- then fall back to any available IP.
                 SELECT config_id, ip_address
                 FROM (
-                    SELECT config_id, ip_address,
+                    SELECT pn.config_id, pn.ip_address,
                            ROW_NUMBER() OVER (
-                               PARTITION BY config_id
+                               PARTITION BY pn.config_id
                                ORDER BY
-                                   CASE
-                                       WHEN ip_address LIKE '192.168.42.%' THEN 0
-                                       WHEN ip_address LIKE '192.168.33.%' THEN 1
-                                       ELSE 2
-                                   END,
-                                   ip_address
+                                   CASE WHEN st.source_ip IS NOT NULL THEN 0 ELSE 1 END,
+                                   pn.ip_address
                            ) AS rn
-                    FROM proxmox_nets
-                    WHERE ip_address IS NOT NULL AND ip_address != ''
+                    FROM proxmox_nets pn
+                    LEFT JOIN ssh_targets st ON st.ip_address = pn.ip_address
+                    WHERE pn.ip_address IS NOT NULL AND pn.ip_address != ''
                 )
                 WHERE rn = 1
             ) n ON n.config_id = c.config_id
