@@ -1,17 +1,16 @@
-"""routes_nodes.py — node registration and self-identity endpoints.
+"""routes_nodes.py — node management endpoints.
 
-/api/v1/nodes/self — returns this node's identity (from env vars, not DB)
-/api/v1/nodes      — list peer nodes registered in the DB
-POST /api/v1/nodes — register a peer node (operator-triggered); on first
-                     registration this node immediately sends the new peer a
-                     full DB backup, acting as temporary primary for the
-                     onboarding.  Nodes never self-register — the operator
-                     always introduces nodes to each other.
+/api/v1/nodes/self    — returns this node's identity (from config, not DB)
+/api/v1/nodes         — list nodes registered in the DB
+POST /api/v1/nodes/refresh — re-read .nodes.json and upsert DB (Refresh button)
+DELETE /api/v1/nodes/{id}  — mark node inactive in .nodes.json and update DB
 """
 
 import asyncio
 import json
 import logging
+import os
+import subprocess
 from typing import Any
 
 import httpx
@@ -62,13 +61,13 @@ def _row_to_out(row) -> NodeOut:
 
 @router.get("/self", response_model=NodeOut)
 async def get_self() -> NodeOut:
-    """Return this node's identity as derived from env vars."""
+    """Return this node's identity as derived from .nodes.json."""
     return NodeOut(
         node_id=cfg.NODE_ID,
         display_name=cfg.NODE_NAME,
         host_machine=cfg.HOST_MACHINE,
         tailnet=None,
-        addresses=cfg.PEER_URLS,  # own addresses not known without .env; use peers as context
+        addresses=[cfg.SELF_ADDRESS],
         last_seen=None,
         created_at="",
     )
@@ -89,26 +88,92 @@ async def list_nodes() -> list[NodeOut]:
     return [_row_to_out(r) for r in rows]
 
 
+@router.post("/refresh", status_code=200)
+async def refresh_nodes() -> dict:
+    """
+    Re-read .nodes.json and upsert all active nodes into the local DB.
+    Called by the Refresh button in the Nodes UI tab.
+    """
+    _upsert_nodes_from_config()
+    log.info("nodes refreshed from .nodes.json via API")
+    return {"status": "ok", "active_nodes": len([n for n in cfg.NODES_DATA if n.get("active", False)])}
+
+
+def _upsert_nodes_from_config() -> int:
+    """Upsert all active nodes from cfg.NODES_DATA into the local DB. Returns count."""
+    count = 0
+    with get_conn() as conn:
+        for node in cfg.NODES_DATA:
+            if not node.get("active", False):
+                continue
+            nid     = node["node_id"]
+            name    = node["display_name"]
+            host    = node["host_machine"]
+            tailnet = node.get("tailnet", "")
+            pip     = node["primary_ip"]
+            ph      = node["primary_hostname"]
+            tip     = node["tailnet_ip"]
+            port    = node["sync_port"]
+
+            addresses = json.dumps([
+                f"http://{pip}:{port}",
+                f"http://{tip}:{port}",
+            ])
+            ui_url = f"https://{ph}"
+
+            existing = conn.execute(
+                "SELECT node_id FROM nodes WHERE node_id=?", (nid,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE nodes SET display_name=?, host_machine=?, tailnet=?, "
+                    "addresses=?, ui_url=?, last_seen=datetime('now') WHERE node_id=?",
+                    (name, host, tailnet, addresses, ui_url, nid),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO nodes (node_id, display_name, host_machine, tailnet, "
+                    "addresses, ui_url, last_seen) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                    (nid, name, host, tailnet, addresses, ui_url),
+                )
+            count += 1
+    return count
+
+
 @router.delete("/{node_id}", status_code=204)
 async def delete_node(node_id: str) -> Response:
-    """Remove a node record and propagate the deletion to all fleet peers via sync queue."""
+    """
+    Mark a node inactive in .nodes.json (via bp-nodes-delete.sh) and remove
+    its DB record from this node. Does not propagate via sync queue — nodes
+    table is local-only, sourced from .nodes.json.
+    """
+    if node_id == cfg.NODE_ID:
+        raise HTTPException(400, "cannot delete self")
+
+    # Run bp-nodes-delete.sh to mark inactive in JSON and reload
+    script = os.path.join(cfg.REPO_OUTER_PATH, "bp-nodes-delete.sh")
+    if os.path.isfile(script):
+        result = subprocess.run(
+            ["bash", script, node_id],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log.error("bp-nodes-delete.sh failed: %s", result.stderr)
+            raise HTTPException(500, f"failed to update .nodes.json: {result.stderr.strip()}")
+        log.info("bp-nodes-delete.sh marked %s inactive in .nodes.json", node_id)
+    else:
+        log.warning(
+            "bp-nodes-delete.sh not found at %s — deleting from DB only", script
+        )
+
     with get_conn() as conn:
         deleted = conn.execute(
             "DELETE FROM nodes WHERE node_id=?", (node_id,)
         ).rowcount
         if not deleted:
             raise HTTPException(404, f"node '{node_id}' not found")
-        gen = increment_gen(conn)
-        enqueue_for_all_peers(
-            conn,
-            action_type="DELETE",
-            table_name="nodes",
-            row_id=node_id,
-            row_data=None,
-            gen=gen,
-            exclude_node_id=node_id,  # no point queuing for the node being deleted
-        )
-    log.info("deleted node %s from local DB and enqueued fleet-wide DELETE (gen=%d)", node_id, gen)
+
+    log.info("deleted node %s from local DB", node_id)
     return Response(status_code=204)
 
 

@@ -20,6 +20,7 @@ import re
 
 from fastapi import APIRouter, HTTPException
 
+from . import config as cfg
 from .db import get_conn, increment_gen
 from .models import SshTargetCreate, SshTargetOut, SshTargetUpdate
 from .sync.queue import enqueue_for_all_peers
@@ -29,9 +30,8 @@ router = APIRouter(prefix="/ssh-targets", tags=["ssh-targets"])
 # ── Helpers (env-driven, no secrets in source) ──────────────────────────────
 
 def _fleet_lxc_names() -> set[str]:
-    """Names of xarta-node fleet LXCs — loaded from FLEET_LXC_NAMES env var."""
-    raw = os.environ.get("FLEET_LXC_NAMES", "")
-    return {n.strip().lower() for n in raw.split(",") if n.strip()}
+    """Names of xarta-node fleet LXCs — derived from .nodes.json active nodes."""
+    return {n.lower() for n in cfg.FLEET_LXC_NAMES}
 
 
 def _nested_proxmox_names() -> set[str]:

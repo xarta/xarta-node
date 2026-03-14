@@ -30,7 +30,7 @@ from .cors import DynamicCORSMiddleware
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_machines import router as machines_router
-from .routes_nodes import router as nodes_router
+from .routes_nodes import router as nodes_router, _upsert_nodes_from_config
 from .routes_schema import router as schema_router
 from .routes_services import router as services_router
 from .routes_backup import router as backup_router
@@ -84,24 +84,18 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         )
         log.info("serving GUI from %s at /ui", cfg.GUI_DIR)
 
-    # Self-register this node's own identity from env vars — idempotent upsert
-    # so that ui_url and addresses stay current every restart without manual
-    # DB writes.  The /api/v1/nodes route rejects self-registration from peers
-    # but we bypass that here via the DB directly.
-    _self_register()
+    # Load all nodes from .nodes.json into DB — idempotent upsert.
+    # Populates peer records and self-record with current addresses from JSON.
+    _load_nodes_from_json()
 
     # Start async drain loop
     await start_drain_loop()
 
-    # Boot catch-up: compare gen with known peers; request backup if behind or degraded
+    # Boot catch-up: if DB integrity failed, pull full backup from a trusted peer
     asyncio.create_task(_boot_catchup())
 
     # Enqueue any vlans rows that were seeded locally but not yet distributed
     asyncio.create_task(_enqueue_seeded_vlans())
-
-    # Bootstrap: contact configured peers, exchange identities, trigger initial sync
-    if cfg.PEER_URLS:
-        asyncio.create_task(_bootstrap_peers())
 
     log.info("blueprints node ready — peers: %s", cfg.PEER_URLS or "(none)")
 
@@ -110,33 +104,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Shutdown — nothing to clean up in Phase 1
 
 
-def _self_register() -> None:
+def _load_nodes_from_json() -> None:
     """
-    Upsert this node's own identity row in the local DB from environment
-    variables.  Runs on every startup AND after any full restore so that this
-    node's own record is always current regardless of the backup source.
+    Upsert all active nodes from .nodes.json into the local DB.
+
+    Called on startup and after a boot-catchup restore. Ensures the DB mirrors
+    the JSON file on every start — this node's own record stays current and all
+    fleet peers are known without needing peer-to-peer bootstrap.
     """
-    # Use BLUEPRINTS_SELF_ADDRESS if set (bare-systemd nodes with a real TS IP);
-    # fall back to localhost (Docker nodes where Caddy handles external routing).
-    own_address = cfg.SELF_ADDRESS
-    addresses_json = json.dumps([own_address])
-    with db.get_conn() as conn:
-        existing = conn.execute(
-            "SELECT ui_url FROM nodes WHERE node_id=?", (cfg.NODE_ID,)
-        ).fetchone()
-        if existing:
-            conn.execute(
-                "UPDATE nodes SET display_name=?, host_machine=?, addresses=?, ui_url=?, last_seen=datetime('now')"
-                " WHERE node_id=?",
-                (cfg.NODE_NAME, cfg.HOST_MACHINE, addresses_json, cfg.UI_URL or None, cfg.NODE_ID),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO nodes (node_id, display_name, host_machine, addresses, ui_url, last_seen)"
-                " VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                (cfg.NODE_ID, cfg.NODE_NAME, cfg.HOST_MACHINE, addresses_json, cfg.UI_URL or None),
-            )
-    log.info("self-registered node=%s ui_url=%s", cfg.NODE_ID, cfg.UI_URL or "(none)")
+    count = _upsert_nodes_from_config()
+    log.info("loaded %d active nodes from .nodes.json into DB", count)
 
 
 async def _enqueue_seeded_vlans() -> None:
@@ -258,10 +235,10 @@ async def _boot_catchup() -> None:
                 "boot_catchup: ✓ restored from %s — node is now up-to-date",
                 best_peer_id,
             )
-            # Re-register self after restore: the incoming DB is a copy of the
-            # peer's DB which may not include this node's own record.
-            _self_register()
-            log.info("boot_catchup: re-self-registered after restore")
+            # Re-load nodes from JSON after restore: the incoming DB is a copy
+            # of the peer's DB which may not have current addresses for this node.
+            _load_nodes_from_json()
+            log.info("boot_catchup: refreshed nodes from .nodes.json after restore")
         else:
             log.error(
                 "boot_catchup: restore from %s failed — checksum mismatch or "
@@ -272,87 +249,6 @@ async def _boot_catchup() -> None:
         log.exception("boot_catchup: unexpected error fetching backup from %s", best_peer_id)
 
 
-async def _bootstrap_peers() -> None:
-    """
-    Startup bootstrap — called when BLUEPRINTS_PEERS is set in the environment.
-
-    BLUEPRINTS_PEERS is populated by the operator (in .xarta/deploy.env) to tell
-    THIS node about one or more peers at deploy time.  It is always the operator
-    who introduces nodes to each other — nodes never register themselves with
-    other nodes.  Any node can act as temporary primary; there is no fixed primary.
-
-    For each peer URL configured by the operator:
-      1. GET /health to learn the peer's node_id and display name.
-      2. Register the peer locally via our own POST /api/v1/nodes endpoint.
-         This is identical to the operator calling that endpoint manually and
-         triggers _send_initial_backup so this node pushes its full DB to the
-         peer immediately (acting as temporary primary for this onboarding).
-
-    Runs inside a background task so it does not block application startup.
-    Retries once after 10 s on ConnectError per peer.
-    """
-    await asyncio.sleep(5)  # let the app finish startup before making requests
-
-    for peer_url in cfg.PEER_URLS:
-        peer_url = peer_url.rstrip("/")
-        for attempt in range(2):
-            try:
-                # Step 1: learn peer identity
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(f"{peer_url}/health")
-                if resp.status_code != 200:
-                    log.warning(
-                        "bootstrap: peer %s /health returned HTTP %d",
-                        peer_url, resp.status_code,
-                    )
-                    break
-                health = resp.json()
-                peer_node_id = health.get("node_id")
-                peer_node_name = health.get("node_name", peer_node_id or "unknown")
-                if not peer_node_id:
-                    log.warning("bootstrap: peer %s health missing node_id", peer_url)
-                    break
-
-                # Normalise display name: "lady-penelope" → "Lady Penelope"
-                peer_display = peer_node_name.replace("-", " ").title()
-
-                # Step 2: register peer locally — this triggers a full DB backup
-                # push to the peer (this node acting as temporary primary).
-                # We do NOT post our own identity to the peer — that would be
-                # self-registration, which is explicitly not part of the design.
-                # If the operator wants the peer to know about us, they will tell
-                # that peer separately.
-                peer_ui_url = health.get("ui_url") or None
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    r2 = await client.post(
-                        "http://localhost:8080/api/v1/nodes",
-                        json={
-                            "node_id": peer_node_id,
-                            "display_name": peer_display,
-                            "addresses": [peer_url],
-                            "ui_url": peer_ui_url,
-                        },
-                    )
-                log.info(
-                    "bootstrap: registered peer %s locally, full backup scheduled (HTTP %d)",
-                    peer_node_id, r2.status_code,
-                )
-                break  # success — no retry needed
-
-            except httpx.ConnectError:
-                if attempt == 0:
-                    log.warning(
-                        "bootstrap: peer %s unreachable — retrying in 10 s", peer_url
-                    )
-                    await asyncio.sleep(10)
-                else:
-                    log.warning(
-                        "bootstrap: peer %s still unreachable — giving up for now",
-                        peer_url,
-                    )
-            except Exception:
-                log.exception("bootstrap: unexpected error contacting peer %s", peer_url)
-                break
 
 
 def create_app() -> FastAPI:
