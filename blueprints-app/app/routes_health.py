@@ -22,10 +22,6 @@ def _git_short_hash() -> Optional[str]:
         return None
 
 
-# Computed once at startup — stays constant until the service restarts after a pull
-_COMMIT: Optional[str] = _git_short_hash()
-
-
 @router.get("/health", response_model=HealthOut)
 async def health() -> HealthOut:
     with get_conn() as conn:
@@ -38,5 +34,5 @@ async def health() -> HealthOut:
         gen=gen,
         integrity_ok=integrity_ok,
         ui_url=cfg.UI_URL or None,
-        commit=_COMMIT,
+        commit=_git_short_hash(),
     )
