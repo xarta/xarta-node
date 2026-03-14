@@ -204,10 +204,23 @@ async def _boot_catchup() -> None:
     best_peer_id: str | None = None
     best_gen = -1 if force_catchup else my_gen  # -1 means always catchup
 
+    # Only allow nodes whose address appears in our configured PEER_URLS to
+    # act as a restore source.  Ghost/retired nodes kept in the DB for
+    # historical reference must never be elected as backup donors — their DB
+    # may be on old schema or missing tables entirely.
+    trusted_urls: set[str] = {u.rstrip("/") for u in cfg.PEER_URLS}
+
     for row in peer_rows:
         addresses = json.loads(row["addresses"]) if row["addresses"] else []
         for addr in addresses:
             addr = addr.rstrip("/")
+            if addr not in trusted_urls:
+                log.debug(
+                    "boot_catchup: skipping %s (%s) — not in configured PEER_URLS",
+                    row["node_id"],
+                    addr,
+                )
+                break  # skip this peer entirely (no address will match)
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     resp = await client.get(f"{addr}/health")
