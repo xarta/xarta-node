@@ -66,6 +66,32 @@ All peers receive a `sync_git_outer` queue action → `git pull` → service res
 
 For GUI updates (`.xarta/gui/`), use `scope: "inner"` → `sync_git_inner`.
 
+## Sync protocol & commit guard
+
+The sync system uses a persistent queue in `sync_queue` (SQLite). Each data write is enqueued for all peer nodes and drained in the background every 1–20 s.
+
+### ⚠️ Blind upsert — no per-row recency check
+
+`_apply_action()` in `routes_sync.py` applies an `INSERT ... ON CONFLICT DO UPDATE SET ...` with **no timestamp comparison**. The last write wins at row level. This is acceptable when only one node writes a given row — but if two nodes independently update the same row, there is no winner guarantee.
+
+### Commit guard (added 2026-03-14)
+
+`routes_sync.py` carries a coarse-payload guard:
+
+- `config.py` caches `COMMIT_HASH` (short hash) and `COMMIT_TS` (unix epoch from `git log -1 --format=%ct`) **once at process startup**.
+- Outgoing payloads (`drain.py`) include `source_commit_ts`.
+- On `receive_actions()`, if `payload.source_commit_ts < cfg.COMMIT_TS`, all DB-write actions are **rejected with HTTP 409**.
+- System actions (`sync_git_outer`, `sync_git_inner`) are **always accepted** regardless of commit age — so a newer node can tell a stale peer to pull.
+- When the drain loop receives a 409, it calls `purge_unsent_db_actions(peer_id)` — marks all unsent DB-write queue entries as sent (discards them). System actions in the queue are preserved.
+
+**Why this matters:** during a rolling fleet update (T1 gets new code first, peers still on old), the old-code peers would otherwise push stale-schema data to T1 and overwrite correct rows. The commit guard stops this.
+
+**Startup guarantee:** `_git_pull_and_restart` restarts the process after every git pull, so `COMMIT_TS` always reflects the running code. No cron needed.
+
+### `nodes` table — excluded from sync
+
+`"nodes"` is absent from `_ALLOWED_TABLES` in `routes_sync.py`. The nodes table is populated from `.nodes.json` at startup (`_load_nodes_from_json()`) and must never be overwritten by peer sync. Peer-synced `nodes` entries would carry stale addresses.
+
 ## Backup and restore
 
 Local (per-node) DB backups are stored as `.db.tar.gz` files in `BLUEPRINTS_BACKUP_DIR` (typically `.xarta/db-backups/`, committed to the private repo). The `sync_queue` table is always stripped from backups.
