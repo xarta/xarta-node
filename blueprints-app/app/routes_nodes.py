@@ -235,7 +235,6 @@ async def register_node(body: NodeCreate) -> NodeOut:
                 body.node_id,
             )
             # Enqueue the new node registration to all OTHER existing peers
-            from .sync.queue import enqueue_for_all_peers
             row = conn.execute(
                 "SELECT * FROM nodes WHERE node_id=?", (body.node_id,)
             ).fetchone()
