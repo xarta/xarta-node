@@ -228,6 +228,16 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
     return Response(status_code=204)
 
 
+@router.post("/restart", status_code=204)
+async def trigger_restart() -> Response:
+    """Restart the blueprints-app service on this node (via SERVICE_RESTART_CMD)."""
+    if not cfg.SERVICE_RESTART_CMD:
+        raise HTTPException(503, "SERVICE_RESTART_CMD not configured on this node")
+    asyncio.create_task(_restart_service())
+    log.info("service restart triggered via API")
+    return Response(status_code=204)
+
+
 @router.post("/restore", status_code=204)
 async def receive_restore(request: Request) -> Response:
     """
