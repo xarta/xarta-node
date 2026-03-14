@@ -51,6 +51,9 @@
              font-size: 11px; font-weight: 600; text-transform: uppercase; }
     .badge-ok  { background: #1a3d2a; color: var(--ok); }
     .badge-err { background: #3d1a1a; color: var(--err); }
+    .badge-btn { font-family: var(--font); border: none; cursor: pointer;
+                 text-decoration: underline dotted; }
+    .badge-btn:hover { filter: brightness(1.3); }
 
     /* ── Services table ── */
     .table-wrap { overflow-x: auto; overflow-y: auto; max-height: calc(100vh - 220px); }
@@ -565,6 +568,46 @@
   <p id="modal-error" class="error-msg" hidden></p>
 </dialog>
 
+<!-- Integrity FAILED diagnostic modal -->
+<dialog id="integrity-modal" style="background:var(--surface);border:1px solid var(--err);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:420px;max-width:600px;">
+  <h2 style="color:var(--err);margin-bottom:8px;">&#9888; Integrity FAILED</h2>
+  <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;line-height:1.6;">
+    This node's database has been marked as <strong>degraded</strong>. Sync is paused — no outgoing
+    writes will be sent to peers, and this node will not accept incoming sync actions until recovery.
+  </p>
+  <div style="background:rgba(224,92,92,.08);border:1px solid var(--err);border-radius:var(--radius);
+       padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;">
+    <strong>Common cause:</strong> A <em>Force Restore</em> was applied (disaster recovery). The restored
+    database is flagged as degraded until a healthy peer pushes its full backup to this node.
+  </div>
+  <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);
+      margin-bottom:10px;">Diagnostics</h3>
+  <div id="integrity-diag" style="font-size:13px;line-height:1.8;color:var(--text-dim);">
+    <span class="spinner"></span> Loading&hellip;
+  </div>
+  <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);
+      margin:16px 0 10px;">How to recover</h3>
+  <ol style="font-size:13px;line-height:1.9;padding-left:20px;">
+    <li><strong>Wait</strong> — on every boot the app requests a full backup from the first reachable peer.
+        If peers are online, recovery is automatic within ~10–30&nbsp;s of (re)starting the service.</li>
+    <li><strong>Restart the service</strong> — if the node has been running for a while without recovering,
+        restarting triggers boot-catchup again:
+        <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
+        systemctl restart blueprints-app</code></li>
+    <li><strong>Manual restore</strong> — navigate to <em>Settings &rsaquo; Backups</em> and restore from a
+        known-good backup, then restart the service.</li>
+    <li><strong>No peers available?</strong> — if this is the only node, you can reset integrity manually
+        from the SQLite shell:
+        <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
+        UPDATE sync_meta SET value='true' WHERE key='integrity_ok';</code>
+        Only do this if you are certain the data is uncorrupted.</li>
+  </ol>
+  <div style="display:flex;justify-content:flex-end;margin-top:20px;">
+    <button class="secondary" onclick="document.getElementById('integrity-modal').close()">Close</button>
+  </div>
+</dialog>
+
 <!-- Add / Edit setting modal -->
 <dialog id="setting-modal" style="background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;max-width:480px;">
@@ -664,11 +707,52 @@
       _nodeName = d.node_name || d.node_id || '';
       document.getElementById('nn-gen').textContent = d.gen ?? '—';
       const ok = d.integrity_ok;
-      document.getElementById('nn-integrity').innerHTML =
-        `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${ok ? 'OK' : 'FAILED'}</span>`;
+      document.getElementById('nn-integrity').innerHTML = ok
+        ? `<span class="badge badge-ok">OK</span>`
+        : `<button class="badge badge-err badge-btn" onclick="openIntegrityModal()">FAILED</button>`;
       lookupHostParent(d.node_id || _nodeName);
     } catch (e) {
       console.warn('health check failed:', e);
+    }
+  }
+
+  async function openIntegrityModal() {
+    const modal = document.getElementById('integrity-modal');
+    const diag  = document.getElementById('integrity-diag');
+    diag.innerHTML = '<span class="spinner"></span> Loading&hellip;';
+    modal.showModal();
+    try {
+      const [hr, sr] = await Promise.all([
+        fetch('/health'),
+        fetch('/api/v1/sync/status'),
+      ]);
+      const h = hr.ok ? await hr.json() : null;
+      const s = sr.ok ? await sr.json() : null;
+      const rows = [];
+      if (h) {
+        rows.push(['Node', `${h.node_name || h.node_id}`]);
+        rows.push(['Gen', h.gen]);
+        rows.push(['Commit', h.commit ? `${h.commit}` : '—']);
+      }
+      if (s) {
+        rows.push(['Last write at', s.last_write_at || '—']);
+        rows.push(['Last write by', s.last_write_by || '—']);
+        rows.push(['Peers known', s.peer_count]);
+        const depths = s.queue_depths || {};
+        const depthStr = Object.keys(depths).length
+          ? Object.entries(depths).map(([k,v]) => `${k}: ${v}`).join(', ')
+          : 'none';
+        rows.push(['Pending queue', depthStr]);
+      }
+      diag.innerHTML = rows.map(([k,v]) =>
+        `<div style="display:flex;gap:12px;border-bottom:1px solid var(--border);padding:4px 0;">
+          <span style="min-width:130px;color:var(--text-dim);font-size:12px;text-transform:uppercase;
+                letter-spacing:.4px;">${k}</span>
+          <span style="font-family:monospace;font-size:13px;color:var(--text);">${v}</span>
+        </div>`
+      ).join('');
+    } catch (e) {
+      diag.textContent = `Could not load diagnostics: ${e.message}`;
     }
   }
 
