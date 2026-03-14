@@ -657,7 +657,7 @@
       const ok = d.integrity_ok;
       document.getElementById('nn-integrity').innerHTML =
         `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${ok ? 'OK' : 'FAILED'}</span>`;
-      lookupHostParent(_nodeName);
+      lookupHostParent(d.node_id || _nodeName);
     } catch (e) {
       console.warn('health check failed:', e);
     }
