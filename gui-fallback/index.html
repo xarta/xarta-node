@@ -281,8 +281,11 @@
   <!-- Nodes -->
   <section id="tab-nodes" class="tab-panel">
     <h2>Fleet Nodes</h2>
-    <div class="toolbar">
+    <div class="toolbar" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
       <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
+      <span style="font-size:12px;color:var(--text-dim);align-self:center">
+        <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
+      </span>
     </div>
     <div class="table-wrap">
       <table>
@@ -520,10 +523,8 @@
     </div>
     <div class="warn-box">
       &#9888; Restoring only updates <strong>this node</strong>.
-      Other nodes are not automatically updated — their gen will remain higher,
-      so they will push their state back to this node on the next sync cycle,
-      overwriting the restore. Use <strong>Force Restore</strong> to propagate
-      the restored state to all peers (disaster recovery only).
+      Other nodes are not automatically updated — they will push their queued writes back to this node on the next sync cycle, which may overwrite the restore.
+      Use <strong>Force Restore</strong> to propagate the restored state to all peers and suppress incoming overwrites (disaster recovery only).
     </div>
     <div class="table-wrap">
       <table class="backup-table">
