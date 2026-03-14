@@ -3,6 +3,12 @@
 # setup-hosts.sh
 # Installs fleet hostnames into /etc/hosts from .xarta/fleet-hosts.conf.
 #
+# NOTE: On nodes that have .nodes.json, prefer bp-nodes-hosts.sh instead.
+#   bp-nodes-hosts.sh reads from .nodes.json (the single source of truth)
+#   and writes primary + tailnet entries for every active node automatically.
+#   This script remains available for nodes without .nodes.json, or to manage
+#   hosts-format custom entries that are not in .nodes.json.
+#
 # Reads:
 #   .xarta/fleet-hosts.conf  — IP/hostname pairs; belongs in the PRIVATE repo.
 #                              Never commit this file to the public repo.
