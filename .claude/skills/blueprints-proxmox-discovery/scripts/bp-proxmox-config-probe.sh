@@ -49,7 +49,7 @@ _bp_pve_ssh() {
     fi
     [[ -n "$_src" ]] && _bind=(-b "$_src")
     ssh "${SSH_OPTS[@]}" "${_bind[@]+${_bind[@]}}" "root@${_ip}" "$@"
-} >&2
+}
 echo "Timestamp: ${TIMESTAMP}" >&2
 
 WORK_DIR=$(mktemp -d)
