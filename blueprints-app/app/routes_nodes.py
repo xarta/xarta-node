@@ -4,6 +4,8 @@
 /api/v1/nodes         — list nodes registered in the DB
 POST /api/v1/nodes/refresh — re-read .nodes.json and upsert DB (Refresh button)
 DELETE /api/v1/nodes/{id}  — mark node inactive in .nodes.json and update DB
+POST /api/v1/nodes/{id}/pct — start or stop the LXC for a fleet node via pct on its PVE host
+GET  /api/v1/nodes/{id}/pct-status — return current pct status from proxmox_config DB
 """
 
 import json
@@ -14,6 +16,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from starlette.responses import Response
 
 from . import config as cfg
@@ -235,6 +238,108 @@ async def proxy_node_restart(node_id: str) -> Response:
         raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
     log.info("proxied restart to %s (%s)", node_id, target)
     return Response(status_code=204)
+
+
+class PctAction(BaseModel):
+    action: str  # "start" | "stop"
+
+
+@router.get("/{node_id}/pct-status", status_code=200)
+async def get_node_pct_status(node_id: str) -> dict:
+    """Return the current pct status of the LXC for this node (from proxmox_config DB)."""
+    with get_conn() as conn:
+        node_row = conn.execute(
+            "SELECT host_machine FROM nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    if not node_row:
+        raise HTTPException(404, f"node '{node_id}' not found")
+
+    with get_conn() as conn:
+        pve_row = conn.execute(
+            "SELECT pve_host, vmid, status FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
+            (node_row["host_machine"],),
+        ).fetchone()
+
+    if not pve_row:
+        return {"node_id": node_id, "status": "unknown", "vmid": None, "pve_host": None}
+
+    return {
+        "node_id":  node_id,
+        "status":   pve_row["status"] or "unknown",
+        "vmid":     pve_row["vmid"],
+        "pve_host": pve_row["pve_host"],
+    }
+
+
+@router.post("/{node_id}/pct", status_code=200)
+async def node_pct_action(node_id: str, body: PctAction) -> dict:
+    """Start or stop the LXC for the named node via pct on its PVE host."""
+    action = body.action.strip().lower()
+    if action not in ("start", "stop"):
+        raise HTTPException(400, f"invalid action '{action}'; must be 'start' or 'stop'")
+
+    with get_conn() as conn:
+        node_row = conn.execute(
+            "SELECT host_machine FROM nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    if not node_row:
+        raise HTTPException(404, f"node '{node_id}' not found")
+
+    host_machine = node_row["host_machine"]
+
+    with get_conn() as conn:
+        pve_row = conn.execute(
+            "SELECT pve_host, vmid FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
+            (host_machine,),
+        ).fetchone()
+    if not pve_row:
+        raise HTTPException(
+            404,
+            f"no proxmox_config entry for '{host_machine}' — run a Proxmox probe first",
+        )
+
+    pve_host = pve_row["pve_host"]
+    vmid     = pve_row["vmid"]
+
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing, resolve_env_key
+
+    try:
+        ssh_args = make_ssh_args(pve_host, connect_timeout=10)
+    except SshTargetNotFound:
+        # Fallback: use PROXMOX_SSH_KEY directly (no source-IP binding)
+        try:
+            key_path = resolve_env_key("PROXMOX_SSH_KEY")
+        except SshKeyMissing as exc:
+            raise HTTPException(503, f"SSH key not available: {exc}") from exc
+        ssh_args = [
+            "-i", key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+        ]
+    except SshKeyMissing as exc:
+        raise HTTPException(503, f"SSH key not available: {exc}") from exc
+
+    cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct {action} {vmid}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "SSH command timed out") from exc
+
+    if result.returncode != 0:
+        raise HTTPException(
+            500,
+            f"pct {action} {vmid} on {pve_host} failed: {result.stderr.strip() or '(no output)'}",
+        )
+
+    log.info("pct %s %s on %s (node %s) succeeded", action, vmid, pve_host, node_id)
+    return {
+        "status":   "ok",
+        "action":   action,
+        "vmid":     vmid,
+        "pve_host": pve_host,
+        "output":   result.stdout.strip(),
+    }
 
 
 @router.post("", status_code=405)
