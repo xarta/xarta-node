@@ -616,6 +616,7 @@ class GitPullRequest(BaseModel):
 class SyncActionsPayload(BaseModel):
     actions: list[SyncAction]
     source_node_id: str
+    source_commit_ts: int = 0   # unix epoch of source node's HEAD commit
 
 
 class SyncStatus(BaseModel):
@@ -639,3 +640,4 @@ class HealthOut(BaseModel):
     integrity_ok: bool
     ui_url: Optional[str] = None   # browser-accessible URL; set via BLUEPRINTS_UI_URL
     commit: Optional[str] = None   # short git hash of the current outer-repo checkout
+    commit_ts: int = 0             # unix epoch of HEAD commit (for commit-guard ordering)

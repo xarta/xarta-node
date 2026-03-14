@@ -1,8 +1,5 @@
 """routes_health.py — GET /health"""
 
-import subprocess
-from typing import Optional
-
 from fastapi import APIRouter
 
 from . import config as cfg
@@ -10,16 +7,6 @@ from .db import get_conn, get_gen, get_meta
 from .models import HealthOut
 
 router = APIRouter(tags=["health"])
-
-
-def _git_short_hash() -> Optional[str]:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", cfg.REPO_OUTER_PATH, "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL, text=True,
-        ).strip() or None
-    except Exception:
-        return None
 
 
 @router.get("/health", response_model=HealthOut)
@@ -34,5 +21,6 @@ async def health() -> HealthOut:
         gen=gen,
         integrity_ok=integrity_ok,
         ui_url=cfg.UI_URL or None,
-        commit=_git_short_hash(),
+        commit=cfg.COMMIT_HASH,
+        commit_ts=cfg.COMMIT_TS,
     )

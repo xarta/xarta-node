@@ -142,6 +142,24 @@ def get_peers_with_pending() -> list[str]:
     return [r["target_node_id"] for r in rows]
 
 
+def purge_unsent_db_actions(target_node_id: str) -> int:
+    """Mark all unsent DB-write actions for a peer as sent (purge).
+
+    System actions (sync_git_*) are preserved — they must always be delivered
+    so a newer node can tell a stale peer to git-pull.
+
+    Returns the number of rows purged.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE sync_queue SET sent=1 "
+            "WHERE target_node_id=? AND sent=0 "
+            "AND action_type NOT IN ('sync_git_outer', 'sync_git_inner')",
+            (target_node_id,),
+        )
+    return cur.rowcount
+
+
 def get_peer_url(node_id: str) -> str | None:
     """Look up the first address URL for a registered peer node."""
     with get_conn() as conn:
