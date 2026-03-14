@@ -2,6 +2,7 @@
 routes_sync.py — endpoints that implement the Layer 1 + Layer 2 sync protocol.
 
 POST /api/v1/sync/actions   — receive a batch of CRUD actions from a peer
+                             (commit guard: rejects DB writes from older commits)
 POST /api/v1/sync/restore   — receive a full DB backup zip (Layer 1) + SHA-256
 GET  /api/v1/sync/export    — serve the current DB backup zip for a peer to pull
 GET  /api/v1/sync/status    — current sync state summary
@@ -26,8 +27,12 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
+# NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
+# populated from .nodes.json on each node. Incoming sync entries for nodes
+# are silently dropped to prevent stale peer data overwriting the JSON-derived
+# addresses and config.
 _ALLOWED_TABLES = {
-    "services", "machines", "nodes",
+    "services", "machines",
     "pfsense_dns",
     "proxmox_config", "proxmox_nets", "vlans", "dockge_stacks", "dockge_stack_services", "caddy_configs",
     "settings", "pve_hosts",
@@ -136,6 +141,11 @@ def _pk_for_table(table: str) -> str:
 async def receive_actions(payload: SyncActionsPayload) -> Response:
     """
     Receive a batch of CRUD actions from a peer node and apply them locally.
+
+    Commit guard: if the source node's commit timestamp is older than ours,
+    DB-write actions are rejected (409) to prevent stale data overwriting
+    newer-schema rows. System actions (git-pull) are always accepted so the
+    stale node can be told to pull newer code.
     """
     if not payload.actions:
         return Response(status_code=204)
@@ -144,8 +154,8 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
     system_actions = [a for a in payload.actions if a.action_type in _SYSTEM_ACTION_TYPES]
     db_actions = [a for a in payload.actions if a.action_type not in _SYSTEM_ACTION_TYPES]
 
-    # Schedule system actions immediately — they run async, don't touch the DB,
-    # and don't re-propagate (the originating node queued for all known peers).
+    # Schedule system actions immediately — always accepted regardless of
+    # commit age so a newer node can tell an older one to git-pull.
     for action in system_actions:
         if action.action_type == "sync_git_outer":
             asyncio.create_task(_git_pull_and_restart(cfg.REPO_OUTER_PATH, "outer"))
@@ -156,6 +166,24 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
 
     if not db_actions:
         return Response(status_code=204)
+
+    # ── Commit guard: reject DB writes from older-commit peers ────────────
+    if cfg.COMMIT_TS and payload.source_commit_ts:
+        if payload.source_commit_ts < cfg.COMMIT_TS:
+            log.warning(
+                "commit guard: rejecting %d DB actions from %s "
+                "(source_ts=%d < local_ts=%d)",
+                len(db_actions),
+                payload.source_node_id,
+                payload.source_commit_ts,
+                cfg.COMMIT_TS,
+            )
+            raise HTTPException(
+                409,
+                f"commit guard: source commit ({payload.source_commit_ts}) "
+                f"is older than local ({cfg.COMMIT_TS}) — "
+                "pull newer code before syncing data",
+            )
 
     with get_conn() as conn:
         # Check own integrity — if not OK, refuse to accept (corrupt state)

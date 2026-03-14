@@ -26,6 +26,7 @@ from ..sync.queue import (
     get_queue_depth,
     get_peer_url,
     mark_sent,
+    purge_unsent_db_actions,
 )
 from ..sync.restore import make_full_backup
 
@@ -106,6 +107,7 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
 
     payload = {
         "source_node_id": cfg.NODE_ID,
+        "source_commit_ts": cfg.COMMIT_TS,
         "actions": [
             {
                 "action_type": a["action_type"],
@@ -130,6 +132,17 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
             mark_sent(queue_ids)
             log.debug(
                 "drained %d actions to peer %s", len(actions), node_id
+            )
+        elif resp.status_code == 409:
+            # Commit guard: peer is on a newer commit and refused our data.
+            # Purge all unsent DB-write actions for this peer (they carry
+            # stale-schema data). System actions are preserved.
+            purged = purge_unsent_db_actions(node_id)
+            log.warning(
+                "commit guard: peer %s rejected actions (409) — "
+                "purged %d outgoing DB actions. Local code is behind.",
+                node_id,
+                purged,
             )
         else:
             log.warning(

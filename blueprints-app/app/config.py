@@ -106,3 +106,30 @@ REPO_INNER_PATH: str = os.environ.get("REPO_INNER_PATH", "")
 # Shell command to restart the blueprints service after a git pull.
 SERVICE_RESTART_CMD: str = os.environ.get("SERVICE_RESTART_CMD", "")
 
+# ── Git commit identity (computed once at import, cached for process lifetime) ─
+# After git pull + restart, the new process will re-compute these values.
+import subprocess as _sp
+
+def _get_commit_info() -> tuple[str | None, int]:
+    """Return (short_hash, unix_epoch) of HEAD in the outer repo.
+
+    Falls back to (None, 0) if the repo is missing or git fails.
+    """
+    if not REPO_OUTER_PATH or not os.path.isdir(os.path.join(REPO_OUTER_PATH, ".git")):
+        return (None, 0)
+    try:
+        h = _sp.check_output(
+            ["git", "-C", REPO_OUTER_PATH, "rev-parse", "--short", "HEAD"],
+            stderr=_sp.DEVNULL, text=True,
+        ).strip()
+        ts = int(_sp.check_output(
+            ["git", "-C", REPO_OUTER_PATH, "log", "-1", "--format=%ct"],
+            stderr=_sp.DEVNULL, text=True,
+        ).strip())
+        return (h, ts)
+    except Exception:
+        return (None, 0)
+
+COMMIT_HASH, COMMIT_TS = _get_commit_info()
+log.info("commit guard: hash=%s ts=%d", COMMIT_HASH, COMMIT_TS)
+
