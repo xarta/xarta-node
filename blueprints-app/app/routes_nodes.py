@@ -6,7 +6,6 @@ POST /api/v1/nodes/refresh — re-read .nodes.json and upsert DB (Refresh button
 DELETE /api/v1/nodes/{id}  — mark node inactive in .nodes.json and update DB
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -18,9 +17,8 @@ from fastapi import APIRouter, HTTPException
 from starlette.responses import Response
 
 from . import config as cfg
-from .db import get_conn, get_gen, increment_gen
-from .models import NodeCreate, NodeOut
-from .sync.queue import enqueue_for_all_peers
+from .db import get_conn
+from .models import NodeOut
 
 log = logging.getLogger(__name__)
 
@@ -239,137 +237,21 @@ async def proxy_node_restart(node_id: str) -> Response:
     return Response(status_code=204)
 
 
-@router.post("", response_model=NodeOut, status_code=201)
-async def register_node(body: NodeCreate) -> NodeOut:
+@router.post("", status_code=405)
+async def register_node_rejected() -> dict:
     """
-    Register a peer node.
+    Nodes are now managed via .nodes.json (single source of truth).
 
-    Stores the node in the local DB and enqueues the registration to all
-    existing peers (Phase 2: also triggers full-DB backup to the new node).
+    To add or remove a node: edit .nodes.json, then distribute it with
+    bp-nodes-push.sh and press Refresh in Settings > Nodes (or restart
+    the app).  Programmatic registration via this endpoint is no longer
+    supported.
     """
-    if body.node_id == cfg.NODE_ID:
-        raise HTTPException(400, "cannot register self as a peer")
+    raise HTTPException(
+        405,
+        detail=(
+            "Node registration via the API is no longer supported. "
+            "Edit .nodes.json and distribute via bp-nodes-push.sh."
+        ),
+    )
 
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT node_id FROM nodes WHERE node_id=?", (body.node_id,)
-        ).fetchone()
-
-        if existing:
-            # Update addresses + last_seen on re-registration
-            gen = increment_gen(conn)
-            conn.execute(
-                "UPDATE nodes SET display_name=?, host_machine=?, tailnet=?, "
-                "addresses=?, ui_url=?, machine_id=?, last_seen=datetime('now') WHERE node_id=?",
-                (
-                    body.display_name,
-                    body.host_machine,
-                    body.tailnet,
-                    json.dumps(body.addresses) if body.addresses else None,
-                    body.ui_url,
-                    body.machine_id,
-                    body.node_id,
-                ),
-            )
-            row = conn.execute("SELECT * FROM nodes WHERE node_id=?", (body.node_id,)).fetchone()
-            enqueue_for_all_peers(
-                conn, "UPDATE", "nodes", body.node_id, dict(row), gen,
-                exclude_node_id=body.node_id,
-            )
-            log.info("updated peer node %s and enqueued fleet-wide UPDATE (gen=%d)", body.node_id, gen)
-        else:
-            gen = increment_gen(conn, "human")
-            conn.execute(
-                """
-                INSERT INTO nodes
-                    (node_id, display_name, host_machine, tailnet, addresses, ui_url, machine_id, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                """,
-                (
-                    body.node_id,
-                    body.display_name,
-                    body.host_machine,
-                    body.tailnet,
-                    json.dumps(body.addresses) if body.addresses else None,
-                    body.ui_url,
-                    body.machine_id,
-                ),
-            )
-            log.info(
-                "registered new peer node %s — queuing for existing peers",
-                body.node_id,
-            )
-            # Enqueue the new node registration to all OTHER existing peers
-            row = conn.execute(
-                "SELECT * FROM nodes WHERE node_id=?", (body.node_id,)
-            ).fetchone()
-            enqueue_for_all_peers(
-                conn, "INSERT", "nodes", body.node_id, dict(row), gen,
-                exclude_node_id=body.node_id,
-            )
-
-            # Send a full DB backup to the new peer if we know their address.
-            # A brand-new peer has no data yet — the incremental queue alone
-            # won't help them catch up, so we push the whole DB immediately.
-            if body.addresses:
-                asyncio.create_task(
-                    _send_initial_backup(body.node_id, body.addresses[0])
-                )
-                log.info(
-                    "scheduled initial full backup for new peer %s at %s",
-                    body.node_id, body.addresses[0],
-                )
-
-        row = conn.execute(
-            "SELECT * FROM nodes WHERE node_id=?", (body.node_id,)
-        ).fetchone()
-    return _row_to_out(row)
-
-
-async def _send_initial_backup(node_id: str, peer_url: str) -> None:
-    """
-    Send a full DB backup zip to a newly registered peer's restore endpoint.
-    Called as a background task immediately after a new node is registered.
-    Waits 2 s so the peer has time to finish processing the registration
-    response before we start sending.
-    """
-    await asyncio.sleep(2)
-    from .sync.restore import make_full_backup
-    from .db import get_conn, get_gen
-
-    try:
-        zip_bytes, sha256_hex = make_full_backup()
-    except Exception:
-        log.exception("initial backup: failed to create backup for new peer %s", node_id)
-        return
-
-    # Include our current gen so the receiver can apply the generation guard.
-    with get_conn() as conn:
-        current_gen = get_gen(conn)
-
-    target = peer_url.rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{target}/api/v1/sync/restore",
-                content=zip_bytes,
-                headers={
-                    "content-type": "application/octet-stream",
-                    "x-blueprints-checksum": sha256_hex,
-                    "x-blueprints-gen": str(current_gen),
-                },
-            )
-        if resp.status_code == 204:
-            log.info(
-                "initial backup sent to new peer %s — %d bytes",
-                node_id, len(zip_bytes),
-            )
-        else:
-            log.warning(
-                "initial backup: peer %s rejected restore: HTTP %d",
-                node_id, resp.status_code,
-            )
-    except httpx.ConnectError:
-        log.warning("initial backup: peer %s unreachable — they will sync via queue later", node_id)
-    except Exception:
-        log.exception("initial backup: unexpected error sending to peer %s", node_id)
