@@ -12,9 +12,11 @@ POST /api/v1/nodes — register a peer node (operator-triggered); on first
 import asyncio
 import json
 import logging
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from starlette.responses import Response
 
 from . import config as cfg
 from .db import get_conn, get_gen, increment_gen
@@ -51,6 +53,7 @@ def _row_to_out(row) -> NodeOut:
         last_seen=row["last_seen"],
         created_at=row["created_at"],
         fleet_peer=fleet_peer,
+        pending_count=row["pending_count"] if "pending_count" in keys else 0,
     )
 
 
@@ -75,9 +78,65 @@ async def list_nodes() -> list[NodeOut]:
     """List all peer nodes registered in the local DB."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM nodes ORDER BY display_name"
+            """
+            SELECT n.*,
+                   (SELECT COUNT(*) FROM sync_queue
+                    WHERE target_node_id = n.node_id AND sent = 0) AS pending_count
+            FROM nodes n ORDER BY n.display_name
+            """
         ).fetchall()
     return [_row_to_out(r) for r in rows]
+
+
+@router.delete("/{node_id}", status_code=204)
+async def delete_node(node_id: str) -> Response:
+    """Remove a node record from the local DB (does not purge the sync queue)."""
+    with get_conn() as conn:
+        deleted = conn.execute(
+            "DELETE FROM nodes WHERE node_id=?", (node_id,)
+        ).rowcount
+    if not deleted:
+        raise HTTPException(404, f"node '{node_id}' not found")
+    log.info("deleted node %s from local DB", node_id)
+    return Response(status_code=204)
+
+
+@router.delete("/{node_id}/sync-queue", status_code=204)
+async def purge_node_sync_queue(node_id: str) -> Response:
+    """Purge all unsent sync queue entries targeting a specific node."""
+    with get_conn() as conn:
+        n = conn.execute(
+            "DELETE FROM sync_queue WHERE target_node_id=? AND sent=0", (node_id,)
+        ).rowcount
+    log.info("purged %d unsent sync queue entries for node %s", n, node_id)
+    return Response(status_code=204)
+
+
+@router.post("/{node_id}/git-pull", status_code=204)
+async def proxy_node_git_pull(node_id: str) -> Response:
+    """Proxy a git-pull (scope=outer) request to the named peer node."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    if not row or not row["addresses"]:
+        raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
+    addrs: list[str] = json.loads(row["addresses"])
+    if not addrs:
+        raise HTTPException(422, f"node '{node_id}' has no addresses configured")
+    target = addrs[0].rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{target}/api/v1/sync/git-pull",
+                json={"scope": "outer"},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"failed to reach {node_id} at {target}: {exc}") from exc
+    if resp.status_code not in (200, 204):
+        raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
+    log.info("proxied git-pull to %s (%s)", node_id, target)
+    return Response(status_code=204)
 
 
 @router.post("", response_model=NodeOut, status_code=201)
