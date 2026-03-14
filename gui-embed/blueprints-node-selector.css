@@ -135,6 +135,8 @@ blueprints-node-selector,
 .bp-ns-node-metric.ms-stale { color: #7b82a0; }
 .bp-ns-node-metric.ms-pending { color: #5b6080; }
 
+.bp-ns-node-local { color: #e6a817 !important; }
+
 .bp-ns-node-empty {
   color: #5b6080;
   cursor: default;
