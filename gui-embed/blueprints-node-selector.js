@@ -172,12 +172,19 @@
         if (!uiUrl) uiUrl = syncAddr;
       }
 
+      // Collect LAN/HTTP fallback addresses — any address from p.addresses that differs
+      // from the primary uiUrl (e.g. local VLAN HTTP addresses when uiUrl is HTTPS/Tailscale)
+      const altAddresses = (p.addresses || [])
+        .map(a => a.replace(/\/$/, ''))
+        .filter(a => a && a !== uiUrl);
+
       fresh.push({
         id: p.node_id,
         name: p.display_name || p.node_id,
         uiUrl,
         healthUrl: `${uiUrl}/health`,
         fleetPeer: p.fleet_peer ?? true,
+        altAddresses,
       });
     }
 
@@ -210,6 +217,8 @@
             lastSeenAt: byId[n.id].lastSeenAt,
             lastPolledAt: byId[n.id].lastPolledAt,
             discoveredAt: byId[n.id].discoveredAt || Date.now(),
+            localMode: byId[n.id].localMode,
+            activeHealthUrl: byId[n.id].activeHealthUrl,
           }
         : {},
     ));
@@ -232,11 +241,32 @@
         method: 'GET',
         signal: AbortSignal.timeout(REQUEST_TIMEOUT),
       });
-      if (!r.ok) return { ok: false, latencyMs: null };
-      return { ok: true, latencyMs: Math.round(performance.now() - start) };
-    } catch {
-      return { ok: false, latencyMs: null };
+      if (r.ok) {
+        node.localMode = false;
+        node.activeHealthUrl = null;
+        return { ok: true, latencyMs: Math.round(performance.now() - start) };
+      }
+    } catch {}
+
+    // Primary unreachable — try LAN/fallback addresses
+    for (const alt of (node.altAddresses || [])) {
+      const t = performance.now();
+      try {
+        const r = await fetch(`${alt}/health`, {
+          method: 'GET',
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+        });
+        if (r.ok) {
+          node.localMode = true;
+          node.activeHealthUrl = `${alt}/health`;
+          return { ok: true, latencyMs: Math.round(performance.now() - t) };
+        }
+      } catch {}
     }
+
+    node.localMode = false;
+    node.activeHealthUrl = null;
+    return { ok: false, latencyMs: null };
   }
 
   function pulseHeart() {
@@ -559,8 +589,8 @@
     list.innerHTML = _nodes.map(n => `
       <div class="bp-ns-node${n.id === _current ? ' active' : ''}"
            data-id="${esc(n.id)}" data-url="${esc(n.uiUrl)}">
-        <span class="bp-ns-node-name"${n.fleetPeer === false ? ' style="text-decoration:line-through;opacity:0.55"' : ''}>${esc(n.name)}</span>
-        <span class="bp-ns-node-metric ${esc(metricClass(n, now))}">${esc(metricText(n, now))}</span>
+        <span class="bp-ns-node-name${n.localMode ? ' bp-ns-node-local' : ''}"${n.fleetPeer === false ? ' style="text-decoration:line-through;opacity:0.55"' : ''}>${esc(n.name)}</span>
+        <span class="bp-ns-node-metric ${esc(metricClass(n, now))}${n.localMode ? ' bp-ns-node-local' : ''}"${n.localMode ? ' title="via LAN"' : ''}>${esc(metricText(n, now))}</span>
       </div>`).join('');
 
     list.querySelectorAll('.bp-ns-node').forEach(el => {
