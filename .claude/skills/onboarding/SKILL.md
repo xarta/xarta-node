@@ -91,14 +91,20 @@ ENVEOF"
 ```
 Verify: `ssh ... "grep BLUEPRINTS_NODE_ID /root/xarta-node/.env"`
 
-### 6. Setup hosts file (fleet DNS)
+### 6. Copy .nodes.json and set up hosts file (fleet DNS)
 ```bash
+# Copy the fleet node list to the new node
+scp -i /root/.ssh/<deploy-key> \
+  /root/xarta-node/.nodes.json root@<TARGET-IP>:/root/xarta-node/.nodes.json
+
+# Generate /etc/hosts entries from .nodes.json
 ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
-  "cd /root/xarta-node && bash setup-hosts.sh"
+  "cd /root/xarta-node && bash bp-nodes-hosts.sh"
 ```
-> `fleet-hosts.conf` lives in `.xarta/` (private repo) — already present after step 3.
-> Tailscale tagged devices do not receive MagicDNS; this script writes a static `/etc/hosts`
-> block so fleet hostnames resolve on every node. See [references/gotchas.md](references/gotchas.md).
+> `.nodes.json` is the single source of truth for fleet node addresses (gitignored).
+> `bp-nodes-hosts.sh` writes `primary_ip → primary_hostname` and `tailnet_ip → tailnet_hostname`
+> for every active node into a managed block in `/etc/hosts`.
+> See the [blueprints-nodes-json skill](./../blueprints-nodes-json/SKILL.md) for details.
 
 ### 7. Run setup scripts in order
 ```bash
@@ -121,17 +127,39 @@ curl -sk --cacert /root/xarta-node/.xarta/.certs/<your-ca>.crt \
 # gen advances automatically via boot-catchup from BLUEPRINTS_PEERS
 ```
 
-### 9. Register in the fleet
-See [references/fleet-registry.md](references/fleet-registry.md) for the pattern.
-Register the new node on every existing node, and register every existing node on the new one.
+### 9. Register in the fleet via .nodes.json
+On an **existing** fleet node:
+```bash
+# 1. Add the new node entry to .nodes.json (set active: true)
+#    Edit /root/xarta-node/.nodes.json manually or with jq/python3
 
-### 10. Update BLUEPRINTS_PEERS on all nodes
-Every node's `.env` BLUEPRINTS_PEERS must include the new node's address.
-Edit each node's `.env` and `systemctl restart blueprints-app`.
+# 2. Validate
+bash /root/xarta-node/bp-nodes-validate.sh
 
-### 11. Update fleet-hosts.conf on all nodes
-Add the new node's IP/hostname to `.xarta/fleet-hosts.conf`, commit + push to
-the private repo, then run `setup-hosts.sh` on every node.
+# 3. Push to all active peers (including the new node if it's reachable)
+bash /root/xarta-node/bp-nodes-push.sh
+```
+
+On the **new node**:
+```bash
+# .nodes.json was already copied in step 6 (re-copy now if it's been updated)
+scp -i /root/.ssh/<deploy-key> \
+  /root/xarta-node/.nodes.json root@<TARGET-IP>:/root/xarta-node/.nodes.json
+
+# Load nodes into the DB
+ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
+  "cd /root/xarta-node && bash bp-nodes-load.sh"
+```
+
+See the [blueprints-nodes-json skill](./../blueprints-nodes-json/SKILL.md) for the full workflow.
+
+### 10. (Removed) BLUEPRINTS_PEERS env var
+`BLUEPRINTS_PEERS` is no longer used. Peer URLs are derived from `.nodes.json` at startup.
+No `.env` changes are needed on existing nodes when adding a new node.
+
+### 11. (Removed) fleet-hosts.conf
+`fleet-hosts.conf` has been superseded by `bp-nodes-hosts.sh` + `.nodes.json`.
+Run `bash bp-nodes-hosts.sh` on each node after distributing an updated `.nodes.json`.
 
 ### 12. Sync env backup
 ```bash
