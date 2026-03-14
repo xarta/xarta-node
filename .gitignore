@@ -1,5 +1,6 @@
 # Secrets and local deploy config — never commit these
 .env
+.nodes.json
 .xarta/
 .lone-wolf/
 fleet-hosts.conf
