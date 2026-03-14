@@ -795,6 +795,7 @@
       _nodes = await r.json();
       renderNodes();
       enrichNodeVersions();
+      enrichNodePctStatus();
     } catch (e) {
       err.textContent = `Failed to load nodes: ${e.message}`;
       err.hidden = false;
@@ -825,6 +826,7 @@
           <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeRestart('${esc(n.node_id)}',this)" title="restart blueprints-app service">&#8635; Restart</button>
           <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
           <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePurgeQueue('${esc(n.node_id)}',this)" title="purge unsent sync queue entries">&#128465; Queue</button>
+          <button id="node-pct-${esc(n.node_id)}" class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePct('${esc(n.node_id)}',this)" title="start or stop LXC via pct on PVE host" data-pct-status="unknown">&#x23FB; PCT</button>
           <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px;color:var(--danger,#f85149)" onclick="nodeDeleteRow('${esc(n.node_id)}',this)" title="remove this node from DB">&#10005; Delete</button>
         </td>
       </tr>`;
@@ -910,6 +912,78 @@
     } catch {
       btn.textContent = '✗ err'; btn.style.color = 'var(--danger,#f85149)';
       btn.disabled = false;
+    }
+  }
+
+  async function enrichNodePctStatus() {
+    for (const n of _nodes) {
+      const btn = document.getElementById(`node-pct-${n.node_id}`);
+      if (!btn) continue;
+      try {
+        const r = await fetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
+        if (!r.ok) { btn.dataset.pctStatus = 'unknown'; continue; }
+        const d = await r.json();
+        const st = (d.status || 'unknown').toLowerCase();
+        btn.dataset.pctStatus = st;
+        if (st === 'running') {
+          btn.innerHTML = '&#9632; Stop';
+          btn.title = `Stop LXC ${d.vmid} on ${d.pve_host}`;
+        } else if (st === 'stopped') {
+          btn.innerHTML = '&#9654; Start';
+          btn.title = `Start LXC ${d.vmid} on ${d.pve_host}`;
+        } else {
+          btn.innerHTML = '&#x23FB; PCT';
+          btn.title = 'start or stop LXC via pct on PVE host (status unknown)';
+        }
+      } catch {
+        btn.dataset.pctStatus = 'unknown';
+      }
+    }
+  }
+
+  async function nodePct(nodeId, btn) {
+    const currentStatus = btn.dataset.pctStatus || 'unknown';
+    let action;
+    if (currentStatus === 'running') {
+      if (!confirm(`Stop LXC for ${nodeId}?\n\nThis will shut down the container via pct stop.`)) return;
+      action = 'stop';
+    } else if (currentStatus === 'stopped') {
+      if (!confirm(`Start LXC for ${nodeId}?`)) return;
+      action = 'start';
+    } else {
+      const choice = prompt(`PCT action for ${nodeId}:\nEnter "start" or "stop"`);
+      if (!choice) return;
+      action = choice.trim().toLowerCase();
+      if (action !== 'start' && action !== 'stop') { alert('Invalid action. Enter "start" or "stop".'); return; }
+    }
+    const orig = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/pct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (r.ok) {
+        btn.innerHTML = '&#10003; Done';
+        btn.style.color = 'var(--ok,#3fb950)';
+        btn.dataset.pctStatus = action === 'start' ? 'running' : 'stopped';
+        setTimeout(() => {
+          btn.disabled = false;
+          btn.innerHTML = action === 'start' ? '&#9632; Stop' : '&#9654; Start';
+          btn.style.color = '';
+          btn.dataset.pctStatus = action === 'start' ? 'running' : 'stopped';
+        }, 3000);
+      } else {
+        const err = await r.json().catch(() => ({}));
+        btn.innerHTML = `&#10007; ${r.status}`;
+        btn.style.color = 'var(--danger,#f85149)';
+        btn.title = err.detail || r.statusText;
+        setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 4000);
+      }
+    } catch {
+      btn.innerHTML = '&#10007; err'; btn.style.color = 'var(--danger,#f85149)';
+      setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
     }
   }
 
