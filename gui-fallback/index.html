@@ -599,6 +599,7 @@
   let _vlans = [];
   let _arpManual = [];
   let _sshTargets = [];
+  let _pctPollInterval = null;
 
   /* ── Group + tab switching ───────────────────────────────────────────── */
   function switchGroup(group) {
@@ -634,6 +635,14 @@
     if (tab === 'arp-manual'     && !_arpManual.length)     loadArpManual();
     if (tab === 'ssh-targets'    && !_sshTargets.length)    loadSshTargets();
     if (tab === 'settings'       && !_settings.length)      loadSettings();
+    // PCT live status polling — only while nodes tab is open
+    if (tab === 'nodes') {
+      if (!_pctPollInterval) {
+        _pctPollInterval = setInterval(() => { if (_nodes.length) enrichNodePctStatus(); }, 5000);
+      }
+    } else {
+      if (_pctPollInterval) { clearInterval(_pctPollInterval); _pctPollInterval = null; }
+    }
   }
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
@@ -918,7 +927,7 @@
   async function enrichNodePctStatus() {
     for (const n of _nodes) {
       const btn = document.getElementById(`node-pct-${n.node_id}`);
-      if (!btn) continue;
+      if (!btn || btn.disabled) continue;  // skip buttons mid-action
       try {
         const r = await fetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
         if (!r.ok) { btn.dataset.pctStatus = 'unknown'; continue; }
