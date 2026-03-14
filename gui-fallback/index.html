@@ -291,7 +291,8 @@
             <th>Node ID</th>
             <th>Display Name</th>
             <th>Addresses</th>
-            <th>Version</th>
+            <th>Gen</th>
+            <th>Commit</th>
             <th>Pending</th>
             <th>Actions</th>
           </tr>
@@ -797,7 +798,7 @@
   function renderNodes() {
     const tbody = document.getElementById('nodes-tbody');
     if (!_nodes.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No nodes registered.</td></tr>';
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No nodes registered.</td></tr>';
       return;
     }
     tbody.innerHTML = _nodes.map(n => {
@@ -811,10 +812,12 @@
         <td><code style="font-size:12px;color:var(--text-dim)"${nameStyle}>${esc(n.node_id)}</code></td>
         <td><strong${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
         <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
+        <td id="node-gen-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
         <td id="node-ver-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
         <td>${pendingBadge}</td>
         <td style="white-space:nowrap">
-          <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
+          <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeRestart('${esc(n.node_id)}',this)" title="restart blueprints-app service">&#8635; Restart</button>
+          <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
           <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePurgeQueue('${esc(n.node_id)}',this)" title="purge unsent sync queue entries">&#128465; Queue</button>
           <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px;color:var(--danger,#f85149)" onclick="nodeDeleteRow('${esc(n.node_id)}',this)" title="remove this node from DB">&#10005; Delete</button>
         </td>
@@ -824,22 +827,39 @@
 
   async function enrichNodeVersions() {
     for (const n of _nodes) {
-      const cell = document.getElementById(`node-ver-${n.node_id}`);
-      if (!cell) continue;
+      const genCell = document.getElementById(`node-gen-${n.node_id}`);
+      const verCell = document.getElementById(`node-ver-${n.node_id}`);
       const addr = (n.addresses && n.addresses[0]) ? n.addresses[0].replace(/\/$/, '') : null;
-      if (!addr) { cell.textContent = '—'; continue; }
+      if (!addr) {
+        if (genCell) genCell.textContent = '—';
+        if (verCell) verCell.textContent = '—';
+        continue;
+      }
       try {
         const r = await fetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
-        cell.textContent = d.commit || '—';
-        cell.title = `gen: ${d.gen ?? '?'}`;
-        cell.style.color = '';
+        if (genCell) { genCell.textContent = d.gen ?? '—'; genCell.style.color = ''; }
+        if (verCell) { verCell.textContent = d.commit || '—'; verCell.style.color = ''; }
       } catch {
-        cell.textContent = '?';
-        cell.style.color = 'var(--text-dim)';
+        if (genCell) { genCell.textContent = '?'; genCell.style.color = 'var(--text-dim)'; }
+        if (verCell) { verCell.textContent = '?'; verCell.style.color = 'var(--text-dim)'; }
       }
     }
+  }
+
+  async function nodeRestart(nodeId, btn) {
+    if (!confirm(`Restart blueprints-app on ${nodeId}?`)) return;
+    const orig = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/restart`, { method: 'POST' });
+      btn.innerHTML = r.ok ? '&#10003; Sent' : `&#10007; ${r.status}`;
+      btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
+    } catch {
+      btn.innerHTML = '&#10007; err'; btn.style.color = 'var(--danger,#f85149)';
+    }
+    setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
   }
 
   async function nodeGitPull(nodeId, btn) {
