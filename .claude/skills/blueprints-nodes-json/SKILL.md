@@ -96,6 +96,11 @@ bash bp-nodes-push.sh [/path/to/.nodes.json]
 
 Requires SSH key configured: `XARTA_NODE_SSH_KEY` env var or `SSH_KEY_NAME` in `.env`.
 
+> ⛔ **ALWAYS run `bp-nodes-push.sh` BEFORE `fleet-pull-public.sh`.**
+> `.nodes.json` is gitignored — it does not travel with the repo.
+> If new code lands on a node that doesn't have `.nodes.json`, the app crashes on start.
+> `bp-nodes-push.sh` is idempotent. There is no reason to skip it.
+
 ### Mark a node inactive (soft-delete)
 
 ```bash
