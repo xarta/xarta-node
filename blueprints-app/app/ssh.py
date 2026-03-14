@@ -83,12 +83,13 @@ def make_ssh_args(ip: str, *, connect_timeout: int = 8) -> list[str]:
 
     Returns e.g.::
 
-        ["-i", "/root/.ssh/id_ed25519_vm",
+        ["-i", "/root/.ssh/<key-file>",
          "-b", "10.0.0.1",   # source_ip from ssh_targets row (omitted when NULL)
          "-o", "StrictHostKeyChecking=no",
          "-o", "BatchMode=yes",
          "-o", "ConnectTimeout=8"]
 
+    The key path is resolved from the env var stored in ssh_targets.
     source_ip / -b is omitted when not present in ssh_targets.
     Raises SshTargetNotFound or SshKeyMissing on lookup failure.
     """
