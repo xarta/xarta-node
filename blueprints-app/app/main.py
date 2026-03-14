@@ -163,17 +163,17 @@ async def _enqueue_seeded_vlans() -> None:
 
 async def _boot_catchup() -> None:
     """
-    Boot-up catch-up task.
+    Boot-up corruption-recovery task.
 
-    Runs after startup to detect and heal two scenarios:
-      1. DB corruption: integrity_ok == false → pull a full backup immediately
-         from the first available peer, regardless of gen.
-      2. Stale node: this node was offline while peers made changes → local gen
-         is lower than the highest-gen peer → pull a full backup from that peer.
+    Runs after startup to heal one scenario only:
+      DB corruption: integrity_ok == false → pull a full backup immediately
+      from the first reachable trusted peer (PEER_URLS), regardless of gen.
 
-    This makes restarts safe: a node that missed writes while down will
-    automatically re-sync from the most up-to-date peer rather than silently
-    serving stale data.
+    A node that was merely offline while peers made writes does NOT need a
+    full restore — the drain queue handles incremental catch-up automatically
+    once the node is back up.  Gen numbers are local write counters and are
+    not comparable across nodes, so gen comparison is not a reliable signal
+    for "who has better data".
 
     Runs inside a background task; does not block application startup.
     Waits 8 s to allow peers and the drain loop to initialise first.
@@ -188,27 +188,26 @@ async def _boot_catchup() -> None:
             (cfg.NODE_ID,),
         ).fetchall()
 
-    if not peer_rows:
-        log.debug("boot_catchup: no peers known yet — nothing to check")
+    if integrity_ok:
+        log.debug("boot_catchup: integrity_ok=true — no recovery needed")
         return
 
-    force_catchup = not integrity_ok
-    if force_catchup:
-        log.warning(
-            "boot_catchup: integrity_ok=false — will request full backup "
-            "from first available peer (my gen=%d)",
-            my_gen,
-        )
+    log.warning(
+        "boot_catchup: integrity_ok=false — will request full backup "
+        "from first reachable trusted peer (my gen=%d)",
+        my_gen,
+    )
+
+    if not peer_rows:
+        log.error("boot_catchup: DB is degraded but no peers known — cannot recover")
+        return
+
+    # Only pull from nodes whose address is in our configured PEER_URLS.
+    # Ghost/retired nodes in the DB must never be used as restore sources.
+    trusted_urls: set[str] = {u.rstrip("/") for u in cfg.PEER_URLS}
 
     best_peer_url: str | None = None
     best_peer_id: str | None = None
-    best_gen = -1 if force_catchup else my_gen  # -1 means always catchup
-
-    # Only allow nodes whose address appears in our configured PEER_URLS to
-    # act as a restore source.  Ghost/retired nodes kept in the DB for
-    # historical reference must never be elected as backup donors — their DB
-    # may be on old schema or missing tables entirely.
-    trusted_urls: set[str] = {u.rstrip("/") for u in cfg.PEER_URLS}
 
     for row in peer_rows:
         addresses = json.loads(row["addresses"]) if row["addresses"] else []
@@ -220,48 +219,27 @@ async def _boot_catchup() -> None:
                     row["node_id"],
                     addr,
                 )
-                break  # skip this peer entirely (no address will match)
+                break  # skip this peer entirely
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     resp = await client.get(f"{addr}/health")
-                if resp.status_code != 200:
-                    continue
-                peer_health = resp.json()
-                peer_gen = int(peer_health.get("gen", 0))
-                if peer_gen > best_gen:
-                    best_gen = peer_gen
+                if resp.status_code == 200:
                     best_peer_url = addr
                     best_peer_id = row["node_id"]
-                break  # use first reachable address for this peer
+                    break
             except Exception:
-                continue  # try next address
+                continue
+        if best_peer_url:
+            break
 
     if best_peer_url is None:
-        if force_catchup:
-            log.error(
-                "boot_catchup: DB is degraded but no peers reachable — "
-                "node will remain degraded until a peer sends a restore"
-            )
-        else:
-            log.debug("boot_catchup: no peers reachable — skipping gen comparison")
-        return
-
-    if not force_catchup and best_gen <= my_gen:
-        log.info(
-            "boot_catchup: up-to-date (my gen=%d, best peer gen=%d) — no catchup needed",
-            my_gen,
-            best_gen,
+        log.error(
+            "boot_catchup: DB is degraded but no trusted peers reachable — "
+            "node will remain degraded until a peer sends a restore"
         )
         return
 
-    log.info(
-        "boot_catchup: requesting full backup from %s "
-        "(peer gen=%d, my gen=%d, force=%s)",
-        best_peer_id,
-        best_gen,
-        my_gen,
-        force_catchup,
-    )
+    log.info("boot_catchup: requesting full backup from %s", best_peer_id)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
