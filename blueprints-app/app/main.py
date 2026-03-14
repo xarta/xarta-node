@@ -9,7 +9,7 @@ Startup sequence:
   5. Start async queue-drain background task.
   6. Schedule boot catch-up task: compare gen with known peers; if behind or
      degraded, pull a full backup from the highest-gen available peer.
-  7. Bootstrap new peers listed in BLUEPRINTS_PEERS (operator-introduced).
+  7. Load nodes from .nodes.json into the DB.
   8. Serve /data/gui as static files at /ui.
 """
 

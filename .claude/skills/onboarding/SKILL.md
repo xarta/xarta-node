@@ -68,7 +68,7 @@ ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> "
   cd /root && git clone git@github.com:<your-org>/xarta-node.git xarta-node
   cd xarta-node
   GIT_SSH_COMMAND='ssh -i /root/.ssh/<deploy-key>' \
-    git clone git@github.com:<your-account>/xarta-node-private.git .xarta
+    git clone git@github.com:<your-account>/<your-private-repo>.git .xarta
 "
 ```
 

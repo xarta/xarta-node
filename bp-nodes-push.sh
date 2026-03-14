@@ -11,7 +11,8 @@
 #   bash bp-nodes-push.sh [/path/to/.nodes.json]
 #
 # Environment:
-#   XARTA_NODE_SSH_KEY  — path to SSH private key (required if SSH_KEY_NAME not in .env)
+#   BLUEPRINTS_DB_DIR  — directory containing blueprints.db (used for ssh_targets lookup)
+#   SSH_KEY_NAME       — fallback key name in /root/.ssh/ (used only when IP not in ssh_targets)
 #
 # Exit codes:
 #   0 = all pushes succeeded
@@ -28,21 +29,35 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# ── Resolve SSH key ──────────────────────────────────────────────────────────
-# Prefer XARTA_NODE_SSH_KEY env var, then SSH_KEY_NAME from .env, else require
-# the caller to set XARTA_NODE_SSH_KEY.  The key path is never hardcoded here.
-SSH_KEY="${XARTA_NODE_SSH_KEY:-}"
-if [[ -z "$SSH_KEY" && -f "$ENV_FILE" ]]; then
-    _KEY_NAME="$(grep -E '^SSH_KEY_NAME=' "$ENV_FILE" 2>/dev/null \
+# ── SSH key resolution ───────────────────────────────────────────────────────
+# Primary: query ssh_targets table for each target IP.
+# Fallback: SSH_KEY_NAME from .env (used only when IP absent or DB unavailable).
+_DB_DIR="$(grep -E '^BLUEPRINTS_DB_DIR=' "$ENV_FILE" 2>/dev/null \
+    | head -1 | sed 's/^BLUEPRINTS_DB_DIR=//' | tr -d '"' | tr -d "'" || true)"
+DB="${_DB_DIR:-/opt/blueprints/data/db}/blueprints.db"
+
+resolve_key() {
+    local ip="$1"
+    local key_env key_path
+    if [[ -f "$DB" ]]; then
+        key_env="$(sqlite3 "$DB" \
+            "SELECT key_env_var FROM ssh_targets WHERE ip_address='$ip' LIMIT 1;" \
+            2>/dev/null || true)"
+        if [[ -n "$key_env" ]]; then
+            key_path="$(grep -E "^${key_env}=" "$ENV_FILE" 2>/dev/null \
+                | head -1 | sed "s/^${key_env}=//" | tr -d '"' | tr -d "'" || true)"
+            if [[ -n "$key_path" && -f "$key_path" ]]; then
+                echo "$key_path"
+                return
+            fi
+        fi
+    fi
+    # Fallback: SSH_KEY_NAME from .env
+    local key_name
+    key_name="$(grep -E '^SSH_KEY_NAME=' "$ENV_FILE" 2>/dev/null \
         | head -1 | sed 's/^SSH_KEY_NAME=//' | tr -d '"' | tr -d "'" || true)"
-    [[ -n "$_KEY_NAME" ]] && SSH_KEY="/root/.ssh/$_KEY_NAME"
-fi
-if [[ -z "$SSH_KEY" ]]; then
-    echo -e "${RED}ERROR:${NC} SSH key not configured." >&2
-    echo "  Set XARTA_NODE_SSH_KEY in .env or the environment." >&2
-    exit 1
-fi
-SSH_OPTS=(-n -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
+    [[ -n "$key_name" ]] && echo "/root/.ssh/$key_name" || echo ""
+}
 
 echo "=== bp-nodes-push.sh ==="
 
@@ -109,6 +124,15 @@ while IFS=' ' read -r ip node_id sync_port; do
     fi
 
     echo "--- $node_id ($ip) ---"
+
+    # Resolve SSH key for this specific IP
+    SSH_KEY="$(resolve_key "$ip")"
+    if [[ -z "$SSH_KEY" ]]; then
+        echo -e "  ${RED}SKIP:${NC} no SSH key resolved for $node_id ($ip)"
+        FAILS=$(( FAILS + 1 ))
+        continue
+    fi
+    SSH_OPTS=(-n -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
 
     # 1. SCP the JSON to the remote node
     # Try to read the remote node's NODES_JSON_PATH from its .env; fall back

@@ -20,14 +20,17 @@ MIN_LEN=5
 # not be treated as leaks (e.g. paths baked into templates, service names in scripts).
 SKIP_KEYS=(
     "REPO_OUTER_PATH"
-    "REPO_INNER_PATH"       # paths appear in docs/templates — not secrets
+    "REPO_INNER_PATH"           # paths appear in docs/templates — not secrets
     "SERVICE_RESTART_CMD"
     "BLUEPRINTS_DB_DIR"
-    "GIT_USER_NAME"         # value matches the public repo name — not a secret leak
-    "TAILSCALE_ACCEPT_DNS"  # value is "false" — too generic to scan for
-    "TAILSCALE_EXIT_NODE"   # value is "true" — too generic to scan for
-    "PROXMOX_SSH_KEY"       # standard path convention, present in onboarding templates
-    "NODES_JSON_PATH"       # default path is /root/xarta-node/.nodes.json — not a secret
+    "GIT_USER_NAME"             # value matches the public repo name — not a secret leak
+    "TAILSCALE_ACCEPT_DNS"      # value is "false" — too generic to scan for
+    "TAILSCALE_EXIT_NODE"       # value is "true" — too generic to scan for
+    "PROXMOX_SSH_KEY"           # standard path convention, present in onboarding templates
+    "NODES_JSON_PATH"           # default path is a public convention — not a secret
+    "BLUEPRINTS_GUI_DIR"        # derived from REPO_INNER_PATH — documented public structure
+    "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
+    "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure
 )
 
 # Colours

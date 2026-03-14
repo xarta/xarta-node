@@ -8,11 +8,11 @@ cat > /root/xarta-node/.env << 'ENVEOF'
 # -----------------------------------------------------------------------------
 # Gateway Failover Configuration
 # -----------------------------------------------------------------------------
-IF_PRIMARY="net4"
-IF_SECONDARY="net3"
+IF_PRIMARY="<primary-vlan-interface>"
+IF_SECONDARY="<secondary-vlan-interface>"
 GW_PRIMARY="<WAN-A-GATEWAY>"
 GW_SECONDARY="<WAN-B-GATEWAY>"
-TEST_IP="1.1.1.1"
+TEST_IP="<connectivity-test-ip>"
 
 # -----------------------------------------------------------------------------
 # Auto-update configuration
@@ -21,7 +21,7 @@ REPO_OUTER_PATH="/root/xarta-node"
 REPO_INNER_PATH="/root/xarta-node/.xarta"
 REPO_CADDY_PATH="/root/xarta-node/<node-local-caddy-repo>"  # each node has its own independent git repo here
 GIT_TIMEOUT=5
-AUTO_UPDATE_LOG="/var/log/auto-update.log"
+AUTO_UPDATE_LOG="<log-file-path>"
 SERVICE_RESTART_CMD="systemctl restart blueprints-app"
 
 # -----------------------------------------------------------------------------
@@ -34,27 +34,15 @@ GIT_USER_EMAIL="xarta-node@example.com"
 # -----------------------------------------------------------------------------
 # Blueprints Node Configuration
 # -----------------------------------------------------------------------------
+# Only the node's own identity stays in .env.
+# All fleet peer data (addresses, hostnames, etc.) is loaded from .nodes.json.
 BLUEPRINTS_NODE_ID=<HOSTNAME>
-BLUEPRINTS_NODE_NAME=<HOSTNAME>
 BLUEPRINTS_INSTANCE=1
-BLUEPRINTS_HOST_MACHINE=<HOSTNAME>
+NODES_JSON_PATH=/root/xarta-node/.nodes.json
 
 BLUEPRINTS_DB_DIR=/opt/blueprints/data/db
 BLUEPRINTS_GUI_DIR=/root/xarta-node/.xarta/gui
 BLUEPRINTS_BACKUP_DIR=/root/xarta-node/.xarta/db-backups
-
-# Browser-facing HTTPS URL for this node
-BLUEPRINTS_UI_URL=https://<HOSTNAME>.<your-tailnet>.ts.net
-
-# All fleet nodes — include the new node here too
-BLUEPRINTS_CORS_ORIGINS=https://existing-node-1.<your-tailnet>.ts.net,https://existing-node-1.<your-domain>,https://existing-node-2.<your-tailnet>.ts.net,https://existing-node-2.<your-domain>,https://<HOSTNAME>.<your-tailnet>.ts.net,https://<HOSTNAME>.<your-domain>
-
-# This node's own Tailscale IP:port — how peers reach us
-BLUEPRINTS_SELF_ADDRESS=http://<TAILSCALE-IP>:8080
-
-# One established fleet node as bootstrap peer — DB will sync automatically on first contact
-# After onboarding, expand this to all fleet nodes
-BLUEPRINTS_PEERS=http://<EXISTING-NODE-TS-IP>:8080
 
 # -----------------------------------------------------------------------------
 # TLS / Certificates
@@ -88,14 +76,14 @@ ENVEOF
 
 ```bash
 ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
-  "grep -E 'BLUEPRINTS_NODE_ID|BLUEPRINTS_SELF_ADDRESS|BLUEPRINTS_UI_URL|TAILSCALE_HOSTNAME' \
+  "grep -E 'BLUEPRINTS_NODE_ID|NODES_JSON_PATH|TAILSCALE_HOSTNAME' \
    /root/xarta-node/.env"
 ```
 
 ## Notes
 
-- `BLUEPRINTS_PEERS` starts with one existing node's IP. After onboarding,
-  update **all** nodes' PEERS to include the new node (see `fleet-registry.md`).
+- `BLUEPRINTS_NODE_ID` is the only identity key that stays in `.env` per node.
+  All fleet peer data comes from `.nodes.json` (distributed via `bp-nodes-push.sh`).
 - `CERT_FILE`/`CERT_KEY`/`CERT_CA` are set automatically by `setup-certificates.sh`
   if the correct certs are present in `.xarta/.certs/`. If missing, it falls back
   to a locally-generated self-signed cert — the browser will warn, which is expected.
