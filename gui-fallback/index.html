@@ -290,9 +290,10 @@
           <tr>
             <th>Node ID</th>
             <th>Display Name</th>
-            <th>Machine</th>
             <th>Addresses</th>
-            <th>Last Seen</th>
+            <th>Version</th>
+            <th>Pending</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody id="nodes-tbody"></tbody>
@@ -786,6 +787,7 @@
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _nodes = await r.json();
       renderNodes();
+      enrichNodeVersions();
     } catch (e) {
       err.textContent = `Failed to load nodes: ${e.message}`;
       err.hidden = false;
@@ -795,20 +797,94 @@
   function renderNodes() {
     const tbody = document.getElementById('nodes-tbody');
     if (!_nodes.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No nodes registered.</td></tr>';
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No nodes registered.</td></tr>';
       return;
     }
     tbody.innerHTML = _nodes.map(n => {
       const addrs = (n.addresses || []).map(a => `<span class="ip-chip">${esc(a)}</span>`).join(' ');
-      const seen = (n.last_seen_at || '').replace('T', ' ').slice(0, 19);
+      const nameStyle = n.fleet_peer === false ? ' style="text-decoration:line-through;opacity:0.55"' : '';
+      const pending = n.pending_count || 0;
+      const pendingBadge = pending > 0
+        ? `<span style="background:var(--badge-warn,#b45309);color:#fff;border-radius:4px;padding:1px 6px;font-size:11px">${pending}</span>`
+        : `<span style="color:var(--text-dim)">—</span>`;
       return `<tr>
-        <td><code style="font-size:12px;color:var(--text-dim)">${esc(n.node_id)}</code></td>
-        <td><strong>${esc(n.display_name || n.node_id)}</strong></td>
-        <td><code style="font-size:11px;color:var(--text-dim)">${esc(n.machine_id || '—')}</code></td>
+        <td><code style="font-size:12px;color:var(--text-dim)"${nameStyle}>${esc(n.node_id)}</code></td>
+        <td><strong${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
         <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
-        <td style="color:var(--text-dim);font-size:13px">${esc(seen || '—')}</td>
+        <td id="node-ver-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
+        <td>${pendingBadge}</td>
+        <td style="white-space:nowrap">
+          <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
+          <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePurgeQueue('${esc(n.node_id)}',this)" title="purge unsent sync queue entries">&#128465; Queue</button>
+          <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px;color:var(--danger,#f85149)" onclick="nodeDeleteRow('${esc(n.node_id)}',this)" title="remove this node from DB">&#10005; Delete</button>
+        </td>
       </tr>`;
     }).join('');
+  }
+
+  async function enrichNodeVersions() {
+    for (const n of _nodes) {
+      const cell = document.getElementById(`node-ver-${n.node_id}`);
+      if (!cell) continue;
+      const addr = (n.addresses && n.addresses[0]) ? n.addresses[0].replace(/\/$/, '') : null;
+      if (!addr) { cell.textContent = '—'; continue; }
+      try {
+        const r = await fetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        cell.textContent = d.commit || '—';
+        cell.title = `gen: ${d.gen ?? '?'}`;
+        cell.style.color = '';
+      } catch {
+        cell.textContent = '?';
+        cell.style.color = 'var(--text-dim)';
+      }
+    }
+  }
+
+  async function nodeGitPull(nodeId, btn) {
+    if (!confirm(`Trigger git pull (outer) on ${nodeId}?`)) return;
+    const orig = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/git-pull`, { method: 'POST' });
+      btn.innerHTML = r.ok ? '&#10003; Pull' : `&#10007; ${r.status}`;
+      btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
+    } catch {
+      btn.innerHTML = '&#10007; err'; btn.style.color = 'var(--danger,#f85149)';
+    }
+    setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
+  }
+
+  async function nodePurgeQueue(nodeId, btn) {
+    const n = _nodes.find(x => x.node_id === nodeId);
+    const cnt = n ? (n.pending_count || 0) : '?';
+    if (!confirm(`Purge ${cnt} unsent sync queue entries for ${nodeId}?`)) return;
+    const orig = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/sync-queue`, { method: 'DELETE' });
+      btn.innerHTML = r.ok ? '&#10003; Done' : `&#10007; ${r.status}`;
+      btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
+      if (r.ok) { _nodes = []; setTimeout(loadNodes, 500); }
+    } catch {
+      btn.innerHTML = '&#10007; err'; btn.style.color = 'var(--danger,#f85149)';
+      setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
+    }
+  }
+
+  async function nodeDeleteRow(nodeId, btn) {
+    if (!confirm(`Delete node "${nodeId}" from this node's DB?\n\nThis does not purge the sync queue — use Purge Queue first if needed.`)) return;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+      if (r.ok) { _nodes = []; loadNodes(); return; }
+      btn.textContent = `✗ ${r.status}`; btn.style.color = 'var(--danger,#f85149)';
+      btn.disabled = false;
+    } catch {
+      btn.textContent = '✗ err'; btn.style.color = 'var(--danger,#f85149)';
+      btn.disabled = false;
+    }
   }
 
   /* ── pfSense DNS ──────────────────────────────────────────────────────── */

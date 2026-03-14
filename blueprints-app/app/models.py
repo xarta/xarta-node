@@ -147,7 +147,8 @@ class NodeOut(BaseModel):
     machine_id: Optional[str] = None  # canonical FK to machines.machine_id
     last_seen: Optional[str] = None
     created_at: str
-    fleet_peer: bool = True  # False if node is in DB but not a configured sync peer
+    fleet_peer: bool = True       # False if node is in DB but not a configured sync peer
+    pending_count: int = 0        # unsent sync queue entries targeting this node
 
 
 # ── pfSense DNS ───────────────────────────────────────────────────────────────
@@ -637,3 +638,4 @@ class HealthOut(BaseModel):
     gen: int
     integrity_ok: bool
     ui_url: Optional[str] = None   # browser-accessible URL; set via BLUEPRINTS_UI_URL
+    commit: Optional[str] = None   # short git hash of the current outer-repo checkout
