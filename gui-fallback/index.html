@@ -291,12 +291,12 @@
       <table>
         <thead>
           <tr>
-            <th>Node ID</th>
-            <th>Display Name</th>
-            <th>Addresses</th>
-            <th>Gen</th>
-            <th>Commit</th>
-            <th>Pending</th>
+            <th style="min-width:130px;white-space:nowrap">Node ID</th>
+            <th style="min-width:120px;white-space:nowrap">Display Name</th>
+            <th style="min-width:180px">Addresses</th>
+            <th style="width:60px">Gen</th>
+            <th style="width:65px">Commit</th>
+            <th style="width:65px">Pending</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -810,8 +810,8 @@
         ? `<span style="background:var(--badge-warn,#b45309);color:#fff;border-radius:4px;padding:1px 6px;font-size:11px">${pending}</span>`
         : `<span style="color:var(--text-dim)">—</span>`;
       return `<tr>
-        <td><code style="font-size:12px;color:var(--text-dim)"${nameStyle}>${esc(n.node_id)}</code></td>
-        <td><strong${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
+        <td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><code style="font-size:12px;color:var(--text-dim)"${nameStyle}>${esc(n.node_id)}</code></td>
+        <td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><strong${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
         <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
         <td id="node-gen-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
         <td id="node-ver-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
