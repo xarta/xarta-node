@@ -11,7 +11,7 @@
 #   bash bp-nodes-push.sh [/path/to/.nodes.json]
 #
 # Environment:
-#   XARTA_NODE_SSH_KEY  — override SSH key (default: /root/.ssh/id_ed25519_xarta_node)
+#   XARTA_NODE_SSH_KEY  — path to SSH private key (required if SSH_KEY_NAME not in .env)
 #
 # Exit codes:
 #   0 = all pushes succeeded
@@ -21,14 +21,28 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
-SSH_KEY="${XARTA_NODE_SSH_KEY:-/root/.ssh/id_ed25519_xarta_node}"
-SSH_OPTS=(-n -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+
+# ── Resolve SSH key ──────────────────────────────────────────────────────────
+# Prefer XARTA_NODE_SSH_KEY env var, then SSH_KEY_NAME from .env, else require
+# the caller to set XARTA_NODE_SSH_KEY.  The key path is never hardcoded here.
+SSH_KEY="${XARTA_NODE_SSH_KEY:-}"
+if [[ -z "$SSH_KEY" && -f "$ENV_FILE" ]]; then
+    _KEY_NAME="$(grep -E '^SSH_KEY_NAME=' "$ENV_FILE" 2>/dev/null \
+        | head -1 | sed 's/^SSH_KEY_NAME=//' | tr -d '"' | tr -d "'" || true)"
+    [[ -n "$_KEY_NAME" ]] && SSH_KEY="/root/.ssh/$_KEY_NAME"
+fi
+if [[ -z "$SSH_KEY" ]]; then
+    echo -e "${RED}ERROR:${NC} SSH key not configured." >&2
+    echo "  Set XARTA_NODE_SSH_KEY in .env or the environment." >&2
+    exit 1
+fi
+SSH_OPTS=(-n -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
 
 echo "=== bp-nodes-push.sh ==="
 
@@ -97,12 +111,13 @@ while IFS=' ' read -r ip node_id sync_port; do
     echo "--- $node_id ($ip) ---"
 
     # 1. SCP the JSON to the remote node
+    # Try to read the remote node's NODES_JSON_PATH from its .env; fall back
+    # to using the same path as the local JSON file.
     REMOTE_PATH="$(ssh "${SSH_OPTS[@]}" "root@$ip" \
         "grep -E '^NODES_JSON_PATH=' /root/xarta-node/.env 2>/dev/null \
-         | head -1 | sed 's/^NODES_JSON_PATH=//' | tr -d '\"' | tr -d \"'\" \
-         || echo /root/xarta-node/.nodes.json" 2>/dev/null \
-        || echo "/root/xarta-node/.nodes.json")"
-    REMOTE_PATH="${REMOTE_PATH:-/root/xarta-node/.nodes.json}"
+         | head -1 | sed 's/^NODES_JSON_PATH=//' | tr -d '\"' | tr -d \"'\"" 2>/dev/null \
+        || true)"
+    REMOTE_PATH="${REMOTE_PATH:-$NODES_JSON}"
 
     echo "  → scp to root@$ip:$REMOTE_PATH"
     if scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \

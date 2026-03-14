@@ -27,6 +27,7 @@ SKIP_KEYS=(
     "TAILSCALE_ACCEPT_DNS"  # value is "false" — too generic to scan for
     "TAILSCALE_EXIT_NODE"   # value is "true" — too generic to scan for
     "PROXMOX_SSH_KEY"       # standard path convention, present in onboarding templates
+    "NODES_JSON_PATH"       # default path is /root/xarta-node/.nodes.json — not a secret
 )
 
 # Colours
@@ -149,6 +150,54 @@ else
             (( LEAKS++ ))
         fi
     done < "$INFRA_LEAKS_FILE"
+fi
+
+# ---------------------------------------------------------------------------
+# Pass 3: .nodes.json values (IPs and hostnames)
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Checking .nodes.json values ==="
+
+NODES_JSON=""
+if [ -f "$ENV_FILE" ]; then
+    NODES_JSON="$(grep -E '^NODES_JSON_PATH=' "$ENV_FILE" 2>/dev/null \
+        | head -1 | sed 's/^NODES_JSON_PATH=//' | tr -d '"' | tr -d "'" || true)"
+fi
+: "${NODES_JSON:=$REPO_DIR/.nodes.json}"
+
+if [ ! -f "$NODES_JSON" ]; then
+    echo -e "${YELLOW}Warning:${NC} $NODES_JSON not found — skipping .nodes.json value check."
+else
+    echo "Loading values from: $NODES_JSON"
+    echo ""
+
+    # Extract every IP and hostname from .nodes.json
+    mapfile -t JSON_VALUES < <(python3 - "$NODES_JSON" <<'PYEOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+seen = set()
+for n in data.get("nodes", []):
+    for field in ("primary_ip", "primary_hostname", "tailnet_ip", "tailnet_hostname"):
+        v = n.get(field, "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            print(v)
+PYEOF
+    )
+
+    for jval in "${JSON_VALUES[@]}"; do
+        [ "${#jval}" -lt "$MIN_LEN" ] && continue
+        matches=$(grep -rn --fixed-strings -- "$jval" "${SCAN_FILES[@]}" 2>/dev/null)
+        if [ -n "$matches" ]; then
+            echo -e "${RED}LEAK${NC}: .nodes.json value \"$jval\""
+            echo "$matches" | while IFS= read -r match; do
+                rel="${match/$REPO_DIR\//}"
+                echo "       $rel"
+            done
+            echo ""
+            (( LEAKS++ ))
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
