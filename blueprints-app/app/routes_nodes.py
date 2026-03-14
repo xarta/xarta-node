@@ -192,6 +192,7 @@ async def register_node(body: NodeCreate) -> NodeOut:
 
         if existing:
             # Update addresses + last_seen on re-registration
+            gen = increment_gen(conn)
             conn.execute(
                 "UPDATE nodes SET display_name=?, host_machine=?, tailnet=?, "
                 "addresses=?, ui_url=?, machine_id=?, last_seen=datetime('now') WHERE node_id=?",
@@ -205,7 +206,12 @@ async def register_node(body: NodeCreate) -> NodeOut:
                     body.node_id,
                 ),
             )
-            log.info("updated peer node %s", body.node_id)
+            row = conn.execute("SELECT * FROM nodes WHERE node_id=?", (body.node_id,)).fetchone()
+            enqueue_for_all_peers(
+                conn, "UPDATE", "nodes", body.node_id, dict(row), gen,
+                exclude_node_id=body.node_id,
+            )
+            log.info("updated peer node %s and enqueued fleet-wide UPDATE (gen=%d)", body.node_id, gen)
         else:
             gen = increment_gen(conn, "human")
             conn.execute(
