@@ -21,6 +21,7 @@ from starlette.responses import Response
 from . import config as cfg
 from .db import get_conn, get_gen, increment_gen
 from .models import NodeCreate, NodeOut
+from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
 
@@ -90,14 +91,24 @@ async def list_nodes() -> list[NodeOut]:
 
 @router.delete("/{node_id}", status_code=204)
 async def delete_node(node_id: str) -> Response:
-    """Remove a node record from the local DB (does not purge the sync queue)."""
+    """Remove a node record and propagate the deletion to all fleet peers via sync queue."""
     with get_conn() as conn:
         deleted = conn.execute(
             "DELETE FROM nodes WHERE node_id=?", (node_id,)
         ).rowcount
-    if not deleted:
-        raise HTTPException(404, f"node '{node_id}' not found")
-    log.info("deleted node %s from local DB", node_id)
+        if not deleted:
+            raise HTTPException(404, f"node '{node_id}' not found")
+        gen = increment_gen(conn)
+        enqueue_for_all_peers(
+            conn,
+            action_type="DELETE",
+            table_name="nodes",
+            row_id=node_id,
+            row_data=None,
+            gen=gen,
+            exclude_node_id=node_id,  # no point queuing for the node being deleted
+        )
+    log.info("deleted node %s from local DB and enqueued fleet-wide DELETE (gen=%d)", node_id, gen)
     return Response(status_code=204)
 
 
@@ -136,6 +147,30 @@ async def proxy_node_git_pull(node_id: str) -> Response:
     if resp.status_code not in (200, 204):
         raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
     log.info("proxied git-pull to %s (%s)", node_id, target)
+    return Response(status_code=204)
+
+
+@router.post("/{node_id}/restart", status_code=204)
+async def proxy_node_restart(node_id: str) -> Response:
+    """Proxy a service restart request to the named peer node."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    if not row or not row["addresses"]:
+        raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
+    addrs: list[str] = json.loads(row["addresses"])
+    if not addrs:
+        raise HTTPException(422, f"node '{node_id}' has no addresses configured")
+    target = addrs[0].rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{target}/api/v1/sync/restart")
+    except Exception as exc:
+        raise HTTPException(502, f"failed to reach {node_id} at {target}: {exc}") from exc
+    if resp.status_code not in (200, 204):
+        raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
+    log.info("proxied restart to %s (%s)", node_id, target)
     return Response(status_code=204)
 
 
