@@ -246,7 +246,7 @@ class PctAction(BaseModel):
 
 @router.get("/{node_id}/pct-status", status_code=200)
 async def get_node_pct_status(node_id: str) -> dict:
-    """Return the current pct status of the LXC for this node (from proxmox_config DB)."""
+    """Return the live pct status of the LXC for this node via SSH to its PVE host."""
     with get_conn() as conn:
         node_row = conn.execute(
             "SELECT host_machine FROM nodes WHERE node_id=?", (node_id,)
@@ -256,19 +256,44 @@ async def get_node_pct_status(node_id: str) -> dict:
 
     with get_conn() as conn:
         pve_row = conn.execute(
-            "SELECT pve_host, vmid, status FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
+            "SELECT pve_host, vmid FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
             (node_row["host_machine"],),
         ).fetchone()
 
     if not pve_row:
         return {"node_id": node_id, "status": "unknown", "vmid": None, "pve_host": None}
 
-    return {
-        "node_id":  node_id,
-        "status":   pve_row["status"] or "unknown",
-        "vmid":     pve_row["vmid"],
-        "pve_host": pve_row["pve_host"],
-    }
+    pve_host = pve_row["pve_host"]
+    vmid     = pve_row["vmid"]
+
+    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing, resolve_env_key
+
+    try:
+        ssh_args = make_ssh_args(pve_host, connect_timeout=6)
+    except SshTargetNotFound:
+        try:
+            key_path = resolve_env_key("PROXMOX_SSH_KEY")
+        except SshKeyMissing as exc:
+            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc)}
+        ssh_args = ["-i", key_path, "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+    except SshKeyMissing as exc:
+        return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc)}
+
+    cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct status {vmid}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    except subprocess.TimeoutExpired:
+        return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": "SSH timed out"}
+
+    output = result.stdout.strip().lower()
+    if "running" in output:
+        status = "running"
+    elif "stopped" in output:
+        status = "stopped"
+    else:
+        status = "unknown"
+
+    return {"node_id": node_id, "status": status, "vmid": vmid, "pve_host": pve_host}
 
 
 @router.post("/{node_id}/pct", status_code=200)
