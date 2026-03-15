@@ -22,6 +22,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
@@ -290,6 +291,18 @@ def create_app() -> FastAPI:
     application.include_router(ssh_targets_router,    prefix="/api/v1")
     application.include_router(keys_router,           prefix="/api/v1")
     application.include_router(gui_sync_router,       prefix="/api/v1")
+
+    @application.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+            '<rect width="32" height="32" rx="4" fill="#1a5c30"/>'
+            '<text x="16" y="22.5" text-anchor="middle"'
+            ' font-family="\'Arial Black\',Arial,sans-serif"'
+            ' font-weight="900" font-size="15" fill="#ffffff"'
+            ' letter-spacing="0.5">FAB</text></svg>'
+        )
+        return Response(content=svg, media_type="image/svg+xml")
 
     return application
 

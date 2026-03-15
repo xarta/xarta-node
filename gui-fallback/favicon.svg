@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Thunderbird 2 green background -->
+  <rect width="32" height="32" rx="4" fill="#1a5c30"/>
+  <!-- FAB — Thunderbirds sign-off, bold white -->
+  <text x="16" y="22.5"
+        text-anchor="middle"
+        font-family="'Arial Black',Arial,sans-serif"
+        font-weight="900"
+        font-size="15"
+        fill="#ffffff"
+        letter-spacing="0.5">FAB</text>
+</svg>
