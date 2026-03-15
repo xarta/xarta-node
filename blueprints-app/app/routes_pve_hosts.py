@@ -211,11 +211,11 @@ async def _check_proxmox(
                 r = await client.get(url)
             if not any(marker in r.text for marker in _PVE_MARKERS):
                 return None
-            # Best-effort version extraction
+            # Best-effort version extraction — PVE embeds it as ?ver=X.X.X on JS assets
             version = None
-            m = re.search(r'pve(?:version)?\s*[=:"\s]+([0-9]+\.[0-9][^\s"<]*)', r.text, re.I)
+            m = re.search(r'pvemanagerlib\.js\?ver=([0-9]+\.[0-9][^\s"&<]*)', r.text, re.I)
             if not m:
-                m = re.search(r'(\d+\.\d+-\d+)', r.text)
+                m = re.search(r'ext6-pve\.css\?ver=([0-9]+\.[0-9][^\s"&<]*)', r.text, re.I)
             if m:
                 version = m.group(1)
             # Best-effort reverse DNS (only if pfSense IP is known)
