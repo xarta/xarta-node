@@ -3170,12 +3170,31 @@
           <td style="white-space:nowrap">
             <button class="btn-restore secondary" onclick="confirmRestore('${esc(b.filename)}', false)">Restore</button>
             <button class="btn-force"              onclick="confirmRestore('${esc(b.filename)}', true)">&#9888; Force restore</button>
+            <button class="secondary" style="color:var(--danger,#f85149)" onclick="deleteBackup('${esc(b.filename)}', this)">&#10005; Delete</button>
           </td>
         </tr>`;
       }).join('');
     } catch (e) {
       err.textContent = `Failed to load backups: ${e.message}`;
       err.hidden = false;
+    }
+  }
+
+  async function deleteBackup(filename, btn) {
+    if (!confirm(`Delete backup ${filename}?\n\nThis cannot be undone.`)) return;
+    const orig = btn.innerHTML;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch(`/api/v1/backup/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+      if (r.ok) {
+        await loadBackups();
+      } else {
+        btn.innerHTML = `&#10007; ${r.status}`; btn.style.color = 'var(--danger,#f85149)';
+        setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
+      }
+    } catch (e) {
+      btn.innerHTML = '&#10007; err'; btn.style.color = 'var(--danger,#f85149)';
+      setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; btn.style.color = ''; }, 3000);
     }
   }
 
