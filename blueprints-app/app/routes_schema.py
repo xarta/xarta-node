@@ -112,15 +112,19 @@ def _build_mermaid(tables: list[str], table_columns: dict[str, list[dict]], rela
         lines.append(f"    {table.upper()} {{")
         for column in table_columns[table]:
             col_type = column["type"] or "TEXT"
-            flags = []
-            if column["pk"]:
-                flags.append("PK")
-            if any(
+            is_pk = column["pk"]
+            is_fk = any(
                 rel["source_table"] == table and rel["source_column"] == column["name"]
                 for rel in relationships
-            ):
-                flags.append("FK")
-            suffix = f" {' '.join(flags)}" if flags else ""
+            )
+            # Mermaid erDiagram only accepts one key attribute per column.
+            # PK takes precedence; FK alone is valid; PK+FK together is not.
+            if is_pk:
+                suffix = " PK"
+            elif is_fk:
+                suffix = " FK"
+            else:
+                suffix = ""
             lines.append(f"        {col_type} {column['name']}{suffix}")
         lines.append("    }")
         lines.append("")
