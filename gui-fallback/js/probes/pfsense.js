@@ -53,11 +53,17 @@ function renderPfSenseDns() {
     )
   );
   const tbody = document.getElementById('dns-tbody');
+  const expandAllBtn   = document.getElementById('dns-expand-all-btn');
+  const collapseAllBtn = document.getElementById('dns-collapse-all-btn');
   if (!rows.length) {
     const msg = hideInactive ? 'No active DNS entries match the filter.' : 'No DNS entries found.';
     tbody.innerHTML = `<tr class="empty-row"><td colspan="10">${msg}</td></tr>`;
+    if (expandAllBtn)   expandAllBtn.hidden   = true;
+    if (collapseAllBtn) collapseAllBtn.hidden = true;
     return;
   }
+  if (expandAllBtn)   expandAllBtn.hidden   = false;
+  if (collapseAllBtn) collapseAllBtn.hidden = false;
 
   // Preserve which groups are open across re-renders (only when not filtering)
   const openGroups = new Set();
@@ -137,6 +143,17 @@ function renderPfSenseDns() {
     }
   }
   tbody.innerHTML = html.join('');
+}
+
+function setAllDnsGroups(open) {
+  document.querySelectorAll('[data-dns-group-hdr]').forEach(hdr => {
+    const safeip = hdr.dataset.dnsGroupHdr;
+    const rows   = document.querySelectorAll(`[data-dns-ip="${safeip}"]`);
+    const arrow  = document.getElementById(`dns-grp-arrow-${safeip}`);
+    rows.forEach(r => r.style.display = open ? 'table-row' : 'none');
+    hdr.dataset.dnsGroupOpen = open ? '1' : '0';
+    if (arrow) arrow.textContent = open ? '▼' : '▶';
+  });
 }
 
 function toggleDnsGroup(safeip) {
