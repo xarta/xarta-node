@@ -54,9 +54,16 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+_LOOPBACK = frozenset({"127.0.0.1", "::1"})
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         ip_str = _client_ip(request)
+
+        # Loopback (localhost curl calls from shell scripts) — always trusted.
+        if ip_str in _LOOPBACK:
+            return await call_next(request)
 
         # ── 1. IP allowlist ───────────────────────────────────────────────────
         if _allowed_networks:
