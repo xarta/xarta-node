@@ -65,6 +65,9 @@ def _read_pub_comment(pub_path: str) -> Optional[str]:
 
 def _safe_write(path: str, content: str, mode: int) -> None:
     """Atomically write content to path and set permissions."""
+    # SSH requires key files to end with a newline.
+    if not content.endswith("\n"):
+        content += "\n"
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
