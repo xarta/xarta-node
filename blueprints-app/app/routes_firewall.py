@@ -54,7 +54,8 @@ _PORT_CATALOGUE: list[dict] = [
 ]
 
 # Ports that XARTA_INPUT explicitly allows (used by status endpoint).
-# Port 8080 is allowed but only from the fleet VLAN subnet (not all sources).
+# Port 8080 is allowed but only from known fleet peer IPs (per-IP rules
+# generated from .nodes.json at firewall-setup time — not open to all sources).
 _XARTA_ALLOWED_PORTS = {22, 80, 443, 41641, 8080}
 
 _TCP_TIMEOUT = 3   # seconds for TCP connect probes
