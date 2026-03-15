@@ -16,6 +16,23 @@ INFRA_LEAKS_FILE="$XARTA_DIR/infra-leaks.txt"
 # short/common strings like "5" or short interface names.
 MIN_LEN=5
 
+# Well-known public values that should never be flagged as leaks regardless of
+# which .env key they appear under (e.g. public DNS IPs used in health checks,
+# connectivity probes, and documentation examples).
+SKIP_VALUES=(
+    "1.1.1.1"       # Cloudflare public DNS
+    "1.0.0.1"       # Cloudflare public DNS (secondary)
+    "8.8.8.8"       # Google public DNS
+    "8.8.4.4"       # Google public DNS (secondary)
+    "9.9.9.9"       # Quad9 public DNS
+    "149.112.112.112" # Quad9 secondary
+    "208.67.222.222"  # OpenDNS
+    "208.67.220.220"  # OpenDNS secondary
+    "0.0.0.0"       # placeholder / unspecified address
+    "127.0.0.1"     # loopback — not a real infra address
+    "::1"           # IPv6 loopback
+)
+
 # Keys whose values are intentionally referenced in committed files and should
 # not be treated as leaks (e.g. paths baked into templates, service names in scripts).
 SKIP_KEYS=(
@@ -92,6 +109,13 @@ while IFS= read -r line; do
 
     # Skip empty values
     [ -z "$value" ] && continue
+
+    # Skip values that are well-known public addresses / not real infra secrets
+    skip_val=0
+    for sv in "${SKIP_VALUES[@]}"; do
+        [[ "$value" == "$sv" ]] && skip_val=1 && break
+    done
+    [ "$skip_val" -eq 1 ] && continue
 
     # Skip values that are too short to search meaningfully
     if [ "${#value}" -lt "$MIN_LEN" ]; then
