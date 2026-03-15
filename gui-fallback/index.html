@@ -552,15 +552,15 @@
   <p id="modal-error" class="error-msg" hidden></p>
 </dialog>
 
-<!-- Integrity FAILED diagnostic modal -->
+<!-- Integrity diagnostic modal (OK and FAILED) -->
 <dialog id="integrity-modal" style="background:var(--surface);border:1px solid var(--err);
   border-radius:var(--radius);color:var(--text);padding:24px;min-width:420px;max-width:600px;">
-  <h2 style="color:var(--err);margin-bottom:8px;">&#9888; Integrity FAILED</h2>
-  <p style="color:var(--text-dim);font-size:13px;margin-bottom:16px;line-height:1.6;">
+  <h2 id="integrity-modal-title" style="color:var(--err);margin-bottom:8px;">&#9888; Integrity FAILED</h2>
+  <p id="integrity-modal-intro" style="color:var(--text-dim);font-size:13px;margin-bottom:16px;line-height:1.6;">
     This node's database has been marked as <strong>degraded</strong>. Sync is paused — no outgoing
     writes will be sent to peers, and this node will not accept incoming sync actions until recovery.
   </p>
-  <div style="background:rgba(224,92,92,.08);border:1px solid var(--err);border-radius:var(--radius);
+  <div id="integrity-modal-cause" style="background:rgba(224,92,92,.08);border:1px solid var(--err);border-radius:var(--radius);
        padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;">
     <strong>Common cause:</strong> A <em>Force Restore</em> was applied (disaster recovery). The restored
     database is flagged as degraded until a healthy peer pushes its full backup to this node.
@@ -570,6 +570,7 @@
   <div id="integrity-diag" style="font-size:13px;line-height:1.8;color:var(--text-dim);">
     <span class="spinner"></span> Loading&hellip;
   </div>
+  <div id="integrity-modal-recovery">
   <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);
       margin:16px 0 10px;">How to recover</h3>
   <ol style="font-size:13px;line-height:1.9;padding-left:20px;">
@@ -587,6 +588,7 @@
         UPDATE sync_meta SET value='true' WHERE key='integrity_ok';</code>
         Only do this if you are certain the data is uncorrupted.</li>
   </ol>
+  </div>
   <div style="display:flex;justify-content:flex-end;margin-top:20px;">
     <button class="secondary" onclick="document.getElementById('integrity-modal').close()">Close</button>
   </div>
