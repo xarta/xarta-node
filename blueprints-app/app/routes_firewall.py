@@ -42,8 +42,11 @@ _PORT_CATALOGUE: list[dict] = [
     {"port": 80,    "proto": "tcp", "label": "HTTP (Caddy redirect)",  "expected": "open"},
     {"port": 443,   "proto": "tcp", "label": "HTTPS (Caddy/API)",      "expected": "open"},
     {"port": 41641, "proto": "udp", "label": "Tailscale/WireGuard",    "expected": "open"},
-    # Expected BLOCKED (should not be reachable from outside)
-    {"port": 8080,  "proto": "tcp", "label": "uvicorn (direct)",       "expected": "blocked"},
+    # Expected BLOCKED (should not be reachable from outside the fleet VLAN)
+    # Note: port 8080 IS open from the fleet VLAN (see setup-firewall.sh) for
+    # node-to-node sync.  A probe from a fleet peer will correctly show it
+    # as open — that is expected and correct behaviour.
+    {"port": 8080,  "proto": "tcp", "label": "uvicorn (fleet VLAN only)",  "expected": "open"},
     {"port": 3000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
     {"port": 5000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
     {"port": 8000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
@@ -51,7 +54,8 @@ _PORT_CATALOGUE: list[dict] = [
 ]
 
 # Ports that XARTA_INPUT explicitly allows (used by status endpoint).
-_XARTA_ALLOWED_PORTS = {22, 80, 443, 41641}
+# Port 8080 is allowed but only from the fleet VLAN subnet (not all sources).
+_XARTA_ALLOWED_PORTS = {22, 80, 443, 41641, 8080}
 
 _TCP_TIMEOUT = 3   # seconds for TCP connect probes
 _UDP_TIMEOUT = 3   # seconds for nc -u UDP probe

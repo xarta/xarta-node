@@ -108,6 +108,40 @@ echo "    added: TCP 443 (HTTPS/Caddy) → ACCEPT"
 # Essential for exit node performance.
 iptables -A XARTA_INPUT -p udp --dport 41641 -j ACCEPT
 echo "    added: UDP 41641 (Tailscale/WireGuard) → ACCEPT"
+
+# Fleet sync — allow the Blueprints app (uvicorn :8080) to be reached by
+# peers for node-to-node sync (drain.py action pushes and git-pull triggers
+# go directly node-to-node, not through Caddy).
+# Rules are generated from .nodes.json — both VLAN and Tailscale IPs for
+# every node are allowed.  Port 8080 remains blocked from any other source.
+# The browser GUI never uses port 8080 — it always goes via Caddy on 443.
+NODES_JSON="${SCRIPT_DIR}/.nodes.json"
+if [[ ! -f "$NODES_JSON" ]]; then
+    echo -e "${YELLOW}Warning:${NC} .nodes.json not found at $NODES_JSON"
+    echo "  Port 8080 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
+else
+    # Extract all primary_ip and tailnet_ip values from every node entry.
+    PEER_IPS=$(python3 -c "
+import json, sys
+data = json.load(open('$NODES_JSON'))
+ips = set()
+for n in data.get('nodes', []):
+    for field in ('primary_ip', 'tailnet_ip'):
+        v = n.get(field, '').strip()
+        if v:
+            ips.add(v)
+for ip in sorted(ips):
+    print(ip)
+")
+    if [[ -z "$PEER_IPS" ]]; then
+        echo -e "${YELLOW}Warning:${NC} No IPs found in .nodes.json — skipping port 8080 rules."
+    else
+        while IFS= read -r ip; do
+            iptables -A XARTA_INPUT -p tcp --dport 8080 -s "$ip" -j ACCEPT
+            echo "    added: TCP 8080 from $ip (fleet peer sync) → ACCEPT"
+        done <<< "$PEER_IPS"
+    fi
+fi
 echo ""
 
 # ── Step 3 — Jump from INPUT → XARTA_INPUT ────────────────────────────────────
