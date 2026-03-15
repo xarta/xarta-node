@@ -1,0 +1,48 @@
+/* ── Sync panel ── */
+#sync-panel { background: var(--surface); border: 1px solid var(--border);
+              border-radius: var(--radius); padding: 14px 18px; }
+.sync-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr));
+             gap: 12px; }
+.sync-item { display: flex; justify-content: space-between; padding: 6px 0;
+             border-bottom: 1px solid var(--border); }
+.sync-item:last-child { border-bottom: none; }
+
+/* ── Toolbar ── */
+.toolbar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; }
+input[type=text] { background: var(--surface); border: 1px solid var(--border);
+                   color: var(--text); border-radius: var(--radius); padding: 6px 10px;
+                   font-size: 13px; flex: 1; max-width: 300px; }
+input[type=text]:focus { outline: none; border-color: var(--accent); }
+button { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-dim);
+         border-radius: var(--radius); padding: 6px 14px; font-size: 13px;
+         cursor: pointer; transition: background .15s; }
+button:hover { background: var(--accent); color: #fff; }
+button.secondary { background: transparent; border-color: var(--border);
+                   color: var(--text-dim); }
+button.secondary:hover { color: var(--text); border-color: var(--text-dim); }
+
+/* ── Loading / error states ── */
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+           border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.error-msg { color: var(--err); font-size: 12px; margin-top: 6px; }
+
+/* ── Backup section ── */
+.backup-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.backup-table th { text-align: left; padding: 6px 10px;
+  border-bottom: 1px solid var(--border); color: var(--text-dim); font-weight: 500; }
+.backup-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.backup-table tr:last-child td { border-bottom: none; }
+.btn-restore  { font-size: 12px; padding: 4px 10px; }
+.btn-force    { font-size: 12px; padding: 4px 10px;
+  background: var(--err); border-color: var(--err); color: #fff; }
+.btn-force:hover { opacity: .85; }
+.warn-box { margin: 12px 0; padding: 10px 14px;
+  background: rgba(255,180,0,.08); border: 1px solid var(--warn);
+  border-radius: var(--radius); font-size: 13px; color: var(--warn); }
+.force-box { margin: 12px 0; padding: 10px 14px;
+  background: rgba(210,50,50,.08); border: 1px solid var(--err);
+  border-radius: var(--radius); font-size: 13px; color: var(--err); }
+.restore-result { margin-top: 10px; padding: 10px 14px;
+  background: rgba(60,210,100,.08); border: 1px solid var(--ok);
+  border-radius: var(--radius); font-size: 13px; }
