@@ -11,17 +11,18 @@
 #        - TCP 80   (Caddy HTTP → HTTPS redirect)
 #        - TCP 443  (Caddy HTTPS)
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
+#        - TCP 8080  (fleet sync) — per-peer-IP from .nodes.json only
 #   4. Inserts a jump to XARTA_INPUT at position 1 of the INPUT chain
 #      (if not already present), so our rules run before any other rules.
 #   5. Sets the default INPUT policy to DROP.
-#   6. Saves with netfilter-persistent (installed by setup-lxc-failover.sh).
+#   6. Sets all ip6tables default policies to DROP (IPv6 is not used).
+#   7. Saves with netfilter-persistent (installed by setup-lxc-failover.sh).
 #
 # What this script deliberately does NOT change:
 #   - FORWARD chain policy / rules  — left as-is so Tailscale exit node
 #     NAT and subnet routing continue to work.
 #   - nat table POSTROUTING rules   — managed by setup-lxc-failover.sh.
 #   - mangle table MSS clamping     — managed by setup-lxc-failover.sh.
-#   - IPv6 (ip6tables)              — not handled; see ASSUMPTIONS.md.
 #
 # Prerequisites:
 #   - Run setup-lxc-failover.sh first (installs iptables-persistent /
@@ -164,8 +165,26 @@ iptables -P INPUT DROP
 echo -e "    ${GREEN}set${NC}: INPUT policy → DROP"
 echo ""
 
-# ── Step 5 — Save rules ───────────────────────────────────────────────────────
-echo "Step 5: Saving rules with netfilter-persistent..."
+# ── Step 5 — IPv6: DROP everything ───────────────────────────────────────────
+# xarta-node does not use IPv6.  Set all three default ip6tables policies to
+# DROP so no IPv6 traffic is accepted, forwarded, or sent from this node.
+# Existing rules in each chain are flushed first for a clean state.
+echo "Step 5: Configuring ip6tables to DROP all IPv6 traffic..."
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -F INPUT   2>/dev/null || true
+    ip6tables -F FORWARD 2>/dev/null || true
+    ip6tables -F OUTPUT  2>/dev/null || true
+    ip6tables -P INPUT   DROP
+    ip6tables -P FORWARD DROP
+    ip6tables -P OUTPUT  DROP
+    echo -e "    ${GREEN}set${NC}: ip6tables INPUT/FORWARD/OUTPUT policy → DROP"
+else
+    echo -e "    ${YELLOW}skipped${NC}: ip6tables not found (IPv6 kernel support absent — already safe)"
+fi
+echo ""
+
+# ── Step 6 — Save rules ───────────────────────────────────────────────────────
+echo "Step 6: Saving rules with netfilter-persistent..."
 netfilter-persistent save
 echo -e "    ${GREEN}saved${NC}"
 echo ""
@@ -176,6 +195,9 @@ iptables -L INPUT -n -v --line-numbers
 echo ""
 echo "=== Current XARTA_INPUT chain ==="
 iptables -L XARTA_INPUT -n -v --line-numbers
+echo ""
+echo "=== Current ip6tables policies ==="
+ip6tables -L -n | grep -E "^Chain" || true
 echo ""
 echo -e "${GREEN}Done.${NC}"
 echo ""
