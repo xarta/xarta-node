@@ -68,7 +68,8 @@ async function loadSchema() {
   status.classList.remove('error');
 
   try {
-    const response = await fetch('/api/v1/schema');
+    const _fetch = window.apiFetch || fetch;
+    const response = await _fetch('/api/v1/schema');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     schemaData = await response.json();
     status.textContent = `Loaded ${schemaData.tables.length} tables.`;
