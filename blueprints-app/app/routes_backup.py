@@ -34,6 +34,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from starlette.responses import Response
 from pydantic import BaseModel
 
 from . import config as cfg
@@ -326,3 +327,17 @@ async def restore_backup(
         gen_after=gen_after,
         warning=warning,
     )
+
+
+@router.delete("/{filename}", status_code=204)
+def delete_backup(filename: str) -> Response:
+    """Delete a local backup file."""
+    if not _SAFE_NAME.match(filename):
+        raise HTTPException(status_code=400, detail="Invalid backup filename.")
+    bdir = _backup_dir()
+    path = bdir / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Backup not found: {filename}")
+    path.unlink()
+    log.info("backup deleted: %s", filename)
+    return Response(status_code=204)
