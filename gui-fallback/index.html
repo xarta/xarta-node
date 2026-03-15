@@ -288,6 +288,8 @@
     <h2>Fleet Nodes</h2>
     <div class="toolbar" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
       <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
+      <button id="fleet-update-btn" class="secondary" onclick="fleetUpdate(this)" title="git pull (public + private) on this node, then queue for all peers">&#9652; Fleet Update</button>
+      <span id="fleet-update-status" style="font-size:12px;align-self:center"></span>
       <span style="font-size:12px;color:var(--text-dim);align-self:center">
         <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
       </span>
@@ -1052,6 +1054,37 @@
         if (verCell) { verCell.textContent = '?'; verCell.style.color = 'var(--text-dim)'; }
       }
     }
+  }
+
+  async function fleetUpdate(btn) {
+    if (!confirm('Trigger git pull (public + private repos) on this node and queue for all fleet peers?\n\nAll nodes will pull latest code and restart if there are new commits.')) return;
+    const statusEl = document.getElementById('fleet-update-status');
+    btn.disabled = true;
+    const orig = btn.innerHTML;
+    btn.innerHTML = '&#8987; Updating…';
+    statusEl.textContent = '';
+    statusEl.style.color = '';
+    try {
+      const r = await fetch('/api/v1/sync/git-pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: 'both' }),
+      });
+      if (r.ok) {
+        statusEl.textContent = '✓ Queued for all nodes — peers will pull and restart shortly';
+        statusEl.style.color = 'var(--ok,#3fb950)';
+        setTimeout(() => { loadNodes(); }, 4000);
+      } else {
+        statusEl.textContent = `✗ HTTP ${r.status}`;
+        statusEl.style.color = 'var(--danger,#f85149)';
+      }
+    } catch (e) {
+      statusEl.textContent = `✗ ${e.message}`;
+      statusEl.style.color = 'var(--danger,#f85149)';
+    }
+    btn.disabled = false;
+    btn.innerHTML = orig;
+    setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 10000);
   }
 
   async function nodeRestart(nodeId, btn) {
