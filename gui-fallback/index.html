@@ -812,7 +812,7 @@
 
   function _saveDiagNodes(nodes) {
     try {
-      const slim = nodes.map(n => ({ node_id: n.node_id, display_name: n.display_name, addresses: n.addresses }));
+      const slim = nodes.map(n => ({ node_id: n.node_id, display_name: n.display_name, addresses: n.addresses, tailnet: n.tailnet }));
       localStorage.setItem(_LS_DIAG_NODES, JSON.stringify(slim));
     } catch (_) {}
   }
@@ -831,9 +831,9 @@
       const addr = n.addresses[0].replace(/\/$/, '');
       try {
         const r = await _diagFetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
-        return { node_id: n.node_id, display_name: n.display_name || n.node_id, address: addr, reachable: r.ok };
+        return { node_id: n.node_id, display_name: n.display_name || n.node_id, address: addr, reachable: r.ok, tailnet: n.tailnet };
       } catch {
-        return { node_id: n.node_id, display_name: n.display_name || n.node_id, address: addr, reachable: false };
+        return { node_id: n.node_id, display_name: n.display_name || n.node_id, address: addr, reachable: false, tailnet: n.tailnet };
       }
     }));
   }
@@ -3038,6 +3038,8 @@
     })();
     // Use node_id (not display name) for peer filtering and node lookups
     const selfId = _selfNodeId || localStorage.getItem(_LS_DIAG_NODE) || '';
+    const selfNode = cachedNodes.find(n => n.node_id === selfId);
+    const selfTailnet = selfNode?.tailnet || null;
 
     // Run connectivity + all endpoint tests concurrently
     const [endpointResults, peerResults, netResults, openapiData] = await Promise.all([
@@ -3128,7 +3130,15 @@
       } catch { return null; }
     })();
 
-    const proberPeer = peerResults.find(p => p.reachable);
+    const proberPeer = (() => {
+      // Prefer a peer on the same tailnet — tailscale ping only works within
+      // a tailnet, so a same-tailnet prober gives a definitive UDP 41641 result.
+      const sameTailnetPeer = selfTailnet
+        ? peerResults.find(p => p.reachable && p.tailnet === selfTailnet)
+        : null;
+      return sameTailnetPeer || peerResults.find(p => p.reachable) || null;
+    })();
+    const proberSameTailnet = !!(proberPeer && selfTailnet && proberPeer.tailnet === selfTailnet);
 
     html += _diagSection('Firewall — Local iptables Status');
     let localFwOk = false;
@@ -3160,7 +3170,8 @@
 
     let probePassCount = 0, probeTotalCount = 0;
     if (proberPeer && myAddress) {
-      html += _diagSection(`Firewall — External Port Probe (via ${esc(proberPeer.display_name || proberPeer.node_id)})`);
+      const tailnetNote = proberSameTailnet ? ' — same tailnet' : ' — cross-tailnet';
+      html += _diagSection(`Firewall — External Port Probe (via ${esc(proberPeer.display_name || proberPeer.node_id)}${tailnetNote})`);
       status.textContent = `Probing ports via ${proberPeer.display_name || proberPeer.node_id}\u2026`;
       try {
         const probeR = await _diagFetch(`${proberPeer.address}/api/v1/firewall/probe`, {
@@ -3173,7 +3184,7 @@
           const probe = await probeR.json();
           for (const p of (probe.ports || [])) {
             if (p.result === 'skipped') {
-              html += _selfDiagRow('\u2014', `${p.proto.toUpperCase()} ${p.port} — ${esc(p.label)}`, 'skipped (nmap unavailable)', '');
+              html += _selfDiagRow('\u2014', `${p.proto.toUpperCase()} ${p.port} — ${esc(p.label)}`, 'skipped (probe tool unavailable)', '');
               continue;
             }
             probeTotalCount++;
