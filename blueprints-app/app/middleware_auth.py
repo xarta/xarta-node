@@ -41,7 +41,7 @@ for _cidr in cfg.ALLOWED_NETWORKS_RAW.split(","):
         log.warning("middleware_auth: ignoring invalid CIDR %r", _cidr)
 
 # Paths that require NO token (IP allowlist still applies)
-_TOKEN_EXEMPT_PREFIXES = ("/health", "/ui")
+_TOKEN_EXEMPT_PREFIXES = ("/health", "/ui", "/favicon.ico")
 # Routes that use SYNC_SECRET instead of API_SECRET
 _SYNC_PREFIX = "/api/v1/sync/"
 # Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
