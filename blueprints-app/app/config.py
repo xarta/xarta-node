@@ -133,3 +133,34 @@ def _get_commit_info() -> tuple[str | None, int]:
 COMMIT_HASH, COMMIT_TS = _get_commit_info()
 log.info("commit guard: hash=%s ts=%d", COMMIT_HASH, COMMIT_TS)
 
+# ── SSH probe key configuration ────────────────────────────────────────────────
+# Maps a stable id → human label + env-var that holds the key path.
+# The API resolves actual paths from env vars at request time — clients never
+# supply a path directly (prevents path-injection attacks).
+KEY_CONFIGS: dict[str, dict] = {
+    "xarta_node": {
+        "label": "xarta-node Fleet LXCs",
+        "env_var": "XARTA_NODE_SSH_KEY",
+    },
+    "lxc": {
+        "label": "Other LXCs",
+        "env_var": "LXC_SSH_KEY",
+    },
+    "vm": {
+        "label": "QEMU VMs",
+        "env_var": "VM_SSH_KEY",
+    },
+    "citadel": {
+        "label": "Citadel VM",
+        "env_var": "CITADEL_SSH_KEY",
+    },
+    "proxmox": {
+        "label": "Proxmox PVE Hosts",
+        "env_var": "PROXMOX_SSH_KEY",
+    },
+    "pfsense": {
+        "label": "pfSense Firewall",
+        "env_var": "PFSENSE_SSH_KEY",
+    },
+}
+
