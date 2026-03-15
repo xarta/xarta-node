@@ -182,6 +182,7 @@
       fresh.push({
         id: p.node_id,
         name: p.display_name || p.node_id,
+        displayOrder: typeof p.display_order === 'number' ? p.display_order : 999,
         uiUrl,
         healthUrl: `${uiUrl}/health`,
         fleetPeer: p.fleet_peer ?? true,
@@ -202,6 +203,16 @@
     }
 
     if (!fresh.length) return;
+
+    // Sort by display_order (self is always first regardless of its order value)
+    const selfId = selfNode && selfNode.id;
+    fresh.sort((a, b) => {
+      if (a.id === selfId) return -1;
+      if (b.id === selfId) return  1;
+      const ao = typeof a.displayOrder === 'number' ? a.displayOrder : 999;
+      const bo = typeof b.displayOrder === 'number' ? b.displayOrder : 999;
+      return ao !== bo ? ao - bo : (a.name || '').localeCompare(b.name || '');
+    });
 
     const byId = Object.fromEntries(_nodes.map(n => [n.id, n]));
     _nodes = fresh.map(n => Object.assign(

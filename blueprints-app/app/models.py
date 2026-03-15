@@ -140,6 +140,7 @@ class NodeCreate(BaseModel):
 class NodeOut(BaseModel):
     node_id: str
     display_name: str
+    display_order: int = 0        # preferred sort position in the node selector
     host_machine: Optional[str] = None
     tailnet: Optional[str] = None
     addresses: Optional[list[str]] = None

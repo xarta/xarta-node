@@ -335,6 +335,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # (table created in DDL above; no ALTER TABLE needed for it)
         # pve_hosts: tailnet IP discovered during scan (2026-03-15)
         ("pve_hosts", "tailnet_ip",           "TEXT"),
+        # nodes: display order from .nodes.json (2026-03-15)
+        ("nodes",    "display_order",          "INTEGER DEFAULT 0"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

@@ -48,6 +48,7 @@ def _row_to_out(row) -> NodeOut:
     return NodeOut(
         node_id=row["node_id"],
         display_name=row["display_name"],
+        display_order=row["display_order"] if "display_order" in keys else 0,
         host_machine=row["host_machine"],
         tailnet=row["tailnet"],
         addresses=addr_list or None,
@@ -85,7 +86,7 @@ async def list_nodes() -> list[NodeOut]:
             SELECT n.*,
                    (SELECT COUNT(*) FROM sync_queue
                     WHERE target_node_id = n.node_id AND sent = 0) AS pending_count
-            FROM nodes n ORDER BY n.display_name
+            FROM nodes n ORDER BY n.display_order, n.display_name
             """
         ).fetchall()
     return [_row_to_out(r) for r in rows]
@@ -111,6 +112,7 @@ def _upsert_nodes_from_config() -> int:
                 continue
             nid     = node["node_id"]
             name    = node["display_name"]
+            order   = node.get("display_order", 0)
             host    = node["host_machine"]
             tailnet = node.get("tailnet", "")
             pip     = node["primary_ip"]
@@ -129,15 +131,15 @@ def _upsert_nodes_from_config() -> int:
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE nodes SET display_name=?, host_machine=?, tailnet=?, "
+                    "UPDATE nodes SET display_name=?, display_order=?, host_machine=?, tailnet=?, "
                     "addresses=?, ui_url=?, last_seen=datetime('now') WHERE node_id=?",
-                    (name, host, tailnet, addresses, ui_url, nid),
+                    (name, order, host, tailnet, addresses, ui_url, nid),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO nodes (node_id, display_name, host_machine, tailnet, "
-                    "addresses, ui_url, last_seen) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-                    (nid, name, host, tailnet, addresses, ui_url),
+                    "INSERT INTO nodes (node_id, display_name, display_order, host_machine, tailnet, "
+                    "addresses, ui_url, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                    (nid, name, order, host, tailnet, addresses, ui_url),
                 )
             count += 1
     return count
