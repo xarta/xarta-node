@@ -80,7 +80,8 @@ async function loadDiagram() {
   status.classList.remove('error');
 
   try {
-    const response = await fetch('/api/v1/schema');
+    const _fetch = window.apiFetch || fetch;
+    const response = await _fetch('/api/v1/schema');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     mermaidText = data.mermaid || 'erDiagram\n    EMPTY ||--|| EMPTY : "no data"';
