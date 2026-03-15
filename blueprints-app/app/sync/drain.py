@@ -19,6 +19,7 @@ import random
 import httpx
 
 from .. import config as cfg
+from ..auth import compute_token
 from ..db import get_conn, get_meta
 from ..sync.queue import (
     get_peers_with_pending,
@@ -126,6 +127,7 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
             resp = await client.post(
                 f"{peer_url}/api/v1/sync/actions",
                 json=payload,
+                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
             )
         if resp.status_code == 204:
             queue_ids = [a["queue_id"] for a in actions]
@@ -166,13 +168,16 @@ async def _send_full_backup(node_id: str, peer_url: str) -> None:
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            _restore_headers = {
+                "content-type": "application/octet-stream",
+                "x-blueprints-checksum": sha256_hex,
+            }
+            if cfg.SYNC_SECRET:
+                _restore_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
             resp = await client.post(
                 f"{peer_url}/api/v1/sync/restore",
                 content=zip_bytes,
-                headers={
-                    "content-type": "application/octet-stream",
-                    "x-blueprints-checksum": sha256_hex,
-                },
+                headers=_restore_headers,
             )
         if resp.status_code == 204:
             log.info("full backup sent to peer %s", node_id)

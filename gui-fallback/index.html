@@ -171,6 +171,7 @@
       <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
       <button class="group-tab" onclick="switchGroup('settings')">Settings</button>
     </nav>
+    <button class="secondary" onclick="openApiKeyModal()" title="Configure API key" style="padding:4px 8px;font-size:14px;flex-shrink:0;">🔑</button>
     <blueprints-node-selector></blueprints-node-selector>
   </div>
 </header>
@@ -703,6 +704,54 @@
 </dialog>
 
 <script>
+  /* ── API authentication (TOTP) ──────────────────────────────────────── */
+  const _LS_SECRET_KEY = 'blueprints_api_secret';
+
+  async function _computeApiToken(secretHex) {
+    if (!secretHex) return '';
+    try {
+      const windowNum = Math.floor(Date.now() / 5000);
+      const keyBytes  = Uint8Array.from(secretHex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
+      const msgBytes  = new TextEncoder().encode(String(windowNum));
+      const key = await crypto.subtle.importKey(
+        'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+      const sig = await crypto.subtle.sign('HMAC', key, msgBytes);
+      return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  async function apiFetch(url, options = {}) {
+    const secret = localStorage.getItem(_LS_SECRET_KEY) || '';
+    const token  = await _computeApiToken(secret);
+    const merged = {
+      ...options,
+      headers: { ...(options.headers || {}), ...(token ? { 'X-API-Token': token } : {}) },
+    };
+    const r = await fetch(url, merged);
+    if (r.status === 401) { openApiKeyModal(true); }
+    return r;
+  }
+
+  function openApiKeyModal(authFailed = false) {
+    const modal = document.getElementById('api-key-modal');
+    document.getElementById('api-key-failed-msg').hidden = !authFailed;
+    document.getElementById('api-key-input').value = localStorage.getItem(_LS_SECRET_KEY) || '';
+    modal.showModal();
+  }
+
+  function saveApiKey() {
+    const val = document.getElementById('api-key-input').value.trim();
+    if (val) {
+      localStorage.setItem(_LS_SECRET_KEY, val);
+    } else {
+      localStorage.removeItem(_LS_SECRET_KEY);
+    }
+    document.getElementById('api-key-modal').close();
+  }
+
   /* ── State ────────────────────────────────────────────────────────────── */
   let _services = [];
   let _machines = [];
@@ -771,6 +820,7 @@
 
   /* ── Bootstrap ────────────────────────────────────────────────────────── */
   document.addEventListener('DOMContentLoaded', () => {
+    if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
     loadHealth();
     loadServices();
     loadSyncStatus();
@@ -782,7 +832,7 @@
   /* ── Health / header stats ────────────────────────────────────────────── */
   async function loadHealth() {
     try {
-      const r = await fetch('/health');
+      const r = await apiFetch('/health');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       _nodeName = d.node_name || d.node_id || '';
@@ -797,7 +847,7 @@
     }
     // Key badge — best-effort, does not block main health display
     try {
-      const kr = await fetch('/api/v1/keys/status');
+      const kr = await apiFetch('/api/v1/keys/status');
       if (kr.ok) {
         const kd = await kr.json();
         updateKeyBadge(kd.keys);
@@ -830,8 +880,8 @@
     modal.showModal();
     try {
       const [hr, sr] = await Promise.all([
-        fetch('/health'),
-        fetch('/api/v1/sync/status'),
+        apiFetch('/health'),
+        apiFetch('/api/v1/sync/status'),
       ]);
       const h = hr.ok ? await hr.json() : null;
       const s = sr.ok ? await sr.json() : null;
@@ -869,7 +919,7 @@
     _hostLookedUp = true;
     try {
       if (!_machines.length) {
-        const r = await fetch('/api/v1/machines');
+        const r = await apiFetch('/api/v1/machines');
         if (r.ok) _machines = await r.json();
       }
       const name = (nodeName || '').toLowerCase();
@@ -886,7 +936,7 @@
     const err = document.getElementById('services-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/services');
+      const r = await apiFetch('/api/v1/services');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _services = await r.json();
       renderServices();
@@ -940,7 +990,7 @@
     const err = document.getElementById('machines-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/machines');
+      const r = await apiFetch('/api/v1/machines');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _machines = await r.json();
       renderMachines();
@@ -990,7 +1040,7 @@
     const err = document.getElementById('nodes-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/nodes');
+      const r = await apiFetch('/api/v1/nodes');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _nodes = await r.json();
       renderNodes();
@@ -1044,7 +1094,7 @@
         continue;
       }
       try {
-        const r = await fetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
+        const r = await apiFetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
         if (genCell) { genCell.textContent = d.gen ?? '—'; genCell.style.color = ''; }
@@ -1065,7 +1115,7 @@
     statusEl.textContent = '';
     statusEl.style.color = '';
     try {
-      const r = await fetch('/api/v1/sync/git-pull', {
+      const r = await apiFetch('/api/v1/sync/git-pull', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope: 'both' }),
@@ -1092,7 +1142,7 @@
     const orig = btn.innerHTML;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/restart`, { method: 'POST' });
+      const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/restart`, { method: 'POST' });
       btn.innerHTML = r.ok ? '&#10003; Sent' : `&#10007; ${r.status}`;
       btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
     } catch {
@@ -1106,7 +1156,7 @@
     const orig = btn.innerHTML;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/git-pull`, { method: 'POST' });
+      const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/git-pull`, { method: 'POST' });
       btn.innerHTML = r.ok ? '&#10003; Pull' : `&#10007; ${r.status}`;
       btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
     } catch {
@@ -1122,7 +1172,7 @@
     const orig = btn.innerHTML;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/sync-queue`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/sync-queue`, { method: 'DELETE' });
       btn.innerHTML = r.ok ? '&#10003; Done' : `&#10007; ${r.status}`;
       btn.style.color = r.ok ? 'var(--ok,#3fb950)' : 'var(--danger,#f85149)';
       if (r.ok) { _nodes = []; setTimeout(loadNodes, 500); }
@@ -1136,7 +1186,7 @@
     if (!confirm(`Delete node "${nodeId}" from this node's DB?\n\nThis does not purge the sync queue — use Purge Queue first if needed.`)) return;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
       if (r.ok) { _nodes = []; loadNodes(); return; }
       btn.textContent = `✗ ${r.status}`; btn.style.color = 'var(--danger,#f85149)';
       btn.disabled = false;
@@ -1151,7 +1201,7 @@
       const btn = document.getElementById(`node-pct-${n.node_id}`);
       if (!btn || btn.disabled) return;  // skip buttons mid-action
       try {
-        const r = await fetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
+        const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
         if (!r.ok) { btn.dataset.pctStatus = 'unknown'; return; }
         const d = await r.json();
         const st = (d.status || 'unknown').toLowerCase();
@@ -1190,7 +1240,7 @@
     const orig = btn.innerHTML;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/pct`, {
+      const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/pct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -1224,7 +1274,7 @@
     err.hidden = true;
     checkProbeStatus();   // update button state every time tab is visited
     try {
-      const r = await fetch('/api/v1/pfsense-dns');
+      const r = await apiFetch('/api/v1/pfsense-dns');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _pfsenseDns = await r.json();
       renderPfSenseDns();
@@ -1238,7 +1288,7 @@
     const btn    = document.getElementById('dns-probe-btn');
     const status = document.getElementById('dns-probe-status');
     try {
-      const r = await fetch('/api/v1/pfsense-dns/probe/status');
+      const r = await apiFetch('/api/v1/pfsense-dns/probe/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       if (d.configured) {
@@ -1315,7 +1365,7 @@
     btn.textContent = '⟳ Probing…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/pfsense-dns/probe', { method: 'POST' });
+      const r = await apiFetch('/api/v1/pfsense-dns/probe', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       const macs = d.mac_enriched ?? d.mac_addresses_found ?? 0;
@@ -1343,7 +1393,7 @@
     btn.textContent = '⟳ Sweeping…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/pfsense-dns/ping-sweep', { method: 'POST' });
+      const r = await apiFetch('/api/v1/pfsense-dns/ping-sweep', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ Sweep complete — reached: ${d.reached}/${d.ips_checked}, MACs found: ${d.macs_found}`;
@@ -1366,7 +1416,7 @@
     const err = document.getElementById('arp-manual-error');
     if (err) err.hidden = true;
     try {
-      const r = await fetch('/api/v1/arp-manual');
+      const r = await apiFetch('/api/v1/arp-manual');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _arpManual = await r.json();
       renderArpManual();
@@ -1401,7 +1451,7 @@
     if (!mac) return;
     const notes = prompt('Notes (optional):', '') ?? '';
     try {
-      const r = await fetch('/api/v1/arp-manual', {
+      const r = await apiFetch('/api/v1/arp-manual', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ ip_address: ip, mac_address: mac, notes: notes || null }),
@@ -1420,7 +1470,7 @@
     const notes = prompt('Notes (optional):', currentNotes);
     if (notes === null) return;
     try {
-      const r = await fetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, {
+      const r = await apiFetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ ip_address: ip || null, mac_address: mac || null, notes: notes || null }),
@@ -1433,7 +1483,7 @@
   async function deleteArpManualEntry(entry_id, ip) {
     if (!confirm(`Delete manual ARP entry for ${ip}?`)) return;
     try {
-      const r = await fetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, { method: 'DELETE' });
       if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
       _arpManual = _arpManual.filter(e => e.entry_id !== entry_id);
       renderArpManual();
@@ -1445,7 +1495,7 @@
     const err = document.getElementById('ssh-targets-error');
     if (err) err.hidden = true;
     try {
-      const r = await fetch('/api/v1/ssh-targets');
+      const r = await apiFetch('/api/v1/ssh-targets');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _sshTargets = await r.json();
       renderSshTargets();
@@ -1485,7 +1535,7 @@
     const status = document.getElementById('ssh-targets-status');
     btn.disabled = true; btn.textContent = '\u23F3 Rebuilding\u2026';
     try {
-      const r = await fetch('/api/v1/ssh-targets/rebuild', { method: 'POST' });
+      const r = await apiFetch('/api/v1/ssh-targets/rebuild', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `\u2713 ${d.message}`;
@@ -1501,7 +1551,7 @@
   async function deleteSshTarget(ip) {
     if (!confirm(`Remove ssh_target for ${ip}?`)) return;
     try {
-      const r = await fetch(`/api/v1/ssh-targets/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/ssh-targets/${encodeURIComponent(ip)}`, { method: 'DELETE' });
       if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
       _sshTargets = _sshTargets.filter(e => e.ip_address !== ip);
       renderSshTargets();
@@ -1512,7 +1562,7 @@
     const err = document.getElementById('vlans-error');
     if (err) err.hidden = true;
     try {
-      const r = await fetch('/api/v1/vlans');
+      const r = await apiFetch('/api/v1/vlans');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _vlans = await r.json();
       renderVlans();
@@ -1553,7 +1603,7 @@
     const description = prompt(`VLAN ${vlan_id} — Description (optional):`, currentDesc);
     if (description === null) return;
     try {
-      const r = await fetch(`/api/v1/vlans/${vlan_id}`, {
+      const r = await apiFetch(`/api/v1/vlans/${vlan_id}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ cidr: cidr || null, description: description || null }),
@@ -1572,7 +1622,7 @@
     btn.textContent = '⏳ Scanning…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/find-ips-by-arp', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/find-ips-by-arp', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       if (d.scanned === 0) {
@@ -1602,7 +1652,7 @@
     btn.textContent = '⏳ Scanning via PVE…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-pve', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/find-ips-via-pve', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ PVE scan complete — ${d.message}`;
@@ -1630,7 +1680,7 @@
     btn.textContent = '⏳ Reading pfSense ARP…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/enrich-from-pfsense-arp', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/enrich-from-pfsense-arp', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ pfSense ARP — ${d.message}`;
@@ -1658,7 +1708,7 @@
     btn.textContent = '⏳ Querying QEMU agents…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-qemu-agent', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/find-ips-via-qemu-agent', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ QEMU agent — ${d.message}`;
@@ -1682,7 +1732,7 @@
     btn.textContent = '⏳ pfSense sweep…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/find-ips-via-pfsense-sweep', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/find-ips-via-pfsense-sweep', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ pfSense sweep — ${d.message}`;
@@ -1702,7 +1752,7 @@
   async function deleteProxmoxNet(net_id, net_key) {
     if (!confirm(`Delete NIC "${net_key}" (${net_id})?\nThis removes it from Blueprints only — not from Proxmox.`)) return;
     try {
-      const r = await fetch(`/api/v1/proxmox-nets/${encodeURIComponent(net_id)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/proxmox-nets/${encodeURIComponent(net_id)}`, { method: 'DELETE' });
       if (!r.ok && r.status !== 204) { const d = await r.json().catch(()=>{}); throw new Error(d?.detail || `HTTP ${r.status}`); }
       await loadProxmoxNets();
       renderProxmoxConfig();
@@ -1716,7 +1766,7 @@
     err.hidden = true;
     checkProxmoxProbeStatus();
     try {
-      const r = await fetch('/api/v1/proxmox-config');
+      const r = await apiFetch('/api/v1/proxmox-config');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _proxmoxConfig = await r.json();
       await loadProxmoxNets();
@@ -1732,7 +1782,7 @@
     const btn = document.getElementById('pve-probe-btn');
     const status = document.getElementById('pve-probe-status');
     try {
-      const r = await fetch('/api/v1/proxmox-config/probe/status');
+      const r = await apiFetch('/api/v1/proxmox-config/probe/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       btn.disabled = !d.configured;
@@ -1865,7 +1915,7 @@
 
   async function loadProxmoxNets() {
     try {
-      const r = await fetch('/api/v1/proxmox-nets');
+      const r = await apiFetch('/api/v1/proxmox-nets');
       if (!r.ok) return;
       const nets = await r.json();
       _proxmoxNetsMap = {};
@@ -1882,7 +1932,7 @@
     btn.disabled = true;
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-nets/enrich-from-pfsense', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-nets/enrich-from-pfsense', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `⇑ Enriched ${d.enriched ?? 0} of ${d.checked ?? 0} net interfaces from pfSense`;
@@ -1931,7 +1981,7 @@
     for (const [label, url, refreshNets] of STEPS) {
       status.textContent = `⏳ ${label}…`;
       try {
-        const r = await fetch(url, { method: 'POST' });
+        const r = await apiFetch(url, { method: 'POST' });
         const d = await r.json().catch(() => ({}));
         if (!r.ok) {
           stepResults.push(`⚠ ${label}: ${d.detail || 'HTTP ' + r.status}`);
@@ -1960,7 +2010,7 @@
     btn.textContent = '⏳ Probing VM services…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-config/probe-services', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-config/probe-services', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ VM services — ${d.message}`;
@@ -1984,7 +2034,7 @@
     btn.textContent = '⟳ Probing…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/proxmox-config/probe', { method: 'POST' });
+      const r = await apiFetch('/api/v1/proxmox-config/probe', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       const nc = d.nets_created ?? 0, nu = d.nets_updated ?? 0;
@@ -2012,8 +2062,8 @@
     checkDockgeProbeStatus();
     try {
       const [stacksRes, svcsRes] = await Promise.all([
-        fetch('/api/v1/dockge-stacks'),
-        fetch('/api/v1/dockge-stacks/services'),
+        apiFetch('/api/v1/dockge-stacks'),
+        apiFetch('/api/v1/dockge-stacks/services'),
       ]);
       if (!stacksRes.ok) throw new Error(`HTTP ${stacksRes.status}`);
       _dockgeStacks = await stacksRes.json();
@@ -2041,7 +2091,7 @@
     const btn    = document.getElementById('dockge-probe-btn');
     const status = document.getElementById('dockge-probe-status');
     try {
-      const r = await fetch('/api/v1/dockge-stacks/probe/status');
+      const r = await apiFetch('/api/v1/dockge-stacks/probe/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       btn.disabled = !d.configured;
@@ -2191,7 +2241,7 @@
     if (!row) return;
     const newVal = row.obsolete ? 0 : 1;
     try {
-      const r = await fetch(`/api/v1/dockge-stacks/${encodeURIComponent(stackId)}`, {
+      const r = await apiFetch(`/api/v1/dockge-stacks/${encodeURIComponent(stackId)}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({obsolete: newVal}),
@@ -2210,7 +2260,7 @@
     const newNote = prompt('Edit note for "' + stackId + '":', row.notes || '');
     if (newNote === null) return; // cancelled
     try {
-      const r = await fetch(`/api/v1/dockge-stacks/${encodeURIComponent(stackId)}`, {
+      const r = await apiFetch(`/api/v1/dockge-stacks/${encodeURIComponent(stackId)}`, {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({notes: newNote}),
@@ -2230,7 +2280,7 @@
     btn.textContent = '⟳ Probing…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/dockge-stacks/probe', { method: 'POST' });
+      const r = await apiFetch('/api/v1/dockge-stacks/probe', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ Done — stacks: ${d.stacks_total??0} (new: ${d.stacks_created??0}), services: ${d.services_total??0}, machines: ${d.machines_probed??0}`;
@@ -2254,7 +2304,7 @@
     err.hidden = true;
     checkCaddyProbeStatus();
     try {
-      const r = await fetch('/api/v1/caddy-configs');
+      const r = await apiFetch('/api/v1/caddy-configs');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _caddyConfigs = await r.json();
       renderCaddyConfigs();
@@ -2268,7 +2318,7 @@
     const btn = document.getElementById('caddy-probe-btn');
     const status = document.getElementById('caddy-probe-status');
     try {
-      const r = await fetch('/api/v1/caddy-configs/probe/status');
+      const r = await apiFetch('/api/v1/caddy-configs/probe/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       btn.disabled = !d.configured;
@@ -2322,7 +2372,7 @@
     btn.textContent = '⟳ Probing…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/caddy-configs/probe', { method: 'POST' });
+      const r = await apiFetch('/api/v1/caddy-configs/probe', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ Done — created: ${d.created ?? 0}, updated: ${d.updated ?? 0}, hosts: ${d.pve_hosts_probed ?? 0}`;
@@ -2346,7 +2396,7 @@
     const err = document.getElementById('settings-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/settings');
+      const r = await apiFetch('/api/v1/settings');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _settings = await r.json();
       renderSettings();
@@ -2409,7 +2459,7 @@
     const err  = document.getElementById('setting-error');
     if (!key) { err.textContent = 'Key is required'; err.hidden = false; return; }
     try {
-      const r = await fetch(`/api/v1/settings/${encodeURIComponent(key)}`, {
+      const r = await apiFetch(`/api/v1/settings/${encodeURIComponent(key)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value: val, description: desc || null }),
@@ -2427,7 +2477,7 @@
   async function deleteSetting(key) {
     if (!confirm(`Delete setting "${key}"?`)) return;
     try {
-      const r = await fetch(`/api/v1/settings/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/settings/${encodeURIComponent(key)}`, { method: 'DELETE' });
       if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
       _settings = [];
       await loadSettings();
@@ -2438,7 +2488,7 @@
 
   async function loadSettingsCidr() {
     try {
-      const r = await fetch('/api/v1/settings/mgmt_cidr');
+      const r = await apiFetch('/api/v1/settings/mgmt_cidr');
       if (r.ok) {
         const d = await r.json();
         document.getElementById('settings-cidr').value = d.value || '';
@@ -2452,7 +2502,7 @@
     const cidr   = input.value.trim();
     if (!cidr) { status.textContent = '⚠ Enter a CIDR first'; status.hidden = false; return; }
     try {
-      const r = await fetch('/api/v1/settings/mgmt_cidr', {
+      const r = await apiFetch('/api/v1/settings/mgmt_cidr', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value: cidr, description: 'Management network CIDR for PVE host scanning' }),
@@ -2474,7 +2524,7 @@
     const err = document.getElementById('pve-hosts-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/pve-hosts');
+      const r = await apiFetch('/api/v1/pve-hosts');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _pveHosts = await r.json();
       renderPveHosts();
@@ -2512,7 +2562,7 @@
     btn.textContent = '⟳ Scanning…';
     status.hidden = true;
     try {
-      const r = await fetch('/api/v1/pve-hosts/scan', { method: 'POST' });
+      const r = await apiFetch('/api/v1/pve-hosts/scan', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       status.textContent = `✓ Scanned ${d.ips_checked} IPs — found: ${d.found} (created: ${d.created}, updated: ${d.updated})`;
@@ -2536,7 +2586,7 @@
     const err = document.getElementById('sync-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/sync/status');
+      const r = await apiFetch('/api/v1/sync/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       document.getElementById('nn-peers').textContent = d.peer_count;
@@ -2575,7 +2625,7 @@
     const err  = document.getElementById('modal-error');
     if (!id || !name) { err.textContent='ID and Name are required'; err.hidden=false; return; }
     try {
-      const r = await fetch('/api/v1/services', {
+      const r = await apiFetch('/api/v1/services', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -2610,7 +2660,7 @@
     const err   = document.getElementById('keys-status-error');
     err.hidden  = true;
     try {
-      const r = await fetch('/api/v1/keys/status');
+      const r = await apiFetch('/api/v1/keys/status');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _keys = (await r.json()).keys;
       renderKeysTable();
@@ -2774,7 +2824,7 @@
       if (!confirm(`Delete key files for "${label}" from this node?\n\nThe private and public key files will be permanently removed. Ensure they are backed up before deleting.`)) return;
     }
     try {
-      const r = await fetch(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (r.status !== 204 && !r.ok) {
         const d = await r.json().catch(() => ({}));
         throw new Error(d.detail || `HTTP ${r.status}`);
@@ -2852,7 +2902,7 @@
     result.style.color = 'var(--text-dim)';
 
     try {
-      const r = await fetch('/api/v1/keys/import', {
+      const r = await apiFetch('/api/v1/keys/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keys: toImport.map(e => ({ id: e.id, private: e.private, public: e.public })) }),
@@ -2879,7 +2929,7 @@
     status.style.color = 'var(--text-dim)';
     status.textContent = 'Fetching encrypted store…';
     try {
-      const storeR = await fetch('/api/v1/keys/store');
+      const storeR = await apiFetch('/api/v1/keys/store');
       if (storeR.status === 404) {
         status.textContent = 'No encrypted store found — paste a key bundle above and Save to store.';
         status.style.color = 'var(--warn)';
@@ -3029,7 +3079,7 @@
         return;
       }
       const blob = await _ksEncrypt(pw, JSON.stringify(entries));
-      const r    = await fetch('/api/v1/keys/store', {
+      const r    = await apiFetch('/api/v1/keys/store', {
         method:  'PUT',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ blob }),
@@ -3058,7 +3108,7 @@
     status.style.color      = 'var(--text-dim)';
     status.textContent      = 'Fetching encrypted store\u2026';
     try {
-      const storeR = await fetch('/api/v1/keys/store');
+      const storeR = await apiFetch('/api/v1/keys/store');
       if (storeR.status === 404) {
         status.textContent = 'No encrypted store found on this node.';
         status.style.color = 'var(--warn)';
@@ -3121,7 +3171,7 @@
     result.style.color = 'var(--text-dim)';
     result.textContent = 'Importing\u2026';
     try {
-      const r = await fetch('/api/v1/keys/import', {
+      const r = await apiFetch('/api/v1/keys/import', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ keys: keysToImport }),
@@ -3146,7 +3196,7 @@
     const err   = document.getElementById('backup-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/backup');
+      const r = await apiFetch('/api/v1/backup');
       if (!r.ok) {
         if (r.status === 503) {
           tbody.innerHTML = '<tr class="empty-row"><td colspan="4">Backups not configured on this node.</td></tr>';
@@ -3185,7 +3235,7 @@
     const orig = btn.innerHTML;
     btn.disabled = true; btn.textContent = '…';
     try {
-      const r = await fetch(`/api/v1/backup/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+      const r = await apiFetch(`/api/v1/backup/${encodeURIComponent(filename)}`, { method: 'DELETE' });
       if (r.ok) {
         await loadBackups();
       } else {
@@ -3205,7 +3255,7 @@
     const err = document.getElementById('backup-error');
     err.hidden = true;
     try {
-      const r = await fetch('/api/v1/backup', { method: 'POST' });
+      const r = await apiFetch('/api/v1/backup', { method: 'POST' });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
       await loadBackups();
@@ -3242,7 +3292,7 @@
     resultEl.hidden = true;
     try {
       const url = `/api/v1/backup/restore/${encodeURIComponent(filename)}${force ? '?force=true' : ''}`;
-      const r = await fetch(url, { method: 'POST' });
+      const r = await apiFetch(url, { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
       let msg = `✓ Restored from ${d.restored_from}. Gen: ${d.gen_before} → ${d.gen_after}.`;
@@ -3298,6 +3348,29 @@
   <div id="key-info-body" style="font-size:13px;line-height:1.6;"></div>
   <div style="display:flex;justify-content:flex-end;margin-top:20px;">
     <button class="secondary" onclick="document.getElementById('key-info-modal').close()">Close</button>
+  </div>
+</dialog>
+
+<!-- API key configuration modal -->
+<dialog id="api-key-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:380px;max-width:480px;">
+  <h2 style="margin-bottom:12px;">🔑 API Key</h2>
+  <p id="api-key-failed-msg" style="color:var(--danger);margin-bottom:10px;" hidden>
+    ⚠ Authentication failed — check your API secret.
+  </p>
+  <p style="margin-bottom:14px;font-size:13px;color:var(--text-muted);">Paste your
+    <code>BLUEPRINTS_API_SECRET</code> (64-hex char string) from the node's
+    <code>.env</code> file. It is stored only in this browser's localStorage and
+    never transmitted — only a derived time-based token is sent with each request.
+  </p>
+  <input id="api-key-input" type="password" placeholder="64-char hex secret"
+    style="width:100%;box-sizing:border-box;font-family:monospace;font-size:13px;
+           padding:8px;border:1px solid var(--border);border-radius:var(--radius);
+           background:var(--surface-alt, #1e1e2e);color:var(--text);margin-bottom:16px;"
+    onkeydown="if(event.key==='Enter')saveApiKey()" />
+  <div style="display:flex;gap:10px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('api-key-modal').close()">Cancel</button>
+    <button onclick="saveApiKey()">Save</button>
   </div>
 </dialog>
 
