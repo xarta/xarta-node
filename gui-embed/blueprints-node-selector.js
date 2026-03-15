@@ -145,7 +145,8 @@
 
     let peers = [];
     try {
-      const r = await fetch(`${origin}/api/v1/nodes`, { signal: AbortSignal.timeout(5000) });
+      const _apiFetch = window.apiFetch || fetch;
+      const r = await _apiFetch(`${origin}/api/v1/nodes`, { signal: AbortSignal.timeout(5000) });
       if (r.ok) peers = await r.json();
     } catch {}
 

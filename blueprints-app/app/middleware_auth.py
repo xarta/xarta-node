@@ -44,6 +44,9 @@ for _cidr in cfg.ALLOWED_NETWORKS_RAW.split(","):
 _TOKEN_EXEMPT_PREFIXES = ("/health", "/ui")
 # Routes that use SYNC_SECRET instead of API_SECRET
 _SYNC_PREFIX = "/api/v1/sync/"
+# Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
+# All other sync routes (status, git-pull, gui/*) are browser-accessible and accept either secret.
+_SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
 
 
 def _client_ip(request: Request) -> str:
@@ -81,30 +84,27 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # ── 2. Token check (skip for exempt paths) ────────────────────────────
         path = request.url.path
         if not any(path.startswith(p) for p in _TOKEN_EXEMPT_PREFIXES):
-            if path.startswith(_SYNC_PREFIX):
-                secret = cfg.SYNC_SECRET
-                secret_name = "SYNC"
-            else:
-                secret = cfg.API_SECRET
-                secret_name = "API"
+            token = request.headers.get("x-api-token", "")
 
-            if not secret:
-                log.debug(
-                    "auth: %s_SECRET not set — skipping token check for %s",
-                    secret_name,
-                    path,
-                )
+            if any(path.startswith(p) for p in _SYNC_WRITE_PATHS):
+                # Node-to-node sync writes: SYNC_SECRET only.
+                if not cfg.SYNC_SECRET:
+                    log.debug("auth: SYNC_SECRET not set — skipping token check for %s", path)
+                elif not verify_token(cfg.SYNC_SECRET, token):
+                    log.warning("auth: invalid SYNC token from %s for %s", ip_str, path)
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
             else:
-                token = request.headers.get("x-api-token", "")
-                if not verify_token(secret, token):
-                    log.warning(
-                        "auth: invalid %s token from %s for %s",
-                        secret_name,
-                        ip_str,
-                        path,
+                # All other routes (including browser-facing sync routes):
+                # accept API_SECRET or SYNC_SECRET — whichever the caller has.
+                if cfg.API_SECRET or cfg.SYNC_SECRET:
+                    valid = (
+                        (cfg.API_SECRET and verify_token(cfg.API_SECRET, token))
+                        or (cfg.SYNC_SECRET and verify_token(cfg.SYNC_SECRET, token))
                     )
-                    return JSONResponse(
-                        {"detail": "Unauthorized"}, status_code=401
-                    )
+                    if not valid:
+                        log.warning("auth: invalid token from %s for %s", ip_str, path)
+                        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                else:
+                    log.debug("auth: no secrets set — skipping token check for %s", path)
 
         return await call_next(request)
