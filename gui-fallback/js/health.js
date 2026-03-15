@@ -13,8 +13,8 @@ async function loadHealth() {
     document.getElementById('nn-gen').textContent = d.gen ?? '—';
     const ok = d.integrity_ok;
     document.getElementById('nn-integrity').innerHTML = ok
-      ? `<span class="badge badge-ok">OK</span>`
-      : `<button class="badge badge-err badge-btn" onclick="openIntegrityModal()">FAILED</button>`;
+      ? `<button class="badge badge-ok badge-btn" onclick="openIntegrityModal(true)">OK</button>`
+      : `<button class="badge badge-err badge-btn" onclick="openIntegrityModal(false)">FAILED</button>`;
     lookupHostParent(d.node_id || _nodeName);
   } catch (e) {
     console.warn('health check failed:', e);
@@ -49,9 +49,22 @@ function updateKeyBadge(keys) {
   }
 }
 
-async function openIntegrityModal() {
+async function openIntegrityModal(isOk = false) {
   const modal = document.getElementById('integrity-modal');
   const diag  = document.getElementById('integrity-diag');
+
+  // Adapt modal to OK vs FAILED state
+  modal.style.borderColor = isOk ? 'var(--ok,#3fb950)' : 'var(--err,#f85149)';
+  document.getElementById('integrity-modal-title').innerHTML =
+    isOk ? '&#10003; Integrity OK' : '&#9888; Integrity FAILED';
+  document.getElementById('integrity-modal-title').style.color =
+    isOk ? 'var(--ok,#3fb950)' : 'var(--err,#f85149)';
+  document.getElementById('integrity-modal-intro').innerHTML = isOk
+    ? 'This node\'s database is <strong>healthy</strong>. Sync is active and peer writes are accepted. The readings below confirm the current state.'
+    : 'This node\'s database has been marked as <strong>degraded</strong>. Sync is paused \u2014 no outgoing writes will be sent to peers, and this node will not accept incoming sync actions until recovery.';
+  document.getElementById('integrity-modal-cause').style.display = isOk ? 'none' : '';
+  document.getElementById('integrity-modal-recovery').style.display = isOk ? 'none' : '';
+
   diag.innerHTML = '<span class="spinner"></span> Loading&hellip;';
   modal.showModal();
   try {
@@ -89,14 +102,30 @@ async function openIntegrityModal() {
   }
 }
 
+function _setHostParentEl(parent) {
+  const el = document.getElementById('header-host');
+  if (!el) return;
+  if (!parent || parent === 'Unknown') {
+    el.innerHTML = `&#9670; ${parent || 'Unknown'}`;
+    return;
+  }
+  // Build Proxmox URL: replace the first hostname segment with the parent name,
+  // keeping the same domain as the current page.
+  const parts  = window.location.hostname.split('.');
+  const domain = parts.length > 1 ? parts.slice(1).join('.') : window.location.hostname;
+  const pveUrl = `https://${parent}.${domain}:8006`;
+  el.innerHTML = `&#9670; <a href="${pveUrl}" target="_blank" rel="noopener"
+    style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;cursor:pointer"
+    title="Open Proxmox: ${pveUrl}">${parent}</a>`;
+}
+
 async function lookupHostParent(nodeName) {
   const cachedParent = localStorage.getItem(_LS_DIAG_HOST);
   const cachedTs     = parseInt(localStorage.getItem(_LS_DIAG_HOST_TS) || '0', 10);
   const isStale      = (Date.now() - cachedTs) > _HOST_TTL_MS;
 
   if (cachedParent && !isStale) {
-    // Fresh cache — update the header display without any API call
-    document.getElementById('header-host').textContent = `\u25C6 ${cachedParent}`;
+    _setHostParentEl(cachedParent);
     return;
   }
 
@@ -107,7 +136,7 @@ async function lookupHostParent(nodeName) {
     const name   = (nodeName || '').toLowerCase();
     const m      = _machines.find(m => (m.name || '').toLowerCase() === name);
     const parent = (m && m.parent_machine_id) ? m.parent_machine_id : 'Unknown';
-    document.getElementById('header-host').textContent = `\u25C6 ${parent}`;
+    _setHostParentEl(parent);
     if (parent !== 'Unknown') {
       try {
         localStorage.setItem(_LS_DIAG_HOST, parent);
@@ -116,7 +145,6 @@ async function lookupHostParent(nodeName) {
     }
   } catch (_) {
     // On failure fall back to whatever is cached (even if stale), or Unknown
-    const fallback = cachedParent || 'Unknown';
-    document.getElementById('header-host').textContent = `\u25C6 ${fallback}`;
+    _setHostParentEl(cachedParent || 'Unknown');
   }
 }
