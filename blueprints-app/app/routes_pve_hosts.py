@@ -13,6 +13,7 @@ import ipaddress
 import logging
 import os
 import re
+import socket
 from datetime import datetime, timezone
 
 import httpx
@@ -49,6 +50,44 @@ def _pfsense_ip() -> str | None:
     return ip if ip else None
 
 
+async def _resolve_tailnet_ip(pve_name: str, tailnet_domain: str, timeout: float = 3.0) -> str | None:
+    """
+    Best-effort: try to resolve `<pve_name>.<tailnet_domain>` via the system DNS
+    (which will use MagicDNS if this node is a Tailscale peer and the PVE host
+    also has Tailscale installed).  Returns the first A-record IP, or None.
+    """
+    if not pve_name or not tailnet_domain:
+        return None
+    fqdn = f"{pve_name}.{tailnet_domain}"
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: socket.getaddrinfo(fqdn, None, socket.AF_INET)),
+            timeout=timeout,
+        )
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+    return None
+
+
+async def _check_reachable_tcp(ip: str, port: int, timeout: float = 3.0) -> bool:
+    """Best-effort TCP connect to ip:port. Returns True on success."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 async def _reverse_dns(ip: str, dns_server: str, timeout: float = 2.0) -> str | None:
     """
     Non-blocking reverse DNS lookup via `dig -x <ip> @<dns_server> +short`.
@@ -78,6 +117,7 @@ async def _reverse_dns(ip: str, dns_server: str, timeout: float = 2.0) -> str | 
 async def _check_proxmox(
     ip: str, port: int, sem: asyncio.Semaphore, timestamp: str,
     dns_server: str | None = None,
+    tailnet_domain: str | None = None,
 ) -> dict | None:
     """
     Try HTTPS on ip:port.  Return a candidate dict when the response looks
@@ -109,6 +149,10 @@ async def _check_proxmox(
                 if hostname:
                     # Use the first label (e.g. "pve1" from "pve1.infra.example.com")
                     pve_name = hostname.split(".")[0]
+            # Best-effort tailnet IP resolution (only if pve_name + tailnet_domain known)
+            tailnet_ip = None
+            if pve_name and tailnet_domain:
+                tailnet_ip = await _resolve_tailnet_ip(pve_name, tailnet_domain)
             return {
                 "pve_id":        ip,
                 "ip_address":    ip,
@@ -117,6 +161,7 @@ async def _check_proxmox(
                 "version":       version,
                 "port":          port,
                 "ssh_reachable": 0,
+                "tailnet_ip":    tailnet_ip,
                 "last_scanned":  timestamp,
             }
         except Exception:
@@ -145,10 +190,10 @@ async def create_pve_host(body: PveHostCreate) -> PveHostOut:
         conn.execute(
             """INSERT INTO pve_hosts
                (pve_id, ip_address, hostname, pve_name, version,
-                port, ssh_reachable, last_scanned)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                port, ssh_reachable, tailnet_ip, last_scanned)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (body.pve_id, body.ip_address, body.hostname, body.pve_name,
-             body.version, body.port, body.ssh_reachable, body.last_scanned),
+             body.version, body.port, body.ssh_reachable, body.tailnet_ip, body.last_scanned),
         )
         row = conn.execute(
             "SELECT * FROM pve_hosts WHERE pve_id=?", (body.pve_id,)
@@ -202,13 +247,21 @@ async def scan_for_proxmox() -> dict:
     log.info("pve-hosts scan: checking %s (%d hosts) on port %d",
              cidr, sum(1 for _ in network.hosts()), port)
 
-    dns_server = _pfsense_ip()   # None when PFSENSE_SSH_TARGET not set — that's fine
+    dns_server    = _pfsense_ip()   # None when PFSENSE_SSH_TARGET not set — that's fine
+    # Get tailnet domain from .nodes.json via config (e.g. "yourtailnet.ts.net")
+    try:
+        from . import config as cfg
+        tailnet_domain = cfg._self_node.get("tailnet") or None
+    except Exception:
+        tailnet_domain = None
     if dns_server:
         log.info("pve-hosts scan: reverse-DNS via pfSense at %s", dns_server)
     else:
         log.info("pve-hosts scan: PFSENSE_SSH_TARGET not set, skipping reverse DNS")
+    if tailnet_domain:
+        log.info("pve-hosts scan: will attempt tailnet resolution via %s", tailnet_domain)
 
-    tasks   = [_check_proxmox(str(ip), port, sem, timestamp, dns_server) for ip in network.hosts()]
+    tasks   = [_check_proxmox(str(ip), port, sem, timestamp, dns_server, tailnet_domain) for ip in network.hosts()]
     results = await asyncio.gather(*tasks)
     found   = [r for r in results if r is not None]
 
@@ -223,25 +276,30 @@ async def scan_for_proxmox() -> dict:
                 "SELECT pve_id FROM pve_hosts WHERE pve_id=?", (cid,)
             ).fetchone()
             if existing:
+                # Non-destructive update: only fill in blanks or update scanned fields.
+                # Never clear an existing tailnet_ip or pve_name that was manually set.
                 conn.execute(
                     """UPDATE pve_hosts
                        SET version=?, last_scanned=?, updated_at=datetime('now'),
                            hostname=COALESCE(hostname, ?),
-                           pve_name=COALESCE(pve_name, ?)
+                           pve_name=COALESCE(pve_name, ?),
+                           tailnet_ip=COALESCE(tailnet_ip, ?)
                        WHERE pve_id=?""",
                     (candidate["version"], timestamp,
-                     candidate["hostname"], candidate["pve_name"], cid),
+                     candidate["hostname"], candidate["pve_name"],
+                     candidate["tailnet_ip"], cid),
                 )
                 updated += 1
             else:
                 conn.execute(
                     """INSERT INTO pve_hosts
                        (pve_id, ip_address, hostname, pve_name, version,
-                        port, ssh_reachable, last_scanned)
-                       VALUES (?,?,?,?,?,?,?,?)""",
+                        port, ssh_reachable, tailnet_ip, last_scanned)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
                     (cid, candidate["ip_address"], candidate["hostname"],
                      candidate["pve_name"], candidate["version"], candidate["port"],
-                     candidate["ssh_reachable"], candidate["last_scanned"]),
+                     candidate["ssh_reachable"], candidate["tailnet_ip"],
+                     candidate["last_scanned"]),
                 )
                 created += 1
             row = conn.execute(
@@ -306,3 +364,36 @@ async def delete_pve_host(pve_id: str) -> None:
         gen = increment_gen(conn, "pve-hosts-delete")
         conn.execute("DELETE FROM pve_hosts WHERE pve_id=?", (pve_id,))
         enqueue_for_all_peers(conn, "DELETE", "pve_hosts", pve_id, None, gen)
+
+
+@router.get("/{pve_id}/reachable", response_model=dict)
+async def check_pve_host_reachable(pve_id: str) -> dict:
+    """
+    TCP-connect probe to the management IP (port 8006) and tailnet IP (port 8006)
+    of a known PVE host.  Used by the GUI diagnostic to assess host reachability
+    from the backend LXC — which has direct VLAN access the browser lacks.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT ip_address, tailnet_ip, pve_name, port FROM pve_hosts WHERE pve_id=?",
+            (pve_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"pve_id '{pve_id}' not found")
+
+    port = row["port"] or 8006
+    mgmt_ip    = row["ip_address"]
+    tailnet_ip = row["tailnet_ip"]
+    pve_name   = row["pve_name"] or pve_id
+
+    mgmt_ok    = await _check_reachable_tcp(mgmt_ip, port) if mgmt_ip else None
+    tailnet_ok = await _check_reachable_tcp(tailnet_ip, port) if tailnet_ip else None
+
+    return {
+        "pve_id":         pve_id,
+        "pve_name":       pve_name,
+        "mgmt_ip":        mgmt_ip,
+        "mgmt_reachable": mgmt_ok,
+        "tailnet_ip":     tailnet_ip,
+        "tailnet_reachable": tailnet_ok,
+    }
