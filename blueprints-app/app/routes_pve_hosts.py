@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import socket
+import struct
 from datetime import datetime, timezone
 
 import httpx
@@ -50,27 +51,101 @@ def _pfsense_ip() -> str | None:
     return ip if ip else None
 
 
-async def _resolve_tailnet_ip(pve_name: str, tailnet_domain: str, timeout: float = 3.0) -> str | None:
+async def _resolve_tailnet_ip(pve_name: str, tailnet_domain: str, timeout: float = 2.0) -> str | None:
     """
-    Best-effort: try to resolve `<pve_name>.<tailnet_domain>` via the system DNS
-    (which will use MagicDNS if this node is a Tailscale peer and the PVE host
-    also has Tailscale installed).  Returns the first A-record IP, or None.
+    Try to resolve `<pve_name>.<tailnet_domain>` via Tailscale's internal DNS
+    server at 100.100.100.100 using a raw UDP query.  This is more reliable than
+    the system getaddrinfo because it bypasses stub-resolver configuration and
+    directly queries the tailnet nameserver.
+
+    Returns the first A-record IP on success, or None if the host is not in the
+    tailnet (NXDOMAIN / SERVFAIL) or the DNS server is unreachable.
     """
     if not pve_name or not tailnet_domain:
         return None
     fqdn = f"{pve_name}.{tailnet_domain}"
+    loop = asyncio.get_running_loop()
     try:
-        loop = asyncio.get_running_loop()
-        infos = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: socket.getaddrinfo(fqdn, None, socket.AF_INET)),
+        ip = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _udp_dns_query(fqdn, "100.100.100.100")),
             timeout=timeout,
         )
-        if infos:
-            ip = infos[0][4][0]
-            log.debug("tailnet resolve: %s → %s", fqdn, ip)
-            return ip
+        if ip:
+            log.debug("tailnet resolve via 100.100.100.100: %s → %s", fqdn, ip)
+        else:
+            log.debug("tailnet resolve via 100.100.100.100: %s — not found (NXDOMAIN/SERVFAIL)", fqdn)
+        return ip
     except Exception as exc:
-        log.debug("tailnet resolve: %s failed — %s", fqdn, exc)
+        log.debug("tailnet resolve via 100.100.100.100: %s failed — %s", fqdn, exc)
+    return None
+
+
+def _udp_dns_query(fqdn: str, nameserver: str, port: int = 53, timeout: float = 2.0) -> str | None:
+    """
+    Send a raw UDP DNS A-record query to `nameserver:port`.
+    Returns the first A-record IP string, or None (NXDOMAIN, SERVFAIL, timeout).
+    Pure stdlib — no extra dependencies.
+    """
+    # Build query: header + question
+    tid = 0xBB01
+    header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    question = b""
+    for label in fqdn.rstrip(".").split("."):
+        enc = label.encode("ascii")
+        question += bytes([len(enc)]) + enc
+    question += b"\x00\x00\x01\x00\x01"  # null label + QTYPE=A + QCLASS=IN
+
+    pkt = header + question
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(pkt, (nameserver, port))
+        resp = s.recv(512)
+
+    if len(resp) < 12:
+        return None
+
+    resp_tid, flags, qdcount, ancount = struct.unpack(">HHHH", resp[:8])
+    if resp_tid != tid:
+        return None
+    rcode = flags & 0x000F
+    if rcode != 0 or ancount == 0:  # SERVFAIL, NXDOMAIN, or no answers
+        return None
+
+    # Skip past the header (12 bytes) and question section
+    pos = 12
+    for _ in range(qdcount):
+        while pos < len(resp):
+            n = resp[pos]
+            if n == 0:
+                pos += 1
+                break
+            if n & 0xC0 == 0xC0:  # compression pointer
+                pos += 2
+                break
+            pos += n + 1
+        pos += 4  # QTYPE + QCLASS
+
+    # Parse answer records, return first A record
+    for _ in range(ancount):
+        # Skip name
+        while pos < len(resp):
+            n = resp[pos]
+            if n == 0:
+                pos += 1
+                break
+            if n & 0xC0 == 0xC0:
+                pos += 2
+                break
+            pos += n + 1
+        if pos + 10 > len(resp):
+            break
+        rtype, rclass, _ttl, rdlen = struct.unpack(">HHIH", resp[pos:pos + 10])
+        pos += 10
+        if rtype == 1 and rclass == 1 and rdlen == 4:  # A record, IN class
+            return ".".join(str(b) for b in resp[pos:pos + 4])
+        pos += rdlen
+
     return None
 
 
