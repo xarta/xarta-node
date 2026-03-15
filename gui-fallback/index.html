@@ -1075,6 +1075,7 @@
   let _nodes    = [];
   let _settings = [];
   let _nodeName   = '';
+  let _selfNodeId  = '';  // node_id from /health (may differ from display name)
   let _activeGroup = 'synthesis';
   let _pfsenseDns = [];
   let _proxmoxConfig = [];
@@ -1154,8 +1155,9 @@
       const r = await apiFetch('/health');
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const d = await r.json();
-      _nodeName = d.node_name || d.node_id || '';
-      try { localStorage.setItem(_LS_DIAG_NODE, _nodeName); } catch (_) {}
+      _nodeName   = d.node_name || d.node_id || '';
+      _selfNodeId  = d.node_id || _nodeName;
+      try { localStorage.setItem(_LS_DIAG_NODE, _selfNodeId); } catch (_) {}
       // Close the diagnostic modal if health is now OK
       const dm = document.getElementById('diag-modal');
       if (dm && dm.open) dm.close();
@@ -3034,7 +3036,8 @@
     const cachedNodes = (() => {
       try { return JSON.parse(localStorage.getItem(_LS_DIAG_NODES) || '[]'); } catch { return []; }
     })();
-    const selfId = _nodeName || localStorage.getItem(_LS_DIAG_NODE) || '';
+    // Use node_id (not display name) for peer filtering and node lookups
+    const selfId = _selfNodeId || localStorage.getItem(_LS_DIAG_NODE) || '';
 
     // Run connectivity + all endpoint tests concurrently
     const [endpointResults, peerResults, netResults, openapiData] = await Promise.all([
@@ -3113,13 +3116,102 @@
       html += _selfDiagRow('\u26a0', 'Could not fetch /openapi.json', 'endpoint coverage unknown', '');
     }
 
+    // ── Firewall probe ─────────────────────────────────────────────────
+    // Ask a responding peer to probe this node's ports.
+    // If no peer is available, fall back to the local /api/v1/firewall/status
+    // which reports iptables state (no external vantage point).
+    const myAddress = (() => {
+      try {
+        const self = (JSON.parse(localStorage.getItem(_LS_DIAG_NODES) || '[]'))
+          .find(n => n.node_id === selfId);
+        return self && self.addresses && self.addresses[0] ? self.addresses[0] : null;
+      } catch { return null; }
+    })();
+
+    const proberPeer = peerResults.find(p => p.reachable);
+
+    html += _diagSection('Firewall — Local iptables Status');
+    let localFwOk = false;
+    try {
+      const fwR = await apiFetch('/api/v1/firewall/status', { signal: AbortSignal.timeout(6000) });
+      if (fwR.ok) {
+        const fw = await fwR.json();
+        const policyOk = fw.input_policy === 'DROP';
+        html += _selfDiagRow(policyOk ? '\u2705' : '\u26a0',
+          'INPUT default policy', fw.input_policy,
+          policyOk ? '' : 'should be DROP');
+        html += _selfDiagRow(fw.xarta_input_chain ? '\u2705' : '\u26a0',
+          'XARTA_INPUT chain', fw.xarta_input_chain ? 'present' : 'missing',
+          fw.xarta_input_chain ? '' : 'run setup-firewall.sh');
+        for (const p of (fw.ports || [])) {
+          const ok = p.expected === 'open' ? p.in_ruleset : !p.in_ruleset;
+          html += _selfDiagRow(ok ? '\u2705' : '\u26a0',
+            `TCP/UDP ${p.port} — ${p.label}`,
+            p.in_ruleset ? 'in XARTA_INPUT' : 'not in XARTA_INPUT',
+            p.expected === 'open' ? 'should be allowed' : '');
+        }
+        localFwOk = policyOk && fw.xarta_input_chain;
+      } else {
+        html += _selfDiagRow('\u274c', '/api/v1/firewall/status', `HTTP ${fwR.status}`, '');
+      }
+    } catch (e) {
+      html += _selfDiagRow('\u274c', '/api/v1/firewall/status', e.message, '');
+    }
+
+    let probePassCount = 0, probeTotalCount = 0;
+    if (proberPeer && myAddress) {
+      html += _diagSection(`Firewall — External Port Probe (via ${esc(proberPeer.display_name || proberPeer.node_id)})`);
+      status.textContent = `Probing ports via ${proberPeer.display_name || proberPeer.node_id}\u2026`;
+      try {
+        const probeR = await _diagFetch(`${proberPeer.address}/api/v1/firewall/probe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: myAddress, target_node_id: selfId }),
+          signal: AbortSignal.timeout(30000),
+        });
+        if (probeR.ok) {
+          const probe = await probeR.json();
+          for (const p of (probe.ports || [])) {
+            if (p.result === 'skipped') {
+              html += _selfDiagRow('\u2014', `${p.proto.toUpperCase()} ${p.port} — ${esc(p.label)}`, 'skipped (nmap unavailable)', '');
+              continue;
+            }
+            probeTotalCount++;
+            const icon = p.pass ? '\u2705' : '\u274c';
+            const expectLabel = p.expected === 'open' ? 'should be open' : 'should be blocked';
+            html += _selfDiagRow(icon,
+              `${p.proto.toUpperCase()} ${p.port} — ${esc(p.label)}`,
+              `${expectLabel} \u2192 ${p.result}`,
+              p.pass ? '' : '\u26a0 unexpected');
+            if (p.pass) probePassCount++;
+          }
+          if (!probe.all_pass) {
+            html += _selfDiagRow('\u26a0', 'Overall probe result', 'FAIL — some ports returned unexpected results', '');
+          }
+        } else {
+          html += _selfDiagRow('\u274c', 'Probe request failed', `HTTP ${probeR.status}`, '');
+        }
+      } catch (e) {
+        html += _selfDiagRow('\u274c', 'Probe request error', e.message, '');
+      }
+    } else if (!proberPeer) {
+      html += _diagSection('Firewall — External Port Probe');
+      html += _selfDiagRow('\u2014', 'No reachable peer available', 'external probe requires a responding fleet peer', '');
+    } else {
+      html += _diagSection('Firewall — External Port Probe');
+      html += _selfDiagRow('\u2014', 'Own address not cached', 'open the Nodes tab while online to populate', '');
+    }
+
     results.innerHTML = html;
 
     const total   = endpointResults.length;
     const passed  = endpointResults.filter(r => r.ok).length;
     const peersOk = peerResults.filter(p => p.reachable).length;
-    status.textContent = `Done \u2014 ${passed}/${total} API endpoints OK \u2022 ${peersOk}/${peerResults.length} peers reachable`;
-    status.style.color = passed === total ? 'var(--accent)' : '#f87171';
+    const fwSummary = probeTotalCount
+      ? ` \u2022 firewall probe ${probePassCount}/${probeTotalCount} pass`
+      : '';
+    status.textContent = `Done \u2014 ${passed}/${total} API endpoints OK \u2022 ${peersOk}/${peerResults.length} peers reachable${fwSummary}`;
+    status.style.color = (passed === total && (probeTotalCount === 0 || probePassCount === probeTotalCount)) ? 'var(--accent)' : '#f87171';
     btn.disabled = false;
     btn.textContent = '\u25b6 Run Diagnostics';
   }

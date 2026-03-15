@@ -634,6 +634,41 @@ class SyncStatus(BaseModel):
     peer_count: int
 
 
+# ── Firewall ──────────────────────────────────────────────────────────────────
+
+class FirewallPortCheck(BaseModel):
+    port: int
+    proto: str           # "tcp" or "udp"
+    label: str
+    expected: str        # "open" or "blocked"
+    in_ruleset: bool     # found in XARTA_INPUT chain
+
+
+class FirewallStatusOut(BaseModel):
+    iptables_available: bool
+    input_policy: str    # "DROP", "ACCEPT", or "unknown"
+    xarta_input_chain: bool
+    ports: list[FirewallPortCheck]
+
+
+class FirewallProbePort(BaseModel):
+    port: int
+    proto: str           # "tcp" or "udp"
+    label: str
+    expected: str        # "open" or "blocked"
+    result: str          # "open", "blocked", "timeout", "error", "skipped"
+    pass_: bool = Field(default=False, alias="pass")
+
+    model_config = {"populate_by_name": True}
+
+
+class FirewallProbeOut(BaseModel):
+    prober_node: str
+    target: str
+    ports: list[FirewallProbePort]
+    all_pass: bool
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthOut(BaseModel):
