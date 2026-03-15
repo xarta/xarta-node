@@ -262,6 +262,8 @@
 
     // Primary unreachable — try LAN/fallback addresses
     for (const alt of (node.altAddresses || [])) {
+      // Skip http:// alts when the page is HTTPS — browser blocks these as mixed content
+      if (window.location.protocol === 'https:' && alt.startsWith('http:')) continue;
       const t = performance.now();
       try {
         const r = await fetch(`${alt}/health`, {

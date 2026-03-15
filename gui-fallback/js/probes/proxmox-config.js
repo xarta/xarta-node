@@ -144,6 +144,17 @@ async function deleteProxmoxNet(net_id, net_key) {
   }
 }
 
+async function deleteProxmoxConfig(config_id) {
+  if (!confirm(`Delete "${config_id}" from Blueprints?\nThis removes it from all nodes — the VM/LXC itself is unaffected.`)) return;
+  try {
+    const r = await apiFetch(`/api/v1/proxmox-config/${encodeURIComponent(config_id)}`, { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) { const d = await r.json().catch(()=>{}); throw new Error(d?.detail || `HTTP ${r.status}`); }
+    await loadProxmoxConfig();
+  } catch (e) {
+    alert(`Failed to delete config: ${e.message}`);
+  }
+}
+
 async function loadProxmoxConfig() {
   const err = document.getElementById('pve-error');
   err.hidden = true;
@@ -195,7 +206,7 @@ function renderProxmoxConfig() {
   const expandAllBtn       = document.getElementById('pve-expand-all-btn');
   const collapseAllBtn     = document.getElementById('pve-collapse-all-btn');
   if (!rows.length) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="11">No Proxmox configs found.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="12">No Proxmox configs found.</td></tr>`;
     if (stepsToggleBtn) stepsToggleBtn.hidden = true;
     if (expandAllBtn)   expandAllBtn.hidden   = true;
     if (collapseAllBtn) collapseAllBtn.hidden = true;
@@ -239,6 +250,7 @@ function renderProxmoxConfig() {
       <td>${detectedHtml}</td>
       <td>${esc(d.tags || '—')}</td>
       <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
+      <td style="text-align:right;white-space:nowrap"><button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171" onclick="deleteProxmoxConfig('${esc(d.config_id)}')">Del</button></td>
     </tr>`;
     let detailRow = '';
     if (nets.length > 0) {
@@ -256,7 +268,7 @@ function renderProxmoxConfig() {
         </tr>`;
       }).join('');
       detailRow = `<tr id="nets-detail-${safeid}" style="display:none">
-        <td colspan="11" style="padding:0;border-top:1px solid var(--border,#30363d)">
+        <td colspan="12" style="padding:0;border-top:1px solid var(--border,#30363d)">
           <table style="width:100%;border-collapse:collapse">
             <thead><tr style="font-size:10px;color:var(--text-dim);background:var(--bg-darker,#0d1117)">
               <th style="padding:2px 4px 2px 16px;text-align:left">NIC</th>
