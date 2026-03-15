@@ -116,7 +116,7 @@ echo "    added: UDP 41641 (Tailscale/WireGuard) → ACCEPT"
 # Rules are generated from .nodes.json — both VLAN and Tailscale IPs for
 # every node are allowed.  Port 8080 remains blocked from any other source.
 # The browser GUI never uses port 8080 — it always goes via Caddy on 443.
-NODES_JSON="${SCRIPT_DIR}/.nodes.json"
+NODES_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.nodes.json"
 if [[ ! -f "$NODES_JSON" ]]; then
     echo -e "${YELLOW}Warning:${NC} .nodes.json not found at $NODES_JSON"
     echo "  Port 8080 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
