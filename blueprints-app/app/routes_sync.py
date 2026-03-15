@@ -47,7 +47,7 @@ _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner"}
 # ── Git pull helpers ──────────────────────────────────────────────────────────
 
 async def _git_pull_and_restart(repo_path: str, label: str) -> None:
-    """Run git pull on a repo, then restart the service if new commits landed."""
+    """Run git pull on a repo, then restart the service."""
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         log.info("git pull [%s] skipped: no repo at %r", label, repo_path)
         return
@@ -60,7 +60,7 @@ async def _git_pull_and_restart(repo_path: str, label: str) -> None:
     if proc.returncode == 0:
         result = stdout.decode().strip()
         log.info("git pull [%s]: %s", label, result)
-        if "Already up to date" not in result and cfg.SERVICE_RESTART_CMD:
+        if cfg.SERVICE_RESTART_CMD:
             await _restart_service()
     else:
         log.warning("git pull [%s] failed: %s", label, stderr.decode().strip())
