@@ -21,6 +21,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from . import config as cfg
+from .auth import compute_token
 from .db import get_conn
 
 log = logging.getLogger(__name__)
@@ -138,13 +139,16 @@ async def push_gui_to_peers() -> dict:
             addr = addr.rstrip("/")
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
+                    _push_headers = {
+                        "content-type": "application/octet-stream",
+                        "x-blueprints-checksum": sha256_hex,
+                    }
+                    if cfg.SYNC_SECRET:
+                        _push_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
                     resp = await client.post(
                         f"{addr}/api/v1/sync/gui/receive",
                         content=zip_bytes,
-                        headers={
-                            "content-type": "application/octet-stream",
-                            "x-blueprints-checksum": sha256_hex,
-                        },
+                        headers=_push_headers,
                     )
                 if resp.status_code == 204:
                     success = True

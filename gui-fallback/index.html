@@ -2917,7 +2917,12 @@
       const r = await apiFetch('/api/v1/pve-hosts/scan', { method: 'POST' });
       const d = await r.json();
       if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
-      status.textContent = `✓ Scanned ${d.ips_checked} IPs — found: ${d.found} (created: ${d.created}, updated: ${d.updated})`;
+      const tailnetNote = (d.tailnet_resolved != null)
+        ? (d.tailnet_resolved > 0
+          ? `, tailnet: ${d.tailnet_resolved}/${d.found} resolved`
+          : ` — tailnet IPs not resolved (use Edit to set manually)`)
+        : '';
+      status.textContent = `✓ Scanned ${d.ips_checked} IPs — found: ${d.found} (created: ${d.created}, updated: ${d.updated})${tailnetNote}`;
       status.style.color = 'var(--accent)';
       status.hidden = false;
       _pveHosts = [];
