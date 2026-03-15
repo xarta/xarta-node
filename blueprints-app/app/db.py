@@ -333,6 +333,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("dockge_stacks", "notes",             "TEXT"),
         # dockge_stack_services: relational per-container rows (2026-03-13)
         # (table created in DDL above; no ALTER TABLE needed for it)
+        # pve_hosts: tailnet IP discovered during scan (2026-03-15)
+        ("pve_hosts", "tailnet_ip",           "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

@@ -526,6 +526,7 @@ class PveHostCreate(BaseModel):
     version: Optional[str] = None
     port: int = 8006
     ssh_reachable: int = 0
+    tailnet_ip: Optional[str] = None
     last_scanned: Optional[str] = None
 
 class PveHostUpdate(BaseModel):
@@ -534,6 +535,7 @@ class PveHostUpdate(BaseModel):
     version: Optional[str] = None
     port: Optional[int] = None
     ssh_reachable: Optional[int] = None
+    tailnet_ip: Optional[str] = None
     last_scanned: Optional[str] = None
 
 class PveHostOut(BaseModel):
@@ -544,6 +546,7 @@ class PveHostOut(BaseModel):
     version: Optional[str] = None
     port: int = 8006
     ssh_reachable: int = 0
+    tailnet_ip: Optional[str] = None
     last_scanned: Optional[str] = None
     created_at: str
     updated_at: str
