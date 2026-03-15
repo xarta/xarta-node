@@ -173,11 +173,11 @@
         if (!uiUrl) uiUrl = syncAddr;
       }
 
-      // Collect LAN/HTTP fallback addresses — any address from p.addresses that differs
-      // from the primary uiUrl (e.g. local VLAN HTTP addresses when uiUrl is HTTPS/Tailscale)
-      const altAddresses = (p.addresses || [])
-        .map(a => a.replace(/\/$/, ''))
-        .filter(a => a && a !== uiUrl);
+      // Alt address: use tailnet_hostname from DB (populated from .nodes.json).
+      // Both URLs are HTTPS via Caddy — no raw ports involved.
+      const altAddresses = (p.tailnet_hostname && `https://${p.tailnet_hostname}` !== uiUrl)
+        ? [`https://${p.tailnet_hostname}`]
+        : [];
 
       fresh.push({
         id: p.node_id,

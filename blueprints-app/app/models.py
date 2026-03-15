@@ -143,6 +143,8 @@ class NodeOut(BaseModel):
     display_order: int = 0        # preferred sort position in the node selector
     host_machine: Optional[str] = None
     tailnet: Optional[str] = None
+    primary_hostname: Optional[str] = None   # management VLAN HTTPS hostname
+    tailnet_hostname: Optional[str] = None   # tailnet HTTPS hostname
     addresses: Optional[list[str]] = None
     ui_url: Optional[str] = None   # browser-facing HTTPS URL for this node
     machine_id: Optional[str] = None  # canonical FK to machines.machine_id
