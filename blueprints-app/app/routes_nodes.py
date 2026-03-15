@@ -8,6 +8,7 @@ POST /api/v1/nodes/{id}/pct — start or stop the LXC for a fleet node via pct o
 GET  /api/v1/nodes/{id}/pct-status — return current pct status from proxmox_config DB
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -281,7 +282,7 @@ async def get_node_pct_status(node_id: str) -> dict:
 
     cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct status {vmid}"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=8)
     except subprocess.TimeoutExpired:
         return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": "SSH timed out"}
 
@@ -347,7 +348,7 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
 
     cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct {action} {vmid}"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(504, "SSH command timed out") from exc
 
