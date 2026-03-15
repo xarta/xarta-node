@@ -54,7 +54,7 @@ _PORT_CATALOGUE: list[dict] = [
 _XARTA_ALLOWED_PORTS = {22, 80, 443, 41641}
 
 _TCP_TIMEOUT = 3   # seconds for TCP connect probes
-_UDP_TIMEOUT = 3   # seconds for nmap UDP scan if available
+_UDP_TIMEOUT = 3   # seconds for nc -u UDP probe
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -127,22 +127,57 @@ def _probe_tcp(host: str, port: int, timeout: int = _TCP_TIMEOUT) -> str:
         return "blocked"
 
 
-def _probe_udp_nmap(host: str, port: int) -> str:
+def _probe_udp(host: str, port: int, timeout: int = _UDP_TIMEOUT) -> str:
     """
-    Best-effort UDP probe via nmap -sU.  Requires nmap to be installed and
-    the process to have CAP_NET_RAW (root or nmap with setuid).
-    Returns 'open', 'blocked', 'timeout', or 'skipped'.
+    UDP probe via nc -u -z (netcat-traditional, present on all fleet nodes).
+
+    Limitation: with DROP firewall rules both an open port and a DROP-filtered
+    port produce silence — nc cannot distinguish them.  Use
+    _probe_udp_tailscale() for port 41641 instead.
     """
     try:
         result = subprocess.run(
-            ["nmap", "-sU", "-p", str(port), "--open", "-oG", "-", host],
-            capture_output=True, text=True, timeout=15,
+            ["nc", "-u", "-z", "-w", str(timeout), host, str(port)],
+            capture_output=True, timeout=timeout + 2,
+        )
+        return "open" if result.returncode == 0 else "blocked"
+    except FileNotFoundError:
+        return "skipped"
+    except Exception:
+        return "error"
+
+
+def _get_tailscale_ip(node_id: str) -> str | None:
+    """Return the Tailscale IP (100.x.x.x) for a fleet node, or None."""
+    for addr in _known_node_addresses(node_id):
+        host = _extract_host(addr)
+        if host and re.match(r'^100\.', host):
+            return host
+    return None
+
+
+def _probe_udp_tailscale(ts_ip: str) -> str:
+    """
+    Use `tailscale ping` to verify WireGuard direct connectivity to a peer.
+
+    Interpretation:
+      - "via <ip>:41641" in output, no DERP  →  direct path  →  "open"
+      - "DERP" in output                     →  relay only   →  "blocked"
+      - timeout / no response                →  "timeout"
+
+    A DERP-relay result means UDP 41641 is blocked/filtered and Tailscale has
+    fallen back to its encrypted relay servers — direct WireGuard is not working.
+    """
+    try:
+        result = subprocess.run(
+            ["tailscale", "ping", "--timeout", "5s", ts_ip],
+            capture_output=True, text=True, timeout=8,
         )
         output = result.stdout + result.stderr
-        if "open" in output.lower():
-            return "open"
-        if "filtered" in output.lower() or "closed" in output.lower():
-            return "blocked"
+        if "via" in output and "DERP" not in output:
+            return "open"     # direct WireGuard path confirmed
+        if "DERP" in output:
+            return "blocked"  # relay fallback — UDP 41641 not directly reachable
         return "timeout"
     except FileNotFoundError:
         return "skipped"
@@ -249,6 +284,9 @@ async def firewall_probe(req: ProbeRequest) -> FirewallProbeOut:
                    "Probing arbitrary hosts is not permitted.",
         )
 
+    # Look up the target's Tailscale IP for the UDP 41641 probe.
+    ts_ip = _get_tailscale_ip(req.target_node_id)
+
     results: list[FirewallProbePort] = []
     for p in _PORT_CATALOGUE:
         port = p["port"]
@@ -257,8 +295,12 @@ async def firewall_probe(req: ProbeRequest) -> FirewallProbeOut:
 
         if proto == "tcp":
             result = _probe_tcp(target_host, port)
+        elif proto == "udp" and port == 41641 and ts_ip:
+            # Use tailscale ping for port 41641 — gives a definitive direct vs
+            # DERP-relay answer, which nc -u cannot provide against a DROP policy.
+            result = _probe_udp_tailscale(ts_ip)
         elif proto == "udp":
-            result = _probe_udp_nmap(target_host, port)
+            result = _probe_udp(target_host, port)
         else:
             result = "skipped"
 
