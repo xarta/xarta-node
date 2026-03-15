@@ -337,6 +337,9 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("pve_hosts", "tailnet_ip",           "TEXT"),
         # nodes: display order from .nodes.json (2026-03-15)
         ("nodes",    "display_order",          "INTEGER DEFAULT 0"),
+        # nodes: HTTPS hostnames from .nodes.json (2026-03-15)
+        ("nodes",    "primary_hostname",       "TEXT"),
+        ("nodes",    "tailnet_hostname",       "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

@@ -51,6 +51,8 @@ def _row_to_out(row) -> NodeOut:
         display_order=row["display_order"] if "display_order" in keys else 0,
         host_machine=row["host_machine"],
         tailnet=row["tailnet"],
+        primary_hostname=row["primary_hostname"] if "primary_hostname" in keys else None,
+        tailnet_hostname=row["tailnet_hostname"] if "tailnet_hostname" in keys else None,
         addresses=addr_list or None,
         ui_url=row["ui_url"] if "ui_url" in keys else None,
         machine_id=row["machine_id"] if "machine_id" in keys else None,
@@ -118,6 +120,7 @@ def _upsert_nodes_from_config() -> int:
             pip     = node["primary_ip"]
             ph      = node["primary_hostname"]
             tip     = node["tailnet_ip"]
+            th      = node.get("tailnet_hostname", "")
             port    = node["sync_port"]
 
             addresses = json.dumps([
@@ -132,14 +135,16 @@ def _upsert_nodes_from_config() -> int:
             if existing:
                 conn.execute(
                     "UPDATE nodes SET display_name=?, display_order=?, host_machine=?, tailnet=?, "
+                    "primary_hostname=?, tailnet_hostname=?, "
                     "addresses=?, ui_url=?, last_seen=datetime('now') WHERE node_id=?",
-                    (name, order, host, tailnet, addresses, ui_url, nid),
+                    (name, order, host, tailnet, ph, th, addresses, ui_url, nid),
                 )
             else:
                 conn.execute(
                     "INSERT INTO nodes (node_id, display_name, display_order, host_machine, tailnet, "
-                    "addresses, ui_url, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-                    (nid, name, order, host, tailnet, addresses, ui_url),
+                    "primary_hostname, tailnet_hostname, addresses, ui_url, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                    (nid, name, order, host, tailnet, ph, th, addresses, ui_url),
                 )
             count += 1
     return count

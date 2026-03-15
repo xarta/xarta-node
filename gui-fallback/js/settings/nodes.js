@@ -22,35 +22,45 @@ function renderNodes() {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No nodes registered.</td></tr>';
     return;
   }
-  tbody.innerHTML = _nodes.map(n => {
-    const addrs = (n.addresses || []).map(a => `<span class="ip-chip">${esc(a)}</span>`).join(' ');
+  tbody.innerHTML = _nodes.flatMap(n => {
     const nameStyle = n.fleet_peer === false ? ' style="text-decoration:line-through;opacity:0.55"' : '';
     const pending = n.pending_count || 0;
     const pendingBadge = pending > 0
       ? `<span style="background:var(--badge-warn,#b45309);color:#fff;border-radius:4px;padding:1px 6px;font-size:11px">${pending}</span>`
       : `<span style="color:var(--text-dim)">—</span>`;
-    return `<tr>
-      <td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><code style="font-size:12px;color:var(--text-dim)"${nameStyle}>${esc(n.node_id)}</code></td>
-      <td style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><strong${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
+    const safeid = n.node_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const addrs = (n.addresses || []).map(a => `<span class="ip-chip">${esc(a)}</span>`).join('<br>');
+    const ph = n.primary_hostname || '';
+    const th = n.tailnet_hostname || '';
+    const hostnamesHtml = ph
+      ? `<span class="ip-chip">${esc(ph)}</span>${th ? `<br><span class="ip-chip" style="opacity:0.75">${esc(th)}</span>` : ''}`
+      : '<span style="color:var(--text-dim)">—</span>';
+    const mainRow = `<tr>
+      <td style="white-space:nowrap"><strong title="${esc(n.node_id)}"${nameStyle}>${esc(n.display_name || n.node_id)}</strong></td>
       <td>${addrs || '<span style="color:var(--text-dim)">—</span>'}</td>
-      <td id="node-gen-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
-      <td id="node-ver-${esc(n.node_id)}" style="font-size:12px;color:var(--text-dim)">…</td>
+      <td>${hostnamesHtml}</td>
+      <td id="node-gen-${safeid}" style="font-size:12px;color:var(--text-dim)">…</td>
+      <td id="node-ver-${safeid}" style="font-size:12px;color:var(--text-dim)">…</td>
       <td>${pendingBadge}</td>
-      <td style="white-space:nowrap">
+      <td style="width:200px;max-width:200px"><div style="display:flex;flex-wrap:wrap;gap:3px">
         <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeRestart('${esc(n.node_id)}',this)" title="restart blueprints-app service">&#8635; Restart</button>
-        <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
-        <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePurgeQueue('${esc(n.node_id)}',this)" title="purge unsent sync queue entries">&#128465; Queue</button>
-        <button id="node-pct-${esc(n.node_id)}" class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px" onclick="nodePct('${esc(n.node_id)}',this)" title="start or stop LXC via pct on PVE host" data-pct-status="unknown">&#x23FB; PCT</button>
-        <button class="secondary" style="font-size:11px;padding:2px 7px;margin-left:4px;color:var(--danger,#f85149)" onclick="nodeDeleteRow('${esc(n.node_id)}',this)" title="remove this node from DB">&#10005; Delete</button>
-      </td>
+        <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodeGitPull('${esc(n.node_id)}',this)" title="git pull outer on this node">&#8593; Pull</button>
+        <button class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodePurgeQueue('${esc(n.node_id)}',this)" title="purge unsent sync queue entries">&#128465; Queue</button>
+        <button id="node-pct-${safeid}" class="secondary" style="font-size:11px;padding:2px 7px" onclick="nodePct('${esc(n.node_id)}',this)" title="start or stop LXC via pct on PVE host" data-pct-status="unknown">&#x23FB; Stop</button>
+        <button class="secondary" style="font-size:11px;padding:2px 7px;color:var(--danger,#f85149)" onclick="nodeDeleteRow('${esc(n.node_id)}',this)" title="remove this node from DB">&#10005; Delete</button>
+      </div></td>
     </tr>`;
+    return mainRow;
   }).join('');
 }
 
+
+
 async function enrichNodeVersions() {
   for (const n of _nodes) {
-    const genCell = document.getElementById(`node-gen-${n.node_id}`);
-    const verCell = document.getElementById(`node-ver-${n.node_id}`);
+    const safeid = n.node_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const genCell = document.getElementById(`node-gen-${safeid}`);
+    const verCell = document.getElementById(`node-ver-${safeid}`);
     // Self: use a relative URL (same origin, through Caddy).
     // Peers: use ui_url (Caddy HTTPS) — port 8080 is firewalled from the browser.
     // Fall back to addresses[0] only if ui_url absent (pre-firewall nodes).
@@ -170,7 +180,8 @@ async function nodeDeleteRow(nodeId, btn) {
 
 async function enrichNodePctStatus() {
   await Promise.all(_nodes.map(async n => {
-    const btn = document.getElementById(`node-pct-${n.node_id}`);
+    const safeid = n.node_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const btn = document.getElementById(`node-pct-${safeid}`);
     if (!btn || btn.disabled) return;  // skip buttons mid-action
     try {
       const r = await apiFetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
