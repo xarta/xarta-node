@@ -1114,12 +1114,12 @@
   }
 
   async function enrichNodePctStatus() {
-    for (const n of _nodes) {
+    await Promise.all(_nodes.map(async n => {
       const btn = document.getElementById(`node-pct-${n.node_id}`);
-      if (!btn || btn.disabled) continue;  // skip buttons mid-action
+      if (!btn || btn.disabled) return;  // skip buttons mid-action
       try {
         const r = await fetch(`/api/v1/nodes/${encodeURIComponent(n.node_id)}/pct-status`);
-        if (!r.ok) { btn.dataset.pctStatus = 'unknown'; continue; }
+        if (!r.ok) { btn.dataset.pctStatus = 'unknown'; return; }
         const d = await r.json();
         const st = (d.status || 'unknown').toLowerCase();
         btn.dataset.pctStatus = st;
@@ -1136,7 +1136,7 @@
       } catch {
         btn.dataset.pctStatus = 'unknown';
       }
-    }
+    }));
   }
 
   async function nodePct(nodeId, btn) {
