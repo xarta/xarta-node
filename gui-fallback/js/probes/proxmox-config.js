@@ -212,80 +212,130 @@ function renderProxmoxConfig() {
     if (collapseAllBtn) collapseAllBtn.hidden = true;
     return;
   }
-  const hasAnyNets    = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
+
+  // Preserve open PVE groups across re-renders (only when not filtering)
+  const openPveGroups = new Set();
+  if (!q) {
+    tbody.querySelectorAll('[data-pve-group-hdr]').forEach(el => {
+      if (el.dataset.pveGroupOpen === '1') openPveGroups.add(el.dataset.pveGroupHdr);
+    });
+  }
+
+  const hasAnyNets = rows.some(d => (_proxmoxNetsMap[d.config_id] || []).length > 0);
   if (stepsToggleBtn) stepsToggleBtn.hidden = false;
   if (expandAllBtn)   expandAllBtn.hidden   = !hasAnyNets;
   if (collapseAllBtn) collapseAllBtn.hidden = !hasAnyNets;
-  tbody.innerHTML = rows.flatMap(d => {
-    const probed  = (d.last_probed || '—').replace('T',' ').slice(0,19);
-    const safeid  = d.config_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const nets    = _proxmoxNetsMap[d.config_id] || [];
-    // Networks cell: toggle button + first IP
-    let netsCell;
-    if (nets.length === 0) {
-      netsCell = d.ip_address ? `<code>${esc(d.ip_address)}</code>` : '<span style="color:var(--text-dim)">—</span>';
-    } else {
-      const firstIp = nets[0].ip_address || '—';
-      netsCell = `<button class="secondary" style="padding:1px 5px;font-size:11px;margin-right:4px" onclick="toggleNets('${safeid}')" id="nets-btn-${safeid}">▶ ${nets.length}</button><code>${esc(firstIp)}</code>`;
-    }
-    // Detected services badges — driven from JSON columns
-    const badges = [];
-    const _dockge    = (() => { try { return JSON.parse(d.dockge_json    || '[]'); } catch(e) { return []; } })();
-    const _portainer = (() => { try { return JSON.parse(d.portainer_json || '[]'); } catch(e) { return []; } })();
-    const _caddy     = (() => { try { return JSON.parse(d.caddy_json     || '[]'); } catch(e) { return []; } })();
-    if (d.has_docker) badges.push('<span class="tag" style="background:#1d4ed8;color:#fff">docker</span>');
-    _portainer.forEach(p => badges.push(`<span class="tag" style="background:#0f766e;color:#fff" title="${esc(p.data_dir||p.method||'')}">portainer</span>`));
-    _caddy.forEach(c    => badges.push(`<span class="tag" style="background:#15803d;color:#fff" title="${esc(c.caddyfile||'')}">caddy</span>`));
-    _dockge.forEach(g   => badges.push(`<span class="tag" style="background:#92400e;color:#fff" title="${esc(g.stacks_dir||g.container||'')}">dockge</span>`));
-    const detectedHtml = badges.length ? badges.join(' ') : '<span style="color:var(--text-dim)">—</span>';
-    const mainRow = `<tr>
-      <td><code>${esc(d.pve_name || '')}</code></td>
-      <td>${esc(String(d.vmid || ''))}</td>
-      <td>${esc(d.vm_type || '')}</td>
-      <td>${esc(d.name || '')}</td>
-      <td>${esc(d.status || '—')}</td>
-      <td style="text-align:right">${d.cores ?? '—'}</td>
-      <td style="text-align:right">${d.memory_mb ?? '—'}</td>
-      <td>${netsCell}</td>
-      <td>${detectedHtml}</td>
-      <td>${esc(d.tags || '—')}</td>
-      <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
-      <td style="text-align:right;white-space:nowrap"><button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171" onclick="deleteProxmoxConfig('${esc(d.config_id)}')">Del</button></td>
-    </tr>`;
-    let detailRow = '';
-    if (nets.length > 0) {
-      const netsHtml = nets.map(n => {
-        const srcTag = n.ip_source && n.ip_source !== 'conf'
-          ? ` <span style="color:#94a3b8;font-size:10px">(${esc(n.ip_source)})</span>` : '';
-        return `<tr style="background:var(--bg-alt,#161b22)">
-          <td style="padding:2px 4px 2px 16px;color:var(--text-dim);font-size:11px;white-space:nowrap">${esc(n.net_key)} <button class="secondary" style="padding:1px 5px;font-size:10px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteProxmoxNet('${esc(n.net_id)}','${esc(n.net_key)}')">&#x2715;</button></td>
-          <td colspan="2"><code style="font-size:11px">${esc(n.ip_address || '—')}</code>${srcTag}</td>
-          <td><code style="font-size:11px">${esc(n.mac_address || '—')}</code></td>
-          <td style="font-size:11px">${n.vlan_tag ?? '—'}</td>
-          <td style="font-size:11px;color:var(--text-dim)">${esc(n.bridge || '—')}</td>
-          <td style="font-size:11px;color:var(--text-dim)">${esc(n.model || '—')}</td>
-          <td colspan="4"></td>
-        </tr>`;
-      }).join('');
-      detailRow = `<tr id="nets-detail-${safeid}" style="display:none">
-        <td colspan="12" style="padding:0;border-top:1px solid var(--border,#30363d)">
-          <table style="width:100%;border-collapse:collapse">
-            <thead><tr style="font-size:10px;color:var(--text-dim);background:var(--bg-darker,#0d1117)">
-              <th style="padding:2px 4px 2px 16px;text-align:left">NIC</th>
-              <th colspan="2" style="text-align:left">IP</th>
-              <th style="text-align:left">MAC</th>
-              <th style="text-align:left">VLAN</th>
-              <th style="text-align:left">Bridge</th>
-              <th style="text-align:left">Model</th>
-              <th colspan="4"></th>
-            </tr></thead>
-            <tbody>${netsHtml}</tbody>
-          </table>
-        </td>
+
+  // Sort by pve_name then vmid
+  rows.sort((a, b) => {
+    const c = (a.pve_name || '').localeCompare(b.pve_name || '');
+    return c !== 0 ? c : (a.vmid || 0) - (b.vmid || 0);
+  });
+
+  // Group by pve_name
+  const groups = new Map();
+  for (const d of rows) {
+    const pve = d.pve_name || '';
+    if (!groups.has(pve)) groups.set(pve, []);
+    groups.get(pve).push(d);
+  }
+
+  const html = [];
+  for (const [pve, pveRows] of groups) {
+    const safePve = 'pg' + pve.replace(/[^a-zA-Z0-9]/g, '_');
+    const isOpen  = q.length > 0 || openPveGroups.has(safePve);
+
+    // Build type summary for group header
+    const lxcCnt  = pveRows.filter(d => d.vm_type === 'lxc').length;
+    const qemuCnt = pveRows.filter(d => d.vm_type === 'qemu').length;
+    const typeSummary = [
+      qemuCnt ? `${qemuCnt} VM${qemuCnt !== 1 ? 's' : ''}` : '',
+      lxcCnt  ? `${lxcCnt} LXC${lxcCnt !== 1 ? 's' : ''}` : '',
+    ].filter(Boolean).join(', ') || `${pveRows.length} machine${pveRows.length !== 1 ? 's' : ''}`;
+
+    // PVE group header row
+    html.push(`<tr data-pve-group-hdr="${safePve}" data-pve-group-open="${isOpen ? '1' : '0'}"
+        style="cursor:pointer;background:var(--surface);border-top:2px solid var(--border)"
+        onclick="togglePveGroup('${safePve}')">
+      <td colspan="12" style="padding:7px 10px;font-weight:600"><span id="pve-grp-arrow-${safePve}" style="font-size:10px;color:var(--text-dim);margin-right:6px">${isOpen ? '▼' : '▶'}</span><code>${esc(pve)}</code><span style="font-size:11px;font-weight:normal;color:var(--text-dim);margin-left:8px">${typeSummary}</span></td>
+    </tr>`);
+
+    for (const d of pveRows) {
+      const probed  = (d.last_probed || '—').replace('T',' ').slice(0,19);
+      const safeid  = d.config_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const nets    = _proxmoxNetsMap[d.config_id] || [];
+
+      // Networks cell: toggle button + first IP
+      let netsCell;
+      if (nets.length === 0) {
+        netsCell = d.ip_address ? `<code>${esc(d.ip_address)}</code>` : '<span style="color:var(--text-dim)">—</span>';
+      } else {
+        const firstIp = nets[0].ip_address || '—';
+        netsCell = `<button class="secondary" style="padding:1px 5px;font-size:11px;margin-right:4px" onclick="toggleNets('${safeid}')" id="nets-btn-${safeid}">▶ ${nets.length}</button><code>${esc(firstIp)}</code>`;
+      }
+
+      // Detected services badges — driven from JSON columns
+      const badges = [];
+      const _dockge    = (() => { try { return JSON.parse(d.dockge_json    || '[]'); } catch(e) { return []; } })();
+      const _portainer = (() => { try { return JSON.parse(d.portainer_json || '[]'); } catch(e) { return []; } })();
+      const _caddy     = (() => { try { return JSON.parse(d.caddy_json     || '[]'); } catch(e) { return []; } })();
+      if (d.has_docker) badges.push('<span class="tag" style="background:#1d4ed8;color:#fff">docker</span>');
+      _portainer.forEach(p => badges.push(`<span class="tag" style="background:#0f766e;color:#fff" title="${esc(p.data_dir||p.method||'')}">portainer</span>`));
+      _caddy.forEach(c    => badges.push(`<span class="tag" style="background:#15803d;color:#fff" title="${esc(c.caddyfile||'')}">caddy</span>`));
+      _dockge.forEach(g   => badges.push(`<span class="tag" style="background:#92400e;color:#fff" title="${esc(g.stacks_dir||g.container||'')}">dockge</span>`));
+      const detectedHtml = badges.length ? badges.join(' ') : '<span style="color:var(--text-dim)">—</span>';
+
+      const mainRow = `<tr data-pve-group="${safePve}" data-vm-row="${safeid}" style="display:${isOpen ? 'table-row' : 'none'}">
+        <td><code>${esc(d.pve_name || '')}</code></td>
+        <td>${esc(String(d.vmid || ''))}</td>
+        <td>${esc(d.vm_type || '')}</td>
+        <td>${esc(d.name || '')}</td>
+        <td>${esc(d.status || '—')}</td>
+        <td style="text-align:right">${d.cores ?? '—'}</td>
+        <td style="text-align:right">${d.memory_mb ?? '—'}</td>
+        <td>${netsCell}</td>
+        <td>${detectedHtml}</td>
+        <td>${esc(d.tags || '—')}</td>
+        <td style="white-space:nowrap;color:var(--text-dim)">${esc(probed)}</td>
+        <td style="text-align:right;white-space:nowrap"><button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171" onclick="deleteProxmoxConfig('${esc(d.config_id)}')">Del</button></td>
       </tr>`;
+
+      let detailRow = '';
+      if (nets.length > 0) {
+        const netsHtml = nets.map(n => {
+          const srcTag = n.ip_source && n.ip_source !== 'conf'
+            ? ` <span style="color:#94a3b8;font-size:10px">(${esc(n.ip_source)})</span>` : '';
+          return `<tr style="background:var(--bg-alt,#161b22)">
+            <td style="padding:2px 4px 2px 16px;color:var(--text-dim);font-size:11px;white-space:nowrap">${esc(n.net_key)} <button class="secondary" style="padding:1px 5px;font-size:10px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteProxmoxNet('${esc(n.net_id)}','${esc(n.net_key)}')">&#x2715;</button></td>
+            <td colspan="2"><code style="font-size:11px">${esc(n.ip_address || '—')}</code>${srcTag}</td>
+            <td><code style="font-size:11px">${esc(n.mac_address || '—')}</code></td>
+            <td style="font-size:11px">${n.vlan_tag ?? '—'}</td>
+            <td style="font-size:11px;color:var(--text-dim)">${esc(n.bridge || '—')}</td>
+            <td style="font-size:11px;color:var(--text-dim)">${esc(n.model || '—')}</td>
+            <td colspan="4"></td>
+          </tr>`;
+        }).join('');
+        detailRow = `<tr id="nets-detail-${safeid}" data-pve-group="${safePve}" data-nets-detail="1" style="display:none">
+          <td colspan="12" style="padding:0;border-top:1px solid var(--border,#30363d)">
+            <table style="width:100%;border-collapse:collapse">
+              <thead><tr style="font-size:10px;color:var(--text-dim);background:var(--bg-darker,#0d1117)">
+                <th style="padding:2px 4px 2px 16px;text-align:left">NIC</th>
+                <th colspan="2" style="text-align:left">IP</th>
+                <th style="text-align:left">MAC</th>
+                <th style="text-align:left">VLAN</th>
+                <th style="text-align:left">Bridge</th>
+                <th style="text-align:left">Model</th>
+                <th colspan="4"></th>
+              </tr></thead>
+              <tbody>${netsHtml}</tbody>
+            </table>
+          </td>
+        </tr>`;
+      }
+      html.push(mainRow, detailRow);
     }
-    return [mainRow, detailRow];
-  }).join('');
+  }
+  tbody.innerHTML = html.join('');
 }
 
 function toggleNets(safeid) {
@@ -297,14 +347,34 @@ function toggleNets(safeid) {
   if (btn) btn.textContent = btn.textContent.replace(open ? '▼' : '▶', open ? '▶' : '▼');
 }
 
+function togglePveGroup(safePve) {
+  const hdr     = document.querySelector(`[data-pve-group-hdr="${safePve}"]`);
+  const vmRows  = document.querySelectorAll(`[data-pve-group="${safePve}"]:not([data-nets-detail])`);
+  const allRows = document.querySelectorAll(`[data-pve-group="${safePve}"]`);
+  const arrow   = document.getElementById(`pve-grp-arrow-${safePve}`);
+  const isOpen  = hdr && hdr.dataset.pveGroupOpen === '1';
+  if (isOpen) {
+    allRows.forEach(r => r.style.display = 'none');
+    if (hdr)   hdr.dataset.pveGroupOpen = '0';
+    if (arrow) arrow.textContent = '▶';
+  } else {
+    vmRows.forEach(r => r.style.display = 'table-row');
+    if (hdr)   hdr.dataset.pveGroupOpen = '1';
+    if (arrow) arrow.textContent = '▼';
+  }
+}
+
 function setAllNets(open) {
   document.querySelectorAll('[id^="nets-detail-"]').forEach(detail => {
     const safeid = detail.id.replace('nets-detail-', '');
     const btn    = document.getElementById(`nets-btn-${safeid}`);
-    detail.style.display = open ? 'table-row' : 'none';
-    if (btn) {
-      btn.textContent = btn.textContent.replace(open ? '▶' : '▼', open ? '▼' : '▶');
+    if (open) {
+      // Only expand nets for visible VM rows (i.e. in expanded PVE groups)
+      const vmRow = document.querySelector(`[data-vm-row="${safeid}"]`);
+      if (!vmRow || vmRow.style.display === 'none') return;
     }
+    detail.style.display = open ? 'table-row' : 'none';
+    if (btn) btn.textContent = btn.textContent.replace(open ? '▶' : '▼', open ? '▼' : '▶');
   });
 }
 
