@@ -124,6 +124,54 @@ POST /api/v1/backup/restore/{filename}   → restore (add ?force=true to propaga
 - `/fallback-ui/*` → Caddy `file_server` direct from `gui-fallback/` (frozen public GUI copy, never changes)
 - `/` → 301 to `/ui/`
 
+## API Authentication (TOTP middleware)
+
+`app/middleware_auth.py` — `AuthMiddleware` (Starlette `BaseHTTPMiddleware`) sits before CORS. Two protection layers:
+
+1. **IP allowlist** — client IP (read from `X-Forwarded-For` set by Caddy, then raw socket) must fall within `BLUEPRINTS_ALLOWED_NETWORKS` (comma-separated CIDRs in `.env`).
+2. **TOTP token** — `X-API-Token` header must be `HMAC-SHA256(secret_hex, str(unix_time // 5))`. 5-second windows, ±1 skew (~15 s total validity). Implemented in `app/auth.py`.
+
+### Secret routing — two secrets with distinct scopes
+
+| Secret env var | Used for | Called by |
+|---|---|---|
+| `BLUEPRINTS_SYNC_SECRET` | `POST /api/v1/sync/actions` and `POST /api/v1/sync/restore` **only** | `drain.py` node-to-node writes |
+| `BLUEPRINTS_API_SECRET` | **All other routes** | Browser GUI, operator scripts, fleet-pull scripts |
+
+**Fallback rule:** All routes *except* the two sync write endpoints also accept `SYNC_SECRET` as a valid token. This means `drain.py` only needs one secret regardless of which endpoint it hits.
+
+### Exempt paths (no token required at all)
+
+`/health`, `/ui/*`, `/favicon.ico` — always pass through, no token needed.
+
+### Loopback exemption
+
+`127.0.0.1` and `::1` bypass **all** checks unconditionally — needed for local `curl` calls from shell scripts like `bp-nodes-push.sh`.
+
+### GUI token flow
+
+- Browser stores `BLUEPRINTS_API_SECRET` in `localStorage['blueprints_api_secret']`
+- `apiFetch()` wrapper in `index.html` computes a fresh TOTP via Web Crypto and injects `X-API-Token` on every request
+- **Only the derived token travels on the wire** — the raw secret never leaves the browser
+- On 401, `apiFetch()` opens the API key modal
+
+### `blueprints-node-selector.js` embed
+
+The embed uses `window.apiFetch || fetch` for `/api/v1/nodes` — picks up the parent page's `apiFetch` if available, falls back to raw `fetch` for standalone use.
+
+### fleet-pull scripts
+
+`fleet-pull-public.sh` and `fleet-pull-private.sh` generate a TOTP from `BLUEPRINTS_SYNC_SECRET` (loaded from `.env`) before POSTing to `/api/v1/sync/git-pull` on each node.
+
+### Onboarding new nodes
+
+After generating secrets, SSH-append both to each node's `.env`:
+```bash
+ssh root@<node> "echo 'BLUEPRINTS_API_SECRET=<hex>' >> /root/xarta-node/.env"
+ssh root@<node> "echo 'BLUEPRINTS_SYNC_SECRET=<hex>' >> /root/xarta-node/.env"
+```
+Secrets are **not** distributed by git — they must be pushed manually per node.
+
  — `receive_restore` rejects backups where `sender_gen <= my_gen` when `integrity_ok=true`. A healthy node with data must never be overwritten by a fresh empty node. The `X-Blueprints-Gen` header must be set on every restore POST.
 
 **SELF_ADDRESS** — bare-systemd nodes need `BLUEPRINTS_SELF_ADDRESS=http://<ts-ip>:8080` in `.env`. Without it the node registers itself as `localhost:8080` and peers can't reach it.
@@ -171,6 +219,13 @@ CERT_CA=<path-to-ca.crt>
 
 # Caddy — used by setup-caddy.sh
 CADDY_EXTRA_NAMES=<extra-hostname-1>,<extra-hostname-2>  # optional additional hostnames
+
+# API Authentication — 256-bit hex HMAC secrets (generate with: openssl rand -hex 32)
+# Browser stores API_SECRET in localStorage; only derived TOTP tokens travel on wire.
+# Secrets are NOT in git — push manually to each node's .env via SSH.
+BLUEPRINTS_API_SECRET=<64-hex-chars>   # used by GUI and all non-sync-write routes
+BLUEPRINTS_SYNC_SECRET=<64-hex-chars>  # used by drain.py for /sync/actions and /sync/restore
+BLUEPRINTS_ALLOWED_NETWORKS=<cidr1>,<cidr2>,<cidr3>  # LAN VLANs + tailnet range
 
 # Tailscale — used by setup-tailscale-up.sh
 TAILSCALE_HOSTNAME=<node-hostname>
