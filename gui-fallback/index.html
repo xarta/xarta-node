@@ -2893,9 +2893,9 @@
         <td style="white-space:nowrap;color:var(--text-dim)">${esc(scanned)}</td>
         <td style="white-space:nowrap">
           <button class="secondary" style="padding:2px 8px;font-size:11px"
-            onclick="pveHostEdit(${JSON.stringify(id)}, this)">Edit</button>
+            onclick="pveHostEdit('${id}', this)">Edit</button>
           <button class="secondary" style="padding:2px 8px;font-size:11px;color:#f87171"
-            onclick="pveHostDelete(${JSON.stringify(id)}, this)">Del</button>
+            onclick="pveHostDelete('${id}', this)">Del</button>
         </td>
       </tr>`;
     }).join('');
