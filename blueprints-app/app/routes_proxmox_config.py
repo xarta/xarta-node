@@ -268,6 +268,26 @@ async def probe_proxmox_config() -> dict:
             cid = entry.get("config_id")
             if not cid:
                 continue
+            # ── Clean up stale entries with a renamed config_id ──────────────
+            # E.g. old probes stored pve_ip+"_"+vmid as config_id, but the
+            # current format uses pve_name+"_"+vmid. Delete any stale row that
+            # shares the same (pve_host, vmid, vm_type) but a different
+            # config_id, plus its orphaned net rows.
+            stale_rows = conn.execute(
+                "SELECT config_id FROM proxmox_config"
+                " WHERE pve_host=? AND vmid=? AND vm_type=? AND config_id!=?",
+                (entry.get("pve_host"), entry.get("vmid"), entry.get("vm_type"), cid),
+            ).fetchall()
+            for (stale_cid,) in stale_rows:
+                stale_nets = conn.execute(
+                    "SELECT net_id FROM proxmox_nets WHERE config_id=?", (stale_cid,)
+                ).fetchall()
+                for (net_id,) in stale_nets:
+                    conn.execute("DELETE FROM proxmox_nets WHERE net_id=?", (net_id,))
+                    enqueue_for_all_peers(conn, "DELETE", "proxmox_nets", net_id, {}, gen)
+                conn.execute("DELETE FROM proxmox_config WHERE config_id=?", (stale_cid,))
+                enqueue_for_all_peers(conn, "DELETE", "proxmox_config", stale_cid, {}, gen)
+            # ─────────────────────────────────────────────────────────────────
             existing = conn.execute(
                 "SELECT config_id FROM proxmox_config WHERE config_id=?", (cid,)
             ).fetchone()
