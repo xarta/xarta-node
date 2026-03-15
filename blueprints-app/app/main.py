@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config as cfg
 from . import db
 from .cors import DynamicCORSMiddleware
+from .middleware_auth import AuthMiddleware
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_machines import router as machines_router
@@ -259,6 +260,10 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Auth — IP allowlist + TOTP token check (secrets from .env).
+    # Must be added BEFORE CORS so authenticated preflight requests pass through.
+    application.add_middleware(AuthMiddleware)
 
     # CORS — origin allowlist loaded from config + dynamic peer node ui_urls from DB.
     # Requests from unlisted origins are blocked by the browser (server still receives

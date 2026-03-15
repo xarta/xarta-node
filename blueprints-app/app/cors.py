@@ -40,7 +40,7 @@ CACHE_TTL = 60
 ALLOWED_METHODS = "GET, POST, OPTIONS"
 
 # Headers the component sends.
-ALLOWED_HEADERS = "Content-Type"
+ALLOWED_HEADERS = "Content-Type, X-API-Token"
 
 
 class DynamicCORSMiddleware(BaseHTTPMiddleware):
