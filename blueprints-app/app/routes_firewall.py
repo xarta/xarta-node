@@ -156,17 +156,24 @@ def _get_tailscale_ip(node_id: str) -> str | None:
     return None
 
 
+def _get_node_tailnet(node_id: str) -> str | None:
+    """Return the tailnet name for a fleet node (from nodes.json data)."""
+    for n in cfg.NODES_DATA:
+        if n.get("node_id") == node_id:
+            return n.get("tailnet") or None
+    return None
+
+
 def _probe_udp_tailscale(ts_ip: str) -> str:
     """
-    Use `tailscale ping` to verify WireGuard direct connectivity to a peer.
+    Use `tailscale ping` to verify WireGuard direct connectivity to a same-tailnet peer.
+    Only called when prober and target share the same tailnet.
 
-    Interpretation:
-      - "via <ip>:41641" in output, no DERP  →  direct path  →  "open"
-      - "DERP" in output                     →  relay only   →  "blocked"
-      - timeout / no response                →  "timeout"
-
-    A DERP-relay result means UDP 41641 is blocked/filtered and Tailscale has
-    fallen back to its encrypted relay servers — direct WireGuard is not working.
+    Returns:
+      "open"    — direct WireGuard path confirmed (via <ip>:41641, no DERP)
+      "blocked" — only DERP relay available; UDP 41641 not directly reachable
+      "timeout" — no clear response from ping
+      "skipped" — tailscale binary not available on this node; caller falls back to nc -u
     """
     try:
         result = subprocess.run(
@@ -182,7 +189,7 @@ def _probe_udp_tailscale(ts_ip: str) -> str:
     except FileNotFoundError:
         return "skipped"
     except Exception:
-        return "error"
+        return "skipped"
 
 
 def _extract_host(address: str) -> str:
@@ -284,8 +291,12 @@ async def firewall_probe(req: ProbeRequest) -> FirewallProbeOut:
                    "Probing arbitrary hosts is not permitted.",
         )
 
-    # Look up the target's Tailscale IP for the UDP 41641 probe.
-    ts_ip = _get_tailscale_ip(req.target_node_id)
+    # Use tailscale ping for UDP 41641 only when prober and target share the
+    # same tailnet — cross-tailnet pings will never resolve.
+    prober_tailnet = _get_node_tailnet(cfg.NODE_ID)
+    target_tailnet = _get_node_tailnet(req.target_node_id)
+    same_tailnet = bool(prober_tailnet and target_tailnet and prober_tailnet == target_tailnet)
+    ts_ip = _get_tailscale_ip(req.target_node_id) if same_tailnet else None
 
     results: list[FirewallProbePort] = []
     for p in _PORT_CATALOGUE:
@@ -296,9 +307,11 @@ async def firewall_probe(req: ProbeRequest) -> FirewallProbeOut:
         if proto == "tcp":
             result = _probe_tcp(target_host, port)
         elif proto == "udp" and port == 41641 and ts_ip:
-            # Use tailscale ping for port 41641 — gives a definitive direct vs
-            # DERP-relay answer, which nc -u cannot provide against a DROP policy.
+            # Same tailnet: tailscale ping gives a definitive direct-vs-DERP answer.
+            # Falls back to nc -u only if the tailscale binary is missing.
             result = _probe_udp_tailscale(ts_ip)
+            if result == "skipped":
+                result = _probe_udp(target_host, port)
         elif proto == "udp":
             result = _probe_udp(target_host, port)
         else:
