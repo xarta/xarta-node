@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from starlette.responses import Response
 
 from . import config as cfg
+from .auth import compute_token
 from .db import get_conn
 from .models import NodeOut
 
@@ -208,6 +209,7 @@ async def proxy_node_git_pull(node_id: str) -> Response:
             resp = await client.post(
                 f"{target}/api/v1/sync/git-pull",
                 json={"scope": "outer"},
+                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
             )
     except Exception as exc:
         raise HTTPException(502, f"failed to reach {node_id} at {target}: {exc}") from exc
@@ -232,7 +234,10 @@ async def proxy_node_restart(node_id: str) -> Response:
     target = addrs[0].rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{target}/api/v1/sync/restart")
+            resp = await client.post(
+                f"{target}/api/v1/sync/restart",
+                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+            )
     except Exception as exc:
         raise HTTPException(502, f"failed to reach {node_id} at {target}: {exc}") from exc
     if resp.status_code not in (200, 204):

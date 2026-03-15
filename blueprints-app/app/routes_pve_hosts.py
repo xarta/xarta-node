@@ -66,9 +66,11 @@ async def _resolve_tailnet_ip(pve_name: str, tailnet_domain: str, timeout: float
             timeout=timeout,
         )
         if infos:
-            return infos[0][4][0]
-    except Exception:
-        pass
+            ip = infos[0][4][0]
+            log.debug("tailnet resolve: %s → %s", fqdn, ip)
+            return ip
+    except Exception as exc:
+        log.debug("tailnet resolve: %s failed — %s", fqdn, exc)
     return None
 
 
@@ -311,12 +313,22 @@ async def scan_for_proxmox() -> dict:
                 "pve_hosts", cid, dict(row), gen,
             )
 
+    tailnet_resolved = sum(1 for c in found if c.get("tailnet_ip"))
+    if tailnet_domain and not tailnet_resolved and found:
+        log.info(
+            "pve-hosts scan: tailnet resolution via %s failed for all %d host(s) "
+            "— this node may not have Tailscale MagicDNS access. "
+            "Use Edit to set tailnet IPs manually.",
+            tailnet_domain, len(found),
+        )
+
     return {
         "ips_checked": sum(1 for _ in network.hosts()),
         "found":   len(found),
         "created": created,
         "updated": updated,
         "cidr":    cidr,
+        "tailnet_resolved": tailnet_resolved,
     }
 
 

@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import db
+from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .middleware_auth import AuthMiddleware
 from .routes_gui_sync import router as gui_sync_router
@@ -223,7 +224,10 @@ async def _boot_catchup() -> None:
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(f"{best_peer_url}/api/v1/sync/export")
+            resp = await client.get(
+                f"{best_peer_url}/api/v1/sync/export",
+                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+            )
         if resp.status_code != 200:
             log.warning(
                 "boot_catchup: peer %s returned HTTP %d for /sync/export",
