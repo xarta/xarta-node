@@ -21,7 +21,9 @@ async function loadManualLinks() {
   const err = document.getElementById('ml-error');
   if (err) err.hidden = true;
   try {
-    _manualLinks = await apiFetch('/api/v1/manual-links');
+    const r = await apiFetch('/api/v1/manual-links');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    _manualLinks = await r.json();
     renderManualLinksTable();
     if (_manualLinksView === 'rendered') renderManualLinksRendered();
   } catch (e) {
@@ -213,9 +215,19 @@ async function submitManualLink() {
 
   try {
     if (_editingLinkId) {
-      await apiFetch(`/api/v1/manual-links/${_editingLinkId}`, { method: 'PUT', body: JSON.stringify(body) });
+      const r = await apiFetch(`/api/v1/manual-links/${_editingLinkId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     } else {
-      await apiFetch('/api/v1/manual-links', { method: 'POST', body: JSON.stringify(body) });
+      const r = await apiFetch('/api/v1/manual-links', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     }
     document.getElementById('ml-modal').close();
     await loadManualLinks();
@@ -229,7 +241,8 @@ async function deleteManualLink(linkId) {
   const err = document.getElementById('ml-error');
   if (err) err.hidden = true;
   try {
-    await apiFetch(`/api/v1/manual-links/${linkId}`, { method: 'DELETE' });
+    const r = await apiFetch(`/api/v1/manual-links/${linkId}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     await loadManualLinks();
   } catch (e) {
     if (err) { err.textContent = e.message; err.hidden = false; }
