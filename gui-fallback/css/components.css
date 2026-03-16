@@ -22,6 +22,16 @@
 .ml-tip-row { display: flex; gap: 8px; align-items: baseline; }
 .ml-tip-lbl { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; min-width: 56px; flex-shrink: 0; }
 
+/* ── Manual links table — sortable headers & collapsible group rows ── */
+.ml-th-sort { cursor: pointer; user-select: none; }
+.ml-th-sort:hover { color: var(--text); }
+.ml-sort-arrow { font-size: 10px; margin-left: 3px; opacity: .4; }
+.ml-sort-arrow.active { opacity: 1; color: var(--accent); }
+.ml-group-hdr td { background: var(--surface); font-size: 11px; font-weight: 700;
+                   text-transform: uppercase; letter-spacing: .6px; color: var(--text-dim);
+                   cursor: pointer; padding: 5px 10px; border-top: 2px solid var(--border); }
+.ml-group-hdr:hover td { color: var(--text); }
+
 /* ── Sync panel ── */
 #sync-panel { background: var(--surface); border: 1px solid var(--border);
               border-radius: var(--radius); padding: 14px 18px; }
