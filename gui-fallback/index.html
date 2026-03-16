@@ -185,20 +185,25 @@
 
     <!-- TABLE VIEW -->
     <div id="ml-table-view" style="display:none">
-      <div class="toolbar">
+      <div class="toolbar" style="flex-wrap:wrap;gap:6px">
         <button onclick="openManualLinkModal(null)">+ Add link</button>
         <button class="secondary" onclick="loadManualLinks()">&#8635; Refresh</button>
+        <input type="text" id="ml-filter" placeholder="Filter&#8230;" oninput="renderManualLinksTable()" style="max-width:180px;flex:0 1 180px" />
+        <span style="font-size:12px;color:var(--text-dim);align-self:center;white-space:nowrap">Group by:</span>
+        <button id="ml-grp-none"  class="secondary active" onclick="mlSetGroupBy('none')"  style="padding:3px 8px;font-size:12px">None</button>
+        <button id="ml-grp-group" class="secondary"        onclick="mlSetGroupBy('group')" style="padding:3px 8px;font-size:12px">Group</button>
+        <button id="ml-grp-host"  class="secondary"        onclick="mlSetGroupBy('host')"  style="padding:3px 8px;font-size:12px">Host</button>
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr>
             <th style="width:72px">ID</th>
-            <th>Label</th>
-            <th>Addresses</th>
-            <th>Group</th>
-            <th style="width:48px">Order</th>
-            <th>Host</th>
-            <th>Notes</th>
+            <th class="ml-th-sort" onclick="mlSortBy('label')">Label <span id="ml-arrow-label" class="ml-sort-arrow">&#8597;</span></th>
+            <th class="ml-th-sort" onclick="mlSortBy('addr')">Addresses <span id="ml-arrow-addr" class="ml-sort-arrow">&#8597;</span></th>
+            <th class="ml-th-sort" onclick="mlSortBy('group')">Group <span id="ml-arrow-group" class="ml-sort-arrow">&#8597;</span></th>
+            <th class="ml-th-sort" style="width:48px" onclick="mlSortBy('order')">Order <span id="ml-arrow-order" class="ml-sort-arrow">&#8597;</span></th>
+            <th class="ml-th-sort" onclick="mlSortBy('host')">Host <span id="ml-arrow-host" class="ml-sort-arrow">&#8597;</span></th>
+            <th class="ml-th-sort" onclick="mlSortBy('notes')">Notes <span id="ml-arrow-notes" class="ml-sort-arrow">&#8597;</span></th>
             <th style="width:80px">Actions</th>
           </tr></thead>
           <tbody id="ml-tbody"></tbody>

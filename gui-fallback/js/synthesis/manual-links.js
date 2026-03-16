@@ -2,6 +2,10 @@
 
 let _manualLinksView = 'rendered';   // 'table' | 'rendered' — default to rendered
 let _editingLinkId   = null;      // null = add mode, string = edit mode
+let _mlFilter    = '';               // table filter text
+let _mlSort      = { col: null, dir: 1 }; // active sort column + direction (1=asc, -1=desc)
+let _mlGroupBy   = 'none';          // 'none' | 'group' | 'host'
+let _mlCollapsed = new Set();       // collapsed group keys
 
 /* ── View toggle ─────────────────────────────────────────────────────────── */
 
@@ -34,23 +38,64 @@ async function loadManualLinks() {
 function renderManualLinksTable() {
   const tbody = document.getElementById('ml-tbody');
   if (!tbody) return;
-  if (!_manualLinks.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No links yet — click + Add link</td></tr>';
+
+  // Filter
+  const q = (document.getElementById('ml-filter')?.value || '').toLowerCase().trim();
+  let rows = q
+    ? _manualLinks.filter(l => [
+        l.label, l.vlan_ip, l.vlan_uri, l.tailnet_ip, l.tailnet_uri,
+        l.group_name, l.pve_host, l.vm_name, l.lxc_name, l.location, l.notes
+      ].some(v => v && v.toLowerCase().includes(q)))
+    : [..._manualLinks];
+
+  const _clearArrows = () =>
+    ['label','addr','group','order','host','notes'].forEach(c => {
+      const el = document.getElementById(`ml-arrow-${c}`);
+      if (el) { el.textContent = '⇕'; el.classList.remove('active'); }
+    });
+
+  if (!rows.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="8">${q ? 'No matches.' : 'No links yet — click + Add link'}</td></tr>`;
+    _clearArrows();
     return;
   }
-  tbody.innerHTML = _manualLinks.map(lnk => {
+
+  // Sort
+  if (_mlSort.col) {
+    rows.sort((a, b) => {
+      const av = _mlGetSortVal(a, _mlSort.col);
+      const bv = _mlGetSortVal(b, _mlSort.col);
+      return (av < bv ? -1 : av > bv ? 1 : 0) * _mlSort.dir;
+    });
+  }
+
+  // Update sort arrows
+  ['label','addr','group','order','host','notes'].forEach(c => {
+    const el = document.getElementById(`ml-arrow-${c}`);
+    if (!el) return;
+    if (_mlSort.col === c) {
+      el.textContent = _mlSort.dir === 1 ? '▲' : '▼';
+      el.classList.add('active');
+    } else {
+      el.textContent = '⇕';
+      el.classList.remove('active');
+    }
+  });
+
+  // Row HTML builder
+  function rowHtml(lnk) {
     const addrParts = [];
-    if (lnk.vlan_ip)    addrParts.push(`<span class="badge" title="VLAN IP">${esc(lnk.vlan_ip)}</span>`);
-    if (lnk.vlan_uri)   addrParts.push(`<span class="badge" title="VLAN URI">${esc(lnk.vlan_uri)}</span>`);
-    if (lnk.tailnet_ip) addrParts.push(`<span class="badge" title="Tailnet IP">${esc(lnk.tailnet_ip)}</span>`);
+    if (lnk.vlan_ip)     addrParts.push(`<span class="badge" title="VLAN IP">${esc(lnk.vlan_ip)}</span>`);
+    if (lnk.vlan_uri)    addrParts.push(`<span class="badge" title="VLAN URI">${esc(lnk.vlan_uri)}</span>`);
+    if (lnk.tailnet_ip)  addrParts.push(`<span class="badge" title="Tailnet IP">${esc(lnk.tailnet_ip)}</span>`);
     if (lnk.tailnet_uri) addrParts.push(`<span class="badge" title="Tailnet URI">${esc(lnk.tailnet_uri)}</span>`);
 
     const hostParts = [];
-    if (lnk.pve_host)   hostParts.push(`PVE: ${esc(lnk.pve_host)}`);
+    if (lnk.pve_host)    hostParts.push(`PVE: ${esc(lnk.pve_host)}`);
     if (lnk.is_internet) hostParts.push(`<span class="badge" style="background:var(--accent-dim)">internet</span>`);
-    if (lnk.vm_id)      hostParts.push(`VM ${esc(lnk.vm_id)}${lnk.vm_name ? ` (${esc(lnk.vm_name)})` : ''}`);
-    if (lnk.lxc_id)     hostParts.push(`LXC ${esc(lnk.lxc_id)}${lnk.lxc_name ? ` (${esc(lnk.lxc_name)})` : ''}`);
-    if (lnk.location)   hostParts.push(`<span style="color:var(--text-dim);font-size:11px">${esc(lnk.location)}</span>`);;
+    if (lnk.vm_id)       hostParts.push(`VM ${esc(lnk.vm_id)}${lnk.vm_name ? ` (${esc(lnk.vm_name)})` : ''}`);
+    if (lnk.lxc_id)      hostParts.push(`LXC ${esc(lnk.lxc_id)}${lnk.lxc_name ? ` (${esc(lnk.lxc_name)})` : ''}`);
+    if (lnk.location)    hostParts.push(`<span style="color:var(--text-dim);font-size:11px">${esc(lnk.location)}</span>`);
 
     return `<tr>
       <td style="font-family:monospace;font-size:11px;color:var(--text-dim);max-width:80px;overflow:hidden;text-overflow:ellipsis" title="${esc(lnk.link_id)}">${esc(lnk.link_id.slice(0,8))}</td>
@@ -65,7 +110,71 @@ function renderManualLinksTable() {
         <button class="secondary" style="padding:2px 8px;font-size:12px;color:var(--err)" onclick="deleteManualLink('${esc(lnk.link_id)}')">Del</button>
       </td>
     </tr>`;
-  }).join('');
+  }
+
+  if (_mlGroupBy === 'none') {
+    tbody.innerHTML = rows.map(rowHtml).join('');
+    return;
+  }
+
+  // Grouped rendering
+  const keys = [];
+  const map  = {};
+  rows.forEach(lnk => {
+    const k = _mlGroupKey(lnk);
+    if (!map[k]) { map[k] = []; keys.push(k); }
+    map[k].push(lnk);
+  });
+
+  let html = '';
+  keys.forEach(k => {
+    const collapsed = _mlCollapsed.has(k);
+    html += `<tr class="ml-group-hdr" data-gkey="${esc(k)}" onclick="mlToggleGroup(this.dataset.gkey)">
+      <td colspan="8">${collapsed ? '▶' : '▼'} ${esc(k)} <span style="font-weight:400;opacity:.6">(${map[k].length})</span></td>
+    </tr>`;
+    if (!collapsed) html += map[k].map(rowHtml).join('');
+  });
+  tbody.innerHTML = html;
+}
+
+/* ── Table helpers: sort / filter / group ────────────────────────────────── */
+
+function mlSetGroupBy(by) {
+  _mlGroupBy = by;
+  _mlCollapsed.clear();
+  ['none','group','host'].forEach(k =>
+    document.getElementById(`ml-grp-${k}`)?.classList.toggle('active', k === by));
+  renderManualLinksTable();
+}
+
+function mlSortBy(col) {
+  _mlSort.dir = (_mlSort.col === col) ? _mlSort.dir * -1 : 1;
+  _mlSort.col = col;
+  renderManualLinksTable();
+}
+
+function mlToggleGroup(key) {
+  if (_mlCollapsed.has(key)) _mlCollapsed.delete(key);
+  else _mlCollapsed.add(key);
+  renderManualLinksTable();
+}
+
+function _mlGetSortVal(lnk, col) {
+  switch (col) {
+    case 'label': return (lnk.label || '').toLowerCase();
+    case 'addr':  return (lnk.vlan_uri || lnk.vlan_ip || lnk.tailnet_uri || lnk.tailnet_ip || '').toLowerCase();
+    case 'group': return (lnk.group_name || '').toLowerCase();
+    case 'order': return lnk.sort_order ?? 0;
+    case 'host':  return (lnk.pve_host || lnk.vm_name || lnk.lxc_name || lnk.location || '').toLowerCase();
+    case 'notes': return (lnk.notes || '').toLowerCase();
+    default: return '';
+  }
+}
+
+function _mlGroupKey(lnk) {
+  if (_mlGroupBy === 'group') return lnk.group_name || '(no group)';
+  if (_mlGroupBy === 'host')  return lnk.pve_host || lnk.vm_name || lnk.lxc_name || lnk.location || '(no host)';
+  return '';
 }
 
 /* ── Rendered view ───────────────────────────────────────────────────────── */
