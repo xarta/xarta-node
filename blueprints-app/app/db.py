@@ -370,6 +370,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         # nodes: HTTPS hostnames from .nodes.json (2026-03-15)
         ("nodes",    "primary_hostname",       "TEXT"),
         ("nodes",    "tailnet_hostname",       "TEXT"),
+        # manual_links: physical/logical location label (2026-03-16)
+        ("manual_links", "location",           "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

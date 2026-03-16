@@ -596,6 +596,7 @@ class ManualLinkCreate(BaseModel):
     vm_name:     Optional[str] = None
     lxc_id:      Optional[str] = None
     lxc_name:    Optional[str] = None
+    location:    Optional[str] = None
     notes:       Optional[str] = None
 
 class ManualLinkUpdate(BaseModel):
@@ -614,6 +615,7 @@ class ManualLinkUpdate(BaseModel):
     vm_name:     Optional[str] = None
     lxc_id:      Optional[str] = None
     lxc_name:    Optional[str] = None
+    location:    Optional[str] = None
     notes:       Optional[str] = None
 
 class ManualLinkOut(BaseModel):
@@ -633,6 +635,7 @@ class ManualLinkOut(BaseModel):
     vm_name:     Optional[str] = None
     lxc_id:      Optional[str] = None
     lxc_name:    Optional[str] = None
+    location:    Optional[str] = None
     notes:       Optional[str] = None
     created_at:  str
     updated_at:  str
