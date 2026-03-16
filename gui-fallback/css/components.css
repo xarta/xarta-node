@@ -1,3 +1,27 @@
+/* ── Manual links — hover tooltip ── */
+.ml-tip { position: relative; display: inline-flex; align-items: center; }
+.ml-tip-body {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.7;
+  z-index: 200;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  color: var(--text);
+}
+.ml-tip:hover .ml-tip-body { display: block; }
+.ml-tip-row { display: flex; gap: 8px; align-items: baseline; }
+.ml-tip-lbl { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; min-width: 56px; flex-shrink: 0; }
+
 /* ── Sync panel ── */
 #sync-panel { background: var(--surface); border: 1px solid var(--border);
               border-radius: var(--radius); padding: 14px 18px; }

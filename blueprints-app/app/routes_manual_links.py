@@ -41,8 +41,8 @@ async def create_manual_link(body: ManualLinkCreate) -> ManualLinkOut:
             INSERT INTO manual_links (
                 link_id, vlan_ip, vlan_uri, tailnet_ip, tailnet_uri,
                 label, icon, group_name, parent_id, sort_order,
-                pve_host, is_internet, vm_id, vm_name, lxc_id, lxc_name, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pve_host, is_internet, vm_id, vm_name, lxc_id, lxc_name, location, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 link_id,
@@ -50,7 +50,7 @@ async def create_manual_link(body: ManualLinkCreate) -> ManualLinkOut:
                 body.label, body.icon, body.group_name, body.parent_id,
                 body.sort_order if body.sort_order is not None else 0,
                 body.pve_host, body.is_internet if body.is_internet is not None else 0,
-                body.vm_id, body.vm_name, body.lxc_id, body.lxc_name, body.notes,
+                body.vm_id, body.vm_name, body.lxc_id, body.lxc_name, body.location, body.notes,
             ),
         )
         gen = increment_gen(conn, "human")
@@ -98,6 +98,7 @@ async def update_manual_link(link_id: str, body: ManualLinkUpdate) -> ManualLink
                 vm_name      = COALESCE(?, vm_name),
                 lxc_id       = COALESCE(?, lxc_id),
                 lxc_name     = COALESCE(?, lxc_name),
+                location     = COALESCE(?, location),
                 notes        = COALESCE(?, notes),
                 updated_at   = datetime('now')
             WHERE link_id = ?
@@ -107,7 +108,7 @@ async def update_manual_link(link_id: str, body: ManualLinkUpdate) -> ManualLink
                 body.label, body.icon, body.group_name, body.parent_id,
                 body.sort_order, body.pve_host, body.is_internet,
                 body.vm_id, body.vm_name, body.lxc_id, body.lxc_name,
-                body.notes, link_id,
+                body.location, body.notes, link_id,
             ),
         )
         gen = increment_gen(conn, "human")

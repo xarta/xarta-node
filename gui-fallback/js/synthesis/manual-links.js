@@ -50,6 +50,7 @@ function renderManualLinksTable() {
     if (lnk.is_internet) hostParts.push(`<span class="badge" style="background:var(--accent-dim)">internet</span>`);
     if (lnk.vm_id)      hostParts.push(`VM ${esc(lnk.vm_id)}${lnk.vm_name ? ` (${esc(lnk.vm_name)})` : ''}`);
     if (lnk.lxc_id)     hostParts.push(`LXC ${esc(lnk.lxc_id)}${lnk.lxc_name ? ` (${esc(lnk.lxc_name)})` : ''}`);
+    if (lnk.location)   hostParts.push(`<span style="color:var(--text-dim);font-size:11px">${esc(lnk.location)}</span>`);;
 
     return `<tr>
       <td style="font-family:monospace;font-size:11px;color:var(--text-dim);max-width:80px;overflow:hidden;text-overflow:ellipsis" title="${esc(lnk.link_id)}">${esc(lnk.link_id.slice(0,8))}</td>
@@ -104,36 +105,55 @@ function renderManualLinksRendered() {
     const icon = lnk.icon ? `<span style="margin-right:6px;font-size:1.1em">${esc(lnk.icon)}</span>` : '';
     const labelHtml = lnk.label ? `<span style="font-weight:600">${icon}${esc(lnk.label)}</span>` : `${icon}<span style="color:var(--text-dim);font-style:italic">untitled</span>`;
 
-    const hostCtx = [];
-    if (lnk.pve_host)    hostCtx.push(esc(lnk.pve_host));
-    if (lnk.is_internet) hostCtx.push('internet');
-    if (lnk.vm_id)       hostCtx.push(`VM ${esc(lnk.vm_id)}${lnk.vm_name ? ` ${esc(lnk.vm_name)}` : ''}`);
-    if (lnk.lxc_id)      hostCtx.push(`LXC ${esc(lnk.lxc_id)}${lnk.lxc_name ? ` ${esc(lnk.lxc_name)}` : ''}`);
+    // Tooltip detail rows shared by all address chips on this item
+    const sharedRows = [];
+    if (lnk.pve_host)    sharedRows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">PVE host</span><span>${esc(lnk.pve_host)}</span></div>`);
+    if (lnk.is_internet) sharedRows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">Network</span><span>internet</span></div>`);
+    if (lnk.vm_id)       sharedRows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">VM</span><span>${esc(lnk.vm_id)}${lnk.vm_name ? ` (${esc(lnk.vm_name)})` : ''}</span></div>`);
+    if (lnk.lxc_id)      sharedRows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">LXC</span><span>${esc(lnk.lxc_id)}${lnk.lxc_name ? ` (${esc(lnk.lxc_name)})` : ''}</span></div>`);
+    if (lnk.location)    sharedRows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">Location</span><span>${esc(lnk.location)}</span></div>`);
+    if (lnk.notes)       sharedRows.push(`<div class="ml-tip-row" style="max-width:280px"><span class="ml-tip-lbl">Notes</span><span style="white-space:normal">${esc(lnk.notes)}</span></div>`);;
 
-    const addrs = [];
-    const mkLink = (addr, label) => {
-      // Use http:// prefix if addr has no scheme
+    const mkAnchor = addr => {
       const hasScheme = /^https?:\/\//i.test(addr);
       const href = hasScheme ? addr : `http://${addr}`;
-      return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:none;font-family:monospace;font-size:13px" title="${label}">${esc(addr)}</a>`;
+      return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer"
+        style="color:var(--accent);text-decoration:none;font-family:monospace;font-size:13px">${esc(addr)}</a>`;
     };
-    if (lnk.vlan_ip)     addrs.push({ label: 'VLAN IP',      html: mkLink(lnk.vlan_ip,     'VLAN IP') });
-    if (lnk.vlan_uri)    addrs.push({ label: 'VLAN URI',     html: mkLink(lnk.vlan_uri,    'VLAN URI') });
-    if (lnk.tailnet_ip)  addrs.push({ label: 'Tailnet IP',   html: mkLink(lnk.tailnet_ip,  'Tailnet IP') });
-    if (lnk.tailnet_uri) addrs.push({ label: 'Tailnet',      html: mkLink(lnk.tailnet_uri, 'Tailnet') });
+
+    const mkChip = (primary, tipRows) =>
+      `<span class="ml-tip">${mkAnchor(primary)}<div class="ml-tip-body">${tipRows.join('')}</div></span>`;
+
+    const addrChips = [];
+
+    // VLAN — prefer URI; show IP in tooltip if both present
+    if (lnk.vlan_uri || lnk.vlan_ip) {
+      const primary = lnk.vlan_uri || lnk.vlan_ip;
+      const rows = [`<div class="ml-tip-row"><span class="ml-tip-lbl">VLAN</span><span style="font-family:monospace">${esc(primary)}</span></div>`];
+      if (lnk.vlan_uri && lnk.vlan_ip)
+        rows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">IP</span><span style="font-family:monospace">${esc(lnk.vlan_ip)}</span></div>`);
+      rows.push(...sharedRows);
+      addrChips.push(mkChip(primary, rows));
+    }
+
+    // Tailnet — prefer URI; show IP in tooltip if both present
+    if (lnk.tailnet_uri || lnk.tailnet_ip) {
+      const primary = lnk.tailnet_uri || lnk.tailnet_ip;
+      const rows = [`<div class="ml-tip-row"><span class="ml-tip-lbl">Tailnet</span><span style="font-family:monospace">${esc(primary)}</span></div>`];
+      if (lnk.tailnet_uri && lnk.tailnet_ip)
+        rows.push(`<div class="ml-tip-row"><span class="ml-tip-lbl">IP</span><span style="font-family:monospace">${esc(lnk.tailnet_ip)}</span></div>`);
+      rows.push(...sharedRows);
+      addrChips.push(mkChip(primary, rows));
+    }
 
     const children = sortByOrder(childMap[lnk.link_id] || []);
 
     return `<li style="margin-bottom:12px;list-style:none">
-      <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 14px">
+      <div style="display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px">
         <span style="min-width:160px">${labelHtml}</span>
-        ${addrs.map(a => `<span style="display:inline-flex;align-items:center;gap:4px">
-          <span style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);min-width:60px">${a.label}</span>${a.html}
-        </span>`).join('')}
-        ${!addrs.length ? '<span style="color:var(--text-dim);font-size:12px;font-style:italic">no addresses</span>' : ''}
-        ${hostCtx.length ? `<span style="font-size:11px;color:var(--text-dim)">(${hostCtx.join(', ')})</span>` : ''}
+        ${addrChips.join('')}
+        ${!addrChips.length ? '<span style="color:var(--text-dim);font-size:12px;font-style:italic">no addresses</span>' : ''}
       </div>
-      ${lnk.notes ? `<div style="font-size:12px;color:var(--text-dim);margin-top:3px;padding-left:4px">${esc(lnk.notes)}</div>` : ''}
       ${children.length ? `<ul style="margin:6px 0 0 16px;padding:0">${children.map(renderLink).join('')}</ul>` : ''}
     </li>`;
   }
@@ -179,7 +199,7 @@ function openManualLinkModal(linkId) {
       .map(l => `<option value="${esc(l.link_id)}"${lnk.parent_id === l.link_id ? ' selected' : ''}>${esc(l.label || l.link_id.slice(0,8))}</option>`)
       .join('');
 
-  const fields = ['vlan_ip','vlan_uri','tailnet_ip','tailnet_uri','label','icon','group_name','sort_order','pve_host','vm_id','vm_name','lxc_id','lxc_name','notes'];
+  const fields = ['vlan_ip','vlan_uri','tailnet_ip','tailnet_uri','label','icon','group_name','sort_order','pve_host','vm_id','vm_name','lxc_id','lxc_name','location','notes'];
   fields.forEach(f => {
     const el = document.getElementById(`ml-${f.replace(/_/g,'-')}`);
     if (el) el.value = lnk[f] !== null && lnk[f] !== undefined ? lnk[f] : '';
@@ -210,6 +230,7 @@ async function submitManualLink() {
     vm_name:     get('ml-vm-name')     || null,
     lxc_id:      get('ml-lxc-id')      || null,
     lxc_name:    get('ml-lxc-name')    || null,
+    location:    get('ml-location')    || null,
     notes:       get('ml-notes')       || null,
   };
 
