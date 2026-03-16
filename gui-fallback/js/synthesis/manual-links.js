@@ -159,7 +159,8 @@ function openManualLinkModal(linkId) {
   _editingLinkId = linkId || null;
   const dlg = document.getElementById('ml-modal');
   document.getElementById('ml-modal-title').textContent = linkId ? 'Edit link' : 'Add link';
-  setEl('ml-modal-error', '', true);
+  const modalErr = document.getElementById('ml-modal-error');
+  if (modalErr) modalErr.hidden = true;
 
   const defaults = {
     link_id: '', vlan_ip: '', vlan_uri: '', tailnet_ip: '', tailnet_uri: '',
