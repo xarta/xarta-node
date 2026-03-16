@@ -578,6 +578,68 @@ class ArpManualOut(BaseModel):
 
 # ── SSH Targets ───────────────────────────────────────────────────────────────
 
+# ── Manual Links ─────────────────────────────────────────────────────────────
+
+class ManualLinkCreate(BaseModel):
+    vlan_ip:     Optional[str] = None
+    vlan_uri:    Optional[str] = None
+    tailnet_ip:  Optional[str] = None
+    tailnet_uri: Optional[str] = None
+    label:       Optional[str] = None
+    icon:        Optional[str] = None
+    group_name:  Optional[str] = None
+    parent_id:   Optional[str] = None
+    sort_order:  Optional[int] = 0
+    pve_host:    Optional[str] = None
+    is_internet: Optional[int] = 0
+    vm_id:       Optional[str] = None
+    vm_name:     Optional[str] = None
+    lxc_id:      Optional[str] = None
+    lxc_name:    Optional[str] = None
+    notes:       Optional[str] = None
+
+class ManualLinkUpdate(BaseModel):
+    vlan_ip:     Optional[str] = None
+    vlan_uri:    Optional[str] = None
+    tailnet_ip:  Optional[str] = None
+    tailnet_uri: Optional[str] = None
+    label:       Optional[str] = None
+    icon:        Optional[str] = None
+    group_name:  Optional[str] = None
+    parent_id:   Optional[str] = None
+    sort_order:  Optional[int] = None
+    pve_host:    Optional[str] = None
+    is_internet: Optional[int] = None
+    vm_id:       Optional[str] = None
+    vm_name:     Optional[str] = None
+    lxc_id:      Optional[str] = None
+    lxc_name:    Optional[str] = None
+    notes:       Optional[str] = None
+
+class ManualLinkOut(BaseModel):
+    link_id:     str
+    vlan_ip:     Optional[str] = None
+    vlan_uri:    Optional[str] = None
+    tailnet_ip:  Optional[str] = None
+    tailnet_uri: Optional[str] = None
+    label:       Optional[str] = None
+    icon:        Optional[str] = None
+    group_name:  Optional[str] = None
+    parent_id:   Optional[str] = None
+    sort_order:  int = 0
+    pve_host:    Optional[str] = None
+    is_internet: int = 0
+    vm_id:       Optional[str] = None
+    vm_name:     Optional[str] = None
+    lxc_id:      Optional[str] = None
+    lxc_name:    Optional[str] = None
+    notes:       Optional[str] = None
+    created_at:  str
+    updated_at:  str
+
+
+# ── SSH Targets ───────────────────────────────────────────────────────────────
+
 class SshTargetCreate(BaseModel):
     ip_address: str
     key_env_var: str                 # e.g. VM_SSH_KEY, LXC_SSH_KEY

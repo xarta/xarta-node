@@ -15,6 +15,7 @@ let _pveHosts = [];
 let _vlans = [];
 let _arpManual = [];
 let _sshTargets = [];
+let _manualLinks = [];
 let _keys = [];
 let _parsedBundle = [];   // parsed key entries from import textarea
 let _pctPollInterval = null;

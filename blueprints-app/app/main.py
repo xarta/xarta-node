@@ -45,8 +45,9 @@ from .routes_dockge_stacks import router as dockge_stacks_router
 from .routes_caddy_configs import router as caddy_configs_router
 from .routes_settings   import router as settings_router
 from .routes_pve_hosts   import router as pve_hosts_router
-from .routes_arp_manual  import router as arp_manual_router
-from .routes_ssh_targets import router as ssh_targets_router
+from .routes_arp_manual    import router as arp_manual_router
+from .routes_ssh_targets   import router as ssh_targets_router
+from .routes_manual_links  import router as manual_links_router
 from .routes_sync import router as sync_router
 from .routes_keys import router as keys_router
 from .routes_assumptions import router as assumptions_router
@@ -296,6 +297,7 @@ def create_app() -> FastAPI:
     application.include_router(pve_hosts_router,      prefix="/api/v1")
     application.include_router(arp_manual_router,     prefix="/api/v1")
     application.include_router(ssh_targets_router,    prefix="/api/v1")
+    application.include_router(manual_links_router,   prefix="/api/v1")
     application.include_router(keys_router,           prefix="/api/v1")
     application.include_router(gui_sync_router,       prefix="/api/v1")
     application.include_router(assumptions_router,    prefix="/api/v1")

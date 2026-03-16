@@ -31,6 +31,7 @@ function switchTab(tab) {
   if (tab === 'vlans'          && !_vlans.length)         loadVlans();
   if (tab === 'arp-manual'     && !_arpManual.length)     loadArpManual();
   if (tab === 'ssh-targets'    && !_sshTargets.length)    loadSshTargets();
+  if (tab === 'manual-links'   && !_manualLinks.length)   loadManualLinks();
   if (tab === 'settings'       && !_settings.length)      loadSettings();
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'assumptions')                               loadAssumptions();
@@ -50,7 +51,7 @@ function switchTab(tab) {
 document.addEventListener('DOMContentLoaded', () => {
   if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
   loadHealth();
-  loadServices();
+  loadManualLinks();
   loadSyncStatus();
   loadBackups();
   setInterval(loadHealth, 15_000);
