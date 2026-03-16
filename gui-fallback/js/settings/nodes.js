@@ -1,4 +1,23 @@
 /* ── Nodes ────────────────────────────────────────────────────────────── */
+async function retouchTable(btn) {
+  const sel = document.getElementById('retouch-table-select');
+  const status = document.getElementById('retouch-status');
+  const table = sel ? sel.value : '';
+  if (!table) { if (status) { status.textContent = 'Select a table first'; status.style.color = 'var(--warn)'; } return; }
+  if (btn) btn.disabled = true;
+  if (status) { status.textContent = 'Retouching…'; status.style.color = 'var(--text-dim)'; }
+  try {
+    const r = await apiFetch(`/api/v1/sync/retouch/${encodeURIComponent(table)}`, { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    if (status) { status.textContent = `✓ ${data.requeued} rows re-queued from ${data.table}`; status.style.color = 'var(--ok)'; }
+  } catch (e) {
+    if (status) { status.textContent = `✗ ${e.message}`; status.style.color = 'var(--err)'; }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function loadNodes() {
   const err = document.getElementById('nodes-error');
   err.hidden = true;
