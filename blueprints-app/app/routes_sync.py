@@ -268,6 +268,31 @@ async def trigger_restart() -> Response:
     return Response(status_code=204)
 
 
+@router.post("/retouch/{table_name}")
+async def retouch_table(table_name: str):
+    """
+    Re-enqueue all current rows of a table for sync to all peers.
+
+    Safe to call at any time — the receive side uses INSERT ... ON CONFLICT DO UPDATE
+    so rows are upserted, never duplicated. Useful for recovering from a commit-guard
+    purge or after a new node joins the fleet.
+    """
+    if table_name not in _ALLOWED_TABLES:
+        raise HTTPException(400, f"Table '{table_name}' is not in the syncable table list")
+    pk_col = _pk_for_table(table_name)
+    with get_conn() as conn:
+        rows = conn.execute(f"SELECT * FROM {table_name}").fetchall()
+        if not rows:
+            return {"requeued": 0, "table": table_name}
+        gen = increment_gen(conn, "human")
+        for row in rows:
+            row_dict = dict(row)
+            row_id = str(row_dict[pk_col])
+            enqueue_for_all_peers(conn, "UPDATE", table_name, row_id, row_dict, gen)
+    log.info("retouch: re-queued %d rows from %s", len(rows), table_name)
+    return {"requeued": len(rows), "table": table_name}
+
+
 @router.post("/restore", status_code=204)
 async def receive_restore(request: Request) -> Response:
     """

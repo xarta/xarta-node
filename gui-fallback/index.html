@@ -278,6 +278,27 @@
       <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
       <button id="fleet-update-btn" class="secondary" onclick="fleetUpdate(this)" title="git pull (public + private) on this node, then queue for all peers">&#9652; Fleet Update</button>
       <span id="fleet-update-status" style="font-size:12px;align-self:center"></span>
+      <span style="display:flex;align-items:center;gap:5px;flex-shrink:0">
+        <select id="retouch-table-select" style="font-size:12px;padding:3px 6px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius)">
+          <option value="">— select table —</option>
+          <option value="manual_links">manual_links</option>
+          <option value="services">services</option>
+          <option value="machines">machines</option>
+          <option value="settings">settings</option>
+          <option value="pfsense_dns">pfsense_dns</option>
+          <option value="proxmox_config">proxmox_config</option>
+          <option value="proxmox_nets">proxmox_nets</option>
+          <option value="vlans">vlans</option>
+          <option value="dockge_stacks">dockge_stacks</option>
+          <option value="dockge_stack_services">dockge_stack_services</option>
+          <option value="caddy_configs">caddy_configs</option>
+          <option value="pve_hosts">pve_hosts</option>
+          <option value="arp_manual">arp_manual</option>
+          <option value="ssh_targets">ssh_targets</option>
+        </select>
+        <button id="retouch-btn" class="secondary" onclick="retouchTable(this)" title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
+        <span id="retouch-status" style="font-size:12px;color:var(--text-dim)"></span>
+      </span>
       <span style="font-size:12px;color:var(--text-dim);align-self:center">
         <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
       </span>
