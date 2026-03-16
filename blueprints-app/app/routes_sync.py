@@ -38,6 +38,7 @@ _ALLOWED_TABLES = {
     "settings", "pve_hosts",
     "arp_manual",
     "ssh_targets",
+    "manual_links",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -131,6 +132,7 @@ def _pk_for_table(table: str) -> str:
         "pve_hosts":      "pve_id",
         "arp_manual":     "entry_id",
         "ssh_targets":    "ip_address",
+        "manual_links":   "link_id",
     }
     return pk_map.get(table, "id")
 

@@ -269,6 +269,36 @@ CREATE TABLE IF NOT EXISTS ssh_targets (
     updated_at   TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ssh_targets_host_type ON ssh_targets(host_type);
+
+CREATE TABLE IF NOT EXISTS manual_links (
+    link_id         TEXT PRIMARY KEY,   -- UUID
+    -- Network addresses (nullable; at least one pair is expected)
+    vlan_ip         TEXT,               -- VLAN IP address including port, e.g. 10.0.42.5:8080
+    vlan_uri        TEXT,               -- VLAN hostname URI including port
+    tailnet_ip      TEXT,               -- Tailnet IP including port
+    tailnet_uri     TEXT,               -- Tailnet host.domain address including port
+    -- Display
+    label           TEXT,               -- short description / display name
+    icon            TEXT,               -- favicon URL, SVG data, or emoji
+    -- Grouping / hierarchy
+    group_name      TEXT,               -- optional group label for clustering
+    parent_id       TEXT,               -- optional FK to another link_id (for nesting)
+    sort_order      INTEGER DEFAULT 0,  -- ordering within a group
+    -- Host context
+    pve_host        TEXT,               -- Proxmox host name if applicable
+    is_internet     INTEGER DEFAULT 0,  -- 1 = internet-facing service
+    vm_id           TEXT,               -- QEMU VM ID if applicable
+    vm_name         TEXT,               -- VM arbitrary name
+    lxc_id          TEXT,               -- LXC container ID
+    lxc_name        TEXT,               -- LXC arbitrary name
+    -- Notes
+    notes           TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_manual_links_group  ON manual_links(group_name);
+CREATE INDEX IF NOT EXISTS idx_manual_links_parent ON manual_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_manual_links_sort   ON manual_links(sort_order);
 """
 
 _SEED_SQL = """
