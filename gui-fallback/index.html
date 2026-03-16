@@ -51,6 +51,7 @@
     <button data-group="settings" style="display:none" onclick="switchTab('nodes')">Nodes</button>
     <button data-group="settings" style="display:none" onclick="switchTab('keys')">&#9871; Keys</button>
     <button data-group="settings" style="display:none" onclick="switchTab('assumptions')">Basic Assumptions</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('todo')">TODO</button>
     <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
     <!-- PROBES group -->
     <button data-group="probes" style="display:none" onclick="switchTab('pfsense-dns')">pfSense DNS</button>
@@ -114,6 +115,39 @@
                padding:14px 16px;outline:none;
                min-height:calc(100vh - 260px)"></textarea>
       <div id="assumptions-preview"
+        style="display:none;flex:1;overflow:auto;
+               background:var(--surface);border:1px solid var(--border);
+               border-radius:var(--radius);padding:18px 24px;
+               font-size:14px;line-height:1.75;color:var(--text);
+               min-height:calc(100vh - 260px)"></div>
+    </div>
+  </section>
+
+  <!-- TODO -->
+  <section id="tab-todo" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+      <div>
+        <h2 style="margin:0">TODO</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Saved to the private repo — distributed via fleet-pull-private. Track tasks, work in progress, and pending items.</p>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+        <button id="todo-preview-btn" class="secondary" onclick="todoTogglePreview()">&#128065; Preview</button>
+        <button id="todo-save-btn" onclick="todoSave()">&#128190; Save</button>
+        <button class="secondary" onclick="loadTodo()">&#8635; Refresh</button>
+      </div>
+    </div>
+    <p id="todo-status" style="font-size:12px;margin:0 0 8px" hidden></p>
+    <p id="todo-error" class="error-msg" hidden></p>
+    <div id="todo-editor-wrap" style="flex:1;display:flex;flex-direction:column">
+      <textarea id="todo-editor"
+        placeholder="# TODO&#10;&#10;Track tasks, work in progress, and pending items here..."
+        style="flex:1;width:100%;box-sizing:border-box;resize:none;
+               font-family:monospace;font-size:13px;line-height:1.6;
+               background:var(--surface);color:var(--text);
+               border:1px solid var(--border);border-radius:var(--radius);
+               padding:14px 16px;outline:none;
+               min-height:calc(100vh - 260px)"></textarea>
+      <div id="todo-preview"
         style="display:none;flex:1;overflow:auto;
                background:var(--surface);border:1px solid var(--border);
                border-radius:var(--radius);padding:18px 24px;
@@ -624,6 +658,7 @@
 <script src="js/settings/nodes.js"></script>
 <script src="js/settings/keys.js"></script>
 <script src="js/settings/assumptions.js"></script>
+<script src="js/settings/todo.js"></script>
 <script src="js/settings/self-diag.js"></script>
 <script src="js/settings/settings.js"></script>
 <script src="js/settings/pve-hosts.js"></script>
