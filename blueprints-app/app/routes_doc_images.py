@@ -11,6 +11,7 @@ fleet via fleet-pull-private (git). The DB records sync via the standard
 gen-based peer protocol so all nodes know what images exist.
 """
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -47,10 +48,18 @@ def _images_dir() -> Path:
 
 
 def _row_to_out(row) -> DocImageOut:
+    raw_tags = row["tags"]
+    tags: list[str] | None = None
+    if raw_tags:
+        try:
+            tags = json.loads(raw_tags)
+        except Exception:
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
     return DocImageOut(
         image_id=row["image_id"],
         filename=row["filename"],
         description=row["description"],
+        tags=tags,
         file_size=row["file_size"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -175,9 +184,18 @@ async def update_doc_image(image_id: str, body: DocImageUpdate) -> DocImageOut:
         ).fetchone()
         if not row:
             raise HTTPException(404, "image not found")
+        updates: list[str] = ["updated_at=datetime('now')"]
+        params: list = []
+        if body.description is not None:
+            updates.append("description=?")
+            params.append(body.description)
+        if body.tags is not None:
+            updates.append("tags=?")
+            params.append(json.dumps(body.tags) if body.tags else None)
+        params.append(image_id)
         conn.execute(
-            "UPDATE doc_images SET description=COALESCE(?,description), updated_at=datetime('now') WHERE image_id=?",
-            (body.description, image_id),
+            f"UPDATE doc_images SET {', '.join(updates)} WHERE image_id=?",
+            params,
         )
         gen = increment_gen(conn, "human")
         row = conn.execute(

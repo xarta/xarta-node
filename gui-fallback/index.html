@@ -849,9 +849,12 @@
       <span id="doc-img-upload-status" style="font-size:12px;color:var(--accent)"></span>
     </div>
     <!-- Filter -->
-    <div style="display:flex;gap:8px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <button class="secondary doc-img-filter-btn active" data-filter="all" onclick="_docImagesSetFilter('all')">All images</button>
       <button class="secondary doc-img-filter-btn" data-filter="unused" onclick="_docImagesSetFilter('unused')">Unused</button>
+      <select id="doc-img-tag-filter" style="padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:13px" onchange="_docImagesSetTagFilter(this.value)">
+        <option value="">All tags</option>
+      </select>
     </div>
     <!-- List -->
     <div id="doc-images-list" style="overflow-y:auto;flex:1"></div>
