@@ -590,12 +590,45 @@ function _docsRenderDocRow(doc) {
     <span style="color:var(--text-dim);font-size:15px;user-select:none;cursor:grab">≡</span>
     <span style="flex:1;font-size:13px">${esc(doc.label)}</span>
     ${doc.description ? `<span style="font-size:11px;color:var(--text-dim);flex:2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(doc.description)}</span>` : ''}
+    <button class="secondary" style="padding:2px 8px;font-size:12px;flex-shrink:0" onclick="docsListCopyLink('${doc.doc_id}')" title="Copy Markdown link">🔗 Copy Link</button>
+    <button class="secondary" style="padding:2px 8px;font-size:12px;flex-shrink:0;color:#f87171" onclick="docsListDeleteDoc('${doc.doc_id}')" title="Delete document">🗑</button>
     <button class="secondary" style="padding:2px 8px;font-size:12px;flex-shrink:0" onclick="docsListOpenDoc('${doc.doc_id}')">Open</button>
   `;
   return row;
 }
 
 // ── List actions ──────────────────────────────────────────────────────────────
+
+function docsListCopyLink(docId) {
+  const doc = _docsAll.find(d => d.doc_id === docId);
+  if (!doc) return;
+  const base = doc.path ? doc.path.split('/').pop() : '';
+  const md = `[${doc.label}](${base})`;
+  navigator.clipboard.writeText(md).then(() => {
+    const status = document.getElementById('docs-status');
+    if (status) {
+      status.textContent = `\u2713 Copied: ${md}`;
+      status.style.color = 'var(--accent)';
+      status.hidden = false;
+      setTimeout(() => { status.hidden = true; }, 3000);
+    }
+  });
+}
+
+function docsListDeleteDoc(docId) {
+  // Route through the existing delete modal — temporarily set active doc
+  const prev = _docsActiveId;
+  _docsActiveId = docId;
+  openDeleteDocModal();
+  // If user cancels the modal the active doc may be wrong, so patch the modal's
+  // cancel button to restore it
+  const modal = document.getElementById('docs-delete-modal');
+  const cancelHandler = () => {
+    if (_docsActiveId === docId && docId !== prev) _docsActiveId = prev;
+    modal.removeEventListener('close', cancelHandler);
+  };
+  modal.addEventListener('close', cancelHandler);
+}
 
 function docsListOpenDoc(docId) {
   _docsListClose();
