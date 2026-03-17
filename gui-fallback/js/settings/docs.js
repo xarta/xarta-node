@@ -3,7 +3,8 @@
 let _docsAll       = [];   // array of DocOut records
 let _docsActiveId  = null; // currently open doc_id
 let _docsDirty     = false; // unsaved changes in the textarea
-let _docsPreview   = false; // preview mode active
+let _docsPreview   = false; // preview mode active for current doc (kept in sync with _docsViewModes)
+const _docsViewModes = {}; // doc_id → true (preview) | false (edit); default preview on first open
 
 // ── List view state ──────────────────────────────────────────────────────────
 let _docsGroups    = [];   // array of DocGroupOut records
@@ -79,7 +80,9 @@ async function docsSelectDoc(docId) {
     await docsSave(true /* silent */);
   }
   _docsActiveId = docId;
-  _docsPreview = false;
+  // Default to preview on first open; restore last-used mode on revisits
+  if (!(docId in _docsViewModes)) _docsViewModes[docId] = true;
+  _docsPreview = _docsViewModes[docId];
   _docsRenderSidebar();
   await _docsOpenDoc(docId);
 }
@@ -106,12 +109,20 @@ function _docsFillPane(doc) {
   const editor  = document.getElementById('docs-editor');
   const preview = document.getElementById('docs-preview');
   editor.value = doc.content || '';
-  // Reset to edit mode
-  editor.style.display  = 'block';
-  preview.style.display = 'none';
-  _docsPreview = false;
-  document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
   document.getElementById('docs-status').hidden = true;
+  // Apply stored view mode (default: preview)
+  if (_docsPreview) {
+    // Render preview immediately
+    preview.innerHTML = _mdToHtml(editor.value);
+    _docsResolvePrevImgs(preview);
+    editor.style.display  = 'none';
+    preview.style.display = 'block';
+    document.getElementById('docs-preview-btn').textContent = '\u270f Edit';
+  } else {
+    editor.style.display  = 'block';
+    preview.style.display = 'none';
+    document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
+  }
   // Track changes
   editor.oninput = () => { _docsDirty = true; };
 }
@@ -133,6 +144,7 @@ function _docsHidePane() {
   document.getElementById('docs-editor').style.display = 'block';
   _docsPreview = false;
   document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
+  // Note: do NOT clear _docsViewModes here — keep per-doc memory across hide/show cycles
 }
 
 // ── Save ─────────────────────────────────────────────────────────────────────
@@ -197,6 +209,8 @@ async function _docsImgBlobUrl(imageId) {
 
 async function docsTogglePreview() {
   _docsPreview = !_docsPreview;
+  // Remember the choice for this doc
+  if (_docsActiveId) _docsViewModes[_docsActiveId] = _docsPreview;
   const btn     = document.getElementById('docs-preview-btn');
   const editor  = document.getElementById('docs-editor');
   const preview = document.getElementById('docs-preview');
@@ -215,6 +229,10 @@ async function docsTogglePreview() {
 async function _docsRenderPreview() {
   const preview = document.getElementById('docs-preview');
   preview.innerHTML = _mdToHtml(document.getElementById('docs-editor').value);
+  await _docsResolvePrevImgs(preview);
+}
+
+async function _docsResolvePrevImgs(preview) {
   for (const img of preview.querySelectorAll('img[data-doc-img]')) {
     const url = await _docsImgBlobUrl(img.dataset.docImg);
     if (url) img.src = url;
@@ -571,7 +589,7 @@ function _docsRenderDocRow(doc) {
   row.innerHTML = `
     <span style="color:var(--text-dim);font-size:15px;user-select:none;cursor:grab">≡</span>
     <span style="flex:1;font-size:13px">${esc(doc.label)}</span>
-    ${doc.description ? `<span style="font-size:11px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(doc.description)}</span>` : ''}
+    ${doc.description ? `<span style="font-size:11px;color:var(--text-dim);flex:2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(doc.description)}</span>` : ''}
     <button class="secondary" style="padding:2px 8px;font-size:12px;flex-shrink:0" onclick="docsListOpenDoc('${doc.doc_id}')">Open</button>
   `;
   return row;
