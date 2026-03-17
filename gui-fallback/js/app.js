@@ -35,8 +35,7 @@ function switchTab(tab) {
   if (tab === 'settings'       && !_settings.length)      loadSettings();
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'certs')                                     loadCerts();
-  if (tab === 'assumptions')                               loadAssumptions();
-  if (tab === 'todo')                                      loadTodo();
+  if (tab === 'docs' && !_docsAll.length)                  loadDocs();
   // self-diag: just show the shell — user clicks Run to trigger tests
   // PCT live status polling — only while nodes tab is open
   if (tab === 'nodes') {

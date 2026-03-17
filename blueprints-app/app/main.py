@@ -53,6 +53,7 @@ from .routes_keys import router as keys_router
 from .routes_certs import router as certs_router
 from .routes_assumptions import router as assumptions_router
 from .routes_todo import router as todo_router
+from .routes_docs import router as docs_router
 from .routes_firewall import router as firewall_router
 from .sync.drain import start_drain_loop
 from .sync.queue import enqueue_for_all_peers
@@ -304,6 +305,7 @@ def create_app() -> FastAPI:
     application.include_router(gui_sync_router,       prefix="/api/v1")
     application.include_router(assumptions_router,    prefix="/api/v1")
     application.include_router(todo_router,           prefix="/api/v1")
+    application.include_router(docs_router,           prefix="/api/v1")
     application.include_router(firewall_router,        prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
