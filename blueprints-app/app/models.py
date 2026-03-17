@@ -783,6 +783,7 @@ class DocImageOut(BaseModel):
     image_id: str
     filename: str
     description: Optional[str] = None
+    tags: Optional[list[str]] = None
     file_size: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -790,6 +791,7 @@ class DocImageOut(BaseModel):
 
 class DocImageUpdate(BaseModel):
     description: Optional[str] = None
+    tags: Optional[list[str]] = None
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

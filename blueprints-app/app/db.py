@@ -394,6 +394,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("nodes",    "tailnet_hostname",       "TEXT"),
         # manual_links: physical/logical location label (2026-03-16)
         ("manual_links", "location",           "TEXT"),
+        # doc_images: user-defined tags for filtering (2026-03-17)
+        ("doc_images",   "tags",               "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

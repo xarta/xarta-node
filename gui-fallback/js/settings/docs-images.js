@@ -1,18 +1,25 @@
 // ── Docs Images Modal ────────────────────────────────────────────────────────
 // _docsImgCache  and  _docsImgBlobUrl()  are defined in docs.js (global scope)
 
-let _docImagesAll    = [];
-let _docImagesFilter = 'all'; // 'all' | 'unused'
-let _docImgDescTimers = {};
+let _docImagesAll      = [];
+let _docImagesFilter   = 'all'; // 'all' | 'unused'
+let _docImagesTagFilter = '';
+let _docImagesPage     = 0;
+const _DOC_IMG_PAGE_SIZE = 6;
+let _docImgDescTimers  = {};
 
 function openDocImagesModal() {
   document.getElementById('doc-images-modal').style.display = 'flex';
   document.getElementById('doc-img-upload-file').value       = '';
   document.getElementById('doc-img-upload-desc').value       = '';
-  _docImagesFilter = 'all';
+  _docImagesFilter    = 'all';
+  _docImagesTagFilter = '';
+  _docImagesPage      = 0;
   document.querySelectorAll('.doc-img-filter-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.filter === 'all');
   });
+  const tagSel = document.getElementById('doc-img-tag-filter');
+  if (tagSel) tagSel.value = '';
   _loadDocImages();
 }
 
@@ -33,21 +40,95 @@ async function _loadDocImages() {
 }
 
 function _docImagesSetFilter(f) {
-  _docImagesFilter = f;
+  _docImagesFilter    = f;
+  _docImagesTagFilter = '';
+  _docImagesPage      = 0;
+  const tagSel = document.getElementById('doc-img-tag-filter');
+  if (tagSel) tagSel.value = '';
   document.querySelectorAll('.doc-img-filter-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.filter === f);
   });
   _loadDocImages();
 }
 
+function _docImagesSetTagFilter(tag) {
+  _docImagesTagFilter = tag;
+  _docImagesPage      = 0;
+  _renderDocImagesList();
+}
+
+function _getAllTags() {
+  const set = new Set();
+  _docImagesAll.forEach(img => {
+    if (Array.isArray(img.tags)) img.tags.forEach(t => t && set.add(t));
+  });
+  return [...set].sort();
+}
+
 function _renderDocImagesList() {
   const list = document.getElementById('doc-images-list');
-  if (!_docImagesAll.length) {
+
+  // Apply tag filter on top of the already-fetched list
+  const items = _docImagesTagFilter
+    ? _docImagesAll.filter(img => Array.isArray(img.tags) && img.tags.includes(_docImagesTagFilter))
+    : _docImagesAll;
+
+  // Refresh tag filter select with live tags
+  const tagSel = document.getElementById('doc-img-tag-filter');
+  if (tagSel) {
+    const allTags = _getAllTags();
+    const cur = _docImagesTagFilter;
+    tagSel.innerHTML = '<option value="">All tags</option>';
+    allTags.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t; opt.textContent = t;
+      if (t === cur) opt.selected = true;
+      tagSel.appendChild(opt);
+    });
+  }
+
+  if (!items.length) {
     list.innerHTML = '<p style="color:var(--text-muted);padding:12px 0">No images found.</p>';
     return;
   }
+
+  // Paging
+  const totalPages = Math.ceil(items.length / _DOC_IMG_PAGE_SIZE);
+  if (_docImagesPage >= totalPages) _docImagesPage = Math.max(0, totalPages - 1);
+  const pageItems = items.slice(
+    _docImagesPage * _DOC_IMG_PAGE_SIZE,
+    (_docImagesPage + 1) * _DOC_IMG_PAGE_SIZE
+  );
+
   list.innerHTML = '';
-  _docImagesAll.forEach(img => list.appendChild(_buildImgRow(img)));
+  pageItems.forEach(img => list.appendChild(_buildImgRow(img)));
+
+  // Pagination controls
+  if (totalPages > 1) {
+    const pager = document.createElement('div');
+    pager.style.cssText =
+      'display:flex;align-items:center;justify-content:center;gap:10px;' +
+      'padding:12px 0 4px;border-top:1px solid var(--border);margin-top:4px';
+    const prevBtn = document.createElement('button');
+    prevBtn.className    = 'secondary';
+    prevBtn.style.cssText = 'padding:3px 12px';
+    prevBtn.textContent  = '‹ Prev';
+    prevBtn.disabled     = _docImagesPage === 0;
+    prevBtn.onclick      = () => { _docImagesPage--; _renderDocImagesList(); };
+    const info = document.createElement('span');
+    info.style.cssText = 'font-size:13px;color:var(--text-muted);min-width:90px;text-align:center';
+    info.textContent   = `Page ${_docImagesPage + 1} of ${totalPages}`;
+    const nextBtn = document.createElement('button');
+    nextBtn.className    = 'secondary';
+    nextBtn.style.cssText = 'padding:3px 12px';
+    nextBtn.textContent  = 'Next ›';
+    nextBtn.disabled     = _docImagesPage >= totalPages - 1;
+    nextBtn.onclick      = () => { _docImagesPage++; _renderDocImagesList(); };
+    pager.appendChild(prevBtn);
+    pager.appendChild(info);
+    pager.appendChild(nextBtn);
+    list.appendChild(pager);
+  }
 }
 
 function _buildImgRow(img) {
@@ -93,6 +174,46 @@ function _buildImgRow(img) {
     );
   });
 
+  // tags input + known-tag pills
+  const tagsWrap = document.createElement('div');
+  tagsWrap.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+  const tagsInput = document.createElement('input');
+  tagsInput.type        = 'text';
+  tagsInput.placeholder = 'Tags (comma-separated)…';
+  tagsInput.value       = Array.isArray(img.tags) ? img.tags.join(', ') : '';
+  tagsInput.style.cssText = 'width:100%;max-width:340px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:13px';
+  tagsInput.addEventListener('input', () => {
+    clearTimeout(_docImgDescTimers['tags_' + img.image_id]);
+    _docImgDescTimers['tags_' + img.image_id] = setTimeout(
+      () => _saveDocImgTags(img.image_id, tagsInput.value), 800
+    );
+  });
+  tagsWrap.appendChild(tagsInput);
+  const knownTags = _getAllTags();
+  if (knownTags.length) {
+    const pills = document.createElement('div');
+    pills.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px';
+    knownTags.forEach(tag => {
+      const pill = document.createElement('button');
+      pill.className    = 'secondary';
+      pill.style.cssText = 'font-size:10px;padding:1px 7px;border-radius:10px';
+      pill.textContent  = tag;
+      pill.onclick = () => {
+        const current = tagsInput.value.split(',').map(t => t.trim()).filter(Boolean);
+        if (!current.includes(tag)) {
+          current.push(tag);
+          tagsInput.value = current.join(', ');
+          clearTimeout(_docImgDescTimers['tags_' + img.image_id]);
+          _docImgDescTimers['tags_' + img.image_id] = setTimeout(
+            () => _saveDocImgTags(img.image_id, tagsInput.value), 800
+          );
+        }
+      };
+      pills.appendChild(pill);
+    });
+    tagsWrap.appendChild(pills);
+  }
+
   // markdown snippet row
   const snipRow = document.createElement('div');
   snipRow.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap';
@@ -127,6 +248,7 @@ function _buildImgRow(img) {
 
   meta.appendChild(nameRow);
   meta.appendChild(descInput);
+  meta.appendChild(tagsWrap);
   meta.appendChild(snipRow);
   meta.appendChild(delContainer);
 
@@ -198,6 +320,30 @@ async function _saveDocImgDesc(imageId, description) {
   });
 }
 
+async function _saveDocImgTags(imageId, tagsStr) {
+  const tags = tagsStr.split(',').map(t => t.trim()).filter(Boolean);
+  const img = _docImagesAll.find(i => i.image_id === imageId);
+  if (img) img.tags = tags;
+  await apiFetch(`/api/v1/doc-images/${imageId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tags }),
+  });
+  // Refresh tag filter select to pick up any newly created tags
+  const tagSel = document.getElementById('doc-img-tag-filter');
+  if (tagSel) {
+    const allTags = _getAllTags();
+    const cur = tagSel.value;
+    tagSel.innerHTML = '<option value="">All tags</option>';
+    allTags.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t; opt.textContent = t;
+      if (t === cur) opt.selected = true;
+      tagSel.appendChild(opt);
+    });
+  }
+}
+
 async function submitDocImageUpload() {
   const fileInput = document.getElementById('doc-img-upload-file');
   const desc      = document.getElementById('doc-img-upload-desc').value.trim();
@@ -223,11 +369,10 @@ async function submitDocImageUpload() {
     // copy snippet to clipboard automatically
     const mdSnip = `![${newImg.filename}](/api/v1/doc-images/${newImg.image_id}/file)`;
     navigator.clipboard.writeText(mdSnip).catch(() => {});
-    // prepend to list
+    // prepend to list and re-render respecting paging
     _docImagesAll.unshift(newImg);
-    const list = document.getElementById('doc-images-list');
-    const row  = _buildImgRow(newImg);
-    list.insertBefore(row, list.firstChild);
+    _docImagesPage = 0;
+    _renderDocImagesList();
     setTimeout(() => { statusEl.textContent = ''; }, 3000);
   } catch (e) {
     statusEl.textContent = 'Error: ' + e.message;
