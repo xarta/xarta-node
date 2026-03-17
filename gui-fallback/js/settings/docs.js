@@ -599,7 +599,12 @@ function _docsRenderDocRow(doc) {
 
 function docsListOpenDoc(docId) {
   _docsListClose();
-  docsSelectDoc(docId);
+  if (docId === _docsActiveId) {
+    // docsSelectDoc would bail early — force a fresh load instead
+    _docsOpenDoc(docId);
+  } else {
+    docsSelectDoc(docId);
+  }
 }
 
 async function docsListAddGroup() {
