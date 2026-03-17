@@ -46,8 +46,7 @@
     <button data-group="settings" style="display:none" onclick="switchTab('nodes')">Nodes</button>
     <button data-group="settings" style="display:none" onclick="switchTab('keys')">&#9871; Keys</button>
     <button data-group="settings" style="display:none" onclick="switchTab('certs')">&#128274; Certs</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('assumptions')">Basic Assumptions</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('todo')">TODO</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('docs')">&#128196; Docs</button>
     <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
     <!-- PROBES group -->
     <button data-group="probes" style="display:none" onclick="switchTab('pfsense-dns')">pfSense DNS</button>
@@ -86,69 +85,61 @@
     <p id="settings-error" class="error-msg" hidden></p>
   </section>
 
-  <!-- Assumptions -->
-  <section id="tab-assumptions" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
-      <div>
-        <h2 style="margin:0">Basic Assumptions</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Saved to the private repo — distributed via fleet-pull-private. Documents dependencies, ACL requirements, symptoms etc.</p>
+  <!-- Docs -->
+  <section id="tab-docs" class="tab-panel">
+    <div style="display:flex;flex-direction:column;height:100%">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <div>
+          <h2 style="margin:0">Docs</h2>
+          <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Markdown documents saved to the private repo — distributed via fleet-pull-private. Click a document in the sidebar to edit it.</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+          <button onclick="openNewDocModal()">+ New Doc</button>
+          <button class="secondary" onclick="loadDocs()">&#8635; Refresh</button>
+        </div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
-        <button id="assumptions-preview-btn" class="secondary" onclick="assumptionsTogglePreview()">&#128065; Preview</button>
-        <button id="assumptions-save-btn" onclick="assumptionsSave()">&#128190; Save</button>
-        <button class="secondary" onclick="loadAssumptions()">&#8635; Refresh</button>
+      <p id="docs-error" class="error-msg" hidden></p>
+      <div style="display:flex;gap:12px;flex:1;min-height:0;align-items:flex-start">
+        <!-- Sidebar: docs tagged "menu" in sort order -->
+        <div id="docs-sidebar" style="width:170px;flex-shrink:0;display:flex;flex-direction:column;gap:4px"></div>
+        <!-- Editor pane (shown when a doc is open) -->
+        <div id="docs-editor-pane" style="flex:1;display:flex;flex-direction:column;min-width:0" hidden>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+            <div>
+              <div id="docs-active-label" style="font-size:16px;font-weight:700;color:var(--text)"></div>
+              <div id="docs-active-desc"  style="font-size:12px;color:var(--text-dim);margin-top:2px"></div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
+              <button id="docs-preview-btn" class="secondary" onclick="docsTogglePreview()">&#128065; Preview</button>
+              <button id="docs-save-btn" onclick="docsSave()">&#128190; Save</button>
+              <button class="secondary" onclick="docsRefreshContent()">&#8635; Refresh</button>
+              <button class="secondary" onclick="openEditDocModal()">&#9998; Meta</button>
+              <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
+            </div>
+          </div>
+          <p id="docs-status" style="font-size:12px;margin:0 0 8px" hidden></p>
+          <div id="docs-content-wrap" style="flex:1;display:flex;flex-direction:column">
+            <textarea id="docs-editor"
+              placeholder="# Document title&#10;&#10;Start writing here..."
+              style="flex:1;width:100%;box-sizing:border-box;resize:none;
+                     font-family:monospace;font-size:13px;line-height:1.6;
+                     background:var(--surface);color:var(--text);
+                     border:1px solid var(--border);border-radius:var(--radius);
+                     padding:14px 16px;outline:none;
+                     min-height:calc(100vh - 310px)"></textarea>
+            <div id="docs-preview"
+              style="display:none;flex:1;overflow:auto;
+                     background:var(--surface);border:1px solid var(--border);
+                     border-radius:var(--radius);padding:18px 24px;
+                     font-size:14px;line-height:1.75;color:var(--text);
+                     min-height:calc(100vh - 310px)"></div>
+          </div>
+        </div>
+        <!-- Empty state -->
+        <div id="docs-empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:14px;padding:40px 0">
+          Select a document from the sidebar, or create a new one.
+        </div>
       </div>
-    </div>
-    <p id="assumptions-status" style="font-size:12px;margin:0 0 8px" hidden></p>
-    <p id="assumptions-error" class="error-msg" hidden></p>
-    <div id="assumptions-editor-wrap" style="flex:1;display:flex;flex-direction:column">
-      <textarea id="assumptions-editor"
-        placeholder="# Basic Assumptions&#10;&#10;Document ACL requirements, dependencies, and troubleshooting notes here..."
-        style="flex:1;width:100%;box-sizing:border-box;resize:none;
-               font-family:monospace;font-size:13px;line-height:1.6;
-               background:var(--surface);color:var(--text);
-               border:1px solid var(--border);border-radius:var(--radius);
-               padding:14px 16px;outline:none;
-               min-height:calc(100vh - 260px)"></textarea>
-      <div id="assumptions-preview"
-        style="display:none;flex:1;overflow:auto;
-               background:var(--surface);border:1px solid var(--border);
-               border-radius:var(--radius);padding:18px 24px;
-               font-size:14px;line-height:1.75;color:var(--text);
-               min-height:calc(100vh - 260px)"></div>
-    </div>
-  </section>
-
-  <!-- TODO -->
-  <section id="tab-todo" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
-      <div>
-        <h2 style="margin:0">TODO</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Saved to the private repo — distributed via fleet-pull-private. Track tasks, work in progress, and pending items.</p>
-      </div>
-      <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
-        <button id="todo-preview-btn" class="secondary" onclick="todoTogglePreview()">&#128065; Preview</button>
-        <button id="todo-save-btn" onclick="todoSave()">&#128190; Save</button>
-        <button class="secondary" onclick="loadTodo()">&#8635; Refresh</button>
-      </div>
-    </div>
-    <p id="todo-status" style="font-size:12px;margin:0 0 8px" hidden></p>
-    <p id="todo-error" class="error-msg" hidden></p>
-    <div id="todo-editor-wrap" style="flex:1;display:flex;flex-direction:column">
-      <textarea id="todo-editor"
-        placeholder="# TODO&#10;&#10;Track tasks, work in progress, and pending items here..."
-        style="flex:1;width:100%;box-sizing:border-box;resize:none;
-               font-family:monospace;font-size:13px;line-height:1.6;
-               background:var(--surface);color:var(--text);
-               border:1px solid var(--border);border-radius:var(--radius);
-               padding:14px 16px;outline:none;
-               min-height:calc(100vh - 260px)"></textarea>
-      <div id="todo-preview"
-        style="display:none;flex:1;overflow:auto;
-               background:var(--surface);border:1px solid var(--border);
-               border-radius:var(--radius);padding:18px 24px;
-               font-size:14px;line-height:1.75;color:var(--text);
-               min-height:calc(100vh - 260px)"></div>
     </div>
   </section>
 
@@ -813,6 +804,60 @@
   <p id="setting-error" class="error-msg" hidden></p>
 </dialog>
 
+<!-- New / Edit doc modal -->
+<dialog id="docs-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:400px;max-width:520px;">
+  <h2 id="docs-modal-title" style="margin-bottom:16px;">New Document</h2>
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <label>Label (display name)
+      <input type="text" id="docs-modal-label" placeholder="e.g. Basic Assumptions" style="width:100%;margin-top:4px;" />
+    </label>
+    <label>Description
+      <input type="text" id="docs-modal-desc" placeholder="Short subtitle or explanation" style="width:100%;margin-top:4px;" />
+    </label>
+    <label>Tags <span style="font-size:11px;color:var(--text-dim)">(comma-separated; use &ldquo;menu&rdquo; to show in sidebar)</span>
+      <input type="text" id="docs-modal-tags" placeholder="menu,ops" style="width:100%;margin-top:4px;" />
+    </label>
+    <label>File path <span style="font-size:11px;color:var(--text-dim)">(relative to private repo root)</span>
+      <input type="text" id="docs-modal-path" placeholder="docs/my-doc.md" style="width:100%;margin-top:4px;" />
+    </label>
+    <label>Sort order
+      <input type="number" id="docs-modal-order" value="0" style="width:80px;margin-top:4px;" />
+    </label>
+    <div id="docs-modal-init-row">
+      <label>Initial content <span style="font-size:11px;color:var(--text-dim)">(optional — leave blank for heading-only stub)</span>
+        <textarea id="docs-modal-initial" rows="4"
+          placeholder="# My Document&#10;&#10;Notes go here..."
+          style="width:100%;margin-top:4px;font-family:monospace;font-size:12px;
+                 background:var(--bg);color:var(--text);border:1px solid var(--border);
+                 border-radius:var(--radius);padding:8px;box-sizing:border-box"></textarea>
+      </label>
+    </div>
+  </div>
+  <p id="docs-modal-error" class="error-msg" hidden></p>
+  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('docs-modal').close()">Cancel</button>
+    <button id="docs-modal-submit" onclick="_docsModalSubmit()">Create</button>
+  </div>
+</dialog>
+
+<!-- Delete doc confirmation modal -->
+<dialog id="docs-delete-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;max-width:480px;">
+  <h2 style="margin-bottom:12px;">Delete document?</h2>
+  <p>Remove <strong id="docs-delete-name"></strong> from the docs index.</p>
+  <p style="font-size:12px;color:var(--text-dim);margin-top:4px">File: <code id="docs-delete-path"></code></p>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;cursor:pointer">
+    <input type="checkbox" id="docs-delete-file-chk" />
+    Also delete the file from disk
+  </label>
+  <p id="docs-delete-error" class="error-msg" hidden></p>
+  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+    <button class="secondary" onclick="document.getElementById('docs-delete-modal').close()">Cancel</button>
+    <button id="docs-delete-confirm-btn" style="background:#dc2626" onclick="submitDeleteDoc()">Delete</button>
+  </div>
+</dialog>
+
 <script src="js/utils.js"></script>
 <script src="js/api.js"></script>
 <script src="js/state.js"></script>
@@ -826,8 +871,7 @@
 <script src="js/settings/nodes.js"></script>
 <script src="js/settings/keys.js"></script>
 <script src="js/settings/certs.js"></script>
-<script src="js/settings/assumptions.js"></script>
-<script src="js/settings/todo.js"></script>
+<script src="js/settings/docs.js"></script>
 <script src="js/settings/self-diag.js"></script>
 <script src="js/settings/settings.js"></script>
 <script src="js/settings/pve-hosts.js"></script>

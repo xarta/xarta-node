@@ -738,6 +738,47 @@ class FirewallProbeOut(BaseModel):
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
+# ── Docs ─────────────────────────────────────────────────────────────────────
+
+class DocCreate(BaseModel):
+    label: str
+    description: Optional[str] = None
+    tags: Optional[str] = None          # comma-separated, e.g. "menu,ops"
+    path: str                           # relative path from REPO_INNER_PATH
+    sort_order: int = 0
+    initial_content: Optional[str] = None  # written to file on create if provided
+
+
+class DocUpdate(BaseModel):
+    label: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[str] = None
+    path: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class DocOut(BaseModel):
+    doc_id: str
+    label: str
+    description: Optional[str] = None
+    tags: Optional[str] = None
+    path: str
+    sort_order: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DocWithContent(DocOut):
+    content: Optional[str] = None
+    file_exists: bool = False
+
+
+class DocContentBody(BaseModel):
+    content: str
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
 class HealthOut(BaseModel):
     status: str
     node_id: str

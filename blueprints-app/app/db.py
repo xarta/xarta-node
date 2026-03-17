@@ -299,6 +299,18 @@ CREATE TABLE IF NOT EXISTS manual_links (
 CREATE INDEX IF NOT EXISTS idx_manual_links_group  ON manual_links(group_name);
 CREATE INDEX IF NOT EXISTS idx_manual_links_parent ON manual_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_manual_links_sort   ON manual_links(sort_order);
+
+CREATE TABLE IF NOT EXISTS docs (
+    doc_id      TEXT PRIMARY KEY,   -- UUID
+    label       TEXT NOT NULL,      -- display name shown in sidebar
+    description TEXT,               -- short subtitle / explanation
+    tags        TEXT,               -- comma-separated tags; "menu" = show in docs navbar
+    path        TEXT NOT NULL,      -- path relative to REPO_INNER_PATH (e.g. "docs/ASSUMPTIONS.md")
+    sort_order  INTEGER DEFAULT 0,  -- ordering within the sidebar
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_docs_sort ON docs(sort_order, label);
 """
 
 _SEED_SQL = """
