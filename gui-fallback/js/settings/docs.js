@@ -35,14 +35,15 @@ function _docsRenderSidebar() {
     .sort((a, b) => (a.sort_order - b.sort_order) || a.label.localeCompare(b.label));
   sidebar.innerHTML = '';
   if (!menuDocs.length) {
-    sidebar.innerHTML = '<p style="font-size:12px;color:var(--text-dim);padding:4px 8px">No docs tagged "menu".</p>';
+    sidebar.innerHTML = '<span style="font-size:12px;color:var(--text-dim)">No docs tagged "menu".</span>';
     return;
   }
   menuDocs.forEach(doc => {
     const btn = document.createElement('button');
-    btn.className = 'docs-nav-item' + (doc.doc_id === _docsActiveId ? ' active' : '');
-    btn.style.cssText = 'width:100%;text-align:left;padding:7px 10px;font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.15s';
-    if (doc.doc_id === _docsActiveId) {
+    const isActive = doc.doc_id === _docsActiveId;
+    btn.className = 'secondary' + (isActive ? ' active' : '');
+    btn.style.cssText = 'padding:4px 12px;font-size:13px;white-space:nowrap';
+    if (isActive) {
       btn.style.background = 'var(--accent)';
       btn.style.color = '#fff';
       btn.style.borderColor = 'var(--accent)';
@@ -96,9 +97,6 @@ function _docsFillPane(doc) {
   _docsPreview = false;
   document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
   document.getElementById('docs-status').hidden = true;
-  // Show pane, hide empty state
-  document.getElementById('docs-editor-pane').hidden = false;
-  document.getElementById('docs-empty-state').hidden  = true;
   // Track changes
   editor.oninput = () => { _docsDirty = true; };
 }
@@ -109,13 +107,17 @@ function _docsShowPane(docId) {
   if (!doc) return;
   document.getElementById('docs-active-label').textContent = doc.label;
   document.getElementById('docs-active-desc').textContent  = doc.description || '';
-  document.getElementById('docs-editor-pane').hidden = false;
-  document.getElementById('docs-empty-state').hidden  = true;
 }
 
 function _docsHidePane() {
-  document.getElementById('docs-editor-pane').hidden = true;
-  document.getElementById('docs-empty-state').hidden  = false;
+  document.getElementById('docs-active-label').textContent = '';
+  document.getElementById('docs-active-desc').textContent  = '';
+  document.getElementById('docs-editor').value = '';
+  document.getElementById('docs-preview').innerHTML = '';
+  document.getElementById('docs-preview').style.display = 'none';
+  document.getElementById('docs-editor').style.display = 'block';
+  _docsPreview = false;
+  document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
 }
 
 // ── Save ─────────────────────────────────────────────────────────────────────

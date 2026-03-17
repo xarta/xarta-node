@@ -87,58 +87,46 @@
 
   <!-- Docs -->
   <section id="tab-docs" class="tab-panel">
-    <div style="display:flex;flex-direction:column;height:100%">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-        <div>
-          <h2 style="margin:0">Docs</h2>
-          <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Markdown documents saved to the private repo — distributed via fleet-pull-private. Click a document in the sidebar to edit it.</p>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+    <div style="display:flex;flex-direction:column">
+      <!-- Row 1: doc nav + action buttons all in one line -->
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <!-- Horizontal doc navbar -->
+        <div id="docs-sidebar" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;flex:1;min-width:0"></div>
+        <!-- Action buttons (always shown) -->
+        <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
+          <button id="docs-preview-btn" class="secondary" onclick="docsTogglePreview()">&#128065; Preview</button>
+          <button id="docs-save-btn" onclick="docsSave()">&#128190; Save</button>
+          <button class="secondary" onclick="docsRefreshContent()">&#8635; Refresh</button>
+          <button class="secondary" onclick="openEditDocModal()">&#9998; Meta</button>
+          <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
           <button onclick="openNewDocModal()">+ New Doc</button>
-          <button class="secondary" onclick="loadDocs()">&#8635; Refresh</button>
+          <button class="secondary" onclick="loadDocs()">&#8635;</button>
         </div>
       </div>
-      <p id="docs-error" class="error-msg" hidden></p>
-      <div style="display:flex;gap:12px;flex:1;min-height:0;align-items:flex-start">
-        <!-- Sidebar: docs tagged "menu" in sort order -->
-        <div id="docs-sidebar" style="width:170px;flex-shrink:0;display:flex;flex-direction:column;gap:4px"></div>
-        <!-- Editor pane (shown when a doc is open) -->
-        <div id="docs-editor-pane" style="flex:1;display:flex;flex-direction:column;min-width:0" hidden>
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-            <div>
-              <div id="docs-active-label" style="font-size:16px;font-weight:700;color:var(--text)"></div>
-              <div id="docs-active-desc"  style="font-size:12px;color:var(--text-dim);margin-top:2px"></div>
-            </div>
-            <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-              <button id="docs-preview-btn" class="secondary" onclick="docsTogglePreview()">&#128065; Preview</button>
-              <button id="docs-save-btn" onclick="docsSave()">&#128190; Save</button>
-              <button class="secondary" onclick="docsRefreshContent()">&#8635; Refresh</button>
-              <button class="secondary" onclick="openEditDocModal()">&#9998; Meta</button>
-              <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
-            </div>
-          </div>
-          <p id="docs-status" style="font-size:12px;margin:0 0 8px" hidden></p>
-          <div id="docs-content-wrap" style="flex:1;display:flex;flex-direction:column">
-            <textarea id="docs-editor"
-              placeholder="# Document title&#10;&#10;Start writing here..."
-              style="flex:1;width:100%;box-sizing:border-box;resize:none;
-                     font-family:monospace;font-size:13px;line-height:1.6;
-                     background:var(--surface);color:var(--text);
-                     border:1px solid var(--border);border-radius:var(--radius);
-                     padding:14px 16px;outline:none;
-                     min-height:calc(100vh - 310px)"></textarea>
-            <div id="docs-preview"
-              style="display:none;flex:1;overflow:auto;
-                     background:var(--surface);border:1px solid var(--border);
-                     border-radius:var(--radius);padding:18px 24px;
-                     font-size:14px;line-height:1.75;color:var(--text);
-                     min-height:calc(100vh - 310px)"></div>
-          </div>
+      <!-- Status / error row -->
+      <p id="docs-status" style="font-size:12px;margin:0 0 4px" hidden></p>
+      <p id="docs-error"  class="error-msg" hidden></p>
+      <!-- Active doc header (label + description) -->
+      <div id="docs-editor-pane" style="display:flex;flex-direction:column">
+        <div style="margin-bottom:6px">
+          <div id="docs-active-label" style="font-size:15px;font-weight:700;color:var(--text)"></div>
+          <div id="docs-active-desc"  style="font-size:12px;color:var(--text-dim);margin-top:1px"></div>
         </div>
-        <!-- Empty state -->
-        <div id="docs-empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:14px;padding:40px 0">
-          Select a document from the sidebar, or create a new one.
-        </div>
+        <!-- Editor / preview fills remaining vertical space -->
+        <textarea id="docs-editor"
+          placeholder="# Document title&#10;&#10;Start writing here..."
+          style="width:100%;box-sizing:border-box;resize:vertical;
+                 font-family:monospace;font-size:13px;line-height:1.6;
+                 background:var(--surface);color:var(--text);
+                 border:1px solid var(--border);border-radius:var(--radius);
+                 padding:14px 16px;outline:none;
+                 min-height:calc(100vh - 220px)"></textarea>
+        <div id="docs-preview"
+          style="display:none;overflow:auto;
+                 background:var(--surface);border:1px solid var(--border);
+                 border-radius:var(--radius);padding:18px 24px;
+                 font-size:14px;line-height:1.75;color:var(--text);
+                 min-height:calc(100vh - 220px)"></div>
       </div>
     </div>
   </section>
