@@ -23,12 +23,6 @@
     </div>
   </div>
   <div class="header-right">
-    <nav class="group-tabs">
-      <button class="group-tab active" onclick="switchGroup('synthesis')">Synthesis</button>
-      <button class="group-tab" onclick="switchGroup('probes')">Probes</button>
-      <button class="group-tab" onclick="switchGroup('settings')">Settings</button>
-    </nav>
-    <button class="secondary" onclick="openApiKeyModal()" title="Configure API key" style="padding:4px 8px;font-size:14px;flex-shrink:0;">🔑</button>
     <blueprints-node-selector></blueprints-node-selector>
   </div>
 </header>
@@ -890,6 +884,17 @@
 
 <!-- Node-selector component — source lives in gui-embed/ (public outer repo).
      Served here via a symlink created by setup-blueprints.sh. -->
+<script>
+  window.BLUEPRINTS_SELECTOR_BUTTONS = {
+    pages: [
+      ['ui', 'synthesis', 'probes', 'settings'],
+      ['api-key', 'database-tables', 'database-diagram'],
+    ],
+    showPagingButton: true,
+    side: 'left',
+    nodeSwitchPath: '/ui/',
+  };
+</script>
 <link  rel="stylesheet" href="embed/blueprints-node-selector.css" />
 <script src="embed/blueprints-node-selector.js"></script>
 

@@ -6,7 +6,7 @@
  *   window.BLUEPRINTS_API_BASE
  *   window.BLUEPRINTS_SEED_NODES
  *   window.BLUEPRINTS_SELECTOR_BUTTONS = {
- *     enabledButtons: ['ui', 'fallback-ui', 'database-tables', 'database-diagram', 'paging-button'],
+ *     enabledButtons: ['ui', 'synthesis', 'probes', 'settings', 'api-key', 'database-tables', 'database-diagram', 'paging-button'],
  *     side: 'left' | 'right',
  *     pageSize: 4,
  *     nodeSwitchPath: '/ui/' | 'current'
@@ -37,10 +37,25 @@
   };
 
   const BUTTON_DEFS = {
-    'fallback-ui': { icon: '🧰', label: 'Fallback UI', buildPath: () => '/fallback-ui/' },
-    'ui': { icon: '🏠', label: 'UI', buildPath: () => '/' },
-    'database-tables': { icon: '🗂️', label: 'Database Tables', buildPath: () => `${getDbBasePath()}/database-tables.html` },
+    'fallback-ui':      { icon: '🧰', label: 'Fallback UI',      buildPath: () => '/fallback-ui/' },
+    'ui':               { icon: '🏠', label: 'UI',               buildPath: () => '/' },
+    'synthesis':        { icon: '📋', label: 'Synthesis',        buildPath: () => '/fallback-ui/' },
+    'probes':           { icon: '📡', label: 'Probes',           buildPath: () => '/fallback-ui/?group=probes' },
+    'settings':         { icon: '⚙️',  label: 'Settings',         buildPath: () => '/fallback-ui/?group=settings' },
+    'database-tables':  { icon: '🗂️', label: 'Database Tables',  buildPath: () => `${getDbBasePath()}/database-tables.html` },
     'database-diagram': { icon: '🕸️', label: 'Database Diagram', buildPath: () => `${getDbBasePath()}/database-diagram.html` },
+    'api-key': {
+      icon: '🔑', label: 'API Key',
+      doAction() {
+        if (typeof window.openApiKeyModal === 'function') {
+          window.openApiKeyModal();
+        } else {
+          const cur = localStorage.getItem('blueprints_api_secret') || '';
+          const v = prompt('Blueprints API Key\n\nEnter your BLUEPRINTS_API_SECRET (64-char hex):', cur);
+          if (v !== null && v.trim()) localStorage.setItem('blueprints_api_secret', v.trim());
+        }
+      },
+    },
   };
 
   const LS_NODES = 'bp_nodes_v2';
@@ -586,6 +601,7 @@
         }
         const def = BUTTON_DEFS[action];
         if (!def) return;
+        if (typeof def.doAction === 'function') { def.doAction(); return; }
         navigateToNodePath(def.buildPath());
       });
     });
