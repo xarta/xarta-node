@@ -812,5 +812,38 @@ function _inlineMd(s) {
       const m = src.match(/\/api\/v1\/doc-images\/([a-f0-9-]+)\/file/);
       return `<img${m ? ` data-doc-img="${m[1]}"` : ''} src="${src}" alt="${alt}" style="max-width:100%;border-radius:4px;margin:8px 0;display:block" />`;
     })
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">$1</a>');
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, href) => {
+      // Internal doc link: relative .md path that isn't an absolute URL
+      const isDocLink = href && !href.match(/^https?:\/\/|^\/\//) && /\.md$/i.test(href);
+      if (isDocLink) {
+        const safeHref = href.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+        return `<a href="#" onclick="docsOpenByPath('${safeHref}'); return false;" style="color:var(--accent);text-decoration:underline;text-decoration-style:dashed" title="Open: ${href}">${text}</a>`;
+      }
+      return `<a href="${href}" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    });
+}
+
+// Navigate to a doc by relative path or basename (called from inline preview links)
+function docsOpenByPath(href) {
+  const base = href.split('/').pop().toLowerCase();
+  const doc = _docsAll.find(d => {
+    if (!d.path) return false;
+    return d.path.toLowerCase() === href.toLowerCase() ||
+           d.path.split('/').pop().toLowerCase() === base;
+  });
+  if (!doc) {
+    const status = document.getElementById('docs-status');
+    if (status) {
+      status.textContent = `\u2717 Doc not found: ${href}`;
+      status.style.color = '#f87171';
+      status.hidden = false;
+      setTimeout(() => { status.hidden = true; }, 4000);
+    }
+    return;
+  }
+  if (doc.doc_id === _docsActiveId) {
+    _docsOpenDoc(doc.doc_id);
+  } else {
+    docsSelectDoc(doc.doc_id);
+  }
 }
