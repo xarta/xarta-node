@@ -142,7 +142,7 @@ function _docsHidePane() {
   document.getElementById('docs-preview').innerHTML = '';
   document.getElementById('docs-preview').style.display = 'none';
   document.getElementById('docs-editor').style.display = 'block';
-  _docsPreview = false;
+  // Note: do NOT reset _docsPreview here — per-doc view mode is managed by _docsViewModes
   document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
   // Note: do NOT clear _docsViewModes here — keep per-doc memory across hide/show cycles
 }
