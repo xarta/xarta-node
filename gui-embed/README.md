@@ -16,6 +16,7 @@ health-checks them every 10 s, and fails over automatically.
 |---|---|
 | `blueprints-node-selector.js` | The web component (no build step, no dependencies) |
 | `blueprints-node-selector.css` | Component styles |
+| `blueprints-auth.js` | TOTP auth helper — defines `window.apiFetch`; required on any site that doesn't define its own |
 | `embed.html` | Standalone demo page |
 | `config.example.js` | Config template — copy to `config.js` and edit |
 | `config.js` | Your site-specific config (gitignored) |
@@ -34,11 +35,14 @@ health-checks them every 10 s, and fails over automatically.
 
 <!-- Load assets directly from the node (always up to date) -->
 <link  rel="stylesheet" href="http://<your-node-ip>:8080/ui/embed/blueprints-node-selector.css" />
+<script src="http://<your-node-ip>:8080/ui/embed/blueprints-auth.js"></script>
 <script src="http://<your-node-ip>:8080/ui/embed/blueprints-node-selector.js"></script>
 
 <!-- Place the element wherever you want the selector to appear -->
 <blueprints-node-selector></blueprints-node-selector>
 ```
+
+`blueprints-auth.js` handles TOTP authentication. On any site that doesn't already define `window.apiFetch`, it installs one that reads the API secret from `localStorage` (key `blueprints_api_secret`) and derives a time-based token for each request. On a 401 it prompts for the secret once and caches it. The main Blueprints GUI defines its own `apiFetch` — if both scripts are present, `blueprints-auth.js` detects this and does nothing, so there is no conflict.
 
 That's it. The component discovers all peer nodes from the API and keeps
 itself up to date — no extra configuration needed unless you want seed nodes.
