@@ -175,3 +175,88 @@ KEY_CONFIGS: dict[str, dict] = {
     },
 }
 
+# ── Certificate configuration ──────────────────────────────────────────────────
+# CERTS_DIR: where cert/key files live.  Defaults to REPO_INNER_PATH/.certs
+# (set by setup-certificates.sh).  The directory is gitignored in the private
+# inner repo — cert material never enters any public or private git repo.
+CERTS_DIR: str = os.environ.get(
+    "CERTS_DIR",
+    os.path.join(REPO_INNER_PATH, ".certs") if REPO_INNER_PATH else "",
+)
+
+# Maps a stable id → metadata for each cert/key slot.
+# - env_var:      env var that holds the absolute path to the file.
+# - default_name: used when env var is not set; resolved relative to CERTS_DIR.
+# - mode:         file permission bits (0o600 for keys, 0o644 for certs/CAs).
+# - kind:         "cert" | "key" | "ca"
+# - group:        "caddy" | "mtls" — used by the GUI for visual grouping.
+# - description:  shown in the GUI.
+CERT_CONFIGS: dict[str, dict] = {
+    "cert_ca": {
+        "label": "Caddy CA Certificate",
+        "env_var": "CERT_CA",
+        "default_name": "local-ca.crt",
+        "mode": 0o644,
+        "kind": "ca",
+        "group": "caddy",
+        "description": (
+            "CA that signed the Caddy TLS certificate. "
+            "Installed into the system trust store on upload."
+        ),
+    },
+    "caddy_cert": {
+        "label": "Caddy Server Cert",
+        "env_var": "CERT_FILE",
+        "default_name": "caddy-server.crt",
+        "mode": 0o644,
+        "kind": "cert",
+        "group": "caddy",
+        "description": (
+            "TLS certificate served by Caddy on port 443. "
+            "Replace to update the node HTTPS certificate."
+        ),
+    },
+    "caddy_key": {
+        "label": "Caddy Server Key",
+        "env_var": "CERT_KEY",
+        "default_name": "caddy-server.key",
+        "mode": 0o600,
+        "kind": "key",
+        "group": "caddy",
+        "description": "Private key for the Caddy TLS certificate.",
+    },
+    "sync_tls_ca": {
+        "label": "Fleet CA (mTLS)",
+        "env_var": "SYNC_TLS_CA",
+        "default_name": "fleet-ca.crt",
+        "mode": 0o644,
+        "kind": "ca",
+        "group": "mtls",
+        "description": (
+            "Fleet Certificate Authority for mTLS node-to-node sync (port 8443). "
+            "Installed into the system trust store on upload."
+        ),
+    },
+    "sync_tls_cert": {
+        "label": "mTLS Node Cert",
+        "env_var": "SYNC_TLS_CERT",
+        "default_name": f"{NODE_ID}.crt",
+        "mode": 0o644,
+        "kind": "cert",
+        "group": "mtls",
+        "description": (
+            "Node certificate for mTLS sync transport (port 8443). "
+            "Must include VLAN42 and Tailscale IP SANs."
+        ),
+    },
+    "sync_tls_key": {
+        "label": "mTLS Node Key",
+        "env_var": "SYNC_TLS_KEY",
+        "default_name": f"{NODE_ID}.key",
+        "mode": 0o600,
+        "kind": "key",
+        "group": "mtls",
+        "description": "Private key for the mTLS node certificate.",
+    },
+}
+

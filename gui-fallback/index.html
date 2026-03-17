@@ -45,6 +45,7 @@
     <button data-group="settings" style="display:none" onclick="switchTab('arp-manual')">Manual ARP</button>
     <button data-group="settings" style="display:none" onclick="switchTab('nodes')">Nodes</button>
     <button data-group="settings" style="display:none" onclick="switchTab('keys')">&#9871; Keys</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('certs')">&#128274; Certs</button>
     <button data-group="settings" style="display:none" onclick="switchTab('assumptions')">Basic Assumptions</button>
     <button data-group="settings" style="display:none" onclick="switchTab('todo')">TODO</button>
     <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
@@ -581,6 +582,44 @@
     </div>
   </section>
 
+  <!-- Certs -->
+  <section id="tab-certs" class="tab-panel">
+    <h2>Certificates</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Manage TLS certificates on this node. Certificates are stored in <strong><span id="certs-dir-hint"></span></strong> and are never committed to any git repository.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Upload only &mdash; no download. CA certificates are installed into the system trust store automatically on upload.</p>
+
+    <!-- Status table -->
+    <div class="table-wrap" style="margin-bottom:20px;">
+      <table>
+        <thead><tr>
+          <th>Name</th><th>Env Var</th><th>Path</th><th>Status</th><th>Details</th><th>Action</th>
+        </tr></thead>
+        <tbody id="certs-status-tbody"><tr class="empty-row"><td colspan="6">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+    <p id="certs-status-error" class="error-msg" hidden></p>
+
+    <!-- Upload panel (shown when Upload button is clicked) -->
+    <div id="certs-upload-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 id="certs-upload-title" style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0;">Upload</h3>
+        <button class="secondary" style="padding:2px 8px;font-size:12px" onclick="closeCertUpload()">&#10005; Close</button>
+      </div>
+      <p id="certs-upload-hint" style="font-size:12px;color:var(--text-dim);margin-bottom:8px;"></p>
+      <input type="hidden" id="certs-upload-id">
+      <textarea id="certs-upload-pem" rows="10"
+        style="width:100%;font-family:monospace;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:8px;resize:vertical;"
+        placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap;">
+        <button id="certs-upload-btn" onclick="submitCertUpload()">&#8593; Upload</button>
+        <button class="secondary" onclick="certLoadFile()">&#128193; Load from file&hellip;</button>
+        <!-- hidden file input, triggered programmatically -->
+        <input type="file" id="certs-file-input" accept=".pem,.crt,.cer,.key" style="display:none;">
+        <span id="certs-upload-result" style="font-size:12px;color:var(--text-dim);"></span>
+      </div>
+    </div>
+  </section>
+
   <!-- SSH Targets -->
   <section id="tab-ssh-targets" class="tab-panel">
     <h2>SSH Targets</h2>
@@ -786,6 +825,7 @@
 <script src="js/synthesis/machines.js"></script>
 <script src="js/settings/nodes.js"></script>
 <script src="js/settings/keys.js"></script>
+<script src="js/settings/certs.js"></script>
 <script src="js/settings/assumptions.js"></script>
 <script src="js/settings/todo.js"></script>
 <script src="js/settings/self-diag.js"></script>

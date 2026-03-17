@@ -34,6 +34,7 @@ function switchTab(tab) {
   if (tab === 'manual-links'   && !_manualLinks.length)   loadManualLinks();
   if (tab === 'settings'       && !_settings.length)      loadSettings();
   if (tab === 'keys')                                      loadKeys();
+  if (tab === 'certs')                                     loadCerts();
   if (tab === 'assumptions')                               loadAssumptions();
   if (tab === 'todo')                                      loadTodo();
   // self-diag: just show the shell — user clicks Run to trigger tests
