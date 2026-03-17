@@ -40,6 +40,7 @@ _ALLOWED_TABLES = {
     "ssh_targets",
     "manual_links",
     "docs",
+    "doc_images",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -135,6 +136,7 @@ def _pk_for_table(table: str) -> str:
         "ssh_targets":    "ip_address",
         "manual_links":   "link_id",
         "docs":           "doc_id",
+        "doc_images":     "image_id",
     }
     return pk_map.get(table, "id")
 

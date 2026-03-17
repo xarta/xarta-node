@@ -777,6 +777,21 @@ class DocContentBody(BaseModel):
     content: str
 
 
+# ── Doc Images ────────────────────────────────────────────────────────────────
+
+class DocImageOut(BaseModel):
+    image_id: str
+    filename: str
+    description: Optional[str] = None
+    file_size: Optional[int] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DocImageUpdate(BaseModel):
+    description: Optional[str] = None
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthOut(BaseModel):

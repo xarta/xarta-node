@@ -311,6 +311,16 @@ CREATE TABLE IF NOT EXISTS docs (
     updated_at  TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_docs_sort ON docs(sort_order, label);
+
+CREATE TABLE IF NOT EXISTS doc_images (
+    image_id    TEXT PRIMARY KEY,
+    filename    TEXT NOT NULL,
+    description TEXT,
+    file_size   INTEGER,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_doc_images_filename ON doc_images(filename);
 """
 
 _SEED_SQL = """

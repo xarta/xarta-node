@@ -163,22 +163,46 @@ async function docsRefreshContent() {
   await _docsOpenDoc(_docsActiveId);
 }
 
+// ── Image blob URL cache (shared with docs-images.js) ────────────────────────
+
+const _docsImgCache = {};
+
+async function _docsImgBlobUrl(imageId) {
+  if (_docsImgCache[imageId]) return _docsImgCache[imageId];
+  try {
+    const r = await apiFetch(`/api/v1/doc-images/${imageId}/file`);
+    if (!r.ok) return null;
+    const blob = await r.blob();
+    _docsImgCache[imageId] = URL.createObjectURL(blob);
+    return _docsImgCache[imageId];
+  } catch { return null; }
+}
+
 // ── Preview ───────────────────────────────────────────────────────────────────
 
-function docsTogglePreview() {
+async function docsTogglePreview() {
   _docsPreview = !_docsPreview;
   const btn     = document.getElementById('docs-preview-btn');
   const editor  = document.getElementById('docs-editor');
   const preview = document.getElementById('docs-preview');
   if (_docsPreview) {
-    preview.innerHTML    = _mdToHtml(editor.value);
-    editor.style.display = 'none';
+    await _docsRenderPreview();
+    editor.style.display  = 'none';
     preview.style.display = 'block';
     btn.textContent = '\u270f Edit';
   } else {
     preview.style.display = 'none';
     editor.style.display  = 'block';
     btn.textContent = '\ud83d\udc41 Preview';
+  }
+}
+
+async function _docsRenderPreview() {
+  const preview = document.getElementById('docs-preview');
+  preview.innerHTML = _mdToHtml(document.getElementById('docs-editor').value);
+  for (const img of preview.querySelectorAll('img[data-doc-img]')) {
+    const url = await _docsImgBlobUrl(img.dataset.docImg);
+    if (url) img.src = url;
   }
 }
 
@@ -401,5 +425,9 @@ function _inlineMd(s) {
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/_([^_]+)_/g, '<em>$1</em>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => {
+      const m = src.match(/\/api\/v1\/doc-images\/([a-f0-9-]+)\/file/);
+      return `<img${m ? ` data-doc-img="${m[1]}"` : ''} src="${src}" alt="${alt}" style="max-width:100%;border-radius:4px;margin:8px 0;display:block" />`;
+    })
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">$1</a>');
 }
