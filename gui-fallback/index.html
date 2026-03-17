@@ -96,11 +96,12 @@
         <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
           <button id="docs-preview-btn" class="secondary" onclick="docsTogglePreview()">&#128065; Preview</button>
           <button id="docs-save-btn" onclick="docsSave()">&#128190; Save</button>
-          <button class="secondary" onclick="docsRefreshContent()">&#8635; Refresh</button>
+          <button class="secondary" onclick="docsRefreshContent()">&#8635; Reload</button>
           <button class="secondary" onclick="openEditDocModal()">&#9998; Meta</button>
           <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
           <button onclick="openNewDocModal()">+ New Doc</button>
-          <button class="secondary" onclick="loadDocs()">&#8635;</button>
+          <button class="secondary" onclick="openDocImagesModal()">&#128247; Images</button>
+          <button class="secondary" onclick="loadDocs()">&#8635; List</button>
         </div>
       </div>
       <!-- Status / error row -->
@@ -830,6 +831,33 @@
 </dialog>
 
 <!-- Delete doc confirmation modal -->
+<!-- ── Doc Images Modal ──────────────────────────────────────────────── -->
+<div id="doc-images-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1200;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;width:min(680px,96vw);max-height:88vh;display:flex;flex-direction:column;gap:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2 style="margin:0">&#128247; Doc Images</h2>
+      <button class="secondary" onclick="closeDocImagesModal()">&#10005;</button>
+    </div>
+    <!-- Upload -->
+    <div style="background:var(--bg2);border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px">
+      <div style="font-weight:600;font-size:13px">Upload image</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="doc-img-upload-file" type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml" style="flex:1;min-width:140px" />
+        <input id="doc-img-upload-desc" type="text" placeholder="Description (optional)" style="flex:2;min-width:160px;padding:5px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg2);color:var(--text)" />
+        <button onclick="submitDocImageUpload()">Upload</button>
+      </div>
+      <span id="doc-img-upload-status" style="font-size:12px;color:var(--accent)"></span>
+    </div>
+    <!-- Filter -->
+    <div style="display:flex;gap:8px">
+      <button class="secondary doc-img-filter-btn active" data-filter="all" onclick="_docImagesSetFilter('all')">All images</button>
+      <button class="secondary doc-img-filter-btn" data-filter="unused" onclick="_docImagesSetFilter('unused')">Unused</button>
+    </div>
+    <!-- List -->
+    <div id="doc-images-list" style="overflow-y:auto;flex:1"></div>
+  </div>
+</div>
+
 <dialog id="docs-delete-modal" style="background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;max-width:480px;">
   <h2 style="margin-bottom:12px;">Delete document?</h2>
@@ -860,6 +888,7 @@
 <script src="js/settings/keys.js"></script>
 <script src="js/settings/certs.js"></script>
 <script src="js/settings/docs.js"></script>
+<script src="js/settings/docs-images.js"></script>
 <script src="js/settings/self-diag.js"></script>
 <script src="js/settings/settings.js"></script>
 <script src="js/settings/pve-hosts.js"></script>
