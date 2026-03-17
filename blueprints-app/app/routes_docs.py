@@ -41,6 +41,7 @@ def _safe_resolve(root: Path, rel_path: str) -> Path:
 
 
 def _row_to_out(row) -> DocOut:
+    cols = row.keys()
     return DocOut(
         doc_id=row["doc_id"],
         label=row["label"],
@@ -48,6 +49,7 @@ def _row_to_out(row) -> DocOut:
         tags=row["tags"],
         path=row["path"],
         sort_order=row["sort_order"] if row["sort_order"] is not None else 0,
+        group_id=row["group_id"] if "group_id" in cols else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -97,8 +99,8 @@ async def create_doc(body: DocCreate) -> DocOut:
         log.info("docs: created file %s", p)
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO docs (doc_id, label, description, tags, path, sort_order) VALUES (?,?,?,?,?,?)",
-            (doc_id, body.label, body.description, body.tags, body.path, body.sort_order),
+            "INSERT INTO docs (doc_id, label, description, tags, path, sort_order, group_id) VALUES (?,?,?,?,?,?,?)",
+            (doc_id, body.label, body.description, body.tags, body.path, body.sort_order, body.group_id),
         )
         gen = increment_gen(conn, "human")
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
@@ -121,9 +123,11 @@ async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
                tags        = COALESCE(?, tags),
                path        = COALESCE(?, path),
                sort_order  = COALESCE(?, sort_order),
+               group_id    = CASE WHEN ? IS NOT NULL THEN NULLIF(?, '') ELSE group_id END,
                updated_at  = datetime('now')
                WHERE doc_id = ?""",
-            (body.label, body.description, body.tags, body.path, body.sort_order, doc_id),
+            (body.label, body.description, body.tags, body.path, body.sort_order,
+             body.group_id, body.group_id, doc_id),
         )
         gen = increment_gen(conn, "human")
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()

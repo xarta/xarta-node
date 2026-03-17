@@ -300,13 +300,23 @@ CREATE INDEX IF NOT EXISTS idx_manual_links_group  ON manual_links(group_name);
 CREATE INDEX IF NOT EXISTS idx_manual_links_parent ON manual_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_manual_links_sort   ON manual_links(sort_order);
 
+CREATE TABLE IF NOT EXISTS doc_groups (
+    group_id    TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    sort_order  INTEGER DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_doc_groups_sort ON doc_groups(sort_order, name);
+
 CREATE TABLE IF NOT EXISTS docs (
     doc_id      TEXT PRIMARY KEY,   -- UUID
     label       TEXT NOT NULL,      -- display name shown in sidebar
     description TEXT,               -- short subtitle / explanation
     tags        TEXT,               -- comma-separated tags; "menu" = show in docs navbar
     path        TEXT NOT NULL,      -- path relative to REPO_INNER_PATH (e.g. "docs/ASSUMPTIONS.md")
-    sort_order  INTEGER DEFAULT 0,  -- ordering within the sidebar
+    sort_order  INTEGER DEFAULT 0,  -- ordering within the sidebar / group
+    group_id    TEXT REFERENCES doc_groups(group_id),  -- NULL = Undefined Group
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
 );
@@ -396,6 +406,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("manual_links", "location",           "TEXT"),
         # doc_images: user-defined tags for filtering (2026-03-17)
         ("doc_images",   "tags",               "TEXT"),
+        # docs: group assignment (2026-03-17)
+        ("docs",         "group_id",            "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

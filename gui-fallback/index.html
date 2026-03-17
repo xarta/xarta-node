@@ -101,7 +101,7 @@
           <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
           <button onclick="openNewDocModal()">+ New Doc</button>
           <button class="secondary" onclick="openDocImagesModal()">&#128247; Images</button>
-          <button class="secondary" onclick="loadDocs()">&#8635; List</button>
+          <button id="docs-list-btn" class="secondary" onclick="docsToggleList()">&#9776; List</button>
         </div>
       </div>
       <!-- Status / error row -->
@@ -129,6 +129,10 @@
                  font-size:14px;line-height:1.75;color:var(--text);
                  min-height:calc(100vh - 220px)"></div>
       </div>
+      <!-- List view pane (shown instead of editor when List is active) -->
+      <div id="docs-list-pane"
+           style="display:none;flex-direction:column;overflow-y:auto;
+                  min-height:calc(100vh - 220px);padding:4px 0"></div>
     </div>
   </section>
 
@@ -812,6 +816,11 @@
     </label>
     <label>Sort order
       <input type="number" id="docs-modal-order" value="0" style="width:80px;margin-top:4px;" />
+    </label>
+    <label>Group
+      <select id="docs-modal-group" style="width:100%;margin-top:4px;padding:5px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px">
+        <option value="">— Undefined Group —</option>
+      </select>
     </label>
     <div id="docs-modal-init-row">
       <label>Initial content <span style="font-size:11px;color:var(--text-dim)">(optional — leave blank for heading-only stub)</span>

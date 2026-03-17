@@ -740,12 +740,31 @@ class FirewallProbeOut(BaseModel):
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 
+class DocGroupCreate(BaseModel):
+    name: str
+    sort_order: int = 0
+
+
+class DocGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class DocGroupOut(BaseModel):
+    group_id: str
+    name: str
+    sort_order: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 class DocCreate(BaseModel):
     label: str
     description: Optional[str] = None
     tags: Optional[str] = None          # comma-separated, e.g. "menu,ops"
     path: str                           # relative path from REPO_INNER_PATH
     sort_order: int = 0
+    group_id: Optional[str] = None     # NULL = Undefined Group
     initial_content: Optional[str] = None  # written to file on create if provided
 
 
@@ -755,6 +774,7 @@ class DocUpdate(BaseModel):
     tags: Optional[str] = None
     path: Optional[str] = None
     sort_order: Optional[int] = None
+    group_id: Optional[str] = None     # use empty string "" to clear group
 
 
 class DocOut(BaseModel):
@@ -764,6 +784,7 @@ class DocOut(BaseModel):
     tags: Optional[str] = None
     path: str
     sort_order: int = 0
+    group_id: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
