@@ -54,6 +54,7 @@ from .routes_certs import router as certs_router
 from .routes_assumptions import router as assumptions_router
 from .routes_todo import router as todo_router
 from .routes_docs import router as docs_router
+from .routes_doc_groups import router as doc_groups_router
 from .routes_doc_images import router as doc_images_router
 from .routes_firewall import router as firewall_router
 from .sync.drain import start_drain_loop
@@ -307,6 +308,7 @@ def create_app() -> FastAPI:
     application.include_router(assumptions_router,    prefix="/api/v1")
     application.include_router(todo_router,           prefix="/api/v1")
     application.include_router(docs_router,           prefix="/api/v1")
+    application.include_router(doc_groups_router,     prefix="/api/v1")
     application.include_router(doc_images_router,      prefix="/api/v1")
     application.include_router(firewall_router,        prefix="/api/v1")
 

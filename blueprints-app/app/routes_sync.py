@@ -39,7 +39,7 @@ _ALLOWED_TABLES = {
     "arp_manual",
     "ssh_targets",
     "manual_links",
-    "docs",
+    "docs", "doc_groups",
     "doc_images",
 }
 
@@ -136,6 +136,7 @@ def _pk_for_table(table: str) -> str:
         "ssh_targets":    "ip_address",
         "manual_links":   "link_id",
         "docs":           "doc_id",
+        "doc_groups":     "group_id",
         "doc_images":     "image_id",
     }
     return pk_map.get(table, "id")
