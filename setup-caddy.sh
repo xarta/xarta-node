@@ -174,33 +174,19 @@ CADDY
 
 # ── mTLS sync block (:8443) — appended when cert env vars are all set ────────
 if [[ -n "${SYNC_TLS_CA:-}" && -n "${SYNC_TLS_CERT:-}" && -n "${SYNC_TLS_KEY:-}" ]]; then
-    # Derive the node's own IPs from .nodes.json so Caddy can route requests
-    # that arrive via IP address (no SNI). Using bare :8443 with Caddy causes
-    # 421 Misdirected Request for IP-based connections; explicit IP site
-    # addresses fix this by letting Caddy match the Host header correctly.
-    NODES_JSON="${NODES_JSON_PATH:-$SCRIPT_DIR/.nodes.json}"
-    SYNC_SITE_NAMES=""
-    if [[ -f "$NODES_JSON" && -n "${BLUEPRINTS_NODE_ID:-}" ]]; then
-        SYNC_SITE_NAMES="$(python3 -c "
-import json, sys
-data = json.load(open('$NODES_JSON'))
-node = next((n for n in data.get('nodes', []) if n.get('node_id') == '$BLUEPRINTS_NODE_ID'), None)
-if node:
-    names = [f\"https://{node['primary_ip']}:8443\"]
-    if node.get('tailnet_ip'):
-        names.append(f\"https://{node['tailnet_ip']}:8443\")
-    print(', '.join(names))
-" 2>/dev/null || true)"
-    fi
-    # Fallback to bare port if extraction fails
-    SYNC_SITE_NAMES="${SYNC_SITE_NAMES:-:8443}"
-
     cat >> "$CADDYFILE" <<CADDY_MTLS
 
 # mTLS sync transport — accepts inbound sync connections from fleet peers.
 # Requires a valid client certificate signed by the fleet CA.
 # All verified traffic is proxied through to uvicorn on localhost:8080.
-${SYNC_SITE_NAMES} {
+#
+# Uses "https://:8443" (HTTPS wildcard on port 8443) so that:
+#   - The TLS connection policy has NO SNI filter (catch-all). This is
+#     essential because clients connecting by IP don't include SNI in
+#     the TLS ClientHello, so named-host policies would never match.
+#   - client_auth (require_and_verify) applies to ALL connections on :8443.
+#   - HTTP routing has no host matcher either, so all Host headers are served.
+https://:8443 {
     tls ${SYNC_TLS_CERT} ${SYNC_TLS_KEY} {
         client_auth {
             mode require_and_verify
@@ -212,7 +198,7 @@ ${SYNC_SITE_NAMES} {
     reverse_proxy localhost:8080
 }
 CADDY_MTLS
-    echo "    Appended mTLS :8443 sync block for: ${SYNC_SITE_NAMES}"
+    echo "    Appended mTLS :8443 sync block (https://:8443 — SNI-free catch-all)"
 else
     echo "    Skipped mTLS :8443 block (SYNC_TLS_CA/CERT/KEY not set — plain HTTP only)"
 fi
