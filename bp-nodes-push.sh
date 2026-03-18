@@ -153,10 +153,11 @@ while IFS=' ' read -r ip node_id sync_port; do
         continue
     fi
 
-    # 2. Trigger /nodes/refresh on the remote node
-    echo "  → POST http://$ip:$sync_port/api/v1/nodes/refresh"
+    # 2. Trigger /nodes/refresh on the remote node via loopback (always plain
+    #    HTTP on 8080 — loopback bypasses auth and is unaffected by sync_scheme).
+    echo "  → POST http://$ip:8080/api/v1/nodes/refresh"
     RESPONSE="$(ssh "${SSH_OPTS[@]}" "root@$ip" \
-        "curl -s -X POST http://localhost:$sync_port/api/v1/nodes/refresh" 2>/dev/null || echo "curl_failed")"
+        "curl -s -X POST http://localhost:8080/api/v1/nodes/refresh" 2>/dev/null || echo "curl_failed")"
 
     if echo "$RESPONSE" | grep -q '"status".*"ok"'; then
         echo "    [OK] nodes refreshed on $node_id"
