@@ -182,8 +182,10 @@ if [[ -n "${SYNC_TLS_CA:-}" && -n "${SYNC_TLS_CERT:-}" && -n "${SYNC_TLS_KEY:-}"
 :8443 {
     tls ${SYNC_TLS_CERT} ${SYNC_TLS_KEY} {
         client_auth {
-            mode                 require_and_verify
-            trusted_ca_certs_pem_file ${SYNC_TLS_CA}
+            mode require_and_verify
+            trust_pool file {
+                pem_file ${SYNC_TLS_CA}
+            }
         }
     }
     reverse_proxy localhost:8080
