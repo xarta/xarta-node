@@ -122,10 +122,11 @@ def _upsert_nodes_from_config() -> int:
             tip     = node["tailnet_ip"]
             th      = node.get("tailnet_hostname", "")
             port    = node["sync_port"]
+            scheme  = node.get("sync_scheme", "http")
 
             addresses = json.dumps([
-                f"http://{pip}:{port}",
-                f"http://{tip}:{port}",
+                f"{scheme}://{pip}:{port}",
+                f"{scheme}://{tip}:{port}",
             ])
             ui_url = f"https://{ph}"
 
