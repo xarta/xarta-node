@@ -13,10 +13,15 @@ import asyncio
 import json
 import logging
 import os
+import ssl
+import time
+import uuid
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from . import config as cfg
+from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, increment_gen
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
 from .sync.queue import enqueue_for_all_peers, get_queue_depths
@@ -437,3 +442,249 @@ async def sync_status() -> SyncStatus:
         queue_depths=queue_depths,
         peer_count=len(peer_ids),
     )
+
+
+# ── Diagnostic probe endpoints ────────────────────────────────────────────────
+
+def _probe_client(timeout: float) -> httpx.AsyncClient:
+    """Return an httpx.AsyncClient configured identically to the sync drain.
+
+    When SYNC_TLS_CA/CERT/KEY are all set the client uses mTLS:
+    - server cert verified against the fleet CA
+    - this node's client cert+key are presented
+    Falls back to plain HTTP if any TLS var is absent.
+    """
+    if cfg.SYNC_TLS_CA and cfg.SYNC_TLS_CERT and cfg.SYNC_TLS_KEY:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cfg.SYNC_TLS_CA)
+        ctx.load_cert_chain(cfg.SYNC_TLS_CERT, cfg.SYNC_TLS_KEY)
+        return httpx.AsyncClient(timeout=timeout, verify=ctx)
+    return httpx.AsyncClient(timeout=timeout)
+
+
+@router.get("/mtls-probe")
+async def mtls_probe() -> dict:
+    """
+    Probe each fleet peer via mTLS — the same transport the sync drain uses.
+
+    Performs a real TLS handshake + GET /health on each peer's sync address.
+    Distinguishes:
+      ok:         TLS handshake succeeded, /health returned 2xx
+      tls_error:  SSL handshake failed (cert/CA mismatch or missing client cert)
+      refused:    TCP connection refused (port closed or firewall drop)
+      timeout:    connection or read timed out
+      http_error: TLS OK but peer returned non-2xx
+      error:      other unexpected failure
+    A spurious "ok" is not possible — the remote must accept the client cert
+    AND return a 2xx response.
+    """
+    tls_configured = bool(cfg.SYNC_TLS_CA and cfg.SYNC_TLS_CERT and cfg.SYNC_TLS_KEY)
+    results = []
+    async with _probe_client(timeout=8.0) as client:
+        for n in cfg._peer_nodes:
+            node_id = n["node_id"]
+            url = (
+                f"{n.get('sync_scheme', 'http')}://{n['primary_ip']}"
+                f":{n.get('sync_port', 8080)}/health"
+            )
+            try:
+                r = await client.get(url)
+                results.append({
+                    "node_id": node_id,
+                    "address": url,
+                    "status": "ok" if r.is_success else "http_error",
+                    "http_status": r.status_code,
+                    "error": None,
+                })
+            except httpx.ConnectError as e:
+                err = str(e)
+                status = "tls_error" if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower()) else "refused"
+                results.append({"node_id": node_id, "address": url, "status": status, "http_status": None, "error": err})
+            except httpx.TimeoutException:
+                results.append({"node_id": node_id, "address": url, "status": "timeout", "http_status": None, "error": "connection timed out"})
+            except Exception as e:
+                results.append({"node_id": node_id, "address": url, "status": "error", "http_status": None, "error": str(e)})
+    return {"tls_configured": tls_configured, "peers": results}
+
+
+@router.get("/ssh-probe")
+async def ssh_probe() -> dict:
+    """
+    Probe each fleet peer via SSH using the xarta-node fleet key.
+
+    Runs: ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+              -o ConnectTimeout=5 -i <key> root@<ip> echo ok
+
+    BatchMode=yes: no password prompts — immediate failure on auth rejection.
+    Distinguishes:
+      ok:                echo ok received — SSH auth and connectivity confirmed
+      auth_failed:       Permission denied / Authentication failed
+      host_key_changed:  Remote host identification changed (MITM risk or rebuild)
+      refused:           Connection refused
+      no_route:          No route to host / Network unreachable
+      timeout:           Connection timed out
+      no_key:            XARTA_NODE_SSH_KEY unset or file not found
+      error:             Other SSH failure
+    A spurious "ok" is not possible — remote must respond with "ok" to stdout.
+    """
+    ssh_key = os.environ.get("XARTA_NODE_SSH_KEY", "")
+    if not ssh_key or not os.path.isfile(ssh_key):
+        return {
+            "ssh_key_present": False,
+            "ssh_key_path": ssh_key or None,
+            "peers": [],
+            "error": "XARTA_NODE_SSH_KEY not set or key file not found",
+        }
+
+    async def _probe_peer(n: dict) -> dict:
+        ip = n["primary_ip"]
+        node_id = n["node_id"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-n",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=5",
+                "-i", ssh_key,
+                f"root@{ip}",
+                "echo ok",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+            rc = proc.returncode
+            out = stdout.decode().strip()
+            err = stderr.decode().strip()
+            if rc == 0 and out == "ok":
+                return {"node_id": node_id, "ip": ip, "status": "ok", "error": None}
+            if "REMOTE HOST IDENTIFICATION HAS CHANGED" in err:
+                return {"node_id": node_id, "ip": ip, "status": "host_key_changed", "error": err}
+            if "Permission denied" in err or "Authentication failed" in err:
+                return {"node_id": node_id, "ip": ip, "status": "auth_failed", "error": err}
+            if "Connection refused" in err:
+                return {"node_id": node_id, "ip": ip, "status": "refused", "error": err}
+            if "No route to host" in err or "Network unreachable" in err:
+                return {"node_id": node_id, "ip": ip, "status": "no_route", "error": err}
+            if "Connection timed out" in err or "Operation timed out" in err:
+                return {"node_id": node_id, "ip": ip, "status": "timeout", "error": err}
+            return {"node_id": node_id, "ip": ip, "status": "error", "error": err or f"exit {rc}: {out}"}
+        except asyncio.TimeoutError:
+            return {"node_id": node_id, "ip": ip, "status": "timeout", "error": "SSH timed out (12s)"}
+        except Exception as e:
+            return {"node_id": node_id, "ip": ip, "status": "error", "error": str(e)}
+
+    results = await asyncio.gather(*[_probe_peer(n) for n in cfg._peer_nodes])
+    return {
+        "ssh_key_present": True,
+        "ssh_key_path": ssh_key,
+        "peers": list(results),
+    }
+
+
+@router.post("/roundtrip-test")
+async def sync_roundtrip_test() -> dict:
+    """
+    End-to-end data propagation test.
+
+    Writes a temporary canary row to the settings table, enqueues it for peers
+    via the normal drain path, then polls the first available peer's API to
+    confirm the row arrived.  Cleans up (deletes the canary) regardless of
+    outcome.
+
+    Returns:
+      status:         ok | timeout | auth_failed | no_peers | no_secret | error
+      elapsed_ms:     time from write to confirmed propagation (or timeout)
+      propagated_to:  node_id of the peer that received the canary
+      error:          human-readable failure reason, or null on success
+
+    Timeout: 25s — covers more than one drain cycle (drain sleeps 1-20s randomly).
+    """
+    if not cfg._peer_nodes:
+        return {"status": "no_peers", "elapsed_ms": 0, "propagated_to": None,
+                "error": "no active peer nodes configured"}
+    if not cfg.SYNC_SECRET:
+        return {"status": "no_secret", "elapsed_ms": 0, "propagated_to": None,
+                "error": "BLUEPRINTS_SYNC_SECRET not configured — cannot authenticate peer read"}
+
+    canary_key = f"_bp_diag_canary_{uuid.uuid4().hex[:16]}"
+    peer = cfg._peer_nodes[0]
+    peer_base = (
+        f"{peer.get('sync_scheme', 'http')}://{peer['primary_ip']}"
+        f":{peer.get('sync_port', 8080)}"
+    )
+    start_ts = time.monotonic()
+    propagated = False
+    early_result: dict | None = None
+
+    try:
+        # Write canary locally and queue for peers via normal sync path
+        canary_row = {
+            "key": canary_key,
+            "value": "diagnostic-probe",
+            "description": "Temporary sync round-trip test — will auto-delete",
+        }
+        with get_conn() as conn:
+            gen = increment_gen(conn, "human")
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value, description) VALUES (?, ?, ?)",
+                (canary_key, canary_row["value"], canary_row["description"]),
+            )
+            enqueue_for_all_peers(conn, "INSERT", "settings", canary_key, canary_row, gen)
+        log.info("roundtrip-test: wrote canary '%s', polling %s", canary_key, peer["node_id"])
+
+        # Poll peer for canary; 12 x 2s = 24s max
+        async with _probe_client(timeout=8.0) as client:
+            for _ in range(12):
+                await asyncio.sleep(2)
+                try:
+                    token = compute_token(cfg.SYNC_SECRET)
+                    r = await client.get(
+                        f"{peer_base}/api/v1/settings/{canary_key}",
+                        headers={"X-API-Token": token},
+                    )
+                    if r.status_code == 200:
+                        propagated = True
+                        break
+                    if r.status_code == 401:
+                        elapsed = round((time.monotonic() - start_ts) * 1000)
+                        early_result = {
+                            "status": "auth_failed",
+                            "elapsed_ms": elapsed,
+                            "propagated_to": None,
+                            "error": (
+                                f"peer {peer['node_id']} rejected token (HTTP 401) "
+                                "— check BLUEPRINTS_SYNC_SECRET matches on all nodes"
+                            ),
+                        }
+                        break
+                except Exception as poll_err:
+                    log.debug("roundtrip-test: poll error: %s", poll_err)
+    finally:
+        # Always clean up — delete canary locally and queue delete for peers
+        try:
+            with get_conn() as conn:
+                conn.execute("DELETE FROM settings WHERE key=?", (canary_key,))
+                gen = increment_gen(conn, "human")
+                enqueue_for_all_peers(conn, "DELETE", "settings", canary_key, None, gen)
+            log.info("roundtrip-test: canary '%s' deleted", canary_key)
+        except Exception as cleanup_err:
+            log.warning("roundtrip-test: cleanup failed: %s", cleanup_err)
+
+    elapsed = round((time.monotonic() - start_ts) * 1000)
+    if early_result:
+        return early_result
+    if propagated:
+        log.info("roundtrip-test: propagated to %s in %dms", peer["node_id"], elapsed)
+        return {
+            "status": "ok",
+            "elapsed_ms": elapsed,
+            "propagated_to": peer["node_id"],
+            "error": None,
+        }
+    log.warning("roundtrip-test: timeout after %dms — canary not found on %s", elapsed, peer["node_id"])
+    return {
+        "status": "timeout",
+        "elapsed_ms": elapsed,
+        "propagated_to": None,
+        "error": f"canary not found on {peer['node_id']} within 25s — drain may be stalled or queue depth too high",
+    }

@@ -51,7 +51,7 @@ async function runSelfDiag() {
   const selfTailnet = selfNode?.tailnet || null;
 
   // Run connectivity + all endpoint tests concurrently
-  const [endpointResults, peerResults, netResults, openapiData] = await Promise.all([
+  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData] = await Promise.all([
     Promise.all(_DIAG_ENDPOINTS.map(async ep => {
       const start = performance.now();
       try {
@@ -69,6 +69,18 @@ async function runSelfDiag() {
         const r = await apiFetch('/openapi.json', { signal: AbortSignal.timeout(6000) });
         if (!r.ok) return null;
         return await r.json();
+      } catch { return null; }
+    })(),
+    (async () => {
+      try {
+        const r = await apiFetch('/api/v1/sync/mtls-probe', { signal: AbortSignal.timeout(30000) });
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    })(),
+    (async () => {
+      try {
+        const r = await apiFetch('/api/v1/sync/ssh-probe', { signal: AbortSignal.timeout(30000) });
+        return r.ok ? await r.json() : null;
       } catch { return null; }
     })(),
   ]);
@@ -95,6 +107,48 @@ async function runSelfDiag() {
     html += _diagSection('Fleet Connectivity');
     html += _selfDiagRow('\u2014', 'No peer addresses cached', 'open Nodes tab while online to populate', '');
   }
+
+  // ── Sync — mTLS Transport ───────────────────────────────────────────────
+  html += _diagSection('Sync \u2014 mTLS Transport (drain)');
+  if (!mtlsProbeData) {
+    html += _selfDiagRow('\u26a0', '/api/v1/sync/mtls-probe', 'endpoint missing \u2014 update app code on this node', '');
+  } else {
+    const tlsIcon = mtlsProbeData.tls_configured ? '\u2705' : '\u26a0';
+    const tlsLabel = mtlsProbeData.tls_configured ? 'mTLS configured (SYNC_TLS_* set)' : 'TLS not configured \u2014 using plain HTTP';
+    html += _selfDiagRow(tlsIcon, 'TLS configuration', tlsLabel, '');
+    const _mtlsIcons = { ok: '\u2705', tls_error: '\uD83D\uDD12', http_error: '\u26a0', refused: '\u274c', timeout: '\u274c', error: '\u274c' };
+    for (const p of (mtlsProbeData.peers || [])) {
+      const icon = _mtlsIcons[p.status] || '\u274c';
+      const detail = p.error || (p.http_status != null ? `HTTP ${p.http_status}` : p.status);
+      html += _selfDiagRow(icon, esc(p.node_id), p.status, esc(detail));
+    }
+  }
+
+  // ── Sync — SSH Fleet Connectivity ───────────────────────────────────────
+  html += _diagSection('Sync \u2014 SSH Fleet Connectivity (fleet-pull)');
+  if (!sshProbeData) {
+    html += _selfDiagRow('\u26a0', '/api/v1/sync/ssh-probe', 'endpoint missing \u2014 update app code on this node', '');
+  } else if (!sshProbeData.ssh_key_present) {
+    html += _selfDiagRow('\u274c', 'XARTA_NODE_SSH_KEY', 'key file not found', esc(sshProbeData.error || ''));
+  } else {
+    html += _selfDiagRow('\u2705', 'XARTA_NODE_SSH_KEY', 'key file present', '');
+    const _sshIcons = { ok: '\u2705', auth_failed: '\uD83D\uDD12', host_key_changed: '\u26a0', refused: '\u274c', timeout: '\u274c', no_route: '\u274c', error: '\u274c' };
+    for (const p of (sshProbeData.peers || [])) {
+      const icon = _sshIcons[p.status] || '\u274c';
+      const detail = esc((p.error || p.status).split('\n')[0].trim());
+      html += _selfDiagRow(icon, esc(p.node_id), p.status, detail);
+    }
+  }
+
+  // ── Sync — Data Propagation Round-trip ───────────────────────────────
+  html += _diagSection('Sync \u2014 Data Propagation Round-trip');
+  html += `<div id="bp-roundtrip-section" style="display:flex;align-items:center;gap:8px;padding:5px 2px">
+    <button id="bp-roundtrip-btn"
+      style="padding:3px 10px;background:var(--accent-dim);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0">
+      &#x25b6; Test propagation (~25s)
+    </button>
+    <span style="font-size:12px;color:var(--text-dim)">Writes a canary row, confirms it arrives on a peer, then deletes it</span>
+  </div>`;
 
   // ── Internet ──────────────────────────────────────────────────────
   html += _diagSection('Internet Connectivity');
@@ -224,14 +278,50 @@ async function runSelfDiag() {
 
   results.innerHTML = html;
 
+  // Bind the propagation round-trip test button
+  const _rtBtn = document.getElementById('bp-roundtrip-btn');
+  const _rtSection = document.getElementById('bp-roundtrip-section');
+  if (_rtBtn) {
+    _rtBtn.addEventListener('click', async () => {
+      _rtBtn.disabled = true;
+      _rtBtn.textContent = '\u29d0 Running\u2026';
+      try {
+        const r = await apiFetch('/api/v1/sync/roundtrip-test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(35000),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          const _rtIcons = { ok: '\u2705', timeout: '\u274c', auth_failed: '\uD83D\uDD12', no_peers: '\u2014', no_secret: '\u274c', error: '\u274c' };
+          const icon = _rtIcons[d.status] || '\u274c';
+          const detail = d.status === 'ok'
+            ? `propagated to ${esc(d.propagated_to)} in ${d.elapsed_ms}ms`
+            : esc(d.error || d.status);
+          _rtSection.outerHTML = _selfDiagRow(icon, 'data propagation round-trip', d.status, detail);
+        } else {
+          _rtSection.outerHTML = _selfDiagRow('\u274c', 'data propagation round-trip', `HTTP ${r.status}`, '');
+        }
+      } catch (e) {
+        _rtSection.outerHTML = _selfDiagRow('\u274c', 'data propagation round-trip', e.message, '');
+      }
+    });
+  }
+
   const total   = endpointResults.length;
   const passed  = endpointResults.filter(r => r.ok).length;
   const peersOk = peerResults.filter(p => p.reachable).length;
   const fwSummary = probeTotalCount
     ? ` \u2022 firewall probe ${probePassCount}/${probeTotalCount} pass`
     : '';
-  status.textContent = `Done \u2014 ${passed}/${total} API endpoints OK \u2022 ${peersOk}/${peerResults.length} peers reachable${fwSummary}`;
-  status.style.color = (passed === total && (probeTotalCount === 0 || probePassCount === probeTotalCount)) ? 'var(--accent)' : '#f87171';
+  const mtlsOk = (mtlsProbeData?.peers || []).filter(p => p.status === 'ok').length;
+  const mtlsTotal = (mtlsProbeData?.peers || []).length;
+  const sshOk = (sshProbeData?.peers || []).filter(p => p.status === 'ok').length;
+  const sshTotal = (sshProbeData?.peers || []).length;
+  const mtlsSummary = mtlsTotal ? ` \u2022 mTLS ${mtlsOk}/${mtlsTotal}` : '';
+  const sshSummary  = sshTotal  ? ` \u2022 SSH ${sshOk}/${sshTotal}`   : '';
+  status.textContent = `Done \u2014 ${passed}/${total} API endpoints OK \u2022 ${peersOk}/${peerResults.length} peers reachable${mtlsSummary}${sshSummary}${fwSummary}`;
+  status.style.color = (passed === total && mtlsOk === mtlsTotal && sshOk === sshTotal && (probeTotalCount === 0 || probePassCount === probeTotalCount)) ? 'var(--accent)' : '#f87171';
   btn.disabled = false;
   btn.textContent = '\u25b6 Run Diagnostics';
 }
