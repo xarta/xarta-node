@@ -856,6 +856,12 @@ async function _docsDropGroupBefore(draggedGroupId, targetGroupId) {
 function _mdToHtml(md) {
   // Minimal but functional markdown renderer — no external deps
   const esc2 = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const _isTableRow = s => /^\s*\|.*\|\s*$/.test(s);
+  const _isTableSeparator = s => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(s);
+  const _tableCells = s => {
+    const core = s.trim().replace(/^\|/, '').replace(/\|$/, '');
+    return core.split('|').map(c => c.trim());
+  };
   const lines = md.split('\n');
   let html = '';
   let inUl = false, inOl = false, inCode = false, codeLang = '', codeBuf = '';
@@ -909,6 +915,36 @@ function _mdToHtml(md) {
       html += `<blockquote style="margin:8px 0;padding:8px 14px;border-left:3px solid var(--accent);background:var(--surface);color:var(--text-dim);font-style:italic">${_inlineMd(bqm[1])}</blockquote>`;
       continue;
     }
+
+    // GFM-style tables
+    if (_isTableRow(line) && i + 1 < lines.length && _isTableSeparator(lines[i + 1])) {
+      closeList();
+      const headerCells = _tableCells(line);
+      i += 1; // Skip separator row
+      const bodyRows = [];
+      while (i + 1 < lines.length && _isTableRow(lines[i + 1])) {
+        i += 1;
+        bodyRows.push(_tableCells(lines[i]));
+      }
+
+      let tableHtml = '<div style="overflow-x:auto;margin:10px 0"><table style="width:100%;border-collapse:collapse;font-size:13px">';
+      tableHtml += '<thead><tr>';
+      for (const cell of headerCells) {
+        tableHtml += `<th style="text-align:left;padding:7px 9px;border:1px solid var(--border);background:var(--bg)">${_inlineMd(cell)}</th>`;
+      }
+      tableHtml += '</tr></thead><tbody>';
+      for (const row of bodyRows) {
+        tableHtml += '<tr>';
+        for (let c = 0; c < headerCells.length; c++) {
+          tableHtml += `<td style="padding:7px 9px;border:1px solid var(--border)">${_inlineMd(row[c] || '')}</td>`;
+        }
+        tableHtml += '</tr>';
+      }
+      tableHtml += '</tbody></table></div>';
+      html += tableHtml;
+      continue;
+    }
+
     closeList();
     if (!line.trim()) { html += '<div style="height:8px"></div>'; continue; }
     html += `<p style="margin:4px 0">${_inlineMd(line)}</p>`;
