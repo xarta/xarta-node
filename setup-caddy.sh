@@ -172,6 +172,28 @@ ${HTTP_NAMES} {
 }
 CADDY
 
+# ── mTLS sync block (:8443) — appended when cert env vars are all set ────────
+if [[ -n "${SYNC_TLS_CA:-}" && -n "${SYNC_TLS_CERT:-}" && -n "${SYNC_TLS_KEY:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_MTLS
+
+# mTLS sync transport — accepts inbound sync connections from fleet peers.
+# Requires a valid client certificate signed by the fleet CA.
+# All verified traffic is proxied through to uvicorn on localhost:8080.
+:8443 {
+    tls ${SYNC_TLS_CERT} ${SYNC_TLS_KEY} {
+        client_auth {
+            mode                 require_and_verify
+            trusted_ca_certs_pem_file ${SYNC_TLS_CA}
+        }
+    }
+    reverse_proxy localhost:8080
+}
+CADDY_MTLS
+    echo "    Appended mTLS :8443 sync block (SYNC_TLS_CA/CERT/KEY are set)"
+else
+    echo "    Skipped mTLS :8443 block (SYNC_TLS_CA/CERT/KEY not set — plain HTTP only)"
+fi
+
 echo "    Written: $CADDYFILE"
 echo ""
 
