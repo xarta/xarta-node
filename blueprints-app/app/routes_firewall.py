@@ -42,21 +42,21 @@ _PORT_CATALOGUE: list[dict] = [
     {"port": 80,    "proto": "tcp", "label": "HTTP (Caddy redirect)",  "expected": "open"},
     {"port": 443,   "proto": "tcp", "label": "HTTPS (Caddy/API)",      "expected": "open"},
     {"port": 41641, "proto": "udp", "label": "Tailscale/WireGuard",    "expected": "open"},
-    # Expected BLOCKED (should not be reachable from outside the fleet VLAN)
-    # Note: port 8080 IS open from the fleet VLAN (see setup-firewall.sh) for
-    # node-to-node sync.  A probe from a fleet peer will correctly show it
-    # as open — that is expected and correct behaviour.
-    {"port": 8080,  "proto": "tcp", "label": "uvicorn (fleet VLAN only)",  "expected": "open"},
+    # Expected BLOCKED
+    # Port 8080 is bound to 0.0.0.0 by uvicorn but is no longer allowed through
+    # the firewall to peers — fleet-pull scripts now use SSH-to-loopback.
+    # An external probe timing out here is correct and expected.
+    {"port": 8080,  "proto": "tcp", "label": "uvicorn (loopback only — peer access removed)", "expected": "blocked"},
     {"port": 3000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
     {"port": 5000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
     {"port": 8000,  "proto": "tcp", "label": "Common dev port",        "expected": "blocked"},
     {"port": 9000,  "proto": "tcp", "label": "Common admin port",      "expected": "blocked"},
 ]
 
-# Ports that XARTA_INPUT explicitly allows (used by status endpoint).
-# Port 8080 is allowed but only from known fleet peer IPs (per-IP rules
-# generated from .nodes.json at firewall-setup time — not open to all sources).
-_XARTA_ALLOWED_PORTS = {22, 80, 443, 41641, 8080}
+# Ports that XARTA_INPUT explicitly allows (used by the local status endpoint
+# to report which expected-open ports are/aren't represented in the chain).
+# Port 8080 is intentionally absent — it is no longer allowed externally.
+_XARTA_ALLOWED_PORTS = {22, 80, 443, 41641}
 
 _TCP_TIMEOUT = 3   # seconds for TCP connect probes
 _UDP_TIMEOUT = 3   # seconds for nc -u UDP probe
