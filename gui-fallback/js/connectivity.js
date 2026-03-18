@@ -10,8 +10,15 @@ let _diagRunning = false;
 function _saveDiagNodes(nodes) {
   try {
     // addresses = raw port-8080 sync addresses (backend use only)
-    // ui_url    = Caddy HTTPS URL (browser use)
-    const slim = nodes.map(n => ({ node_id: n.node_id, display_name: n.display_name, addresses: n.addresses, tailnet: n.tailnet, ui_url: n.ui_url }));
+    // ui_url/primary_ip = Caddy HTTPS target for browser health checks
+    const slim = nodes.map(n => ({
+      node_id: n.node_id,
+      display_name: n.display_name,
+      addresses: n.addresses,
+      tailnet: n.tailnet,
+      ui_url: n.ui_url,
+      primary_ip: n.primary_ip,
+    }));
     localStorage.setItem(_LS_DIAG_NODES, JSON.stringify(slim));
   } catch (_) {}
 }
@@ -25,11 +32,22 @@ async function _diagFetch(url, options = {}) {
 }
 
 async function _checkPeerNodes(peers, thisNodeId) {
-  const others = peers.filter(n => n.node_id !== thisNodeId && (n.ui_url || (n.addresses && n.addresses.length)));
+  const others = peers.filter(n => n.node_id !== thisNodeId && (n.ui_url || n.primary_ip));
   return Promise.all(others.map(async n => {
-    // Prefer ui_url (HTTPS via Caddy) over raw port-8080 address — the browser
-    // cannot reach port 8080 directly once the firewall is active.
-    const addr = n.ui_url ? n.ui_url.replace(/\/$/, '') : n.addresses[0].replace(/\/$/, '');
+    // Browser checks must never use raw mTLS addresses (e.g. :8443) because
+    // the browser does not present a client cert for those requests.
+    const addr = n.ui_url
+      ? n.ui_url.replace(/\/$/, '')
+      : (n.primary_ip ? `https://${n.primary_ip}` : '');
+    if (!addr) {
+      return {
+        node_id: n.node_id,
+        display_name: n.display_name || n.node_id,
+        address: '(no ui_url/primary_ip)',
+        reachable: false,
+        tailnet: n.tailnet,
+      };
+    }
     try {
       const r = await _diagFetch(`${addr}/health`, { signal: AbortSignal.timeout(4000) });
       return { node_id: n.node_id, display_name: n.display_name || n.node_id, address: addr, reachable: r.ok, tailnet: n.tailnet };
