@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import random
+import ssl
 
 import httpx
 
@@ -46,13 +47,17 @@ def _make_sync_client(timeout: float) -> httpx.AsyncClient:
       - this node's cert+key are presented as the client certificate
 
     When any of the three are unset/empty, falls back to plain HTTP (no TLS).
+
+    Note: ssl.SSLContext is built manually rather than passing string paths to
+    httpx.  In httpx ≥0.28 passing verify=<str> triggers an early return that
+    silently drops the cert= parameter, meaning no client cert is presented and
+    Caddy rejects the connection with TLSV13_ALERT_CERTIFICATE_REQUIRED.
     """
     if cfg.SYNC_TLS_CA and cfg.SYNC_TLS_CERT and cfg.SYNC_TLS_KEY:
-        return httpx.AsyncClient(
-            timeout=timeout,
-            verify=cfg.SYNC_TLS_CA,
-            cert=(cfg.SYNC_TLS_CERT, cfg.SYNC_TLS_KEY),
-        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cfg.SYNC_TLS_CA)
+        ctx.load_cert_chain(cfg.SYNC_TLS_CERT, cfg.SYNC_TLS_KEY)
+        return httpx.AsyncClient(timeout=timeout, verify=ctx)
     return httpx.AsyncClient(timeout=timeout)
 
 
