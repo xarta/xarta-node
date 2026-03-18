@@ -56,15 +56,15 @@ Boot-catchup runs automatically — the new node pulls the full DB from the peer
 
 ## Distributing app updates
 
-Push to GitHub → trigger git-sync on any live node:
+Push to GitHub, then update the fleet with the SSH-to-loopback scripts:
 ```bash
-curl -X POST http://<any-node>:8080/api/v1/sync/git-pull \
-     -H 'Content-Type: application/json' \
-     -d '{"scope":"outer"}'
+bash bp-nodes-push.sh
+bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-public.sh
+bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-private.sh
 ```
-All peers receive a `sync_git_outer` queue action → `git pull` → service restart (via `SERVICE_RESTART_CMD` in `.env`).
+The scripts SSH to each node and trigger loopback-only `git-pull` actions safely.
 
-For GUI updates (`.xarta/gui/`), use `scope: "inner"` → `sync_git_inner`.
+For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback.
 
 ## Sync protocol & commit guard
 
@@ -161,7 +161,7 @@ The embed uses `window.apiFetch || fetch` for `/api/v1/nodes` — picks up the p
 
 ### fleet-pull scripts
 
-`fleet-pull-public.sh` and `fleet-pull-private.sh` generate a TOTP from `BLUEPRINTS_SYNC_SECRET` (loaded from `.env`) before POSTing to `/api/v1/sync/git-pull` on each node.
+`fleet-pull-public.sh` and `fleet-pull-private.sh` use SSH-to-loopback on each peer and call `http://127.0.0.1:8080/api/v1/sync/git-pull`. Because the call is loopback-local on the peer, no TOTP token is required in the fleet-pull scripts.
 
 ### Onboarding new nodes
 
