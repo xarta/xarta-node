@@ -36,6 +36,7 @@ call. The `nodes` SQLite table is derived from it — not the other way around.
       "primary_hostname": "<node-id>.infra.<your-domain>",
       "tailnet_ip":       "<100.x.x.x>",
       "tailnet_hostname": "<node-id>.<tailnet-name>.ts.net",
+      "lone_wolf_repo":   "git@github.com:<owner>/<node-repo>.git",
       "sync_port":        8080,
       "active":           true
     }
@@ -55,8 +56,11 @@ call. The `nodes` SQLite table is derived from it — not the other way around.
 | `primary_hostname` | ✅ (if active) | HTTPS-accessible hostname (e.g. Caddy TLS) |
 | `tailnet_ip` | ✅ (if active) | Tailscale IP (100.x.x.x) |
 | `tailnet_hostname` | ✅ (if active) | Full Tailscale hostname |
+| `lone_wolf_repo` | optional | Node-local `.lone-wolf` git remote override used by `fleet-pull-lone-wolf.sh` |
 | `sync_port` | ✅ (if active) | Usually `8080` |
 | `active` | ✅ | `true` = included in sync; `false` = node excluded but record preserved |
+
+Unknown extra fields are tolerated by validation and can be used for tooling metadata.
 
 ---
 
