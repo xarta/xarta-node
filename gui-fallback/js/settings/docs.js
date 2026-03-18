@@ -26,6 +26,7 @@ async function _docsLoadGroups() {
 }
 
 async function loadDocs() {
+  if (typeof docsHistInit === 'function') docsHistInit(_docsActiveId);
   await Promise.all([
     apiFetch('/api/v1/docs').then(r => r.ok ? r.json() : []).then(d => { _docsAll = d; }).catch(() => { _docsAll = []; }),
     _docsLoadGroups(),
@@ -39,8 +40,49 @@ async function loadDocs() {
     _docsActiveId = null;
     _docsHidePane();
   }
+  // Restore the most recent history doc when opening Docs tab on a fresh UI state.
+  if (!_docsActiveId && typeof docsHistCurrent === 'function') {
+    const histDocId = docsHistCurrent();
+    if (histDocId && _docsAll.find(d => d.doc_id === histDocId)) {
+      _docsActiveId = histDocId;
+      if (!(histDocId in _docsViewModes)) _docsViewModes[histDocId] = true;
+      _docsPreview = _docsViewModes[histDocId];
+      _docsRenderSidebar();
+      await _docsOpenDoc(histDocId);
+    }
+  }
   // Refresh list view if it's currently visible
   if (_docsListView) _docsRenderList();
+  _docsUpdateHistoryButtons();
+}
+
+function _docsLabelById(docId) {
+  const doc = _docsAll.find(d => d.doc_id === docId);
+  return doc ? doc.label : null;
+}
+
+function _docsUpdateHistoryButtons() {
+  const backBtn = document.getElementById('docs-back-btn');
+  const fwdBtn = document.getElementById('docs-forward-btn');
+  const hint = document.getElementById('docs-history-hint');
+  if (!backBtn || !fwdBtn || !hint) return;
+
+  const canBack = typeof docsHistCanBack === 'function' ? docsHistCanBack() : false;
+  const canFwd = typeof docsHistCanForward === 'function' ? docsHistCanForward() : false;
+  const backId = typeof docsHistPeekBack === 'function' ? docsHistPeekBack() : null;
+  const fwdId = typeof docsHistPeekForward === 'function' ? docsHistPeekForward() : null;
+  const stats = typeof docsHistStats === 'function' ? docsHistStats() : { back: 0, forward: 0 };
+
+  backBtn.disabled = !canBack;
+  fwdBtn.disabled = !canFwd;
+  backBtn.title = canBack ? `Back to ${_docsLabelById(backId) || 'previous doc'}` : 'No previous doc in history';
+  fwdBtn.title = canFwd ? `Forward to ${_docsLabelById(fwdId) || 'next doc'}` : 'No forward doc in history';
+
+  const parts = [];
+  if (canBack) parts.push(`Back: ${_docsLabelById(backId) || 'doc'}`);
+  if (canFwd) parts.push(`Forward: ${_docsLabelById(fwdId) || 'doc'}`);
+  const countText = `(${stats.back}/${stats.forward})`;
+  hint.textContent = parts.length ? `${parts.join(' • ')} ${countText}` : `History idle ${countText}`;
 }
 
 function _docsRenderSidebar() {
@@ -73,8 +115,13 @@ function _docsRenderSidebar() {
 
 // ── Selection / auto-save ────────────────────────────────────────────────────
 
-async function docsSelectDoc(docId) {
-  if (docId === _docsActiveId) return; // already open
+async function docsSelectDoc(docId, opts = {}) {
+  const fromHistory = !!opts.fromHistory;
+  const force = !!opts.force;
+  if (!force && docId === _docsActiveId) {
+    _docsUpdateHistoryButtons();
+    return true; // already open
+  }
   // Auto-save dirty content before switching
   if (_docsDirty && _docsActiveId) {
     await docsSave(true /* silent */);
@@ -84,7 +131,12 @@ async function docsSelectDoc(docId) {
   if (!(docId in _docsViewModes)) _docsViewModes[docId] = true;
   _docsPreview = _docsViewModes[docId];
   _docsRenderSidebar();
-  await _docsOpenDoc(docId);
+  const ok = await _docsOpenDoc(docId);
+  if (ok && !fromHistory && typeof docsHistRecordDirect === 'function') {
+    docsHistRecordDirect(docId);
+  }
+  _docsUpdateHistoryButtons();
+  return ok;
 }
 
 async function _docsOpenDoc(docId) {
@@ -97,9 +149,39 @@ async function _docsOpenDoc(docId) {
     const doc = await r.json();
     _docsFillPane(doc);
     _docsDirty = false;
+    return true;
   } catch (e) {
     errEl.textContent = `Failed to load document: ${e.message}`;
     errEl.hidden = false;
+    return false;
+  }
+}
+
+async function docsHistoryBack() {
+  if (!(typeof docsHistStepBack === 'function')) return;
+  const target = docsHistStepBack();
+  if (!target) {
+    _docsUpdateHistoryButtons();
+    return;
+  }
+  const ok = await docsSelectDoc(target, { fromHistory: true, force: true });
+  if (!ok && typeof docsHistRemoveDoc === 'function') {
+    docsHistRemoveDoc(target);
+    _docsUpdateHistoryButtons();
+  }
+}
+
+async function docsHistoryForward() {
+  if (!(typeof docsHistStepForward === 'function')) return;
+  const target = docsHistStepForward();
+  if (!target) {
+    _docsUpdateHistoryButtons();
+    return;
+  }
+  const ok = await docsSelectDoc(target, { fromHistory: true, force: true });
+  if (!ok && typeof docsHistRemoveDoc === 'function') {
+    docsHistRemoveDoc(target);
+    _docsUpdateHistoryButtons();
   }
 }
 
@@ -378,6 +460,7 @@ function openDeleteDocModal() {
 }
 
 async function submitDeleteDoc() {
+  const deletingDocId = _docsActiveId;
   const deleteFile = document.getElementById('docs-delete-file-chk').checked;
   const errEl = document.getElementById('docs-delete-error');
   const btn   = document.getElementById('docs-delete-confirm-btn');
@@ -387,7 +470,11 @@ async function submitDeleteDoc() {
     const r = await apiFetch(url, { method: 'DELETE' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     document.getElementById('docs-delete-modal').close();
-    _docsActiveId = null;
+    if (typeof docsHistRemoveDoc === 'function') {
+      _docsActiveId = docsHistRemoveDoc(deletingDocId) || null;
+    } else {
+      _docsActiveId = null;
+    }
     _docsHidePane();
     await loadDocs();
   } catch (e) {

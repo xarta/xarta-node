@@ -104,6 +104,12 @@
           <button id="docs-list-btn" class="secondary" onclick="docsToggleList()">&#9776; List</button>
         </div>
       </div>
+      <!-- Row 2: docs history navigation -->
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 8px 0">
+        <button id="docs-back-btn" class="secondary" onclick="docsHistoryBack()" disabled>&larr; Back</button>
+        <button id="docs-forward-btn" class="secondary" onclick="docsHistoryForward()" disabled>Forward &rarr;</button>
+        <span id="docs-history-hint" style="font-size:12px;color:var(--text-dim)">History idle</span>
+      </div>
       <!-- Status / error row -->
       <p id="docs-status" style="font-size:12px;margin:0 0 4px" hidden></p>
       <p id="docs-error"  class="error-msg" hidden></p>
@@ -899,6 +905,7 @@
 <script src="js/settings/nodes.js"></script>
 <script src="js/settings/keys.js"></script>
 <script src="js/settings/certs.js"></script>
+<script src="js/settings/docs-history.js"></script>
 <script src="js/settings/docs.js"></script>
 <script src="js/settings/docs-images.js"></script>
 <script src="js/settings/self-diag.js"></script>
