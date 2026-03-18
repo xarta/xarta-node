@@ -14,6 +14,7 @@ const _DIAG_ENDPOINTS = [
   { path: '/api/v1/machines',                     label: 'Machines',                  group: 'Data' },
   { path: '/api/v1/arp-manual',                   label: 'Manual ARP',                group: 'Data' },
   { path: '/api/v1/vlans',                        label: 'VLANs',                     group: 'Data' },
+  { path: '/api/v1/manual-links',                 label: 'Manual links',              group: 'Data' },
   { path: '/api/v1/pve-hosts',                    label: 'PVE hosts',                 group: 'Proxmox' },
   { path: '/api/v1/pve-hosts/scan/status',        label: 'PVE scan readiness',        group: 'Proxmox' },
   { path: '/api/v1/proxmox-config',               label: 'Proxmox config',            group: 'Proxmox' },
@@ -29,6 +30,11 @@ const _DIAG_ENDPOINTS = [
   { path: '/api/v1/dockge-stacks',                label: 'Dockge stacks',             group: 'Services' },
   { path: '/api/v1/dockge-stacks/probe/status',   label: 'Dockge probe status',       group: 'Services' },
   { path: '/api/v1/dockge-stacks/services',       label: 'Dockge stack services',     group: 'Services' },
+  { path: '/api/v1/certs/status',                 label: 'Cert status',               group: 'Services' },
+  { path: '/api/v1/docs',                         label: 'Docs',                      group: 'Docs' },
+  { path: '/api/v1/doc-groups',                   label: 'Doc groups',                group: 'Docs' },
+  { path: '/api/v1/doc-images',                   label: 'Doc images',                group: 'Docs' },
+  { path: '/api/v1/todo',                         label: 'Todo list',                 group: 'Data' },
 ];
 
 async function runSelfDiag() {
@@ -86,6 +92,8 @@ async function runSelfDiag() {
   ]);
 
   const testedPaths = new Set(_DIAG_ENDPOINTS.map(e => e.path));
+  // Paths handled specially (fetched outside _DIAG_ENDPOINTS or in their own section)
+  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe'].forEach(p => testedPaths.add(p));
   // GET endpoints from OpenAPI that we don't auto-test (parameterised paths)
   const untestedGets = openapiData
     ? Object.entries(openapiData.paths || {})
@@ -100,8 +108,9 @@ async function runSelfDiag() {
   if (peerResults.length) {
     html += _diagSection('Fleet Connectivity');
     for (const p of peerResults) {
+      // Put address in the wider detail column; status word in the narrow extra column
       html += _selfDiagRow(p.reachable ? '\u2705' : '\u274c',
-        esc(p.display_name || p.node_id), p.reachable ? 'reachable' : 'unreachable', esc(p.address));
+        esc(p.display_name || p.node_id), esc(p.address), p.reachable ? 'reachable' : 'unreachable');
     }
   } else {
     html += _diagSection('Fleet Connectivity');
@@ -330,7 +339,7 @@ function _selfDiagRow(icon, label, detail, extra) {
   return `<div style="display:flex;align-items:baseline;gap:8px;padding:4px 2px;border-bottom:1px solid var(--border);font-size:13px">
     <span style="width:22px;flex-shrink:0;text-align:center">${icon}</span>
     <code style="flex:1.4;font-size:12px;word-break:break-all;color:var(--text)">${esc(label)}</code>
-    <span style="flex:1.2;color:var(--text-dim);font-size:12px">${esc(detail || '')}</span>
+    <span style="flex:1.2;color:var(--text-dim);font-size:12px;word-break:break-all">${esc(detail || '')}</span>
     <span style="flex:0.6;color:var(--text-dim);font-size:11px;text-align:right">${esc(extra || '')}</span>
   </div>`;
 }
