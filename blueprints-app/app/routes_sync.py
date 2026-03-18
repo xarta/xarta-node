@@ -16,6 +16,7 @@ import os
 import ssl
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -647,13 +648,36 @@ async def sync_roundtrip_test() -> dict:
                         break
                     if r.status_code == 401:
                         elapsed = round((time.monotonic() - start_ts) * 1000)
+                        # Disambiguate wrong-secret vs clock-skew.
+                        # TOTP window = ±1 × 5s = 15s tolerance.
+                        # /health is auth-exempt — fetch it to get the peer's
+                        # Date response header and compare against local time.
+                        totp_note = ""
+                        try:
+                            health_r = await client.get(f"{peer_base}/health")
+                            peer_date = health_r.headers.get("date", "")
+                            if peer_date:
+                                peer_ts = parsedate_to_datetime(peer_date).timestamp()
+                                skew_s = abs(peer_ts - time.time())
+                                if skew_s > 15:
+                                    totp_note = (
+                                        f" — clock skew {skew_s:.0f}s detected "
+                                        f"(TOTP window is \u00b115s; sync NTP/chrony on peer)"
+                                    )
+                                else:
+                                    totp_note = (
+                                        f" — clock skew only {skew_s:.1f}s "
+                                        f"(within TOTP tolerance; likely wrong BLUEPRINTS_SYNC_SECRET)"
+                                    )
+                        except Exception:
+                            pass  # if health fetch fails, omit the clock note
                         early_result = {
                             "status": "auth_failed",
                             "elapsed_ms": elapsed,
                             "propagated_to": None,
                             "error": (
-                                f"peer {peer['node_id']} rejected token (HTTP 401) "
-                                "— check BLUEPRINTS_SYNC_SECRET matches on all nodes"
+                                f"peer {peer['node_id']} rejected token (HTTP 401)"
+                                f"{totp_note}"
                             ),
                         }
                         break
