@@ -36,7 +36,25 @@ log = logging.getLogger(__name__)
 _drain_task: asyncio.Task | None = None
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── mTLS client factory ──────────────────────────────────────────────────────
+
+def _make_sync_client(timeout: float) -> httpx.AsyncClient:
+    """Return an httpx.AsyncClient configured for sync drain requests.
+
+    When SYNC_TLS_CA/CERT/KEY are all set in config, the client uses mTLS:
+      - server cert is verified against the fleet CA (not the system bundle)
+      - this node's cert+key are presented as the client certificate
+
+    When any of the three are unset/empty, falls back to plain HTTP (no TLS).
+    """
+    if cfg.SYNC_TLS_CA and cfg.SYNC_TLS_CERT and cfg.SYNC_TLS_KEY:
+        return httpx.AsyncClient(
+            timeout=timeout,
+            verify=cfg.SYNC_TLS_CA,
+            cert=(cfg.SYNC_TLS_CERT, cfg.SYNC_TLS_KEY),
+        )
+    return httpx.AsyncClient(timeout=timeout)
+
 
 async def start_drain_loop() -> None:
     """Start the background queue-drain task (idempotent)."""
@@ -123,7 +141,7 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with _make_sync_client(15.0) as client:
             resp = await client.post(
                 f"{peer_url}/api/v1/sync/actions",
                 json=payload,
@@ -167,7 +185,7 @@ async def _send_full_backup(node_id: str, peer_url: str) -> None:
         return
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with _make_sync_client(60.0) as client:
             _restore_headers = {
                 "content-type": "application/octet-stream",
                 "x-blueprints-checksum": sha256_hex,

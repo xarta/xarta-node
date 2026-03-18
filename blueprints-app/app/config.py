@@ -65,9 +65,12 @@ SELF_ADDRESS: str = f"http://{_self_node['primary_ip']}:{_self_node['sync_port']
 _active_nodes: list[dict] = [n for n in NODES_DATA if n.get("active", False)]
 _peer_nodes: list[dict] = [n for n in _active_nodes if n["node_id"] != NODE_ID]
 
-# Sync peers: other nodes' primary (VLAN) sync addresses
+# Sync peers: other nodes' primary (VLAN) sync addresses.
+# sync_scheme defaults to "http" if not set — nodes without certs continue
+# to work unchanged until they are converted to mTLS.
 PEER_URLS: list[str] = [
-    f"http://{n['primary_ip']}:{n['sync_port']}" for n in _peer_nodes
+    f"{n.get('sync_scheme', 'http')}://{n['primary_ip']}:{n.get('sync_port', 8080)}"
+    for n in _peer_nodes
 ]
 
 # CORS: all active nodes' primary and secondary (tailnet) HTTPS URLs
@@ -78,6 +81,13 @@ CORS_ORIGINS: list[str] = (
 
 # Fleet node IDs — used by ssh-targets key routing
 FLEET_LXC_NAMES: list[str] = [n["node_id"] for n in _active_nodes]
+
+# ── mTLS sync transport ──────────────────────────────────────────────────────
+# Paths to fleet CA cert, this node's cert, and this node's private key.
+# Leave unset (or empty) to fall back to plain HTTP sync.
+SYNC_TLS_CA:   str = os.environ.get("SYNC_TLS_CA",   "")
+SYNC_TLS_CERT: str = os.environ.get("SYNC_TLS_CERT", "")
+SYNC_TLS_KEY:  str = os.environ.get("SYNC_TLS_KEY",  "")
 
 # ── Authentication ────────────────────────────────────────────────────────────
 # 256-bit HMAC secrets (hex). Keep these in .env — never commit.

@@ -11,7 +11,8 @@
 #        - TCP 80   (Caddy HTTP → HTTPS redirect)
 #        - TCP 443  (Caddy HTTPS)
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
-#        - TCP 8080  (fleet sync) — per-peer-IP from .nodes.json only
+#        - TCP 8080  (fleet sync, plain HTTP) — per-peer-IP from .nodes.json only
+#        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
 #   4. Inserts a jump to XARTA_INPUT at position 1 of the INPUT chain
 #      (if not already present), so our rules run before any other rules.
 #   5. Sets the default INPUT policy to DROP.
@@ -110,16 +111,15 @@ echo "    added: TCP 443 (HTTPS/Caddy) → ACCEPT"
 iptables -A XARTA_INPUT -p udp --dport 41641 -j ACCEPT
 echo "    added: UDP 41641 (Tailscale/WireGuard) → ACCEPT"
 
-# Fleet sync — allow the Blueprints app (uvicorn :8080) to be reached by
-# peers for node-to-node sync (drain.py action pushes and git-pull triggers
-# go directly node-to-node, not through Caddy).
-# Rules are generated from .nodes.json — both VLAN and Tailscale IPs for
-# every node are allowed.  Port 8080 remains blocked from any other source.
-# The browser GUI never uses port 8080 — it always goes via Caddy on 443.
+# Fleet sync — allow fleet peers to reach the Blueprints app for node-to-node
+# sync (drain.py action pushes and git-pull triggers).
+#   Port 8080 — plain HTTP directly to uvicorn (loopback shell scripts use this)
+#   Port 8443 — mTLS sync via Caddy (drain.py uses this once certs are deployed)
+# Both ports are per-peer-IP only.  The browser GUI never uses either port.
 NODES_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.nodes.json"
 if [[ ! -f "$NODES_JSON" ]]; then
     echo -e "${YELLOW}Warning:${NC} .nodes.json not found at $NODES_JSON"
-    echo "  Port 8080 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
+    echo "  Port 8080/8443 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
 else
     # Extract all primary_ip and tailnet_ip values from every node entry.
     PEER_IPS=$(python3 -c "
@@ -135,11 +135,13 @@ for ip in sorted(ips):
     print(ip)
 ")
     if [[ -z "$PEER_IPS" ]]; then
-        echo -e "${YELLOW}Warning:${NC} No IPs found in .nodes.json — skipping port 8080 rules."
+        echo -e "${YELLOW}Warning:${NC} No IPs found in .nodes.json — skipping port 8080/8443 rules."
     else
         while IFS= read -r ip; do
             iptables -A XARTA_INPUT -p tcp --dport 8080 -s "$ip" -j ACCEPT
-            echo "    added: TCP 8080 from $ip (fleet peer sync) → ACCEPT"
+            echo "    added: TCP 8080 from $ip (fleet peer sync, plain HTTP) → ACCEPT"
+            iptables -A XARTA_INPUT -p tcp --dport 8443 -s "$ip" -j ACCEPT
+            echo "    added: TCP 8443 from $ip (fleet peer sync, mTLS) → ACCEPT"
         done <<< "$PEER_IPS"
     fi
 fi
