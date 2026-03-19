@@ -112,6 +112,11 @@ PEER_SYNC_URLS: dict[str, list[str]] = {
 # Primary address is always first per peer; tailnet address follows where applicable.
 PEER_URLS: list[str] = [url for urls in PEER_SYNC_URLS.values() for url in urls]
 
+# SELF_NODE / NODE_MAP / PEER_NODES — used by smart forwarding in Phase 2.
+SELF_NODE: dict = _self_node
+NODE_MAP: dict[str, dict] = {n["node_id"]: n for n in NODES_DATA}
+PEER_NODES: list[dict] = _peer_nodes
+
 # CORS: all active nodes' primary and secondary (tailnet) HTTPS URLs
 CORS_ORIGINS: list[str] = (
     [f"https://{n['primary_hostname']}" for n in _active_nodes]

@@ -678,6 +678,7 @@ class SyncAction(BaseModel):
     row_data: Optional[dict[str, Any]] = None
     gen: int
     source_node_id: str
+    guid: str = ""  # UUID4 hex from originating node; empty = legacy (skip dedup)
 
 
 class GitPullRequest(BaseModel):

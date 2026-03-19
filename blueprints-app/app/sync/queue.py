@@ -14,6 +14,7 @@ in drain.py). The queue functions here are pure enqueue/query helpers.
 import json
 import logging
 import sqlite3
+import uuid
 from typing import Any
 
 from .. import config as cfg
@@ -32,16 +33,19 @@ def enqueue(
     row_id: str,
     row_data: dict[str, Any] | None,
     gen: int,
+    guid: str | None = None,
 ) -> None:
     """
     Append one action to a peer's queue within an open transaction.
     Must be called from inside a get_conn() context after a write.
     """
+    if guid is None:
+        guid = uuid.uuid4().hex
     conn.execute(
         """
         INSERT INTO sync_queue
-            (target_node_id, action_type, table_name, row_id, row_data, gen)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (target_node_id, action_type, table_name, row_id, row_data, gen, guid)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             target_node_id,
@@ -50,6 +54,7 @@ def enqueue(
             row_id,
             json.dumps(row_data) if row_data is not None else None,
             gen,
+            guid,
         ),
     )
 
@@ -62,14 +67,20 @@ def enqueue_for_all_peers(
     row_data: dict[str, Any] | None,
     gen: int,
     exclude_node_id: str | None = None,
+    guid: str | None = None,
 ) -> None:
     """
     Enqueue a write action for every registered peer node.
+
+    A single GUID is generated (or accepted from the caller) and shared
+    across all per-peer queue entries — this lets receiving nodes deduplicate
+    forwarded copies via sync_seen_guids.
 
     exclude_node_id: optionally skip one node (e.g. when registering that node
     itself — the new node will receive a full backup instead of incremental
     actions).
     """
+    shared_guid = guid if guid is not None else uuid.uuid4().hex
     try:
         peer_rows = conn.execute(
             "SELECT node_id FROM nodes WHERE node_id != ?", (cfg.NODE_ID,)
@@ -83,7 +94,7 @@ def enqueue_for_all_peers(
         if peer_id == exclude_node_id:
             continue
         try:
-            enqueue(conn, peer_id, action_type, table_name, row_id, row_data, gen)
+            enqueue(conn, peer_id, action_type, table_name, row_id, row_data, gen, guid=shared_guid)
         except Exception:
             log.exception("failed to enqueue action for peer %s", peer_id)
 
@@ -95,7 +106,7 @@ def get_pending_actions(target_node_id: str, limit: int = 50) -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT queue_id, action_type, table_name, row_id, row_data, gen
+            SELECT queue_id, action_type, table_name, row_id, row_data, gen, guid
             FROM   sync_queue
             WHERE  target_node_id=? AND sent=0
             ORDER  BY queue_id ASC

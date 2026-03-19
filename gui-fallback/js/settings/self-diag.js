@@ -57,7 +57,7 @@ async function runSelfDiag() {
   const selfTailnet = selfNode?.tailnet || null;
 
   // Run connectivity + all endpoint tests concurrently
-  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData, failoverProbeData] = await Promise.all([
+  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData, failoverProbeData, guidProbeData] = await Promise.all([
     Promise.all(_DIAG_ENDPOINTS.map(async ep => {
       const start = performance.now();
       try {
@@ -95,11 +95,17 @@ async function runSelfDiag() {
         return r.ok ? await r.json() : null;
       } catch { return null; }
     })(),
+    (async () => {
+      try {
+        const r = await apiFetch('/api/v1/sync/guid-probe', { signal: AbortSignal.timeout(10000) });
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    })(),
   ]);
 
   const testedPaths = new Set(_DIAG_ENDPOINTS.map(e => e.path));
   // Paths handled specially (fetched outside _DIAG_ENDPOINTS or in their own section)
-  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe', '/api/v1/sync/failover-probe'].forEach(p => testedPaths.add(p));
+  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe', '/api/v1/sync/failover-probe', '/api/v1/sync/guid-probe'].forEach(p => testedPaths.add(p));
   // GET endpoints from OpenAPI that we don't auto-test (parameterised paths)
   const untestedGets = openapiData
     ? Object.entries(openapiData.paths || {})
@@ -180,6 +186,51 @@ async function runSelfDiag() {
         : esc(p.real_status + (p.real_error ? ': ' + p.real_error : ''));
       html += _selfDiagRow(realIcon, esc(p.node_id) + ' \u2192 real URL', esc(p.real_url || 'none configured'), realDetail);
     }
+  }
+
+  // ── Sync — GUID Dedup & Forwarding probe ────────────────────────────────────
+  html += _diagSection('Sync — GUID Dedup & Forwarding (Phase 2 probe)');
+  if (!guidProbeData) {
+    html += _selfDiagRow('⚠', '/api/v1/sync/guid-probe', 'endpoint missing — update app code on this node', '');
+  } else {
+    const overallIcon = guidProbeData.all_passed ? '✅' : '❌';
+    html += _selfDiagRow(overallIcon, 'Overall result',
+      guidProbeData.all_passed ? 'all checks passed' : 'one or more checks failed', '');
+
+    // Test 1: GUID dedup
+    const d = guidProbeData.dedup || {};
+    const firstOk = d.first_insert === 'accepted';
+    const secondOk = d.second_insert === 'deduplicated';
+    html += _selfDiagRow(firstOk ? '✅' : '❌', 'GUID dedup → first insert',
+      d.first_insert || '?', firstOk ? '(expected: row created)' : '');
+    html += _selfDiagRow(secondOk ? '✅' : '❌', 'GUID dedup → second insert',
+      d.second_insert || '?', secondOk ? '(expected: IntegrityError)' : '⚠ should be deduplicated');
+    html += _selfDiagRow(d.cleanup === 'ok' ? '✅' : '⚠', 'GUID dedup → cleanup',
+      d.cleanup || '?', '');
+
+    // Test 2: fleet topology
+    for (const t of (guidProbeData.topology || [])) {
+      const icon = t.self_can_reach ? '✅' : '⚠';
+      const via = t.self_can_reach
+        ? (t.peer_has_primary_ip ? 'via LAN' : 'via tailnet')
+        : 'unreachable';
+      html += _selfDiagRow(icon,
+        esc(t.peer_node_id) + ' → reachability',
+        via,
+        t.peer_tailnet ? esc(t.peer_tailnet) : '');
+    }
+
+    // Test 3: mock VPS relay
+    const mr = guidProbeData.mock_relay || {};
+    const relayIcon = mr.relay_ok ? '✅' : '❌';
+    const relayCount = (mr.relay_peers || []).length;
+    const relayDetail = relayCount === 0
+      ? 'none needed (all peers share LAN or same tailnet with VPS source)'
+      : `would relay to: ${(mr.relay_peers || []).map(id => esc(id)).join(', ')}`;
+    html += _selfDiagRow(relayIcon,
+      'Mock VPS relay (no primary_ip source)',
+      mr.relay_ok ? 'relay set correct' : 'relay set mismatch',
+      relayDetail);
   }
 
   // ── Sync — Data Propagation Round-trip ───────────────────────────────
