@@ -605,6 +605,131 @@ async def ssh_probe() -> dict:
     }
 
 
+# Port used as the synthetic "dead" first address in the failover probe.
+# Must never be in use on any fleet node.  Port 19999 is in the ephemeral
+# range boundary and is not assigned to any standard service.
+_FAILOVER_DEAD_PORT = 19999
+
+
+@router.get("/failover-probe")
+async def failover_probe() -> dict:
+    """
+    Validate the Phase 1 multi-address failover logic without a real remote node.
+
+    For each fleet peer, constructs a synthetic 2-URL list:
+      1. Dead URL:  <scheme>://<peer_ip>:<_FAILOVER_DEAD_PORT>  — same IP as
+                    the real peer, but a port that is never listening anywhere.
+                    TCP connect is refused instantly (ECONNREFUSED) — no timeout
+                    wait.  This simulates the drain hitting an unreachable primary
+                    address (VLAN42 down, or future VPS with no primary_ip).
+      2. Real URL:  the peer's actual configured sync URL (from PEER_SYNC_URLS).
+
+    The probe attempts the dead URL, expects ConnectError, then falls through
+    to the real URL — exactly as drain.py does.
+
+    A peer PASSES when:
+      - dead_status == "refused" (ConnectError on port 19999, as expected)
+      - real_status == "ok"       (peer responded normally on real URL)
+
+    This validates the full failover code path (config.py → drain URL list →
+    httpx ConnectError catch → next URL) against every live peer, on every
+    node that runs the diagnostic.
+
+    Phase 2 hook: when GUID deduplication is implemented, a companion
+    /failover-guid-probe endpoint can test that the same GUID arriving twice
+    is silently dropped on the second application.
+    """
+    import time
+
+    async def _probe_one(n: dict, client: httpx.AsyncClient) -> dict:
+        node_id = n["node_id"]
+        scheme  = n.get("sync_scheme", "http")
+        peer_ip = n.get("primary_ip") or "127.0.0.1"
+
+        dead_url = f"{scheme}://{peer_ip}:{_FAILOVER_DEAD_PORT}"
+        real_urls = cfg.PEER_SYNC_URLS.get(node_id, [])
+        real_url  = real_urls[0] if real_urls else None
+
+        # ── Step 1: attempt the dead URL ─────────────────────────────────
+        t0 = time.monotonic()
+        dead_status = "unknown"
+        dead_error  = None
+        try:
+            await client.get(f"{dead_url}/health")
+            dead_status = "open"   # unexpected — port 19999 should be closed
+        except httpx.ConnectError as e:
+            err = str(e)
+            dead_status = (
+                "tls_error"
+                if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower())
+                else "refused"
+            )
+            dead_error = err
+        except httpx.TimeoutException:
+            dead_status = "timeout"
+            dead_error  = "connection timed out"
+        except Exception as e:
+            dead_status = "error"
+            dead_error  = str(e)
+        dead_ms = round((time.monotonic() - t0) * 1000)
+
+        # ── Step 2: attempt the real URL ─────────────────────────────────
+        real_status      = "no_url"
+        real_http_status = None
+        real_error       = None
+        real_ms          = 0
+        if real_url:
+            t1 = time.monotonic()
+            try:
+                r = await client.get(f"{real_url}/health")
+                real_status      = "ok" if r.is_success else "http_error"
+                real_http_status = r.status_code
+            except httpx.ConnectError as e:
+                err = str(e)
+                real_status = (
+                    "tls_error"
+                    if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower())
+                    else "refused"
+                )
+                real_error = err
+            except httpx.TimeoutException:
+                real_status = "timeout"
+                real_error  = "connection timed out"
+            except Exception as e:
+                real_status = "error"
+                real_error  = str(e)
+            real_ms = round((time.monotonic() - t1) * 1000)
+
+        failover_ok = (dead_status in ("refused", "timeout")) and real_status == "ok"
+
+        return {
+            "node_id":         node_id,
+            "dead_url":        f"{dead_url}/health",
+            "dead_status":     dead_status,
+            "dead_ms":         dead_ms,
+            "dead_error":      dead_error,
+            "real_url":        f"{real_url}/health" if real_url else None,
+            "real_status":     real_status,
+            "real_http_status": real_http_status,
+            "real_ms":         real_ms,
+            "real_error":      real_error,
+            "failover_ok":     failover_ok,
+        }
+
+    results = []
+    async with _probe_client(timeout=8.0) as client:
+        for n in cfg._peer_nodes:
+            results.append(await _probe_one(n, client))
+
+    all_passed = all(r["failover_ok"] for r in results) if results else False
+    return {
+        "method":     f"synthetic dead-port (port {_FAILOVER_DEAD_PORT}) + real configured URL",
+        "dead_port":  _FAILOVER_DEAD_PORT,
+        "all_passed": all_passed,
+        "peers":      results,
+    }
+
+
 @router.post("/roundtrip-test")
 async def sync_roundtrip_test() -> dict:
     """
