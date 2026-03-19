@@ -35,6 +35,8 @@ const _DIAG_ENDPOINTS = [
   { path: '/api/v1/doc-groups',                   label: 'Doc groups',                group: 'Docs' },
   { path: '/api/v1/doc-images',                   label: 'Doc images',                group: 'Docs' },
   { path: '/api/v1/todo',                         label: 'Todo list',                 group: 'Data' },
+  { path: '/api/v1/ai-providers',                  label: 'AI providers',              group: 'AI' },
+  { path: '/api/v1/ai-project-assignments',        label: 'AI project assignments',    group: 'AI' },
 ];
 
 async function runSelfDiag() {
@@ -369,6 +371,20 @@ async function runSelfDiag() {
     html += _selfDiagRow('\u2014', 'Own address not cached', 'open the Nodes tab while online to populate', '');
   }
 
+  // ── Local AI Providers ─────────────────────────────────────────────────────
+  html += _diagSection('Local AI Providers');
+  html += `<div id="bp-ai-probe-section" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 2px">
+    <button id="bp-ai-probe-btn"
+      style="padding:3px 10px;background:var(--accent-dim);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0">
+      &#x25b6; Probe (lightweight)
+    </button>
+    <button id="bp-ai-infer-btn"
+      style="padding:3px 10px;background:var(--accent-dim);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0">
+      &#x1f9e0; Probe + inference
+    </button>
+    <span style="font-size:12px;color:var(--text-dim)">Tests all enabled providers from the DB. Inference triggers GPU.</span>
+  </div>`;
+
   results.innerHTML = html;
 
   // Bind the propagation round-trip test button
@@ -400,6 +416,71 @@ async function runSelfDiag() {
       }
     });
   }
+
+  // Bind AI provider probe buttons
+  async function _runAiProbe(withInference) {
+    const probeSection = document.getElementById('bp-ai-probe-section');
+    const activeBtn = document.getElementById(withInference ? 'bp-ai-infer-btn' : 'bp-ai-probe-btn');
+    if (!probeSection || !activeBtn) return;
+    activeBtn.disabled = true;
+    activeBtn.textContent = '\u29d0 Running\u2026';
+    try {
+      const r = await apiFetch(`/api/v1/ai-providers/probe?inference=${withInference}`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(withInference ? 120000 : 20000),
+      });
+      if (!r.ok) {
+        probeSection.outerHTML = _selfDiagRow('\u274c', 'AI probe', `HTTP ${r.status}`, '');
+        return;
+      }
+      const d = await r.json();
+      if (!d.providers?.length) {
+        probeSection.outerHTML = _selfDiagRow('\u2014', 'AI providers', 'No enabled providers in DB', '');
+        return;
+      }
+      let rows = '';
+      for (const p of d.providers) {
+        const c = p.checks || {};
+        const liveOk  = !!(c.liveliness?.ok);
+        const readyOk = !!(c.readiness?.ok);
+        const modelsOk = !!(c.models_ok?.ok);
+        const modelFound = !!c.model_in_list;
+        const lightOk = liveOk && readyOk && modelsOk && modelFound;
+        rows += _selfDiagRow(
+          lightOk ? '\u2705' : '\u274c',
+          `${p.model_type.toUpperCase()}: ${p.name}`,
+          p.model_name,
+          p.base_url
+        );
+        rows += _selfDiagRow(
+          liveOk ? '\u2705' : '\u274c', '  \u2192 liveliness',
+          liveOk ? 'ok' : (c.liveliness?.error || `HTTP ${c.liveliness?.status}`), '');
+        rows += _selfDiagRow(
+          readyOk ? '\u2705' : '\u274c', '  \u2192 readiness',
+          readyOk ? 'ok' : (c.readiness?.error || `HTTP ${c.readiness?.status}`), '');
+        rows += _selfDiagRow(
+          modelsOk ? '\u2705' : '\u274c', '  \u2192 /v1/models',
+          modelsOk ? 'ok' : (c.models_ok?.error || `HTTP ${c.models_ok?.status}`), '');
+        rows += _selfDiagRow(
+          modelFound ? '\u2705' : '\u274c', '  \u2192 model alias in list',
+          modelFound ? `${p.model_name} found` : `${p.model_name} NOT found`, '');
+        if (withInference && c.inference !== undefined && c.inference !== null) {
+          const infOk = !!(c.inference?.ok);
+          rows += _selfDiagRow(
+            infOk ? '\u2705' : '\u274c', '  \u2192 inference call',
+            infOk ? 'ok' : (c.inference?.error || `HTTP ${c.inference?.status}`), '');
+        }
+      }
+      probeSection.outerHTML = rows;
+    } catch (e) {
+      const probeSection2 = document.getElementById('bp-ai-probe-section');
+      if (probeSection2) probeSection2.outerHTML = _selfDiagRow('\u274c', 'AI probe error', e.message, '');
+    }
+  }
+  const _aiProbeBtn = document.getElementById('bp-ai-probe-btn');
+  const _aiInferBtn = document.getElementById('bp-ai-infer-btn');
+  if (_aiProbeBtn) _aiProbeBtn.addEventListener('click', () => _runAiProbe(false));
+  if (_aiInferBtn) _aiInferBtn.addEventListener('click', () => _runAiProbe(true));
 
   const total   = endpointResults.length;
   const passed  = endpointResults.filter(r => r.ok).length;
