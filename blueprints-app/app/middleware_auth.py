@@ -83,6 +83,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # ── 2. Token check (skip for exempt paths) ────────────────────────────
         path = request.url.path
+        if path == "/api/v1/bookmarks/health":
+            return await call_next(request)
         if not any(path.startswith(p) for p in _TOKEN_EXEMPT_PREFIXES):
             token = request.headers.get("x-api-token", "")
 

@@ -158,6 +158,27 @@ BACKUP_DIR: str = os.environ.get("BLUEPRINTS_BACKUP_DIR", "")
 # ── GUI ───────────────────────────────────────────────────────────────────────
 GUI_DIR: str = os.environ.get("BLUEPRINTS_GUI_DIR", "/data/gui")
 
+# ── SeekDB (server mode) ─────────────────────────────────────────────────────
+_required_seekdb_keys = (
+    "SEEKDB_HOST",
+    "SEEKDB_PORT",
+    "SEEKDB_DB",
+    "SEEKDB_USER",
+    "SEEKDB_PASSWORD",
+)
+for _k in _required_seekdb_keys:
+    if _k not in os.environ:
+        raise RuntimeError(f"{_k} is not set — add it to .env before starting the app")
+
+SEEKDB_HOST: str = os.environ["SEEKDB_HOST"]
+try:
+    SEEKDB_PORT: int = int(os.environ["SEEKDB_PORT"])
+except ValueError as _exc:
+    raise RuntimeError("SEEKDB_PORT must be an integer in .env") from _exc
+SEEKDB_DB: str = os.environ["SEEKDB_DB"]
+SEEKDB_USER: str = os.environ["SEEKDB_USER"]
+SEEKDB_PASSWORD: str = os.environ["SEEKDB_PASSWORD"]
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 SYNC_DRAIN_INTERVAL_MIN: int = 1    # seconds — minimum random delay per drain
 SYNC_DRAIN_INTERVAL_MAX: int = 20   # seconds — maximum random delay per drain

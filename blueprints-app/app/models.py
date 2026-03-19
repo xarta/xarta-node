@@ -897,3 +897,76 @@ class AiProjectAssignmentOut(BaseModel):
     enabled: bool = True
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+# ── Browser Links (Bookmarks + Visits) ──────────────────────────────────────
+
+class BookmarkCreate(BaseModel):
+    url: str
+    title: str = ""
+    description: str = ""
+    tags: list[str] = []
+    folder: str = ""
+    notes: str = ""
+    favicon_url: str = ""
+    source: str = "manual"
+
+
+class BookmarkUpdate(BaseModel):
+    url: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list[str]] = None
+    folder: Optional[str] = None
+    notes: Optional[str] = None
+    favicon_url: Optional[str] = None
+    source: Optional[str] = None
+    archived: Optional[bool] = None
+
+
+class BookmarkOut(BaseModel):
+    bookmark_id: str
+    url: str
+    normalized_url: str
+    title: str
+    description: str
+    tags: list[str] = []
+    folder: str = ""
+    notes: str = ""
+    favicon_url: str = ""
+    source: str = "manual"
+    archived: bool = False
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class BookmarkImportRequest(BaseModel):
+    bookmarks: list[BookmarkCreate]
+    skip_duplicates: bool = True
+
+
+class BookmarkImportResult(BaseModel):
+    imported: int
+    skipped_duplicates: int
+
+
+class VisitCreate(BaseModel):
+    url: str
+    title: str = ""
+    source: str = "visit-recorder"
+    dwell_seconds: Optional[int] = None
+    visited_at: Optional[str] = None
+
+
+class VisitOut(BaseModel):
+    visit_id: str
+    url: str
+    normalized_url: str
+    domain: str = ""
+    title: str = ""
+    source: str = "visit-recorder"
+    dwell_seconds: Optional[int] = None
+    bookmark_id: Optional[str] = None
+    visited_at: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

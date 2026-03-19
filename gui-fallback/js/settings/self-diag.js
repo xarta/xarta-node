@@ -37,6 +37,9 @@ const _DIAG_ENDPOINTS = [
   { path: '/api/v1/todo',                         label: 'Todo list',                 group: 'Data' },
   { path: '/api/v1/ai-providers',                  label: 'AI providers',              group: 'AI' },
   { path: '/api/v1/ai-project-assignments',        label: 'AI project assignments',    group: 'AI' },
+  { path: '/api/v1/bookmarks',                     label: 'Bookmarks list',            group: 'Browser Links' },
+  { path: '/api/v1/bookmarks/tags',                label: 'Bookmark tags',             group: 'Browser Links' },
+  { path: '/api/v1/bookmarks/visits',              label: 'Bookmark visits',           group: 'Browser Links' },
 ];
 
 async function runSelfDiag() {
@@ -59,7 +62,7 @@ async function runSelfDiag() {
   const selfTailnet = selfNode?.tailnet || null;
 
   // Run connectivity + all endpoint tests concurrently
-  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData, failoverProbeData, guidProbeData] = await Promise.all([
+  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData, failoverProbeData, guidProbeData, bookmarksHealthData] = await Promise.all([
     Promise.all(_DIAG_ENDPOINTS.map(async ep => {
       const start = performance.now();
       try {
@@ -103,11 +106,17 @@ async function runSelfDiag() {
         return r.ok ? await r.json() : null;
       } catch { return null; }
     })(),
+    (async () => {
+      try {
+        const r = await apiFetch('/api/v1/bookmarks/health', { signal: AbortSignal.timeout(10000) });
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    })(),
   ]);
 
   const testedPaths = new Set(_DIAG_ENDPOINTS.map(e => e.path));
   // Paths handled specially (fetched outside _DIAG_ENDPOINTS or in their own section)
-  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe', '/api/v1/sync/failover-probe', '/api/v1/sync/guid-probe'].forEach(p => testedPaths.add(p));
+  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe', '/api/v1/sync/failover-probe', '/api/v1/sync/guid-probe', '/api/v1/bookmarks/health'].forEach(p => testedPaths.add(p));
   // GET endpoints from OpenAPI that we don't auto-test (parameterised paths)
   const untestedGets = openapiData
     ? Object.entries(openapiData.paths || {})
@@ -369,6 +378,27 @@ async function runSelfDiag() {
   } else {
     html += _diagSection('Firewall — External Port Probe');
     html += _selfDiagRow('\u2014', 'Own address not cached', 'open the Nodes tab while online to populate', '');
+  }
+
+  // ── Browser Links — SeekDB Health ─────────────────────────────────────────
+  html += _diagSection('Browser Links — SeekDB Health');
+  if (!bookmarksHealthData) {
+    html += _selfDiagRow('⚠', '/api/v1/bookmarks/health', 'endpoint missing or error — is routes_bookmarks.py loaded?', '');
+  } else {
+    const bmOverallOk = bookmarksHealthData.status === 'ok';
+    html += _selfDiagRow(bmOverallOk ? '✅' : '❌', 'Overall status', bookmarksHealthData.status || '?', '');
+    for (const sub of ['sqlite', 'seekdb', 'embedding']) {
+      const val = bookmarksHealthData[sub];
+      const ok = val === 'ok';
+      const errKey = sub + '_error';
+      const errDetail = bookmarksHealthData[errKey] ? esc(String(bookmarksHealthData[errKey]).split('\n')[0]) : '';
+      html += _selfDiagRow(ok ? '✅' : '❌', sub, val || '?', errDetail);
+    }
+    html += _selfDiagRow('ℹ', 'Indexed bookmarks', String(bookmarksHealthData.seekdb_indexed ?? '?'), `${bookmarksHealthData.bookmark_count ?? '?'} in SQLite`);
+    html += _selfDiagRow('ℹ', 'Indexed visits', String(bookmarksHealthData.seekdb_visits_indexed ?? '?'), `${bookmarksHealthData.visit_count ?? '?'} in SQLite`);
+    if (bookmarksHealthData.last_seekdb_sync) {
+      html += _selfDiagRow('ℹ', 'Last SeekDB sync', esc(bookmarksHealthData.last_seekdb_sync), '');
+    }
   }
 
   // ── Local AI Providers ─────────────────────────────────────────────────────
