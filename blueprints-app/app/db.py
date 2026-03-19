@@ -366,6 +366,49 @@ CREATE TABLE IF NOT EXISTS ai_project_assignments (
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ai_assignments_project ON ai_project_assignments(project_name, role);
+
+-- ── Browser links (SQLite canonical store) ─────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS bookmarks (
+    bookmark_id      TEXT PRIMARY KEY,
+    url              TEXT NOT NULL,
+    normalized_url   TEXT NOT NULL,
+    title            TEXT NOT NULL DEFAULT '',
+    description      TEXT NOT NULL DEFAULT '',
+    tags_json        TEXT NOT NULL DEFAULT '[]',
+    folder           TEXT NOT NULL DEFAULT '',
+    notes            TEXT NOT NULL DEFAULT '',
+    favicon_url      TEXT NOT NULL DEFAULT '',
+    source           TEXT NOT NULL DEFAULT 'manual',
+    archived         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_norm_url ON bookmarks(normalized_url);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_updated  ON bookmarks(updated_at);
+
+CREATE TABLE IF NOT EXISTS visits (
+    visit_id         TEXT PRIMARY KEY,
+    url              TEXT NOT NULL,
+    normalized_url   TEXT NOT NULL,
+    domain           TEXT NOT NULL DEFAULT '',
+    title            TEXT NOT NULL DEFAULT '',
+    source           TEXT NOT NULL DEFAULT 'visit-recorder',
+    dwell_seconds    INTEGER,
+    bookmark_id      TEXT,
+    visited_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_visits_norm_url   ON visits(normalized_url);
+CREATE INDEX IF NOT EXISTS idx_visits_visited_at ON visits(visited_at);
+CREATE INDEX IF NOT EXISTS idx_visits_updated    ON visits(updated_at);
+
+CREATE TABLE IF NOT EXISTS bookmark_deletions (
+    bookmark_id      TEXT PRIMARY KEY,
+    deleted_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bm_deletions_deleted_at ON bookmark_deletions(deleted_at);
 """
 
 _SEED_SQL = """

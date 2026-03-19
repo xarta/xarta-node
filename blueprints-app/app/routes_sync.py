@@ -50,6 +50,9 @@ _ALLOWED_TABLES = {
     "doc_images",
     "ai_providers",
     "ai_project_assignments",
+    "bookmarks",
+    "visits",
+    "bookmark_deletions",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -149,6 +152,9 @@ def _pk_for_table(table: str) -> str:
         "doc_images":              "image_id",
         "ai_providers":            "provider_id",
         "ai_project_assignments":  "assignment_id",
+        "bookmarks":               "bookmark_id",
+        "visits":                  "visit_id",
+        "bookmark_deletions":      "bookmark_id",
     }
     return pk_map.get(table, "id")
 

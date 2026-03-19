@@ -48,6 +48,7 @@ SKIP_KEYS=(
     "BLUEPRINTS_GUI_DIR"        # derived from REPO_INNER_PATH — documented public structure
     "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
     "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure
+    "SEEKDB_DB"                 # value is "blueprints" — the project name, present everywhere
 )
 
 # Colours
