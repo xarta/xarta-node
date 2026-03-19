@@ -48,6 +48,7 @@
     <button data-group="settings" style="display:none" onclick="switchTab('certs')">&#128274; Certs</button>
     <button data-group="settings" style="display:none" onclick="switchTab('docs')">&#128196; Docs</button>
     <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
+    <button data-group="settings" style="display:none" onclick="switchTab('ai-providers')">&#129302; AI Providers</button>
     <!-- PROBES group -->
     <button data-group="probes" style="display:none" onclick="switchTab('pfsense-dns')">pfSense DNS</button>
     <button data-group="probes" style="display:none" id="tab-btn-proxmox-config" onclick="switchTab('proxmox-config')">Proxmox Config</button>
@@ -285,6 +286,8 @@
           <option value="pve_hosts">pve_hosts</option>
           <option value="arp_manual">arp_manual</option>
           <option value="ssh_targets">ssh_targets</option>
+          <option value="ai_providers">ai_providers</option>
+          <option value="ai_project_assignments">ai_project_assignments</option>
         </select>
         <button id="retouch-btn" class="secondary" onclick="retouchTable(this)" title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
         <span id="retouch-status" style="font-size:12px;color:var(--text-dim)"></span>
@@ -610,6 +613,44 @@
     </div>
   </section>
 
+  <!-- AI Providers -->
+  <section id="tab-ai-providers" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">&#129302; AI Providers</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        <button onclick="openAiProviderModal(null)">+ Add provider</button>
+        <button class="secondary" onclick="loadAiProviders()">&#8635; Refresh</button>
+      </div>
+    </div>
+
+    <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 8px">Providers</h3>
+    <div class="table-wrap" style="margin-bottom:20px">
+      <table>
+        <thead><tr>
+          <th>Type</th><th>Name</th><th>Model</th><th>Dims</th><th>Enabled</th><th>Notes</th><th style="width:80px">Actions</th>
+        </tr></thead>
+        <tbody id="ai-providers-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0">Project Assignments</h3>
+      <button onclick="openAiAssignmentModal(null)">+ Add assignment</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Project</th><th>Role</th><th>Provider</th><th>Priority</th><th>Enabled</th><th style="width:60px">Actions</th>
+        </tr></thead>
+        <tbody id="ai-assignments-tbody"><tr class="empty-row"><td colspan="6">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+    <p id="ai-providers-error" class="error-msg" hidden></p>
+  </section>
+
   <!-- SSH Targets -->
   <section id="tab-ssh-targets" class="tab-panel">
     <h2>SSH Targets</h2>
@@ -912,6 +953,7 @@
 <script src="js/settings/settings.js"></script>
 <script src="js/settings/pve-hosts.js"></script>
 <script src="js/settings/arp-manual.js"></script>
+<script src="js/settings/ai-providers.js"></script>
 <script src="js/probes/pfsense.js"></script>
 <script src="js/probes/proxmox-config.js"></script>
 <script src="js/probes/vlans.js"></script>
