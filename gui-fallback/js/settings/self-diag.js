@@ -57,7 +57,7 @@ async function runSelfDiag() {
   const selfTailnet = selfNode?.tailnet || null;
 
   // Run connectivity + all endpoint tests concurrently
-  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData] = await Promise.all([
+  const [endpointResults, peerResults, netResults, openapiData, mtlsProbeData, sshProbeData, failoverProbeData] = await Promise.all([
     Promise.all(_DIAG_ENDPOINTS.map(async ep => {
       const start = performance.now();
       try {
@@ -89,11 +89,17 @@ async function runSelfDiag() {
         return r.ok ? await r.json() : null;
       } catch { return null; }
     })(),
+    (async () => {
+      try {
+        const r = await apiFetch('/api/v1/sync/failover-probe', { signal: AbortSignal.timeout(60000) });
+        return r.ok ? await r.json() : null;
+      } catch { return null; }
+    })(),
   ]);
 
   const testedPaths = new Set(_DIAG_ENDPOINTS.map(e => e.path));
   // Paths handled specially (fetched outside _DIAG_ENDPOINTS or in their own section)
-  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe'].forEach(p => testedPaths.add(p));
+  ['/api/v1/firewall/status', '/api/v1/sync/mtls-probe', '/api/v1/sync/ssh-probe', '/api/v1/sync/failover-probe'].forEach(p => testedPaths.add(p));
   // GET endpoints from OpenAPI that we don't auto-test (parameterised paths)
   const untestedGets = openapiData
     ? Object.entries(openapiData.paths || {})
@@ -146,6 +152,33 @@ async function runSelfDiag() {
       const icon = _sshIcons[p.status] || '\u274c';
       const detail = esc((p.error || p.status).split('\n')[0].trim());
       html += _selfDiagRow(icon, esc(p.node_id), p.status, detail);
+    }
+  }
+
+  // ── Sync — Failover Logic ───────────────────────────────────────────
+  html += _diagSection('Sync \u2014 Failover Logic (simulated VPS probe)');
+  if (!failoverProbeData) {
+    html += _selfDiagRow('\u26a0', '/api/v1/sync/failover-probe', 'endpoint missing \u2014 update app code on this node', '');
+  } else {
+    const overallIcon = failoverProbeData.all_passed ? '\u2705' : '\u274c';
+    html += _selfDiagRow(overallIcon, 'Overall result',
+      failoverProbeData.all_passed ? 'all peers passed' : 'one or more peers failed',
+      esc(failoverProbeData.method || ''));
+    for (const p of (failoverProbeData.peers || [])) {
+      // Dead URL: ✅ if it correctly refused (expected), ⚠️ if somehow open, ❌ other
+      const deadExpected = p.dead_status === 'refused' || p.dead_status === 'timeout';
+      const deadIcon = deadExpected ? '\u2705' : (p.dead_status === 'open' ? '\u26a0' : '\u274c');
+      const deadDetail = deadExpected
+        ? `${p.dead_status} in ${p.dead_ms}ms (expected \u2014 port ${failoverProbeData.dead_port} closed)`
+        : esc(p.dead_status + (p.dead_error ? ': ' + p.dead_error : ''));
+      html += _selfDiagRow(deadIcon, esc(p.node_id) + ' \u2192 dead URL', esc(p.dead_url || ''), deadDetail);
+      // Real URL: ✅ if ok, ❌ otherwise
+      const realOk = p.real_status === 'ok';
+      const realIcon = realOk ? '\u2705' : '\u274c';
+      const realDetail = realOk
+        ? `ok in ${p.real_ms}ms`
+        : esc(p.real_status + (p.real_error ? ': ' + p.real_error : ''));
+      html += _selfDiagRow(realIcon, esc(p.node_id) + ' \u2192 real URL', esc(p.real_url || 'none configured'), realDetail);
     }
   }
 
