@@ -38,8 +38,8 @@ def _row_to_out(row) -> NodeOut:
     addr_list: list[str] = json.loads(addrs) if addrs else []
 
     # A node is a fleet peer if it is self, or if any of its addresses appears
-    # in the configured PEER_URLS (these are the nodes this instance syncs to).
-    _peer_set = {u.rstrip('/') for u in cfg.PEER_URLS}
+    # in the configured PEER_SYNC_URLS (these are the nodes this instance syncs to).
+    _peer_set = {u.rstrip('/') for urls in cfg.PEER_SYNC_URLS.values() for u in urls}
     fleet_peer: bool = (
         row["node_id"] == cfg.NODE_ID
         or any(a.rstrip('/') in _peer_set for a in addr_list)

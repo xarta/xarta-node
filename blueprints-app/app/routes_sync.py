@@ -468,8 +468,12 @@ async def mtls_probe() -> dict:
     """
     Probe each fleet peer via mTLS — the same transport the sync drain uses.
 
-    Performs a real TLS handshake + GET /health on each peer's sync address.
-    Distinguishes:
+    Probes every configured sync address per peer (VLAN42 primary + tailnet
+    fallback where applicable), mirroring the multi-address failover order used
+    by drain.py.  Each address is probed independently so the GUI can show
+    which path is healthy.
+
+    Per-address status values:
       ok:         TLS handshake succeeded, /health returned 2xx
       tls_error:  SSL handshake failed (cert/CA mismatch or missing client cert)
       refused:    TCP connection refused (port closed or firewall drop)
@@ -481,30 +485,49 @@ async def mtls_probe() -> dict:
     """
     tls_configured = bool(cfg.SYNC_TLS_CA and cfg.SYNC_TLS_CERT and cfg.SYNC_TLS_KEY)
     results = []
+
+    async def _probe_address(node_id: str, url: str, client: httpx.AsyncClient) -> dict:
+        health_url = f"{url}/health"
+        try:
+            r = await client.get(health_url)
+            return {
+                "node_id": node_id,
+                "address": health_url,
+                "status": "ok" if r.is_success else "http_error",
+                "http_status": r.status_code,
+                "error": None,
+            }
+        except httpx.ConnectError as e:
+            err = str(e)
+            status = (
+                "tls_error"
+                if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower())
+                else "refused"
+            )
+            return {"node_id": node_id, "address": health_url, "status": status, "http_status": None, "error": err}
+        except httpx.TimeoutException:
+            return {"node_id": node_id, "address": health_url, "status": "timeout", "http_status": None, "error": "connection timed out"}
+        except Exception as e:
+            return {"node_id": node_id, "address": health_url, "status": "error", "http_status": None, "error": str(e)}
+
     async with _probe_client(timeout=8.0) as client:
         for n in cfg._peer_nodes:
             node_id = n["node_id"]
-            url = (
-                f"{n.get('sync_scheme', 'http')}://{n['primary_ip']}"
-                f":{n.get('sync_port', 8080)}/health"
-            )
-            try:
-                r = await client.get(url)
+            peer_urls = cfg.PEER_SYNC_URLS.get(node_id, [])
+            if not peer_urls:
+                # Peer has no configured sync addresses (misconfigured node)
                 results.append({
                     "node_id": node_id,
-                    "address": url,
-                    "status": "ok" if r.is_success else "http_error",
-                    "http_status": r.status_code,
-                    "error": None,
+                    "address": None,
+                    "status": "error",
+                    "http_status": None,
+                    "error": "no sync addresses configured",
                 })
-            except httpx.ConnectError as e:
-                err = str(e)
-                status = "tls_error" if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower()) else "refused"
-                results.append({"node_id": node_id, "address": url, "status": status, "http_status": None, "error": err})
-            except httpx.TimeoutException:
-                results.append({"node_id": node_id, "address": url, "status": "timeout", "http_status": None, "error": "connection timed out"})
-            except Exception as e:
-                results.append({"node_id": node_id, "address": url, "status": "error", "http_status": None, "error": str(e)})
+                continue
+            for url in peer_urls:
+                result = await _probe_address(node_id, url, client)
+                results.append(result)
+
     return {"tls_configured": tls_configured, "peers": results}
 
 

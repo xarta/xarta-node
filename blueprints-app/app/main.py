@@ -109,7 +109,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Enqueue any vlans rows that were seeded locally but not yet distributed
     asyncio.create_task(_enqueue_seeded_vlans())
 
-    log.info("blueprints node ready — peers: %s", cfg.PEER_URLS or "(none)")
+    log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
 
@@ -191,9 +191,13 @@ async def _boot_catchup() -> None:
         log.error("boot_catchup: DB is degraded but no peers known — cannot recover")
         return
 
-    # Only pull from nodes whose address is in our configured PEER_URLS.
+    # Only pull from nodes whose address is in our configured PEER_SYNC_URLS.
     # Ghost/retired nodes in the DB must never be used as restore sources.
-    trusted_urls: set[str] = {u.rstrip("/") for u in cfg.PEER_URLS}
+    trusted_urls: set[str] = {
+        url.rstrip("/")
+        for urls in cfg.PEER_SYNC_URLS.values()
+        for url in urls
+    }
 
     best_peer_url: str | None = None
     best_peer_id: str | None = None
