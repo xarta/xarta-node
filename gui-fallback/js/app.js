@@ -37,6 +37,7 @@ function switchTab(tab) {
   if (tab === 'certs')                                     loadCerts();
   if (tab === 'docs' && !_docsAll.length)                  loadDocs();
   if (tab === 'ai-providers' && !_aiProviders.length)      loadAiProviders();
+  if (tab === 'bookmarks'    && !_bookmarks.length)         loadBookmarks();
   // self-diag: just show the shell — user clicks Run to trigger tests
   // PCT live status polling — only while nodes tab is open
   if (tab === 'nodes') {

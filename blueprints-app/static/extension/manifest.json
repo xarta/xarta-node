@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Blueprints Bookmarks",
+  "version": "1.0.0",
+  "description": "Save, search, and passively record bookmarks via the Blueprints API.",
+
+  "permissions": [
+    "activeTab",
+    "storage",
+    "contextMenus",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Blueprints Bookmarks"
+  },
+
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
