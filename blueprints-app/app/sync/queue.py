@@ -173,3 +173,16 @@ def get_peer_url(node_id: str) -> str | None:
         return addrs[0].rstrip("/") if addrs else None
     except (json.JSONDecodeError, TypeError, IndexError):
         return None
+
+
+def get_peer_urls(node_id: str) -> list[str]:
+    """Return the ordered sync URL list for a peer from config.
+
+    Uses PEER_SYNC_URLS (built at startup from .nodes.json) which applies the
+    same-tailnet filter: VLAN42 primary first, tailnet fallback only when both
+    this node and the peer share the same tailnet string.
+
+    Returns an empty list if the node_id is not a configured sync peer (e.g.
+    it was removed from .nodes.json without an app restart).
+    """
+    return list(cfg.PEER_SYNC_URLS.get(node_id, []))

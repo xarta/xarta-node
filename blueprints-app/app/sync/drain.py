@@ -26,7 +26,7 @@ from ..sync.queue import (
     get_peers_with_pending,
     get_pending_actions,
     get_queue_depth,
-    get_peer_url,
+    get_peer_urls,
     mark_sent,
     purge_unsent_db_actions,
 )
@@ -96,19 +96,23 @@ async def _drain_all_peers() -> None:
         return
 
     for node_id in pending_peers:
-        peer_url = get_peer_url(node_id)
-        if not peer_url:
-            log.debug("no URL for peer %s — skipping drain", node_id)
+        peer_urls = get_peer_urls(node_id)
+        if not peer_urls:
+            log.debug("no URLs configured for peer %s — skipping drain", node_id)
             continue
         try:
-            await _drain_peer(node_id, peer_url)
+            await _drain_peer(node_id, peer_urls)
         except Exception:
-            log.exception("drain failed for peer %s (%s)", node_id, peer_url)
+            log.exception("drain failed for peer %s", node_id)
 
 
-async def _drain_peer(node_id: str, peer_url: str) -> None:
+async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     """
     Drain the action queue for one peer.
+
+    Tries each URL in peer_urls in order (VLAN42 primary first, tailnet
+    fallback second).  Stops at the first successful connection.  If all
+    addresses fail the peer is left queued and retried on the next drain cycle.
 
     If the depth is at/above SYNC_QUEUE_MAX_DEPTH, send a full backup instead
     and mark all pending items as sent (they will be covered by the backup).
@@ -122,7 +126,7 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
             node_id,
             depth,
         )
-        await _send_full_backup(node_id, peer_url)
+        await _send_full_backup(node_id, peer_urls)
         return
 
     actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
@@ -145,79 +149,91 @@ async def _drain_peer(node_id: str, peer_url: str) -> None:
         ],
     }
 
-    try:
-        async with _make_sync_client(15.0) as client:
-            resp = await client.post(
-                f"{peer_url}/api/v1/sync/actions",
-                json=payload,
-                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
-            )
-        if resp.status_code == 204:
-            queue_ids = [a["queue_id"] for a in actions]
-            mark_sent(queue_ids)
-            log.debug(
-                "drained %d actions to peer %s", len(actions), node_id
-            )
-        elif resp.status_code == 409:
-            # Commit guard: peer is on a newer commit and refused our data.
-            # Purge all unsent DB-write actions for this peer (they carry
-            # stale-schema data). System actions are preserved.
-            purged = purge_unsent_db_actions(node_id)
-            log.warning(
-                "commit guard: peer %s rejected actions (409) — "
-                "purged %d outgoing DB actions. Local code is behind.",
-                node_id,
-                purged,
-            )
-        else:
-            log.warning(
-                "peer %s rejected actions: HTTP %d — will retry",
-                node_id,
-                resp.status_code,
-            )
-    except httpx.ConnectError:
-        log.debug("peer %s unreachable — will retry later", node_id)
-    except Exception:
-        log.exception("error draining to peer %s", node_id)
+    async with _make_sync_client(15.0) as client:
+        for url in peer_urls:
+            try:
+                resp = await client.post(
+                    f"{url}/api/v1/sync/actions",
+                    json=payload,
+                    headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+                )
+                if resp.status_code == 204:
+                    queue_ids = [a["queue_id"] for a in actions]
+                    mark_sent(queue_ids)
+                    log.debug(
+                        "drained %d actions to peer %s via %s",
+                        len(actions), node_id, url,
+                    )
+                    return
+                elif resp.status_code == 409:
+                    # Commit guard: peer is on a newer commit and refused our
+                    # data. Purge stale outgoing DB-write actions; system
+                    # actions are preserved.  No point trying other addresses
+                    # — the issue is a code mismatch, not connectivity.
+                    purged = purge_unsent_db_actions(node_id)
+                    log.warning(
+                        "commit guard: peer %s rejected actions (409) — "
+                        "purged %d outgoing DB actions. Local code is behind.",
+                        node_id,
+                        purged,
+                    )
+                    return
+                else:
+                    log.warning(
+                        "peer %s rejected actions via %s: HTTP %d — trying next address",
+                        node_id, url, resp.status_code,
+                    )
+            except httpx.ConnectError:
+                log.debug("peer %s unreachable at %s — trying next address", node_id, url)
+            except Exception:
+                log.exception("error draining to peer %s at %s", node_id, url)
+        log.debug("peer %s unreachable on all addresses — will retry next cycle", node_id)
 
 
-async def _send_full_backup(node_id: str, peer_url: str) -> None:
-    """Send a full DB backup zip to a peer's Layer 1 restore endpoint."""
+async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
+    """Send a full DB backup zip to a peer's Layer 1 restore endpoint.
+
+    Tries each URL in peer_urls in order, stopping at the first successful
+    delivery.  If all addresses fail the peer remains queued for retry.
+    """
     try:
         zip_bytes, sha256_hex = make_full_backup()
     except Exception:
         log.exception("failed to create full backup for peer %s", node_id)
         return
 
-    try:
-        async with _make_sync_client(60.0) as client:
-            _restore_headers = {
-                "content-type": "application/octet-stream",
-                "x-blueprints-checksum": sha256_hex,
-            }
-            if cfg.SYNC_SECRET:
-                _restore_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
-            resp = await client.post(
-                f"{peer_url}/api/v1/sync/restore",
-                content=zip_bytes,
-                headers=_restore_headers,
-            )
-        if resp.status_code == 204:
-            log.info("full backup sent to peer %s", node_id)
-            # Mark all pending actions as sent — the backup supersedes them
-            from ..db import get_conn
-            with get_conn() as conn:
-                conn.execute(
-                    "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
-                    (node_id,),
+    _restore_headers = {
+        "content-type": "application/octet-stream",
+        "x-blueprints-checksum": sha256_hex,
+    }
+    if cfg.SYNC_SECRET:
+        _restore_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
+
+    async with _make_sync_client(60.0) as client:
+        for url in peer_urls:
+            try:
+                resp = await client.post(
+                    f"{url}/api/v1/sync/restore",
+                    content=zip_bytes,
+                    headers=_restore_headers,
                 )
-        else:
-            log.warning(
-                "peer %s rejected full backup: HTTP %d",
-                node_id,
-                resp.status_code,
-            )
-    except httpx.ConnectError:
-        log.debug("peer %s unreachable for full backup — will retry", node_id)
-    except Exception:
-        log.exception("error sending full backup to peer %s", node_id)
+                if resp.status_code == 204:
+                    log.info("full backup sent to peer %s via %s", node_id, url)
+                    # Mark all pending actions as sent — the backup supersedes them
+                    from ..db import get_conn
+                    with get_conn() as conn:
+                        conn.execute(
+                            "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
+                            (node_id,),
+                        )
+                    return
+                else:
+                    log.warning(
+                        "peer %s rejected full backup via %s: HTTP %d — trying next address",
+                        node_id, url, resp.status_code,
+                    )
+            except httpx.ConnectError:
+                log.debug("peer %s unreachable at %s for full backup — trying next address", node_id, url)
+            except Exception:
+                log.exception("error sending full backup to peer %s at %s", node_id, url)
+        log.debug("peer %s unreachable on all addresses for full backup — will retry", node_id)

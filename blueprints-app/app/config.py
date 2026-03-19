@@ -65,13 +65,52 @@ SELF_ADDRESS: str = f"http://{_self_node['primary_ip']}:{_self_node['sync_port']
 _active_nodes: list[dict] = [n for n in NODES_DATA if n.get("active", False)]
 _peer_nodes: list[dict] = [n for n in _active_nodes if n["node_id"] != NODE_ID]
 
-# Sync peers: other nodes' primary (VLAN) sync addresses.
-# sync_scheme defaults to "http" if not set — nodes without certs continue
-# to work unchanged until they are converted to mTLS.
-PEER_URLS: list[str] = [
-    f"{n.get('sync_scheme', 'http')}://{n['primary_ip']}:{n.get('sync_port', 8080)}"
+
+def _peer_sync_urls(peer: dict, self_node: dict) -> list[str]:
+    """Return the ordered sync URL list for a peer.
+
+    VLAN42 (primary_ip) is always first when present — it is the direct LAN
+    path and doesn't traverse any external network.
+
+    Tailnet IP is appended only when both this node and the peer belong to the
+    same tailnet (same string in the 'tailnet' field).  Nodes on different
+    tailnets cannot reach each other's tailnet IPs directly.
+
+    If a peer has no primary_ip (future remote VPS node) the tailnet URL is
+    the only entry.  If neither address is available the list is empty and the
+    drain will skip that peer until configuration is corrected.
+    """
+    scheme = peer.get("sync_scheme", "http")
+    port   = peer.get("sync_port", 8080)
+    urls: list[str] = []
+
+    # VLAN42 direct — always try first if the peer has one
+    if peer.get("primary_ip"):
+        urls.append(f"{scheme}://{peer['primary_ip']}:{port}")
+
+    # Tailnet — only reachable when both nodes are on the same tailnet
+    if (
+        peer.get("tailnet_ip")
+        and peer.get("tailnet")
+        and peer["tailnet"] == self_node.get("tailnet")
+    ):
+        urls.append(f"{scheme}://{peer['tailnet_ip']}:{port}")
+
+    return urls
+
+
+# PEER_SYNC_URLS: per-peer ordered list of sync addresses (VLAN42 first,
+# tailnet fallback when both nodes share the same tailnet).
+# drain.py iterates this list and stops at the first successful connection.
+PEER_SYNC_URLS: dict[str, list[str]] = {
+    n["node_id"]: _peer_sync_urls(n, _self_node)
     for n in _peer_nodes
-]
+}
+
+# PEER_URLS: flat list of every configured sync address across all peers.
+# Kept for backward-compatibility (trust checks, logging, fleet-peer detection).
+# Primary address is always first per peer; tailnet address follows where applicable.
+PEER_URLS: list[str] = [url for urls in PEER_SYNC_URLS.values() for url in urls]
 
 # CORS: all active nodes' primary and secondary (tailnet) HTTPS URLs
 CORS_ORIGINS: list[str] = (
