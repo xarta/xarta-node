@@ -118,6 +118,59 @@ The sync system uses a persistent queue in `sync_queue` (SQLite). Each data writ
 
 Visible in the self-diagnostics GUI under **Sync — Failover Logic (simulated VPS probe)**.
 
+## GUID dedup + smart forwarding (Phase 2, 2026-03-19)
+
+Prevents duplicate action application when the same write is relayed via multiple paths (needed for cross-tailnet relay to future remote VPS nodes). Zero overhead on the current 6-node on-prem fleet.
+
+### How it works
+
+1. **GUID assigned at origin** — `enqueue_for_all_peers()` generates one `uuid4().hex` per write and stamps it on every per-peer queue row. `enqueue()` accepts an optional `guid` parameter; if omitted it generates a new one.
+2. **GUID travels in the payload** — `drain.py` includes `guid` in each action dict sent to peers.
+3. **Dedup at receive** — `receive_actions()` does `INSERT INTO sync_seen_guids` for each action. If `IntegrityError` (PRIMARY KEY collision) → action was already applied, silently skipped. Empty GUID = legacy pre-Phase-2 peer → dedup skipped, applied normally (backward compatible).
+4. **Smart forwarding** — after applying, `_forward_actions()` re-enqueues the action (same GUID) for any peers the originator cannot reach but this node can. Currently a no-op for all 6 on-prem nodes (all share the LAN). Activates automatically when a remote VPS node is added.
+5. **3-day sliding window** — `_maybe_cleanup_guids()` in `drain.py` deletes `sync_seen_guids` rows older than 3 days, rate-limited to once per hour.
+
+### New schema
+
+| Object | Change |
+|---|---|
+| `sync_seen_guids` | New table: `guid TEXT PRIMARY KEY`, `received_at INTEGER` |
+| `sync_queue.guid` | New column: `TEXT DEFAULT ''` (migration in `_run_migrations`) |
+
+### New config exports
+
+`config.py` exports `SELF_NODE: dict`, `NODE_MAP: dict[str, dict]`, `PEER_NODES: list[dict]` — used by `_can_reach_directly()` and `_forward_actions()` in `routes_sync.py`.
+
+### Reachability helper
+
+```python
+def _can_reach_directly(source: dict, target: dict) -> bool:
+    # LAN: both have primary_ip  → share on-prem network
+    if source.get("primary_ip") and target.get("primary_ip"):
+        return True
+    # Tailnet: both carry same non-empty tailnet string
+    if source.get("tailnet") and target.get("tailnet") and source["tailnet"] == target["tailnet"]:
+        return True
+    return False
+```
+
+### GUID probe diagnostic
+
+`GET /api/v1/sync/guid-probe` — three sub-tests:
+1. **GUID dedup (DB layer)**: inserts a synthetic GUID twice; verifies second is deduplicated via IntegrityError.
+2. **Fleet topology**: runs `_can_reach_directly()` on every peer; shows LAN/tailnet/unreachable per peer.
+3. **Mock VPS relay**: simulates a phantom source with no `primary_ip`; reports which relay peers would be chosen.
+
+Visible in the self-diagnostics GUI under **Sync — GUID Dedup & Forwarding (Phase 2 probe)**.
+
+### Backward compatibility
+
+| Scenario | Behaviour |
+|---|---|
+| New node → old node | Old node ignores `guid` field (extra JSON key) → applies normally |
+| Old node → new node | `guid=""` → dedup skipped, applied normally (legacy path) |
+| New node → new node | Full GUID dedup + smart forwarding active |
+
 ## Backup and restore
 
 Local (per-node) DB backups are stored as `.db.tar.gz` files in `BLUEPRINTS_BACKUP_DIR` (typically `.xarta/db-backups/`, committed to the private repo). The `sync_queue` table is always stripped from backups.

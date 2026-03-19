@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS sync_queue (
 CREATE INDEX IF NOT EXISTS idx_sync_queue_target
     ON sync_queue(target_node_id, sent, queue_id);
 
+CREATE TABLE IF NOT EXISTS sync_seen_guids (
+    guid        TEXT    PRIMARY KEY,  -- UUID4 hex from originating node
+    received_at INTEGER NOT NULL       -- unix epoch; purged after 3 days
+);
+
 CREATE TABLE IF NOT EXISTS pfsense_dns (
     dns_entry_id  TEXT PRIMARY KEY,
     ip_address    TEXT NOT NULL,
@@ -408,6 +413,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("doc_images",   "tags",               "TEXT"),
         # docs: group assignment (2026-03-17)
         ("docs",         "group_id",            "TEXT"),
+        # sync_queue: GUID for dedup + forwarding (Phase 2, 2026-03-19)
+        ("sync_queue",   "guid",                "TEXT DEFAULT ''"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

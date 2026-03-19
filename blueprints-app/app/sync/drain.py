@@ -16,6 +16,7 @@ import json
 import logging
 import random
 import ssl
+import time
 
 import httpx
 
@@ -35,6 +36,7 @@ from ..sync.restore import make_full_backup
 log = logging.getLogger(__name__)
 
 _drain_task: asyncio.Task | None = None
+_last_guid_cleanup: float = 0.0
 
 
 # ── mTLS client factory ──────────────────────────────────────────────────────
@@ -71,6 +73,25 @@ async def start_drain_loop() -> None:
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 
+def _maybe_cleanup_guids() -> None:
+    """Delete sync_seen_guids entries older than 3 days.
+
+    Called once per drain cycle but rate-limited to at most once per hour.
+    """
+    global _last_guid_cleanup
+    now = time.time()
+    if now - _last_guid_cleanup < 3600:
+        return
+    _last_guid_cleanup = now
+    cutoff = int(now) - 3 * 86400
+    with get_conn() as conn:
+        result = conn.execute(
+            "DELETE FROM sync_seen_guids WHERE received_at < ?", (cutoff,)
+        )
+        n = result.rowcount
+    if n:
+        log.info("guid cleanup: removed %d expired seen-GUID entries", n)
+
 async def _drain_loop() -> None:
     """Main drain loop — runs indefinitely."""
     while True:
@@ -91,6 +112,7 @@ async def _drain_all_peers() -> None:
             log.warning("drain suspended: integrity_ok=false — waiting for recovery")
             return
 
+    _maybe_cleanup_guids()
     pending_peers = get_peers_with_pending()
     if not pending_peers:
         return
@@ -144,6 +166,7 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                 "row_data":    json.loads(a["row_data"]) if a["row_data"] else None,
                 "gen":         a["gen"],
                 "source_node_id": cfg.NODE_ID,
+                "guid":        a.get("guid", ""),
             }
             for a in actions
         ],

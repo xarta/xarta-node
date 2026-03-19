@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import ssl
 import time
 import uuid
@@ -25,7 +26,7 @@ from . import config as cfg
 from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, increment_gen
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
-from .sync.queue import enqueue_for_all_peers, get_queue_depths
+from .sync.queue import enqueue, enqueue_for_all_peers, get_queue_depths
 from .sync.restore import apply_restore, make_full_backup
 
 log = logging.getLogger(__name__)
@@ -148,7 +149,76 @@ def _pk_for_table(table: str) -> str:
     return pk_map.get(table, "id")
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Forwarding helpers (Phase 2 — GUID-deduplicated relay) ───────────────────
+
+def _can_reach_directly(source: dict, target: dict) -> bool:
+    """Return True if source node can reach target via any direct network path.
+
+    Two criteria (either is sufficient):
+    1. LAN: both nodes have a primary_ip → they share the on-premises network.
+    2. Tailnet: both nodes carry the same non-empty tailnet string.
+    """
+    if source.get("primary_ip") and target.get("primary_ip"):
+        return True
+    if (
+        source.get("tailnet")
+        and target.get("tailnet")
+        and source["tailnet"] == target["tailnet"]
+    ):
+        return True
+    return False
+
+
+def _forward_actions(
+    conn: sqlite3.Connection,
+    source_node_id: str,
+    actions: list,
+) -> None:
+    """Re-enqueue newly applied actions for peers the originator cannot reach.
+
+    Only fires when there is at least one peer that:
+      • the source node CANNOT reach directly, AND
+      • this node CAN reach directly.
+
+    Each forwarded copy carries the original GUID so the receiving node's
+    dedup check prevents double-application regardless of how many relay
+    nodes attempt the forward.  System actions are never forwarded.
+    """
+    if not actions:
+        return
+    source_node = cfg.NODE_MAP.get(source_node_id)
+    if source_node is None:
+        return  # Unknown originator — no forwarding
+
+    relay_peers = [
+        n for n in cfg.PEER_NODES
+        if not _can_reach_directly(source_node, n)
+        and _can_reach_directly(cfg.SELF_NODE, n)
+    ]
+    if not relay_peers:
+        return
+
+    for peer in relay_peers:
+        for action in actions:
+            try:
+                enqueue(
+                    conn, peer["node_id"],
+                    action.action_type, action.table_name,
+                    action.row_id, action.row_data,
+                    action.gen, guid=action.guid,
+                )
+            except Exception:
+                log.exception(
+                    "failed to forward action %s/%s to relay peer %s",
+                    action.table_name, action.row_id, peer["node_id"],
+                )
+    log.debug(
+        "forwarded %d action(s) from %s to relay peer(s) %s",
+        len(actions), source_node_id, [p["node_id"] for p in relay_peers],
+    )
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @router.post("/actions", status_code=204)
 async def receive_actions(payload: SyncActionsPayload) -> Response:
@@ -208,12 +278,29 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                 "request a full restore instead",
             )
 
-        failures = []
+        newly_applied: list = []
+        failures: list[str] = []
         for action in db_actions:
+            # ── GUID dedup: drop actions already processed on this node ───────
+            # Empty GUID = legacy peer (pre-Phase-2); skip dedup, apply normally.
+            if action.guid:
+                try:
+                    conn.execute(
+                        "INSERT INTO sync_seen_guids (guid, received_at) VALUES (?, ?)",
+                        (action.guid, int(time.time())),
+                    )
+                except sqlite3.IntegrityError:
+                    log.debug(
+                        "GUID %s already seen — skipping duplicate from %s",
+                        action.guid[:8], payload.source_node_id,
+                    )
+                    continue
+
             try:
                 _apply_action(conn, action)
                 # Write source as "sync" so the gen counter tracks sync writes separately
                 _ = increment_gen(conn, "sync")
+                newly_applied.append(action)
             except Exception:
                 log.exception(
                     "failed to apply sync action %s/%s from %s — skipping",
@@ -235,9 +322,13 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
             (payload.source_node_id,),
         )
 
+        # Smart forwarding — relay newly applied actions to any peers the
+        # originator cannot reach but we can (no-op for current 6-node fleet).
+        _forward_actions(conn, payload.source_node_id, newly_applied)
+
     log.info(
         "applied %d sync actions from %s",
-        len(db_actions),
+        len(newly_applied),
         payload.source_node_id,
     )
     return Response(status_code=204)
@@ -727,6 +818,134 @@ async def failover_probe() -> dict:
         "dead_port":  _FAILOVER_DEAD_PORT,
         "all_passed": all_passed,
         "peers":      results,
+    }
+
+
+@router.get("/guid-probe")
+async def guid_probe() -> dict:
+    """
+    Validate Phase 2 GUID deduplication and smart forwarding logic.
+
+    Three sub-tests — all non-destructive and self-cleaning:
+
+    1. GUID dedup (DB layer)
+       Inserts a synthetic UUID4 into sync_seen_guids (first insert → accepted),
+       then tries to insert the same GUID again (second insert → IntegrityError,
+       i.e. correctly deduplicated).  The test GUID is deleted at the end.
+
+    2. Fleet forwarding topology
+       Runs _can_reach_directly() for every known peer and returns whether each
+       is reachable by this node.  In the current 6-node on-prem fleet every
+       peer shares the LAN so all are directly reachable and no forwarding is
+       ever needed (zero-overhead path).
+
+    3. Mock remote node relay
+       Simulates a phantom source node that has no primary_ip (like a future
+       remote VPS) but shares this node's tailnet.  Reports which peers would
+       be identified as relay targets — i.e. peers reachable by this node but
+       NOT by the phantom source.
+    """
+    import sqlite3 as _sqlite3
+
+    # ── Test 1: GUID dedup ────────────────────────────────────────────────────
+    test_guid = f"__probe__{uuid.uuid4().hex}"
+    first_insert   = "error"
+    second_insert  = "error"
+    cleanup        = "ok"
+    dedup_ok       = False
+
+    try:
+        with get_conn() as conn:
+            # First insert — should succeed
+            try:
+                conn.execute(
+                    "INSERT INTO sync_seen_guids (guid, received_at) VALUES (?, ?)",
+                    (test_guid, int(time.time())),
+                )
+                first_insert = "accepted"
+            except Exception as e:
+                first_insert = f"error: {e}"
+
+            # Second insert — should raise IntegrityError (PRIMARY KEY conflict)
+            try:
+                conn.execute(
+                    "INSERT INTO sync_seen_guids (guid, received_at) VALUES (?, ?)",
+                    (test_guid, int(time.time())),
+                )
+                second_insert = "unexpected_accepted"  # bug — should have been rejected
+            except _sqlite3.IntegrityError:
+                second_insert = "deduplicated"
+            except Exception as e:
+                second_insert = f"error: {e}"
+
+            # Cleanup — remove the probe GUID
+            try:
+                conn.execute(
+                    "DELETE FROM sync_seen_guids WHERE guid=?", (test_guid,)
+                )
+            except Exception as e:
+                cleanup = f"failed: {e}"
+
+        dedup_ok = (first_insert == "accepted" and second_insert == "deduplicated" and cleanup == "ok")
+
+    except Exception as e:
+        first_insert = f"db_error: {e}"
+
+    # ── Test 2: Fleet forwarding topology ─────────────────────────────────────
+    topology = []
+    for peer in cfg.PEER_NODES:
+        topology.append({
+            "peer_node_id":       peer["node_id"],
+            "peer_has_primary_ip": bool(peer.get("primary_ip")),
+            "peer_tailnet":        peer.get("tailnet", ""),
+            "self_can_reach":     _can_reach_directly(cfg.SELF_NODE, peer),
+        })
+
+    # ── Test 3: Mock remote node relay ────────────────────────────────────────
+    # Simulate a source with no primary_ip (VPS) on the same tailnet as self.
+    self_tailnet = cfg.SELF_NODE.get("tailnet", "")
+    mock_source = {
+        "node_id":    "__mock_vps__",
+        "primary_ip": "",
+        "tailnet":    self_tailnet,
+    }
+    relay_peers = [
+        p["node_id"] for p in cfg.PEER_NODES
+        if not _can_reach_directly(mock_source, p)
+        and _can_reach_directly(cfg.SELF_NODE, p)
+    ]
+    # In the current 6-node on-prem fleet (all have primary_ip, all same-tailnet covered),
+    # expected relay count depends on peer tailnet membership:
+    # peers with primary_ip CAN be reached by the mock source only via primary_ip path.
+    # Since mock_source has no primary_ip → source can't reach LAN peers unless they share tailnet.
+    # Peers sharing self_tailnet: mock_source CAN reach them via tailnet (same tailnet).
+    # Peers NOT on self_tailnet: only reachable via relay.
+    peers_not_on_self_tailnet = [
+        p["node_id"] for p in cfg.PEER_NODES
+        if p.get("tailnet", "") != self_tailnet
+    ]
+    expected_relay_ids = set(peers_not_on_self_tailnet)
+    relay_ok = set(relay_peers) == expected_relay_ids
+
+    mock_relay = {
+        "mock_source_has_primary_ip": False,
+        "mock_source_tailnet":        self_tailnet or "(none)",
+        "relay_peers":                relay_peers,
+        "expected_relay_peers":       sorted(expected_relay_ids),
+        "relay_ok":                   relay_ok,
+    }
+
+    all_passed = dedup_ok and relay_ok
+    return {
+        "all_passed": all_passed,
+        "dedup": {
+            "ok":           dedup_ok,
+            "first_insert": first_insert,
+            "second_insert": second_insert,
+            "cleanup":      cleanup,
+        },
+        "topology": topology,
+        "mock_relay": mock_relay,
     }
 
 
