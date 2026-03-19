@@ -56,6 +56,7 @@
     <button data-group="probes" style="display:none" onclick="switchTab('ssh-targets')">SSH Targets</button>
     <button data-group="probes" style="display:none" onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
     <button data-group="probes" style="display:none" onclick="switchTab('caddy-configs')">Caddy Configs</button>
+    <button data-group="probes" style="display:none" onclick="switchTab('bookmarks')">&#128278; Bookmarks</button>
   </nav>
 
   <!-- Settings -->
@@ -288,6 +289,8 @@
           <option value="ssh_targets">ssh_targets</option>
           <option value="ai_providers">ai_providers</option>
           <option value="ai_project_assignments">ai_project_assignments</option>
+          <option value="bookmarks">bookmarks</option>
+          <option value="visits">visits</option>
         </select>
         <button id="retouch-btn" class="secondary" onclick="retouchTable(this)" title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
         <span id="retouch-status" style="font-size:12px;color:var(--text-dim)"></span>
@@ -669,6 +672,78 @@
     </div>
     <p id="ssh-targets-error" class="error-msg" hidden></p>
   </section>
+
+  <!-- Bookmarks -->
+  <section id="tab-bookmarks" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">&#128278; Bookmarks</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap">
+        <button onclick="openBookmarkModal(null)">+ Add bookmark</button>
+        <button class="secondary" onclick="document.getElementById('bm-import-file').click()">&#8593; Import HTML</button>
+        <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
+        <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
+      </div>
+    </div>
+    <!-- Search / filter toolbar -->
+    <div class="toolbar" style="margin-bottom:10px">
+      <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
+      <select id="bm-tag-filter" onchange="renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
+        <option value="">All tags</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()"> Show archived
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="bm-show-visits" onchange="_bmToggleVisits()"> Visit history
+      </label>
+    </div>
+    <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
+    <!-- Bookmarks table -->
+    <div id="bm-main-view">
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th style="width:30px"></th>
+            <th>Title</th>
+            <th>URL</th>
+            <th>Tags</th>
+            <th>Description</th>
+            <th>Source</th>
+            <th>Saved</th>
+            <th style="width:80px">Actions</th>
+          </tr></thead>
+          <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <!-- Visit history (toggled) -->
+    <div id="bm-visits-view" style="display:none">
+      <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin-bottom:8px">Visit History</h3>
+      <div class="toolbar" style="margin-bottom:8px">
+        <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
+        <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Title</th>
+            <th>URL</th>
+            <th>Source</th>
+            <th>Dwell</th>
+            <th>Visited</th>
+            <th style="width:80px">Actions</th>
+          </tr></thead>
+          <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="6">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <p id="bm-import-status" style="font-size:12px;margin:6px 0 0" hidden></p>
+    <p id="bm-error" class="error-msg" hidden></p>
+  </section>
+
   <section>
     <h2>Sync status</h2>
     <div id="sync-panel">
@@ -706,6 +781,42 @@
   </section>
 
 </main>
+
+<!-- Bookmark Add / Edit modal -->
+<dialog id="bm-modal" style="background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:24px;min-width:440px;max-width:600px;width:90vw;max-height:90vh;overflow-y:auto">
+  <h2 id="bm-modal-heading" style="margin-bottom:16px">Add bookmark</h2>
+  <input type="hidden" id="bm-modal-id" />
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <label style="font-size:13px">URL <span style="color:var(--err)">*</span>
+      <input type="url" id="bm-modal-url" placeholder="https://&hellip;" style="width:100%;margin-top:3px" />
+    </label>
+    <label style="font-size:13px">Title
+      <input type="text" id="bm-modal-title-input" placeholder="Page title" style="width:100%;margin-top:3px" />
+    </label>
+    <label style="font-size:13px">Description
+      <input type="text" id="bm-modal-desc" placeholder="Short description" style="width:100%;margin-top:3px" />
+    </label>
+    <label style="font-size:13px">Tags <span style="font-size:11px;color:var(--text-dim)">(comma-separated)</span>
+      <input type="text" id="bm-modal-tags" placeholder="e.g. k8s, networking, howto" style="width:100%;margin-top:3px" />
+    </label>
+    <label style="font-size:13px">Folder <span style="font-size:11px;color:var(--text-dim)">(e.g. Dev/Kubernetes)</span>
+      <input type="text" id="bm-modal-folder" style="width:100%;margin-top:3px" />
+    </label>
+    <label style="font-size:13px">Notes
+      <textarea id="bm-modal-notes" rows="3" placeholder="Optional notes or analysis&hellip;"
+        style="width:100%;resize:vertical;font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;margin-top:3px"></textarea>
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+      <input type="checkbox" id="bm-modal-archived" /> Archived
+    </label>
+  </div>
+  <p id="bm-modal-error" class="error-msg" hidden></p>
+  <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
+    <button class="secondary" onclick="document.getElementById('bm-modal').close()">Cancel</button>
+    <button onclick="saveBookmark()">Save</button>
+  </div>
+</dialog>
 
 <!-- Manual Links: Add/Edit modal -->
 <dialog id="ml-modal" style="background:var(--surface);border:1px solid var(--border);
@@ -960,6 +1071,7 @@
 <script src="js/probes/ssh-targets.js"></script>
 <script src="js/probes/dockge.js"></script>
 <script src="js/probes/caddy.js"></script>
+<script src="js/probes/bookmarks.js"></script>
 <script src="js/app.js"></script>
 
 <!-- Restore confirmation modal -->

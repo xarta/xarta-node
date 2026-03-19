@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blueprints Bookmarks</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+      --ok: #3fb950; --err: #f85149; --warn: #d29922;
+      --radius: 6px; --font: system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 360px; min-height: 200px; max-height: 560px;
+      overflow-y: auto;
+      background: var(--bg); color: var(--text);
+      font-family: var(--font); font-size: 13px;
+      padding: 12px;
+    }
+    h1 { font-size: 14px; font-weight: 700; margin-bottom: 12px; color: var(--accent); }
+    .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+    .tab-btn {
+      flex: 1; padding: 5px 8px; border-radius: var(--radius);
+      background: var(--surface); border: 1px solid var(--border);
+      color: var(--text-dim); cursor: pointer; font-size: 12px;
+      transition: color .15s, border-color .15s;
+    }
+    .tab-btn.active { color: var(--accent); border-color: var(--accent); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    input, textarea, select {
+      width: 100%; padding: 5px 8px; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); font-size: 12px; font-family: var(--font);
+      margin-bottom: 6px;
+    }
+    label { font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 2px; }
+    button {
+      padding: 5px 12px; border-radius: var(--radius);
+      border: 1px solid var(--accent); background: rgba(88,166,255,.15);
+      color: var(--accent); cursor: pointer; font-size: 12px;
+      transition: background .15s;
+    }
+    button:hover { background: rgba(88,166,255,.25); }
+    button.secondary {
+      border-color: var(--border); background: transparent; color: var(--text-dim);
+    }
+    button.secondary:hover { border-color: var(--text-dim); color: var(--text); }
+    .row { display: flex; gap: 6px; margin-bottom: 6px; }
+    .row input { margin-bottom: 0; }
+    .status { font-size: 11px; color: var(--text-dim); margin-top: 6px; min-height: 16px; }
+    .status.ok   { color: var(--ok); }
+    .status.err  { color: var(--err); }
+    .results { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+    .result-item {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 6px 8px; cursor: pointer;
+    }
+    .result-item:hover { border-color: var(--accent); }
+    .result-title { font-size: 12px; font-weight: 600; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .result-url   { font-size: 10px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .result-tags  { margin-top: 2px; }
+    .tag-pill { display: inline-block; background: rgba(99,102,241,.18); color: #a5b4fc;
+      border: 1px solid rgba(99,102,241,.3); border-radius: 3px; padding: 0 4px; font-size: 10px; margin: 1px; }
+  </style>
+</head>
+<body>
+  <h1>&#128278; Blueprints Bookmarks</h1>
+
+  <div class="tabs">
+    <button id="tab-save-btn"   class="tab-btn active" onclick="showPanel('save')">Save</button>
+    <button id="tab-search-btn" class="tab-btn"        onclick="showPanel('search')">Search</button>
+  </div>
+
+  <!-- Save panel -->
+  <div id="panel-save" class="panel active">
+    <label>URL</label>
+    <input id="save-url" type="url" placeholder="https://…" />
+    <label>Title</label>
+    <input id="save-title" type="text" placeholder="Page title" />
+    <label>Tags (comma-separated)</label>
+    <input id="save-tags" type="text" placeholder="e.g. k8s, networking" />
+    <label>Notes</label>
+    <textarea id="save-notes" rows="2" placeholder="Optional notes…"></textarea>
+    <div class="row">
+      <button onclick="saveCurrent()">&#128190; Save</button>
+      <button class="secondary" onclick="window.close()">Cancel</button>
+    </div>
+    <div id="save-status" class="status"></div>
+  </div>
+
+  <!-- Search panel -->
+  <div id="panel-search" class="panel">
+    <div class="row">
+      <input id="search-q" type="text" placeholder="Search bookmarks…" style="margin-bottom:0"
+        onkeydown="if(event.key==='Enter') runSearch()" />
+      <button onclick="runSearch()">&#128269;</button>
+    </div>
+    <div id="search-status" class="status"></div>
+    <div id="search-results" class="results"></div>
+  </div>
+
+  <script src="shared/api.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

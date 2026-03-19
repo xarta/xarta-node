@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blueprints Bookmarks — Settings</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+      --ok: #3fb950; --err: #f85149;
+      --radius: 6px; --font: system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; padding: 32px; max-width: 560px; }
+    h1 { font-size: 18px; font-weight: 700; color: var(--accent); margin-bottom: 24px; }
+    h2 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--text-dim); margin: 24px 0 10px; }
+    label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 3px; }
+    input[type="text"], input[type="url"], input[type="password"], textarea {
+      width: 100%; padding: 7px 10px; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+      color: var(--text); font-size: 13px; font-family: var(--font); margin-bottom: 12px;
+    }
+    input[type="checkbox"] { margin-right: 6px; }
+    .check-row { display: flex; align-items: center; margin-bottom: 10px; font-size: 13px; cursor: pointer; }
+    button {
+      padding: 7px 16px; border-radius: var(--radius);
+      border: 1px solid var(--accent); background: rgba(88,166,255,.15);
+      color: var(--accent); cursor: pointer; font-size: 13px; margin-right: 8px;
+    }
+    button:hover { background: rgba(88,166,255,.25); }
+    .status { margin-top: 10px; font-size: 12px; min-height: 18px; }
+    .status.ok  { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-top: -8px; margin-bottom: 12px; }
+    hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h1>&#128278; Blueprints Bookmarks Settings</h1>
+
+  <h2>API Connection</h2>
+  <label for="api-url">Blueprints API URL</label>
+  <input id="api-url" type="url" placeholder="https://thunderbird-1.infra.xarta.co.uk" />
+  <p class="hint">The base URL for your Blueprints node. No trailing slash. Use the VLAN33 or Tailscale URL.</p>
+
+  <label for="api-secret">API Secret (hex)</label>
+  <input id="api-secret" type="password" placeholder="Paste BLUEPRINTS_API_SECRET here" />
+  <p class="hint">Found in <code>.env</code> on your node. Stored locally in your browser — never sent anywhere except derived TOTP tokens.</p>
+
+  <button onclick="saveSettings()">&#128190; Save settings</button>
+  <button onclick="testConnection()" style="border-color:var(--border);color:var(--text-dim)">&#9654; Test connection</button>
+  <div id="settings-status" class="status"></div>
+
+  <hr />
+
+  <h2>Visit Recorder</h2>
+  <label class="check-row">
+    <input type="checkbox" id="recorder-enabled" />
+    Enable passive visit recorder (logs every page you visit to Blueprints)
+  </label>
+  <p class="hint">Incognito windows are never recorded — the extension does not run in incognito mode. Internal / local addresses are skipped automatically.</p>
+
+  <label for="recorder-skip">Skip these URL prefixes <span style="font-size:10px;color:var(--text-dim)">(one per line)</span></label>
+  <textarea id="recorder-skip" rows="5" style="font-size:12px;font-family:monospace"></textarea>
+
+  <button onclick="saveSettings()">&#128190; Save settings</button>
+  <div id="recorder-status" class="status"></div>
+
+  <script src="shared/api.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
