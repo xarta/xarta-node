@@ -32,7 +32,7 @@ call. The `nodes` SQLite table is derived from it — not the other way around.
       "display_name":     "<Display Name>",
       "host_machine":     "<node-id>",
       "tailnet":          "<tailnet-name>.ts.net",
-      "primary_ip":       "<VLAN42-IP>",
+      "primary_ip":       "<primary-lan-ip>",
       "primary_hostname": "<node-id>.infra.<your-domain>",
       "tailnet_ip":       "<100.x.x.x>",
       "tailnet_hostname": "<node-id>.<tailnet-name>.ts.net",
@@ -52,7 +52,7 @@ call. The `nodes` SQLite table is derived from it — not the other way around.
 | `display_name` | ✅ | Human-readable label shown in the GUI |
 | `host_machine` | ✅ | Usually the same as `node_id` unless virtualised differently |
 | `tailnet` | ✅ | The Tailscale tailnet domain for this node |
-| `primary_ip` | ✅ (if active) | VLAN42 / management IP — used for sync traffic |
+| `primary_ip` | ✅ (if active) | Primary LAN IP — used for sync traffic |
 | `primary_hostname` | ✅ (if active) | HTTPS-accessible hostname (e.g. Caddy TLS) |
 | `tailnet_ip` | ✅ (if active) | Tailscale IP (100.x.x.x) |
 | `tailnet_hostname` | ✅ (if active) | Full Tailscale hostname |

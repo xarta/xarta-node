@@ -69,8 +69,8 @@ _peer_nodes: list[dict] = [n for n in _active_nodes if n["node_id"] != NODE_ID]
 def _peer_sync_urls(peer: dict, self_node: dict) -> list[str]:
     """Return the ordered sync URL list for a peer.
 
-    VLAN42 (primary_ip) is always first when present — it is the direct LAN
-    path and doesn't traverse any external network.
+    The primary LAN address (primary_ip) is always first when present — it is
+    the direct on-premises LAN path and doesn't traverse any external network.
 
     Tailnet IP is appended only when both this node and the peer belong to the
     same tailnet (same string in the 'tailnet' field).  Nodes on different
@@ -84,7 +84,7 @@ def _peer_sync_urls(peer: dict, self_node: dict) -> list[str]:
     port   = peer.get("sync_port", 8080)
     urls: list[str] = []
 
-    # VLAN42 direct — always try first if the peer has one
+    # Primary LAN address — always try first if the peer has one
     if peer.get("primary_ip"):
         urls.append(f"{scheme}://{peer['primary_ip']}:{port}")
 
@@ -99,7 +99,7 @@ def _peer_sync_urls(peer: dict, self_node: dict) -> list[str]:
     return urls
 
 
-# PEER_SYNC_URLS: per-peer ordered list of sync addresses (VLAN42 first,
+# PEER_SYNC_URLS: per-peer ordered list of sync addresses (primary LAN first,
 # tailnet fallback when both nodes share the same tailnet).
 # drain.py iterates this list and stops at the first successful connection.
 PEER_SYNC_URLS: dict[str, list[str]] = {
@@ -295,7 +295,7 @@ CERT_CONFIGS: dict[str, dict] = {
         "group": "mtls",
         "description": (
             "Node certificate for mTLS sync transport (port 8443). "
-            "Must include VLAN42 and Tailscale IP SANs."
+            "Must include primary LAN IP and Tailscale IP SANs."
         ),
     },
     "sync_tls_key": {
