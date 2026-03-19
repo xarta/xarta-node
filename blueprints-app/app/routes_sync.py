@@ -468,7 +468,7 @@ async def mtls_probe() -> dict:
     """
     Probe each fleet peer via mTLS — the same transport the sync drain uses.
 
-    Probes every configured sync address per peer (VLAN42 primary + tailnet
+    Probes every configured sync address per peer (primary LAN + tailnet
     fallback where applicable), mirroring the multi-address failover order used
     by drain.py.  Each address is probed independently so the GUI can show
     which path is healthy.
@@ -621,7 +621,7 @@ async def failover_probe() -> dict:
                     the real peer, but a port that is never listening anywhere.
                     TCP connect is refused instantly (ECONNREFUSED) — no timeout
                     wait.  This simulates the drain hitting an unreachable primary
-                    address (VLAN42 down, or future VPS with no primary_ip).
+                    address (primary LAN down, or future VPS with no primary_ip).
       2. Real URL:  the peer's actual configured sync URL (from PEER_SYNC_URLS).
 
     The probe attempts the dead URL, expects ConnectError, then falls through

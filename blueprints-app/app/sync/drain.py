@@ -110,7 +110,7 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     """
     Drain the action queue for one peer.
 
-    Tries each URL in peer_urls in order (VLAN42 primary first, tailnet
+    Tries each URL in peer_urls in order (primary LAN first, tailnet
     fallback second).  Stops at the first successful connection.  If all
     addresses fail the peer is left queued and retried on the next drain cycle.
 

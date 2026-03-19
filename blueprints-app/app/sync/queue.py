@@ -179,8 +179,8 @@ def get_peer_urls(node_id: str) -> list[str]:
     """Return the ordered sync URL list for a peer from config.
 
     Uses PEER_SYNC_URLS (built at startup from .nodes.json) which applies the
-    same-tailnet filter: VLAN42 primary first, tailnet fallback only when both
-    this node and the peer share the same tailnet string.
+    same-tailnet filter: primary LAN (primary_ip) first, tailnet fallback only
+    when both this node and the peer share the same tailnet string.
 
     Returns an empty list if the node_id is not a configured sync peer (e.g.
     it was removed from .nodes.json without an app restart).
