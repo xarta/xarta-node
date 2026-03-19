@@ -827,3 +827,73 @@ class HealthOut(BaseModel):
     ui_url: Optional[str] = None   # browser-accessible URL; set via BLUEPRINTS_UI_URL
     commit: Optional[str] = None   # short git hash of the current outer-repo checkout
     commit_ts: int = 0             # unix epoch of HEAD commit (for commit-guard ordering)
+
+
+# ── AI Providers ─────────────────────────────────────────────────────────────
+
+class AiProviderCreate(BaseModel):
+    name: str
+    base_url: str
+    api_key: str = ""
+    model_name: str
+    model_type: str                     # 'embedding' | 'reranker' | 'llm'
+    dimensions: Optional[int] = None   # output dims (embedding models only)
+    enabled: bool = True
+    options: Optional[str] = None      # JSON blob
+    notes: Optional[str] = None
+
+
+class AiProviderUpdate(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    model_name: Optional[str] = None
+    model_type: Optional[str] = None
+    dimensions: Optional[int] = None
+    enabled: Optional[bool] = None
+    options: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class AiProviderOut(BaseModel):
+    provider_id: str
+    name: str
+    base_url: str
+    api_key: str
+    model_name: str
+    model_type: str
+    dimensions: Optional[int] = None
+    enabled: bool = True
+    options: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+# ── AI Project Assignments ────────────────────────────────────────────────────
+
+class AiProjectAssignmentCreate(BaseModel):
+    project_name: str
+    provider_id: str
+    role: str                   # 'embedding' | 'reranker' | 'llm'
+    priority: int = 0
+    enabled: bool = True
+
+
+class AiProjectAssignmentUpdate(BaseModel):
+    project_name: Optional[str] = None
+    provider_id: Optional[str] = None
+    role: Optional[str] = None
+    priority: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class AiProjectAssignmentOut(BaseModel):
+    assignment_id: str
+    project_name: str
+    provider_id: str
+    role: str
+    priority: int = 0
+    enabled: bool = True
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

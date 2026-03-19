@@ -336,6 +336,36 @@ CREATE TABLE IF NOT EXISTS doc_images (
     updated_at  TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_doc_images_filename ON doc_images(filename);
+
+-- ── AI providers & project assignments ──────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ai_providers (
+    provider_id  TEXT PRIMARY KEY,          -- UUID
+    name         TEXT NOT NULL,             -- human label e.g. "Local GPU LLM"
+    base_url     TEXT NOT NULL,             -- LiteLLM-compatible base URL
+    api_key      TEXT NOT NULL DEFAULT '',  -- Bearer token; stored in fleet DB (infra-internal only)
+    model_name   TEXT NOT NULL,             -- stable alias e.g. "PRIMARY-LOCAL"
+    model_type   TEXT NOT NULL,             -- 'embedding' | 'reranker' | 'llm'
+    dimensions   INTEGER,                   -- output dimensions (embedding models only)
+    enabled      INTEGER DEFAULT 1,
+    options      TEXT,                      -- JSON options blob (verify_tls, timeout, no_think_supported…)
+    notes        TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_providers_type ON ai_providers(model_type);
+
+CREATE TABLE IF NOT EXISTS ai_project_assignments (
+    assignment_id TEXT PRIMARY KEY,                  -- UUID
+    project_name  TEXT NOT NULL,                     -- e.g. "browser-links"
+    provider_id   TEXT NOT NULL,                     -- FK → ai_providers.provider_id
+    role          TEXT NOT NULL,                     -- 'embedding' | 'reranker' | 'llm'
+    priority      INTEGER DEFAULT 0,                 -- higher = preferred when multiple match
+    enabled       INTEGER DEFAULT 1,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_assignments_project ON ai_project_assignments(project_name, role);
 """
 
 _SEED_SQL = """
