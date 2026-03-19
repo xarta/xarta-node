@@ -92,6 +92,32 @@ The sync system uses a persistent queue in `sync_queue` (SQLite). Each data writ
 
 `"nodes"` is absent from `_ALLOWED_TABLES` in `routes_sync.py`. The nodes table is populated from `.nodes.json` at startup (`_load_nodes_from_json()`) and must never be overwritten by peer sync. Peer-synced `nodes` entries would carry stale addresses.
 
+## Multi-address failover (Phase 1, 2026-03-16)
+
+`drain.py` supports multiple addresses per peer — primary LAN first, tailnet as fallback. On each drain cycle it iterates the address list, stopping at the first successful POST. A `ConnectError` on one URL causes it to try the next; a 409 commit-guard rejection returns immediately (that's a code mismatch, not a connectivity issue).
+
+### PEER_SYNC_URLS
+
+`config.py` exports `PEER_SYNC_URLS: dict[str, list[str]]` — a per-peer ordered address list derived from the `nodes` table (populated from `.nodes.json` at startup). The helper `_peer_sync_urls(peer, self_node)` builds it:
+
+1. **Primary LAN address** (`http://<primary_ip>:<sync_port>`) — always first
+2. **Tailnet address** (`http://<tailnet_ip>:<sync_port>` or `http://<tailnet_hostname>:<sync_port>`) — appended only when `peer["tailnet"] == self_node["tailnet"]`
+
+`PEER_URLS` (flat union of all addresses across all peers) is retained for backward-compatible trust checks in `boot_catchup` and `routes_nodes` fleet-peer detection.
+
+### queue.py helpers
+
+| Function | Returns | Used by |
+|---|---|---|
+| `get_peer_urls(node_id)` | `list[str]` — ordered URL list | `drain.py` multi-address loop |
+| `get_peer_url(node_id)` | `str` — first URL only | Legacy callers (retained) |
+
+### Failover probe diagnostic
+
+`GET /api/v1/sync/failover-probe` — exercises the failover logic without a real secondary address. For each peer it builds a synthetic two-URL list: a guaranteed-dead port (refused immediately) followed by the real configured URL. Response per peer: `dead_status`, `dead_ms`, `real_status`, `real_ms`, `failover_ok`. Top-level `all_passed` flag.
+
+Visible in the self-diagnostics GUI under **Sync — Failover Logic (simulated VPS probe)**.
+
 ## Backup and restore
 
 Local (per-node) DB backups are stored as `.db.tar.gz` files in `BLUEPRINTS_BACKUP_DIR` (typically `.xarta/db-backups/`, committed to the private repo). The `sync_queue` table is always stripped from backups.
