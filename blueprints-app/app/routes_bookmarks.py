@@ -220,10 +220,21 @@ async def put_embedding_config(body: dict) -> dict:
                 val = str(tags)
             set_setting(conn, SETTING_EXCLUDED_TAGS, val,
                         description="Comma-separated tags to exclude from embeddings")
+            gen = increment_gen(conn)
+            row = {"key": SETTING_EXCLUDED_TAGS, "value": val,
+                   "description": "Comma-separated tags to exclude from embeddings",
+                   "updated_at": None}
+            enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_EXCLUDED_TAGS, row, gen)
         if "domain_threshold" in body:
             threshold = max(0, int(body["domain_threshold"]))
-            set_setting(conn, SETTING_DOMAIN_THRESHOLD, str(threshold),
+            val_t = str(threshold)
+            set_setting(conn, SETTING_DOMAIN_THRESHOLD, val_t,
                         description="Max occurrences for a domain to be treated as rare (included in embeddings)")
+            gen = increment_gen(conn)
+            row = {"key": SETTING_DOMAIN_THRESHOLD, "value": val_t,
+                   "description": "Max occurrences for a domain to be treated as rare (included in embeddings)",
+                   "updated_at": None}
+            enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_DOMAIN_THRESHOLD, row, gen)
     return {"ok": True}
 
 
