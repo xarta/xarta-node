@@ -6,6 +6,7 @@ let _bmSortCol = 'created_at';
 let _bmSortDir = 'desc';
 let _bmColResizeDone = false;
 let _bmAllTags = [];
+let _bmCurrentExclTags = []; // source of truth; kept in sync with server
 
 async function _bmDownloadExtension(btn) {
   const orig = btn.textContent;
@@ -281,6 +282,7 @@ async function _bmLoadEmbedCfg() {
     if (!r.ok) return;
     const cfg = await r.json();
     _bmRenderExclTags(cfg.excluded_tags || []);
+    _bmCurrentExclTags = cfg.excluded_tags || [];
     const thr = document.getElementById('bm-domain-threshold');
     if (thr) thr.value = cfg.domain_threshold ?? 3;
     const analyzeStatus = document.getElementById('bm-analyze-status');
@@ -306,7 +308,7 @@ function _bmOpenExclTagModal() {
   if (!modal) return;
   document.getElementById('bm-excl-modal-search').value = '';
   document.getElementById('bm-excl-modal-status').textContent = '';
-  const excluded = new Set(_bmGetExclTags());
+  const excluded = new Set(_bmCurrentExclTags);
   _bmRenderExclTagModalList(excluded, '');
   _bmUpdateExclModalCount();
   modal.showModal();
@@ -317,14 +319,18 @@ function _bmRenderExclTagModalList(excluded, filter) {
   const container = document.getElementById('bm-excl-modal-list');
   if (!container) return;
   const f = filter.toLowerCase().trim();
-  const visible = f ? _bmAllTags.filter(t => t.includes(f)) : _bmAllTags;
-  // Sort: excluded first, then alpha
-  const sorted = [...visible].sort((a, b) => {
+  // Union: all known tags + any excluded tags that have no bookmarks (orphans)
+  const allKnown = new Set(_bmAllTags);
+  const combined = [..._bmAllTags];
+  for (const t of excluded) { if (!allKnown.has(t)) combined.unshift(t); }
+  const visible = f ? combined.filter(t => t.includes(f)) : combined;
+  // Excluded tags sorted to top, then alpha
+  visible.sort((a, b) => {
     const ae = excluded.has(a), be = excluded.has(b);
     if (ae !== be) return ae ? -1 : 1;
     return a.localeCompare(b);
   });
-  container.innerHTML = sorted.map(tag => {
+  container.innerHTML = visible.map(tag => {
     const checked = excluded.has(tag) ? 'checked' : '';
     return `<label><input type="checkbox" data-tag="${esc(tag)}" ${checked} />${esc(tag)}</label>`;
   }).join('');
@@ -383,10 +389,11 @@ function _bmInitEmbedPanel() {
   document.getElementById('bm-excl-tag-list')?.addEventListener('click', e => {
     const btn = e.target.closest('[data-remove-tag]');
     if (!btn) return;
-    _bmRenderExclTags(_bmGetExclTags().filter(t => t !== btn.dataset.removeTag));
+    _bmCurrentExclTags = _bmCurrentExclTags.filter(t => t !== btn.dataset.removeTag);
+    _bmRenderExclTags(_bmCurrentExclTags);
   });
 
-  // Save excluded tags
+  // Save excluded tags (chip-level; updates server + state)
   document.getElementById('bm-excl-tag-save-btn')?.addEventListener('click', async () => {
     const statusEl = document.getElementById('bm-excl-tag-status');
     statusEl.textContent = 'Saving…';
@@ -394,7 +401,7 @@ function _bmInitEmbedPanel() {
       const r = await apiFetch('/api/v1/bookmarks/embedding-config', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excluded_tags: _bmGetExclTags() }),
+        body: JSON.stringify({ excluded_tags: _bmCurrentExclTags }),
       });
       statusEl.textContent = r.ok ? '✓ Saved' : `Error ${r.status}`;
     } catch (e) {
@@ -411,15 +418,6 @@ function _bmInitEmbedPanel() {
     _bmUpdateExclModalCount();
   });
 
-  // Modal: cancel / close button
-  const closeModal = () => document.getElementById('bm-excl-tag-modal')?.close();
-  document.getElementById('bm-excl-modal-close-btn')?.addEventListener('click', closeModal);
-  document.getElementById('bm-excl-modal-cancel-btn')?.addEventListener('click', closeModal);
-  // Click on backdrop closes
-  document.getElementById('bm-excl-tag-modal')?.addEventListener('click', e => {
-    if (e.target === e.currentTarget) closeModal();
-  });
-
   // Modal: Apply & Save
   document.getElementById('bm-excl-modal-apply-btn')?.addEventListener('click', async () => {
     const statusEl = document.getElementById('bm-excl-modal-status');
@@ -434,12 +432,20 @@ function _bmInitEmbedPanel() {
         body: JSON.stringify({ excluded_tags: tags }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _bmCurrentExclTags = tags;
       _bmRenderExclTags(tags);
-      closeModal();
+      document.getElementById('bm-excl-tag-modal').close();
     } catch (e) {
       statusEl.textContent = `Error: ${e.message}`;
       applyBtn.disabled = false;
     }
+  });
+
+  // Restore apply button state when modal closes (ESC or cancel)
+  document.getElementById('bm-excl-tag-modal')?.addEventListener('close', () => {
+    const applyBtn = document.getElementById('bm-excl-modal-apply-btn');
+    if (applyBtn) { applyBtn.disabled = false; }
+    document.getElementById('bm-excl-modal-status').textContent = '';
   });
 
   // Analyse domains
