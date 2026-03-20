@@ -77,7 +77,7 @@ function renderResults(results) {
   }
   el.innerHTML = results.map(r => {
     const tags = (r.tags || []).map(t => `<span class="tag-pill">${esc(t)}</span>`).join('');
-    return `<div class="result-item" onclick="openUrl('${esc(r.url)}')">
+    return `<div class="result-item" data-url="${esc(r.url)}">
       <div class="result-title">${esc(r.title || r.url)}</div>
       <div class="result-url">${esc(r.url || '')}</div>
       ${tags ? `<div class="result-tags">${tags}</div>` : ''}
@@ -97,6 +97,25 @@ function esc(s) {
 // ── Init — populate save panel from active tab ────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Wire tab buttons
+  document.getElementById('tab-save-btn').addEventListener('click', () => showPanel('save'));
+  document.getElementById('tab-search-btn').addEventListener('click', () => showPanel('search'));
+
+  // Wire save panel
+  document.getElementById('btn-popup-save').addEventListener('click', saveCurrent);
+  document.getElementById('btn-popup-cancel').addEventListener('click', () => window.close());
+
+  // Wire search panel
+  document.getElementById('search-q').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+  document.getElementById('btn-popup-search').addEventListener('click', runSearch);
+
+  // Event delegation for dynamically rendered search results
+  document.getElementById('search-results').addEventListener('click', e => {
+    const item = e.target.closest('[data-url]');
+    if (item) openUrl(item.dataset.url);
+  });
+
+  // Populate save panel from the active tab
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab) {

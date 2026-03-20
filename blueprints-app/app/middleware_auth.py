@@ -47,6 +47,11 @@ _SYNC_PREFIX = "/api/v1/sync/"
 # Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
 # All other sync routes (status, git-pull, gui/*) are browser-accessible and accept either secret.
 _SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
+# Bookmarks endpoints that are auth-exempt (aggregate/non-sensitive data, open CORS for extension).
+_BOOKMARKS_OPEN_PATHS = frozenset({
+    "/api/v1/bookmarks/health",
+    "/api/v1/bookmarks/extension-version",
+})
 
 
 def _client_ip(request: Request) -> str:
@@ -83,7 +88,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # ── 2. Token check (skip for exempt paths) ────────────────────────────
         path = request.url.path
-        if path == "/api/v1/bookmarks/health":
+        if path in _BOOKMARKS_OPEN_PATHS:
             return await call_next(request)
         if not any(path.startswith(p) for p in _TOKEN_EXEMPT_PREFIXES):
             token = request.headers.get("x-api-token", "")

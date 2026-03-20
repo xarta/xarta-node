@@ -394,11 +394,33 @@ async function runSelfDiag() {
       const errDetail = bookmarksHealthData[errKey] ? esc(String(bookmarksHealthData[errKey]).split('\n')[0]) : '';
       html += _selfDiagRow(ok ? '✅' : '❌', sub, val || '?', errDetail);
     }
-    html += _selfDiagRow('ℹ', 'Indexed bookmarks', String(bookmarksHealthData.seekdb_indexed ?? '?'), `${bookmarksHealthData.bookmark_count ?? '?'} in SQLite`);
-    html += _selfDiagRow('ℹ', 'Indexed visits', String(bookmarksHealthData.seekdb_visits_indexed ?? '?'), `${bookmarksHealthData.visit_count ?? '?'} in SQLite`);
+    const _bmCount = bookmarksHealthData.bookmark_count ?? 0;
+    const _bmIdx   = bookmarksHealthData.seekdb_indexed ?? 0;
+    const _bmCovOk = _bmCount > 0 && _bmIdx >= _bmCount;
+    const _bmCovPct = _bmCount > 0 ? Math.round(_bmIdx / _bmCount * 100) : 0;
+    html += _selfDiagRow(
+      _bmCovOk ? '✅' : (_bmIdx > 0 ? '⚠' : '❌'),
+      'Index coverage — bookmarks',
+      `${_bmIdx} / ${_bmCount} indexed`,
+      _bmCovOk ? '100%' : `${_bmCovPct}% — sync still catching up`);
+    const _visCount = bookmarksHealthData.visit_count ?? 0;
+    const _visIdx   = bookmarksHealthData.seekdb_visits_indexed ?? 0;
+    const _visCovOk = _visCount === 0 || _visIdx >= _visCount;
+    html += _selfDiagRow(
+      _visCovOk ? '✅' : '⚠',
+      'Index coverage — visits',
+      `${_visIdx} / ${_visCount} indexed`,
+      _visCovOk ? (_visCount === 0 ? 'no visits yet' : '100%') : `${Math.round(_visIdx / _visCount * 100)}%`);
     if (bookmarksHealthData.last_seekdb_sync) {
       html += _selfDiagRow('ℹ', 'Last SeekDB sync', esc(bookmarksHealthData.last_seekdb_sync), '');
     }
+    html += `<div id="bp-search-probe-section" style="display:flex;align-items:center;gap:8px;padding:5px 2px">
+      <button id="bp-search-probe-btn"
+        style="padding:3px 10px;background:var(--accent-dim);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0">
+        &#x25b6; Search probe
+      </button>
+      <span style="font-size:12px;color:var(--text-dim)">Tests keyword (BM25), vector (HNSW), hybrid RRF fusion, and reranker against live indexed data</span>
+    </div>`;
   }
 
   // ── Local AI Providers ─────────────────────────────────────────────────────
@@ -511,6 +533,87 @@ async function runSelfDiag() {
   const _aiInferBtn = document.getElementById('bp-ai-infer-btn');
   if (_aiProbeBtn) _aiProbeBtn.addEventListener('click', () => _runAiProbe(false));
   if (_aiInferBtn) _aiInferBtn.addEventListener('click', () => _runAiProbe(true));
+
+  // ── Browser Links — Search probe ──────────────────────────────────────────
+  async function _runBmSearchProbe() {
+    const section = document.getElementById('bp-search-probe-section');
+    if (!section) return;
+    const btn = document.getElementById('bp-search-probe-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '\u29d0 Probing\u2026'; }
+
+    try {
+      // Fetch a sample of real bookmarks to use as test fixtures
+      const r0 = await apiFetch('/api/v1/bookmarks?limit=50');
+      if (!r0.ok) throw new Error(`Cannot fetch bookmarks: HTTP ${r0.status}`);
+      const allBms = await r0.json();
+
+      const STOPWORDS = new Set(['the','and','for','with','this','that','from','your','are','was','but','not','have','http','https','www']);
+      // Prefer bookmarks with multi-word titles so a single word is distinctive
+      const candidates = allBms
+        .filter(b => b.title && b.title.length >= 8)
+        .sort((a, b) => b.title.split(' ').length - a.title.split(' ').length);
+
+      let rows = '';
+      let tested = 0;
+      const INDENT = '\u00a0\u00a0\u00a0\u2192';
+
+      for (const bm of candidates) {
+        if (tested >= 3) break;
+        const words = bm.title.split(/[\s\-\/]+/)
+          .filter(w => w.length >= 4 && /^[a-zA-Z]/.test(w) && !STOPWORDS.has(w.toLowerCase()));
+        if (!words.length) continue;
+        const testWord = words[0];
+        const testLabel = `search("${testWord.length > 20 ? testWord.slice(0, 18) + '\u2026' : testWord}")`;
+
+        const sr = await apiFetch(`/api/v1/bookmarks/search?q=${encodeURIComponent(testWord)}&limit=20`);
+        if (!sr.ok) {
+          rows += _selfDiagRow('❌', testLabel, `HTTP ${sr.status}`, esc(bm.title.slice(0, 40)));
+          tested++; continue;
+        }
+        const sd = await sr.json();
+        const results = sd.results || [];
+        const count = sd.count ?? 0;
+
+        const allSrcs = results.flatMap(r => r.score_sources || []);
+        const hasKw     = allSrcs.includes('bookmark_keyword');
+        const hasVec    = allSrcs.includes('bookmark_vector');
+        // RRF fusion is working if both pipelines contributed results to the pool
+        // (even if their result sets are disjoint — disjoint sets are normal for name searches).
+        const isHybrid  = hasKw && hasVec;
+        const hybridDetail = isHybrid
+          ? (results.some(r => { const s = r.score_sources || []; return s.includes('bookmark_keyword') && s.includes('bookmark_vector'); })
+              ? 'keyword + vector merged (overlapping sets)'
+              : 'keyword + vector merged (disjoint sets — normal for specific terms)')
+          : 'only one source contributing';
+        const recalled  = results.some(r => r.id === bm.bookmark_id);
+        const reranked  = count > 1;  // reranker only fires when ≥2 results
+
+        rows += _selfDiagRow(count > 0 ? '✅' : '❌',
+          testLabel, `${count} results`, `from: "${esc(bm.title.slice(0, 40))}"`);
+        rows += _selfDiagRow(hasKw    ? '✅' : '❌', `${INDENT} keyword (BM25)`,
+          hasKw    ? 'contributing' : 'no keyword hits', '');
+        rows += _selfDiagRow(hasVec   ? '✅' : '❌', `${INDENT} vector (HNSW)`,
+          hasVec   ? 'contributing' : 'no vector hits — embedding issue?', '');
+        rows += _selfDiagRow(isHybrid ? '✅' : '⚠',  `${INDENT} hybrid RRF fusion`,
+          hybridDetail, '');
+        rows += _selfDiagRow(recalled ? '✅' : '⚠',  `${INDENT} source bookmark recalled`,
+          recalled ? 'found in top 20' : 'not in top 20 (word too common?)', '');
+        rows += _selfDiagRow(reranked ? '✅' : '⚠',  `${INDENT} reranker`,
+          reranked ? `ran — ${count} results reranked without error` : 'skipped (< 2 results)', '');
+        tested++;
+      }
+
+      if (tested === 0) {
+        rows = _selfDiagRow('⚠', 'No suitable test bookmarks', 'need bookmarks with titles ≥ 8 chars and non-stop-word terms', '');
+      }
+      section.outerHTML = rows;
+    } catch (e) {
+      const s = document.getElementById('bp-search-probe-section');
+      if (s) s.outerHTML = _selfDiagRow('❌', 'Search probe error', e.message, '');
+    }
+  }
+  const _bmSearchProbeBtn = document.getElementById('bp-search-probe-btn');
+  if (_bmSearchProbeBtn) _bmSearchProbeBtn.addEventListener('click', _runBmSearchProbe);
 
   const total   = endpointResults.length;
   const passed  = endpointResults.filter(r => r.ok).length;

@@ -42,6 +42,14 @@ ALLOWED_METHODS = "GET, POST, OPTIONS"
 # Headers the component sends.
 ALLOWED_HEADERS = "Content-Type, X-API-Token"
 
+# Paths served with Access-Control-Allow-Origin: * so that extension pages
+# (with unpredictable chrome-extension:// origins) can call them freely.
+# Only add paths that are already auth-exempt and return non-sensitive data.
+_OPEN_CORS_PATHS = frozenset({
+    "/api/v1/bookmarks/health",
+    "/api/v1/bookmarks/extension-version",
+})
+
 
 class DynamicCORSMiddleware(BaseHTTPMiddleware):
     """
@@ -111,6 +119,20 @@ class DynamicCORSMiddleware(BaseHTTPMiddleware):
         if not origin:
             return await call_next(request)
 
+        path = request.url.path
+
+        # Public endpoints that may be called from any origin (e.g. browser
+        # extensions with unknown/unpredictable origin IDs).  Only endpoints
+        # that are already auth-exempt and return non-sensitive aggregate data
+        # should be listed here.
+        if path in _OPEN_CORS_PATHS:
+            if request.method == "OPTIONS":
+                return Response(status_code=204, headers=_cors_headers("*"))
+            response = await call_next(request)
+            for k, v in _cors_headers("*").items():
+                response.headers[k] = v
+            return response
+
         allowed = self._is_allowed(origin)
 
         # Preflight OPTIONS — respond immediately; never forward to the app.
@@ -134,10 +156,13 @@ class DynamicCORSMiddleware(BaseHTTPMiddleware):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _cors_headers(origin: str) -> dict[str, str]:
-    return {
+    h = {
         "Access-Control-Allow-Origin":  origin,
         "Access-Control-Allow-Methods": ALLOWED_METHODS,
         "Access-Control-Allow-Headers": ALLOWED_HEADERS,
         "Access-Control-Max-Age":       "600",
-        "Vary":                         "Origin",
     }
+    # Vary: Origin must not be set when using wildcard — it would confuse caches.
+    if origin != "*":
+        h["Vary"] = "Origin"
+    return h

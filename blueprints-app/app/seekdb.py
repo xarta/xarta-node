@@ -160,15 +160,22 @@ def delete_bookmark_index(bookmark_id: str) -> None:
 
 
 def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    ids_lists = payload.get("ids") or [[]]
-    doc_lists = payload.get("documents") or [[]]
-    meta_lists = payload.get("metadatas") or [[]]
-    dist_lists = payload.get("distances") or [[]]
+    # col.query() returns nested lists [[...]] (one per query embedding).
+    # col.get()   returns flat lists   [...].
+    # Detect by checking whether the first ids element is itself a list.
+    raw_ids = payload.get("ids") or []
+    nested = bool(raw_ids) and isinstance(raw_ids[0], list)
 
-    ids = ids_lists[0] if ids_lists else []
-    docs = doc_lists[0] if doc_lists else []
-    metas = meta_lists[0] if meta_lists else []
-    dists = dist_lists[0] if dist_lists else []
+    if nested:
+        ids   = raw_ids[0]
+        docs  = (payload.get("documents") or [[]])[0]
+        metas = (payload.get("metadatas") or [[]])[0]
+        dists = (payload.get("distances") or [[]])[0]
+    else:
+        ids   = raw_ids
+        docs  = payload.get("documents") or []
+        metas = payload.get("metadatas") or []
+        dists = payload.get("distances") or []
 
     rows: list[dict[str, Any]] = []
     for idx, item_id in enumerate(ids):

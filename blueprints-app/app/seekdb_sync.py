@@ -28,7 +28,9 @@ _loop_started = False
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    # Use SQLite-compatible format (space separator, no timezone) so the
+    # string comparison `updated_at > last_sync` works correctly in SQLite.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _parse_tags(tags_json: str) -> list[str]:
