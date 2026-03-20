@@ -2,6 +2,9 @@
 
 let _bmSearchTimer = null;
 let _bmSearchActive = false;
+let _bmSortCol = 'created_at';
+let _bmSortDir = 'desc';
+let _bmColResizeDone = false;
 
 async function _bmDownloadExtension(btn) {
   const orig = btn.textContent;
@@ -113,6 +116,8 @@ function _renderBmSearchResults(results) {
     const editBtns = isBookmark ? `
       <button class="secondary" style="padding:1px 6px;font-size:11px"
         onclick="openBookmarkModal('${esc(r.id)}')">&#9998;</button>
+      <button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--text-dim);border-color:var(--border);margin-left:2px" title="Archive"
+        onclick="archiveBookmark('${esc(r.id)}', false)">&#128229;</button>
       <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:2px"
         onclick="deleteBookmark('${esc(r.id)}','${esc(r.title || r.url)}')">&#x2715;</button>` : '';
     return `<tr>
@@ -147,14 +152,28 @@ function renderBookmarks() {
   if (tagFilter) {
     rows = rows.filter(b => (b.tags || []).includes(tagFilter));
   }
+  // Apply sort
+  if (_bmSortCol) {
+    rows = [...rows].sort((a, b) => {
+      const av = _bmSortVal(a, _bmSortCol);
+      const bv = _bmSortVal(b, _bmSortCol);
+      return _bmSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+    });
+  }
   const tbody = document.getElementById('bm-tbody');
   if (!rows.length) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No bookmarks found.</td></tr>';
+    _bmUpdateSortHeaders();
     return;
   }
   tbody.innerHTML = rows.map(b => {
     const tags = (b.tags || []).map(t => _bmTagPill(t)).join(' ');
     const archiveStyle = b.archived ? 'opacity:0.55' : '';
+    const archBtn = b.archived
+      ? `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--ok);border-color:var(--ok);margin-left:2px" title="Restore from archive"
+          onclick="archiveBookmark('${esc(b.bookmark_id)}', true)">&#128228;</button>`
+      : `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--text-dim);border-color:var(--border);margin-left:2px" title="Archive"
+          onclick="archiveBookmark('${esc(b.bookmark_id)}', false)">&#128229;</button>`;
     return `<tr style="${archiveStyle}">
       <td style="text-align:center">&#128278;</td>
       <td><a href="${esc(b.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">${esc(b.title || b.url)}</a></td>
@@ -166,11 +185,14 @@ function renderBookmarks() {
       <td style="white-space:nowrap">
         <button class="secondary" style="padding:1px 6px;font-size:11px"
           onclick="openBookmarkModal('${esc(b.bookmark_id)}')">&#9998;</button>
+        ${archBtn}
         <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:2px"
           onclick="deleteBookmark('${esc(b.bookmark_id)}','${esc(b.title || b.url)}')">&#x2715;</button>
       </td>
     </tr>`;
   }).join('');
+  _bmUpdateSortHeaders();
+  _bmInitColResize();
 }
 
 // ── Visits ──────────────────────────────────────────────────────────────
@@ -362,6 +384,128 @@ async function deleteBookmark(id, title) {
     const err = document.getElementById('bm-error');
     err.textContent = `Delete failed: ${e.message}`;
     err.hidden = false;
+  }
+}
+
+// ── Archive / restore bookmark ──────────────────────────────────────────
+
+async function archiveBookmark(id, currentArchived) {
+  try {
+    const r = await apiFetch(`/api/v1/bookmarks/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived: !currentArchived }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    await loadBookmarks();
+  } catch (e) {
+    const err = document.getElementById('bm-error');
+    err.textContent = `Archive failed: ${e.message}`;
+    err.hidden = false;
+  }
+}
+
+// ── Sort helpers ────────────────────────────────────────────────────────
+
+function _bmSortBy(col) {
+  if (_bmSortCol === col) {
+    _bmSortDir = _bmSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    _bmSortCol = col;
+    _bmSortDir = 'asc';
+  }
+  renderBookmarks();
+}
+
+function _bmSortVal(b, col) {
+  if (col === 'tags') return (b.tags || []).join(',').toLowerCase();
+  const v = b[col];
+  return v !== null && v !== undefined ? String(v).toLowerCase() : '';
+}
+
+function _bmUpdateSortHeaders() {
+  document.querySelectorAll('#bm-main-view .bm-sort-arrow').forEach(span => {
+    const col = span.dataset.col;
+    if (col === _bmSortCol) {
+      span.textContent = _bmSortDir === 'asc' ? ' \u2191' : ' \u2193';
+      span.classList.add('active');
+    } else {
+      span.textContent = '\u21C5';
+      span.classList.remove('active');
+    }
+  });
+}
+
+// ── Column resize ───────────────────────────────────────────────────────
+
+function _bmInitColResize() {
+  if (_bmColResizeDone) return;
+  const table = document.querySelector('#bm-main-view table');
+  if (!table) return;
+  _bmColResizeDone = true;
+  table.querySelectorAll('thead th').forEach(th => {
+    const resizer = document.createElement('div');
+    resizer.className = 'bm-col-resize';
+    th.appendChild(resizer);
+    // Prevent resize click from triggering column sort
+    resizer.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
+    let startX = 0, startW = 0;
+    resizer.addEventListener('mousedown', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      startX = e.clientX;
+      startW = th.offsetWidth;
+      resizer.classList.add('dragging');
+      const onMove = ev => {
+        const w = Math.max(40, startW + ev.clientX - startX);
+        th.style.width = w + 'px';
+      };
+      const onUp = () => {
+        resizer.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  });
+}
+
+// ── Auto-archive dead links ─────────────────────────────────────────────
+
+async function _bmAutoArchiveDead(btn) {
+  const panel = document.getElementById('bm-deadlink-panel');
+  const statusEl = document.getElementById('bm-deadlink-status');
+  const resultsEl = document.getElementById('bm-deadlink-results');
+  const total = _bookmarks.length;
+  statusEl.textContent = `Checking ${total} bookmark${total === 1 ? '' : 's'} for dead links\u2026 (may take a minute)`;
+  statusEl.style.color = 'var(--text-dim)';
+  resultsEl.textContent = '';
+  panel.style.display = '';
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '\u27F3 Checking\u2026';
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/check-dead-links', { method: 'POST' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    statusEl.textContent = `Done \u2014 checked ${data.checked}`;
+    statusEl.style.color = 'var(--text)';
+    if (data.archived > 0) {
+      resultsEl.innerHTML = ` \u00B7 <span style="color:var(--warn)">${data.archived} dead link${data.archived === 1 ? '' : 's'} archived</span>`;
+      if (data.errors > 0) resultsEl.innerHTML += ` \u00B7 <span style="color:var(--text-dim)">${data.errors} error${data.errors === 1 ? '' : 's'}</span>`;
+      await loadBookmarks();
+    } else {
+      resultsEl.innerHTML = ` \u00B7 <span style="color:var(--ok)">no dead links found</span>`;
+      if (data.errors > 0) resultsEl.innerHTML += ` \u00B7 <span style="color:var(--text-dim)">${data.errors} error${data.errors === 1 ? '' : 's'}</span>`;
+    }
+  } catch (e) {
+    statusEl.textContent = `Check failed: ${e.message}`;
+    statusEl.style.color = 'var(--err)';
+    resultsEl.textContent = '';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
   }
 }
 

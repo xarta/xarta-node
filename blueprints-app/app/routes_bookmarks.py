@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import uuid
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
@@ -383,6 +385,77 @@ async def create_visit(body: VisitCreate) -> VisitOut:
 
     trigger_seekdb_sync()
     return _row_to_visit_out(row)
+
+
+@router.post("/check-dead-links", response_model=dict)
+async def check_dead_links(
+    timeout: float = Query(8.0, ge=1.0, le=30.0),
+    concurrency: int = Query(50, ge=1, le=100),
+) -> dict:
+    """
+    HEAD-check every non-archived bookmark URL in parallel.
+    Any that return HTTP 404 or 410 are automatically archived and
+    the change is enqueued for fleet sync.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT bookmark_id, url, title FROM bookmarks WHERE archived=0 LIMIT 5000"
+        ).fetchall()
+    bookmarks = [dict(r) for r in rows]
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _check_one(client: httpx.AsyncClient, bm: dict) -> dict:
+        async with sem:
+            url = bm["url"]
+            try:
+                resp = await client.head(url, follow_redirects=True)
+                status = resp.status_code
+                dead = status in (404, 410)
+                return {"bookmark_id": bm["bookmark_id"], "url": url,
+                        "title": bm.get("title") or url, "status": status, "dead": dead}
+            except Exception as exc:
+                return {"bookmark_id": bm["bookmark_id"], "url": url,
+                        "title": bm.get("title") or url, "status": None,
+                        "dead": False, "error": str(exc)[:120]}
+
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=10)
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "BlueprintsLinkChecker/1.0"},
+        timeout=timeout,
+        limits=limits,
+    ) as client:
+        results = list(await asyncio.gather(*[_check_one(client, bm) for bm in bookmarks]))
+
+    dead = [r for r in results if r.get("dead")]
+    errors = [r for r in results if "error" in r]
+
+    now = _now_iso()
+    with get_conn() as conn:
+        for r in dead:
+            conn.execute(
+                "UPDATE bookmarks SET archived=1, updated_at=? WHERE bookmark_id=?",
+                (now, r["bookmark_id"]),
+            )
+            row = conn.execute(
+                "SELECT * FROM bookmarks WHERE bookmark_id=?", (r["bookmark_id"],)
+            ).fetchone()
+            gen = increment_gen(conn, "human")
+            enqueue_for_all_peers(conn, "UPDATE", "bookmarks", r["bookmark_id"], dict(row), gen)
+
+    if dead:
+        trigger_seekdb_sync()
+
+    return {
+        "checked": len(bookmarks),
+        "archived": len(dead),
+        "errors": len(errors),
+        "dead": [
+            {"bookmark_id": r["bookmark_id"], "url": r["url"],
+             "title": r["title"], "status": r.get("status")}
+            for r in dead
+        ],
+    }
 
 
 @router.get("/{bookmark_id}", response_model=BookmarkOut)
