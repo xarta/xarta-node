@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from .ai_client import embed, rerank
-from .db import get_conn, increment_gen
+from .db import get_conn, get_setting, set_setting, increment_gen
 from .models import (
     BookmarkCreate,
     BookmarkImportRequest,
@@ -33,7 +33,17 @@ from .seekdb import (
     vector_search_bookmarks,
     vector_search_visits,
 )
-from .seekdb_sync import trigger_seekdb_sync
+from .seekdb_sync import (
+    trigger_seekdb_sync,
+    reindex_all as _do_reindex_all,
+    analyze_domains as _do_analyze_domains,
+    get_reindex_state,
+    SETTING_EXCLUDED_TAGS,
+    SETTING_DOMAIN_THRESHOLD,
+    SETTING_RARE_DOMAINS,
+    DEFAULT_EXCLUDED_TAGS,
+    DEFAULT_DOMAIN_THRESHOLD,
+)
 from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/bookmarks", tags=["bookmarks"])
@@ -158,6 +168,70 @@ async def list_tags() -> list[str]:
         for t in _tags_from_json(row["tags_json"]):
             tags.add(t)
     return sorted(tags)
+
+
+# ── Embedding config & reindex ────────────────────────────────────────────────
+
+@router.get("/embedding-config", response_model=dict)
+async def get_embedding_config() -> dict:
+    with get_conn() as conn:
+        excluded_raw = get_setting(conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS) or DEFAULT_EXCLUDED_TAGS
+        threshold = int(get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD) or DEFAULT_DOMAIN_THRESHOLD)
+        rare_raw = get_setting(conn, SETTING_RARE_DOMAINS, "[]") or "[]"
+    excluded_tags = [t.strip() for t in excluded_raw.split(",") if t.strip()]
+    try:
+        rare_domains = json.loads(rare_raw)
+    except Exception:
+        rare_domains = []
+    return {
+        "excluded_tags": excluded_tags,
+        "domain_threshold": threshold,
+        "rare_domains_count": len(rare_domains),
+        "rare_domains": rare_domains,
+    }
+
+
+@router.put("/embedding-config", response_model=dict)
+async def put_embedding_config(body: dict) -> dict:
+    with get_conn() as conn:
+        if "excluded_tags" in body:
+            tags = body["excluded_tags"]
+            if isinstance(tags, list):
+                val = ",".join(str(t).strip().lower() for t in tags if str(t).strip())
+            else:
+                val = str(tags)
+            set_setting(conn, SETTING_EXCLUDED_TAGS, val,
+                        description="Comma-separated tags to exclude from embeddings")
+        if "domain_threshold" in body:
+            threshold = max(0, int(body["domain_threshold"]))
+            set_setting(conn, SETTING_DOMAIN_THRESHOLD, str(threshold),
+                        description="Max occurrences for a domain to be treated as rare (included in embeddings)")
+    return {"ok": True}
+
+
+@router.post("/analyze-domains", response_model=dict)
+async def post_analyze_domains(body: dict | None = None) -> dict:
+    threshold: int | None = None
+    if body and "domain_threshold" in body:
+        threshold = max(0, int(body["domain_threshold"]))
+    rare = _do_analyze_domains(threshold)
+    with get_conn() as conn:
+        used_threshold = int(get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD) or DEFAULT_DOMAIN_THRESHOLD)
+    return {"rare_domains_count": len(rare), "threshold": used_threshold}
+
+
+@router.post("/reindex", response_model=dict)
+async def post_reindex() -> dict:
+    state = get_reindex_state()
+    if state["running"]:
+        raise HTTPException(409, "Reindex already in progress")
+    asyncio.create_task(_do_reindex_all())
+    return {"ok": True, "message": "Reindex started"}
+
+
+@router.get("/reindex-progress", response_model=dict)
+async def get_reindex_progress() -> dict:
+    return get_reindex_state()
 
 
 @router.get("/visits", response_model=list[VisitOut])

@@ -60,4 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadBackups();
   setInterval(loadHealth, 15_000);
   setInterval(loadSyncStatus, 30_000);
+  _bmInitEmbedPanel();
+  // Auto-resume progress display if reindex was running before page load
+  _bmPollReindexProgress();
 });
