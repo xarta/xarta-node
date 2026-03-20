@@ -261,6 +261,198 @@ function _bmToggleSetup() {
   if (opening) _bmPopulateExtUrls();
 }
 
+// ── Embedding config panel ────────────────────────────────────────────────────
+
+let _bmReindexPollTimer = null;
+
+function _bmToggleEmbedCfg() {
+  const panel = document.getElementById('bm-embed-panel');
+  if (!panel) return;
+  const opening = panel.style.display === 'none';
+  panel.style.display = opening ? '' : 'none';
+  if (opening) _bmLoadEmbedCfg();
+}
+
+async function _bmLoadEmbedCfg() {
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/embedding-config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    _bmRenderExclTags(cfg.excluded_tags || []);
+    const thr = document.getElementById('bm-domain-threshold');
+    if (thr) thr.value = cfg.domain_threshold ?? 3;
+    const analyzeStatus = document.getElementById('bm-analyze-status');
+    if (analyzeStatus && cfg.rare_domains_count != null)
+      analyzeStatus.textContent = `${cfg.rare_domains_count} rare domains stored`;
+  } catch (_) {}
+  // Also check if reindex is already running (survives page refresh)
+  _bmPollReindexProgress();
+}
+
+function _bmRenderExclTags(tags) {
+  const list = document.getElementById('bm-excl-tag-list');
+  if (!list) return;
+  list.innerHTML = '';
+  (tags || []).forEach(tag => {
+    const chip = document.createElement('span');
+    chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:12px';
+    chip.dataset.tag = tag;
+    chip.innerHTML = `${esc(tag)} <button data-remove-tag="${esc(tag)}" style="background:none;border:none;cursor:pointer;font-size:13px;line-height:1;padding:0;color:var(--text-dim)">&#10005;</button>`;
+    list.appendChild(chip);
+  });
+}
+
+function _bmGetExclTags() {
+  const list = document.getElementById('bm-excl-tag-list');
+  if (!list) return [];
+  return Array.from(list.querySelectorAll('[data-tag]')).map(el => el.dataset.tag);
+}
+
+function _bmInitEmbedPanel() {
+  const panel = document.getElementById('bm-embed-panel');
+  if (!panel) return;
+
+  document.getElementById('bm-embed-close-btn')?.addEventListener('click', () => {
+    panel.style.display = 'none';
+  });
+
+  // Add tag button
+  document.getElementById('bm-excl-tag-add-btn')?.addEventListener('click', () => {
+    const input = document.getElementById('bm-excl-tag-input');
+    const val = (input?.value || '').trim().toLowerCase();
+    if (!val) return;
+    const existing = _bmGetExclTags();
+    if (existing.includes(val)) { input.value = ''; return; }
+    _bmRenderExclTags([...existing, val]);
+    input.value = '';
+  });
+
+  // Enter key in tag input
+  document.getElementById('bm-excl-tag-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('bm-excl-tag-add-btn')?.click();
+  });
+
+  // Remove tag via event delegation
+  document.getElementById('bm-excl-tag-list')?.addEventListener('click', e => {
+    const btn = e.target.closest('[data-remove-tag]');
+    if (!btn) return;
+    const tag = btn.dataset.removeTag;
+    _bmRenderExclTags(_bmGetExclTags().filter(t => t !== tag));
+  });
+
+  // Save excluded tags
+  document.getElementById('bm-excl-tag-save-btn')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('bm-excl-tag-status');
+    statusEl.textContent = 'Saving…';
+    try {
+      const r = await apiFetch('/api/v1/bookmarks/embedding-config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ excluded_tags: _bmGetExclTags() }),
+      });
+      statusEl.textContent = r.ok ? '✓ Saved' : `Error ${r.status}`;
+    } catch (e) {
+      statusEl.textContent = `Error: ${e.message}`;
+    }
+    setTimeout(() => { statusEl.textContent = ''; }, 3000);
+  });
+
+  // Analyse domains
+  document.getElementById('bm-analyze-domains-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('bm-analyze-domains-btn');
+    const statusEl = document.getElementById('bm-analyze-status');
+    const threshold = parseInt(document.getElementById('bm-domain-threshold')?.value || '3', 10);
+    btn.disabled = true;
+    statusEl.textContent = 'Analysing…';
+    try {
+      // Save threshold first
+      await apiFetch('/api/v1/bookmarks/embedding-config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain_threshold: threshold }),
+      });
+      const r = await apiFetch('/api/v1/bookmarks/analyze-domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain_threshold: threshold }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      statusEl.textContent = `✓ ${data.rare_domains_count} rare domains found (threshold ≤${data.threshold})`;
+    } catch (e) {
+      statusEl.textContent = `Error: ${e.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Reindex all
+  document.getElementById('bm-reindex-btn')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('bm-reindex-status');
+    statusEl.textContent = 'Starting…';
+    try {
+      const r = await apiFetch('/api/v1/bookmarks/reindex', { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${r.status}`);
+      }
+      statusEl.textContent = 'Running…';
+      _bmPollReindexProgress();
+    } catch (e) {
+      statusEl.textContent = `Error: ${e.message}`;
+    }
+  });
+}
+
+function _bmPollReindexProgress() {
+  if (_bmReindexPollTimer) return; // already polling
+  _bmReindexPollTimer = setInterval(_bmCheckReindexProgress, 1500);
+  _bmCheckReindexProgress();
+}
+
+async function _bmCheckReindexProgress() {
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/reindex-progress');
+    if (!r.ok) return;
+    const state = await r.json();
+    const wrap = document.getElementById('bm-reindex-progress-wrap');
+    const bar = document.getElementById('bm-reindex-progress-bar');
+    const label = document.getElementById('bm-reindex-progress-label');
+    const statusEl = document.getElementById('bm-reindex-status');
+    const btn = document.getElementById('bm-reindex-btn');
+
+    if (state.running || state.total > 0) {
+      if (wrap) wrap.style.display = '';
+      const pct = state.total > 0 ? Math.round((state.done / state.total) * 100) : 0;
+      if (bar) bar.style.width = `${pct}%`;
+      if (label) label.textContent = `${state.done} / ${state.total} (${pct}%)`;
+      if (btn) btn.disabled = state.running;
+      if (state.running) {
+        if (statusEl) statusEl.textContent = 'Running…';
+      } else {
+        // Completed
+        if (statusEl) {
+          statusEl.textContent = state.error
+            ? `✗ Failed: ${state.error}`
+            : `✓ Done — ${state.done} bookmarks re-embedded`;
+          statusEl.style.color = state.error ? 'var(--err)' : 'var(--ok,#4caf50)';
+        }
+        if (label) label.textContent = state.error ? '' : `${state.done} / ${state.total} (100%)`;
+        if (btn) btn.disabled = false;
+        clearInterval(_bmReindexPollTimer);
+        _bmReindexPollTimer = null;
+      }
+    } else {
+      // Not running, nothing to show
+      clearInterval(_bmReindexPollTimer);
+      _bmReindexPollTimer = null;
+    }
+  } catch (_) {
+    clearInterval(_bmReindexPollTimer);
+    _bmReindexPollTimer = null;
+  }
+}
+
 async function _bmPopulateExtUrls() {
   const loadingEl = document.getElementById('bm-ext-url-loading');
   const urlsEl    = document.getElementById('bm-ext-urls');

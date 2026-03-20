@@ -686,6 +686,7 @@
         <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
         <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
         <button class="secondary" onclick="_bmToggleSetup()" title="Import guide &amp; extension install">&#9432; Setup</button>
+        <button class="secondary" onclick="_bmToggleEmbedCfg()" title="Configure tag exclusions, domain rarity, and re-embed all bookmarks">&#129504; Embeddings</button>
         <button class="secondary" onclick="_bmAutoArchiveDead(this)" title="Check all non-archived bookmarks for 404/410 errors and archive any dead links">&#128279; Check dead links</button>
       </div>
     </div>
@@ -741,6 +742,53 @@
             &#11015; Download extension zip
           </button>
           <p style="font-size:11px;color:var(--text-dim);margin:8px 0 0">Chromium Manifest V3 &mdash; works in Edge and Chrome. Firefox not supported (different manifest).</p>
+        </div>
+      </div>
+    </div>
+    <!-- Embedding config panel (collapsed by default) -->
+    <div id="bm-embed-panel" style="display:none;margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+      <div style="background:var(--surface-alt,var(--surface));border-bottom:1px solid var(--border);padding:8px 14px;display:flex;justify-content:space-between;align-items:center">
+        <span style="font-weight:700;font-size:13px;letter-spacing:.4px">&#129504; Embedding configuration</span>
+        <button class="secondary" style="padding:2px 10px;font-size:12px" id="bm-embed-close-btn">&#10005; Close</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0">
+        <!-- Tag exclusion card -->
+        <div style="padding:14px 16px;border-right:1px solid var(--border)">
+          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127991; Excluded tags</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Tags in this list are stripped before embedding. Use this to remove structural/browser-folder tags that carry no semantic meaning (e.g. <em>favourites-bar</em>, <em>web</em>).</p>
+          <div id="bm-excl-tag-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;min-height:24px"></div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input type="text" id="bm-excl-tag-input" placeholder="Add tag to exclude…" style="flex:1;font-size:12px;padding:4px 8px" />
+            <button class="secondary" style="font-size:12px;padding:4px 10px;white-space:nowrap" id="bm-excl-tag-add-btn">+ Add</button>
+          </div>
+          <button style="margin-top:10px;font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
+          <span id="bm-excl-tag-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+        </div>
+        <!-- Domain rarity + reindex card -->
+        <div style="padding:14px 16px">
+          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127760; Rare domains</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Domains that appear in very few bookmarks carry high semantic signal (they identify a niche site). Their name (without TLD) is included in the embedding text. Domains that appear everywhere (github, youtube…) are excluded.</p>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+            <label style="font-size:12px;white-space:nowrap">Threshold (max occurrences&nbsp;=&nbsp;rare):</label>
+            <input type="number" id="bm-domain-threshold" min="0" max="100" value="3" style="width:64px;font-size:12px;padding:3px 6px" />
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-analyze-domains-btn">&#128202; Analyse domains</button>
+            <span id="bm-analyze-status" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+          <hr style="border:none;border-top:1px solid var(--border);margin:10px 0" />
+          <h3 style="margin:0 0 6px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#128260; Reindex all embeddings</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">Re-embeds every bookmark using the current excluded tags and rare domains. Run this after changing the embedding config or after the first domain analysis.</p>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+            <button style="font-size:12px;padding:5px 14px" id="bm-reindex-btn">&#128260; Reindex all</button>
+            <span id="bm-reindex-status" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+          <div id="bm-reindex-progress-wrap" style="display:none;margin-top:4px">
+            <div style="background:var(--surface);border:1px solid var(--border);border-radius:3px;overflow:hidden;height:10px">
+              <div id="bm-reindex-progress-bar" style="background:var(--accent,#7c6ee6);height:100%;width:0%;transition:width .3s ease"></div>
+            </div>
+            <span id="bm-reindex-progress-label" style="font-size:11px;color:var(--text-dim);display:block;margin-top:3px"></span>
+          </div>
         </div>
       </div>
     </div>

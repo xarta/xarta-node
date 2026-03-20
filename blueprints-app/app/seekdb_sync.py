@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -22,9 +23,22 @@ from .seekdb import (
 log = logging.getLogger(__name__)
 
 SETTING_LAST_SYNC = "seekdb_last_sync_ts"
+SETTING_EXCLUDED_TAGS = "embedding_excluded_tags"
+SETTING_RARE_DOMAINS = "embedding_rare_domains"
+SETTING_DOMAIN_THRESHOLD = "embedding_domain_threshold"
+DEFAULT_EXCLUDED_TAGS = "favourites-bar,web,interests"
+DEFAULT_DOMAIN_THRESHOLD = "3"
+
 SYNC_INTERVAL_SECONDS = 60
 
 _loop_started = False
+
+# Progress state for full reindex operations (in-memory, resets on restart)
+_reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
+
+
+def get_reindex_state() -> dict:
+    return dict(_reindex_state)
 
 
 def _now_iso() -> str:
@@ -41,6 +55,168 @@ def _parse_tags(tags_json: str) -> list[str]:
     except (TypeError, json.JSONDecodeError):
         pass
     return []
+
+
+def _get_excluded_tags() -> set[str]:
+    with get_conn() as conn:
+        val = get_setting(conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
+    if not val:
+        return set()
+    return {t.strip().lower() for t in val.split(",") if t.strip()}
+
+
+def _get_rare_domains() -> set[str]:
+    with get_conn() as conn:
+        val = get_setting(conn, SETTING_RARE_DOMAINS, "[]")
+    try:
+        return set(json.loads(val or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return set()
+
+
+def _sld_from_netloc(netloc: str) -> str:
+    """Strip TLD from a hostname, returning subdomain + SLD only.
+
+    Examples:
+      'obscure-tool.io'      -> 'obscure-tool'
+      'api.obscure-tool.io'  -> 'api.obscure-tool'
+      'github.com'           -> 'github'
+    Imperfect for multi-part TLDs (.co.uk) but good enough for semantic signal.
+    """
+    host = netloc.split(":")[0].lower()
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[:-1])
+    return host
+
+
+def _build_bookmark_text(row: dict, excluded_tags: set[str], rare_domains: set[str]) -> str:
+    """Build the text that will be embedded for a bookmark."""
+    tags = _parse_tags(row.get("tags_json") or "[]")
+    filtered_tags = [t for t in tags if t.lower() not in excluded_tags]
+
+    parts = [
+        row.get("title") or "",
+        row.get("description") or "",
+        " ".join(filtered_tags),
+        row.get("notes") or "",
+    ]
+
+    # Include the SLD for rare (high-signal) domains
+    url = row.get("url") or ""
+    if url and rare_domains:
+        try:
+            netloc = urlparse(url).netloc.lower()
+            bare_host = netloc.split(":")[0]
+            if bare_host in rare_domains:
+                sld = _sld_from_netloc(netloc)
+                if sld:
+                    parts.append(sld)
+        except Exception:
+            pass
+
+    return " ".join(parts).strip()
+
+
+def analyze_domains(threshold: int | None = None) -> list[str]:
+    """Compute rare domains (appearing <= threshold times) and persist to settings.
+
+    Returns the sorted list of rare domain hostnames.
+    """
+    with get_conn() as conn:
+        if threshold is None:
+            threshold = int(
+                get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD)
+                or DEFAULT_DOMAIN_THRESHOLD
+            )
+        rows = conn.execute("SELECT url FROM bookmarks WHERE url IS NOT NULL").fetchall()
+
+    counts: Counter = Counter()
+    for (url,) in rows:
+        try:
+            netloc = urlparse(url).netloc.lower().split(":")[0]
+            if netloc:
+                counts[netloc] += 1
+        except Exception:
+            pass
+
+    rare = sorted(domain for domain, cnt in counts.items() if cnt <= threshold)
+
+    with get_conn() as conn:
+        set_setting(
+            conn,
+            SETTING_RARE_DOMAINS,
+            json.dumps(rare),
+            description="Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
+        )
+        set_setting(
+            conn,
+            SETTING_DOMAIN_THRESHOLD,
+            str(threshold),
+            description="Max occurrences for a domain to be treated as rare (informative) in embeddings",
+        )
+
+    log.info("analyze_domains: threshold=%d, rare=%d of %d total domains", threshold, len(rare), len(counts))
+    return rare
+
+
+async def reindex_all() -> None:
+    """Re-embed every bookmark using current excluded_tags and rare_domains config.
+
+    Updates _reindex_state continuously so the GUI can poll progress.
+    Resets seekdb_last_sync_ts on completion so incremental sync picks up from now.
+    """
+    global _reindex_state
+    _reindex_state = {"running": True, "done": 0, "total": 0, "error": None}
+    try:
+        excluded_tags = _get_excluded_tags()
+        rare_domains = _get_rare_domains()
+
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bookmarks ORDER BY updated_at ASC"
+            ).fetchall()
+
+        row_dicts = [dict(r) for r in rows]
+        _reindex_state["total"] = len(row_dicts)
+        log.info("reindex_all: starting, %d bookmarks, excluded_tags=%r, rare_domains=%d",
+                 len(row_dicts), excluded_tags, len(rare_domains))
+
+        for i in range(0, len(row_dicts), EMBED_BATCH_SIZE):
+            batch = row_dicts[i : i + EMBED_BATCH_SIZE]
+            texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in batch]
+            embeddings = await _embed_texts(texts)
+
+            with get_conn() as conn:
+                for idx, row in enumerate(batch):
+                    stats = conn.execute(
+                        "SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v FROM visits WHERE normalized_url = ?",
+                        (row["normalized_url"],),
+                    ).fetchone()
+                    visit_count = int(stats["cnt"] if stats else 0)
+                    last_visited = stats["last_v"] if stats else None
+                    upsert_bookmark_index(
+                        row=row,
+                        embedding=embeddings[idx],
+                        visit_count=visit_count,
+                        last_visited=last_visited,
+                    )
+
+            _reindex_state["done"] = min(i + EMBED_BATCH_SIZE, len(row_dicts))
+
+        # Advance last_sync so the incremental loop doesn't redo everything
+        with get_conn() as conn:
+            set_setting(conn, SETTING_LAST_SYNC, _now_iso(),
+                        description="Last successful SQLite->SeekDB sync timestamp")
+
+        _reindex_state["done"] = len(row_dicts)
+        _reindex_state["running"] = False
+        log.info("reindex_all: complete, %d bookmarks re-embedded", len(row_dicts))
+
+    except Exception as exc:
+        _reindex_state["running"] = False
+        _reindex_state["error"] = str(exc)
+        log.exception("reindex_all: failed")
 
 
 EMBED_BATCH_SIZE = 100
@@ -75,18 +251,10 @@ async def _sync_bookmarks_since(last_sync: str) -> int:
             return 0
 
         row_dicts = [dict(r) for r in rows]
-        texts = []
-        for row in row_dicts:
-            tags = _parse_tags(row.get("tags_json") or "[]")
-            text = " ".join(
-                [
-                    row.get("title") or "",
-                    row.get("description") or "",
-                    " ".join(tags),
-                    row.get("notes") or "",
-                ]
-            ).strip()
-            texts.append(text)
+
+    excluded_tags = _get_excluded_tags()
+    rare_domains = _get_rare_domains()
+    texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in row_dicts]
 
     embeddings = await _embed_texts(texts)
 
