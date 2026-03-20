@@ -43,10 +43,18 @@ def _parse_tags(tags_json: str) -> list[str]:
     return []
 
 
+EMBED_BATCH_SIZE = 100
+
+
 async def _embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    return await embed("browser-links", texts)
+    if len(texts) <= EMBED_BATCH_SIZE:
+        return await embed("browser-links", texts)
+    results: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        results.extend(await embed("browser-links", texts[i : i + EMBED_BATCH_SIZE]))
+    return results
 
 
 def _domain_from_url(url: str) -> str:
