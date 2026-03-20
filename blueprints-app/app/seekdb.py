@@ -159,6 +159,10 @@ def delete_bookmark_index(bookmark_id: str) -> None:
     bookmarks_col().delete(ids=[bookmark_id])
 
 
+def delete_visit_index(visit_id: str) -> None:
+    visits_col().delete(ids=[visit_id])
+
+
 def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     # col.query() returns nested lists [[...]] (one per query embedding).
     # col.get()   returns flat lists   [...].

@@ -6,24 +6,25 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from .ai_client import embed
 from .db import get_conn, get_setting, set_setting, increment_gen
 from .seekdb import (
     bookmark_embedding_by_normalized_url,
+    bookmarks_col,
     delete_bookmark_index,
+    delete_visit_index,
     init_seekdb,
     upsert_bookmark_index,
     upsert_visit_index,
     visit_embedding_by_normalized_url,
+    visits_col,
 )
 from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
 
-SETTING_LAST_SYNC = "seekdb_last_sync_ts"
 SETTING_EXCLUDED_TAGS = "embedding_excluded_tags"
 SETTING_RARE_DOMAINS = "embedding_rare_domains"
 SETTING_DOMAIN_THRESHOLD = "embedding_domain_threshold"
@@ -40,12 +41,6 @@ _reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
 
 def get_reindex_state() -> dict:
     return dict(_reindex_state)
-
-
-def _now_iso() -> str:
-    # Use SQLite-compatible format (space separator, no timezone) so the
-    # string comparison `updated_at > last_sync` works correctly in SQLite.
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _parse_tags(tags_json: str) -> list[str]:
@@ -176,7 +171,8 @@ async def reindex_all() -> None:
     """Re-embed every bookmark using current excluded_tags and rare_domains config.
 
     Updates _reindex_state continuously so the GUI can poll progress.
-    Resets seekdb_last_sync_ts on completion so incremental sync picks up from now.
+    The incremental sync will find nothing stale afterwards because all SeekDB
+    metadata updated_at values will match the SQLite rows.
     """
     global _reindex_state
     _reindex_state = {"running": True, "done": 0, "total": 0, "error": None}
@@ -216,11 +212,6 @@ async def reindex_all() -> None:
 
             _reindex_state["done"] = min(i + EMBED_BATCH_SIZE, len(row_dicts))
 
-        # Advance last_sync so the incremental loop doesn't redo everything
-        with get_conn() as conn:
-            set_setting(conn, SETTING_LAST_SYNC, _now_iso(),
-                        description="Last successful SQLite->SeekDB sync timestamp")
-
         _reindex_state["done"] = len(row_dicts)
         _reindex_state["running"] = False
         log.info("reindex_all: complete, %d bookmarks re-embedded", len(row_dicts))
@@ -252,69 +243,118 @@ def _domain_from_url(url: str) -> str:
         return ""
 
 
-async def _sync_bookmarks_since(last_sync: str) -> int:
+async def _sync_bookmarks_stale() -> tuple[int, int]:
+    """Upsert stale/missing bookmark embeddings; delete orphaned SeekDB entries.
+
+    An embedding is stale when the SQLite row's updated_at is newer than the
+    updated_at stored in SeekDB metadata at the time it was last embedded.
+    Returns (embedded_count, deleted_count).
+    """
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM bookmarks WHERE updated_at > ? ORDER BY updated_at ASC",
-            (last_sync,),
-        ).fetchall()
+        sqlite_rows = conn.execute("SELECT * FROM bookmarks").fetchall()
+    sqlite_dict = {r["bookmark_id"]: dict(r) for r in sqlite_rows}
 
-        if not rows:
-            return 0
+    try:
+        raw = bookmarks_col().get(include=["metadatas"])
+    except Exception:
+        log.exception("seekdb_sync: failed to read bookmark index — skipping")
+        return 0, 0
 
-        row_dicts = [dict(r) for r in rows]
+    raw_ids = raw.get("ids") or []
+    raw_metas = raw.get("metadatas") or []
+    seekdb_map: dict[str, str] = {
+        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "")
+        for i in range(len(raw_ids))
+    }
+
+    # Delete SeekDB entries with no matching SQLite row (bookmark was deleted)
+    deleted = 0
+    for bid in list(seekdb_map):
+        if bid not in sqlite_dict:
+            delete_bookmark_index(bid)
+            deleted += 1
+
+    # Find bookmarks with missing or outdated embeddings
+    stale = [
+        row for bid, row in sqlite_dict.items()
+        if bid not in seekdb_map
+        or (row.get("updated_at") or "") > seekdb_map[bid]
+    ]
+
+    if not stale:
+        return 0, deleted
 
     excluded_tags = _get_excluded_tags()
     rare_domains = _get_rare_domains()
-    texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in row_dicts]
-
+    texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in stale]
     embeddings = await _embed_texts(texts)
 
     with get_conn() as conn:
-        for idx, row in enumerate(row_dicts):
+        for idx, row in enumerate(stale):
             stats = conn.execute(
-                """
-                SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v
-                FROM visits
-                WHERE normalized_url = ?
-                """,
+                "SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v FROM visits WHERE normalized_url = ?",
                 (row["normalized_url"],),
             ).fetchone()
-            visit_count = int(stats["cnt"] if stats else 0)
-            last_visited = stats["last_v"] if stats else None
             upsert_bookmark_index(
                 row=row,
                 embedding=embeddings[idx],
-                visit_count=visit_count,
-                last_visited=last_visited,
+                visit_count=int(stats["cnt"] if stats else 0),
+                last_visited=stats["last_v"] if stats else None,
             )
 
-    return len(row_dicts)
+    return len(stale), deleted
 
 
-async def _sync_visits_since(last_sync: str) -> int:
+async def _sync_visits_stale() -> tuple[int, int]:
+    """Upsert stale/missing visit embeddings; delete orphaned SeekDB visit entries.
+
+    Reuses existing bookmark embeddings for visits whose URL is already bookmarked,
+    avoiding an unnecessary LiteLLM call.
+    Returns (embedded_count, deleted_count).
+    """
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM visits WHERE updated_at > ? ORDER BY updated_at ASC",
-            (last_sync,),
-        ).fetchall()
+        sqlite_rows = conn.execute("SELECT * FROM visits").fetchall()
+    sqlite_dict = {r["visit_id"]: dict(r) for r in sqlite_rows}
 
-    if not rows:
-        return 0
+    try:
+        raw = visits_col().get(include=["metadatas"])
+    except Exception:
+        log.exception("seekdb_sync: failed to read visit index — skipping")
+        return 0, 0
 
-    synced = 0
-    pending_embed_rows = []
-    pending_embed_texts = []
+    raw_ids = raw.get("ids") or []
+    raw_metas = raw.get("metadatas") or []
+    seekdb_map: dict[str, str] = {
+        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "")
+        for i in range(len(raw_ids))
+    }
+
+    # Delete SeekDB entries with no matching SQLite row (visit was deleted)
+    deleted = 0
+    for vid in list(seekdb_map):
+        if vid not in sqlite_dict:
+            delete_visit_index(vid)
+            deleted += 1
+
+    # Find visits with missing or outdated embeddings
+    stale = [
+        row for vid, row in sqlite_dict.items()
+        if vid not in seekdb_map
+        or (row.get("updated_at") or "") > seekdb_map[vid]
+    ]
+
+    if not stale:
+        return 0, deleted
+
+    pending_embed_rows: list[dict] = []
+    pending_embed_texts: list[str] = []
     prepared: list[tuple[dict, list[float]]] = []
 
-    for row in rows:
-        d = dict(row)
+    for d in stale:
         norm = d.get("normalized_url") or ""
-
         embedding = bookmark_embedding_by_normalized_url(norm)
         if embedding is None:
             embedding = visit_embedding_by_normalized_url(norm)
-
         if embedding is None:
             domain = d.get("domain") or _domain_from_url(d.get("url") or "")
             d["domain"] = domain
@@ -330,73 +370,40 @@ async def _sync_visits_since(last_sync: str) -> int:
 
     for row, emb in prepared:
         upsert_visit_index(row, emb)
-        synced += 1
 
-    return synced
-
-
-def _sync_bookmark_deletions_since(last_sync: str) -> int:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT bookmark_id FROM bookmark_deletions WHERE deleted_at > ?",
-            (last_sync,),
-        ).fetchall()
-
-    deleted = 0
-    for row in rows:
-        delete_bookmark_index(row["bookmark_id"])
-        deleted += 1
-    return deleted
+    return len(stale), deleted
 
 
 async def sync_once() -> dict[str, int]:
+    """One sync cycle: embed stale bookmarks/visits, delete orphans from SeekDB.
+
+    Uses per-row updated_at comparison between SQLite and SeekDB metadata —
+    no global timestamp state required.
+    """
     if _reindex_state["running"]:
         log.debug("seekdb_sync: reindex in progress — skipping incremental sync cycle")
-        return {"bookmarks_synced": 0, "visits_synced": 0, "bookmarks_deleted": 0}
+        return {"bookmarks_synced": 0, "bookmarks_deleted": 0, "visits_synced": 0, "visits_deleted": 0}
 
     init_seekdb()
 
-    # Capture now BEFORE the queries so we can always advance SETTING_LAST_SYNC
-    # even if embedding calls fail partway through.  A cycle that errors out
-    # mid-way will leave some SeekDB entries stale until the next write touches
-    # those rows, but it will NOT spin forever retrying the same bookmarks.
-    now_ts = _now_iso()
-
-    with get_conn() as conn:
-        last_sync = get_setting(conn, SETTING_LAST_SYNC, "1970-01-01T00:00:00")
-
-    bookmarks_synced = 0
-    visits_synced = 0
-    bookmarks_deleted = 0
+    bookmarks_synced = bookmarks_deleted = 0
+    visits_synced = visits_deleted = 0
 
     try:
-        bookmarks_synced = await _sync_bookmarks_since(last_sync)
+        bookmarks_synced, bookmarks_deleted = await _sync_bookmarks_stale()
     except Exception:
-        log.exception("seekdb_sync: bookmark sync failed — will advance last_sync anyway")
+        log.exception("seekdb_sync: bookmark sync failed")
 
     try:
-        visits_synced = await _sync_visits_since(last_sync)
+        visits_synced, visits_deleted = await _sync_visits_stale()
     except Exception:
-        log.exception("seekdb_sync: visit sync failed — will advance last_sync anyway")
-
-    try:
-        bookmarks_deleted = _sync_bookmark_deletions_since(last_sync)
-    except Exception:
-        log.exception("seekdb_sync: deletion sync failed — will advance last_sync anyway")
-
-    # Always advance SETTING_LAST_SYNC regardless of per-step errors.
-    with get_conn() as conn:
-        set_setting(
-            conn,
-            SETTING_LAST_SYNC,
-            now_ts,
-            description="Last successful SQLite->SeekDB sync timestamp",
-        )
+        log.exception("seekdb_sync: visit sync failed")
 
     return {
         "bookmarks_synced": bookmarks_synced,
-        "visits_synced": visits_synced,
         "bookmarks_deleted": bookmarks_deleted,
+        "visits_synced": visits_synced,
+        "visits_deleted": visits_deleted,
     }
 
 
