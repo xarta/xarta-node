@@ -686,6 +686,7 @@
         <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
         <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
         <button class="secondary" onclick="_bmToggleSetup()" title="Import guide &amp; extension install">&#9432; Setup</button>
+        <button class="secondary" onclick="_bmAutoArchiveDead(this)" title="Check all non-archived bookmarks for 404/410 errors and archive any dead links">&#128279; Check dead links</button>
       </div>
     </div>
     <!-- Setup guide panel (collapsed by default) -->
@@ -749,13 +750,16 @@
       <select id="bm-tag-filter" onchange="renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
         <option value="">All tags</option>
       </select>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()"> Show archived
+      <label class="bm-toggle-label">
+        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()">
+        <span class="bm-toggle-track"></span>
+        Archived
       </label>
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
         <input type="checkbox" id="bm-show-visits" onchange="_bmToggleVisits()"> Visit history
       </label>
     </div>
+    <div id="bm-deadlink-panel" style="display:none;margin-bottom:8px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px"><span id="bm-deadlink-status" style="color:var(--text-dim)"></span><span id="bm-deadlink-results"></span></div>
     <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <!-- Bookmarks table -->
     <div id="bm-main-view">
@@ -763,13 +767,13 @@
         <table>
           <thead><tr>
             <th style="width:30px"></th>
-            <th>Title</th>
-            <th>URL</th>
-            <th>Tags</th>
-            <th>Description</th>
-            <th>Source</th>
-            <th>Saved</th>
-            <th style="width:80px">Actions</th>
+            <th class="bm-th-sort" onclick="_bmSortBy('title')">Title<span class="bm-sort-arrow" data-col="title">&#x21C5;</span></th>
+            <th class="bm-th-sort" onclick="_bmSortBy('url')">URL<span class="bm-sort-arrow" data-col="url">&#x21C5;</span></th>
+            <th class="bm-th-sort" onclick="_bmSortBy('tags')">Tags<span class="bm-sort-arrow" data-col="tags">&#x21C5;</span></th>
+            <th class="bm-th-sort" onclick="_bmSortBy('description')">Description<span class="bm-sort-arrow" data-col="description">&#x21C5;</span></th>
+            <th class="bm-th-sort" onclick="_bmSortBy('source')">Source<span class="bm-sort-arrow" data-col="source">&#x21C5;</span></th>
+            <th class="bm-th-sort" onclick="_bmSortBy('created_at')">Saved<span class="bm-sort-arrow" data-col="created_at">&#x21C5;</span></th>
+            <th style="width:110px">Actions</th>
           </tr></thead>
           <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
         </table>
