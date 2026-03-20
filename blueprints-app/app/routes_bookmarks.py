@@ -1,13 +1,17 @@
-"""routes_bookmarks.py — browser-links CRUD, visits, search, and diagnostics."""
+"""routes_bookmarks.py — browser-links CRUD, visits, search, diagnostics, and extension download."""
 
 from __future__ import annotations
 
+import io
 import json
 import uuid
+import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from .ai_client import embed, rerank
 from .db import get_conn, increment_gen
@@ -229,6 +233,25 @@ async def search_bookmarks(
         "count": len(results),
         "results": results,
     }
+
+
+@router.get("/extension-download")
+async def download_extension() -> StreamingResponse:
+    """Serve the browser extension as a zip archive for manual load-unpacked install."""
+    ext_dir = Path(__file__).parent.parent / "static" / "extension"
+    if not ext_dir.is_dir():
+        raise HTTPException(404, "Extension directory not found on this node")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fpath in sorted(ext_dir.rglob("*")):
+            if fpath.is_file():
+                zf.write(fpath, fpath.relative_to(ext_dir))
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="blueprints-bookmarks-extension.zip"'},
+    )
 
 
 # ── CRUD routes ───────────────────────────────────────────────────────────────

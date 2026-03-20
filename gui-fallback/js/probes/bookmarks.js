@@ -194,6 +194,12 @@ function _bmToggleVisits() {
   if (showVisits && !_bmVisits.length) loadVisits();
 }
 
+function _bmToggleSetup() {
+  const panel = document.getElementById('bm-setup-panel');
+  if (!panel) return;
+  panel.style.display = panel.style.display === 'none' ? '' : 'none';
+}
+
 function promoteVisitToBookmark(url, title) {
   openBookmarkModal(null);
   document.getElementById('bm-modal-url').value = url || '';

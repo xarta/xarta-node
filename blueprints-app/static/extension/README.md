@@ -34,8 +34,8 @@ extension/
 
 After installing, click **Options** (or right-click the extension icon → Options):
 
-- **API URL** — the HTTPS URL of a Blueprints node (e.g. `https://thunderbird-1.infra.xarta.co.uk`)
-  - Use VLAN33 when on the LAN, Tailscale hostname when remote
+- **API URL** — the HTTPS URL of your Blueprints node (e.g. `https://your-node.example.com`)
+  - Use your LAN hostname when on the LAN, Tailscale hostname when remote
 - **API Secret** — paste your `BLUEPRINTS_API_SECRET` from `.env` on the node
 - Click **Test connection** to verify
 
