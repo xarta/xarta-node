@@ -127,12 +127,15 @@ async def bookmarks_health() -> dict:
     with get_conn() as conn:
         bookmark_count = int(conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0])
         visit_count = int(conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0])
-        last_sync = conn.execute(
-            "SELECT value FROM settings WHERE key='seekdb_last_sync_ts'",
-        ).fetchone()
-        last_sync_ts = last_sync[0] if last_sync else ""
 
     counts = seekdb_counts()
+    seekdb_indexed = counts["bookmarks_indexed"]
+    visits_indexed = counts["visits_indexed"]
+    # Stale = entries present in SQLite but absent from SeekDB.
+    # Fast: two COUNTs already fetched above — just arithmetic.
+    seekdb_stale = max(0, bookmark_count - seekdb_indexed)
+    seekdb_visits_stale = max(0, visit_count - visits_indexed)
+
     emb_ok = "ok"
     emb_err = ""
     try:
@@ -153,9 +156,10 @@ async def bookmarks_health() -> dict:
         "embedding_error": emb_err,
         "bookmark_count": bookmark_count,
         "visit_count": visit_count,
-        "seekdb_indexed": counts["bookmarks_indexed"],
-        "seekdb_visits_indexed": counts["visits_indexed"],
-        "last_seekdb_sync": last_sync_ts,
+        "seekdb_indexed": seekdb_indexed,
+        "seekdb_stale": seekdb_stale,
+        "seekdb_visits_indexed": visits_indexed,
+        "seekdb_visits_stale": seekdb_visits_stale,
     }
 
 
