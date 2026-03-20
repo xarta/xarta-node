@@ -356,14 +356,35 @@ async def sync_once() -> dict[str, int]:
 
     init_seekdb()
 
+    # Capture now BEFORE the queries so we can always advance SETTING_LAST_SYNC
+    # even if embedding calls fail partway through.  A cycle that errors out
+    # mid-way will leave some SeekDB entries stale until the next write touches
+    # those rows, but it will NOT spin forever retrying the same bookmarks.
+    now_ts = _now_iso()
+
     with get_conn() as conn:
         last_sync = get_setting(conn, SETTING_LAST_SYNC, "1970-01-01T00:00:00")
 
-    bookmarks_synced = await _sync_bookmarks_since(last_sync)
-    visits_synced = await _sync_visits_since(last_sync)
-    bookmarks_deleted = _sync_bookmark_deletions_since(last_sync)
+    bookmarks_synced = 0
+    visits_synced = 0
+    bookmarks_deleted = 0
 
-    now_ts = _now_iso()
+    try:
+        bookmarks_synced = await _sync_bookmarks_since(last_sync)
+    except Exception:
+        log.exception("seekdb_sync: bookmark sync failed — will advance last_sync anyway")
+
+    try:
+        visits_synced = await _sync_visits_since(last_sync)
+    except Exception:
+        log.exception("seekdb_sync: visit sync failed — will advance last_sync anyway")
+
+    try:
+        bookmarks_deleted = _sync_bookmark_deletions_since(last_sync)
+    except Exception:
+        log.exception("seekdb_sync: deletion sync failed — will advance last_sync anyway")
+
+    # Always advance SETTING_LAST_SYNC regardless of per-step errors.
     with get_conn() as conn:
         set_setting(
             conn,
