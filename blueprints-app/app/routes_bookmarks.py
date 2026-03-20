@@ -185,6 +185,24 @@ async def search_bookmarks(
     vis_kw = keyword_search_visits(q, window) if include_visits else []
     vis_vec = vector_search_visits(query_embedding, window) if include_visits else []
 
+    # Pre-rank keyword results by match location before RRF.
+    # ChromaDB's $contains filter returns results in insertion order, not by
+    # relevance. We sort so that title matches rank first, then URL matches,
+    # then anything else. This ensures an exact word match in the title/URL
+    # gets a low rank number → high RRF score, dominating vector results that
+    # happen to be semantically nearby but don't actually contain the query term.
+    def _kw_rank(row: dict) -> int:
+        q_lower = q.lower()
+        meta = row.get("metadata") or {}
+        if q_lower in (meta.get("title") or "").lower():
+            return 0
+        if q_lower in (meta.get("url") or "").lower():
+            return 1
+        return 2
+
+    bm_kw.sort(key=_kw_rank)
+    vis_kw.sort(key=_kw_rank)
+
     rrf: dict[tuple[str, str], float] = {}
     payload: dict[tuple[str, str], dict] = {}
     k = 60
@@ -210,6 +228,7 @@ async def search_bookmarks(
                     "visited_at": meta.get("visited_at") or "",
                     "bookmark_id": meta.get("bookmark_id") or "",
                     "source": meta.get("source") or "",
+                    "created_at": meta.get("created_at") or "",
                 }
             else:
                 payload[key]["score_sources"].append(src)
@@ -224,11 +243,30 @@ async def search_bookmarks(
 
     if len(results) > 1:
         docs = [
-            f"{r.get('title', '')}. {r.get('description', '')}. {r.get('notes', '')}".strip()
+            " ".join(filter(None, [
+                r.get("title", ""),
+                r.get("url", ""),
+                r.get("description", ""),
+                r.get("notes", ""),
+            ])).strip()
             for r in results
         ]
         ranked = await rerank("browser-links", q, docs, top_n=min(limit, len(docs)))
         results = [results[r["index"]] for r in ranked]
+
+    # Post-reranker exact-match promotion: results with the query term in the
+    # title or URL must not appear below results where it appears nowhere.
+    # Stable sort within each tier preserves the reranker's ordering.
+    q_lower = q.lower()
+
+    def _exact_tier(r: dict) -> int:
+        if q_lower in (r.get("title") or "").lower():
+            return 0
+        if q_lower in (r.get("url") or "").lower():
+            return 1
+        return 2
+
+    results.sort(key=_exact_tier)
 
     return {
         "query": q,

@@ -104,6 +104,7 @@ async function _runBmSearch(q) {
 }
 
 function _renderBmSearchResults(results) {
+  const status = document.getElementById('bm-search-status');
   const tbody = document.getElementById('bm-tbody');
   if (!results.length) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No results found.</td></tr>';
@@ -127,7 +128,7 @@ function _renderBmSearchResults(results) {
       <td style="font-size:11px">${tags}</td>
       <td style="font-size:12px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.description || r.notes || '')}</td>
       <td style="font-size:11px;color:var(--text-dim)">${esc(r.source || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(r.visited_at || '')}</td>
+      <td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(isBookmark ? (r.created_at || '') : (r.visited_at || ''))}</td>
       <td style="white-space:nowrap">${editBtns}</td>
     </tr>`;
   }).join('');
@@ -161,6 +162,9 @@ function renderBookmarks() {
     });
   }
   const tbody = document.getElementById('bm-tbody');
+  const status = document.getElementById('bm-search-status');
+  status.textContent = rows.length + ' bookmark' + (rows.length === 1 ? '' : 's');
+  status.hidden = false;
   if (!rows.length) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No bookmarks found.</td></tr>';
     _bmUpdateSortHeaders();
