@@ -5,6 +5,7 @@ let _bmSearchActive = false;
 let _bmSortCol = 'created_at';
 let _bmSortDir = 'desc';
 let _bmColResizeDone = false;
+let _bmAllTags = [];
 
 async function _bmDownloadExtension(btn) {
   const orig = btn.textContent;
@@ -296,11 +297,50 @@ async function _bmPopulateExclTagDatalist() {
   try {
     const r = await apiFetch('/api/v1/bookmarks/tags');
     if (!r.ok) return;
-    const tags = await r.json();
-    const dl = document.getElementById('bm-excl-tag-datalist');
-    if (!dl) return;
-    dl.innerHTML = tags.map(t => `<option value="${esc(t)}"></option>`).join('');
+    _bmAllTags = await r.json();
   } catch (_) {}
+}
+
+function _bmOpenExclTagModal() {
+  const modal = document.getElementById('bm-excl-tag-modal');
+  if (!modal) return;
+  document.getElementById('bm-excl-modal-search').value = '';
+  document.getElementById('bm-excl-modal-status').textContent = '';
+  const excluded = new Set(_bmGetExclTags());
+  _bmRenderExclTagModalList(excluded, '');
+  _bmUpdateExclModalCount();
+  modal.showModal();
+  document.getElementById('bm-excl-modal-search').focus();
+}
+
+function _bmRenderExclTagModalList(excluded, filter) {
+  const container = document.getElementById('bm-excl-modal-list');
+  if (!container) return;
+  const f = filter.toLowerCase().trim();
+  const visible = f ? _bmAllTags.filter(t => t.includes(f)) : _bmAllTags;
+  // Sort: excluded first, then alpha
+  const sorted = [...visible].sort((a, b) => {
+    const ae = excluded.has(a), be = excluded.has(b);
+    if (ae !== be) return ae ? -1 : 1;
+    return a.localeCompare(b);
+  });
+  container.innerHTML = sorted.map(tag => {
+    const checked = excluded.has(tag) ? 'checked' : '';
+    return `<label><input type="checkbox" data-tag="${esc(tag)}" ${checked} />${esc(tag)}</label>`;
+  }).join('');
+}
+
+function _bmGetExclTagModalSelected() {
+  return Array.from(
+    document.querySelectorAll('#bm-excl-modal-list input[type=checkbox]:checked')
+  ).map(cb => cb.dataset.tag);
+}
+
+function _bmUpdateExclModalCount() {
+  const checked = document.querySelectorAll('#bm-excl-modal-list input[type=checkbox]:checked').length;
+  const total   = document.querySelectorAll('#bm-excl-modal-list input[type=checkbox]').length;
+  const el = document.getElementById('bm-excl-modal-count');
+  if (el) el.textContent = `${checked} excluded • ${total} shown`;
 }
 
 function _bmRenderExclTags(tags) {
@@ -330,28 +370,20 @@ function _bmInitEmbedPanel() {
     panel.style.display = 'none';
   });
 
-  // Add tag button
-  document.getElementById('bm-excl-tag-add-btn')?.addEventListener('click', () => {
-    const input = document.getElementById('bm-excl-tag-input');
-    const val = (input?.value || '').trim().toLowerCase();
-    if (!val) return;
-    const existing = _bmGetExclTags();
-    if (existing.includes(val)) { input.value = ''; return; }
-    _bmRenderExclTags([...existing, val]);
-    input.value = '';
+  // Open tag exclusion modal
+  document.getElementById('bm-excl-tag-edit-btn')?.addEventListener('click', () => {
+    if (!_bmAllTags.length) {
+      _bmPopulateExclTagDatalist().then(() => _bmOpenExclTagModal());
+    } else {
+      _bmOpenExclTagModal();
+    }
   });
 
-  // Enter key in tag input
-  document.getElementById('bm-excl-tag-input')?.addEventListener('keydown', e => {
-    if (e.key === 'Enter') document.getElementById('bm-excl-tag-add-btn')?.click();
-  });
-
-  // Remove tag via event delegation
+  // Remove tag chip via event delegation
   document.getElementById('bm-excl-tag-list')?.addEventListener('click', e => {
     const btn = e.target.closest('[data-remove-tag]');
     if (!btn) return;
-    const tag = btn.dataset.removeTag;
-    _bmRenderExclTags(_bmGetExclTags().filter(t => t !== tag));
+    _bmRenderExclTags(_bmGetExclTags().filter(t => t !== btn.dataset.removeTag));
   });
 
   // Save excluded tags
@@ -369,6 +401,45 @@ function _bmInitEmbedPanel() {
       statusEl.textContent = `Error: ${e.message}`;
     }
     setTimeout(() => { statusEl.textContent = ''; }, 3000);
+  });
+
+  // Modal: filter input re-renders list preserving checked state
+  document.getElementById('bm-excl-modal-list')?.addEventListener('change', _bmUpdateExclModalCount);
+  document.getElementById('bm-excl-modal-search')?.addEventListener('input', e => {
+    const selected = new Set(_bmGetExclTagModalSelected());
+    _bmRenderExclTagModalList(selected, e.target.value);
+    _bmUpdateExclModalCount();
+  });
+
+  // Modal: cancel / close button
+  const closeModal = () => document.getElementById('bm-excl-tag-modal')?.close();
+  document.getElementById('bm-excl-modal-close-btn')?.addEventListener('click', closeModal);
+  document.getElementById('bm-excl-modal-cancel-btn')?.addEventListener('click', closeModal);
+  // Click on backdrop closes
+  document.getElementById('bm-excl-tag-modal')?.addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeModal();
+  });
+
+  // Modal: Apply & Save
+  document.getElementById('bm-excl-modal-apply-btn')?.addEventListener('click', async () => {
+    const statusEl = document.getElementById('bm-excl-modal-status');
+    const applyBtn = document.getElementById('bm-excl-modal-apply-btn');
+    applyBtn.disabled = true;
+    statusEl.textContent = 'Saving…';
+    const tags = _bmGetExclTagModalSelected();
+    try {
+      const r = await apiFetch('/api/v1/bookmarks/embedding-config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ excluded_tags: tags }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      _bmRenderExclTags(tags);
+      closeModal();
+    } catch (e) {
+      statusEl.textContent = `Error: ${e.message}`;
+      applyBtn.disabled = false;
+    }
   });
 
   // Analyse domains

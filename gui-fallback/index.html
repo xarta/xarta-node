@@ -758,13 +758,12 @@
           <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127991; Excluded tags</h3>
           <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Tags in this list are stripped before embedding. Use this to remove structural/browser-folder tags that carry no semantic meaning (e.g. <em>favourites-bar</em>, <em>web</em>).</p>
           <div id="bm-excl-tag-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;min-height:24px"></div>
-          <div style="display:flex;gap:6px;align-items:center">
-            <input type="text" id="bm-excl-tag-input" placeholder="Add tag to exclude…" list="bm-excl-tag-datalist" autocomplete="off" style="flex:1;font-size:12px;padding:4px 8px" />
-            <datalist id="bm-excl-tag-datalist"></datalist>
-            <button class="secondary" style="font-size:12px;padding:4px 10px;white-space:nowrap" id="bm-excl-tag-add-btn">+ Add</button>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">
+            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-excl-tag-edit-btn">&#9998; Edit list…</button>
+            <button style="font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
+            <span id="bm-excl-tag-status" style="font-size:11px;color:var(--text-dim)"></span>
           </div>
-          <button style="margin-top:10px;font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
-          <span id="bm-excl-tag-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+
         </div>
         <!-- Domain rarity + reindex card -->
         <div style="padding:14px 16px">
@@ -1281,6 +1280,30 @@
 </script>
 <link  rel="stylesheet" href="embed/blueprints-node-selector.css" />
 <script src="embed/blueprints-node-selector.js"></script>
+
+<!-- Tag exclusion multi-select modal -->
+<dialog id="bm-excl-tag-modal" style="width:min(900px,92vw);height:min(700px,88vh);border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;display:flex;flex-direction:column">
+  <style>
+    #bm-excl-modal-list label { display:flex;align-items:center;gap:7px;padding:4px 8px;border-radius:5px;cursor:pointer;font-size:13px;user-select:none;border:1px solid transparent;transition:background .1s }
+    #bm-excl-modal-list label:hover { background:var(--surface) }
+    #bm-excl-modal-list label:has(input:checked) { background:color-mix(in srgb,var(--accent,#7c6ee6) 12%,transparent);border-color:color-mix(in srgb,var(--accent,#7c6ee6) 35%,transparent) }
+    #bm-excl-modal-list input[type=checkbox] { flex-shrink:0;width:15px;height:15px;cursor:pointer }
+  </style>
+  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <span style="font-weight:700;font-size:14px">&#127991; Select tags to exclude from embeddings</span>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" id="bm-excl-modal-close-btn">&#10005;</button>
+  </div>
+  <div style="padding:10px 18px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;gap:10px">
+    <input type="text" id="bm-excl-modal-search" placeholder="Filter tags…" style="flex:1;font-size:13px;padding:5px 10px" autocomplete="off" />
+    <span id="bm-excl-modal-count" style="font-size:12px;color:var(--text-dim);white-space:nowrap"></span>
+  </div>
+  <div id="bm-excl-modal-list" style="overflow-y:auto;flex:1;padding:10px 18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 6px;align-content:start"></div>
+  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-shrink:0">
+    <span id="bm-excl-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
+    <button class="secondary" id="bm-excl-modal-cancel-btn">Cancel</button>
+    <button id="bm-excl-modal-apply-btn">&#10003; Apply &amp; Save</button>
+  </div>
+</dialog>
 
 </body>
 </html>
