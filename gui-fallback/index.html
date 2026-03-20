@@ -758,7 +758,8 @@
           <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Tags in this list are stripped before embedding. Use this to remove structural/browser-folder tags that carry no semantic meaning (e.g. <em>favourites-bar</em>, <em>web</em>).</p>
           <div id="bm-excl-tag-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;min-height:24px"></div>
           <div style="display:flex;gap:6px;align-items:center">
-            <input type="text" id="bm-excl-tag-input" placeholder="Add tag to exclude…" style="flex:1;font-size:12px;padding:4px 8px" />
+            <input type="text" id="bm-excl-tag-input" placeholder="Add tag to exclude…" list="bm-excl-tag-datalist" autocomplete="off" style="flex:1;font-size:12px;padding:4px 8px" />
+            <datalist id="bm-excl-tag-datalist"></datalist>
             <button class="secondary" style="font-size:12px;padding:4px 10px;white-space:nowrap" id="bm-excl-tag-add-btn">+ Add</button>
           </div>
           <button style="margin-top:10px;font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
