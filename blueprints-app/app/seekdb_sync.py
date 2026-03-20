@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from .ai_client import embed
-from .db import get_conn, get_setting, set_setting
+from .db import get_conn, get_setting, set_setting, increment_gen
 from .seekdb import (
     bookmark_embedding_by_normalized_url,
     delete_bookmark_index,
@@ -19,6 +19,7 @@ from .seekdb import (
     upsert_visit_index,
     visit_embedding_by_normalized_url,
 )
+from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
 
@@ -143,18 +144,29 @@ def analyze_domains(threshold: int | None = None) -> list[str]:
     rare = sorted(domain for domain, cnt in counts.items() if cnt <= threshold)
 
     with get_conn() as conn:
+        rare_json = json.dumps(rare)
         set_setting(
             conn,
             SETTING_RARE_DOMAINS,
-            json.dumps(rare),
+            rare_json,
             description="Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
         )
+        gen = increment_gen(conn)
+        enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_RARE_DOMAINS,
+            {"key": SETTING_RARE_DOMAINS, "value": rare_json,
+             "description": "Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
+             "updated_at": None}, gen)
         set_setting(
             conn,
             SETTING_DOMAIN_THRESHOLD,
             str(threshold),
             description="Max occurrences for a domain to be treated as rare (informative) in embeddings",
         )
+        gen2 = increment_gen(conn)
+        enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_DOMAIN_THRESHOLD,
+            {"key": SETTING_DOMAIN_THRESHOLD, "value": str(threshold),
+             "description": "Max occurrences for a domain to be treated as rare (informative) in embeddings",
+             "updated_at": None}, gen2)
 
     log.info("analyze_domains: threshold=%d, rare=%d of %d total domains", threshold, len(rare), len(counts))
     return rare
