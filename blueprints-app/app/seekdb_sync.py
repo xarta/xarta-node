@@ -350,6 +350,10 @@ def _sync_bookmark_deletions_since(last_sync: str) -> int:
 
 
 async def sync_once() -> dict[str, int]:
+    if _reindex_state["running"]:
+        log.debug("seekdb_sync: reindex in progress — skipping incremental sync cycle")
+        return {"bookmarks_synced": 0, "visits_synced": 0, "bookmarks_deleted": 0}
+
     init_seekdb()
 
     with get_conn() as conn:
