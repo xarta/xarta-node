@@ -19,6 +19,28 @@ async def list_settings() -> list[SettingOut]:
     return [SettingOut(**dict(r)) for r in rows]
 
 
+@router.get("/frontend-settings", response_model=dict[str, str])
+async def get_frontend_settings() -> dict[str, str]:
+    """Return all fe.* settings as a flat {key: value} map for JS clients (prefix stripped)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'fe.%' ORDER BY key"
+        ).fetchall()
+    return {row[0][3:]: row[1] for row in rows}
+
+
+@router.put("/frontend-settings/{key}", response_model=SettingOut)
+async def upsert_frontend_setting(key: str, body: SettingUpsert) -> SettingOut:
+    """Create or update a frontend setting (stored as fe.<key>). Triggers fleet sync."""
+    full_key = f"fe.{key}"
+    with get_conn() as conn:
+        gen = increment_gen(conn, f"settings-{full_key}")
+        set_setting(conn, full_key, body.value, body.description)
+        row = conn.execute("SELECT * FROM settings WHERE key=?", (full_key,)).fetchone()
+        enqueue_for_all_peers(conn, "UPDATE", "settings", full_key, dict(row), gen)
+    return SettingOut(**dict(row))
+
+
 @router.get("/{key}", response_model=SettingOut)
 async def get_one_setting(key: str) -> SettingOut:
     with get_conn() as conn:

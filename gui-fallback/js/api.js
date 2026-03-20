@@ -1,5 +1,6 @@
 /* ── API authentication (TOTP) ──────────────────────────────────────── */
-const _LS_SECRET_KEY = 'blueprints_api_secret';
+const _LS_SECRET_KEY    = 'blueprints_api_secret';
+const _LS_FE_SETTINGS   = 'bp_fe_settings';
 
 async function _computeApiToken(secretHex) {
   if (!secretHex) return '';
@@ -44,4 +45,32 @@ function saveApiKey() {
     localStorage.removeItem(_LS_SECRET_KEY);
   }
   document.getElementById('api-key-modal').close();
+}
+
+/* ── Frontend settings (localStorage cache of fe.* server settings) ─── */
+
+async function loadFrontendSettings() {
+  try {
+    const r = await apiFetch('/api/v1/settings/frontend-settings');
+    if (!r.ok) return;
+    const data = await r.json();
+    localStorage.setItem(_LS_FE_SETTINGS, JSON.stringify(data));
+  } catch (_) {}
+}
+
+function getFrontendSetting(key, fallback = null) {
+  try {
+    const data = JSON.parse(localStorage.getItem(_LS_FE_SETTINGS) || '{}');
+    return key in data ? data[key] : fallback;
+  } catch (_) { return fallback; }
+}
+
+async function refreshFrontendSettingsCache() {
+  await loadFrontendSettings();
+  const el = document.getElementById('settings-status');
+  if (el) {
+    el.textContent = 'Client settings cache refreshed';
+    el.hidden = false;
+    setTimeout(() => { el.hidden = true; }, 2500);
+  }
 }
