@@ -261,7 +261,8 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     sqlite_dict = {r["bookmark_id"]: dict(r) for r in sqlite_rows}
 
     try:
-        raw = bookmarks_col().get(include=["metadatas"])
+        col = bookmarks_col()
+        raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
     except Exception:
         log.exception("seekdb_sync: failed to read bookmark index — skipping")
         return 0, 0
@@ -327,7 +328,8 @@ async def _sync_visits_stale() -> tuple[int, int]:
     sqlite_dict = {r["visit_id"]: dict(r) for r in sqlite_rows}
 
     try:
-        raw = visits_col().get(include=["metadatas"])
+        col = visits_col()
+        raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
     except Exception:
         log.exception("seekdb_sync: failed to read visit index — skipping")
         return 0, 0
