@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from collections import Counter
 from urllib.parse import urlparse
 
@@ -32,6 +33,8 @@ DEFAULT_EXCLUDED_TAGS = "favourites-bar,web,interests"
 DEFAULT_DOMAIN_THRESHOLD = "3"
 
 SYNC_INTERVAL_SECONDS = 60
+SYNC_JITTER_SECONDS = 20   # each node sleeps 60 + randint(0, 20) between cycles
+EMBED_BATCH_PAUSE_SECONDS = 2  # pause between LiteLLM batches to avoid thundering herd
 
 _loop_started = False
 
@@ -232,6 +235,8 @@ async def _embed_texts(texts: list[str]) -> list[list[float]]:
         return await embed("browser-links", texts)
     results: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        if i > 0:
+            await asyncio.sleep(EMBED_BATCH_PAUSE_SECONDS)
         results.extend(await embed("browser-links", texts[i : i + EMBED_BATCH_SIZE]))
     return results
 
@@ -408,6 +413,8 @@ async def sync_once() -> dict[str, int]:
 
 
 async def _sync_loop() -> None:
+    # Initial random delay so nodes starting simultaneously don't all hit LiteLLM at once
+    await asyncio.sleep(random.randint(0, SYNC_JITTER_SECONDS))
     while True:
         try:
             stats = await sync_once()
@@ -415,7 +422,7 @@ async def _sync_loop() -> None:
                 log.info("seekdb_sync: %s", stats)
         except Exception:
             log.exception("seekdb_sync: sync cycle failed")
-        await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS + random.randint(0, SYNC_JITTER_SECONDS))
 
 
 def start_seekdb_sync_loop() -> None:
