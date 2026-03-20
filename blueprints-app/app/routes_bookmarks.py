@@ -104,7 +104,7 @@ def _row_to_visit_out(row) -> VisitOut:
 @router.get("", response_model=list[BookmarkOut])
 async def list_bookmarks(
     archived: bool = Query(False),
-    limit: int = Query(500, ge=1, le=5000),
+    limit: int = Query(500, ge=1, le=10000),
 ) -> list[BookmarkOut]:
     with get_conn() as conn:
         rows = conn.execute(

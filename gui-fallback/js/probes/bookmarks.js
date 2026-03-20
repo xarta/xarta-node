@@ -37,7 +37,7 @@ async function loadBookmarks() {
   err.hidden = true;
   const archived = document.getElementById('bm-show-archived')?.checked ? 1 : 0;
   try {
-    const r = await apiFetch(`/api/v1/bookmarks?archived=${archived}&limit=2000`);
+    const r = await apiFetch(`/api/v1/bookmarks?archived=${archived}&limit=10000`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _bookmarks = await r.json();
     _bmSearchActive = false;
@@ -285,8 +285,21 @@ async function _bmLoadEmbedCfg() {
     if (analyzeStatus && cfg.rare_domains_count != null)
       analyzeStatus.textContent = `${cfg.rare_domains_count} rare domains stored`;
   } catch (_) {}
+  // Populate tag datalist from the full tag list
+  _bmPopulateExclTagDatalist();
   // Also check if reindex is already running (survives page refresh)
   _bmPollReindexProgress();
+}
+
+async function _bmPopulateExclTagDatalist() {
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/tags');
+    if (!r.ok) return;
+    const tags = await r.json();
+    const dl = document.getElementById('bm-excl-tag-datalist');
+    if (!dl) return;
+    dl.innerHTML = tags.map(t => `<option value="${esc(t)}"></option>`).join('');
+  } catch (_) {}
 }
 
 function _bmRenderExclTags(tags) {
