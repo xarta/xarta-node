@@ -170,6 +170,24 @@ async def list_tags() -> list[str]:
     return sorted(tags)
 
 
+@router.get("/tags-with-counts")
+async def list_tags_with_counts() -> list[dict]:
+    """Return all tags with active and archived bookmark counts."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT tags_json, archived FROM bookmarks").fetchall()
+    counts: dict[str, dict] = {}
+    for row in rows:
+        arch = row["archived"]
+        for t in _tags_from_json(row["tags_json"]):
+            if t not in counts:
+                counts[t] = {"tag": t, "active": 0, "archived": 0}
+            if arch:
+                counts[t]["archived"] += 1
+            else:
+                counts[t]["active"] += 1
+    return sorted(counts.values(), key=lambda x: x["tag"])
+
+
 # ── Embedding config & reindex ────────────────────────────────────────────────
 
 @router.get("/embedding-config", response_model=dict)
