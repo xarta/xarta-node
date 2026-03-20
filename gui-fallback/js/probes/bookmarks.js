@@ -6,6 +6,7 @@ let _bmSortCol = 'created_at';
 let _bmSortDir = 'desc';
 let _bmColResizeDone = false;
 let _bmAllTags = [];
+let _bmTagCounts = {};       // {tag -> {active, archived}}
 let _bmCurrentExclTags = []; // source of truth; kept in sync with server
 
 async function _bmDownloadExtension(btn) {
@@ -264,8 +265,6 @@ function _bmToggleSetup() {
   if (opening) _bmPopulateExtUrls();
 }
 
-// ── Embedding config panel ────────────────────────────────────────────────────
-
 let _bmReindexPollTimer = null;
 
 function _bmToggleEmbedCfg() {
@@ -295,11 +294,18 @@ async function _bmLoadEmbedCfg() {
   _bmPollReindexProgress();
 }
 
+// ── Embedding config panel ────────────────────────────────────────────────────
+
 async function _bmPopulateExclTagDatalist() {
   try {
-    const r = await apiFetch('/api/v1/bookmarks/tags');
+    const r = await apiFetch('/api/v1/bookmarks/tags-with-counts');
     if (!r.ok) return;
-    _bmAllTags = await r.json();
+    const rows = await r.json(); // [{tag, active, archived}, ...]
+    _bmTagCounts = {};
+    _bmAllTags = rows.map(row => {
+      _bmTagCounts[row.tag] = { active: row.active, archived: row.archived };
+      return row.tag;
+    });
   } catch (_) {}
 }
 
@@ -332,7 +338,10 @@ function _bmRenderExclTagModalList(excluded, filter) {
   });
   container.innerHTML = visible.map(tag => {
     const checked = excluded.has(tag) ? 'checked' : '';
-    return `<label><input type="checkbox" data-tag="${esc(tag)}" ${checked} />${esc(tag)}</label>`;
+    const c = _bmTagCounts[tag] || { active: 0, archived: 0 };
+    const activeTxt = `<span class="bm-tc-active" title="active">${c.active}</span>`;
+    const archTxt   = `<span class="bm-tc-arch"   title="archived">${c.archived}</span>`;
+    return `<label><input type="checkbox" data-tag="${esc(tag)}" ${checked} /><span class="bm-tc-name">${esc(tag)}</span><span class="bm-tc-counts">${activeTxt}${archTxt}</span></label>`;
   }).join('');
 }
 
