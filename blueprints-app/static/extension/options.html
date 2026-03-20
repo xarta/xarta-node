@@ -33,10 +33,63 @@
     .status.err { color: var(--err); }
     .hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; margin-top: -8px; margin-bottom: 12px; }
     hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+    /* Connection log */
+    .log-panel {
+      margin-top: 14px;
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .log-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 10px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .log-toolbar span { font-size: 11px; color: var(--text-dim); font-weight: 600; letter-spacing: .4px; text-transform: uppercase; }
+    .log-toolbar button {
+      padding: 2px 8px; font-size: 10px; margin: 0;
+      border-color: var(--border); color: var(--text-dim); background: transparent;
+    }
+    .log-toolbar button:hover { color: var(--text); border-color: var(--text-dim); }
+    #conn-log {
+      height: 280px;
+      overflow-y: auto;
+      padding: 8px 10px;
+      font-family: monospace;
+      font-size: 11.5px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-sep  { color: #30363d; }
+    .log-ts   { color: #4d5566; }
+    .log-info { color: #8b949e; }
+    .log-step { color: #58a6ff; }
+    .log-ok   { color: #3fb950; }
+    .log-warn { color: #d29922; }
+    .log-err  { color: #f85149; }
+    .log-data { color: #c9d1d9; }
   </style>
 </head>
 <body>
   <h1>&#128278; Blueprints Bookmarks Settings</h1>
+
+  <!-- Version status bar -->
+  <div id="version-bar" style="margin-bottom:18px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-dim)">
+    <span>Installed: <strong id="ver-installed" style="color:var(--text)">…</strong></span>
+    <span id="ver-remote-wrap" style="display:none">· Node: <span id="ver-remote">checking…</span></span>
+  </div>
+
+  <!-- Update banner (hidden until an update is detected) -->
+  <div id="update-banner" style="display:none;padding:10px 14px;border-radius:var(--radius);border:1px solid #d29922;background:rgba(210,153,34,0.08);font-size:12px;margin-bottom:18px">
+    <span id="update-banner-text" style="color:#d29922;font-weight:600"></span>
+    <button id="btn-download-update" style="margin-left:10px;border-color:#d29922;color:#d29922;background:rgba(210,153,34,0.15)">&#8593; Download update</button>
+    <p style="margin-top:8px;color:var(--text-dim);font-size:11px;margin-bottom:0">After downloading, extract the zip to the <strong style="color:var(--text)">same folder</strong> as your loaded extension, then click <em>Reload</em> on your extensions page — no reinstall needed.</p>
+  </div>
 
   <h2>API Connection</h2>
   <label for="api-url">Blueprints API URL</label>
@@ -47,9 +100,17 @@
   <input id="api-secret" type="password" placeholder="Paste BLUEPRINTS_API_SECRET here" />
   <p class="hint">Found in <code>.env</code> on your node. Stored locally in your browser — never sent anywhere except derived TOTP tokens.</p>
 
-  <button onclick="saveSettings()">&#128190; Save settings</button>
-  <button onclick="testConnection()" style="border-color:var(--border);color:var(--text-dim)">&#9654; Test connection</button>
+  <button id="btn-save">&#128190; Save settings</button>
+  <button id="btn-test" style="border-color:var(--border);color:var(--text-dim)">&#9654; Test connection</button>
   <div id="settings-status" class="status"></div>
+
+  <div class="log-panel">
+    <div class="log-toolbar">
+      <span>&#128196; Connection log</span>
+      <button id="btn-log-clear">Clear</button>
+    </div>
+    <div id="conn-log"><span class="log-info">Run &#9654; Test connection to see diagnostic output.</span></div>
+  </div>
 
   <hr />
 
@@ -63,8 +124,206 @@
   <label for="recorder-skip">Skip these URL prefixes <span style="font-size:10px;color:var(--text-dim)">(one per line)</span></label>
   <textarea id="recorder-skip" rows="5" style="font-size:12px;font-family:monospace"></textarea>
 
-  <button onclick="saveSettings()">&#128190; Save settings</button>
+  <button id="btn-save-recorder">&#128190; Save settings</button>
   <div id="recorder-status" class="status"></div>
+
+  <hr />
+
+  <h2>&#128218; About &amp; API Reference</h2>
+
+  <details>
+    <summary style="cursor:pointer;font-size:13px;color:var(--accent);margin-bottom:8px">&#9654; How this extension works</summary>
+    <div style="margin-top:10px;font-size:12px;line-height:1.7;color:var(--text)">
+      <p>This extension is a client for a <strong>Blueprints node</strong> — a self-hosted FastAPI service that maintains a personal bookmark and browsing history database. The extension never contacts any third-party service; all traffic goes exclusively to the node URL you configure above.</p>
+      <br/>
+      <p><strong>Three active components:</strong></p>
+      <ul style="margin-left:16px;margin-top:4px">
+        <li><strong>Popup</strong> — save the current tab as a bookmark or search your library via the toolbar icon.</li>
+        <li><strong>Visit recorder</strong> (opt-in) — automatically logs every page you visit to the node so browsing history can be searched alongside bookmarks.</li>
+        <li><strong>Context menu</strong> — right-click any page or link to save it directly.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details style="margin-top:10px">
+    <summary style="cursor:pointer;font-size:13px;color:var(--accent);margin-bottom:8px">&#9654; Authentication — TOTP scheme</summary>
+    <div style="margin-top:10px;font-size:12px;line-height:1.7;color:var(--text)">
+      <p>Every API request (except <code>/api/v1/bookmarks/health</code>) must carry an <code>X-API-Token</code> header. The token is derived fresh for every request — the raw secret is never transmitted.</p>
+      <br/>
+      <p><strong>Token derivation (implemented in <code>shared/api.js</code>):</strong></p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">window_number = floor(unix_time_ms / 5000)   // changes every 5 seconds
+token = HMAC-SHA256(secret_hex, str(window_number))
+                                               // token is 64 hex chars (256-bit)</pre>
+      <p style="margin-top:6px">The server accepts the current window, the previous, and the next (±5 s skew tolerance). If the clocks between browser and server differ by more than ~15 s, authentication will fail intermittently.</p>
+      <br/>
+      <p><strong>Where to find your secret:</strong> <code>BLUEPRINTS_API_SECRET</code> in the <code>.env</code> file on your node. It is a 64-character hex string (256-bit random). Do not share it — anyone with it can read and write your full bookmark database.</p>
+      <br/>
+      <p><strong>IP allowlist:</strong> the node also checks that requests arrive from a permitted CIDR range (<code>BLUEPRINTS_ALLOWED_NETWORKS</code> in <code>.env</code>). If Test Connection returns HTTP 403, your browser's IP is likely not in the allowlist.</p>
+    </div>
+  </details>
+
+  <details style="margin-top:10px">
+    <summary style="cursor:pointer;font-size:13px;color:var(--accent);margin-bottom:8px">&#9654; TLS / SSL — certificate requirements</summary>
+    <div style="margin-top:10px;font-size:12px;line-height:1.7;color:var(--text)">
+      <p>The node serves HTTPS using a TLS certificate. For the browser to trust it without an error, <strong>the certificate's CA must be installed in the browser's certificate store</strong> (or the OS trust store that the browser inherits).</p>
+      <br/>
+      <p><strong>What this extension assumes:</strong></p>
+      <ul style="margin-left:16px;margin-top:4px">
+        <li>The API URL you enter uses <code>https://</code>.</li>
+        <li>The node's certificate is signed by a CA your browser already trusts — either a public CA (e.g. Let's Encrypt) or a private/self-signed CA that you have manually imported.</li>
+        <li>If you are using a private CA, you must install that CA's root certificate into your OS or browser trust store before the extension can connect. The extension cannot bypass certificate errors — that is intentional.</li>
+      </ul>
+      <br/>
+      <p><strong>Diagnosing certificate problems:</strong></p>
+      <ul style="margin-left:16px;margin-top:4px">
+        <li>A TLS error appears in the connection log as a <em>network error</em> (not an HTTP status code), typically before any HTTP headers are seen.</li>
+        <li>The log line will say something like: <code>Failed to fetch</code> or <code>net::ERR_CERT_AUTHORITY_INVALID</code>.</li>
+        <li>To confirm: paste your API URL directly into a browser tab — if you get a certificate warning there, you need to install the CA first.</li>
+        <li>No CORS headers will be present in the log when a TLS error occurs (CORS requires a completed HTTP response).</li>
+      </ul>
+      <br/>
+      <p><strong>Port note:</strong> the standard HTTPS port 443 is used for browser and extension traffic. Port 8443 is used exclusively for node-to-node mTLS sync and is not reachable by the extension.</p>
+    </div>
+  </details>
+
+  <details style="margin-top:10px">
+    <summary style="cursor:pointer;font-size:13px;color:var(--accent);margin-bottom:8px">&#9654; API endpoints used by this extension</summary>
+    <div style="margin-top:10px;font-size:12px;line-height:1.7;color:var(--text)">
+
+      <p>All endpoints are under <code>{API_URL}/api/v1/bookmarks/</code>. All require <code>X-API-Token</code> except where noted. All accept and return JSON.</p>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">GET /api/v1/bookmarks/health</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: <strong>exempt</strong> — no token required. CORS: open (<code>*</code>).</p>
+      <p>Used by: <em>Test Connection button</em>.</p>
+      <p>Returns overall node health. Response fields:</p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">{
+  "status":               "ok" | "degraded",
+  "sqlite":               "ok",
+  "seekdb":               "ok" | "error",      // full-text + vector index
+  "embedding":            "ok" | "error",      // AI embedding service
+  "embedding_error":      "",                  // empty if ok
+  "bookmark_count":       4784,
+  "visit_count":          0,
+  "seekdb_indexed":       4784,                // should equal bookmark_count
+  "seekdb_visits_indexed":0,
+  "last_seekdb_sync":     "2026-03-20 10:17:42"
+}</pre>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">POST /api/v1/bookmarks/</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: required. <code>Content-Type: application/json</code>.</p>
+      <p>Used by: <em>Save button in popup</em>, <em>context menu</em>.</p>
+      <p>Request body:</p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">{
+  "url":         "https://example.com",  // required
+  "title":       "Page title",           // optional, default ""
+  "description": "",                     // optional
+  "tags":        ["tag1", "tag2"],       // optional, default []
+  "folder":      "",                     // optional
+  "notes":       "",                     // optional
+  "favicon_url": "",                     // optional
+  "source":      "extension"             // optional, default "manual"
+}</pre>
+      <p style="margin-top:4px">Returns: <code>201 Created</code> with the full bookmark object (includes server-assigned <code>bookmark_id</code>, <code>created_at</code>, <code>updated_at</code>). Duplicate URLs are accepted (no dedup at this endpoint). The bookmark is replicated to all fleet peers automatically.</p>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">GET /api/v1/bookmarks/search?q=&lt;query&gt;&amp;limit=15</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: required.</p>
+      <p>Used by: <em>Search panel in popup</em>.</p>
+      <p>Hybrid search: BM25 full-text + HNSW vector search, merged with Reciprocal Rank Fusion, then reranked by a language model. Both bookmarks and visit history contribute to results.</p>
+      <p>Query parameters: <code>q</code> (required), <code>limit</code> (default 20, max 100), <code>include_visits</code> (default true).</p>
+      <p>Response:</p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">{
+  "query": "your search",
+  "count": 5,
+  "results": [{
+    "item_type":   "bookmark" | "visit",
+    "id":          "seekdb internal id",
+    "bookmark_id": "uuid or empty",
+    "title":       "Page title",
+    "url":         "https://...",
+    "tags":        ["tag1"],
+    "description": "",
+    "notes":       "",
+    "domain":      "example.com",
+    "score_sources": ["bookmark_keyword", "bookmark_vector"],
+    "rrf_score":   0.032
+  }]
+}</pre>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">POST /api/v1/bookmarks/visits/</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: required. <code>Content-Type: application/json</code>.</p>
+      <p>Used by: <em>Visit recorder</em> (background service worker, only when enabled).</p>
+      <p>Request body:</p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">{
+  "url":            "https://example.com",  // required
+  "title":          "Page title",           // optional
+  "source":         "visit-recorder",       // optional
+  "dwell_seconds":  null,                   // optional, int
+  "visited_at":     null                    // optional ISO timestamp; server fills now() if omitted
+}</pre>
+      <p style="margin-top:4px">Returns: <code>201 Created</code> with the visit record. If the URL matches an existing bookmark, the visit is linked to it via <code>bookmark_id</code>.</p>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">GET /api/v1/bookmarks/extension-download</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: required (TOTP via GUI's <code>apiFetch</code>, not direct navigation).</p>
+      <p>Used by: <em>Download Extension button in the Blueprints GUI</em> and the <em>Download update button</em> on this page.</p>
+      <p>Returns: the extension as a <code>application/zip</code> file stream (<code>blueprints-bookmarks-extension.zip</code>).</p>
+      <br/>
+
+      <p style="color:var(--accent);font-weight:600">GET /api/v1/bookmarks/extension-version</p>
+      <p style="color:var(--text-dim);font-size:11px">Auth: <strong>exempt</strong> — no token required. CORS: open (<code>*</code>).</p>
+      <p>Used by: <em>service worker version check</em>, <em>version status bar on this page</em>.</p>
+      <p>Returns the version of the extension build currently on the node. Response:</p>
+      <pre style="background:#010409;border:1px solid var(--border);border-radius:4px;padding:8px;font-size:11px;overflow-x:auto">{
+  "version":       "1.1.0",
+  "download_path": "/api/v1/bookmarks/extension-download"
+}</pre>
+    </div>
+  </details>
+
+  <details style="margin-top:10px">
+    <summary style="cursor:pointer;font-size:13px;color:var(--accent);margin-bottom:8px">&#9654; Dependencies on the node</summary>
+    <div style="margin-top:10px;font-size:12px;line-height:1.7;color:var(--text)">
+      <p>For full functionality the node must have the following services healthy:</p>
+      <br/>
+      <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead>
+          <tr style="color:var(--text-dim);border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:4px 8px">Dependency</th>
+            <th style="text-align:left;padding:4px 8px">Required for</th>
+            <th style="text-align:left;padding:4px 8px">If missing</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid #21262d">
+            <td style="padding:5px 8px;color:var(--accent)">blueprints-app</td>
+            <td style="padding:5px 8px">Everything</td>
+            <td style="padding:5px 8px;color:var(--err)">All requests fail (connection refused / timeout)</td>
+          </tr>
+          <tr style="border-bottom:1px solid #21262d">
+            <td style="padding:5px 8px;color:var(--accent)">SQLite DB</td>
+            <td style="padding:5px 8px">Save, list, visit recording</td>
+            <td style="padding:5px 8px;color:var(--err)">HTTP 500 on write endpoints</td>
+          </tr>
+          <tr style="border-bottom:1px solid #21262d">
+            <td style="padding:5px 8px;color:var(--accent)">SeekDB (seekdb service)</td>
+            <td style="padding:5px 8px">Full-text + vector search</td>
+            <td style="padding:5px 8px;color:var(--warn)">Search returns 0 results; save still works</td>
+          </tr>
+          <tr>
+            <td style="padding:5px 8px;color:var(--accent)">AI embedding service</td>
+            <td style="padding:5px 8px">Vector (semantic) search</td>
+            <td style="padding:5px 8px;color:var(--warn)">Search falls back to keyword-only; health shows <code>"embedding":"error"</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <br/>
+      <p><strong>Checking status:</strong> the connection log shows the state of each dependency after a successful Test Connection. You can also check the node's <code>journalctl -u blueprints-app</code> and <code>systemctl status seekdb</code> for service health.</p>
+    </div>
+  </details>
 
   <script src="shared/api.js"></script>
   <script src="options.js"></script>

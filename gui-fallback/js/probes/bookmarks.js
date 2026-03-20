@@ -3,6 +3,30 @@
 let _bmSearchTimer = null;
 let _bmSearchActive = false;
 
+async function _bmDownloadExtension(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Downloading…';
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/extension-download');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'blueprints-bookmarks-extension.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert(`Download failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
 // ── Load / Refresh ──────────────────────────────────────────────────────
 
 async function loadBookmarks() {
@@ -47,6 +71,9 @@ function _bmSearchDebounce() {
     renderBookmarks();
     return;
   }
+  // Instant client-side filter while waiting for SeekDB
+  _bmSearchActive = false;
+  renderBookmarks();
   _bmSearchTimer = setTimeout(() => _runBmSearch(q), 500);
 }
 
@@ -55,15 +82,21 @@ async function _runBmSearch(q) {
     const r = await apiFetch(`/api/v1/bookmarks/search?q=${encodeURIComponent(q)}&limit=50`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    _bmSearchActive = true;
     const status = document.getElementById('bm-search-status');
-    status.textContent = `SeekDB: ${data.count} result${data.count === 1 ? '' : 's'} for "${q}"`;
-    status.hidden = false;
-    _renderBmSearchResults(data.results);
+    if (data.count > 0) {
+      _bmSearchActive = true;
+      status.textContent = `SeekDB: ${data.count} result${data.count === 1 ? '' : 's'} for "${q}"`;
+      status.hidden = false;
+      _renderBmSearchResults(data.results);
+    } else {
+      // SeekDB has no results (likely not yet indexed) — keep client-side filter
+      _bmSearchActive = false;
+      status.textContent = `SeekDB: 0 results for "${q}"`;
+      status.hidden = false;
+    }
   } catch (e) {
-    const err = document.getElementById('bm-error');
-    err.textContent = `Search failed: ${e.message}`;
-    err.hidden = false;
+    // SeekDB unavailable — client-side filter already showing, suppress error
+    _bmSearchActive = false;
   }
 }
 
@@ -197,7 +230,50 @@ function _bmToggleVisits() {
 function _bmToggleSetup() {
   const panel = document.getElementById('bm-setup-panel');
   if (!panel) return;
-  panel.style.display = panel.style.display === 'none' ? '' : 'none';
+  const opening = panel.style.display === 'none';
+  panel.style.display = opening ? '' : 'none';
+  if (opening) _bmPopulateExtUrls();
+}
+
+async function _bmPopulateExtUrls() {
+  const loadingEl = document.getElementById('bm-ext-url-loading');
+  const urlsEl    = document.getElementById('bm-ext-urls');
+  if (!urlsEl || urlsEl.dataset.loaded) return;
+
+  // Always include the URL the browser is currently using — it's working by definition
+  const urls = [{ label: 'This page (current network)', url: window.location.origin }];
+
+  // Also fetch peer nodes to show Tailscale URL if available
+  try {
+    const r = await apiFetch('/api/v1/nodes/self');
+    if (r.ok) {
+      const self = await r.json();
+      if (self.tailnet_hostname) {
+        const tsUrl = `https://${self.tailnet_hostname}`;
+        if (tsUrl !== window.location.origin) {
+          urls.push({ label: 'Tailscale', url: tsUrl });
+        }
+      }
+      if (self.primary_hostname) {
+        const lanUrl = `https://${self.primary_hostname}`;
+        if (!urls.some(u => u.url === lanUrl)) {
+          urls.push({ label: 'LAN hostname', url: lanUrl });
+        }
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  const rows = urls.map(u =>
+    `<div style="display:flex;align-items:center;gap:8px;margin-top:3px">` +
+    `<span style="color:var(--text-dim);min-width:160px">${esc(u.label)}:</span>` +
+    `<code style="background:rgba(255,255,255,.07);padding:2px 7px;border-radius:3px;user-select:all;cursor:text">${esc(u.url)}</code>` +
+    `</div>`
+  ).join('');
+
+  if (loadingEl) loadingEl.style.display = 'none';
+  urlsEl.innerHTML = rows;
+  urlsEl.style.display = '';
+  urlsEl.dataset.loaded = '1';
 }
 
 function promoteVisitToBookmark(url, title) {
@@ -314,7 +390,7 @@ async function importBookmarksFile(input) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bookmarks, skip_duplicates: true }),
     });
-    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
+    if (!r.ok) { const d = await r.json().catch(() => ({})); const det = d.detail; const msg = Array.isArray(det) ? `Validation error: ${det[0]?.msg || JSON.stringify(det[0])} (and ${det.length - 1} more)` : det || `HTTP ${r.status}`; throw new Error(msg); }
     const result = await r.json();
     statusEl.textContent = `Done — imported ${result.imported}, skipped ${result.skipped_duplicates} duplicates.`;
     statusEl.style.color = 'var(--ok)';
@@ -361,7 +437,7 @@ function _parseNetscapeBookmarks(html) {
       const tags = folderParts
         .map(f => f.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''))
         .filter(Boolean);
-      bookmarks.push({ url, title, folder, tags, description: null, notes: null, favicon_url: null, source: 'import' });
+      bookmarks.push({ url, title, folder: folder ?? '', tags, description: '', notes: '', favicon_url: '', source: 'import' });
     }
   }
   return bookmarks;

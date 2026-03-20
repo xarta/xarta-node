@@ -82,7 +82,12 @@ async def _git_pull_and_restart(repo_path: str, label: str) -> None:
 
 
 async def _restart_service() -> None:
-    """Run SERVICE_RESTART_CMD, logging the outcome."""
+    """Run SERVICE_RESTART_CMD, logging the outcome.
+
+    Sleep briefly first so the HTTP response that triggered this call
+    has time to be flushed through Caddy before the process is killed.
+    """
+    await asyncio.sleep(1)
     parts = cfg.SERVICE_RESTART_CMD.split()
     proc = await asyncio.create_subprocess_exec(
         *parts,

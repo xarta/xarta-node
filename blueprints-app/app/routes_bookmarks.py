@@ -254,6 +254,18 @@ async def download_extension() -> StreamingResponse:
     )
 
 
+@router.get("/extension-version")
+async def extension_version() -> dict:
+    """Return the current extension version from manifest.json.  Auth-exempt, open CORS."""
+    manifest_path = Path(__file__).parent.parent / "static" / "extension" / "manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text())
+        version = data.get("version", "unknown")
+    except Exception:
+        version = "unknown"
+    return {"version": version, "download_path": "/api/v1/bookmarks/extension-download"}
+
+
 # ── CRUD routes ───────────────────────────────────────────────────────────────
 
 @router.post("", response_model=BookmarkOut, status_code=201)

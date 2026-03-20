@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from .sync.drain import _make_sync_client
 from starlette.responses import Response
 
 from . import config as cfg
@@ -241,7 +242,7 @@ async def proxy_node_restart(node_id: str) -> Response:
         raise HTTPException(422, f"node '{node_id}' has no addresses configured")
     target = addrs[0].rstrip("/")
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _make_sync_client(timeout=10.0) as client:
             resp = await client.post(
                 f"{target}/api/v1/sync/restart",
                 headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},

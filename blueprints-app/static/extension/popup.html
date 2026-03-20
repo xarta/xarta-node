@@ -70,8 +70,8 @@
   <h1>&#128278; Blueprints Bookmarks</h1>
 
   <div class="tabs">
-    <button id="tab-save-btn"   class="tab-btn active" onclick="showPanel('save')">Save</button>
-    <button id="tab-search-btn" class="tab-btn"        onclick="showPanel('search')">Search</button>
+    <button id="tab-save-btn"   class="tab-btn active">Save</button>
+    <button id="tab-search-btn" class="tab-btn">Search</button>
   </div>
 
   <!-- Save panel -->
@@ -85,8 +85,8 @@
     <label>Notes</label>
     <textarea id="save-notes" rows="2" placeholder="Optional notes…"></textarea>
     <div class="row">
-      <button onclick="saveCurrent()">&#128190; Save</button>
-      <button class="secondary" onclick="window.close()">Cancel</button>
+      <button id="btn-popup-save">&#128190; Save</button>
+      <button id="btn-popup-cancel" class="secondary">Cancel</button>
     </div>
     <div id="save-status" class="status"></div>
   </div>
@@ -94,9 +94,8 @@
   <!-- Search panel -->
   <div id="panel-search" class="panel">
     <div class="row">
-      <input id="search-q" type="text" placeholder="Search bookmarks…" style="margin-bottom:0"
-        onkeydown="if(event.key==='Enter') runSearch()" />
-      <button onclick="runSearch()">&#128269;</button>
+      <input id="search-q" type="text" placeholder="Search bookmarks…" style="margin-bottom:0" />
+      <button id="btn-popup-search">&#128269;</button>
     </div>
     <div id="search-status" class="status"></div>
     <div id="search-results" class="results"></div>
