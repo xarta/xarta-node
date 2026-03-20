@@ -396,24 +396,26 @@ async function runSelfDiag() {
     }
     const _bmCount = bookmarksHealthData.bookmark_count ?? 0;
     const _bmIdx   = bookmarksHealthData.seekdb_indexed ?? 0;
-    const _bmCovOk = _bmCount > 0 && _bmIdx >= _bmCount;
-    const _bmCovPct = _bmCount > 0 ? Math.round(_bmIdx / _bmCount * 100) : 0;
+    const _bmStale = bookmarksHealthData.seekdb_stale ?? Math.max(0, _bmCount - _bmIdx);
+    const _bmCovOk = _bmStale === 0 && _bmCount > 0;
     html += _selfDiagRow(
       _bmCovOk ? '✅' : (_bmIdx > 0 ? '⚠' : '❌'),
-      'Index coverage — bookmarks',
-      `${_bmIdx} / ${_bmCount} indexed`,
-      _bmCovOk ? '100%' : `${_bmCovPct}% — sync still catching up`);
+      'SeekDB stale — bookmarks',
+      _bmStale === 0
+        ? `${_bmIdx} / ${_bmCount} indexed — stale: 0`
+        : `${_bmStale} stale entries (${_bmIdx} / ${_bmCount} indexed)`,
+      _bmCovOk ? '100%' : `${_bmCount > 0 ? Math.round(_bmIdx / _bmCount * 100) : 0}% — sync catching up`);
     const _visCount = bookmarksHealthData.visit_count ?? 0;
     const _visIdx   = bookmarksHealthData.seekdb_visits_indexed ?? 0;
-    const _visCovOk = _visCount === 0 || _visIdx >= _visCount;
+    const _visStale = bookmarksHealthData.seekdb_visits_stale ?? Math.max(0, _visCount - _visIdx);
+    const _visCovOk = _visStale === 0;
     html += _selfDiagRow(
       _visCovOk ? '✅' : '⚠',
-      'Index coverage — visits',
-      `${_visIdx} / ${_visCount} indexed`,
+      'SeekDB stale — visits',
+      _visStale === 0
+        ? `${_visIdx} / ${_visCount} indexed — stale: 0`
+        : `${_visStale} stale entries (${_visIdx} / ${_visCount} indexed)`,
       _visCovOk ? (_visCount === 0 ? 'no visits yet' : '100%') : `${Math.round(_visIdx / _visCount * 100)}%`);
-    if (bookmarksHealthData.last_seekdb_sync) {
-      html += _selfDiagRow('ℹ', 'Last SeekDB sync', esc(bookmarksHealthData.last_seekdb_sync), '');
-    }
     html += `<div id="bp-search-probe-section" style="display:flex;align-items:center;gap:8px;padding:5px 2px">
       <button id="bp-search-probe-btn"
         style="padding:3px 10px;background:var(--accent-dim);color:var(--text);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;flex-shrink:0">
