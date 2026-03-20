@@ -37,7 +37,8 @@ async function loadBookmarks() {
   err.hidden = true;
   const archived = document.getElementById('bm-show-archived')?.checked ? 1 : 0;
   try {
-    const r = await apiFetch(`/api/v1/bookmarks?archived=${archived}&limit=10000`);
+    const limit = parseInt(getFrontendSetting('bm_fetch_limit', 10000), 10);
+    const r = await apiFetch(`/api/v1/bookmarks?archived=${archived}&limit=${limit}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _bookmarks = await r.json();
     _bmSearchActive = false;

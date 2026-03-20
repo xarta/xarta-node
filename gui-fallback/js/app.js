@@ -54,6 +54,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
   const _urlGroup = new URLSearchParams(window.location.search).get('group');
   if (_urlGroup && ['synthesis', 'probes', 'settings'].includes(_urlGroup)) switchGroup(_urlGroup);
+  loadFrontendSettings();
   loadHealth();
   loadManualLinks();
   loadSyncStatus();

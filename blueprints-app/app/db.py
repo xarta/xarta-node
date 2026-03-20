@@ -419,6 +419,7 @@ INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_write_by',  'system')
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('gui_version',    'initial');
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_primary_node', '');
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_primary_at',   '');
+INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.bm_fetch_limit', '10000', 'Max bookmarks fetched for browse/filter in JS client');
 """
 
 
