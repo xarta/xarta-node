@@ -35,6 +35,7 @@ DEFAULT_DOMAIN_THRESHOLD = "3"
 SYNC_INTERVAL_SECONDS = 60
 SYNC_JITTER_SECONDS = 20   # each node sleeps 60 + randint(0, 20) between cycles
 EMBED_BATCH_PAUSE_SECONDS = 2  # pause between LiteLLM batches to avoid thundering herd
+SYNC_MAX_STALE_PER_CYCLE = 200  # max bookmarks/visits embedded per sync cycle; remainder deferred to next
 
 _loop_started = False
 
@@ -289,6 +290,10 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     if not stale:
         return 0, deleted
 
+    # Cap per cycle so a node catching up from zero doesn't flood LiteLLM.
+    # Stale rows not processed here will be picked up next cycle.
+    stale = stale[:SYNC_MAX_STALE_PER_CYCLE]
+
     excluded_tags = _get_excluded_tags()
     rare_domains = _get_rare_domains()
     texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in stale]
@@ -350,6 +355,9 @@ async def _sync_visits_stale() -> tuple[int, int]:
 
     if not stale:
         return 0, deleted
+
+    # Cap per cycle — same reasoning as bookmarks.
+    stale = stale[:SYNC_MAX_STALE_PER_CYCLE]
 
     pending_embed_rows: list[dict] = []
     pending_embed_texts: list[str] = []
