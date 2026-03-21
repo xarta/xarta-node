@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="css/layout-nav.css" />
   <link rel="stylesheet" href="css/tables.css" />
   <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/probes-menu.css" />
 </head>
 <body>
 
@@ -49,15 +50,21 @@
     <button data-group="settings" style="display:none" onclick="switchTab('docs')">&#128196; Docs</button>
     <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
     <button data-group="settings" style="display:none" onclick="switchTab('ai-providers')">&#129302; AI Providers</button>
-    <!-- PROBES group -->
-    <button data-group="probes" style="display:none" onclick="switchTab('pfsense-dns')">pfSense DNS</button>
-    <button data-group="probes" style="display:none" id="tab-btn-proxmox-config" onclick="switchTab('proxmox-config')">Proxmox Config</button>
-    <button data-group="probes" style="display:none" id="tab-btn-vlans" onclick="switchTab('vlans')">VLANs</button>
-    <button data-group="probes" style="display:none" onclick="switchTab('ssh-targets')">SSH Targets</button>
-    <button data-group="probes" style="display:none" onclick="switchTab('dockge-stacks')">Dockge Stacks</button>
-    <button data-group="probes" style="display:none" onclick="switchTab('caddy-configs')">Caddy Configs</button>
-    <button data-group="probes" style="display:none" onclick="switchTab('bookmarks')">&#128278; Bookmarks</button>
+    <!-- PROBES group — navigation handled by ProbesMenuConfig split-dropdown below -->
   </nav>
+
+  <!-- Probes split-dropdown menu — shown when probes group is active -->
+  <div id="probesMenuWrapper" style="display:none;margin-bottom:4px">
+    <div class="hub-tabs-wrapper" style="margin-bottom:0">
+      <button class="hub-menu-toggle" id="probesMenuToggle">
+        <span class="hamburger-icon">☰</span>
+        <span class="current-tab-label" id="probesCurrentTabLabel">Probes</span>
+        <span class="dropdown-arrow">▼</span>
+      </button>
+      <div class="hub-tabs" id="probesHubTabs"></div>
+    </div>
+  </div>
+  <div id="probesMenuSaveNotification">✓ Saved</div>
 
   <!-- Settings -->
   <section id="tab-settings" class="tab-panel">
@@ -675,7 +682,7 @@
   </section>
 
   <!-- Bookmarks -->
-  <section id="tab-bookmarks" class="tab-panel">
+  <section id="tab-bookmarks-main" class="tab-panel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
       <div>
         <h2 style="margin:0">&#128278; Bookmarks</h2>
@@ -686,20 +693,129 @@
         <button class="secondary" onclick="document.getElementById('bm-import-file').click()">&#8593; Import HTML</button>
         <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
         <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
-        <button class="secondary" onclick="_bmToggleSetup()" title="Import guide &amp; extension install">&#9432; Setup</button>
-        <button class="secondary" onclick="_bmToggleEmbedCfg()" title="Configure tag exclusions, domain rarity, and re-embed all bookmarks">&#129504; Embeddings</button>
         <button class="secondary" onclick="_bmOpenColsModal()" title="Show or hide table columns">&#9776; Columns</button>
         <button id="bm-explain-sort-btn" class="secondary" onclick="_bmOpenSortExplainModal()" disabled title="Explain how the current search results are sorted (available during search)">&#128202; Explain Sort</button>
         <button class="secondary" onclick="_bmAutoArchiveDead(this)" title="Check all non-archived bookmarks for 404/410 errors and archive any dead links">&#128279; Check dead links</button>
       </div>
     </div>
-    <!-- Setup guide panel (collapsed by default) -->
-    <div id="bm-setup-panel" style="display:none;margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
-      <div style="background:var(--surface-alt,var(--surface));border-bottom:1px solid var(--border);padding:8px 14px;display:flex;justify-content:space-between;align-items:center">
-        <span style="font-weight:700;font-size:13px;letter-spacing:.4px">Setup &amp; import guide</span>
-        <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="_bmToggleSetup()">&#10005; Close</button>
+    <!-- Search / filter toolbar -->
+    <div class="toolbar" style="margin-bottom:10px">
+      <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
+      <select id="bm-tag-filter" onchange="_bmSearchActive ? _renderBmSearchResults(_bmLastSearchResults) : renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
+        <option value="">All tags</option>
+      </select>
+      <label class="bm-toggle-label">
+        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()">
+        <span class="bm-toggle-track"></span>
+        Archived
+      </label>
+    </div>
+    <div id="bm-deadlink-panel" style="display:none;margin-bottom:8px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px"><span id="bm-deadlink-status" style="color:var(--text-dim)"></span><span id="bm-deadlink-results"></span></div>
+    <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
+    <!-- Bookmarks table -->
+    <div id="bm-main-view">
+      <div class="table-wrap">
+        <table>
+          <thead><tr></tr></thead>
+          <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
+        </table>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
+    </div>
+    <!-- Pagination controls (rendered by _bmRenderPagination in bookmarks.js) -->
+    <div id="bm-pagination"></div>
+    <p id="bm-import-status" style="font-size:12px;margin:6px 0 0" hidden></p>
+    <p id="bm-error" class="error-msg" hidden></p>
+  </section>
+
+  <!-- Bookmarks — Visit History -->
+  <section id="tab-bookmarks-history" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">&#128220; Visit History</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
+      </div>
+    </div>
+    <div class="toolbar" style="margin-bottom:8px">
+      <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
+      <select id="bm-visit-saved-filter" onchange="renderVisits()" style="width:auto">
+        <option value="all">All</option>
+        <option value="unsaved">Unsaved only</option>
+        <option value="saved">Saved only</option>
+      </select>
+      <button class="secondary" onclick="_visOpenColsModal()">&#8801; Columns</button>
+      <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table id="vis-table">
+        <thead><tr id="vis-thead-row"></tr></thead>
+        <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Bookmarks — Embeddings -->
+  <section id="tab-bookmarks-embeddings" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">&#129504; Embedding Configuration</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Configure tag exclusions, rare domain weighting, and re-embed all bookmarks.</p>
+      </div>
+    </div>
+    <div id="bm-embed-panel">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+        <!-- Tag exclusion card -->
+        <div style="padding:14px 16px;border-right:1px solid var(--border)">
+          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127991; Excluded tags</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Tags in this list are stripped before embedding. Use this to remove structural/browser-folder tags that carry no semantic meaning (e.g. <em>favourites-bar</em>, <em>web</em>).</p>
+          <div id="bm-excl-tag-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;min-height:24px"></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">
+            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-excl-tag-edit-btn">&#9998; Edit list&hellip;</button>
+            <button style="font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
+            <span id="bm-excl-tag-status" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+        </div>
+        <!-- Domain rarity + reindex card -->
+        <div style="padding:14px 16px">
+          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127760; Rare domains</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Domains that appear in very few bookmarks carry high semantic signal (they identify a niche site). Their name (without TLD) is included in the embedding text. Domains that appear everywhere (github, youtube&hellip;) are excluded.</p>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+            <label style="font-size:12px;white-space:nowrap">Threshold (max occurrences&nbsp;=&nbsp;rare):</label>
+            <input type="number" id="bm-domain-threshold" min="0" max="100" value="3" style="width:64px;font-size:12px;padding:3px 6px" />
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-analyze-domains-btn">&#128202; Analyse domains</button>
+            <span id="bm-analyze-status" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+          <hr style="border:none;border-top:1px solid var(--border);margin:10px 0" />
+          <h3 style="margin:0 0 6px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#128260; Reindex all embeddings</h3>
+          <p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">Re-embeds every bookmark using the current excluded tags and rare domains. Run this after changing the embedding config or after the first domain analysis.</p>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+            <button style="font-size:12px;padding:5px 14px" id="bm-reindex-btn">&#128260; Reindex all</button>
+            <span id="bm-reindex-status" style="font-size:11px;color:var(--text-dim)"></span>
+          </div>
+          <div id="bm-reindex-progress-wrap" style="display:none;margin-top:4px">
+            <div style="background:var(--surface);border:1px solid var(--border);border-radius:3px;overflow:hidden;height:10px">
+              <div id="bm-reindex-progress-bar" style="background:var(--accent,#7c6ee6);height:100%;width:0%;transition:width .3s ease"></div>
+            </div>
+            <span id="bm-reindex-progress-label" style="font-size:11px;color:var(--text-dim);display:block;margin-top:3px"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Bookmarks — Setup -->
+  <section id="tab-bookmarks-setup" class="tab-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <h2 style="margin:0">&#9432; Setup &amp; Import</h2>
+        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Import guide for Edge Favourites and step-by-step browser extension install.</p>
+      </div>
+      <button class="secondary" onclick="document.getElementById('bm-import-file2').click()">&#8593; Import HTML</button>
+      <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
+    </div>
+    <div id="bm-setup-panel">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Import from Edge card -->
         <div style="padding:14px 16px;border-right:1px solid var(--border)">
           <h3 style="margin:0 0 10px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#128278; Import from Edge</h3>
@@ -736,7 +852,7 @@
           </ol>
           <p style="font-size:12px;color:var(--text-dim);margin:0 0 6px">Options to configure in the extension:</p>
           <div id="bm-ext-options" style="background:var(--surface-alt,rgba(255,255,255,.04));border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;margin:0 0 12px;font-size:12px;line-height:1.8">
-            <div><strong>API URL</strong> — <span id="bm-ext-url-loading" style="color:var(--text-dim)">detecting…</span><div id="bm-ext-urls" style="display:none;margin-top:4px"></div></div>
+            <div><strong>API URL</strong> — <span id="bm-ext-url-loading" style="color:var(--text-dim)">detecting&hellip;</span><div id="bm-ext-urls" style="display:none;margin-top:4px"></div></div>
             <div style="margin-top:6px"><strong>API Secret</strong> — your <code>BLUEPRINTS_API_SECRET</code> value from <code>.env</code></div>
             <div style="margin-top:6px"><strong>Visit recorder</strong> — optional; auto-logs every page you visit</div>
           </div>
@@ -748,103 +864,26 @@
         </div>
       </div>
     </div>
-    <!-- Embedding config panel (collapsed by default) -->
-    <div id="bm-embed-panel" style="display:none;margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
-      <div style="background:var(--surface-alt,var(--surface));border-bottom:1px solid var(--border);padding:8px 14px;display:flex;justify-content:space-between;align-items:center">
-        <span style="font-weight:700;font-size:13px;letter-spacing:.4px">&#129504; Embedding configuration</span>
-        <button class="secondary" style="padding:2px 10px;font-size:12px" id="bm-embed-close-btn">&#10005; Close</button>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0">
-        <!-- Tag exclusion card -->
-        <div style="padding:14px 16px;border-right:1px solid var(--border)">
-          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127991; Excluded tags</h3>
-          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Tags in this list are stripped before embedding. Use this to remove structural/browser-folder tags that carry no semantic meaning (e.g. <em>favourites-bar</em>, <em>web</em>).</p>
-          <div id="bm-excl-tag-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;min-height:24px"></div>
-          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">
-            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-excl-tag-edit-btn">&#9998; Edit list…</button>
-            <button style="font-size:12px;padding:5px 14px" id="bm-excl-tag-save-btn">&#10003; Save excluded tags</button>
-            <span id="bm-excl-tag-status" style="font-size:11px;color:var(--text-dim)"></span>
-          </div>
+  </section>
 
-        </div>
-        <!-- Domain rarity + reindex card -->
-        <div style="padding:14px 16px">
-          <h3 style="margin:0 0 8px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#127760; Rare domains</h3>
-          <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Domains that appear in very few bookmarks carry high semantic signal (they identify a niche site). Their name (without TLD) is included in the embedding text. Domains that appear everywhere (github, youtube…) are excluded.</p>
-          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
-            <label style="font-size:12px;white-space:nowrap">Threshold (max occurrences&nbsp;=&nbsp;rare):</label>
-            <input type="number" id="bm-domain-threshold" min="0" max="100" value="3" style="width:64px;font-size:12px;padding:3px 6px" />
-          </div>
-          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
-            <button class="secondary" style="font-size:12px;padding:5px 12px" id="bm-analyze-domains-btn">&#128202; Analyse domains</button>
-            <span id="bm-analyze-status" style="font-size:11px;color:var(--text-dim)"></span>
-          </div>
-          <hr style="border:none;border-top:1px solid var(--border);margin:10px 0" />
-          <h3 style="margin:0 0 6px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#128260; Reindex all embeddings</h3>
-          <p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">Re-embeds every bookmark using the current excluded tags and rare domains. Run this after changing the embedding config or after the first domain analysis.</p>
-          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
-            <button style="font-size:12px;padding:5px 14px" id="bm-reindex-btn">&#128260; Reindex all</button>
-            <span id="bm-reindex-status" style="font-size:11px;color:var(--text-dim)"></span>
-          </div>
-          <div id="bm-reindex-progress-wrap" style="display:none;margin-top:4px">
-            <div style="background:var(--surface);border:1px solid var(--border);border-radius:3px;overflow:hidden;height:10px">
-              <div id="bm-reindex-progress-bar" style="background:var(--accent,#7c6ee6);height:100%;width:0%;transition:width .3s ease"></div>
-            </div>
-            <span id="bm-reindex-progress-label" style="font-size:11px;color:var(--text-dim);display:block;margin-top:3px"></span>
-          </div>
+  <!-- Probes — Menu Settings -->
+  <section id="tab-probes-settings" class="tab-panel">
+    <h2>&#9881; Menu Settings</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Probes navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
+    <div class="menu-editor-container">
+      <div class="menu-editor-header">
+        <h3>Probes Navigation</h3>
+        <div style="display:flex;gap:8px">
+          <button class="btn-save-menu" id="probesMenuSaveButton">Save layout</button>
+          <button class="btn-reset-menu" id="probesMenuResetButton">Reset defaults</button>
         </div>
       </div>
-    </div>
-    <!-- Search / filter toolbar -->
-    <div class="toolbar" style="margin-bottom:10px">
-      <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
-      <select id="bm-tag-filter" onchange="_bmSearchActive ? _renderBmSearchResults(_bmLastSearchResults) : renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
-        <option value="">All tags</option>
-      </select>
-      <label class="bm-toggle-label">
-        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()">
-        <span class="bm-toggle-track"></span>
-        Archived
-      </label>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="bm-show-visits" onchange="_bmToggleVisits()"> Visit history
-      </label>
-    </div>
-    <div id="bm-deadlink-panel" style="display:none;margin-bottom:8px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px"><span id="bm-deadlink-status" style="color:var(--text-dim)"></span><span id="bm-deadlink-results"></span></div>
-    <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
-    <!-- Bookmarks table -->
-    <div id="bm-main-view">
-      <div class="table-wrap">
-        <table>
-          <thead><tr></tr></thead>
-          <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
-        </table>
+      <div class="menu-editor-instructions">
+        <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
+        <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
       </div>
+      <div id="probesMenuEditorList"></div>
     </div>
-    <!-- Pagination controls (rendered by _bmRenderPagination in bookmarks.js) -->
-    <div id="bm-pagination"></div>
-    <!-- Visit history (toggled) -->
-    <div id="bm-visits-view" style="display:none">
-      <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin-bottom:8px">Visit History</h3>
-      <div class="toolbar" style="margin-bottom:8px">
-        <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
-        <select id="bm-visit-saved-filter" onchange="renderVisits()" style="width:auto">
-          <option value="all">All</option>
-          <option value="unsaved">Unsaved only</option>
-          <option value="saved">Saved only</option>
-        </select>
-        <button class="secondary" onclick="_visOpenColsModal()">&#8801; Columns</button>
-        <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
-      </div>
-      <div class="table-wrap">
-        <table id="vis-table">
-          <thead><tr id="vis-thead-row"></tr></thead>
-          <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-    <p id="bm-import-status" style="font-size:12px;margin:6px 0 0" hidden></p>
-    <p id="bm-error" class="error-msg" hidden></p>
   </section>
 
   <section>
@@ -1175,6 +1214,7 @@
 <script src="js/probes/dockge.js"></script>
 <script src="js/probes/caddy.js"></script>
 <script src="js/probes/bookmarks.js"></script>
+<script src="js/probes/probes-menu.js"></script>
 <script src="js/app.js"></script>
 
 <!-- Restore confirmation modal -->

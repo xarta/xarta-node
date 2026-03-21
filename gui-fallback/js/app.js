@@ -6,6 +6,15 @@ function switchGroup(group) {
   document.querySelectorAll('.table-nav button[data-group]').forEach(b => {
     b.style.display = b.dataset.group === group ? '' : 'none';
   });
+  // Show/hide probes split-dropdown menu
+  const probesWrapper = document.getElementById('probesMenuWrapper');
+  if (probesWrapper) probesWrapper.style.display = group === 'probes' ? '' : 'none';
+  if (group === 'probes') {
+    ProbesMenuConfig.showGroup();
+    switchTab('pfsense-dns');
+    ProbesMenuConfig.updateActiveTab('pfsense-dns');
+    return;
+  }
   const firstBtn = document.querySelector(`.table-nav button[data-group="${group}"]`);
   if (firstBtn) {
     const m = firstBtn.getAttribute('onclick').match(/switchTab\('([^']+)'\)/);
@@ -37,7 +46,10 @@ function switchTab(tab) {
   if (tab === 'certs')                                     loadCerts();
   if (tab === 'docs' && !_docsAll.length)                  loadDocs();
   if (tab === 'ai-providers' && !_aiProviders.length)      loadAiProviders();
-  if (tab === 'bookmarks'    && !_bookmarks.length)         loadBookmarks();
+  if (tab === 'bookmarks-main'  && !_bookmarks.length)  loadBookmarks();
+  if (tab === 'bookmarks-history')                       loadVisits();
+  if (tab === 'bookmarks'        && !_bookmarks.length)  loadBookmarks();
+  if (tab === 'bookmarks') { switchTab('bookmarks-main'); return; }
   // self-diag: just show the shell — user clicks Run to trigger tests
   // PCT live status polling — only while nodes tab is open
   if (tab === 'nodes') {
