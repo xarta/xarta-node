@@ -283,6 +283,20 @@ async def search_bookmarks(
     limit: int = Query(20, ge=1, le=100),
     include_visits: bool = Query(True),
 ) -> dict:
+    q_lower = q.lower()
+    q_tokens = q_lower.split()  # individual words: ["github", "noise"]
+
+    # Load excluded tags first — before any embedding or SeekDB call.
+    with get_conn() as _conn:
+        _excl_raw = get_setting(_conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
+    _excluded_tags: set[str] = {t.strip().lower() for t in (_excl_raw or "").split(",") if t.strip()}
+
+    # If every token in the query is an excluded tag, return nothing immediately.
+    # Searching for "favourites-bar" or "web" (nuisance tags) should produce no
+    # results — not 50 vector results that happen to be semantically adjacent.
+    if q_tokens and all(t in _excluded_tags for t in q_tokens):
+        return {"query": q, "count": 0, "results": [], "excluded": True}
+
     query_embedding = (await embed("browser-links", [q]))[0]
 
     window = max(limit * 3, 30)
@@ -291,16 +305,6 @@ async def search_bookmarks(
 
     vis_kw = keyword_search_visits(q, window) if include_visits else []
     vis_vec = vector_search_visits(query_embedding, window) if include_visits else []
-
-    # Compute once; used by both pre-RRF and post-rerank ranking functions.
-    q_lower = q.lower()
-    q_tokens = q_lower.split()  # individual words: ["github", "noise"]
-
-    # Load excluded tags so we don't boost results merely because a nuisance
-    # tag (e.g. "favourites-bar") happens to match the query term.
-    with get_conn() as _conn:
-        _excl_raw = get_setting(_conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
-    _excluded_tags: set[str] = {t.strip().lower() for t in (_excl_raw or "").split(",") if t.strip()}
 
     def _searchable_tags(tags_json_str: str | None) -> str:
         """Return space-joined tag text with excluded tags removed."""
