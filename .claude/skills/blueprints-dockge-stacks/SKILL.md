@@ -1,4 +1,3 @@
-````skill
 ---
 name: blueprints-dockge-stacks
 description: Probe Dockge instances across the fleet via direct SSH (using ssh_targets) and populate dockge_stacks + dockge_stack_services tables. Detects parentage of each Dockge instance. Use when the user wants to enumerate stacks, discover compose definitions, show container status, or refresh Dockge inventory.
@@ -141,4 +140,3 @@ Portainer is tracked separately via `proxmox_config.portainer_json`. It does
 **not** share this table. Portainer API access requires tokens and is
 fundamentally different from Dockge's file-based approach. A dedicated
 `portainer_stacks` table and probe are planned for the future.
-````

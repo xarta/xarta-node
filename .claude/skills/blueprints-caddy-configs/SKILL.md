@@ -1,4 +1,3 @@
-````skill
 ---
 name: blueprints-caddy-configs
 description: Discover Caddy reverse proxy configurations across all LXCs in the fleet via pct exec, extracting domain names and upstream targets into the Blueprints caddy_configs table. Use when the user wants to audit reverse proxy rules, find which domains map to which services, or refresh Caddy inventory.
@@ -83,4 +82,3 @@ Location: `/root/xarta-node/.claude/skills/blueprints-caddy-configs/scripts/bp-c
 | `/api/v1/caddy-configs/probe/status` | GET | Check if probe key is available |
 | `/api/v1/caddy-configs/probe` | POST | Run probe and upsert results |
 | `/api/v1/caddy-configs/{caddy_id}` | GET/PUT/DELETE | CRUD for one record |
-````
