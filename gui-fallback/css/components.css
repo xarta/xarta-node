@@ -42,10 +42,10 @@
 .sync-item:last-child { border-bottom: none; }
 
 /* ── Toolbar ── */
-.toolbar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; }
+.toolbar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; flex-wrap: wrap; }
 input[type=text] { background: var(--surface); border: 1px solid var(--border);
                    color: var(--text); border-radius: var(--radius); padding: 6px 10px;
-                   font-size: 13px; flex: 1; max-width: 300px; }
+                   font-size: 13px; flex: 1 1 160px; min-width: 120px; max-width: 300px; }
 input[type=text]:focus { outline: none; border-color: var(--accent); }
 button { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-dim);
          border-radius: var(--radius); padding: 6px 14px; font-size: 13px;
@@ -117,4 +117,28 @@ button.secondary:hover { color: var(--text); border-color: var(--text-dim); }
 /* Fixed-layout bookmarks table — cells clip to column width */
 #bm-main-view table { table-layout: fixed; }
 #bm-main-view table td { overflow: hidden; }
+
+/* ── Responsive component adjustments ── */
+@media (max-width: 900px) {
+  .sync-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+}
+
+@media (max-width: 600px) {
+  button { padding: 5px 10px; font-size: 12px; }
+  input[type=text] { max-width: none; }
+  #sync-panel { padding: 10px 12px; }
+  .toolbar { gap: 6px; margin-bottom: 10px; }
+}
+
+/* ── Responsive dialogs ── */
+@media (max-width: 520px) {
+  dialog {
+    min-width: 0 !important;
+    width: 92vw !important;
+    max-width: 92vw !important;
+    padding: 16px !important;
+    max-height: 92vh !important;
+    overflow-y: auto !important;
+  }
+}
 

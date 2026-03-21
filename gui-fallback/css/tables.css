@@ -1,6 +1,6 @@
 /* ── Services table ── */
 .table-wrap { overflow-x: auto; overflow-y: auto; max-height: calc(100vh - 220px); }
-table { width: 100%; border-collapse: collapse; }
+table { width: 100%; border-collapse: collapse; min-width: 400px; }
 thead th { background: var(--surface); color: var(--text-dim); font-size: 11px;
            text-transform: uppercase; letter-spacing: .6px; padding: 8px 10px;
            text-align: left; border-bottom: 1px solid var(--border);
@@ -8,6 +8,16 @@ thead th { background: var(--surface); color: var(--text-dim); font-size: 11px;
 tbody tr { border-bottom: 1px solid var(--border); }
 tbody tr:hover { background: rgba(91,156,246,.06); }
 tbody td { padding: 9px 10px; vertical-align: top; }
+
+/* ── Responsive table max-height: more content visible on small screens ── */
+@media (max-width: 900px) {
+  .table-wrap { max-height: calc(100vh - 200px); }
+}
+@media (max-width: 600px) {
+  .table-wrap { max-height: calc(100vh - 160px); }
+  thead th { padding: 6px 8px; }
+  tbody td { padding: 7px 8px; }
+}
 .tag { display: inline-block; background: var(--accent-dim); color: var(--accent);
        border-radius: 3px; padding: 1px 6px; font-size: 11px; margin: 1px; }
 .link-badge { display: inline-block; background: #1a2a1a; color: #6ecf8e;
