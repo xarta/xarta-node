@@ -365,17 +365,24 @@ function togglePveGroup(safePve) {
 }
 
 function setAllNets(open) {
+  if (open) {
+    // Expand all PVE groups first so VM rows are visible
+    document.querySelectorAll('[data-pve-group-hdr]').forEach(hdr => {
+      if (hdr.dataset.pveGroupOpen !== '1') togglePveGroup(hdr.dataset.pveGroupHdr);
+    });
+  }
   document.querySelectorAll('[id^="nets-detail-"]').forEach(detail => {
     const safeid = detail.id.replace('nets-detail-', '');
     const btn    = document.getElementById(`nets-btn-${safeid}`);
-    if (open) {
-      // Only expand nets for visible VM rows (i.e. in expanded PVE groups)
-      const vmRow = document.querySelector(`[data-vm-row="${safeid}"]`);
-      if (!vmRow || vmRow.style.display === 'none') return;
-    }
     detail.style.display = open ? 'table-row' : 'none';
     if (btn) btn.textContent = btn.textContent.replace(open ? '▶' : '▼', open ? '▼' : '▶');
   });
+  if (!open) {
+    // Collapse all PVE groups too — mirrors what Expand All opened
+    document.querySelectorAll('[data-pve-group-hdr]').forEach(hdr => {
+      if (hdr.dataset.pveGroupOpen === '1') togglePveGroup(hdr.dataset.pveGroupHdr);
+    });
+  }
 }
 
 async function loadProxmoxNets() {

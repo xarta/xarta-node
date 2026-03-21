@@ -697,28 +697,23 @@ async function _bmToggleVisitEvents(normalizedUrl, rowId) {
 }
 
 function _bmToggleVisits() {
-  const showVisits = document.getElementById('bm-show-visits')?.checked;
-  document.getElementById('bm-main-view').style.display = showVisits ? 'none' : '';
-  document.getElementById('bm-visits-view').style.display = showVisits ? '' : 'none';
-  if (showVisits && !_bmVisits.length) loadVisits();
+  switchTab('bookmarks-history');
+  if (typeof ProbesMenuConfig !== 'undefined') ProbesMenuConfig.updateActiveTab('bookmarks-history');
+  loadVisits();
 }
 
 function _bmToggleSetup() {
-  const panel = document.getElementById('bm-setup-panel');
-  if (!panel) return;
-  const opening = panel.style.display === 'none';
-  panel.style.display = opening ? '' : 'none';
-  if (opening) _bmPopulateExtUrls();
+  switchTab('bookmarks-setup');
+  if (typeof ProbesMenuConfig !== 'undefined') ProbesMenuConfig.updateActiveTab('bookmarks-setup');
+  _bmPopulateExtUrls();
 }
 
 let _bmReindexPollTimer = null;
 
 function _bmToggleEmbedCfg() {
-  const panel = document.getElementById('bm-embed-panel');
-  if (!panel) return;
-  const opening = panel.style.display === 'none';
-  panel.style.display = opening ? '' : 'none';
-  if (opening) _bmLoadEmbedCfg();
+  switchTab('bookmarks-embeddings');
+  if (typeof ProbesMenuConfig !== 'undefined') ProbesMenuConfig.updateActiveTab('bookmarks-embeddings');
+  _bmLoadEmbedCfg();
 }
 
 async function _bmLoadEmbedCfg() {
@@ -824,12 +819,9 @@ function _bmGetExclTags() {
 }
 
 function _bmInitEmbedPanel() {
-  const panel = document.getElementById('bm-embed-panel');
-  if (!panel) return;
-
-  document.getElementById('bm-embed-close-btn')?.addEventListener('click', () => {
-    panel.style.display = 'none';
-  });
+  // bm-embed-panel is now a permanent section (tab-bookmarks-embeddings).
+  // No close button — close btn wiring is no longer needed.
+  // Wire the remaining interactive controls.
 
   // Open tag exclusion modal
   document.getElementById('bm-excl-tag-edit-btn')?.addEventListener('click', () => {
