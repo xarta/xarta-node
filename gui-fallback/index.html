@@ -828,19 +828,18 @@
       <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin-bottom:8px">Visit History</h3>
       <div class="toolbar" style="margin-bottom:8px">
         <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
+        <select id="bm-visit-saved-filter" onchange="renderVisits()" style="width:auto">
+          <option value="all">All</option>
+          <option value="unsaved">Unsaved only</option>
+          <option value="saved">Saved only</option>
+        </select>
+        <button class="secondary" onclick="_visOpenColsModal()">&#8801; Columns</button>
         <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
       </div>
       <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>Title</th>
-            <th>URL</th>
-            <th>Source</th>
-            <th>Dwell</th>
-            <th>Visited</th>
-            <th style="width:80px">Actions</th>
-          </tr></thead>
-          <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="6">Loading&hellip;</td></tr></tbody>
+        <table id="vis-table">
+          <thead><tr id="vis-thead-row"></tr></thead>
+          <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1323,6 +1322,19 @@
   <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-shrink:0">
     <button class="secondary" onclick="document.getElementById('bm-cols-modal').close()">Cancel</button>
     <button onclick="_bmApplyColsModal()">&#10003; Apply</button>
+  </div>
+</dialog>
+
+<style>#vis-cols-modal[open] { display:flex;flex-direction:column }</style>
+<dialog id="vis-cols-modal" style="width:min(380px,95vw);border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
+  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <span style="font-weight:700;font-size:14px">&#9776; Visit columns</span>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('vis-cols-modal').close()">&#10005;</button>
+  </div>
+  <div id="vis-cols-modal-list" style="padding:4px 18px;flex:1"></div>
+  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-shrink:0">
+    <button class="secondary" onclick="document.getElementById('vis-cols-modal').close()">Cancel</button>
+    <button onclick="_visApplyColsModal()">&#10003; Apply</button>
   </div>
 </dialog>
 

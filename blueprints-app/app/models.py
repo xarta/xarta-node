@@ -968,5 +968,6 @@ class VisitOut(BaseModel):
     dwell_seconds: Optional[int] = None
     bookmark_id: Optional[str] = None
     visited_at: str
+    visit_count: int = 1
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

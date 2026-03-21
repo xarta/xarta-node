@@ -409,6 +409,16 @@ CREATE TABLE IF NOT EXISTS bookmark_deletions (
     deleted_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_bm_deletions_deleted_at ON bookmark_deletions(deleted_at);
+
+CREATE TABLE IF NOT EXISTS visit_events (
+    event_id         TEXT PRIMARY KEY,
+    normalized_url   TEXT NOT NULL,
+    visited_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    dwell_seconds    INTEGER,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_visit_events_norm_url   ON visit_events(normalized_url);
+CREATE INDEX IF NOT EXISTS idx_visit_events_visited_at ON visit_events(visited_at);
 """
 
 _SEED_SQL = """
@@ -489,6 +499,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("docs",         "group_id",            "TEXT"),
         # sync_queue: GUID for dedup + forwarding (Phase 2, 2026-03-19)
         ("sync_queue",   "guid",                "TEXT DEFAULT ''"),
+        # visits: count of times a URL has been visited (2026-03-21)
+        ("visits",       "visit_count",          "INTEGER NOT NULL DEFAULT 1"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -498,6 +510,72 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         if column not in existing_cols[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
             log.info("migration: added column %s.%s", table, column)
+
+
+def _backfill_visit_events(conn: sqlite3.Connection) -> None:
+    """One-time backfill: seed visit_events from existing visits rows.
+
+    For each visits row that has no corresponding event_id in visit_events,
+    insert one event row using the visits row's visited_at.  This preserves
+    the most-recent timestamp that survived the dedup run.  Idempotent — safe
+    to call on every startup; skips rows that already have an event.
+    """
+    import uuid as _uuid
+    rows = conn.execute(
+        "SELECT v.normalized_url, v.visited_at "
+        "FROM visits v "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM visit_events e WHERE e.normalized_url = v.normalized_url"
+        ")"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO visit_events (event_id, normalized_url, visited_at) VALUES (?,?,?)",
+            (str(_uuid.uuid4()), row[0], row[1]),
+        )
+    if rows:
+        log.info("_backfill_visit_events: seeded %d event row(s)", len(rows))
+
+
+def _dedup_visits(conn: sqlite3.Connection) -> None:
+    """Collapse existing duplicate visit rows by normalized_url.
+
+    On each node, the visit-recorder may have inserted many rows for the same
+    URL before the upsert logic was introduced.  This migration is idempotent:
+    for each normalized_url with more than one row it keeps the most-recently-
+    visited row, sets its visit_count to the total number of rows for that URL,
+    and deletes the rest.
+    """
+    dups = conn.execute(
+        "SELECT normalized_url, COUNT(*) as cnt FROM visits "
+        "GROUP BY normalized_url HAVING cnt > 1"
+    ).fetchall()
+    if not dups:
+        return
+    collapsed = 0
+    for dup in dups:
+        nurl = dup[0]
+        agg = conn.execute(
+            "SELECT MAX(visited_at) as latest, SUM(visit_count) as total "
+            "FROM visits WHERE normalized_url=?",
+            (nurl,),
+        ).fetchone()
+        keeper = conn.execute(
+            "SELECT visit_id FROM visits WHERE normalized_url=? "
+            "ORDER BY visited_at DESC LIMIT 1",
+            (nurl,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE visits SET visit_count=?, visited_at=?, updated_at=datetime('now') "
+            "WHERE visit_id=?",
+            (agg[1], agg[0], keeper[0]),
+        )
+        conn.execute(
+            "DELETE FROM visits WHERE normalized_url=? AND visit_id != ?",
+            (nurl, keeper[0]),
+        )
+        collapsed += 1
+    log.info("_dedup_visits: collapsed duplicate rows for %d URLs", collapsed)
 
 
 def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
@@ -572,6 +650,8 @@ def init_db() -> None:
         conn.executescript(_SCHEMA_SQL)
         conn.executescript(_SEED_SQL)
         _run_migrations(conn)
+        _dedup_visits(conn)
+        _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 

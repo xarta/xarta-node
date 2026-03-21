@@ -480,6 +480,106 @@ function _bmSetPageSize(n) {
 
 // ── Visits ──────────────────────────────────────────────────────────────
 
+// ── Visit column metadata ────────────────────────────────────────────────
+const _VIS_FIELD_META = {
+  title:       { label: 'Title',       render: v => `<td>${esc(v.title || '')}</td>` },
+  url:         { label: 'URL',         render: v => `<td style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.url)}"><a href="${esc(v.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--text-dim);text-decoration:none" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${_bmTruncUrl(v.url)}</a></td>` },
+  domain:      { label: 'Domain',      render: v => `<td style="font-size:11px;color:var(--text-dim)">${esc(v.domain || '')}</td>` },
+  source:      { label: 'Source',      render: v => `<td style="font-size:11px;color:var(--text-dim)">${esc(v.source || '')}</td>` },
+  dwell_seconds:{ label: 'Dwell',      render: v => `<td style="font-size:11px;color:var(--text-dim)">${v.dwell_seconds ? v.dwell_seconds + 's' : '—'}</td>` },
+  visit_count: { label: 'Times',       render: v => `<td style="font-size:11px;text-align:center">${v.visit_count > 1 ? `<span style="font-weight:600;color:var(--accent)">${v.visit_count}</span>` : `<span style="color:var(--text-dim)">1</span>`}</td>` },
+  visited_at:  { label: 'Visited',     render: v => `<td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(v.visited_at || '')}</td>` },
+  _actions:    { label: 'Actions',     render: v => {
+    const expandId = `ve-${esc(v.visit_id)}`;
+    const saveBtn = v.bookmark_id ? '' :
+      `<button class="secondary" style="padding:1px 6px;font-size:11px" onclick="promoteVisitToBookmark('${esc(v.url)}','${esc(v.title || '')}')">&#128278; Save</button>`;
+    const expandBtn = v.visit_count > 1
+      ? `<button class="secondary" style="padding:1px 6px;font-size:11px" title="Show individual visit times" onclick="_bmToggleVisitEvents('${esc(v.normalized_url)}','${expandId}')">&#128337;</button>`
+      : '';
+    return `<td style="white-space:nowrap">${saveBtn} ${expandBtn}</td>`;
+  }},
+};
+
+const _VIS_ALL_COLS    = ['title', 'url', 'domain', 'source', 'dwell_seconds', 'visit_count', 'visited_at', '_actions'];
+const _VIS_DEFAULT_HIDDEN = ['domain'];
+// sortKey: the field name to sort on (null = not sortable)
+const _VIS_SORT_KEYS = { title: 'title', url: 'url', domain: 'domain', source: 'source',
+  dwell_seconds: 'dwell_seconds', visit_count: 'visit_count', visited_at: 'visited_at' };
+
+const _visHiddenColsRaw = localStorage.getItem('vis-hidden-cols');
+let _visHiddenCols = new Set(_visHiddenColsRaw ? JSON.parse(_visHiddenColsRaw) : _VIS_DEFAULT_HIDDEN);
+let _visColResizeDone = false;
+let _visSortCol = 'visited_at';
+let _visSortDir = 'desc';
+
+function _visVisibleCols() { return _VIS_ALL_COLS.filter(k => !_visHiddenCols.has(k)); }
+function _visColCount()    { return _visVisibleCols().length; }
+
+function _visRebuildThead() {
+  const tr = document.getElementById('vis-thead-row');
+  if (!tr) return;
+  tr.innerHTML = _visVisibleCols().map(k => {
+    const label   = _VIS_FIELD_META[k]?.label ?? k;
+    const sortKey = _VIS_SORT_KEYS[k] ?? null;
+    const style   = k === '_actions' ? ' style="width:90px"' : k === 'visit_count' ? ' style="width:50px;text-align:center"' : '';
+    return sortKey
+      ? `<th class="bm-th-sort" onclick="_visSortBy('${sortKey}')"${style}>${label}<span class="bm-sort-arrow vis-sort-arrow" data-col="${sortKey}">&#x21C5;</span></th>`
+      : `<th${style}>${label}</th>`;
+  }).join('');
+  _visColResizeDone = false;
+  _visUpdateSortHeaders();
+}
+
+function _visInitColResize() {
+  if (_visColResizeDone) return;
+  const table = document.getElementById('vis-table');
+  if (!table) return;
+  _visColResizeDone = true;
+  table.querySelectorAll('thead th').forEach(th => {
+    const resizer = document.createElement('div');
+    resizer.className = 'bm-col-resize';
+    th.appendChild(resizer);
+    resizer.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); });
+    let startX = 0, startW = 0;
+    resizer.addEventListener('mousedown', e => {
+      e.preventDefault(); e.stopPropagation();
+      startX = e.clientX; startW = th.offsetWidth;
+      resizer.classList.add('dragging');
+      const onMove = ev => { th.style.width = Math.max(40, startW + ev.clientX - startX) + 'px'; };
+      const onUp   = () => { resizer.classList.remove('dragging'); document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  });
+}
+
+function _visOpenColsModal() {
+  const list = document.getElementById('vis-cols-modal-list');
+  list.innerHTML = _VIS_ALL_COLS.map(k => {
+    const label   = _VIS_FIELD_META[k]?.label ?? k;
+    const checked = !_visHiddenCols.has(k) ? 'checked' : '';
+    return `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 4px;font-size:13px;border-bottom:1px solid var(--border)">
+      <input type="checkbox" data-col="${k}" ${checked} style="width:15px;height:15px;cursor:pointer" />
+      <span>${label}</span>
+    </label>`;
+  }).join('');
+  document.getElementById('vis-cols-modal').showModal();
+}
+
+function _visApplyColsModal() {
+  const modal = document.getElementById('vis-cols-modal');
+  const newHidden = new Set(_visHiddenCols);
+  modal.querySelectorAll('input[data-col]').forEach(cb => {
+    if (cb.checked) newHidden.delete(cb.dataset.col);
+    else            newHidden.add(cb.dataset.col);
+  });
+  _visHiddenCols = newHidden;
+  localStorage.setItem('vis-hidden-cols', JSON.stringify([..._visHiddenCols]));
+  _visRebuildThead();
+  renderVisits();
+  modal.close();
+}
+
 async function loadVisits() {
   const err = document.getElementById('bm-error');
   err.hidden = true;
@@ -487,6 +587,7 @@ async function loadVisits() {
     const r = await apiFetch('/api/v1/bookmarks/visits?limit=1000');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _bmVisits = await r.json();
+    _visRebuildThead();
     renderVisits();
   } catch (e) {
     err.textContent = `Failed to load visits: ${e.message}`;
@@ -496,6 +597,7 @@ async function loadVisits() {
 
 function renderVisits() {
   const q = (document.getElementById('bm-visit-search')?.value || '').toLowerCase();
+  const savedFilter = document.getElementById('bm-visit-saved-filter')?.value || 'all';
   let rows = _bmVisits;
   if (q) {
     rows = rows.filter(v =>
@@ -504,25 +606,94 @@ function renderVisits() {
       (v.domain || '').toLowerCase().includes(q)
     );
   }
+  if (savedFilter === 'saved')   rows = rows.filter(v => v.bookmark_id);
+  if (savedFilter === 'unsaved') rows = rows.filter(v => !v.bookmark_id);
+  // Sort
+  rows = [...rows].sort((a, b) => {
+    const av = String(a[_visSortCol] ?? '').toLowerCase();
+    const bv = String(b[_visSortCol] ?? '').toLowerCase();
+    return _visSortDir === 'asc'
+      ? av.localeCompare(bv, undefined, {numeric: true})
+      : bv.localeCompare(av, undefined, {numeric: true});
+  });
+  const cols  = _visVisibleCols();
   const tbody = document.getElementById('bm-visits-tbody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No visit history.</td></tr>';
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
     return;
   }
+  const expandColspan = cols.length;
   tbody.innerHTML = rows.map(v => {
-    const dwell = v.dwell_seconds ? `${v.dwell_seconds}s` : '—';
-    const saveBtn = v.bookmark_id ? '' :
-      `<button class="secondary" style="padding:1px 6px;font-size:11px"
-        onclick="promoteVisitToBookmark('${esc(v.url)}','${esc(v.title || '')}')">&#128278; Save</button>`;
-    return `<tr>
-      <td>${esc(v.title || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(v.url)}">${_bmTruncUrl(v.url)}</td>
-      <td style="font-size:11px;color:var(--text-dim)">${esc(v.source || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim)">${dwell}</td>
-      <td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(v.visited_at || '')}</td>
-      <td style="white-space:nowrap">${saveBtn}</td>
+    const expandId = `ve-${esc(v.visit_id)}`;
+    const tds = cols.map(k => (_VIS_FIELD_META[k]?.render ?? (v => `<td>${esc(String(v[k] ?? ''))}</td>`))(v)).join('');
+    return `<tr>${tds}</tr>
+    <tr id="${expandId}" style="display:none">
+      <td colspan="${expandColspan}" style="padding:0 0 6px 18px">
+        <div id="${expandId}-body" style="font-size:11px;color:var(--text-dim)">Loading&hellip;</div>
+      </td>
     </tr>`;
   }).join('');
+  _visInitColResize();
+  _visUpdateSortHeaders();
+}
+
+function _visSortBy(col) {
+  if (_visSortCol === col) {
+    _visSortDir = _visSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    _visSortCol = col;
+    _visSortDir = 'asc';
+  }
+  renderVisits();
+}
+
+function _visUpdateSortHeaders() {
+  document.querySelectorAll('.vis-sort-arrow').forEach(span => {
+    const col = span.dataset.col;
+    if (col === _visSortCol) {
+      span.textContent = _visSortDir === 'asc' ? ' ↑' : ' ↓';
+      span.classList.add('active');
+    } else {
+      span.textContent = '⇅';
+      span.classList.remove('active');
+    }
+  });
+}
+
+async function _bmToggleVisitEvents(normalizedUrl, rowId) {
+  const row = document.getElementById(rowId);
+  if (!row) return;
+  const body = document.getElementById(rowId + '-body');
+  if (row.style.display !== 'none') { row.style.display = 'none'; return; }
+  row.style.display = '';
+  if (body.dataset.loaded) return;
+  const fmtDateTime = iso => {
+    if (!iso) return '—';
+    try {
+      return new Date(iso).toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+      });
+    } catch (_) { return iso; }
+  };
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/visit-events?normalized_url=' + encodeURIComponent(normalizedUrl));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const events = await r.json();
+    body.dataset.loaded = '1';
+    if (!events.length) { body.textContent = 'No events recorded.'; return; }
+    body.innerHTML = '<table style="border-collapse:collapse;width:100%"><thead><tr>'
+      + '<th style="text-align:left;padding:2px 8px;color:var(--text-dim);font-weight:600">Date / Time</th>'
+      + '<th style="text-align:left;padding:2px 8px;color:var(--text-dim);font-weight:600">Dwell</th>'
+      + '</tr></thead><tbody>'
+      + events.map(e => {
+          const d = e.dwell_seconds ? `${e.dwell_seconds}s` : '—';
+          return `<tr><td style="padding:2px 8px">${esc(fmtDateTime(e.visited_at))}</td><td style="padding:2px 8px">${d}</td></tr>`;
+        }).join('')
+      + '</tbody></table>';
+  } catch(err) {
+    body.textContent = `Failed: ${err.message}`;
+  }
 }
 
 function _bmToggleVisits() {
