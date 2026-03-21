@@ -30,11 +30,14 @@ async function saveCurrent() {
     const r = await apiFetch('/api/v1/bookmarks', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, title: title || null, tags, notes: notes || null, source: 'extension' }),
+      body: JSON.stringify({ url, title: title || '', tags, notes: notes || '', source: 'extension' }),
     });
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      throw new Error(d.detail || `HTTP ${r.status}`);
+      const msg = Array.isArray(d.detail)
+        ? d.detail.map(e => `${e.loc?.slice(-1)[0]}: ${e.msg}`).join('; ')
+        : (d.detail || `HTTP ${r.status}`);
+      throw new Error(msg);
     }
     statusEl.textContent = '✓ Saved!';
     statusEl.className = 'status ok';
