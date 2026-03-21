@@ -12,7 +12,7 @@
 //   🗄 PVE Hosts  [▼ 🤝 Nodes]                        (implicit Fleet group)
 //   🔧 App Config [▼ 🗺 Manual ARP, 🤖 AI Providers]  (implicit Configuration group)
 //   🗝 Keys       [▼ 🔒 Certs]                         (implicit Security group)
-//   📄 Docs       [▼ 🩺 Self Diagnostic]               (implicit Reference group)
+//   📄 Docs       [▼ 📋 Doc List, 🖼️ Images, 🩺 Self Diagnostic]  (implicit Reference group)
 //   ☰ Navbar Layout  (this editor — standalone)
 //
 // Disambiguation note:
@@ -44,8 +44,10 @@ const SettingsMenuConfig = {
         { id: 'ai-providers',    label: '🤖 AI Providers',    icon: '🤖', parent: 'settings',  order: 1 },
         { id: 'keys',            label: '🗝 Keys',            icon: '🗝', parent: null,       order: 2 },
         { id: 'certs',           label: '🔒 Certs',           icon: '🔒', parent: 'keys',     order: 0 },
-        { id: 'docs',            label: '📄 Docs',            icon: '📄', parent: null,       order: 3 },
-        { id: 'self-diag',       label: '🩺 Self Diagnostic', icon: '🩺', parent: 'docs',     order: 0 },
+        { id: 'docs',          label: '📄 Docs',            icon: '📄', parent: null,        order: 3 },
+        { id: 'docs-list',     label: '📋 Doc List',        icon: '📋', parent: 'docs',     order: 0 },
+        { id: 'docs-images',   label: '🖼️ Images',          icon: '🖼️', parent: 'docs',     order: 1 },
+        { id: 'self-diag',     label: '🩺 Self Diagnostic', icon: '🩺', parent: 'docs',     order: 2 },
         { id: 'settings-layout', label: '☰ Navbar Layout',   icon: '☰',  parent: null,       order: 4 },
     ],
 

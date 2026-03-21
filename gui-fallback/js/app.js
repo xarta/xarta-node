@@ -54,6 +54,8 @@ function switchTab(tab) {
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'certs')                                     loadCerts();
   if (tab === 'docs' && !_docsAll.length)                  loadDocs();
+  if (tab === 'docs-list') { if (!_docsAll.length) loadDocs(); else _docsRenderList(); }
+  if (tab === 'docs-images')                               openDocImagesModal();
   if (tab === 'ai-providers' && !_aiProviders.length)      loadAiProviders();
   if (tab === 'bookmarks-main'  && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks-history')                       loadVisits();
