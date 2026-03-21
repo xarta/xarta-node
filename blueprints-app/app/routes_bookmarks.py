@@ -277,6 +277,21 @@ async def list_visits(limit: int = Query(500, ge=1, le=5000)) -> list[VisitOut]:
     return [_row_to_visit_out(r) for r in rows]
 
 
+@router.get("/visit-events", response_model=list[dict])
+async def list_visit_events(
+    normalized_url: str = Query(...),
+    limit: int = Query(500, ge=1, le=10000),
+) -> list[dict]:
+    """Return the individual date/time audit trail for one URL."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_id, visited_at, dwell_seconds FROM visit_events "
+            "WHERE normalized_url=? ORDER BY visited_at DESC LIMIT ?",
+            (normalized_url, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 @router.get("/search", response_model=dict)
 async def search_bookmarks(
     q: str = Query(..., min_length=1),
@@ -779,7 +794,6 @@ async def import_bookmarks(body: BookmarkImportRequest) -> BookmarkImportResult:
 
 @router.post("/visits", response_model=VisitOut, status_code=201)
 async def create_visit(body: VisitCreate) -> VisitOut:
-    visit_id = str(uuid.uuid4())
     normalized_url = _normalize_url(body.url)
     visited_at = body.visited_at or _now_iso()
     with get_conn() as conn:
@@ -788,28 +802,75 @@ async def create_visit(body: VisitCreate) -> VisitOut:
             (normalized_url,),
         ).fetchone()
         bookmark_id = bm["bookmark_id"] if bm else None
+
+        # Always record an individual visit event (audit trail).
+        event_id = str(uuid.uuid4())
         conn.execute(
-            """
-            INSERT INTO visits (
-                visit_id, url, normalized_url, domain, title, source,
-                dwell_seconds, bookmark_id, visited_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                visit_id,
-                body.url,
-                normalized_url,
-                _domain(body.url),
-                body.title,
-                body.source,
-                body.dwell_seconds,
-                bookmark_id,
-                visited_at,
-            ),
+            "INSERT INTO visit_events (event_id, normalized_url, visited_at, dwell_seconds) VALUES (?,?,?,?)",
+            (event_id, normalized_url, visited_at, body.dwell_seconds),
         )
-        row = conn.execute("SELECT * FROM visits WHERE visit_id=?", (visit_id,)).fetchone()
-        gen = increment_gen(conn, "human")
-        enqueue_for_all_peers(conn, "INSERT", "visits", visit_id, dict(row), gen)
+        event_row = conn.execute(
+            "SELECT * FROM visit_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        event_gen = increment_gen(conn, "human")
+        enqueue_for_all_peers(conn, "INSERT", "visit_events", event_id, dict(event_row), event_gen)
+
+        existing = conn.execute(
+            "SELECT * FROM visits WHERE normalized_url=? LIMIT 1",
+            (normalized_url,),
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                """
+                UPDATE visits SET
+                    visited_at    = ?,
+                    title         = CASE WHEN ? != '' THEN ? ELSE title END,
+                    dwell_seconds = COALESCE(?, dwell_seconds),
+                    bookmark_id   = COALESCE(?, bookmark_id),
+                    visit_count   = visit_count + 1,
+                    updated_at    = datetime('now')
+                WHERE normalized_url = ?
+                """,
+                (
+                    visited_at,
+                    body.title, body.title,
+                    body.dwell_seconds,
+                    bookmark_id,
+                    normalized_url,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM visits WHERE normalized_url=?", (normalized_url,)
+            ).fetchone()
+            gen = increment_gen(conn, "human")
+            enqueue_for_all_peers(conn, "UPDATE", "visits", row["visit_id"], dict(row), gen)
+        else:
+            visit_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO visits (
+                    visit_id, url, normalized_url, domain, title, source,
+                    dwell_seconds, bookmark_id, visited_at, visit_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    visit_id,
+                    body.url,
+                    normalized_url,
+                    _domain(body.url),
+                    body.title,
+                    body.source,
+                    body.dwell_seconds,
+                    bookmark_id,
+                    visited_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM visits WHERE visit_id=?", (visit_id,)
+            ).fetchone()
+            gen = increment_gen(conn, "human")
+            enqueue_for_all_peers(conn, "INSERT", "visits", visit_id, dict(row), gen)
 
     trigger_seekdb_sync()
     return _row_to_visit_out(row)

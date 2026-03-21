@@ -118,6 +118,10 @@ button.secondary:hover { color: var(--text); border-color: var(--text-dim); }
 #bm-main-view table { table-layout: fixed; }
 #bm-main-view table td { overflow: hidden; }
 
+/* Fixed-layout visits table */
+#vis-table { table-layout: fixed; }
+#vis-table td { overflow: hidden; }
+
 /* ── Responsive component adjustments ── */
 @media (max-width: 900px) {
   .sync-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }

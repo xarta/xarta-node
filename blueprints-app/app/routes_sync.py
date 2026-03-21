@@ -53,6 +53,7 @@ _ALLOWED_TABLES = {
     "bookmarks",
     "visits",
     "bookmark_deletions",
+    "visit_events",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -160,6 +161,7 @@ def _pk_for_table(table: str) -> str:
         "bookmarks":               "bookmark_id",
         "visits":                  "visit_id",
         "bookmark_deletions":      "bookmark_id",
+        "visit_events":            "event_id",
     }
     return pk_map.get(table, "id")
 
