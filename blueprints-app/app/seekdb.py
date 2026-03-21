@@ -215,7 +215,7 @@ def vector_search_bookmarks(query_embedding: list[float], limit: int) -> list[di
     res = bookmarks_col().query(
         query_embeddings=[query_embedding],
         n_results=limit,
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
     return _extract_rows(res)
 
@@ -233,7 +233,7 @@ def vector_search_visits(query_embedding: list[float], limit: int) -> list[dict[
     res = visits_col().query(
         query_embeddings=[query_embedding],
         n_results=limit,
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
     return _extract_rows(res)
 

@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from .ai_client import embed, rerank
+from .ai_client import embed, rerank, complete
 from .db import get_conn, get_setting, set_setting, increment_gen
 from .models import (
     BookmarkCreate,
@@ -360,6 +360,8 @@ async def search_bookmarks(
     k = 60
 
     def _accumulate(rows: list[dict], src: str) -> None:
+        is_kw = "keyword" in src
+        is_vec = "vector" in src
         for rank, row in enumerate(rows):
             meta = row.get("metadata") or {}
             item_type = str(meta.get("item_type") or "bookmark")
@@ -371,6 +373,8 @@ async def search_bookmarks(
                     "item_type": item_type,
                     "id": item_id,
                     "score_sources": [src],
+                    "kw_tier": _kw_rank(row) if is_kw else None,
+                    "cosine_distance": row.get("distance") if is_vec else None,
                     "title": meta.get("title") or "",
                     "url": meta.get("url") or "",
                     "description": meta.get("description") or "",
@@ -384,6 +388,17 @@ async def search_bookmarks(
                 }
             else:
                 payload[key]["score_sources"].append(src)
+                # Keep the best (lowest) keyword tier.
+                if is_kw and payload[key]["kw_tier"] is None:
+                    payload[key]["kw_tier"] = _kw_rank(row)
+                elif is_kw:
+                    payload[key]["kw_tier"] = min(payload[key]["kw_tier"], _kw_rank(row))
+                # Keep the best (lowest) cosine distance.
+                if is_vec:
+                    dist = row.get("distance")
+                    if dist is not None:
+                        prev = payload[key]["cosine_distance"]
+                        payload[key]["cosine_distance"] = dist if prev is None else min(prev, dist)
 
     _accumulate(bm_kw, "bookmark_keyword")
     _accumulate(bm_vec, "bookmark_vector")
@@ -404,7 +419,15 @@ async def search_bookmarks(
             for r in results
         ]
         ranked = await rerank("browser-links", q, docs, top_n=min(limit, len(docs)))
-        results = [results[r["index"]] for r in ranked]
+        reranked = []
+        for reranker_pos, r_item in enumerate(ranked):
+            res = results[r_item["index"]]
+            res["reranker_rank"] = reranker_pos + 1
+            reranked.append(res)
+        results = reranked
+    else:
+        for r in results:
+            r["reranker_rank"] = 1
 
     # Post-reranker exact-match promotion.
     # Stable sort keeps the reranker's ordering within each tier.
@@ -433,13 +456,213 @@ async def search_bookmarks(
             return 3
         return 4
 
-    results.sort(key=_exact_tier)
+    # Compound sort: exact tier (keyword quality) primary; cosine distance secondary
+    # (results that also appear in vector search are ordered by semantic similarity
+    # within each tier); rrf_score as final tiebreaker.
+    # null cosine_distance = float('inf') → keyword-only results sort after dual-match
+    # results within the same tier, but still above pure-embedding (tier 4) results.
+    results.sort(key=lambda r: (
+        _exact_tier(r),
+        r.get("cosine_distance") if r.get("cosine_distance") is not None else float("inf"),
+        -(r.get("rrf_score") or 0.0),
+    ))
+    for r in results:
+        r["exact_tier"] = _exact_tier(r)
 
     return {
         "query": q,
         "count": len(results),
         "results": results,
     }
+
+
+# ── Score explanation endpoint ────────────────────────────────────────────────
+
+_SCORE_PIPELINE_CONTEXT = """
+You are a search ranking analyst explaining how a SINGLE bookmark result was scored in a hybrid search pipeline.
+
+ACRONYMS AND TERMS:
+- RRF = Reciprocal Rank Fusion — the score-merging formula that combines results from multiple ranking lists
+- HNSW = Hierarchical Navigable Small World — the graph-based approximate nearest-neighbour index used for vector search
+- KW = Keyword (the $contains full-text filter arm)
+- VEC = Vector (the HNSW semantic embedding similarity arm)
+- BM = Bookmark (a saved bookmark record)
+- V = Visit (a browser history visit record)
+- kw_tier = Keyword Tier — pre-RRF quality rank of where the query appears in this bookmark's text fields
+- exact_tier = Exact Tier — post-reranker promotion tier based on literal token presence
+- cosine_distance = geometric distance between query and bookmark in embedding space (0=identical, 1=orthogonal)
+- score_sources = list of pipeline arms that returned this bookmark as a candidate
+- reranker_rank = position assigned by the cross-encoder reranker (1=best)
+- rrf_score = final Reciprocal Rank Fusion score (higher=better)
+
+CRITICAL FRAMING — make this clear in your response:
+- The pipeline always runs ALL four search arms (bookmark keyword, bookmark vector, visit keyword, visit vector) for the entire query.
+- Each result's score_sources only lists which arms FOUND THAT SPECIFIC BOOKMARK in their top candidates.
+- If score_sources shows only bookmark_keyword, it means the vector arm ran fine but this bookmark did not appear in its top candidates — NOT that vector search was skipped.
+- Other results in the same search may have been found by vector search. Each result is independent.
+
+The search pipeline (in order):
+1. KEYWORD SEARCH — SeekDB $contains filter over a text document concatenating title+description+tags+notes+url. Results are pre-sorted by kw_tier before RRF: 0=full phrase in title, 1=full phrase in URL, 2=all tokens cross-field, 3=full phrase in tags, 4=any token in title, 5=any token in URL, 6=any token in tags, 7=document body only. Null kw_tier means this result was not a keyword match.
+2. VECTOR SEARCH — Each bookmark has ONE embedding of its full concatenated document (title+description+tags+notes+url). Query is also embedded. Cosine HNSW nearest-neighbour search finds the 30 closest bookmarks. cosine_distance: 0=identical direction, 1=orthogonal. Null cosine_distance means this result was not a vector match (it appeared via keyword search only).
+3. RRF (Reciprocal Rank Fusion) — Merges results from all contributing arms. score += 1/(60+rank+1) per arm. rrf_score is the sum — higher means better combined rank.
+4. RERANKER — Cross-encoder rescores the top results by reading title+url+description+notes against the query. reranker_rank is 1-indexed position after this step.
+5. EXACT TIER PROMOTION — Stable sort after reranking: 0=phrase in title/URL, 1=all tokens cross-field, 2=any token in title/URL, 3=tags only, 4=pure embedding.
+
+The user's search query and full result JSON will be provided. Explain each metric clearly — what the value means specifically for this result and this query, and what it reveals about relevance. Use markdown with headings. Be concise and precise.
+""".strip()
+
+_FOCUS_CONTEXT = {
+    "score_sources": ("Score Sources", "score_sources lists which of the 4 pipeline arms found THIS SPECIFIC BOOKMARK in their top candidates (bookmark_keyword, bookmark_vector, visit_keyword, visit_vector). IMPORTANT: all four arms always run for every search. An arm missing from score_sources means this bookmark was not in that arm's top candidates — not that the arm was skipped. Other results in the same search may have different sources. Each arm that finds a result adds 1/(60+rank+1) to the RRF score. Being found by multiple arms is a strong relevance signal."),
+    "rrf_score": ("RRF Score", "rrf_score is the Reciprocal Rank Fusion total. For each source list a result appears in, the formula 1/(60+rank+1) is added, where rank is 0-indexed position in that list. Higher = better. Typical values: ~0.015 for a top result, ~0.005 for a lower one. The k=60 constant dampens rank differences — it prevents one very-top rank from dominating."),
+    "kw_tier": ("Keyword Tier (kw_tier)", "kw_tier is the pre-RRF quality tier for keyword matches (0=best, 7=worst). It determines sort order within the keyword result list before RRF merging. 0: full phrase in title. 1: full phrase in URL. 2: all query tokens found across title+url+tags combined. 3: full phrase in tags. 4: any token in title. 5: any token in URL. 6: any token in any tag. 7: match only in description or notes (document body). Null means this result was NOT found by keyword search at all — it came from vector search only."),
+    "cosine_distance": ("Cosine Distance", "cosine_distance is the geometric distance between the query embedding and the bookmark's embedding in the HNSW vector index. Both are computed from a concatenation of title+description+tags+notes+url. Scale: 0=identical direction, 1=orthogonal (no semantic overlap). Values below 0.3 indicate strong semantic match; 0.4-0.6 is moderate; above 0.6 is weak. Null means this result was NOT found by vector search — it appeared only via keyword match. The vector search ran but this bookmark was not in its top candidates."),
+    "reranker_rank": ("Reranker Rank", "reranker_rank is the 1-indexed position assigned by the cross-encoder reranker. The reranker reads the bookmark's title+url+description+notes together with the query and produces a relevance score — it understands full sentences and context, unlike the embedding model which computes a single vector. rank=1 is best. A null value means only one result was returned (no reranking needed) or the result was below the top-N cutoff."),
+    "exact_tier": ("Exact Tier", "exact_tier is the post-reranker promotion tier (stable sort, so reranker order is preserved within each tier). 0: full phrase in title or URL. 1: all query tokens found across title+url+tags. 2: any query token in title or URL. 3: phrase or token only in tags. 4: pure semantic match (no token overlap at all). This ensures that a result containing the literal query words is never buried below a purely semantic result, even if the reranker ranked it lower."),
+}
+
+
+@router.post("/score-explain", response_model=dict)
+async def post_score_explain(body: dict) -> dict:
+    """Call the browser-links LLM to explain how a search result was scored and ranked."""
+    query: str = (body.get("query") or "").strip()
+    result: dict = body.get("result") or {}
+    focus: str | None = body.get("focus")  # None = overview; metric key = drill-down
+
+    if focus and focus in _FOCUS_CONTEXT:
+        metric_label, metric_context = _FOCUS_CONTEXT[focus]
+        metric_value = result.get(focus)
+        title = result.get("title") or result.get("url") or "this bookmark"
+        system = (
+            f"You are a search ranking analyst. Explain the '{metric_label}' metric in detail for one specific search result.\n\n"
+            f"Metric context:\n{metric_context}\n\n"
+            f"Be specific to the actual value and the bookmark's content. Use markdown. Be concise but complete."
+        )
+        user_content = (
+            f"/no-think\n"
+            f"Search query: \"{query}\"\n"
+            f"Bookmark: \"{title}\"\n"
+            f"Metric: {metric_label}\n"
+            f"Value: {json.dumps(metric_value)}\n\n"
+            f"Full result JSON for context:\n{json.dumps(result, indent=2, default=str)}\n\n"
+            f"Explain specifically why {metric_label} has this value for this bookmark and this query. "
+            f"What does it tell us about how relevant this bookmark is?"
+        )
+    else:
+        title = result.get("title") or result.get("url") or "this bookmark"
+        system = _SCORE_PIPELINE_CONTEXT
+        user_content = (
+            f"/no-think\n"
+            f"Search query: \"{query}\"\n"
+            f"Bookmark title: \"{title}\"\n\n"
+            f"Full result JSON:\n{json.dumps(result, indent=2, default=str)}\n\n"
+            f"Explain each scoring metric for this result. For each metric, say what the value means "
+            f"specifically for this bookmark and this query. Does each metric suggest this result is relevant? "
+            f"How did the pipeline steps combine to produce this final ranking?"
+        )
+
+    try:
+        answer = await complete(
+            "browser-links",
+            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+            max_tokens=2000,
+            strip_think=True,
+            no_think=True,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"LLM error: {e}")
+
+    return {"explanation": answer, "focus": focus}
+
+
+_SORT_EXPLAIN_SYSTEM = """
+You are a search ranking analyst explaining to a user exactly why a list of bookmark search results is ordered the way it is.
+
+ACRONYMS AND TERMS:
+- RRF = Reciprocal Rank Fusion — score-merging formula combining multiple result lists: score += 1/(60+rank+1) per arm
+- HNSW = Hierarchical Navigable Small World — graph-based approximate nearest-neighbour index used for vector search
+- KW = Keyword (the $contains full-text filter arm)
+- VEC = Vector (the HNSW semantic embedding similarity arm)
+- BM = Bookmark record; V = Visit (browser history) record
+- kw_tier = Keyword Tier — pre-RRF quality rank of where the query appears in the bookmark's text (0=best, 7=worst, null=not a keyword match)
+- exact_tier = Exact Tier — post-reranker promotion tier based on literal token presence (0=best, 4=worst)
+- cosine_distance = geometric distance between query and bookmark embedding (0=identical direction, 1=orthogonal; null=not found by vector search)
+- rrf_score = final merged score from all contributing arms (higher=better)
+- reranker_rank = position assigned by cross-encoder reranker (1=best; may be overridden by compound sort)
+- score_sources = which pipeline arms returned this bookmark as a candidate
+
+THE COMPOUND SORT KEY (applied in this order of priority):
+1. exact_tier (ascending — lower is better): coarse grouping by how well query tokens match title/URL/tags
+   - 0: full query phrase in title or URL
+   - 1: every token found across title+url+tags combined
+   - 2: at least one token in title or URL
+   - 3: phrase or token only in tags
+   - 4: no token match — pure semantic/embedding result
+2. cosine_distance (ascending — lower is better): within each exact_tier group, results also found by vector search are sorted by semantic closeness. Results NOT found by vector search (null cosine_distance) sort after all vector-matched results in the same tier.
+3. rrf_score (descending — higher is better): final tiebreaker within the same tier and distance group.
+
+The user will supply the search query, the top results in final sort order (as a JSON array with all scoring fields), and the current sort state if the user has clicked a column header.
+
+Your job: explain clearly and concisely WHY each result is in its current position. Walk through the compound sort key. Identify which tier group(s) are present, point out what's driving the ordering within each group, and flag any interesting cases (e.g. a result with a great reranker_rank that is not at the top because exact_tier or cosine_distance pushed it down). Use markdown with clear sections.
+""".strip()
+
+
+@router.post("/sort-explain", response_model=dict)
+async def post_sort_explain(body: dict) -> dict:
+    """Call the browser-links LLM to explain the sort order of the current search results."""
+    query: str = (body.get("query") or "").strip()
+    results: list = body.get("results") or []
+    sort_col: str = body.get("sort_col") or "compound"
+    sort_dir: str = body.get("sort_dir") or "asc"
+
+    if not results:
+        raise HTTPException(400, "No results provided")
+
+    # Strip large fields to keep the prompt tight but keep all scoring fields
+    slim = []
+    for i, r in enumerate(results):
+        slim.append({
+            "rank": i + 1,
+            "title": (r.get("title") or "")[:120],
+            "url": (r.get("url") or "")[:100],
+            "score_sources": r.get("score_sources"),
+            "kw_tier": r.get("kw_tier"),
+            "cosine_distance": r.get("cosine_distance"),
+            "rrf_score": r.get("rrf_score"),
+            "reranker_rank": r.get("reranker_rank"),
+            "exact_tier": r.get("exact_tier"),
+            "item_type": r.get("item_type"),
+        })
+
+    sort_note = (
+        f"NOTE: The user has manually re-sorted the table by column '{sort_col}' ({sort_dir}). "
+        f"The compound sort above was the original order; the user-selected sort is now applied instead."
+        if sort_col != "compound"
+        else "The results are shown in the default compound sort order."
+    )
+
+    user_content = (
+        f"/no-think\n"
+        f"Search query: \"{query}\"\n"
+        f"{sort_note}\n\n"
+        f"Results in current display order (top {len(slim)}):\n"
+        f"{json.dumps(slim, indent=2, default=str)}\n\n"
+        f"Explain the sort order. Walk through each result group, what's driving position, "
+        f"and point out any interesting or surprising placements."
+    )
+
+    try:
+        answer = await complete(
+            "browser-links",
+            [{"role": "system", "content": _SORT_EXPLAIN_SYSTEM},
+             {"role": "user", "content": user_content}],
+            max_tokens=2500,
+            strip_think=True,
+            no_think=True,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"LLM error: {e}")
+
+    return {"explanation": answer}
 
 
 @router.get("/extension-download")
