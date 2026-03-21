@@ -1,3 +1,8 @@
+---
+name: blueprints-gui
+description: Work on the Blueprints GUI — the HTML/CSS/JS dashboard and node-selector embed served by each xarta-node. Use when the user wants to edit, improve, or debug the Blueprints web interface, node selector component, or embed widget. Also use when distributing GUI updates across the fleet via sync_git_inner.
+---
+
 # blueprints-gui skill
 
 Work on the Blueprints GUI — the HTML/CSS/JS dashboard served at `/ui` on every

@@ -1,4 +1,3 @@
-````skill
 ---
 name: blueprints-add-table
 description: Add a brand-new table to the Blueprints app with full CRUD API, fleet sync, and optional GUI tab. Use when the user wants to introduce a new data entity (not just a new column on an existing table).
@@ -289,4 +288,3 @@ wrong PK). The drain retries every 1–20 s. **No data is lost** — items stay 
 - [ ] Local service restarted
 - [ ] `git-pull` triggered (`scope: "outer"`) to fleet
 - [ ] Drain verified clean (`sent=1` for all queue rows)
-````
