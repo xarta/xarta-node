@@ -292,20 +292,61 @@ async def search_bookmarks(
     vis_kw = keyword_search_visits(q, window) if include_visits else []
     vis_vec = vector_search_visits(query_embedding, window) if include_visits else []
 
+    # Compute once; used by both pre-RRF and post-rerank ranking functions.
+    q_lower = q.lower()
+    q_tokens = q_lower.split()  # individual words: ["github", "noise"]
+
+    # Load excluded tags so we don't boost results merely because a nuisance
+    # tag (e.g. "favourites-bar") happens to match the query term.
+    with get_conn() as _conn:
+        _excl_raw = get_setting(_conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
+    _excluded_tags: set[str] = {t.strip().lower() for t in (_excl_raw or "").split(",") if t.strip()}
+
+    def _searchable_tags(tags_json_str: str | None) -> str:
+        """Return space-joined tag text with excluded tags removed."""
+        try:
+            all_tags = json.loads(tags_json_str or "[]")
+        except Exception:
+            all_tags = []
+        return " ".join(t for t in (str(x) for x in all_tags) if t.lower() not in _excluded_tags)
+
     # Pre-rank keyword results by match location before RRF.
     # ChromaDB's $contains filter returns results in insertion order, not by
-    # relevance. We sort so that title matches rank first, then URL matches,
-    # then anything else. This ensures an exact word match in the title/URL
-    # gets a low rank number → high RRF score, dominating vector results that
-    # happen to be semantically nearby but don't actually contain the query term.
+    # relevance. We sort so that the best substring matches get low rank
+    # numbers → high RRF scores, dominating vector results that happen to be
+    # semantically nearby but don't actually contain the query terms.
+    #
+    # Priority (lower number = better):
+    #   0 — full phrase in title
+    #   1 — full phrase in url
+    #   2 — all tokens found anywhere across title+url+tags (cross-field)
+    #   3 — full phrase matches any tag
+    #   4 — at least one token in title
+    #   5 — at least one token in url
+    #   6 — at least one token in any tag
+    #   7 — no substring match (document match only — e.g. description/notes)
     def _kw_rank(row: dict) -> int:
-        q_lower = q.lower()
         meta = row.get("metadata") or {}
-        if q_lower in (meta.get("title") or "").lower():
+        title = (meta.get("title") or "").lower()
+        url = (meta.get("url") or "").lower()
+        combined = title + " " + url
+        tags_text = _searchable_tags(meta.get("tags_json")).lower()
+        all_text = combined + " " + tags_text
+        if q_lower in title:
             return 0
-        if q_lower in (meta.get("url") or "").lower():
+        if q_lower in url:
             return 1
-        return 2
+        if len(q_tokens) > 1 and all(t in all_text for t in q_tokens):
+            return 2
+        if q_lower in tags_text:
+            return 3
+        if any(t in title for t in q_tokens):
+            return 4
+        if any(t in url for t in q_tokens):
+            return 5
+        if any(t in tags_text for t in q_tokens):
+            return 6
+        return 7
 
     bm_kw.sort(key=_kw_rank)
     vis_kw.sort(key=_kw_rank)
@@ -361,17 +402,32 @@ async def search_bookmarks(
         ranked = await rerank("browser-links", q, docs, top_n=min(limit, len(docs)))
         results = [results[r["index"]] for r in ranked]
 
-    # Post-reranker exact-match promotion: results with the query term in the
-    # title or URL must not appear below results where it appears nowhere.
-    # Stable sort within each tier preserves the reranker's ordering.
-    q_lower = q.lower()
+    # Post-reranker exact-match promotion.
+    # Stable sort keeps the reranker's ordering within each tier.
+    #
+    # Tier 0 — full phrase found in title or url
+    # Tier 1 — every token found across title+url+tags combined (cross-field)
+    # Tier 2 — at least one token found in title or url
+    # Tier 3 — phrase or token found in tags only
+    # Tier 4 — no token match at all (pure embedding result)
 
     def _exact_tier(r: dict) -> int:
-        if q_lower in (r.get("title") or "").lower():
+        title = (r.get("title") or "").lower()
+        url = (r.get("url") or "").lower()
+        combined = title + " " + url
+        tags_text = " ".join(
+            t for t in (r.get("tags") or []) if t.lower() not in _excluded_tags
+        ).lower()
+        all_text = combined + " " + tags_text
+        if q_lower in combined:
             return 0
-        if q_lower in (r.get("url") or "").lower():
+        if len(q_tokens) > 1 and all(t in all_text for t in q_tokens):
             return 1
-        return 2
+        if any(t in combined for t in q_tokens):
+            return 2
+        if q_lower in tags_text or any(t in tags_text for t in q_tokens):
+            return 3
+        return 4
 
     results.sort(key=_exact_tier)
 
