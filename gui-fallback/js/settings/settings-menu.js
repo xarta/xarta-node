@@ -1,42 +1,52 @@
-// probes-menu.js — Split-dropdown navigation for the Probes group
+// settings-menu.js — Split-dropdown navigation for the Settings group
 // xarta-node Blueprints GUI
 //
 // Adapts the reference menu-system pattern (patterns/menu-system/) to
-// the Probes group. Calls the existing switchTab() / switchGroup()
+// the Settings group. Calls the existing switchTab() / switchGroup()
 // infrastructure — does NOT manage its own tab panels.
 //
-// localStorage key: 'blueprintsProbesMenuConfig'
-// (unique key — future group menus must use different keys)
+// localStorage key: 'blueprintsSettingsMenuConfig'
+// (unique key — probes menu uses 'blueprintsProbesMenuConfig')
+//
+// Default groupings:
+//   🗄 PVE Hosts  [▼ 🤝 Nodes]                        (implicit Fleet group)
+//   🔧 App Config [▼ 🗺 Manual ARP, 🤖 AI Providers]  (implicit Configuration group)
+//   🗝 Keys       [▼ 🔒 Certs]                         (implicit Security group)
+//   📄 Docs       [▼ 🩺 Self Diagnostic]               (implicit Reference group)
+//   ☰ Navbar Layout  (this editor — standalone)
+//
+// Disambiguation note:
+//   "🔧 App Config"   = /api/v1/settings key-value store  (tab id: settings)
+//   "☰ Navbar Layout" = this menu editor                   (tab id: settings-layout)
 //
 // No inline event handlers — all event wiring via addEventListener.
 
 'use strict';
 
-const ProbesMenuConfig = {
+const SettingsMenuConfig = {
 
-    STORAGE_KEY: 'blueprintsProbesMenuConfig',
+    STORAGE_KEY: 'blueprintsSettingsMenuConfig',
 
     _initialized: false,
 
     // ── Default menu structure ─────────────────────────────────
-    // id     — must match the existing switchTab() tab IDs
+    // id     — must match existing switchTab() tab IDs
     // parent — null = top-level; 'parentId' = child of that item
     // order  — sort order within level (0-based)
-    // Note: items with children redirect to their first child on label click.
-
+    //
+    // All top-level items are real tabs so clicking their label always
+    // navigates to a live panel (same pattern as proxmox-config in probes).
     defaultMenu: [
-        { id: 'pfsense-dns',          label: '🔥 pfSense DNS',     icon: '🔥', parent: null,             order: 0 },
-        { id: 'proxmox-config',       label: '🖥 Proxmox Config',  icon: '🖥', parent: null,             order: 1 },
-        { id: 'vlans',                label: '🔀 VLANs',           icon: '🔀', parent: 'proxmox-config',  order: 0 },
-        { id: 'ssh-targets',          label: '🎯 SSH Targets',     icon: '🎯', parent: 'proxmox-config',  order: 1 },
-        { id: 'dockge-stacks',        label: '🐳 Dockge Stacks',   icon: '🐳', parent: 'proxmox-config',  order: 2 },
-        { id: 'caddy-configs',        label: '🌐 Caddy Configs',   icon: '🌐', parent: 'proxmox-config',  order: 3 },
-        { id: 'bookmarks',            label: '🔖 Bookmarks',       icon: '🔖', parent: null,             order: 2 },
-        { id: 'bookmarks-main',       label: '📋 Main',            icon: '📋', parent: 'bookmarks',       order: 0 },
-        { id: 'bookmarks-history',    label: '📜 History',         icon: '📜', parent: 'bookmarks',       order: 1 },
-        { id: 'bookmarks-embeddings', label: '🤖 Embeddings',      icon: '🤖', parent: 'bookmarks',       order: 2 },
-        { id: 'bookmarks-setup',      label: '⚙ Setup',           icon: '⚙',  parent: 'bookmarks',       order: 3 },
-        { id: 'probes-settings',      label: '☰ Navbar Layout',   icon: '☰',  parent: null,             order: 3 },
+        { id: 'pve-hosts',       label: '🗄 PVE Hosts',       icon: '🗄', parent: null,       order: 0 },
+        { id: 'nodes',           label: '🤝 Nodes',           icon: '🤝', parent: 'pve-hosts', order: 0 },
+        { id: 'settings',        label: '🔧 App Config',      icon: '🔧', parent: null,       order: 1 },
+        { id: 'arp-manual',      label: '🗺 Manual ARP',      icon: '🗺', parent: 'settings',  order: 0 },
+        { id: 'ai-providers',    label: '🤖 AI Providers',    icon: '🤖', parent: 'settings',  order: 1 },
+        { id: 'keys',            label: '🗝 Keys',            icon: '🗝', parent: null,       order: 2 },
+        { id: 'certs',           label: '🔒 Certs',           icon: '🔒', parent: 'keys',     order: 0 },
+        { id: 'docs',            label: '📄 Docs',            icon: '📄', parent: null,       order: 3 },
+        { id: 'self-diag',       label: '🩺 Self Diagnostic', icon: '🩺', parent: 'docs',     order: 0 },
+        { id: 'settings-layout', label: '☰ Navbar Layout',   icon: '☰',  parent: null,       order: 4 },
     ],
 
     currentMenu: [],
@@ -44,7 +54,7 @@ const ProbesMenuConfig = {
 
     // ── Lifecycle ──────────────────────────────────────────────
 
-    // Called by switchGroup('probes') each time the probes group becomes active.
+    // Called by switchGroup('settings') each time the settings group becomes active.
     // Full setup on first call; subsequent calls just refresh active state.
     showGroup() {
         if (!this._initialized) {
@@ -55,16 +65,16 @@ const ProbesMenuConfig = {
             this._initialized = true;
 
             // Wire hamburger toggle
-            const toggle = document.getElementById('probesMenuToggle');
+            const toggle = document.getElementById('settingsMenuToggle');
             if (toggle) toggle.addEventListener('click', () => this.toggleMenu());
 
-            // Wire save/reset buttons in navbar-layout panel
-            const saveBtn = document.getElementById('probesMenuSaveButton');
+            // Wire save/reset buttons in the layout editor panel
+            const saveBtn = document.getElementById('settingsMenuSaveButton');
             if (saveBtn) saveBtn.addEventListener('click', () => this.saveConfig(true));
-            const resetBtn = document.getElementById('probesMenuResetButton');
+            const resetBtn = document.getElementById('settingsMenuResetButton');
             if (resetBtn) resetBtn.addEventListener('click', () => this.resetConfig());
         }
-        // Always refresh active state when the group re-activates
+        // Always refresh active state when group re-activates
         this.updateActiveTab();
     },
 
@@ -82,7 +92,7 @@ const ProbesMenuConfig = {
                     }
                 });
             } catch (e) {
-                console.error('[ProbesMenuConfig] Failed to parse saved config:', e);
+                console.error('[SettingsMenuConfig] Failed to parse saved config:', e);
                 this.currentMenu = JSON.parse(JSON.stringify(this.defaultMenu));
             }
         } else {
@@ -98,7 +108,7 @@ const ProbesMenuConfig = {
     },
 
     resetConfig() {
-        if (confirm('Reset probes menu to default layout?')) {
+        if (confirm('Reset settings navbar to default layout?')) {
             localStorage.removeItem(this.STORAGE_KEY);
             this.currentMenu = JSON.parse(JSON.stringify(this.defaultMenu));
             this.saveConfig(false);
@@ -108,7 +118,7 @@ const ProbesMenuConfig = {
     },
 
     showSaveNotification() {
-        const notif = document.getElementById('probesMenuSaveNotification');
+        const notif = document.getElementById('settingsMenuSaveNotification');
         if (notif) {
             notif.classList.add('show');
             setTimeout(() => notif.classList.remove('show'), 2000);
@@ -130,7 +140,7 @@ const ProbesMenuConfig = {
     },
 
     updateOrderFromDOM() {
-        const topItems = document.querySelectorAll('#probesMenuEditorList > .menu-editor-item');
+        const topItems = document.querySelectorAll('#settingsMenuEditorList > .menu-editor-item');
         topItems.forEach((el, idx) => {
             const id = el.dataset.id;
             const item = this.currentMenu.find(m => m.id === id);
@@ -148,16 +158,16 @@ const ProbesMenuConfig = {
     // ── Mobile menu ────────────────────────────────────────────
 
     toggleMenu() {
-        const toggle = document.getElementById('probesMenuToggle');
-        const tabs   = document.getElementById('probesHubTabs');
+        const toggle = document.getElementById('settingsMenuToggle');
+        const tabs   = document.getElementById('settingsHubTabs');
         if (!toggle || !tabs) return;
         const open = tabs.classList.toggle('open');
         toggle.classList.toggle('open', open);
     },
 
     closeMenu() {
-        const toggle = document.getElementById('probesMenuToggle');
-        const tabs   = document.getElementById('probesHubTabs');
+        const toggle = document.getElementById('settingsMenuToggle');
+        const tabs   = document.getElementById('settingsHubTabs');
         if (toggle) toggle.classList.remove('open');
         if (tabs)   tabs.classList.remove('open');
     },
@@ -165,7 +175,7 @@ const ProbesMenuConfig = {
     // ── Navbar rendering ───────────────────────────────────────
 
     renderNavbar() {
-        const navbar = document.getElementById('probesHubTabs');
+        const navbar = document.getElementById('settingsHubTabs');
         if (!navbar) return;
         navbar.innerHTML = '';
 
@@ -186,8 +196,8 @@ const ProbesMenuConfig = {
                     </div>
                 `;
 
-                // Label click → navigate to this item's own tab if it exists,
-                // otherwise fall back to first child (pure grouping parent with no own panel).
+                // Label click → navigate to this item's own tab
+                // (all top-level items are real tabs in the default config)
                 dropdown.querySelector('.hub-tab-label').addEventListener('click', (e) => {
                     e.stopPropagation();
                     const ownPanel = document.getElementById('tab-' + item.id);
@@ -243,7 +253,7 @@ const ProbesMenuConfig = {
     },
 
     closeDropdowns() {
-        document.querySelectorAll('#probesHubTabs .hub-tab-dropdown.open')
+        document.querySelectorAll('#settingsHubTabs .hub-tab-dropdown.open')
             .forEach(d => d.classList.remove('open'));
     },
 
@@ -256,16 +266,16 @@ const ProbesMenuConfig = {
         }
 
         // Update mobile hamburger label
-        const labelEl = document.getElementById('probesCurrentTabLabel');
+        const labelEl = document.getElementById('settingsCurrentTabLabel');
 
-        // Reset all active states in the probes navbar
-        document.querySelectorAll('#probesHubTabs .hub-tab, #probesHubTabs .hub-dropdown-item')
+        // Reset all active states in the settings navbar
+        document.querySelectorAll('#settingsHubTabs .hub-tab, #settingsHubTabs .hub-dropdown-item')
             .forEach(el => el.classList.remove('active'));
 
         // Find and activate the matching button
         const activeBtn = document.querySelector(
-            `#probesHubTabs .hub-tab[data-tab="${activeId}"], ` +
-            `#probesHubTabs .hub-dropdown-item[data-tab="${activeId}"]`
+            `#settingsHubTabs .hub-tab[data-tab="${activeId}"], ` +
+            `#settingsHubTabs .hub-dropdown-item[data-tab="${activeId}"]`
         );
         if (activeBtn) {
             activeBtn.classList.add('active');
@@ -283,7 +293,7 @@ const ProbesMenuConfig = {
     // ── Editor rendering ───────────────────────────────────────
 
     renderEditor() {
-        const container = document.getElementById('probesMenuEditorList');
+        const container = document.getElementById('settingsMenuEditorList');
         if (!container) return;
         container.innerHTML = '';
         this.getTopLevelItems().forEach(item => container.appendChild(this.createEditorItem(item)));
@@ -362,7 +372,7 @@ const ProbesMenuConfig = {
     // ── Drag & Drop ────────────────────────────────────────────
 
     setupDragAndDrop() {
-        const container = document.getElementById('probesMenuEditorList');
+        const container = document.getElementById('settingsMenuEditorList');
         if (!container) return;
 
         // Replace node to remove all stale event listeners
@@ -454,7 +464,7 @@ const ProbesMenuConfig = {
                     }
                 } else if (!draggedIsChild && !targetIsChild) {
                     // Reorder top-level items
-                    const list  = document.getElementById('probesMenuEditorList');
+                    const list  = document.getElementById('settingsMenuEditorList');
                     const items = Array.from(list.querySelectorAll(':scope > .menu-editor-item'));
                     const draggedIdx = items.indexOf(this.draggedItem);
                     const targetIdx  = items.indexOf(targetItem);

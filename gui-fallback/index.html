@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="css/tables.css" />
   <link rel="stylesheet" href="css/components.css" />
   <link rel="stylesheet" href="css/probes-menu.css" />
+  <link rel="stylesheet" href="css/settings-menu.css" />
 </head>
 <body>
 
@@ -19,7 +20,7 @@
     <div class="node-meta">
       <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
       <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
-      <span class="nm-item" id="nn-keys"><button class="badge badge-btn" id="keys-badge" onclick="switchGroup('settings');switchTab('keys')" style="display:none">&#9871; —</button></span>
+      <span class="nm-item" id="nn-keys"><button class="badge badge-btn" id="keys-badge" onclick="switchGroup('settings');switchTab('keys');SettingsMenuConfig.updateActiveTab('keys')" style="display:none">&#9871; —</button></span>
       <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
     </div>
   </div>
@@ -40,16 +41,7 @@
     <button data-group="synthesis" class="active" onclick="switchTab('manual-links')">Manual</button>
     <button data-group="synthesis" onclick="switchTab('services')">Services</button>
     <button data-group="synthesis" onclick="switchTab('machines')">Machines</button>
-    <!-- SETTINGS group -->
-    <button data-group="settings" style="display:none" onclick="switchTab('settings')">Settings</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('pve-hosts')">PVE Hosts</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('arp-manual')">Manual ARP</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('nodes')">Nodes</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('keys')">&#9871; Keys</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('certs')">&#128274; Certs</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('docs')">&#128196; Docs</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('self-diag')">Self Diagnostic</button>
-    <button data-group="settings" style="display:none" onclick="switchTab('ai-providers')">&#129302; AI Providers</button>
+    <!-- SETTINGS group — navigation handled by SettingsMenuConfig split-dropdown below -->
     <!-- PROBES group — navigation handled by ProbesMenuConfig split-dropdown below -->
   </nav>
 
@@ -65,6 +57,19 @@
     </div>
   </div>
   <div id="probesMenuSaveNotification">✓ Saved</div>
+
+  <!-- Settings split-dropdown menu — shown when settings group is active -->
+  <div id="settingsMenuWrapper" style="display:none;margin-bottom:4px">
+    <div class="hub-tabs-wrapper" style="margin-bottom:0">
+      <button class="hub-menu-toggle" id="settingsMenuToggle">
+        <span class="hamburger-icon">☰</span>
+        <span class="current-tab-label" id="settingsCurrentTabLabel">Settings</span>
+        <span class="dropdown-arrow">▼</span>
+      </button>
+      <div class="hub-tabs" id="settingsHubTabs"></div>
+    </div>
+  </div>
+  <div id="settingsMenuSaveNotification">✓ Saved</div>
 
   <!-- Settings -->
   <section id="tab-settings" class="tab-panel">
@@ -867,8 +872,29 @@
   </section>
 
   <!-- Probes — Menu Settings -->
+  <!-- Settings — Navbar Layout editor -->
+  <section id="tab-settings-layout" class="tab-panel">
+    <h2>&#9776; Navbar Layout</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Settings navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
+    <div class="menu-editor-container">
+      <div class="menu-editor-header">
+        <h3>Settings Navigation</h3>
+        <div style="display:flex;gap:8px">
+          <button class="btn-save-menu" id="settingsMenuSaveButton">Save layout</button>
+          <button class="btn-reset-menu" id="settingsMenuResetButton">Reset defaults</button>
+        </div>
+      </div>
+      <div class="menu-editor-instructions">
+        <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
+        <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
+      </div>
+      <div id="settingsMenuEditorList"></div>
+    </div>
+  </section>
+
+  <!-- Probes — Navbar Layout -->
   <section id="tab-probes-settings" class="tab-panel">
-    <h2>&#9881; Menu Settings</h2>
+    <h2>&#9776; Navbar Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Probes navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -1215,6 +1241,7 @@
 <script src="js/probes/caddy.js"></script>
 <script src="js/probes/bookmarks.js"></script>
 <script src="js/probes/probes-menu.js"></script>
+<script src="js/settings/settings-menu.js"></script>
 <script src="js/app.js"></script>
 
 <!-- Restore confirmation modal -->
