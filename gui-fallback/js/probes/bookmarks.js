@@ -116,6 +116,17 @@ let _bmTagCounts = {};       // {tag -> {active, archived}}
 let _bmCurrentExclTags = []; // source of truth; kept in sync with server
 let _bmLastSearchResults = []; // cached for re-render on column toggle
 
+// ── Pagination state ─────────────────────────────────────────────────────
+// Visual-only pagination: full _bookmarks array is always loaded; only the
+// rendered slice changes.  All client-side filter/sort/search still operates
+// on the complete dataset — only the table render is sliced.
+const _BM_PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 1000, 2000, 5000, 10000];
+let _bmPage = 1;
+let _bmPageSize = (() => {
+  const n = parseInt(localStorage.getItem('bm-page-size') || '100', 10);
+  return _BM_PAGE_SIZE_OPTIONS.includes(n) ? n : 100;
+})();
+
 // Dynamic column list — derived from actual API response keys, not hardcoded
 let _bmDynCols = []; // populated by _bmDetectCols(); drives everything
 
@@ -221,7 +232,7 @@ function _bmApplyColsModal() {
   if (_bmSearchActive) {
     _renderBmSearchResults(_bmLastSearchResults);
   } else {
-    renderBookmarks();
+    renderBookmarks({ keepPage: true }); // column toggle — stay on current page
   }
   modal.close();
 }
@@ -341,6 +352,9 @@ async function _runBmSearch(q) {
 
 function _renderBmSearchResults(results) {
   _bmLastSearchResults = results;
+  // Search results replace the paginated browse view — clear pagination controls.
+  const pag = document.getElementById('bm-pagination');
+  if (pag) pag.innerHTML = '';
   const tagFilter = document.getElementById('bm-tag-filter')?.value || '';
   let rows = tagFilter ? results.filter(r => (r.tags || []).includes(tagFilter)) : results;
   const tbody = document.getElementById('bm-tbody');
@@ -357,9 +371,14 @@ function _renderBmSearchResults(results) {
 }
 
 // ── Render table (local filter, no SeekDB) ──────────────────────────────
+// opts.keepPage — if true, stay on the current page instead of resetting to 1.
+// Pass keepPage=true when only the column visibility or a single row changed;
+// leave it false (default) for filter/sort/load changes so the user always
+// sees results from the start.
 
-function renderBookmarks() {
+function renderBookmarks(opts = {}) {
   if (_bmSearchActive) return;
+  if (!opts.keepPage) _bmPage = 1;
   const q = (document.getElementById('bm-search')?.value || '').toLowerCase();
   const tagFilter = document.getElementById('bm-tag-filter')?.value || '';
   let rows = _bookmarks;
@@ -383,19 +402,72 @@ function renderBookmarks() {
       return _bmSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
     });
   }
+  // Pagination: slice the filtered+sorted array for rendering.
+  // The full rows array is always processed above — only the table render is limited.
+  const totalRows = rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / _bmPageSize));
+  _bmPage = Math.max(1, Math.min(_bmPage, totalPages)); // clamp to valid range
+  const pageRows = totalRows > _bmPageSize
+    ? rows.slice((_bmPage - 1) * _bmPageSize, _bmPage * _bmPageSize)
+    : rows;
   const tbody = document.getElementById('bm-tbody');
   const status = document.getElementById('bm-search-status');
-  status.textContent = rows.length + ' bookmark' + (rows.length === 1 ? '' : 's');
+  if (pageRows.length < totalRows) {
+    const from = (_bmPage - 1) * _bmPageSize + 1;
+    const to   = Math.min(_bmPage * _bmPageSize, totalRows);
+    status.textContent = `${totalRows} bookmark${totalRows === 1 ? '' : 's'} (showing ${from}\u2013${to})`;
+  } else {
+    status.textContent = totalRows + ' bookmark' + (totalRows === 1 ? '' : 's');
+  }
   status.hidden = false;
   _bmRebuildThead();
-  if (!rows.length) {
+  if (!pageRows.length) {
     tbody.innerHTML = `<tr class="empty-row"><td colspan="${_bmColCount()}">No bookmarks found.</td></tr>`;
     _bmUpdateSortHeaders();
+    _bmRenderPagination(totalRows, _bmPageSize, _bmPage);
     return;
   }
-  tbody.innerHTML = rows.map(b => _bmBuildBookmarkRow(b)).join('');
+  tbody.innerHTML = pageRows.map(b => _bmBuildBookmarkRow(b)).join('');
   _bmUpdateSortHeaders();
   _bmInitColResize();
+  _bmRenderPagination(totalRows, _bmPageSize, _bmPage);
+}
+
+// ── Pagination controls ──────────────────────────────────────────────────
+
+function _bmRenderPagination(total, pageSize, page) {
+  const el = document.getElementById('bm-pagination');
+  if (!el) return;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  if (totalPages <= 1) { el.innerHTML = ''; return; }
+  const sizeOpts = _BM_PAGE_SIZE_OPTIONS.map(n =>
+    `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`
+  ).join('');
+  const prevDis = page <= 1 ? ' disabled' : '';
+  const nextDis = page >= totalPages ? ' disabled' : '';
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">
+      <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_bmGoPage(${page - 1})">&#8592; Prev</button>
+      <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
+      <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_bmGoPage(${page + 1})">Next &#8594;</button>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:8px">
+        Per page:
+        <select onchange="_bmSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select>
+      </label>
+    </div>`;
+}
+
+function _bmGoPage(n) {
+  _bmPage = n; // renderBookmarks will clamp to valid range via Math.min
+  renderBookmarks({ keepPage: true });
+}
+
+function _bmSetPageSize(n) {
+  if (!_BM_PAGE_SIZE_OPTIONS.includes(n)) return;
+  _bmPageSize = n;
+  localStorage.setItem('bm-page-size', String(n));
+  _bmPage = 1;
+  renderBookmarks({ keepPage: true });
 }
 
 // ── Visits ──────────────────────────────────────────────────────────────
@@ -870,7 +942,7 @@ async function deleteBookmark(id, title) {
     const r = await apiFetch(`/api/v1/bookmarks/${id}`, { method: 'DELETE' });
     if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
     _bookmarks = _bookmarks.filter(b => b.bookmark_id !== id);
-    renderBookmarks();
+    renderBookmarks({ keepPage: true }); // stay on current page after deleting one row
   } catch (e) {
     const err = document.getElementById('bm-error');
     err.textContent = `Delete failed: ${e.message}`;
