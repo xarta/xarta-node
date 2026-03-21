@@ -9,7 +9,6 @@ const _DOC_IMG_PAGE_SIZE = 6;
 let _docImgDescTimers  = {};
 
 function openDocImagesModal() {
-  document.getElementById('doc-images-modal').style.display = 'flex';
   document.getElementById('doc-img-upload-file').value       = '';
   document.getElementById('doc-img-upload-desc').value       = '';
   _docImagesFilter    = 'all';
@@ -21,10 +20,6 @@ function openDocImagesModal() {
   const tagSel = document.getElementById('doc-img-tag-filter');
   if (tagSel) tagSel.value = '';
   _loadDocImages();
-}
-
-function closeDocImagesModal() {
-  document.getElementById('doc-images-modal').style.display = 'none';
 }
 
 async function _loadDocImages() {

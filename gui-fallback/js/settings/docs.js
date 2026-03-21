@@ -8,7 +8,6 @@ const _docsViewModes = {}; // doc_id → true (preview) | false (edit); default 
 
 // ── List view state ──────────────────────────────────────────────────────────
 let _docsGroups    = [];   // array of DocGroupOut records
-let _docsListView  = false; // true = list view is visible
 let _docsDragId    = null;  // doc_id currently being dragged
 let _groupDragId   = null;  // group_id currently being dragged
 
@@ -51,8 +50,8 @@ async function loadDocs() {
       await _docsOpenDoc(histDocId);
     }
   }
-  // Refresh list view if it's currently visible
-  if (_docsListView) _docsRenderList();
+  // Refresh list view if it's currently the active tab
+  if (document.getElementById('tab-docs-list')?.classList.contains('active')) _docsRenderList();
   _docsUpdateHistoryButtons();
 }
 
@@ -487,33 +486,6 @@ async function submitDeleteDoc() {
 
 // ── List view toggle ──────────────────────────────────────────────────────────
 
-async function docsToggleList() {
-  _docsListView = !_docsListView;
-  const btn = document.getElementById('docs-list-btn');
-  const editorPane = document.getElementById('docs-editor-pane');
-  const listPane   = document.getElementById('docs-list-pane');
-  if (_docsListView) {
-    await loadDocs();
-    editorPane.style.display = 'none';
-    listPane.style.display   = 'flex';
-    _docsRenderList();
-    if (btn) { btn.style.background = 'var(--accent)'; btn.style.color = '#fff'; btn.style.borderColor = 'var(--accent)'; }
-  } else {
-    listPane.style.display   = 'none';
-    editorPane.style.display = 'flex';
-    if (btn) { btn.style.background = ''; btn.style.color = ''; btn.style.borderColor = ''; }
-  }
-}
-
-function _docsListClose() {
-  if (!_docsListView) return;
-  _docsListView = false;
-  document.getElementById('docs-list-pane').style.display   = 'none';
-  document.getElementById('docs-editor-pane').style.display = 'flex';
-  const btn = document.getElementById('docs-list-btn');
-  if (btn) { btn.style.background = ''; btn.style.color = ''; btn.style.borderColor = ''; }
-}
-
 // ── List view rendering ───────────────────────────────────────────────────────
 
 function _docsRenderList() {
@@ -718,7 +690,8 @@ function docsListDeleteDoc(docId) {
 }
 
 function docsListOpenDoc(docId) {
-  _docsListClose();
+  switchTab('docs');
+  SettingsMenuConfig.updateActiveTab('docs');
   if (docId === _docsActiveId) {
     // docsSelectDoc would bail early — force a fresh load instead
     _docsOpenDoc(docId);
