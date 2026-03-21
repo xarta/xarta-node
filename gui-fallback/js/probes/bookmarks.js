@@ -1,5 +1,109 @@
 /* ── Bookmarks (browser-links) ───────────────────────────────────────── */
 
+// ── Known-field renderers and metadata ───────────────────────────────────
+// Only fields with special rendering logic need an entry here.
+// Any field that arrives from the API and is NOT listed gets a plain-text
+// fallback renderer automatically — that is what makes this data-driven.
+const _BM_FIELD_META = {
+  _icon:       { label: 'Icon',        sortKey: null,
+                 render: b => `<td style="text-align:center;width:30px">${b._item_type === 'visit' ? '&#128065;' : '&#128278;'}</td>` },
+  title:       { label: 'Title',       sortKey: 'title',
+                 render: b => `<td><a href="${esc(b.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">${esc(b.title || b.url)}</a></td>` },
+  url:         { label: 'URL',         sortKey: 'url',
+                 render: b => `<td style="font-size:11px;color:var(--text-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(b.url)}">${_bmTruncUrl(b.url)}</td>` },
+  tags:        { label: 'Tags',        sortKey: 'tags',
+                 render: b => `<td style="font-size:11px">${(b.tags||[]).map(t=>_bmTagPill(t)).join(' ')}</td>` },
+  description: { label: 'Description', sortKey: 'description',
+                 render: b => `<td style="font-size:12px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.description||b.notes||'')}</td>` },
+  notes:       { label: 'Notes',       sortKey: null,
+                 render: b => `<td style="font-size:12px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.notes||'')}</td>` },
+  source:      { label: 'Source',      sortKey: 'source',
+                 render: b => `<td style="font-size:11px;color:var(--text-dim)">${esc(b.source||'')}</td>` },
+  created_at:  { label: 'Saved',       sortKey: 'created_at',
+                 render: b => `<td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(b.created_at||b.visited_at||'')}</td>` },
+  updated_at:  { label: 'Updated',     sortKey: 'updated_at',
+                 render: b => `<td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(b.updated_at||'')}</td>` },
+  folder:      { label: 'Folder',      sortKey: null,
+                 render: b => `<td style="font-size:11px;color:var(--text-dim)">${esc(b.folder||'')}</td>` },
+  favicon_url: { label: 'Favicon',     sortKey: null,
+                 render: b => b.favicon_url ? `<td><img src="${esc(b.favicon_url)}" style="width:16px;height:16px;vertical-align:middle" loading="lazy" /></td>` : '<td></td>' },
+  archived:    { label: 'Archived',    sortKey: null,
+                 render: b => `<td style="font-size:11px;color:var(--text-dim)">${b.archived ? 'Yes' : ''}</td>` },
+  // ── Search transparency fields (hidden by default; appear only in search results) ──
+  score_sources: { label: 'Sources',      sortKey: null,
+                   render: b => {
+                     const srcs = b.score_sources || [];
+                     const pills = {
+                       bookmark_keyword: ['KW-BM', '#d97706'],
+                       visit_keyword:    ['KW-V',  '#b45309'],
+                       bookmark_vector:  ['VEC-BM','#2563eb'],
+                       visit_vector:     ['VEC-V', '#7c3aed'],
+                     };
+                     const html = srcs.map(s => {
+                       const [label, color] = pills[s] || [s, '#6b7280'];
+                       return `<span style="font-size:10px;padding:1px 5px;border-radius:9px;background:${color};color:#fff;white-space:nowrap">${label}</span>`;
+                     }).join(' ');
+                     return `<td><span class="bm-score-cell" data-metric="score_sources" style="cursor:pointer" title="Click to analyse score">${html}</span></td>`;
+                   } },
+  rrf_score:     { label: 'RRF Score',    sortKey: 'rrf_score',
+                   render: b => {
+                     const v = b.rrf_score;
+                     return `<td><span class="bm-score-cell" data-metric="rrf_score" style="cursor:pointer;font-size:11px;font-variant-numeric:tabular-nums;color:var(--text-dim)" title="Click to analyse score">${v != null ? v.toFixed(5) : ''}</span></td>`;
+                   } },
+  kw_tier:       { label: 'KW Tier',      sortKey: 'kw_tier',
+                   render: b => {
+                     const tier = b.kw_tier;
+                     if (tier == null) return '<td></td>';
+                     const labels = ['Phrase in title','Phrase in URL','All tokens cross-field','Phrase in tags','Token in title','Token in URL','Token in tags','Document only'];
+                     const colors = ['#059669','#059669','#16a34a','#ca8a04','#ca8a04','#ea580c','#ea580c','#6b7280'];
+                     return `<td><span class="bm-score-cell" data-metric="kw_tier" style="cursor:pointer;font-size:11px;white-space:nowrap;color:${colors[tier]||'#6b7280'}" title="${labels[tier]||''} — Click to analyse">${tier} – ${labels[tier]||'?'}</span></td>`;
+                   } },
+  cosine_distance:{ label: 'Cos Dist',    sortKey: 'cosine_distance',
+                   render: b => {
+                     const v = b.cosine_distance;
+                     if (v == null) return '<td></td>';
+                     const color = v < 0.3 ? '#059669' : v < 0.6 ? '#ca8a04' : '#6b7280';
+                     return `<td><span class="bm-score-cell" data-metric="cosine_distance" style="cursor:pointer;font-size:11px;font-variant-numeric:tabular-nums;color:${color}" title="Click to analyse score">${v.toFixed(4)}</span></td>`;
+                   } },
+  reranker_rank: { label: 'Reranker',     sortKey: 'reranker_rank',
+                   render: b => {
+                     const v = b.reranker_rank;
+                     return `<td><span class="bm-score-cell" data-metric="reranker_rank" style="cursor:pointer;font-size:11px;color:var(--text-dim)" title="Click to analyse score">${v != null ? '#' + v : ''}</span></td>`;
+                   } },
+  exact_tier:    { label: 'Exact Tier',   sortKey: 'exact_tier',
+                   render: b => {
+                     const tier = b.exact_tier;
+                     if (tier == null) return '<td></td>';
+                     const labels = ['Phrase in title/URL','All tokens cross-field','Token in title/URL','Tags only','Pure embedding'];
+                     const colors = ['#059669','#16a34a','#ca8a04','#ea580c','#6b7280'];
+                     return `<td><span class="bm-score-cell" data-metric="exact_tier" style="cursor:pointer;font-size:11px;white-space:nowrap;color:${colors[tier]||'#6b7280'}" title="${labels[tier]||''} — Click to analyse">${tier} – ${labels[tier]||'?'}</span></td>`;
+                   } },
+  _actions:    { label: 'Actions',     sortKey: null,
+                 render: b => {
+                   if (b._item_type === 'visit') return '<td></td>';
+                   const archBtn = b.archived
+                     ? `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--ok);border-color:var(--ok);margin-left:2px" title="Restore from archive" onclick="archiveBookmark('${esc(b.bookmark_id)}', true)">&#128228;</button>`
+                     : `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--text-dim);border-color:var(--border);margin-left:2px" title="Archive" onclick="archiveBookmark('${esc(b.bookmark_id)}', false)">&#128229;</button>`;
+                   return `<td style="white-space:nowrap;width:110px">
+                     <button class="secondary" style="padding:1px 6px;font-size:11px" onclick="openBookmarkModal('${esc(b.bookmark_id)}')">&#9998;</button>${archBtn}
+                     <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:2px" onclick="deleteBookmark('${esc(b.bookmark_id)}','${esc(b.title||b.url)}')">&#x2715;</button></td>`;
+                 } },
+};
+
+// Fields never shown as columns (used internally for operations)
+const _BM_EXCLUDE_COLS = new Set(['bookmark_id', '_item_type']);
+
+// Fields hidden by default on first visit (user can show via Columns modal)
+const _BM_DEFAULT_HIDDEN = ['notes', 'folder', 'favicon_url', 'updated_at', 'archived',
+  'score_sources', 'rrf_score', 'kw_tier', 'cosine_distance', 'reranker_rank', 'exact_tier'];
+
+// Convert a snake_case key to a human label (fallback for unknown fields)
+function _bmFieldLabel(key) {
+  const m = _BM_FIELD_META[key];
+  if (m) return m.label;
+  return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
 let _bmSearchTimer = null;      // server SeekDB search debounce
 let _bmRenderTimer = null;      // client-side filter render debounce
 let _bmSearchActive = false;
@@ -10,6 +114,117 @@ let _bmColResizeDone = false;
 let _bmAllTags = [];
 let _bmTagCounts = {};       // {tag -> {active, archived}}
 let _bmCurrentExclTags = []; // source of truth; kept in sync with server
+let _bmLastSearchResults = []; // cached for re-render on column toggle
+
+// Dynamic column list — derived from actual API response keys, not hardcoded
+let _bmDynCols = []; // populated by _bmDetectCols(); drives everything
+
+function _bmSetSearchActive(active) {
+  _bmSearchActive = active;
+  const btn = document.getElementById('bm-explain-sort-btn');
+  if (btn) btn.disabled = !active;
+}
+
+// Hidden cols: persisted to localStorage. On first visit, apply default hidden set.
+const _bmHiddenColsRaw = localStorage.getItem('bm-hidden-cols');
+let _bmHiddenCols = new Set(_bmHiddenColsRaw ? JSON.parse(_bmHiddenColsRaw) : _BM_DEFAULT_HIDDEN);
+
+// Called after each API load — derives column list from actual response keys.
+// Preserves existing order for known cols; appends any new/unknown cols at end.
+// _icon and _actions are synthetic (not from API): always first and last.
+function _bmDetectCols(rows) {
+  const apiKeys = rows.length ? Object.keys(rows[0]).filter(k => !_BM_EXCLUDE_COLS.has(k)) : [];
+  const existingApiCols = _bmDynCols.filter(k => k !== '_icon' && k !== '_actions');
+  const existingSet = new Set(existingApiCols);
+  const newSet = new Set(apiKeys);
+  _bmDynCols = [
+    '_icon',
+    ...existingApiCols.filter(k => newSet.has(k)), // keep order, drop removed
+    ...apiKeys.filter(k => !existingSet.has(k)),   // append new keys
+    '_actions',
+  ];
+}
+
+function _bmVisibleDataCols() {
+  return _bmDynCols.filter(k => !_bmHiddenCols.has(k));
+}
+
+function _bmColCount() { return _bmVisibleDataCols().length; }
+
+function _bmRebuildThead() {
+  const tr = document.querySelector('#bm-main-view thead tr');
+  if (!tr) return;
+  let html = '';
+  for (const key of _bmVisibleDataCols()) {
+    const sortKey = _BM_FIELD_META[key]?.sortKey ?? null;
+    const label   = _bmFieldLabel(key);
+    const style   = key === '_icon' ? ' style="width:30px"' : key === '_actions' ? ' style="width:110px"' : '';
+    html += sortKey
+      ? `<th class="bm-th-sort" onclick="_bmSortBy('${sortKey}')"${style}>${label}<span class="bm-sort-arrow" data-col="${sortKey}">&#x21C5;</span></th>`
+      : `<th${style}>${label}</th>`;
+  }
+  tr.innerHTML = html;
+  _bmColResizeDone = false;
+  _bmUpdateSortHeaders();
+}
+
+function _bmRenderDataTds(b) {
+  return _bmVisibleDataCols().map(key => {
+    const meta = _BM_FIELD_META[key];
+    if (meta) return meta.render(b);
+    // Unknown field — plain text fallback; this is the data-driven path
+    const val = b[key];
+    const text = val == null ? '' : (Array.isArray(val) ? val.join(', ') : String(val));
+    return `<td style="font-size:11px;color:var(--text-dim)">${esc(text)}</td>`;
+  }).join('');
+}
+
+function _bmBuildBookmarkRow(b) {
+  const archiveStyle = b.archived ? 'opacity:0.55' : '';
+  const row = { ...b, _item_type: 'bookmark' };
+  return `<tr style="${archiveStyle}">${_bmRenderDataTds(row)}</tr>`;
+}
+
+function _bmBuildSearchRow(r, scoreIdx) {
+  const isBookmark = r.item_type !== 'visit';
+  const b = { ...r, bookmark_id: r.id, _item_type: r.item_type || 'bookmark' };
+  if (!isBookmark && r.visited_at && !b.created_at) b.created_at = r.visited_at;
+  const idxAttr = scoreIdx != null ? ` data-score-idx="${scoreIdx}"` : '';
+  return `<tr${idxAttr}>${_bmRenderDataTds(b)}</tr>`;
+}
+
+// ── Column visibility modal ──────────────────────────────────────────────
+// Modal list is built from _bmDynCols — whatever the API actually returned.
+// No column names are hardcoded here.
+function _bmOpenColsModal() {
+  const list = document.getElementById('bm-cols-modal-list');
+  list.innerHTML = _bmDynCols.map(key => {
+    const label   = _bmFieldLabel(key);
+    const checked = !_bmHiddenCols.has(key) ? 'checked' : '';
+    return `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:8px 4px;font-size:13px;border-bottom:1px solid var(--border)">
+      <input type="checkbox" data-col="${key}" ${checked} style="width:15px;height:15px;cursor:pointer" />
+      <span>${label}</span>
+    </label>`;
+  }).join('');
+  document.getElementById('bm-cols-modal').showModal();
+}
+
+function _bmApplyColsModal() {
+  const modal = document.getElementById('bm-cols-modal');
+  const newHidden = new Set();
+  modal.querySelectorAll('input[data-col]').forEach(cb => {
+    if (!cb.checked) newHidden.add(cb.dataset.col);
+  });
+  _bmHiddenCols = newHidden;
+  localStorage.setItem('bm-hidden-cols', JSON.stringify([..._bmHiddenCols]));
+  _bmRebuildThead();
+  if (_bmSearchActive) {
+    _renderBmSearchResults(_bmLastSearchResults);
+  } else {
+    renderBookmarks();
+  }
+  modal.close();
+}
 
 async function _bmDownloadExtension(btn) {
   const orig = btn.textContent;
@@ -46,7 +261,8 @@ async function loadBookmarks() {
     const r = await apiFetch(`/api/v1/bookmarks?archived=${archived}&limit=${limit}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _bookmarks = await r.json();
-    _bmSearchActive = false;
+    _bmDetectCols(_bookmarks);  // derive column list from actual API response keys
+    _bmSetSearchActive(false);
     document.getElementById('bm-search-status').hidden = true;
     await Promise.all([_loadBookmarkTags(), _loadExcludedTags()]);
     renderBookmarks();
@@ -85,7 +301,7 @@ function _bmSearchDebounce() {
   clearTimeout(_bmRenderTimer);
   const q = (document.getElementById('bm-search').value || '').trim();
   if (!q) {
-    _bmSearchActive = false;
+    _bmSetSearchActive(false);
     document.getElementById('bm-search-status').hidden = true;
     renderBookmarks();
     return;
@@ -93,7 +309,7 @@ function _bmSearchDebounce() {
   // Debounce client-side filter (250ms) — fast enough to feel responsive,
   // slow enough to avoid rebuilding the full table on every keystroke.
   _bmRenderTimer = setTimeout(() => {
-    _bmSearchActive = false;
+    _bmSetSearchActive(false);
     renderBookmarks();
   }, 250);
   // Debounce server SeekDB search (600ms) — fires after typing pauses.
@@ -107,51 +323,37 @@ async function _runBmSearch(q) {
     const data = await r.json();
     const status = document.getElementById('bm-search-status');
     if (data.count > 0) {
-      _bmSearchActive = true;
+      _bmSetSearchActive(true);
       status.textContent = `SeekDB: ${data.count} result${data.count === 1 ? '' : 's'} for "${q}"`;
       status.hidden = false;
       _renderBmSearchResults(data.results);
     } else {
       // SeekDB has no results (likely not yet indexed) — keep client-side filter
-      _bmSearchActive = false;
+      _bmSetSearchActive(false);
       status.textContent = `SeekDB: 0 results for "${q}"`;
       status.hidden = false;
     }
   } catch (e) {
     // SeekDB unavailable — client-side filter already showing, suppress error
-    _bmSearchActive = false;
+    _bmSetSearchActive(false);
   }
 }
 
 function _renderBmSearchResults(results) {
-  const status = document.getElementById('bm-search-status');
+  _bmLastSearchResults = results;
+  const tagFilter = document.getElementById('bm-tag-filter')?.value || '';
+  let rows = tagFilter ? results.filter(r => (r.tags || []).includes(tagFilter)) : results;
   const tbody = document.getElementById('bm-tbody');
-  if (!results.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No results found.</td></tr>';
+  const status = document.getElementById('bm-search-status');
+  if (!rows.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="${_bmColCount()}">No results found.</td></tr>`;
+    if (status) { status.textContent = '0 results'; status.hidden = false; }
     return;
   }
-  tbody.innerHTML = results.map(r => {
-    const isBookmark = r.item_type !== 'visit';
-    const icon = isBookmark ? '&#128278;' : '&#128065;';
-    const tags = (r.tags || []).map(t => _bmTagPill(t)).join(' ');
-    const editBtns = isBookmark ? `
-      <button class="secondary" style="padding:1px 6px;font-size:11px"
-        onclick="openBookmarkModal('${esc(r.id)}')">&#9998;</button>
-      <button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--text-dim);border-color:var(--border);margin-left:2px" title="Archive"
-        onclick="archiveBookmark('${esc(r.id)}', false)">&#128229;</button>
-      <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:2px"
-        onclick="deleteBookmark('${esc(r.id)}','${esc(r.title || r.url)}')">&#x2715;</button>` : '';
-    return `<tr>
-      <td style="text-align:center">${icon}</td>
-      <td><a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">${esc(r.title || r.url)}</a></td>
-      <td style="font-size:11px;color:var(--text-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.url)}">${_bmTruncUrl(r.url)}</td>
-      <td style="font-size:11px">${tags}</td>
-      <td style="font-size:12px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.description || r.notes || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim)">${esc(r.source || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(isBookmark ? (r.created_at || '') : (r.visited_at || ''))}</td>
-      <td style="white-space:nowrap">${editBtns}</td>
-    </tr>`;
-  }).join('');
+  _bmDetectCols(rows);  // search results have extra fields (score_sources, rrf_score, etc.)
+  _bmRebuildThead();
+  tbody.innerHTML = rows.map((r, i) => _bmBuildSearchRow(r, i)).join('');
+  if (status) { status.textContent = rows.length + ' result' + (rows.length === 1 ? '' : 's') + (tagFilter ? ` (tag: ${tagFilter})` : ''); status.hidden = false; }
 }
 
 // ── Render table (local filter, no SeekDB) ──────────────────────────────
@@ -185,36 +387,13 @@ function renderBookmarks() {
   const status = document.getElementById('bm-search-status');
   status.textContent = rows.length + ' bookmark' + (rows.length === 1 ? '' : 's');
   status.hidden = false;
+  _bmRebuildThead();
   if (!rows.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No bookmarks found.</td></tr>';
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="${_bmColCount()}">No bookmarks found.</td></tr>`;
     _bmUpdateSortHeaders();
     return;
   }
-  tbody.innerHTML = rows.map(b => {
-    const tags = (b.tags || []).map(t => _bmTagPill(t)).join(' ');
-    const archiveStyle = b.archived ? 'opacity:0.55' : '';
-    const archBtn = b.archived
-      ? `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--ok);border-color:var(--ok);margin-left:2px" title="Restore from archive"
-          onclick="archiveBookmark('${esc(b.bookmark_id)}', true)">&#128228;</button>`
-      : `<button class="secondary" style="padding:1px 6px;font-size:11px;color:var(--text-dim);border-color:var(--border);margin-left:2px" title="Archive"
-          onclick="archiveBookmark('${esc(b.bookmark_id)}', false)">&#128229;</button>`;
-    return `<tr style="${archiveStyle}">
-      <td style="text-align:center">&#128278;</td>
-      <td><a href="${esc(b.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">${esc(b.title || b.url)}</a></td>
-      <td style="font-size:11px;color:var(--text-dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(b.url)}">${_bmTruncUrl(b.url)}</td>
-      <td style="font-size:11px">${tags}</td>
-      <td style="font-size:12px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.description || '')}</td>
-      <td style="font-size:11px;color:var(--text-dim)">${esc(b.source || 'manual')}</td>
-      <td style="font-size:11px;color:var(--text-dim);white-space:nowrap">${_bmFmtDate(b.created_at || '')}</td>
-      <td style="white-space:nowrap">
-        <button class="secondary" style="padding:1px 6px;font-size:11px"
-          onclick="openBookmarkModal('${esc(b.bookmark_id)}')">&#9998;</button>
-        ${archBtn}
-        <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:2px"
-          onclick="deleteBookmark('${esc(b.bookmark_id)}','${esc(b.title || b.url)}')">&#x2715;</button>
-      </td>
-    </tr>`;
-  }).join('');
+  tbody.innerHTML = rows.map(b => _bmBuildBookmarkRow(b)).join('');
   _bmUpdateSortHeaders();
   _bmInitColResize();
 }
@@ -726,7 +905,16 @@ function _bmSortBy(col) {
     _bmSortCol = col;
     _bmSortDir = 'asc';
   }
-  renderBookmarks();
+  if (_bmSearchActive) {
+    _bmLastSearchResults = [..._bmLastSearchResults].sort((a, b) => {
+      const av = _bmSortVal(a, col);
+      const bv = _bmSortVal(b, col);
+      return _bmSortDir === 'asc' ? av.localeCompare(bv, undefined, {numeric: true}) : bv.localeCompare(av, undefined, {numeric: true});
+    });
+    _renderBmSearchResults(_bmLastSearchResults);
+  } else {
+    renderBookmarks();
+  }
 }
 
 function _bmSortVal(b, col) {
@@ -930,5 +1118,139 @@ function _bmFmtDate(iso) {
     return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   } catch (_) {
     return iso;
+  }
+}
+
+// ── Score analysis modal ─────────────────────────────────────────────────
+
+const _BM_SCORE_METRICS = ['score_sources', 'rrf_score', 'kw_tier', 'cosine_distance', 'reranker_rank', 'exact_tier'];
+
+const _BM_METRIC_LABELS = {
+  score_sources:    'Score Sources',
+  rrf_score:        'RRF Score',
+  kw_tier:          'Keyword Tier',
+  cosine_distance:  'Cosine Distance',
+  reranker_rank:    'Reranker Rank',
+  exact_tier:       'Exact Tier',
+};
+
+// Stored context for the currently-open overview modal — used by drill-down delegation.
+let _bmScoreCtx = { query: '', result: null };
+
+// Called when any .bm-score-cell is clicked (event-delegated from bm-tbody).
+function _bmOpenScoreModal(cell) {
+  const tr = cell.closest('tr[data-score-idx]');
+  if (!tr) return;
+  const idx = parseInt(tr.dataset.scoreIdx, 10);
+  const result = _bmLastSearchResults[idx];
+  if (!result) return;
+  const query = (document.getElementById('bm-search')?.value || '').trim();
+  _bmScoreCtx = { query, result };
+  const title = result.title || result.url || 'result';
+  document.getElementById('bm-score-modal-subtitle').textContent = `"${title.slice(0, 70)}"`;
+  const body = document.getElementById('bm-score-modal-body');
+  body.innerHTML = _bmScoreLoadingHtml();
+  document.getElementById('bm-score-modal').showModal();
+  _bmFetchScoreExplain(query, result, null, body);
+}
+
+// Called when a per-metric drill-down link is clicked inside the overview modal.
+// Uses _bmScoreCtx so no inline JSON is needed.
+function _bmOpenScoreDetailModal(metric) {
+  const { query, result } = _bmScoreCtx;
+  if (!result) return;
+  const label = _BM_METRIC_LABELS[metric] || metric;
+  document.getElementById('bm-score-detail-subtitle').textContent = label;
+  const body = document.getElementById('bm-score-detail-body');
+  body.innerHTML = _bmScoreLoadingHtml();
+  document.getElementById('bm-score-detail-modal').showModal();
+  _bmFetchScoreExplain(query, result, metric, body);
+}
+
+function _bmScoreLoadingHtml() {
+  return `<div style="display:flex;align-items:center;gap:10px;color:var(--text-dim);padding:20px 0">
+    <span style="font-size:18px;animation:spin 1s linear infinite;display:inline-block">&#8635;</span>
+    <span>Asking LLM…</span>
+  </div>`;
+}
+
+async function _bmFetchScoreExplain(query, result, focus, bodyEl) {
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/score-explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, result, focus }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const md = data.explanation || '(No response)';
+    let html = typeof _mdToHtml === 'function' ? _mdToHtml(md) : `<pre style="white-space:pre-wrap">${esc(md)}</pre>`;
+    if (!focus) {
+      // Drill-down links use data-metric and event delegation — no inline JSON
+      const metricLinksHtml = _BM_SCORE_METRICS
+        .filter(m => result[m] != null)
+        .map(m => {
+          const label = _BM_METRIC_LABELS[m] || m;
+          const val = Array.isArray(result[m]) ? result[m].join(', ') : String(result[m]);
+          return `<a href="#" class="bm-score-drill" data-metric="${esc(m)}"
+                     style="display:inline-flex;align-items:center;gap:4px;color:var(--accent);font-size:12px;text-decoration:underline;white-space:nowrap"
+                  >&#128270; ${esc(label)} <span style="color:var(--text-dim);font-size:11px">(${esc(val.slice(0,30))})</span></a>`;
+        }).join('');
+      if (metricLinksHtml) {
+        html += `<div style="margin-top:24px;padding-top:14px;border-top:1px solid var(--border)">
+          <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em">Drill into a metric</div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">${metricLinksHtml}</div>
+        </div>`;
+      }
+    }
+    bodyEl.innerHTML = html;
+  } catch (e) {
+    bodyEl.innerHTML = `<p style="color:var(--err)">Error: ${esc(e.message)}</p>`;
+  }
+}
+
+// Event delegation: score cells in results table + drill-down links in overview modal
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('bm-tbody')?.addEventListener('click', e => {
+    const cell = e.target.closest('.bm-score-cell');
+    if (cell) _bmOpenScoreModal(cell);
+  });
+  document.getElementById('bm-score-modal-body')?.addEventListener('click', e => {
+    const link = e.target.closest('.bm-score-drill');
+    if (link) {
+      e.preventDefault();
+      _bmOpenScoreDetailModal(link.dataset.metric);
+    }
+  });
+});
+
+// ── Sort explanation modal ───────────────────────────────────────────────
+
+async function _bmOpenSortExplainModal() {
+  if (!_bmSearchActive || !_bmLastSearchResults.length) return;
+  const query = (document.getElementById('bm-search')?.value || '').trim();
+  const top = _bmLastSearchResults.slice(0, 20);
+  const subtitle = document.getElementById('bm-sort-explain-subtitle');
+  subtitle.textContent = `"${query}" — top ${top.length} results`;
+  const body = document.getElementById('bm-sort-explain-body');
+  body.innerHTML = _bmScoreLoadingHtml();
+  document.getElementById('bm-sort-explain-modal').showModal();
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/sort-explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        results: top,
+        sort_col: _bmSortCol || 'compound',
+        sort_dir: _bmSortDir || 'asc',
+      }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const md = data.explanation || '(No response)';
+    body.innerHTML = typeof _mdToHtml === 'function' ? _mdToHtml(md) : `<pre style="white-space:pre-wrap">${esc(md)}</pre>`;
+  } catch (e) {
+    body.innerHTML = `<p style="color:var(--err)">Error: ${esc(e.message)}</p>`;
   }
 }

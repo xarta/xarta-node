@@ -51,6 +51,7 @@ button { background: var(--accent-dim); color: var(--accent); border: 1px solid 
          border-radius: var(--radius); padding: 6px 14px; font-size: 13px;
          cursor: pointer; transition: background .15s; }
 button:hover { background: var(--accent); color: #fff; }
+button:disabled, button[disabled] { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
 button.secondary { background: transparent; border-color: var(--border);
                    color: var(--text-dim); }
 button.secondary:hover { color: var(--text); border-color: var(--text-dim); }

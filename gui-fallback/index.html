@@ -688,6 +688,8 @@
         <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
         <button class="secondary" onclick="_bmToggleSetup()" title="Import guide &amp; extension install">&#9432; Setup</button>
         <button class="secondary" onclick="_bmToggleEmbedCfg()" title="Configure tag exclusions, domain rarity, and re-embed all bookmarks">&#129504; Embeddings</button>
+        <button class="secondary" onclick="_bmOpenColsModal()" title="Show or hide table columns">&#9776; Columns</button>
+        <button id="bm-explain-sort-btn" class="secondary" onclick="_bmOpenSortExplainModal()" disabled title="Explain how the current search results are sorted (available during search)">&#128202; Explain Sort</button>
         <button class="secondary" onclick="_bmAutoArchiveDead(this)" title="Check all non-archived bookmarks for 404/410 errors and archive any dead links">&#128279; Check dead links</button>
       </div>
     </div>
@@ -796,7 +798,7 @@
     <!-- Search / filter toolbar -->
     <div class="toolbar" style="margin-bottom:10px">
       <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
-      <select id="bm-tag-filter" onchange="renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
+      <select id="bm-tag-filter" onchange="_bmSearchActive ? _renderBmSearchResults(_bmLastSearchResults) : renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
         <option value="">All tags</option>
       </select>
       <label class="bm-toggle-label">
@@ -814,16 +816,7 @@
     <div id="bm-main-view">
       <div class="table-wrap">
         <table>
-          <thead><tr>
-            <th style="width:30px"></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('title')">Title<span class="bm-sort-arrow" data-col="title">&#x21C5;</span></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('url')">URL<span class="bm-sort-arrow" data-col="url">&#x21C5;</span></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('tags')">Tags<span class="bm-sort-arrow" data-col="tags">&#x21C5;</span></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('description')">Description<span class="bm-sort-arrow" data-col="description">&#x21C5;</span></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('source')">Source<span class="bm-sort-arrow" data-col="source">&#x21C5;</span></th>
-            <th class="bm-th-sort" onclick="_bmSortBy('created_at')">Saved<span class="bm-sort-arrow" data-col="created_at">&#x21C5;</span></th>
-            <th style="width:110px">Actions</th>
-          </tr></thead>
+          <thead><tr></tr></thead>
           <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
         </table>
       </div>
@@ -1316,6 +1309,58 @@
     <button class="secondary" onclick="document.getElementById('bm-excl-tag-modal').close()">Cancel</button>
     <button id="bm-excl-modal-apply-btn">&#10003; Apply &amp; Save</button>
   </div>
+</dialog>
+
+<style>#bm-cols-modal[open] { display:flex;flex-direction:column }</style>
+<dialog id="bm-cols-modal" style="width:min(380px,95vw);border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
+  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <span style="font-weight:700;font-size:14px">&#9776; Visible columns</span>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-cols-modal').close()">&#10005;</button>
+  </div>
+  <div id="bm-cols-modal-list" style="padding:4px 18px;flex:1"></div>
+  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-shrink:0">
+    <button class="secondary" onclick="document.getElementById('bm-cols-modal').close()">Cancel</button>
+    <button onclick="_bmApplyColsModal()">&#10003; Apply</button>
+  </div>
+</dialog>
+
+<style>#bm-score-modal[open],#bm-score-detail-modal[open]{display:flex;flex-direction:column}</style>
+
+<!-- Score analysis overview modal -->
+<dialog id="bm-score-modal" style="width:min(920px,96vw);height:90vh;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
+  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <div>
+      <span style="font-weight:700;font-size:15px">&#128269; Score Analysis</span>
+      <span id="bm-score-modal-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
+    </div>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-score-modal').close()">&#10005;</button>
+  </div>
+  <div id="bm-score-modal-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
+</dialog>
+
+<!-- Score detail modal (per-metric drill-down, stacks on top of overview) -->
+<dialog id="bm-score-detail-modal" style="width:min(800px,94vw);height:84vh;border-radius:var(--radius);border:1px solid var(--accent);background:var(--bg);color:var(--text);padding:0;margin:auto">
+  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <div>
+      <span style="font-weight:700;font-size:14px">&#128270; Metric Detail</span>
+      <span id="bm-score-detail-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
+    </div>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-score-detail-modal').close()">&#8592; Back</button>
+  </div>
+  <div id="bm-score-detail-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
+</dialog>
+
+<!-- Sort explanation modal -->
+<style>#bm-sort-explain-modal[open]{display:flex;flex-direction:column}</style>
+<dialog id="bm-sort-explain-modal" style="width:min(960px,96vw);height:90vh;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
+  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+    <div>
+      <span style="font-weight:700;font-size:15px">&#128202; Sort Order Explanation</span>
+      <span id="bm-sort-explain-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
+    </div>
+    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-sort-explain-modal').close()">&#10005;</button>
+  </div>
+  <div id="bm-sort-explain-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
 </dialog>
 
 </body>
