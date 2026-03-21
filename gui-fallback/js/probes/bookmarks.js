@@ -1,6 +1,7 @@
 /* ── Bookmarks (browser-links) ───────────────────────────────────────── */
 
-let _bmSearchTimer = null;
+let _bmSearchTimer = null;      // server SeekDB search debounce
+let _bmRenderTimer = null;      // client-side filter render debounce
 let _bmSearchActive = false;
 let _bmSortCol = 'created_at';
 let _bmSortDir = 'desc';
@@ -71,6 +72,7 @@ async function _loadBookmarkTags() {
 
 function _bmSearchDebounce() {
   clearTimeout(_bmSearchTimer);
+  clearTimeout(_bmRenderTimer);
   const q = (document.getElementById('bm-search').value || '').trim();
   if (!q) {
     _bmSearchActive = false;
@@ -78,10 +80,14 @@ function _bmSearchDebounce() {
     renderBookmarks();
     return;
   }
-  // Instant client-side filter while waiting for SeekDB
-  _bmSearchActive = false;
-  renderBookmarks();
-  _bmSearchTimer = setTimeout(() => _runBmSearch(q), 500);
+  // Debounce client-side filter (250ms) — fast enough to feel responsive,
+  // slow enough to avoid rebuilding the full table on every keystroke.
+  _bmRenderTimer = setTimeout(() => {
+    _bmSearchActive = false;
+    renderBookmarks();
+  }, 250);
+  // Debounce server SeekDB search (600ms) — fires after typing pauses.
+  _bmSearchTimer = setTimeout(() => _runBmSearch(q), 600);
 }
 
 async function _runBmSearch(q) {

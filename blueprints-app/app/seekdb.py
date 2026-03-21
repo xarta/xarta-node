@@ -107,7 +107,12 @@ def upsert_bookmark_index(
     embedding: list[float],
     visit_count: int,
     last_visited: str | None,
+    document: str | None = None,
 ) -> None:
+    # `document` should be the pre-filtered text (excluded tags stripped).  If
+    # not supplied we fall back to the unfiltered bookmark_document(row).  Always
+    # supply it from seekdb_sync so that excluded tags are absent from the stored
+    # document and therefore invisible to keyword ($contains) searches.
     metadata = {
         "item_type": "bookmark",
         "bookmark_id": row["bookmark_id"],
@@ -128,7 +133,7 @@ def upsert_bookmark_index(
     bookmarks_col().upsert(
         ids=[row["bookmark_id"]],
         embeddings=[embedding],
-        documents=[bookmark_document(row)],
+        documents=[document if document is not None else bookmark_document(row)],
         metadatas=[metadata],
     )
 

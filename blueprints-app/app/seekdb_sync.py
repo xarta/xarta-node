@@ -212,6 +212,7 @@ async def reindex_all() -> None:
                         embedding=embeddings[idx],
                         visit_count=visit_count,
                         last_visited=last_visited,
+                        document=texts[idx],
                     )
 
             _reindex_state["done"] = min(i + EMBED_BATCH_SIZE, len(row_dicts))
@@ -311,6 +312,7 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
                 embedding=embeddings[idx],
                 visit_count=int(stats["cnt"] if stats else 0),
                 last_visited=stats["last_v"] if stats else None,
+                document=texts[idx],
             )
 
     return len(stale), deleted
