@@ -15,6 +15,15 @@ function switchGroup(group) {
     ProbesMenuConfig.updateActiveTab('pfsense-dns');
     return;
   }
+  // Show/hide settings split-dropdown menu
+  const settingsWrapper = document.getElementById('settingsMenuWrapper');
+  if (settingsWrapper) settingsWrapper.style.display = group === 'settings' ? '' : 'none';
+  if (group === 'settings') {
+    SettingsMenuConfig.showGroup();
+    switchTab('pve-hosts');
+    SettingsMenuConfig.updateActiveTab('pve-hosts');
+    return;
+  }
   const firstBtn = document.querySelector(`.table-nav button[data-group="${group}"]`);
   if (firstBtn) {
     const m = firstBtn.getAttribute('onclick').match(/switchTab\('([^']+)'\)/);
