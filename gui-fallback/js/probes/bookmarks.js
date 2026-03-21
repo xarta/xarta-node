@@ -222,9 +222,17 @@ function _bmOpenColsModal() {
 
 function _bmApplyColsModal() {
   const modal = document.getElementById('bm-cols-modal');
-  const newHidden = new Set();
+  // Start from existing hidden set — only update columns that were actually
+  // shown in this modal.  Columns not in the modal (e.g. search-only fields
+  // like domain/item_type/score cols when the modal was opened in browse mode)
+  // keep their current hidden/visible state and are NOT implicitly un-hidden.
+  const newHidden = new Set(_bmHiddenCols);
   modal.querySelectorAll('input[data-col]').forEach(cb => {
-    if (!cb.checked) newHidden.add(cb.dataset.col);
+    if (cb.checked) {
+      newHidden.delete(cb.dataset.col); // user made it visible
+    } else {
+      newHidden.add(cb.dataset.col);    // user hid it
+    }
   });
   _bmHiddenCols = newHidden;
   localStorage.setItem('bm-hidden-cols', JSON.stringify([..._bmHiddenCols]));
