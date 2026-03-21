@@ -3,6 +3,7 @@
 let _bmSearchTimer = null;      // server SeekDB search debounce
 let _bmRenderTimer = null;      // client-side filter render debounce
 let _bmSearchActive = false;
+let _bmExcludedTags = new Set(); // tags excluded from embeddings — also skipped in client-side keyword filter
 let _bmSortCol = 'created_at';
 let _bmSortDir = 'desc';
 let _bmColResizeDone = false;
@@ -47,7 +48,7 @@ async function loadBookmarks() {
     _bookmarks = await r.json();
     _bmSearchActive = false;
     document.getElementById('bm-search-status').hidden = true;
-    await _loadBookmarkTags();
+    await Promise.all([_loadBookmarkTags(), _loadExcludedTags()]);
     renderBookmarks();
   } catch (e) {
     err.textContent = `Failed to load bookmarks: ${e.message}`;
@@ -65,6 +66,15 @@ async function _loadBookmarkTags() {
     sel.innerHTML = '<option value="">All tags</option>' +
       tags.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
     sel.value = prev;
+  } catch (_) {}
+}
+
+async function _loadExcludedTags() {
+  try {
+    const r = await apiFetch('/api/v1/bookmarks/embedding-config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    _bmExcludedTags = new Set((cfg.excluded_tags || []).map(t => t.toLowerCase()));
   } catch (_) {}
 }
 
@@ -157,7 +167,7 @@ function renderBookmarks() {
       (b.url || '').toLowerCase().includes(q) ||
       (b.description || '').toLowerCase().includes(q) ||
       (b.notes || '').toLowerCase().includes(q) ||
-      (b.tags || []).some(t => t.toLowerCase().includes(q))
+      (b.tags || []).some(t => !_bmExcludedTags.has(t.toLowerCase()) && t.toLowerCase().includes(q))
     );
   }
   if (tagFilter) {
