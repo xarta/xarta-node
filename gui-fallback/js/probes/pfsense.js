@@ -22,21 +22,18 @@ async function checkProbeStatus() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     if (d.configured) {
-      btn.disabled = false;
-      btn.title = '';
+      if (btn) { btn.disabled = false; btn.title = ''; }
       // Only clear the status line if it's showing a config message (not a probe result)
       if (status.dataset.type === 'config') { status.hidden = true; }
     } else {
-      btn.disabled = true;
-      btn.title = d.reason;
+      if (btn) { btn.disabled = true; btn.title = d.reason; }
       status.textContent = `⚠ Probe unavailable: ${d.reason}`;
       status.style.color = 'var(--text-dim)';
       status.dataset.type = 'config';
       status.hidden = false;
     }
   } catch (e) {
-    btn.disabled = true;
-    btn.title = `Could not check probe status: ${e.message}`;
+    if (btn) { btn.disabled = true; btn.title = `Could not check probe status: ${e.message}`; }
   }
 }
 
@@ -179,8 +176,7 @@ function _ipCmp(a, b) {
 async function probePfSense() {
   const btn    = document.getElementById('dns-probe-btn');
   const status = document.getElementById('dns-probe-status');
-  btn.disabled = true;
-  btn.textContent = '⟳ Probing…';
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Probing…'; }
   status.hidden = true;
   try {
     const r = await apiFetch('/api/v1/pfsense-dns/probe', { method: 'POST' });
@@ -199,16 +195,14 @@ async function probePfSense() {
     status.dataset.type = 'probe';
     status.hidden = false;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '▶ Probe pfSense';
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Probe pfSense'; }
   }
 }
 
 async function pingSweep() {
   const btn    = document.getElementById('dns-sweep-btn');
   const status = document.getElementById('dns-sweep-status');
-  btn.disabled = true;
-  btn.textContent = '⟳ Sweeping…';
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Sweeping…'; }
   status.hidden = true;
   try {
     const r = await apiFetch('/api/v1/pfsense-dns/ping-sweep', { method: 'POST' });
@@ -224,8 +218,7 @@ async function pingSweep() {
     status.style.color = '#f87171';
     status.hidden = false;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '▶ Ping Sweep';
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Ping Sweep'; }
   }
 }
 

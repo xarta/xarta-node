@@ -432,8 +432,7 @@ function togglePveSteps() {
 async function fullProbeProxmox() {
   const btn    = document.getElementById('pve-full-probe-btn');
   const status = document.getElementById('pve-probe-status');
-  btn.disabled = true;
-  btn.textContent = '⏳ Running…';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
   status.style.color = 'var(--text-dim)';
   status.hidden = false;
 
@@ -470,8 +469,7 @@ async function fullProbeProxmox() {
   const ok = stepResults.filter(s => s.startsWith('✓')).length;
   status.textContent = `⚡ Full probe done — ${ok}/${STEPS.length} steps succeeded`;
   status.style.color = ok >= STEPS.length - 1 ? 'var(--accent)' : '#f59e0b';
-  btn.disabled = false;
-  btn.textContent = '⚡ Full Probe';
+  if (btn) { btn.disabled = false; btn.textContent = '⚡ Full Probe'; }
   console.log('Full probe results:', stepResults);
 }
 
