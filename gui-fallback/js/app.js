@@ -79,6 +79,7 @@ function switchTab(tab) {
     if (!_pctPollInterval) {
       _pctPollInterval = setInterval(() => { if (_nodes.length) enrichNodePctStatus(); }, 5000);
     }
+    loadBackups();
   } else {
     if (_pctPollInterval) { clearInterval(_pctPollInterval); _pctPollInterval = null; }
   }
@@ -95,7 +96,6 @@ document.addEventListener('DOMContentLoaded', () => {
   SynthesisMenuConfig.showGroup();
   SynthesisMenuConfig.updateActiveTab('manual-links-' + _manualLinksView);
   loadSyncStatus();
-  loadBackups();
   setInterval(loadHealth, 15_000);
   setInterval(loadSyncStatus, 30_000);
   _bmInitEmbedPanel();

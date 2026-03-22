@@ -36,13 +36,6 @@
 
 
 
-  <!-- Secondary navigation — tabs shown change with active top-level group -->
-  <nav class="table-nav">
-    <!-- SYNTHESIS group — navigation handled by SynthesisMenuConfig split-dropdown below -->
-    <!-- SETTINGS group — navigation handled by SettingsMenuConfig split-dropdown below -->
-    <!-- PROBES group — navigation handled by ProbesMenuConfig split-dropdown below -->
-  </nav>
-
   <!-- Synthesis split-dropdown menu — shown when synthesis group is active (default) -->
   <div id="synthesisMenuWrapper" style="margin-bottom:4px">
     <div class="hub-tabs-wrapper" style="margin-bottom:0">
@@ -207,9 +200,9 @@
     <div id="self-diag-results"></div>
   </section>
 
-  <!-- Synthesis — Navbar Layout -->
+  <!-- Synthesis — Layout editor -->
   <section id="tab-synthesis-layout" class="tab-panel">
-    <h2>&#9776; Navbar Layout</h2>
+    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Synthesis navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -382,6 +375,42 @@
       </table>
     </div>
     <p id="nodes-error" class="error-msg" hidden></p>
+
+    <section style="margin-top:24px">
+      <h2>Sync status</h2>
+      <div id="sync-panel">
+        <div class="sync-grid" id="sync-grid">
+          <div><span class="spinner"></span> loading…</div>
+        </div>
+      </div>
+      <p id="sync-error" class="error-msg" hidden></p>
+    </section>
+
+    <!-- Backups -->
+    <section style="margin-top:24px">
+      <h2>Backups</h2>
+      <div class="toolbar" style="margin-bottom:12px;">
+        <button onclick="createBackup(this)">&#128190; Create backup</button>
+        <button class="secondary" onclick="loadBackups()">&#8635; Refresh</button>
+      </div>
+      <div class="warn-box">
+        &#9888; Restoring only updates <strong>this node</strong>.
+        Other nodes are not automatically updated — they will push their queued writes back to this node on the next sync cycle, which may overwrite the restore.
+        Use <strong>Force Restore</strong> to propagate the restored state to all peers and suppress incoming overwrites (disaster recovery only).
+      </div>
+      <div class="table-wrap">
+        <table class="backup-table">
+          <thead><tr>
+            <th>Filename</th>
+            <th>Size</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr></thead>
+          <tbody id="backup-tbody"><tr class="empty-row"><td colspan="4">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <p id="backup-error" class="error-msg" hidden></p>
+    </section>
   </section>
 
   <!-- pfSense DNS -->
@@ -928,10 +957,9 @@
     </div>
   </section>
 
-  <!-- Probes — Menu Settings -->
-  <!-- Settings — Navbar Layout editor -->
+  <!-- Settings — Layout editor -->
   <section id="tab-settings-layout" class="tab-panel">
-    <h2>&#9776; Navbar Layout</h2>
+    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Settings navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -949,9 +977,9 @@
     </div>
   </section>
 
-  <!-- Probes — Navbar Layout -->
+  <!-- Probes — Layout editor -->
   <section id="tab-probes-settings" class="tab-panel">
-    <h2>&#9776; Navbar Layout</h2>
+    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Probes navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -969,41 +997,6 @@
     </div>
   </section>
 
-  <section>
-    <h2>Sync status</h2>
-    <div id="sync-panel">
-      <div class="sync-grid" id="sync-grid">
-        <div><span class="spinner"></span> loading…</div>
-      </div>
-    </div>
-    <p id="sync-error" class="error-msg" hidden></p>
-  </section>
-
-  <!-- Backups -->
-  <section>
-    <h2>Backups</h2>
-    <div class="toolbar" style="margin-bottom:12px;">
-      <button onclick="createBackup(this)">&#128190; Create backup</button>
-      <button class="secondary" onclick="loadBackups()">&#8635; Refresh</button>
-    </div>
-    <div class="warn-box">
-      &#9888; Restoring only updates <strong>this node</strong>.
-      Other nodes are not automatically updated — they will push their queued writes back to this node on the next sync cycle, which may overwrite the restore.
-      Use <strong>Force Restore</strong> to propagate the restored state to all peers and suppress incoming overwrites (disaster recovery only).
-    </div>
-    <div class="table-wrap">
-      <table class="backup-table">
-        <thead><tr>
-          <th>Filename</th>
-          <th>Size</th>
-          <th>Created</th>
-          <th>Actions</th>
-        </tr></thead>
-        <tbody id="backup-tbody"><tr class="empty-row"><td colspan="4">Loading…</td></tr></tbody>
-      </table>
-    </div>
-    <p id="backup-error" class="error-msg" hidden></p>
-  </section>
 
 </main>
 
