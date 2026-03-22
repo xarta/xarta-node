@@ -18,6 +18,17 @@ const ProbesMenuConfig = {
 
     _initialized: false,
 
+    // Registry of callable functions assignable to menu items.
+    // Keys are arbitrary dot-namespaced strings ('bm.add', 'bm.refresh', etc.).
+    // Values are zero-argument functions — never serialised to localStorage.
+    _fnRegistry: {},
+
+    // Register one or more functions by key.
+    // Call from any script that loads after probes-menu.js, or collect here.
+    registerFunctions(map) {
+        Object.assign(this._fnRegistry, map);
+    },
+
     // ── Default menu structure ─────────────────────────────────
     // id     — must match the existing switchTab() tab IDs
     // parent — null = top-level; 'parentId' = child of that item
@@ -37,6 +48,18 @@ const ProbesMenuConfig = {
         { id: 'bookmarks-embeddings', label: '🤖 Embeddings',      icon: '🤖', pageLabel: 'Embedding Config',  parent: 'bookmarks',       order: 2 },
         { id: 'bookmarks-setup',      label: '⚙ Setup',           icon: '⚙',  pageLabel: 'Setup & Import',    parent: 'bookmarks',       order: 3 },
         { id: 'probes-settings',      label: '☰',                 icon: '☰',  pageLabel: 'Navbar Layout',     parent: null,             order: 3 },
+
+        // ── Bookmarks page function items ───────────────────────────────────
+        // These items call registered functions rather than navigating to a tab.
+        // activeOn: the item is only visible in the dropdown when the named tab is active.
+        // fn: key into ProbesMenuConfig._fnRegistry.
+        // To add functions for another page, append items here with the appropriate activeOn.
+        { id: 'bm-fn-add',    label: '➕ Add Bookmark',   icon: '➕', fn: 'bm.add',         activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 0 },
+        { id: 'bm-fn-import', label: '⬆ Import HTML',     icon: '⬆', fn: 'bm.import',      activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 1 },
+        { id: 'bm-fn-refresh',label: '↺ Refresh',         icon: '↺', fn: 'bm.refresh',     activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 2 },
+        { id: 'bm-fn-cols',   label: '☰ Columns',         icon: '☰', fn: 'bm.cols',        activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 3 },
+        { id: 'bm-fn-expl',   label: '📊 Explain Sort',   icon: '📊', fn: 'bm.explainSort', activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 4 },
+        { id: 'bm-fn-dead',   label: '🔗 Dead links',     icon: '🔗', fn: 'bm.deadLinks',   activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 5 },
     ],
 
     currentMenu: [],
@@ -80,8 +103,12 @@ const ProbesMenuConfig = {
                     const existing = this.currentMenu.find(m => m.id === def.id);
                     if (!existing) {
                         this.currentMenu.push({ ...def });
-                    } else if (existing.pageLabel === undefined) {
-                        existing.pageLabel = def.pageLabel;
+                    } else {
+                        // Back-fill fields that may be missing from older saved configs
+                        if (existing.pageLabel === undefined) existing.pageLabel = def.pageLabel;
+                        // fn and activeOn are always developer-controlled — always sync from defaultMenu
+                        if (def.fn !== undefined) existing.fn = def.fn; else delete existing.fn;
+                        if (def.activeOn !== undefined) existing.activeOn = def.activeOn; else delete existing.activeOn;
                     }
                 });
             } catch (e) {
@@ -174,42 +201,65 @@ const ProbesMenuConfig = {
         navbar.innerHTML = '';
 
         this.getTopLevelItems().forEach(item => {
-            const children = this.getChildren(item.id);
-            const allInGroup = [item, ...children];
-            // Which member of this group (if any) is the currently active tab?
-            const activeMember = activeId ? allInGroup.find(m => m.id === activeId) : null;
+            const children     = this.getChildren(item.id);
+            const navChildren  = children.filter(c => !c.fn);
+            const fnChildren   = children.filter(c => !!c.fn);
+
+            // Function children filtered by activeOn context — they only appear
+            // in the dropdown when the specified tab is currently active.
+            const visibleFnChildren = fnChildren.filter(c =>
+                !c.activeOn || (activeId && c.activeOn.includes(activeId))
+            );
+
+            // Active group detection considers only tab-navigation children.
+            const allNavGroup  = [item, ...navChildren];
+            const activeMember = activeId ? allNavGroup.find(m => m.id === activeId) : null;
             const isGroupActive = !!activeMember;
 
-            if (children.length > 0) {
-                // Group with children: split-button + dropdown
-                const labelText = isGroupActive
-                    ? (activeMember.pageLabel || activeMember.label)
-                    : item.label;
-                // When active: show all group members EXCEPT the active one in dropdown.
-                // When inactive: show children only (parent is the labelled button as usual).
-                const dropdownItems = isGroupActive
-                    ? allInGroup.filter(m => m.id !== activeMember.id)
-                    : children;
+            // Nav items shown in the dropdown (may exclude the active member).
+            const dropdownNavItems = navChildren.length > 0
+                ? (isGroupActive
+                    ? allNavGroup.filter(m => m.id !== activeMember.id)
+                    : navChildren)
+                : [];
 
+            // Combine visible nav and fn items — fn items come after nav items.
+            const allDropdownItems = [...dropdownNavItems, ...visibleFnChildren];
+
+            const labelText = isGroupActive
+                ? (activeMember.pageLabel || activeMember.label)
+                : item.label;
+
+            if (allDropdownItems.length > 0) {
+                // ── Split-button with dropdown ────────────────────────────
+                const hasSeparator = dropdownNavItems.length > 0 && visibleFnChildren.length > 0;
+                const navHtml  = dropdownNavItems.map(c =>
+                    `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`
+                ).join('');
+                const sepHtml  = hasSeparator ? '<hr class="hub-dropdown-separator">' : '';
+                const fnHtml   = visibleFnChildren.map(c =>
+                    `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}">${c.label}</button>`
+                ).join('');
+
+                const isActive = isGroupActive || (activeId === item.id);
                 const dropdown = document.createElement('div');
                 dropdown.className = 'hub-tab-dropdown';
                 dropdown.innerHTML = `
                     <div class="hub-tab-split">
-                        <button class="hub-tab hub-tab-label${isGroupActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
+                        <button class="hub-tab hub-tab-label${isActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
                         <button class="hub-tab-caret" aria-label="Toggle submenu">▼</button>
                     </div>
                     <div class="hub-dropdown-menu">
-                        ${dropdownItems.map(c => `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`).join('')}
+                        ${navHtml}${sepHtml}${fnHtml}
                     </div>
                 `;
 
-                // Label click: if group active → re-navigate to active member;
-                // else → navigate to parent's own tab or first child.
+                // Label click: navigate to own tab or first nav child
                 dropdown.querySelector('.hub-tab-label').addEventListener('click', (e) => {
                     e.stopPropagation();
                     const targetId = isGroupActive
                         ? activeMember.id
-                        : (document.getElementById('tab-' + item.id) ? item.id : children[0]?.id);
+                        : (document.getElementById('tab-' + item.id) ? item.id : navChildren[0]?.id);
                     if (targetId) {
                         switchTab(targetId);
                         this.updateActiveTab(targetId);
@@ -226,8 +276,8 @@ const ProbesMenuConfig = {
                     if (!wasOpen) dropdown.classList.add('open');
                 });
 
-                // Dropdown item clicks → navigate (resolve missing panels to first child)
-                dropdown.querySelectorAll('.hub-dropdown-item').forEach(btn => {
+                // Nav dropdown items → navigate (resolve missing panels to first child)
+                dropdown.querySelectorAll('.hub-dropdown-item:not(.hub-dropdown-fn)').forEach(btn => {
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         const destId = btn.dataset.tab;
@@ -241,10 +291,35 @@ const ProbesMenuConfig = {
                     });
                 });
 
+                // Fn dropdown items → call registered function
+                dropdown.querySelectorAll('.hub-dropdown-fn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const fn = this._fnRegistry[btn.dataset.fn];
+                        if (typeof fn === 'function') fn();
+                        else console.warn('[ProbesMenuConfig] No function registered for:', btn.dataset.fn);
+                        this.closeMenu();
+                        this.closeDropdowns();
+                    });
+                });
+
                 navbar.appendChild(dropdown);
 
+            } else if (item.fn) {
+                // ── Top-level function button (promoted fn item) ──────────
+                const btn = document.createElement('button');
+                btn.className = 'hub-tab';
+                btn.textContent = item.label;
+                btn.addEventListener('click', () => {
+                    const fn = this._fnRegistry[item.fn];
+                    if (typeof fn === 'function') fn();
+                    else console.warn('[ProbesMenuConfig] No function registered for:', item.fn);
+                    this.closeMenu();
+                });
+                navbar.appendChild(btn);
+
             } else {
-                // Standalone tab button (no children)
+                // ── Standalone tab button ─────────────────────────────────
                 const btn = document.createElement('button');
                 btn.className = 'hub-tab';
                 btn.dataset.tab = item.id;
@@ -287,6 +362,10 @@ const ProbesMenuConfig = {
 
         // Re-render navbar with active state baked in
         this.renderNavbar(activeId || this._activeId);
+        // Re-render editor so fn item context badges update as the active tab changes.
+        // renderEditor is cheap; setupDragAndDrop re-wires listeners on the fresh DOM.
+        this.renderEditor();
+        this.setupDragAndDrop();
     },
 
     // ── Editor rendering ───────────────────────────────────────
@@ -320,20 +399,55 @@ const ProbesMenuConfig = {
                 </div>
             </div>
             <div class="menu-editor-children" data-parent="${item.id}">
-                ${children.map(child => `
-                    <div class="menu-editor-item menu-editor-child" data-id="${child.id}" draggable="true">
+                ${children.map(child => {
+                    const isFn = !!child.fn;
+                    const defItem = this.defaultMenu.find(m => m.id === child.id);
+                    const fnKey = defItem?.fn || child.fn || '';
+                    const activeOnArr = (isFn && defItem?.activeOn) ? defItem.activeOn : null;
+
+                    // Context resolution for the editor:
+                    // ─ When the layout editor tab itself is active (item.id === _activeId),
+                    //   treat all fn children as in-context — editing mode, no content page open.
+                    // ─ Otherwise, match _activeId against the item's activeOn list.
+                    // This is the same activeOn data that controls navbar dropdown visibility,
+                    // so the editor and the navbar are always logically consistent.
+                    const isLayoutEditor = this._activeId === item.id;
+                    const isInContext = isLayoutEditor
+                        || !activeOnArr
+                        || Boolean(this._activeId && activeOnArr.includes(this._activeId));
+
+                    // Context badge: shows which tab activates this fn item, with a live
+                    // green/dim indicator derived from the current page context.
+                    const tabList = activeOnArr ? activeOnArr.join(' / ') : '';
+                    const badgeTitle = isLayoutEditor
+                        ? `Visible in dropdown when on: ${tabList}`
+                        : (isInContext
+                            ? `Active — visible in dropdown now`
+                            : `Inactive — visible in dropdown only when on: ${tabList}`);
+                    const contextBadgeHtml = activeOnArr
+                        ? `<span class="menu-fn-context-badge${(isInContext && !isLayoutEditor) ? ' is-active' : ''}" title="${badgeTitle}">● ${tabList}</span>`
+                        : '';
+
+                    const rightColHtml = isFn
+                        ? `<span class="menu-fn-badge" title="Function — ${fnKey}">⚡ ${fnKey}</span>${contextBadgeHtml}`
+                        : `<span class="menu-item-page-label" title="Page label">→ ${child.pageLabel || '—'}</span>`;
+                    const editPageBtnHtml = isFn ? ''
+                        : `<button class="btn-edit-page-label" data-id="${child.id}" title="Edit page label">🏷️</button>`;
+                    const inactiveClass = (isFn && !isInContext) ? ' menu-editor-fn-child--inactive' : '';
+                    return `
+                    <div class="menu-editor-item menu-editor-child${isFn ? ' menu-editor-fn-child' : ''}${inactiveClass}" data-id="${child.id}" draggable="true">
                         <div class="menu-item-header">
                             <span class="drag-handle">⋮⋮</span>
                             <span class="menu-item-icon">${child.icon}</span>
                             <span class="menu-item-label">${child.label.replace(child.icon, '').trim()}</span>
-                            <span class="menu-item-page-label" title="Page label">→ ${child.pageLabel || '—'}</span>
+                            ${rightColHtml}
                             <div class="menu-item-actions">
-                                <button class="btn-edit-page-label" data-id="${child.id}" title="Edit page label">🏷️</button>
+                                ${editPageBtnHtml}
                                 <button class="btn-promote-item" data-id="${child.id}" title="Promote to top level">⬆️</button>
                             </div>
                         </div>
-                    </div>
-                `).join('')}
+                    </div>`;
+                }).join('')}
                 <div class="drop-zone-child" data-parent="${item.id}">
                     <span>Drop here to nest as submenu item</span>
                 </div>
@@ -502,3 +616,34 @@ const ProbesMenuConfig = {
         });
     },
 };
+
+// ── Built-in function registrations ─────────────────────────────────────────
+// probes-menu.js loads after bookmarks.js so all referenced globals are in scope.
+//
+// To register functions for another page, call:
+//   ProbesMenuConfig.registerFunctions({ 'ns.key': () => myFunction() })
+// from any script loaded after probes-menu.js, or add entries here.
+//
+// Add a matching fn item in defaultMenu above with:
+//   fn: 'ns.key', activeOn: ['your-tab-id']
+
+ProbesMenuConfig.registerFunctions({
+    // Bookmarks — Main tab
+    'bm.add':         () => openBookmarkModal(null),
+    'bm.import':      () => document.getElementById('bm-import-file').click(),
+    'bm.refresh':     () => loadBookmarks(),
+    'bm.cols':        () => _bmOpenColsModal(),
+    'bm.explainSort': () => {
+        if (!_bmSearchActive) {
+            const st = document.getElementById('bm-search-status');
+            if (st) {
+                st.textContent = 'Explain Sort is only available during an active search.';
+                st.hidden = false;
+                setTimeout(() => { st.hidden = true; }, 3000);
+            }
+            return;
+        }
+        _bmOpenSortExplainModal();
+    },
+    'bm.deadLinks':   () => _bmAutoArchiveDead(null),
+});
