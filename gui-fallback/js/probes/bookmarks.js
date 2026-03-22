@@ -512,8 +512,33 @@ let _visColResizeDone = false;
 let _visSortCol = 'visited_at';
 let _visSortDir = 'desc';
 
+// Visual-only pagination for visits — same pattern as bookmarks
+const _VIS_PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 1000];
+let _visPage = 1;
+let _visPageSize = (() => {
+  const n = parseInt(localStorage.getItem('vis-page-size') || '100', 10);
+  return _VIS_PAGE_SIZE_OPTIONS.includes(n) ? n : 100;
+})();
+
+// Domain grouping — active when sorted by url or domain
+let _visExpandedDomains = new Set(); // domains currently expanded in group mode
+
 function _visVisibleCols() { return _VIS_ALL_COLS.filter(k => !_visHiddenCols.has(k)); }
 function _visColCount()    { return _visVisibleCols().length; }
+
+// Return the hostname (stripped of www.) for a URL string
+function _visDomain(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); }
+  catch (_) { return ''; }
+}
+
+// Return the first path segment of a URL, e.g. '/docs', or '/' for root
+function _visFirstSlug(url) {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    return parts.length ? '/' + parts[0] : '/';
+  } catch (_) { return '/'; }
+}
 
 function _visRebuildThead() {
   const tr = document.getElementById('vis-thead-row');
@@ -576,7 +601,7 @@ function _visApplyColsModal() {
   _visHiddenCols = newHidden;
   localStorage.setItem('vis-hidden-cols', JSON.stringify([..._visHiddenCols]));
   _visRebuildThead();
-  renderVisits();
+  renderVisits({ keepPage: true }); // column toggle — stay on current page
   modal.close();
 }
 
@@ -595,7 +620,8 @@ async function loadVisits() {
   }
 }
 
-function renderVisits() {
+function renderVisits(opts = {}) {
+  if (!opts.keepPage) _visPage = 1;
   const q = (document.getElementById('bm-visit-search')?.value || '').toLowerCase();
   const savedFilter = document.getElementById('bm-visit-saved-filter')?.value || 'all';
   let rows = _bmVisits;
@@ -616,35 +642,233 @@ function renderVisits() {
       ? av.localeCompare(bv, undefined, {numeric: true})
       : bv.localeCompare(av, undefined, {numeric: true});
   });
+
+  const groupMode = (_visSortCol === 'url' || _visSortCol === 'domain');
+  // Show/hide grouping controls
+  const expandBtn   = document.getElementById('vis-expand-all-btn');
+  const collapseBtn = document.getElementById('vis-collapse-all-btn');
+  if (expandBtn)   expandBtn.hidden   = !groupMode;
+  if (collapseBtn) collapseBtn.hidden = !groupMode;
+
   const cols  = _visVisibleCols();
   const tbody = document.getElementById('bm-visits-tbody');
-  if (!rows.length) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
+  const status = document.getElementById('vis-status');
+
+  if (!groupMode) {
+    // ── Non-group mode: paginate visit rows ──────────────────────────────
+    const total = rows.length;
+    const totalPages = Math.max(1, Math.ceil(total / _visPageSize));
+    _visPage = Math.max(1, Math.min(_visPage, totalPages));
+    const pageRows = rows.slice((_visPage - 1) * _visPageSize, _visPage * _visPageSize);
+    if (status) {
+      if (total > _visPageSize) {
+        const from = (_visPage - 1) * _visPageSize + 1;
+        const to   = Math.min(_visPage * _visPageSize, total);
+        status.textContent = `${total} visit${total === 1 ? '' : 's'} (showing ${from}\u2013${to})`;
+      } else {
+        status.textContent = `${total} visit${total === 1 ? '' : 's'}`;
+      }
+      status.hidden = false;
+    }
+    if (!pageRows.length) {
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
+      _visUpdateSortHeaders();
+      _visRenderPagination(total, _visPageSize, _visPage);
+      return;
+    }
+    const expandColspan = cols.length;
+    tbody.innerHTML = pageRows.map(v => {
+      const expandId = `ve-${esc(v.visit_id)}`;
+      const tds = cols.map(k => (_VIS_FIELD_META[k]?.render ?? (v => `<td>${esc(String(v[k] ?? ''))}</td>`))(v)).join('');
+      return `<tr>${tds}</tr>
+      <tr id="${expandId}" style="display:none">
+        <td colspan="${expandColspan}" style="padding:0 0 6px 18px">
+          <div id="${expandId}-body" style="font-size:11px;color:var(--text-dim)">Loading&hellip;</div>
+        </td>
+      </tr>`;
+    }).join('');
+    _visInitColResize();
+    _visUpdateSortHeaders();
+    _visRenderPagination(total, _visPageSize, _visPage);
     return;
   }
+
+  // ── Group mode: group by domain, sub-group by first path segment ──────
+  const domainOrder = [];
+  const domainGroups = new Map();
+  for (const v of rows) {
+    const domain = v.domain || _visDomain(v.url || '') || '(unknown)';
+    if (!domainGroups.has(domain)) {
+      domainGroups.set(domain, []);
+      domainOrder.push(domain);
+    }
+    domainGroups.get(domain).push(v);
+  }
+
+  // Build flat list of visible items (domain headers + optional slug headers + visit rows)
+  const items = [];
+  for (const domain of domainOrder) {
+    const visits  = domainGroups.get(domain);
+    const expanded = _visExpandedDomains.has(domain);
+    const totalVisitCount = visits.reduce((s, v) => s + (v.visit_count || 1), 0);
+    items.push({ type: 'domain-header', domain, urlCount: visits.length, totalVisitCount, expanded });
+    if (expanded) {
+      // Only show slug sub-headers when there are multiple different first segments
+      const slugSet = new Set(visits.map(v => _visFirstSlug(v.url || '')));
+      const hasMultipleSlugs = slugSet.size > 1;
+      let lastSlug = null;
+      for (const v of visits) {
+        const slug = _visFirstSlug(v.url || '');
+        if (hasMultipleSlugs && slug !== lastSlug) {
+          items.push({ type: 'slug-header', slug });
+          lastSlug = slug;
+        }
+        items.push({ type: 'visit', v });
+      }
+    }
+  }
+
+  // Paginate over flat items
+  const totalItems = items.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / _visPageSize));
+  _visPage = Math.max(1, Math.min(_visPage, totalPages));
+  const pageItems = items.slice((_visPage - 1) * _visPageSize, _visPage * _visPageSize);
+
+  if (status) {
+    const totalDomains = domainOrder.length;
+    const totalVisits  = rows.reduce((s, v) => s + (v.visit_count || 1), 0);
+    const totalUrls    = rows.length;
+    const expandedCount = [..._visExpandedDomains].filter(d => domainGroups.has(d)).length;
+    let statusText = `${totalVisits} visit${totalVisits === 1 ? '' : 's'} (${totalUrls} URL${totalUrls === 1 ? '' : 's'}) across ${totalDomains} domain${totalDomains === 1 ? '' : 's'}`;
+    if (expandedCount) statusText += ` (${expandedCount} expanded)`;
+    if (totalItems > _visPageSize) {
+      const from = (_visPage - 1) * _visPageSize + 1;
+      const to   = Math.min(_visPage * _visPageSize, totalItems);
+      statusText += ` — rows ${from}\u2013${to} of ${totalItems}`;
+    }
+    status.textContent = statusText;
+    status.hidden = false;
+  }
+
+  if (!pageItems.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
+    _visUpdateSortHeaders();
+    _visRenderPagination(totalItems, _visPageSize, _visPage);
+    return;
+  }
+
   const expandColspan = cols.length;
-  tbody.innerHTML = rows.map(v => {
-    const expandId = `ve-${esc(v.visit_id)}`;
-    const tds = cols.map(k => (_VIS_FIELD_META[k]?.render ?? (v => `<td>${esc(String(v[k] ?? ''))}</td>`))(v)).join('');
-    return `<tr>${tds}</tr>
-    <tr id="${expandId}" style="display:none">
-      <td colspan="${expandColspan}" style="padding:0 0 6px 18px">
-        <div id="${expandId}-body" style="font-size:11px;color:var(--text-dim)">Loading&hellip;</div>
-      </td>
-    </tr>`;
-  }).join('');
+  let html = '';
+  for (const item of pageItems) {
+    if (item.type === 'domain-header') {
+      const chevron = item.expanded ? '&#9660;' : '&#9658;';
+      html += `<tr class="vis-group-header" onclick="_visToggleDomain('${esc(item.domain)}')"
+        style="cursor:pointer;background:rgba(0,0,0,0.25)">
+        <td colspan="${expandColspan}" style="padding:7px 10px;font-weight:600;font-size:12px;user-select:none">
+          <span style="color:var(--text-dim);margin-right:6px;font-size:11px">${chevron}</span>
+          <span style="color:var(--accent)">${esc(item.domain)}</span>
+          <span style="color:var(--text-dim);font-weight:400;margin-left:8px;font-size:11px">${item.totalVisitCount} visit${item.totalVisitCount === 1 ? '' : 's'}</span>
+          ${item.urlCount > 1 ? `<span style="color:var(--text-dim);font-weight:400;font-size:10px;margin-left:5px">(${item.urlCount} URLs)</span>` : ''}
+        </td>
+      </tr>`;
+    } else if (item.type === 'slug-header') {
+      html += `<tr class="vis-slug-header">
+        <td colspan="${expandColspan}" style="padding:3px 10px 3px 28px;font-size:11px;color:var(--text-dim);border-top:1px solid rgba(255,255,255,0.06);background:rgba(0,0,0,0.12);font-style:italic">${esc(item.slug)}</td>
+      </tr>`;
+    } else { // type === 'visit'
+      const v = item.v;
+      const expandId = `ve-${esc(v.visit_id)}`;
+      const tds = cols.map(k => (_VIS_FIELD_META[k]?.render ?? (v => `<td>${esc(String(v[k] ?? ''))}</td>`))(v)).join('');
+      html += `<tr>${tds}</tr>
+      <tr id="${expandId}" style="display:none">
+        <td colspan="${expandColspan}" style="padding:0 0 6px 18px">
+          <div id="${expandId}-body" style="font-size:11px;color:var(--text-dim)">Loading&hellip;</div>
+        </td>
+      </tr>`;
+    }
+  }
+  tbody.innerHTML = html;
   _visInitColResize();
   _visUpdateSortHeaders();
+  _visRenderPagination(totalItems, _visPageSize, _visPage);
 }
 
 function _visSortBy(col) {
+  const wasGroupMode = (_visSortCol === 'url' || _visSortCol === 'domain');
   if (_visSortCol === col) {
     _visSortDir = _visSortDir === 'asc' ? 'desc' : 'asc';
   } else {
     _visSortCol = col;
     _visSortDir = 'asc';
   }
+  const nowGroupMode = (_visSortCol === 'url' || _visSortCol === 'domain');
+  // When entering group mode fresh, start with all groups collapsed
+  if (!wasGroupMode && nowGroupMode) _visExpandedDomains = new Set();
   renderVisits();
+}
+
+// Toggle a single domain group open/closed
+function _visToggleDomain(domain) {
+  if (_visExpandedDomains.has(domain)) {
+    _visExpandedDomains.delete(domain);
+  } else {
+    _visExpandedDomains.add(domain);
+  }
+  renderVisits({ keepPage: true });
+}
+
+// Expand or collapse all domain groups
+function _visSetAllDomains(expanded) {
+  if (expanded) {
+    _visExpandedDomains = new Set(
+      _bmVisits.map(v => v.domain || _visDomain(v.url || '') || '(unknown)')
+    );
+  } else {
+    _visExpandedDomains = new Set();
+  }
+  _visPage = 1;
+  renderVisits({ keepPage: true });
+}
+
+// Pagination controls
+function _visRenderPagination(total, pageSize, page) {
+  const el = document.getElementById('vis-pagination');
+  if (!el) return;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const sizeOpts = _VIS_PAGE_SIZE_OPTIONS.map(n =>
+    `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`
+  ).join('');
+  const sizeSelect = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+    Per page:
+    <select onchange="_visSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select>
+  </label>`;
+  if (totalPages <= 1) {
+    // Always show the per-page selector even when everything fits on one page
+    el.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">${sizeSelect}</div>`;
+    return;
+  }
+  const prevDis = page <= 1 ? ' disabled' : '';
+  const nextDis = page >= totalPages ? ' disabled' : '';
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">
+      <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_visGoPage(${page - 1})">&#8592; Prev</button>
+      <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
+      <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_visGoPage(${page + 1})">Next &#8594;</button>
+      ${sizeSelect}
+    </div>`;
+}
+
+function _visGoPage(n) {
+  _visPage = n;
+  renderVisits({ keepPage: true });
+}
+
+function _visSetPageSize(n) {
+  if (!_VIS_PAGE_SIZE_OPTIONS.includes(n)) return;
+  _visPageSize = n;
+  localStorage.setItem('vis-page-size', String(n));
+  _visPage = 1;
+  renderVisits({ keepPage: true });
 }
 
 function _visUpdateSortHeaders() {
