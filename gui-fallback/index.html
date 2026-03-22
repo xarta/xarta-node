@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="css/components.css" />
   <link rel="stylesheet" href="css/probes-menu.css" />
   <link rel="stylesheet" href="css/settings-menu.css" />
+  <link rel="stylesheet" href="css/synthesis-menu.css" />
 </head>
 <body>
 
@@ -37,13 +38,23 @@
 
   <!-- Secondary navigation — tabs shown change with active top-level group -->
   <nav class="table-nav">
-    <!-- SYNTHESIS group -->
-    <button data-group="synthesis" class="active" onclick="switchTab('manual-links')">Manual</button>
-    <button data-group="synthesis" onclick="switchTab('services')">Services</button>
-    <button data-group="synthesis" onclick="switchTab('machines')">Machines</button>
+    <!-- SYNTHESIS group — navigation handled by SynthesisMenuConfig split-dropdown below -->
     <!-- SETTINGS group — navigation handled by SettingsMenuConfig split-dropdown below -->
     <!-- PROBES group — navigation handled by ProbesMenuConfig split-dropdown below -->
   </nav>
+
+  <!-- Synthesis split-dropdown menu — shown when synthesis group is active (default) -->
+  <div id="synthesisMenuWrapper" style="margin-bottom:4px">
+    <div class="hub-tabs-wrapper" style="margin-bottom:0">
+      <button class="hub-menu-toggle" id="synthesisMenuToggle">
+        <span class="hamburger-icon">☰</span>
+        <span class="current-tab-label" id="synthesisCurrentTabLabel">Synthesis</span>
+        <span class="dropdown-arrow">▼</span>
+      </button>
+      <div class="hub-tabs" id="synthesisHubTabs"></div>
+    </div>
+  </div>
+  <div id="synthesisMenuSaveNotification">✓ Saved</div>
 
   <!-- Probes split-dropdown menu — shown when probes group is active -->
   <div id="probesMenuWrapper" style="display:none;margin-bottom:4px">
@@ -196,16 +207,32 @@
     <div id="self-diag-results"></div>
   </section>
 
+  <!-- Synthesis — Navbar Layout -->
+  <section id="tab-synthesis-layout" class="tab-panel">
+    <h2>&#9776; Navbar Layout</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Synthesis navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
+    <div class="menu-editor-container">
+      <div class="menu-editor-header">
+        <h3>Synthesis Navigation</h3>
+        <div style="display:flex;gap:8px">
+          <button class="btn-save-menu" id="synthesisMenuSaveButton">Save layout</button>
+          <button class="btn-reset-menu" id="synthesisMenuResetButton">Reset defaults</button>
+        </div>
+      </div>
+      <div class="menu-editor-instructions">
+        <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
+        <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
+      </div>
+      <div id="synthesisMenuEditorList"></div>
+    </div>
+  </section>
+
   <!-- Manual Links -->
   <section id="tab-manual-links" class="tab-panel active">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
       <div>
         <h2 style="margin:0">Manual Links</h2>
         <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Curated fallback links — VLAN and tailnet addresses for important services. Syncs across fleet.</p>
-      </div>
-      <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
-        <button id="ml-btn-table" class="secondary" onclick="manualLinksShowView('table')" style="padding:4px 10px;font-size:12px">&#9776; Table</button>
-        <button id="ml-btn-rendered" class="secondary active" onclick="manualLinksShowView('rendered')" style="padding:4px 10px;font-size:12px">&#127760; Rendered</button>
       </div>
     </div>
 
@@ -1218,6 +1245,7 @@
 <script src="js/synthesis/manual-links.js"></script>
 <script src="js/synthesis/services.js"></script>
 <script src="js/synthesis/machines.js"></script>
+<script src="js/synthesis/synthesis-menu.js"></script>
 <script src="js/settings/nodes.js"></script>
 <script src="js/settings/keys.js"></script>
 <script src="js/settings/certs.js"></script>
