@@ -1449,9 +1449,10 @@ async function _bmAutoArchiveDead(btn) {
   statusEl.style.color = 'var(--text-dim)';
   resultsEl.textContent = '';
   panel.style.display = '';
-  btn.disabled = true;
-  const orig = btn.textContent;
-  btn.textContent = '\u27F3 Checking\u2026';
+  // btn may be null when called from the navbar menu rather than the toolbar button
+  if (btn) btn.disabled = true;
+  const orig = btn ? btn.textContent : '';
+  if (btn) btn.textContent = '\u27F3 Checking\u2026';
   try {
     const r = await apiFetch('/api/v1/bookmarks/check-dead-links', { method: 'POST' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -1471,8 +1472,7 @@ async function _bmAutoArchiveDead(btn) {
     statusEl.style.color = 'var(--err)';
     resultsEl.textContent = '';
   } finally {
-    btn.disabled = false;
-    btn.textContent = orig;
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
   }
 }
 

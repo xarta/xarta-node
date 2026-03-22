@@ -742,18 +742,9 @@
 
   <!-- Bookmarks -->
   <section id="tab-bookmarks-main" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <p style="font-size:12px;color:var(--text-dim);margin:0">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
-      <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap">
-        <button onclick="openBookmarkModal(null)">+ Add bookmark</button>
-        <button class="secondary" onclick="document.getElementById('bm-import-file').click()">&#8593; Import HTML</button>
-        <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
-        <button class="secondary" onclick="loadBookmarks()">&#8635; Refresh</button>
-        <button class="secondary" onclick="_bmOpenColsModal()" title="Show or hide table columns">&#9776; Columns</button>
-        <button id="bm-explain-sort-btn" class="secondary" onclick="_bmOpenSortExplainModal()" disabled title="Explain how the current search results are sorted (available during search)">&#128202; Explain Sort</button>
-        <button class="secondary" onclick="_bmAutoArchiveDead(this)" title="Check all non-archived bookmarks for 404/410 errors and archive any dead links">&#128279; Check dead links</button>
-      </div>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
+    <!-- Hidden file input for Import HTML (triggered via menu or Setup tab) -->
+    <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
     <!-- Search / filter toolbar -->
     <div class="toolbar" style="margin-bottom:10px">
       <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
