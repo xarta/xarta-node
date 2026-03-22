@@ -800,15 +800,19 @@
         <option value="unsaved">Unsaved only</option>
         <option value="saved">Saved only</option>
       </select>
+      <button id="vis-expand-all-btn" class="secondary" onclick="_visSetAllDomains(true)" hidden>&#9660; Expand all</button>
+      <button id="vis-collapse-all-btn" class="secondary" onclick="_visSetAllDomains(false)" hidden>&#9650; Collapse all</button>
       <button class="secondary" onclick="_visOpenColsModal()">&#8801; Columns</button>
       <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
     </div>
+    <p id="vis-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <div class="table-wrap">
       <table id="vis-table">
         <thead><tr id="vis-thead-row"></tr></thead>
         <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
       </table>
     </div>
+    <div id="vis-pagination"></div>
   </section>
 
   <!-- Bookmarks — Embeddings -->
