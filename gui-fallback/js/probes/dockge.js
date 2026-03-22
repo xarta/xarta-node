@@ -38,15 +38,15 @@ async function checkDockgeProbeStatus() {
     const r = await apiFetch('/api/v1/dockge-stacks/probe/status');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    btn.disabled = !d.configured;
+    if (btn) btn.disabled = !d.configured;
     if (!d.configured) {
-      btn.title = d.reason;
+      if (btn) btn.title = d.reason;
       status.textContent = `⚠️ Probe unavailable: ${d.reason}`;
       status.style.color = 'var(--text-dim)';
       status.hidden = false;
     }
   } catch (e) {
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
   }
 }
 
@@ -220,8 +220,7 @@ async function editDockgeNote(stackId, el) {
 async function probeDockgeStacks() {
   const btn    = document.getElementById('dockge-probe-btn');
   const status = document.getElementById('dockge-probe-status');
-  btn.disabled = true;
-  btn.textContent = '⟳ Probing…';
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Probing…'; }
   status.hidden = true;
   try {
     const r = await apiFetch('/api/v1/dockge-stacks/probe', { method: 'POST' });
@@ -237,7 +236,6 @@ async function probeDockgeStacks() {
     status.style.color = '#f87171';
     status.hidden = false;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '▶ Probe Dockge';
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Probe Dockge'; }
   }
 }

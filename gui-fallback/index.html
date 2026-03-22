@@ -87,11 +87,6 @@
       </div>
       <p style="font-size:11px;color:var(--text-dim);margin-top:6px;">Used for PVE host scanning (port 8006 sweep).</p>
     </div>
-    <div class="toolbar">
-      <button onclick="openAddSettingModal()">+ Add setting</button>
-      <button class="secondary" onclick="loadSettings()">&#8635; Refresh</button>
-      <button class="secondary" onclick="refreshFrontendSettingsCache()">&#8635; Refresh client cache</button>
-    </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -110,15 +105,6 @@
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
         <!-- Horizontal doc navbar -->
         <div id="docs-sidebar" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;flex:1;min-width:0"></div>
-        <!-- Action buttons (always shown) -->
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
-          <button id="docs-preview-btn" class="secondary" onclick="docsTogglePreview()">&#128065; Preview</button>
-          <button id="docs-save-btn" onclick="docsSave()">&#128190; Save</button>
-          <button class="secondary" onclick="docsRefreshContent()">&#8635; Reload</button>
-          <button class="secondary" onclick="openEditDocModal()">&#9998; Meta</button>
-          <button class="secondary" style="color:#f87171" onclick="openDeleteDocModal()">&#128465;</button>
-          <button onclick="openNewDocModal()">+ New Doc</button>
-        </div>
       </div>
       <!-- Row 2: docs history navigation -->
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 8px 0">
@@ -186,10 +172,7 @@
 
   <!-- Self Diagnostic -->
   <section id="tab-self-diag" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <p style="font-size:12px;color:var(--text-dim);margin:0">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
-      <button id="self-diag-run-btn" onclick="runSelfDiag()">&#9654; Run Diagnostics</button>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
     <p id="self-diag-status" style="font-size:12px;margin:0 0 10px" hidden></p>
     <div id="self-diag-results"></div>
   </section>
@@ -260,8 +243,6 @@
   <section id="tab-services" class="tab-panel">
     <div class="toolbar">
       <input type="text" id="search-input" placeholder="Filter services…" oninput="renderServices()" />
-      <button onclick="openAddModal()">+ Add service</button>
-      <button class="secondary" onclick="loadServices()">&#8635; Refresh</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -286,7 +267,6 @@
   <section id="tab-machines" class="tab-panel">
     <div class="toolbar">
       <input type="text" id="machine-search" placeholder="Filter machines…" oninput="renderMachines()" />
-      <button class="secondary" onclick="loadMachines()">&#8635; Refresh</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -311,9 +291,6 @@
   <!-- Nodes -->
   <section id="tab-nodes" class="tab-panel">
     <div class="toolbar" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
-      <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
-      <button id="fleet-update-btn" class="secondary" onclick="fleetUpdate(this)" title="git pull (public + private) on this node, then queue for all peers">&#9652; Fleet Update</button>
-      <span id="fleet-update-status" style="font-size:12px;align-self:center"></span>
       <span style="display:flex;align-items:center;gap:5px;flex-shrink:0">
         <select id="retouch-table-select" style="font-size:12px;padding:3px 6px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius)">
           <option value="">— select table —</option>
@@ -463,10 +440,6 @@
   <section id="tab-dockge-stacks" class="tab-panel">
     <div class="toolbar">
       <input type="text" id="dockge-search" placeholder="Filter stacks…" oninput="renderDockgeStacks()" />
-      <button class="secondary" onclick="loadDockgeStacks()">&#8635; Refresh</button>
-      <button id="dockge-probe-btn" onclick="probeDockgeStacks()">&#9654; Probe Dockge</button>
-      <button class="secondary" id="dockge-expand-all-btn" onclick="setAllDockgeServices(true)" hidden>&#9660; Expand all</button>
-      <button class="secondary" id="dockge-collapse-all-btn" onclick="setAllDockgeServices(false)" hidden>&#9650; Collapse all</button>
       <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text-dim)">
         <input type="checkbox" id="dockge-hide-obsolete" checked onchange="renderDockgeStacks()"> Hide obsolete
       </label>
@@ -487,8 +460,6 @@
   <section id="tab-caddy-configs" class="tab-panel">
     <div class="toolbar">
       <input type="text" id="caddy-search" placeholder="Filter configs…" oninput="renderCaddyConfigs()" />
-      <button class="secondary" onclick="loadCaddyConfigs()">&#8635; Refresh</button>
-      <button id="caddy-probe-btn" onclick="probeCaddyConfigs()">&#9654; Probe Caddy</button>
     </div>
     <p id="caddy-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
@@ -509,10 +480,6 @@
       Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in the Settings tab (&#9881; group),
       then click <em>Scan for Proxmox</em>.
     </p>
-    <div class="toolbar">
-      <button class="secondary" onclick="loadPveHosts()">↺ Refresh</button>
-      <button id="pve-scan-btn" onclick="scanPveHosts()">▶ Scan for Proxmox</button>
-    </div>
     <p id="pve-scan-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
       <table>
@@ -532,9 +499,6 @@
       Inferred from Proxmox Config probe. CIDRs marked <em>inferred</em> are guessed as /24 from IP data
       — correct them here if needed. These are also used as scan ranges by <em>Find IPs by ARP</em>.
     </p>
-    <div class="toolbar">
-      <button class="secondary" onclick="loadVlans()">&#8635; Refresh</button>
-    </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -553,10 +517,6 @@
       (e.g. CARP backup appliances, offline machines, odd devices).
       Entries sync automatically to all fleet nodes.
     </p>
-    <div class="toolbar">
-      <button onclick="addArpManualEntry()">+ Add entry</button>
-      <button class="secondary" onclick="loadArpManual()">&#8635; Refresh</button>
-    </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -680,13 +640,7 @@
 
   <!-- AI Providers -->
   <section id="tab-ai-providers" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <p style="font-size:12px;color:var(--text-dim);margin:0">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
-      <div style="display:flex;gap:6px;flex-shrink:0">
-        <button onclick="openAiProviderModal(null)">+ Add provider</button>
-        <button class="secondary" onclick="loadAiProviders()">&#8635; Refresh</button>
-      </div>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
 
     <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 8px">Providers</h3>
     <div class="table-wrap" style="margin-bottom:20px">
@@ -698,10 +652,7 @@
       </table>
     </div>
 
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-      <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0">Project Assignments</h3>
-      <button onclick="openAiAssignmentModal(null)">+ Add assignment</button>
-    </div>
+    <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 8px">Project Assignments</h3>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -716,10 +667,7 @@
   <!-- SSH Targets -->
   <section id="tab-ssh-targets" class="tab-panel">
     <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
-      <button id="ssh-targets-rebuild-btn" onclick="rebuildSshTargets()">&#x21BA; Rebuild from config</button>
-      <span id="ssh-targets-status" style="font-size:13px;color:var(--text-dim)"></span>
-    </div>
+    <p id="ssh-targets-status" style="font-size:13px;color:var(--text-dim);margin-bottom:12px"></p>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -777,8 +725,6 @@
       </select>
       <button id="vis-expand-all-btn" class="secondary" onclick="_visSetAllDomains(true)" hidden>&#9660; Expand all</button>
       <button id="vis-collapse-all-btn" class="secondary" onclick="_visSetAllDomains(false)" hidden>&#9650; Collapse all</button>
-      <button class="secondary" onclick="_visOpenColsModal()">&#8801; Columns</button>
-      <button class="secondary" onclick="loadVisits()">&#8635; Refresh</button>
     </div>
     <p id="vis-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <div class="table-wrap">
@@ -838,11 +784,8 @@
 
   <!-- Bookmarks — Setup -->
   <section id="tab-bookmarks-setup" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <p style="font-size:12px;color:var(--text-dim);margin:0">Import guide for Edge Favourites and step-by-step browser extension install.</p>
-      <button class="secondary" onclick="document.getElementById('bm-import-file2').click()">&#8593; Import HTML</button>
-      <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Import guide for Edge Favourites and step-by-step browser extension install.</p>
+    <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
     <div id="bm-setup-panel">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Import from Edge card -->
@@ -854,7 +797,7 @@
             <li>Go to <strong>Favorites &rarr; Manage favorites</strong></li>
             <li>Click the <strong>&#8943;</strong> inside Favorites &rarr; <strong>Export favorites</strong></li>
             <li>Save the <code>.html</code> file anywhere on your device</li>
-            <li>Return here and click <strong>&uarr; Import HTML</strong> (top-right of this tab)</li>
+            <li>Return here and use the <strong>&#9776; Import HTML</strong> menu action (in the top navbar)</li>
             <li>Select your exported file &mdash; duplicates are skipped automatically</li>
           </ol>
           <p style="font-size:12px;color:var(--text-dim);margin:0 0 6px">Tip: chrome://favorites/all can also export from Chrome/Chromium.</p>
@@ -871,7 +814,7 @@
           <h3 style="margin:0 0 10px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--accent,#7c6ee6)">&#129513; Browser Extension</h3>
           <p style="font-size:12px;color:var(--text-dim);margin:0 0 10px">Install the Blueprints Bookmarks extension in Edge for one-click save and inline search from any page.</p>
           <ol style="font-size:12px;line-height:1.8;margin:0 0 12px;padding-left:18px">
-            <li>Click the button below to download the extension zip</li>
+            <li>Use the <strong>&#9776; Download extension</strong> menu action (in the top navbar) to download the extension zip</li>
             <li>Unzip it to a permanent folder on your device (e.g. <code>Documents\blueprints-ext\</code>)</li>
             <li>In Edge, navigate to <strong>edge://extensions</strong></li>
             <li>Enable <strong>Developer mode</strong> (toggle, bottom-left)</li>
@@ -885,10 +828,6 @@
             <div style="margin-top:6px"><strong>API Secret</strong> — your <code>BLUEPRINTS_API_SECRET</code> value from <code>.env</code></div>
             <div style="margin-top:6px"><strong>Visit recorder</strong> — optional; auto-logs every page you visit</div>
           </div>
-          <button onclick="_bmDownloadExtension(this)"
-            style="display:inline-block;padding:7px 16px;background:var(--accent,#7c6ee6);color:#fff;border-radius:var(--radius);font-size:13px;font-weight:600;border:none;cursor:pointer">
-            &#11015; Download extension zip
-          </button>
           <p style="font-size:11px;color:var(--text-dim);margin:8px 0 0">Chromium Manifest V3 &mdash; works in Edge and Chrome. Firefox not supported (different manifest).</p>
         </div>
       </div>

@@ -99,8 +99,7 @@ async function pveHostEdit(pveId, btn) {
 async function scanPveHosts() {
   const btn    = document.getElementById('pve-scan-btn');
   const status = document.getElementById('pve-scan-status');
-  btn.disabled = true;
-  btn.textContent = '⟳ Scanning…';
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Scanning…'; }
   status.hidden = true;
   try {
     const r = await apiFetch('/api/v1/pve-hosts/scan', { method: 'POST' });
@@ -121,7 +120,6 @@ async function scanPveHosts() {
     status.style.color = '#f87171';
     status.hidden = false;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '▶ Scan for Proxmox';
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Scan for Proxmox'; }
   }
 }
