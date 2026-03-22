@@ -405,11 +405,7 @@
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
         <input type="checkbox" id="dns-hide-inactive" onchange="renderPfSenseDns()"> Hide inactive
       </label>
-      <button class="secondary" onclick="loadPfSenseDns()">&#8635; Refresh</button>
-      <button id="dns-expand-all-btn" class="secondary" onclick="setAllDnsGroups(true)" hidden>&#9660; Expand all</button>
-      <button id="dns-collapse-all-btn" class="secondary" onclick="setAllDnsGroups(false)" hidden>&#9650; Collapse all</button>
-      <button id="dns-probe-btn" onclick="probePfSense()">&#9654; Probe pfSense</button>
-      <button id="dns-sweep-btn" onclick="pingSweep()">&#9654; Ping Sweep</button>
+
     </div>
     <p id="dns-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <p id="dns-sweep-status" style="font-size:12px;margin:2px 0 0" hidden></p>
@@ -439,11 +435,6 @@
   <section id="tab-proxmox-config" class="tab-panel">
     <div class="toolbar">
       <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
-      <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
-      <button id="pve-full-probe-btn" onclick="fullProbeProxmox()">&#9889; Full Probe</button>
-      <button class="secondary" id="pve-steps-toggle-btn" onclick="togglePveSteps()" hidden>&#9881; Steps &#9663;</button>
-      <button class="secondary" id="pve-expand-all-btn" onclick="setAllNets(true)" hidden>&#9660; Expand all</button>
-      <button class="secondary" id="pve-collapse-all-btn" onclick="setAllNets(false)" hidden>&#9650; Collapse all</button>
     </div>
     <div id="pve-steps-panel" style="display:none;flex-wrap:wrap;gap:4px;padding:4px 0 6px;border-bottom:1px solid var(--border,#30363d);margin-bottom:2px">
       <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>

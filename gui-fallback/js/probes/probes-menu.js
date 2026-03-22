@@ -60,10 +60,27 @@ const ProbesMenuConfig = {
         { id: 'bm-fn-cols',   label: '☰ Columns',         icon: '☰', fn: 'bm.cols',        activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 3 },
         { id: 'bm-fn-expl',   label: '📊 Explain Sort',   icon: '📊', fn: 'bm.explainSort', activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 4 },
         { id: 'bm-fn-dead',   label: '🔗 Dead links',     icon: '🔗', fn: 'bm.deadLinks',   activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 5 },
+
+        // ── pfSense DNS page function items ───────────────────────────────
+        { id: 'dns-fn-refresh',   label: '↺ Refresh',       icon: '↺', fn: 'dns.refresh',    activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 0 },
+        { id: 'dns-fn-probe',     label: '▶ Probe pfSense', icon: '▶', fn: 'dns.probe',      activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 1 },
+        { id: 'dns-fn-sweep',     label: '▶ Ping Sweep',    icon: '▶', fn: 'dns.sweep',      activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 2 },
+        { id: 'dns-fn-expand',    label: '▼ Expand all',    icon: '▼', fn: 'dns.expandAll',  activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 3 },
+        { id: 'dns-fn-collapse',  label: '▲ Collapse all',  icon: '▲', fn: 'dns.collapseAll',activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 4 },
+
+        // ── Proxmox Config page function items ──────────────────────────────
+        { id: 'pve-fn-refresh',   label: '↺ Refresh',      icon: '↺', fn: 'pve.refresh',    activeOn: ['proxmox-config'], parent: 'probes-settings', order: 0 },
+        { id: 'pve-fn-fullprobe', label: '⚡ Full Probe',   icon: '⚡', fn: 'pve.fullProbe',  activeOn: ['proxmox-config'], parent: 'probes-settings', order: 1 },
+        { id: 'pve-fn-steps',     label: '⚙ Steps',        icon: '⚙', fn: 'pve.steps',      activeOn: ['proxmox-config'], parent: 'probes-settings', order: 2 },
+        { id: 'pve-fn-expand',    label: '▼ Expand all',   icon: '▼', fn: 'pve.expandAll',  activeOn: ['proxmox-config'], parent: 'probes-settings', order: 3 },
+        { id: 'pve-fn-collapse',  label: '▲ Collapse all', icon: '▲', fn: 'pve.collapseAll',activeOn: ['proxmox-config'], parent: 'probes-settings', order: 4 },
     ],
 
     currentMenu: [],
     _activeId: null,
+    // Last content tab visited before the layout editor was opened.
+    // Used to drive fn-item context dimming inside the editor.
+    _lastContentId: null,
     draggedItem: null,
 
     // ── Lifecycle ──────────────────────────────────────────────
@@ -353,6 +370,13 @@ const ProbesMenuConfig = {
         }
         if (activeId) this._activeId = activeId;
 
+        // Track the last *content* page (not the layout editor itself) so that
+        // fn-item context badges stay meaningful while the editor is open.
+        const isLayoutEditorItem = this.defaultMenu.some(
+            m => m.parent === activeId && m.fn !== undefined
+        );
+        if (activeId && !isLayoutEditorItem) this._lastContentId = activeId;
+
         // Update mobile hamburger label
         const labelEl = document.getElementById('probesCurrentTabLabel');
         if (labelEl && activeId) {
@@ -407,25 +431,25 @@ const ProbesMenuConfig = {
 
                     // Context resolution for the editor:
                     // ─ When the layout editor tab itself is active (item.id === _activeId),
-                    //   treat all fn children as in-context — editing mode, no content page open.
-                    // ─ Otherwise, match _activeId against the item's activeOn list.
-                    // This is the same activeOn data that controls navbar dropdown visibility,
-                    // so the editor and the navbar are always logically consistent.
+                    //   use _lastContentId (last visited content page) for context, so that
+                    //   fn items for the previous page stay green and others remain dimmed.
+                    // ─ If no content page has been visited yet (_lastContentId is null),
+                    //   fall back to neutral mode (no dimming — can't know context yet).
+                    // ─ Otherwise, match _activeId directly against the item's activeOn list.
                     const isLayoutEditor = this._activeId === item.id;
-                    const isInContext = isLayoutEditor
-                        || !activeOnArr
-                        || Boolean(this._activeId && activeOnArr.includes(this._activeId));
+                    const contextId = isLayoutEditor ? this._lastContentId : this._activeId;
+                    const isInContext = !activeOnArr
+                        || (isLayoutEditor && !this._lastContentId)  // neutral: no content history yet
+                        || Boolean(contextId && activeOnArr.includes(contextId));
 
                     // Context badge: shows which tab activates this fn item, with a live
                     // green/dim indicator derived from the current page context.
                     const tabList = activeOnArr ? activeOnArr.join(' / ') : '';
-                    const badgeTitle = isLayoutEditor
-                        ? `Visible in dropdown when on: ${tabList}`
-                        : (isInContext
-                            ? `Active — visible in dropdown now`
-                            : `Inactive — visible in dropdown only when on: ${tabList}`);
+                    const badgeTitle = isInContext
+                        ? `Active — visible in dropdown now`
+                        : `Inactive — visible in dropdown only when on: ${tabList}`;
                     const contextBadgeHtml = activeOnArr
-                        ? `<span class="menu-fn-context-badge${(isInContext && !isLayoutEditor) ? ' is-active' : ''}" title="${badgeTitle}">● ${tabList}</span>`
+                        ? `<span class="menu-fn-context-badge${isInContext && contextId ? ' is-active' : ''}" title="${badgeTitle}">● ${tabList}</span>`
                         : '';
 
                     const rightColHtml = isFn
@@ -646,4 +670,18 @@ ProbesMenuConfig.registerFunctions({
         _bmOpenSortExplainModal();
     },
     'bm.deadLinks':   () => _bmAutoArchiveDead(null),
+
+    // pfSense DNS — main tab
+    'dns.refresh':    () => loadPfSenseDns(),
+    'dns.probe':      () => probePfSense(),
+    'dns.sweep':      () => pingSweep(),
+    'dns.expandAll':  () => setAllDnsGroups(true),
+    'dns.collapseAll':() => setAllDnsGroups(false),
+
+    // Proxmox Config — main tab
+    'pve.refresh':    () => loadProxmoxConfig(),
+    'pve.fullProbe':  () => fullProbeProxmox(),
+    'pve.steps':      () => togglePveSteps(),
+    'pve.expandAll':  () => setAllNets(true),
+    'pve.collapseAll':() => setAllNets(false),
 });
