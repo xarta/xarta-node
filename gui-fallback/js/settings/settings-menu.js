@@ -13,11 +13,11 @@
 //   🔧 App Config [▼ 🗺 Manual ARP, 🤖 AI Providers]  (implicit Configuration group)
 //   🗝 Keys       [▼ 🔒 Certs]                         (implicit Security group)
 //   📄 Docs       [▼ 📋 Doc List, 🖼️ Images, 🩺 Self Diagnostic]  (implicit Reference group)
-//   ☰ Navbar Layout  (this editor — standalone)
+//   ☰  (this editor — standalone)
 //
 // Disambiguation note:
-//   "🔧 App Config"   = /api/v1/settings key-value store  (tab id: settings)
-//   "☰ Navbar Layout" = this menu editor                   (tab id: settings-layout)
+//   "🔧 App Config"  = /api/v1/settings key-value store  (tab id: settings)
+//   "☰"             = this menu editor                   (tab id: settings-layout)
 //
 // No inline event handlers — all event wiring via addEventListener.
 
@@ -48,7 +48,7 @@ const SettingsMenuConfig = {
         { id: 'docs-list',     label: '📋 Doc List',        icon: '📋', parent: 'docs',     order: 0 },
         { id: 'docs-images',   label: '🖼️ Images',          icon: '🖼️', parent: 'docs',     order: 1 },
         { id: 'self-diag',     label: '🩺 Self Diagnostic', icon: '🩺', parent: 'docs',     order: 2 },
-        { id: 'settings-layout', label: '☰ Navbar Layout',   icon: '☰',  parent: null,       order: 4 },
+        { id: 'settings-layout', label: '☰',                  icon: '☰',  parent: null,       order: 4 },
     ],
 
     currentMenu: [],

@@ -13,7 +13,7 @@
 //   🔗 Manual  [▼ 🌐 Rendered, ≡ Table]  (Manual Links with view submenu)
 //   📋 Services                            (standalone)
 //   🖥 Machines                            (standalone)
-//   ☰ Navbar Layout  (this editor — standalone)
+//   ☰  (this editor — standalone)
 //
 // Note: 'manual-links-rendered' and 'manual-links-table' are pseudo-tab IDs.
 // switchTab() intercepts them to show #tab-manual-links and call manualLinksShowView().
@@ -38,7 +38,7 @@ const SynthesisMenuConfig = {
         { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  parent: 'manual-links', order: 1 },
         { id: 'services',              label: '📋 Services',     icon: '📋', parent: null,           order: 1 },
         { id: 'machines',              label: '🖥 Machines',     icon: '🖥', parent: null,           order: 2 },
-        { id: 'synthesis-layout',      label: '☰ Navbar Layout', icon: '☰',  parent: null,           order: 3 },
+        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  parent: null,           order: 3 },
     ],
 
     currentMenu: [],

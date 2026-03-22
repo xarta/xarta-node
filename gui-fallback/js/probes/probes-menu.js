@@ -36,7 +36,7 @@ const ProbesMenuConfig = {
         { id: 'bookmarks-history',    label: '📜 History',         icon: '📜', parent: 'bookmarks',       order: 1 },
         { id: 'bookmarks-embeddings', label: '🤖 Embeddings',      icon: '🤖', parent: 'bookmarks',       order: 2 },
         { id: 'bookmarks-setup',      label: '⚙ Setup',           icon: '⚙',  parent: 'bookmarks',       order: 3 },
-        { id: 'probes-settings',      label: '☰ Navbar Layout',   icon: '☰',  parent: null,             order: 3 },
+        { id: 'probes-settings',      label: '☰',                 icon: '☰',  parent: null,             order: 3 },
     ],
 
     currentMenu: [],
