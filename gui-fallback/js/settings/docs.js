@@ -198,11 +198,13 @@ function _docsFillPane(doc) {
     _docsResolvePrevImgs(preview);
     editor.style.display  = 'none';
     preview.style.display = 'block';
-    document.getElementById('docs-preview-btn').textContent = '\u270f Edit';
+    const pb1 = document.getElementById('docs-preview-btn');
+    if (pb1) pb1.textContent = '✏ Edit';
   } else {
     editor.style.display  = 'block';
     preview.style.display = 'none';
-    document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
+    const pb2 = document.getElementById('docs-preview-btn');
+    if (pb2) pb2.textContent = '👁 Preview';
   }
   // Track changes
   editor.oninput = () => { _docsDirty = true; };
@@ -224,7 +226,8 @@ function _docsHidePane() {
   document.getElementById('docs-preview').style.display = 'none';
   document.getElementById('docs-editor').style.display = 'block';
   // Note: do NOT reset _docsPreview here — per-doc view mode is managed by _docsViewModes
-  document.getElementById('docs-preview-btn').textContent = '\ud83d\udc41 Preview';
+  const pb = document.getElementById('docs-preview-btn');
+  if (pb) pb.textContent = '👁 Preview';
   // Note: do NOT clear _docsViewModes here — keep per-doc memory across hide/show cycles
 }
 
@@ -235,7 +238,7 @@ async function docsSave(silent = false) {
   const btn    = document.getElementById('docs-save-btn');
   const status = document.getElementById('docs-status');
   const editor = document.getElementById('docs-editor');
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   if (!silent) { status.hidden = true; }
   try {
     const r = await apiFetch(`/api/v1/docs/${_docsActiveId}/content`, {
@@ -258,7 +261,7 @@ async function docsSave(silent = false) {
       status.hidden = false;
     }
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -299,11 +302,11 @@ async function docsTogglePreview() {
     await _docsRenderPreview();
     editor.style.display  = 'none';
     preview.style.display = 'block';
-    btn.textContent = '\u270f Edit';
+    if (btn) btn.textContent = '✏ Edit';
   } else {
     preview.style.display = 'none';
     editor.style.display  = 'block';
-    btn.textContent = '\ud83d\udc41 Preview';
+    if (btn) btn.textContent = '👁 Preview';
   }
 }
 
@@ -497,7 +500,6 @@ function _docsRenderList() {
   header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-shrink:0';
   header.innerHTML = `
     <span style="font-size:12px;color:var(--text-dim)">Drag documents to reorder or move between groups. Drag group headings to reorder groups.</span>
-    <button onclick="docsListAddGroup()">+ Add Group</button>
   `;
   pane.appendChild(header);
 

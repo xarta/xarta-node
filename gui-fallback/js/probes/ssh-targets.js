@@ -41,18 +41,18 @@ function renderSshTargets() {
 async function rebuildSshTargets() {
   const btn = document.getElementById('ssh-targets-rebuild-btn');
   const status = document.getElementById('ssh-targets-status');
-  btn.disabled = true; btn.textContent = '\u23F3 Rebuilding\u2026';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Rebuilding…'; }
   try {
     const r = await apiFetch('/api/v1/ssh-targets/rebuild', { method: 'POST' });
     const d = await r.json();
     if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`);
-    status.textContent = `\u2713 ${d.message}`;
+    status.textContent = `✓ ${d.message}`;
     _sshTargets = [];
     await loadSshTargets();
   } catch (e) {
-    status.textContent = `\u2717 Rebuild failed: ${e.message}`;
+    status.textContent = `✗ Rebuild failed: ${e.message}`;
   } finally {
-    btn.disabled = false; btn.textContent = '\u21BA Rebuild from config';
+    if (btn) { btn.disabled = false; btn.textContent = '↺ Rebuild from config'; }
   }
 }
 

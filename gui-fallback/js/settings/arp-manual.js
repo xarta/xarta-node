@@ -24,8 +24,8 @@ function renderArpManual() {
     <td>${esc(e.notes || '')}</td>
     <td style="color:var(--text-dim);font-size:11px">${esc((e.updated_at || '').slice(0,16).replace('T',' '))}</td>
     <td style="white-space:nowrap">
-      <button class="secondary" style="padding:1px 6px;font-size:11px" onclick="editArpManualEntry('${esc(e.entry_id)}','${esc(e.ip_address)}','${esc(e.mac_address)}','${esc(e.notes||'')}')">✎ Edit</button>
-      <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteArpManualEntry('${esc(e.entry_id)}','${esc(e.ip_address)}')">&#x2715;</button>
+      <button class="secondary" style="padding:1px 6px;font-size:11px" onclick="editArpManualEntry('${esc(e.entry_id)}')">✎ Edit</button>
+      <button class="secondary" style="padding:1px 6px;font-size:11px;color:#f87171;border-color:#f87171;margin-left:4px" onclick="deleteArpManualEntry('${esc(e.entry_id)}')">&#x2715;</button>
     </td>
   </tr>`).join('');
 }
@@ -48,12 +48,14 @@ async function addArpManualEntry() {
   } catch (e) { alert(`Failed to add entry: ${e.message}`); }
 }
 
-async function editArpManualEntry(entry_id, currentIp, currentMac, currentNotes) {
-  const ip  = prompt('IP Address:', currentIp);
+async function editArpManualEntry(entry_id) {
+  const entry = _arpManual.find(e => e.entry_id === entry_id);
+  if (!entry) return;
+  const ip  = prompt('IP Address:', entry.ip_address);
   if (ip === null) return;
-  const mac = prompt('MAC Address:', currentMac);
+  const mac = prompt('MAC Address:', entry.mac_address);
   if (mac === null) return;
-  const notes = prompt('Notes (optional):', currentNotes);
+  const notes = prompt('Notes (optional):', entry.notes || '');
   if (notes === null) return;
   try {
     const r = await apiFetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, {
@@ -66,7 +68,9 @@ async function editArpManualEntry(entry_id, currentIp, currentMac, currentNotes)
   } catch (e) { alert(`Failed to update entry: ${e.message}`); }
 }
 
-async function deleteArpManualEntry(entry_id, ip) {
+async function deleteArpManualEntry(entry_id) {
+  const entry = _arpManual.find(e => e.entry_id === entry_id);
+  const ip = entry ? entry.ip_address : entry_id;
   if (!confirm(`Delete manual ARP entry for ${ip}?`)) return;
   try {
     const r = await apiFetch(`/api/v1/arp-manual/${encodeURIComponent(entry_id)}`, { method: 'DELETE' });

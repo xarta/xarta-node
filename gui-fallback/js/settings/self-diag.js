@@ -46,8 +46,7 @@ async function runSelfDiag() {
   const btn     = document.getElementById('self-diag-run-btn');
   const results = document.getElementById('self-diag-results');
   const status  = document.getElementById('self-diag-status');
-  btn.disabled  = true;
-  btn.textContent = '\u29d0 Running\u2026';
+  if (btn) { btn.disabled = true; btn.textContent = '⧐ Running…'; }
   status.textContent = 'Running diagnostics\u2026';
   status.style.color = 'var(--text-dim)';
   status.hidden = false;
@@ -631,8 +630,7 @@ async function runSelfDiag() {
   const sshSummary  = sshTotal  ? ` \u2022 SSH ${sshOk}/${sshTotal}`   : '';
   status.textContent = `Done \u2014 ${passed}/${total} API endpoints OK \u2022 ${peersOk}/${peerResults.length} peers reachable${mtlsSummary}${sshSummary}${fwSummary}`;
   status.style.color = (passed === total && mtlsOk === mtlsTotal && sshOk === sshTotal && (probeTotalCount === 0 || probePassCount === probeTotalCount)) ? 'var(--accent)' : '#f87171';
-  btn.disabled = false;
-  btn.textContent = '\u25b6 Run Diagnostics';
+  if (btn) { btn.disabled = false; btn.textContent = '\u25b6 Run Diagnostics'; }
 }
 
 function _selfDiagRow(icon, label, detail, extra) {

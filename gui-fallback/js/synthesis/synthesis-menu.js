@@ -28,21 +28,43 @@ const SynthesisMenuConfig = {
 
     _initialized: false,
 
+    // Registry of callable functions assignable to menu items.
+    // Keys are arbitrary dot-namespaced strings ('svc.add', 'svc.refresh', etc.).
+    // Values are zero-argument functions — never serialised to localStorage.
+    _fnRegistry: {},
+
+    // Register one or more functions by key.
+    registerFunctions(map) {
+        Object.assign(this._fnRegistry, map);
+    },
+
     // ── Default menu structure ─────────────────────────────────
     // id     — must match existing switchTab() tab IDs (or pseudo-IDs for view switches)
     // parent — null = top-level; 'parentId' = child of that item
     // order  — sort order within level (0-based)
     defaultMenu: [
-        { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', pageLabel: 'Manual Links',         parent: null,           order: 0 },
-        { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', pageLabel: 'Manual Links',         parent: 'manual-links', order: 0 },
-        { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  pageLabel: 'Manual Links (Table)',  parent: 'manual-links', order: 1 },
-        { id: 'services',              label: '📋 Services',     icon: '📋', pageLabel: 'Services',              parent: null,           order: 1 },
-        { id: 'machines',              label: '🖥 Machines',     icon: '🖥', pageLabel: 'Machines',              parent: null,           order: 2 },
-        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  pageLabel: 'Navbar Layout',         parent: null,           order: 3 },
+        { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', pageLabel: 'Manual Links',         parent: null,              order: 0 },
+        { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', pageLabel: 'Manual Links',         parent: 'manual-links',    order: 0 },
+        { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  pageLabel: 'Manual Links (Table)',  parent: 'manual-links',    order: 1 },
+        { id: 'services',              label: '📋 Services',     icon: '📋', pageLabel: 'Services',              parent: null,              order: 1 },
+        { id: 'machines',              label: '🖥 Machines',     icon: '🖥', pageLabel: 'Machines',              parent: null,              order: 2 },
+        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  pageLabel: 'Navbar Layout',         parent: null,              order: 3 },
+
+        // ── Services page function items ────────────────────────────────────
+        // These items call registered functions rather than navigating to a tab.
+        // activeOn: the item is only visible in the dropdown when the named tab is active.
+        { id: 'svc-fn-add',     label: '➕ Add service', icon: '➕', fn: 'svc.add',     activeOn: ['services'], parent: 'synthesis-layout', order: 0 },
+        { id: 'svc-fn-refresh', label: '↺ Refresh',      icon: '↺', fn: 'svc.refresh', activeOn: ['services'], parent: 'synthesis-layout', order: 1 },
+
+        // ── Machines page function items ────────────────────────────────────
+        { id: 'mch-fn-refresh', label: '↺ Refresh',      icon: '↺', fn: 'mch.refresh', activeOn: ['machines'], parent: 'synthesis-layout', order: 0 },
     ],
 
     currentMenu: [],
     _activeId: null,
+    // Last content tab visited before the layout editor was opened.
+    // Used to drive fn-item context dimming inside the editor.
+    _lastContentId: null,
     draggedItem: null,
 
     // ── Lifecycle ──────────────────────────────────────────────
@@ -82,8 +104,12 @@ const SynthesisMenuConfig = {
                     const existing = this.currentMenu.find(m => m.id === def.id);
                     if (!existing) {
                         this.currentMenu.push({ ...def });
-                    } else if (existing.pageLabel === undefined) {
-                        existing.pageLabel = def.pageLabel;
+                    } else {
+                        // Back-fill fields that may be missing from older saved configs
+                        if (existing.pageLabel === undefined) existing.pageLabel = def.pageLabel;
+                        // fn and activeOn are always developer-controlled — always sync from defaultMenu
+                        if (def.fn !== undefined) existing.fn = def.fn; else delete existing.fn;
+                        if (def.activeOn !== undefined) existing.activeOn = def.activeOn; else delete existing.activeOn;
                     }
                 });
             } catch (e) {
@@ -176,42 +202,65 @@ const SynthesisMenuConfig = {
         navbar.innerHTML = '';
 
         this.getTopLevelItems().forEach(item => {
-            const children = this.getChildren(item.id);
-            const allInGroup = [item, ...children];
-            // Which member of this group (if any) is the currently active tab?
-            const activeMember = activeId ? allInGroup.find(m => m.id === activeId) : null;
+            const children     = this.getChildren(item.id);
+            const navChildren  = children.filter(c => !c.fn);
+            const fnChildren   = children.filter(c => !!c.fn);
+
+            // Function children filtered by activeOn context — only appear
+            // in the dropdown when the specified tab is currently active.
+            const visibleFnChildren = fnChildren.filter(c =>
+                !c.activeOn || (activeId && c.activeOn.includes(activeId))
+            );
+
+            // Active group detection considers only tab-navigation children.
+            const allNavGroup  = [item, ...navChildren];
+            const activeMember = activeId ? allNavGroup.find(m => m.id === activeId) : null;
             const isGroupActive = !!activeMember;
 
-            if (children.length > 0) {
-                // Group with children: split-button + dropdown
-                const labelText = isGroupActive
-                    ? (activeMember.pageLabel || activeMember.label)
-                    : item.label;
-                // When active: show all group members EXCEPT the active one in dropdown.
-                // When inactive: show children only (parent is the labelled button as usual).
-                const dropdownItems = isGroupActive
-                    ? allInGroup.filter(m => m.id !== activeMember.id)
-                    : children;
+            // Nav items shown in the dropdown (may exclude the active member).
+            const dropdownNavItems = navChildren.length > 0
+                ? (isGroupActive
+                    ? allNavGroup.filter(m => m.id !== activeMember.id)
+                    : navChildren)
+                : [];
 
+            // Combine visible nav and fn items — fn items come after nav items.
+            const allDropdownItems = [...dropdownNavItems, ...visibleFnChildren];
+
+            const labelText = isGroupActive
+                ? (activeMember.pageLabel || activeMember.label)
+                : item.label;
+
+            if (allDropdownItems.length > 0) {
+                // ── Split-button with dropdown ────────────────────────────
+                const hasSeparator = dropdownNavItems.length > 0 && visibleFnChildren.length > 0;
+                const navHtml  = dropdownNavItems.map(c =>
+                    `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`
+                ).join('');
+                const sepHtml  = hasSeparator ? '<hr class="hub-dropdown-separator">' : '';
+                const fnHtml   = visibleFnChildren.map(c =>
+                    `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}">${c.label}</button>`
+                ).join('');
+
+                const isActive = isGroupActive || (activeId === item.id);
                 const dropdown = document.createElement('div');
                 dropdown.className = 'hub-tab-dropdown';
                 dropdown.innerHTML = `
                     <div class="hub-tab-split">
-                        <button class="hub-tab hub-tab-label${isGroupActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
+                        <button class="hub-tab hub-tab-label${isActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
                         <button class="hub-tab-caret" aria-label="Toggle submenu">▼</button>
                     </div>
                     <div class="hub-dropdown-menu">
-                        ${dropdownItems.map(c => `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`).join('')}
+                        ${navHtml}${sepHtml}${fnHtml}
                     </div>
                 `;
 
-                // Label click: if group active → re-navigate to active member;
-                // else → navigate to parent's own tab or first child.
+                // Label click: navigate to own tab or first nav child
                 dropdown.querySelector('.hub-tab-label').addEventListener('click', (e) => {
                     e.stopPropagation();
                     const targetId = isGroupActive
                         ? activeMember.id
-                        : (document.getElementById('tab-' + item.id) ? item.id : children[0]?.id);
+                        : (document.getElementById('tab-' + item.id) ? item.id : navChildren[0]?.id);
                     if (targetId) {
                         switchTab(targetId);
                         this.updateActiveTab(targetId);
@@ -228,8 +277,8 @@ const SynthesisMenuConfig = {
                     if (!wasOpen) dropdown.classList.add('open');
                 });
 
-                // Dropdown item clicks → navigate (resolve missing panels to first child)
-                dropdown.querySelectorAll('.hub-dropdown-item').forEach(btn => {
+                // Nav dropdown items → navigate
+                dropdown.querySelectorAll('.hub-dropdown-item:not(.hub-dropdown-fn)').forEach(btn => {
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
                         const destId = btn.dataset.tab;
@@ -243,10 +292,35 @@ const SynthesisMenuConfig = {
                     });
                 });
 
+                // Fn dropdown items → call registered function
+                dropdown.querySelectorAll('.hub-dropdown-fn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const fn = this._fnRegistry[btn.dataset.fn];
+                        if (typeof fn === 'function') fn();
+                        else console.warn('[SynthesisMenuConfig] No function registered for:', btn.dataset.fn);
+                        this.closeMenu();
+                        this.closeDropdowns();
+                    });
+                });
+
                 navbar.appendChild(dropdown);
 
+            } else if (item.fn) {
+                // ── Top-level function button ─────────────────────────────
+                const btn = document.createElement('button');
+                btn.className = 'hub-tab';
+                btn.textContent = item.label;
+                btn.addEventListener('click', () => {
+                    const fn = this._fnRegistry[item.fn];
+                    if (typeof fn === 'function') fn();
+                    else console.warn('[SynthesisMenuConfig] No function registered for:', item.fn);
+                    this.closeMenu();
+                });
+                navbar.appendChild(btn);
+
             } else {
-                // Standalone tab button (no children)
+                // ── Standalone tab button ─────────────────────────────────
                 const btn = document.createElement('button');
                 btn.className = 'hub-tab';
                 btn.dataset.tab = item.id;
@@ -280,6 +354,13 @@ const SynthesisMenuConfig = {
         }
         if (activeId) this._activeId = activeId;
 
+        // Track the last *content* page (not the layout editor itself) so that
+        // fn-item context badges stay meaningful while the editor is open.
+        const isLayoutEditorItem = this.defaultMenu.some(
+            m => m.parent === activeId && m.fn !== undefined
+        );
+        if (activeId && !isLayoutEditorItem) this._lastContentId = activeId;
+
         // Update mobile hamburger label
         const labelEl = document.getElementById('synthesisCurrentTabLabel');
         if (labelEl && activeId) {
@@ -289,6 +370,9 @@ const SynthesisMenuConfig = {
 
         // Re-render navbar with active state baked in
         this.renderNavbar(activeId || this._activeId);
+        // Re-render editor so fn item context badges update as the active tab changes.
+        this.renderEditor();
+        this.setupDragAndDrop();
     },
 
     // ── Editor rendering ───────────────────────────────────────
@@ -322,20 +406,46 @@ const SynthesisMenuConfig = {
                 </div>
             </div>
             <div class="menu-editor-children" data-parent="${item.id}">
-                ${children.map(child => `
-                    <div class="menu-editor-item menu-editor-child" data-id="${child.id}" draggable="true">
+                ${children.map(child => {
+                    const isFn = !!child.fn;
+                    const defItem = this.defaultMenu.find(m => m.id === child.id);
+                    const fnKey = defItem?.fn || child.fn || '';
+                    const activeOnArr = (isFn && defItem?.activeOn) ? defItem.activeOn : null;
+
+                    const isLayoutEditor = this._activeId === item.id;
+                    const contextId = isLayoutEditor ? this._lastContentId : this._activeId;
+                    const isInContext = !activeOnArr
+                        || (isLayoutEditor && !this._lastContentId)
+                        || Boolean(contextId && activeOnArr.includes(contextId));
+
+                    const tabList = activeOnArr ? activeOnArr.join(' / ') : '';
+                    const badgeTitle = isInContext
+                        ? `Active — visible in dropdown now`
+                        : `Inactive — visible in dropdown only when on: ${tabList}`;
+                    const contextBadgeHtml = activeOnArr
+                        ? `<span class="menu-fn-context-badge${isInContext && contextId ? ' is-active' : ''}" title="${badgeTitle}">● ${tabList}</span>`
+                        : '';
+
+                    const rightColHtml = isFn
+                        ? `<span class="menu-fn-badge" title="Function — ${fnKey}">⚡ ${fnKey}</span>${contextBadgeHtml}`
+                        : `<span class="menu-item-page-label" title="Page label">→ ${child.pageLabel || '—'}</span>`;
+                    const editPageBtnHtml = isFn ? ''
+                        : `<button class="btn-edit-page-label" data-id="${child.id}" title="Edit page label">🏷️</button>`;
+                    const inactiveClass = (isFn && !isInContext) ? ' menu-editor-fn-child--inactive' : '';
+                    return `
+                    <div class="menu-editor-item menu-editor-child${isFn ? ' menu-editor-fn-child' : ''}${inactiveClass}" data-id="${child.id}" draggable="true">
                         <div class="menu-item-header">
                             <span class="drag-handle">⋮⋮</span>
                             <span class="menu-item-icon">${child.icon}</span>
                             <span class="menu-item-label">${child.label.replace(child.icon, '').trim()}</span>
-                            <span class="menu-item-page-label" title="Page label">→ ${child.pageLabel || '—'}</span>
+                            ${rightColHtml}
                             <div class="menu-item-actions">
-                                <button class="btn-edit-page-label" data-id="${child.id}" title="Edit page label">🏷️</button>
+                                ${editPageBtnHtml}
                                 <button class="btn-promote-item" data-id="${child.id}" title="Promote to top level">⬆️</button>
                             </div>
                         </div>
-                    </div>
-                `).join('')}
+                    </div>`;
+                }).join('')}
                 <div class="drop-zone-child" data-parent="${item.id}">
                     <span>Drop here to nest as submenu item</span>
                 </div>
@@ -504,3 +614,15 @@ const SynthesisMenuConfig = {
         });
     },
 };
+
+// ── Built-in function registrations ─────────────────────────────────────────
+// synthesis-menu.js loads after services.js and machines.js so all referenced
+// globals are in scope. To register functions for an additional page, call:
+//   SynthesisMenuConfig.registerFunctions({ 'ns.key': () => myFunction() })
+// from any script loaded after synthesis-menu.js, or add entries here.
+
+SynthesisMenuConfig.registerFunctions({
+    'svc.add':     () => openAddModal(),
+    'svc.refresh': () => loadServices(),
+    'mch.refresh': () => loadMachines(),
+});

@@ -74,6 +74,30 @@ const ProbesMenuConfig = {
         { id: 'pve-fn-steps',     label: '⚙ Steps',        icon: '⚙', fn: 'pve.steps',      activeOn: ['proxmox-config'], parent: 'probes-settings', order: 2 },
         { id: 'pve-fn-expand',    label: '▼ Expand all',   icon: '▼', fn: 'pve.expandAll',  activeOn: ['proxmox-config'], parent: 'probes-settings', order: 3 },
         { id: 'pve-fn-collapse',  label: '▲ Collapse all', icon: '▲', fn: 'pve.collapseAll',activeOn: ['proxmox-config'], parent: 'probes-settings', order: 4 },
+
+        // ── VLANs page function items ─────────────────────────────────────
+        { id: 'vlan-fn-refresh',     label: '↺ Refresh',            icon: '↺', fn: 'vlan.refresh',      activeOn: ['vlans'], parent: 'probes-settings', order: 0 },
+
+        // ── SSH Targets page function items ──────────────────────────────
+        { id: 'ssh-fn-rebuild',      label: '↺ Rebuild from config',  icon: '↺', fn: 'ssh.rebuild',       activeOn: ['ssh-targets'], parent: 'probes-settings', order: 0 },
+
+        // ── Dockge Stacks page function items ───────────────────────────
+        { id: 'dockge-fn-refresh',   label: '↺ Refresh',            icon: '↺', fn: 'dockge.refresh',    activeOn: ['dockge-stacks'], parent: 'probes-settings', order: 0 },
+        { id: 'dockge-fn-probe',     label: '▶ Probe Dockge',      icon: '▶', fn: 'dockge.probe',      activeOn: ['dockge-stacks'], parent: 'probes-settings', order: 1 },
+        { id: 'dockge-fn-expand',    label: '▼ Expand all',        icon: '▼', fn: 'dockge.expandAll',  activeOn: ['dockge-stacks'], parent: 'probes-settings', order: 2 },
+        { id: 'dockge-fn-collapse',  label: '▲ Collapse all',      icon: '▲', fn: 'dockge.collapse',   activeOn: ['dockge-stacks'], parent: 'probes-settings', order: 3 },
+
+        // ── Caddy Configs page function items ────────────────────────────
+        { id: 'caddy-fn-refresh',    label: '↺ Refresh',            icon: '↺', fn: 'caddy.refresh',     activeOn: ['caddy-configs'], parent: 'probes-settings', order: 0 },
+        { id: 'caddy-fn-probe',      label: '▶ Probe Caddy',       icon: '▶', fn: 'caddy.probe',       activeOn: ['caddy-configs'], parent: 'probes-settings', order: 1 },
+
+        // ── Visit History page function items ────────────────────────────
+        { id: 'vis-fn-refresh',      label: '↺ Refresh',            icon: '↺', fn: 'vis.refresh',       activeOn: ['bookmarks-history'], parent: 'probes-settings', order: 0 },
+        { id: 'vis-fn-cols',         label: '≡ Columns',           icon: '≡', fn: 'vis.cols',          activeOn: ['bookmarks-history'], parent: 'probes-settings', order: 1 },
+
+        // ── Setup & Import page function items ─────────────────────────
+        { id: 'setup-fn-import',     label: '⬆ Import HTML',        icon: '⬆', fn: 'setup.import',      activeOn: ['bookmarks-setup'], parent: 'probes-settings', order: 0 },
+        { id: 'setup-fn-ext',        label: '⬇ Download extension', icon: '⬇', fn: 'setup.ext',         activeOn: ['bookmarks-setup'], parent: 'probes-settings', order: 1 },
     ],
 
     currentMenu: [],
@@ -684,4 +708,28 @@ ProbesMenuConfig.registerFunctions({
     'pve.steps':      () => togglePveSteps(),
     'pve.expandAll':  () => setAllNets(true),
     'pve.collapseAll':() => setAllNets(false),
+
+    // VLANs
+    'vlan.refresh':      () => loadVlans(),
+
+    // SSH Targets
+    'ssh.rebuild':       () => rebuildSshTargets(),
+
+    // Dockge Stacks
+    'dockge.refresh':    () => loadDockgeStacks(),
+    'dockge.probe':      () => probeDockgeStacks(),
+    'dockge.expandAll':  () => setAllDockgeServices(true),
+    'dockge.collapse':   () => setAllDockgeServices(false),
+
+    // Caddy Configs
+    'caddy.refresh':     () => loadCaddyConfigs(),
+    'caddy.probe':       () => probeCaddyConfigs(),
+
+    // Visit History
+    'vis.refresh':       () => loadVisits(),
+    'vis.cols':          () => _visOpenColsModal(),
+
+    // Setup & Import
+    'setup.import':      () => { const inp = document.getElementById('bm-import-file2'); if (inp) inp.click(); },
+    'setup.ext':         () => _bmDownloadExtension(null),
 });
