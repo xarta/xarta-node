@@ -13,8 +13,7 @@ function manualLinksShowView(view) {
   _manualLinksView = view;
   document.getElementById('ml-table-view').style.display    = view === 'table'    ? '' : 'none';
   document.getElementById('ml-rendered-view').style.display = view === 'rendered' ? '' : 'none';
-  document.getElementById('ml-btn-table').classList.toggle('active',    view === 'table');
-  document.getElementById('ml-btn-rendered').classList.toggle('active', view === 'rendered');
+  if (typeof SynthesisMenuConfig !== 'undefined') SynthesisMenuConfig.updateActiveTab('manual-links-' + view);
   if (view === 'rendered') renderManualLinksRendered();
   if (view === 'table')    renderManualLinksTable();
 }

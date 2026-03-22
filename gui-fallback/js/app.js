@@ -6,6 +6,16 @@ function switchGroup(group) {
   document.querySelectorAll('.table-nav button[data-group]').forEach(b => {
     b.style.display = b.dataset.group === group ? '' : 'none';
   });
+  // Show/hide synthesis split-dropdown menu
+  const synthesisWrapper = document.getElementById('synthesisMenuWrapper');
+  if (synthesisWrapper) synthesisWrapper.style.display = group === 'synthesis' ? '' : 'none';
+  if (group === 'synthesis') {
+    SynthesisMenuConfig.showGroup();
+    switchTab('manual-links');
+    manualLinksShowView(_manualLinksView);
+    SynthesisMenuConfig.updateActiveTab('manual-links-' + _manualLinksView);
+    return;
+  }
   // Show/hide probes split-dropdown menu
   const probesWrapper = document.getElementById('probesMenuWrapper');
   if (probesWrapper) probesWrapper.style.display = group === 'probes' ? '' : 'none';
@@ -50,6 +60,8 @@ function switchTab(tab) {
   if (tab === 'arp-manual'     && !_arpManual.length)     loadArpManual();
   if (tab === 'ssh-targets'    && !_sshTargets.length)    loadSshTargets();
   if (tab === 'manual-links'   && !_manualLinks.length)   loadManualLinks();
+  if (tab === 'manual-links-table')    { switchTab('manual-links'); manualLinksShowView('table');    return; }
+  if (tab === 'manual-links-rendered') { switchTab('manual-links'); manualLinksShowView('rendered'); return; }
   if (tab === 'settings'       && !_settings.length)      loadSettings();
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'certs')                                     loadCerts();
@@ -80,6 +92,8 @@ document.addEventListener('DOMContentLoaded', () => {
   loadFrontendSettings();
   loadHealth();
   loadManualLinks();
+  SynthesisMenuConfig.showGroup();
+  SynthesisMenuConfig.updateActiveTab('manual-links-' + _manualLinksView);
   loadSyncStatus();
   loadBackups();
   setInterval(loadHealth, 15_000);
