@@ -77,7 +77,6 @@
 
   <!-- Settings -->
   <section id="tab-settings" class="tab-panel">
-    <h2>Settings</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Key-value configuration store. Changes sync automatically to all fleet nodes.</p>
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
@@ -157,14 +156,12 @@
 
   <!-- Docs — Doc List -->
   <section id="tab-docs-list" class="tab-panel">
-    <h2 style="margin:0 0 12px">&#128203; Doc List</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">All documents — drag to reorder or move between groups. Drag group headings to reorder groups.</p>
     <div id="docs-list-pane" style="display:flex;flex-direction:column;overflow-y:auto;padding:4px 0"></div>
   </section>
 
   <!-- Docs — Images -->
   <section id="tab-docs-images" class="tab-panel">
-    <h2 style="margin:0 0 12px">&#128247; Doc Images</h2>
     <!-- Upload -->
     <div style="background:var(--bg2,var(--surface));border:1px solid var(--border);border-radius:var(--radius);padding:12px;display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
       <div style="font-weight:600;font-size:13px">Upload image</div>
@@ -190,10 +187,7 @@
   <!-- Self Diagnostic -->
   <section id="tab-self-diag" class="tab-panel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">Self Diagnostic</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
-      </div>
+      <p style="font-size:12px;color:var(--text-dim);margin:0">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
       <button id="self-diag-run-btn" onclick="runSelfDiag()">&#9654; Run Diagnostics</button>
     </div>
     <p id="self-diag-status" style="font-size:12px;margin:0 0 10px" hidden></p>
@@ -202,7 +196,6 @@
 
   <!-- Synthesis — Layout editor -->
   <section id="tab-synthesis-layout" class="tab-panel">
-    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Synthesis navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -222,12 +215,7 @@
 
   <!-- Manual Links -->
   <section id="tab-manual-links" class="tab-panel active">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">Manual Links</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Curated fallback links — VLAN and tailnet addresses for important services. Syncs across fleet.</p>
-      </div>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Curated fallback links — VLAN and tailnet addresses for important services. Syncs across fleet.</p>
 
     <!-- TABLE VIEW -->
     <div id="ml-table-view" style="display:none">
@@ -270,7 +258,6 @@
 
   <!-- Services -->
   <section id="tab-services" class="tab-panel">
-    <h2>Services</h2>
     <div class="toolbar">
       <input type="text" id="search-input" placeholder="Filter services…" oninput="renderServices()" />
       <button onclick="openAddModal()">+ Add service</button>
@@ -297,7 +284,6 @@
 
   <!-- Machines -->
   <section id="tab-machines" class="tab-panel">
-    <h2>Machines</h2>
     <div class="toolbar">
       <input type="text" id="machine-search" placeholder="Filter machines…" oninput="renderMachines()" />
       <button class="secondary" onclick="loadMachines()">&#8635; Refresh</button>
@@ -324,7 +310,6 @@
 
   <!-- Nodes -->
   <section id="tab-nodes" class="tab-panel">
-    <h2>Fleet Nodes</h2>
     <div class="toolbar" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
       <button class="secondary" onclick="loadNodes()">&#8635; Refresh</button>
       <button id="fleet-update-btn" class="secondary" onclick="fleetUpdate(this)" title="git pull (public + private) on this node, then queue for all peers">&#9652; Fleet Update</button>
@@ -415,7 +400,6 @@
 
   <!-- pfSense DNS -->
   <section id="tab-pfsense-dns" class="tab-panel">
-    <h2>pfSense DNS</h2>
     <div class="toolbar">
       <input type="text" id="dns-search" placeholder="Filter DNS entries…" oninput="renderPfSenseDns()" />
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
@@ -453,7 +437,6 @@
 
   <!-- Proxmox Config -->
   <section id="tab-proxmox-config" class="tab-panel">
-    <h2>Proxmox Config</h2>
     <div class="toolbar">
       <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
       <button class="secondary" onclick="loadProxmoxConfig()">&#8635; Refresh</button>
@@ -487,7 +470,6 @@
 
   <!-- Dockge Stacks -->
   <section id="tab-dockge-stacks" class="tab-panel">
-    <h2>Dockge Stacks</h2>
     <div class="toolbar">
       <input type="text" id="dockge-search" placeholder="Filter stacks…" oninput="renderDockgeStacks()" />
       <button class="secondary" onclick="loadDockgeStacks()">&#8635; Refresh</button>
@@ -512,7 +494,6 @@
 
   <!-- Caddy Configs -->
   <section id="tab-caddy-configs" class="tab-panel">
-    <h2>Caddy Configs</h2>
     <div class="toolbar">
       <input type="text" id="caddy-search" placeholder="Filter configs…" oninput="renderCaddyConfigs()" />
       <button class="secondary" onclick="loadCaddyConfigs()">&#8635; Refresh</button>
@@ -533,7 +514,6 @@
 
   <!-- PVE Hosts -->
   <section id="tab-pve-hosts" class="tab-panel">
-    <h2>PVE Hosts</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in the Settings tab (&#9881; group),
       then click <em>Scan for Proxmox</em>.
@@ -557,7 +537,6 @@
 
   <!-- VLANs -->
   <section id="tab-vlans" class="tab-panel">
-    <h2>VLANs</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Inferred from Proxmox Config probe. CIDRs marked <em>inferred</em> are guessed as /24 from IP data
       — correct them here if needed. These are also used as scan ranges by <em>Find IPs by ARP</em>.
@@ -578,7 +557,6 @@
 
   <!-- Manual ARP -->
   <section id="tab-arp-manual" class="tab-panel">
-    <h2>Manual ARP</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Hand-entered IP ↔ MAC records for hosts that automated discovery can't reach
       (e.g. CARP backup appliances, offline machines, odd devices).
@@ -601,7 +579,6 @@
 
   <!-- Keys -->
   <section id="tab-keys" class="tab-panel">
-    <h2>SSH Keys</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Manage probe SSH keys on this node. Keys are stored at paths configured by env vars — paths are never supplied by the browser.</p>
 
     <!-- Status table -->
@@ -675,7 +652,6 @@
 
   <!-- Certs -->
   <section id="tab-certs" class="tab-panel">
-    <h2>Certificates</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Manage TLS certificates on this node. Certificates are stored in <strong><span id="certs-dir-hint"></span></strong> and are never committed to any git repository.</p>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Upload only &mdash; no download. CA certificates are installed into the system trust store automatically on upload.</p>
 
@@ -714,10 +690,7 @@
   <!-- AI Providers -->
   <section id="tab-ai-providers" class="tab-panel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">&#129302; AI Providers</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
-      </div>
+      <p style="font-size:12px;color:var(--text-dim);margin:0">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
       <div style="display:flex;gap:6px;flex-shrink:0">
         <button onclick="openAiProviderModal(null)">+ Add provider</button>
         <button class="secondary" onclick="loadAiProviders()">&#8635; Refresh</button>
@@ -751,7 +724,6 @@
 
   <!-- SSH Targets -->
   <section id="tab-ssh-targets" class="tab-panel">
-    <h2>SSH Targets</h2>
     <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
       <button id="ssh-targets-rebuild-btn" onclick="rebuildSshTargets()">&#x21BA; Rebuild from config</button>
@@ -771,10 +743,7 @@
   <!-- Bookmarks -->
   <section id="tab-bookmarks-main" class="tab-panel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">&#128278; Bookmarks</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
-      </div>
+      <p style="font-size:12px;color:var(--text-dim);margin:0">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
       <div style="display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap">
         <button onclick="openBookmarkModal(null)">+ Add bookmark</button>
         <button class="secondary" onclick="document.getElementById('bm-import-file').click()">&#8593; Import HTML</button>
@@ -816,12 +785,7 @@
 
   <!-- Bookmarks — Visit History -->
   <section id="tab-bookmarks-history" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">&#128220; Visit History</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
-      </div>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
     <div class="toolbar" style="margin-bottom:8px">
       <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
       <select id="bm-visit-saved-filter" onchange="renderVisits()" style="width:auto">
@@ -846,12 +810,7 @@
 
   <!-- Bookmarks — Embeddings -->
   <section id="tab-bookmarks-embeddings" class="tab-panel">
-    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">&#129504; Embedding Configuration</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Configure tag exclusions, rare domain weighting, and re-embed all bookmarks.</p>
-      </div>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Configure tag exclusions, rare domain weighting, and re-embed all bookmarks.</p>
     <div id="bm-embed-panel">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Tag exclusion card -->
@@ -898,10 +857,7 @@
   <!-- Bookmarks — Setup -->
   <section id="tab-bookmarks-setup" class="tab-panel">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">
-      <div>
-        <h2 style="margin:0">&#9432; Setup &amp; Import</h2>
-        <p style="font-size:12px;color:var(--text-dim);margin:4px 0 0">Import guide for Edge Favourites and step-by-step browser extension install.</p>
-      </div>
+      <p style="font-size:12px;color:var(--text-dim);margin:0">Import guide for Edge Favourites and step-by-step browser extension install.</p>
       <button class="secondary" onclick="document.getElementById('bm-import-file2').click()">&#8593; Import HTML</button>
       <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
     </div>
@@ -959,7 +915,6 @@
 
   <!-- Settings — Layout editor -->
   <section id="tab-settings-layout" class="tab-panel">
-    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Settings navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">
@@ -979,7 +934,6 @@
 
   <!-- Probes — Layout editor -->
   <section id="tab-probes-settings" class="tab-panel">
-    <h2>&#9776; Layout</h2>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Customise the Probes navigation menu. Drag items to reorder; drag into the dashed zone to nest as a submenu item. Layout is saved to this browser only.</p>
     <div class="menu-editor-container">
       <div class="menu-editor-header">

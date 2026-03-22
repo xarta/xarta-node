@@ -33,15 +33,16 @@ const SynthesisMenuConfig = {
     // parent — null = top-level; 'parentId' = child of that item
     // order  — sort order within level (0-based)
     defaultMenu: [
-        { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', parent: null,           order: 0 },
-        { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', parent: 'manual-links', order: 0 },
-        { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  parent: 'manual-links', order: 1 },
-        { id: 'services',              label: '📋 Services',     icon: '📋', parent: null,           order: 1 },
-        { id: 'machines',              label: '🖥 Machines',     icon: '🖥', parent: null,           order: 2 },
-        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  parent: null,           order: 3 },
+        { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', pageLabel: 'Manual Links',         parent: null,           order: 0 },
+        { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', pageLabel: 'Manual Links',         parent: 'manual-links', order: 0 },
+        { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  pageLabel: 'Manual Links (Table)',  parent: 'manual-links', order: 1 },
+        { id: 'services',              label: '📋 Services',     icon: '📋', pageLabel: 'Services',              parent: null,           order: 1 },
+        { id: 'machines',              label: '🖥 Machines',     icon: '🖥', pageLabel: 'Machines',              parent: null,           order: 2 },
+        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  pageLabel: 'Navbar Layout',         parent: null,           order: 3 },
     ],
 
     currentMenu: [],
+    _activeId: null,
     draggedItem: null,
 
     // ── Lifecycle ──────────────────────────────────────────────
@@ -51,7 +52,6 @@ const SynthesisMenuConfig = {
     showGroup() {
         if (!this._initialized) {
             this.loadConfig();
-            this.renderNavbar();
             this.renderEditor();
             this.setupDragAndDrop();
             this._initialized = true;
@@ -66,7 +66,7 @@ const SynthesisMenuConfig = {
             const resetBtn = document.getElementById('synthesisMenuResetButton');
             if (resetBtn) resetBtn.addEventListener('click', () => this.resetConfig());
         }
-        // Always refresh active state when group re-activates
+        // Always refresh active state when group re-activates (also renders navbar)
         this.updateActiveTab();
     },
 
@@ -77,10 +77,13 @@ const SynthesisMenuConfig = {
         if (saved) {
             try {
                 this.currentMenu = JSON.parse(saved);
-                // Upgrade migration: auto-add items missing from older saves
+                // Upgrade migration: auto-add items missing from older saves, and back-fill new fields
                 this.defaultMenu.forEach(def => {
-                    if (!this.currentMenu.find(m => m.id === def.id)) {
+                    const existing = this.currentMenu.find(m => m.id === def.id);
+                    if (!existing) {
                         this.currentMenu.push({ ...def });
+                    } else if (existing.pageLabel === undefined) {
+                        existing.pageLabel = def.pageLabel;
                     }
                 });
             } catch (e) {
@@ -166,37 +169,55 @@ const SynthesisMenuConfig = {
 
     // ── Navbar rendering ───────────────────────────────────────
 
-    renderNavbar() {
+    renderNavbar(activeId) {
+        if (activeId === undefined) activeId = this._activeId;
         const navbar = document.getElementById('synthesisHubTabs');
         if (!navbar) return;
         navbar.innerHTML = '';
 
         this.getTopLevelItems().forEach(item => {
             const children = this.getChildren(item.id);
+            const allInGroup = [item, ...children];
+            // Which member of this group (if any) is the currently active tab?
+            const activeMember = activeId ? allInGroup.find(m => m.id === activeId) : null;
+            const isGroupActive = !!activeMember;
 
             if (children.length > 0) {
-                // Split-button dropdown
+                // Group with children: split-button + dropdown
+                const labelText = isGroupActive
+                    ? (activeMember.pageLabel || activeMember.label)
+                    : item.label;
+                // When active: show all group members EXCEPT the active one in dropdown.
+                // When inactive: show children only (parent is the labelled button as usual).
+                const dropdownItems = isGroupActive
+                    ? allInGroup.filter(m => m.id !== activeMember.id)
+                    : children;
+
                 const dropdown = document.createElement('div');
                 dropdown.className = 'hub-tab-dropdown';
                 dropdown.innerHTML = `
                     <div class="hub-tab-split">
-                        <button class="hub-tab hub-tab-label" data-tab="${item.id}">${item.label}</button>
+                        <button class="hub-tab hub-tab-label${isGroupActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
                         <button class="hub-tab-caret" aria-label="Toggle submenu">▼</button>
                     </div>
                     <div class="hub-dropdown-menu">
-                        ${children.map(c => `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`).join('')}
+                        ${dropdownItems.map(c => `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`).join('')}
                     </div>
                 `;
 
-                // Label click → navigate to own panel if it exists, else first child
+                // Label click: if group active → re-navigate to active member;
+                // else → navigate to parent's own tab or first child.
                 dropdown.querySelector('.hub-tab-label').addEventListener('click', (e) => {
                     e.stopPropagation();
-                    const ownPanel = document.getElementById('tab-' + item.id);
-                    const targetId = ownPanel ? item.id : children[0].id;
-                    switchTab(targetId);
-                    this.updateActiveTab(targetId);
-                    this.closeMenu();
-                    this.closeDropdowns();
+                    const targetId = isGroupActive
+                        ? activeMember.id
+                        : (document.getElementById('tab-' + item.id) ? item.id : children[0]?.id);
+                    if (targetId) {
+                        switchTab(targetId);
+                        this.updateActiveTab(targetId);
+                        this.closeMenu();
+                        this.closeDropdowns();
+                    }
                 });
 
                 // Caret → toggle submenu open/close
@@ -207,12 +228,16 @@ const SynthesisMenuConfig = {
                     if (!wasOpen) dropdown.classList.add('open');
                 });
 
-                // Child items → navigate
+                // Dropdown item clicks → navigate (resolve missing panels to first child)
                 dropdown.querySelectorAll('.hub-dropdown-item').forEach(btn => {
                     btn.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        switchTab(btn.dataset.tab);
-                        this.updateActiveTab(btn.dataset.tab);
+                        const destId = btn.dataset.tab;
+                        const panel = document.getElementById('tab-' + destId);
+                        const destChildren = this.getChildren(destId);
+                        const targetId = panel ? destId : (destChildren[0]?.id || destId);
+                        switchTab(targetId);
+                        this.updateActiveTab(targetId);
                         this.closeMenu();
                         this.closeDropdowns();
                     });
@@ -221,11 +246,12 @@ const SynthesisMenuConfig = {
                 navbar.appendChild(dropdown);
 
             } else {
-                // Plain tab button
+                // Standalone tab button (no children)
                 const btn = document.createElement('button');
                 btn.className = 'hub-tab';
                 btn.dataset.tab = item.id;
                 btn.textContent = item.label;
+                if (isGroupActive) btn.classList.add('active');
                 btn.addEventListener('click', () => {
                     switchTab(item.id);
                     this.updateActiveTab(item.id);
@@ -239,8 +265,6 @@ const SynthesisMenuConfig = {
         document.removeEventListener('click', this._closeHandler);
         this._closeHandler = () => this.closeDropdowns();
         document.addEventListener('click', this._closeHandler);
-
-        this.updateActiveTab();
     },
 
     closeDropdowns() {
@@ -252,33 +276,19 @@ const SynthesisMenuConfig = {
     updateActiveTab(activeId) {
         if (!activeId) {
             const activePanel = document.querySelector('.tab-panel.active');
-            if (!activePanel) return;
-            activeId = activePanel.id.replace('tab-', '');
+            if (activePanel) activeId = activePanel.id.replace('tab-', '');
         }
+        if (activeId) this._activeId = activeId;
 
         // Update mobile hamburger label
         const labelEl = document.getElementById('synthesisCurrentTabLabel');
-
-        // Reset all active states in the synthesis navbar
-        document.querySelectorAll('#synthesisHubTabs .hub-tab, #synthesisHubTabs .hub-dropdown-item')
-            .forEach(el => el.classList.remove('active'));
-
-        // Find and activate the matching button
-        const activeBtn = document.querySelector(
-            `#synthesisHubTabs .hub-tab[data-tab="${activeId}"], ` +
-            `#synthesisHubTabs .hub-dropdown-item[data-tab="${activeId}"]`
-        );
-        if (activeBtn) {
-            activeBtn.classList.add('active');
-            if (labelEl) labelEl.textContent = activeBtn.textContent.trim();
-            // If it's a child, also highlight the parent split-label
-            if (activeBtn.classList.contains('hub-dropdown-item')) {
-                const parentDropdown = activeBtn.closest('.hub-tab-dropdown');
-                if (parentDropdown) {
-                    parentDropdown.querySelector('.hub-tab-label')?.classList.add('active');
-                }
-            }
+        if (labelEl && activeId) {
+            const item = this.currentMenu.find(m => m.id === activeId);
+            if (item) labelEl.textContent = item.pageLabel || item.label;
         }
+
+        // Re-render navbar with active state baked in
+        this.renderNavbar(activeId || this._activeId);
     },
 
     // ── Editor rendering ───────────────────────────────────────
@@ -305,8 +315,10 @@ const SynthesisMenuConfig = {
                 <span class="menu-item-icon">${item.icon}</span>
                 <span class="menu-item-label">${item.label.replace(item.icon, '').trim()}</span>
                 ${hasChildren ? '<span class="has-children-badge">▼ ' + children.length + '</span>' : ''}
+                <span class="menu-item-page-label" title="Page label (shown when active)">→ ${item.pageLabel || '—'}</span>
                 <div class="menu-item-actions">
-                    <button class="btn-edit-item" data-id="${item.id}" title="Edit label">✏️</button>
+                    <button class="btn-edit-item" data-id="${item.id}" title="Edit nav label">✏️</button>
+                    <button class="btn-edit-page-label" data-id="${item.id}" title="Edit page label">🏷️</button>
                 </div>
             </div>
             <div class="menu-editor-children" data-parent="${item.id}">
@@ -316,7 +328,9 @@ const SynthesisMenuConfig = {
                             <span class="drag-handle">⋮⋮</span>
                             <span class="menu-item-icon">${child.icon}</span>
                             <span class="menu-item-label">${child.label.replace(child.icon, '').trim()}</span>
+                            <span class="menu-item-page-label" title="Page label">→ ${child.pageLabel || '—'}</span>
                             <div class="menu-item-actions">
+                                <button class="btn-edit-page-label" data-id="${child.id}" title="Edit page label">🏷️</button>
                                 <button class="btn-promote-item" data-id="${child.id}" title="Promote to top level">⬆️</button>
                             </div>
                         </div>
@@ -330,6 +344,9 @@ const SynthesisMenuConfig = {
 
         // Wire buttons (no inline handlers — CSP-safe)
         div.querySelector('.btn-edit-item').addEventListener('click', () => this.editItem(item.id));
+        div.querySelectorAll('.btn-edit-page-label').forEach(btn => {
+            btn.addEventListener('click', () => this.editPageLabel(btn.dataset.id));
+        });
         div.querySelectorAll('.btn-promote-item').forEach(btn => {
             btn.addEventListener('click', () => this.promoteItem(btn.dataset.id));
         });
@@ -340,9 +357,22 @@ const SynthesisMenuConfig = {
     editItem(id) {
         const item = this.currentMenu.find(m => m.id === id);
         if (!item) return;
-        const newLabel = prompt('Enter new label (without emoji):', item.label.replace(item.icon, '').trim());
+        const newLabel = prompt('Enter new nav label (without emoji):', item.label.replace(item.icon, '').trim());
         if (newLabel !== null && newLabel.trim()) {
             item.label = item.icon + ' ' + newLabel.trim();
+            this.saveConfig(false);
+            this.renderEditor();
+            this.setupDragAndDrop();
+        }
+    },
+
+    editPageLabel(id) {
+        const item = this.currentMenu.find(m => m.id === id);
+        if (!item) return;
+        const current = item.pageLabel || item.label.replace(item.icon, '').trim();
+        const newLabel = prompt('Enter page label (shown as the active tab indicator):', current);
+        if (newLabel !== null && newLabel.trim()) {
+            item.pageLabel = newLabel.trim();
             this.saveConfig(false);
             this.renderEditor();
             this.setupDragAndDrop();
@@ -373,6 +403,9 @@ const SynthesisMenuConfig = {
         // Re-wire edit/promote buttons on the cloned tree
         fresh.querySelectorAll('.btn-edit-item').forEach(btn => {
             btn.addEventListener('click', () => this.editItem(btn.dataset.id));
+        });
+        fresh.querySelectorAll('.btn-edit-page-label').forEach(btn => {
+            btn.addEventListener('click', () => this.editPageLabel(btn.dataset.id));
         });
         fresh.querySelectorAll('.btn-promote-item').forEach(btn => {
             btn.addEventListener('click', () => this.promoteItem(btn.dataset.id));

@@ -69,7 +69,8 @@
 /* Individual tab button */
 .hub-tab {
     background: transparent;
-    border: none;
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    box-sizing: border-box;
     color: #888;
     padding: 12px 20px;
     cursor: pointer;
@@ -111,6 +112,7 @@
 
 .hub-tab-split .hub-tab-label {
     border-radius: 8px 0 0 8px;
+    border-right: none;
     padding-right: 8px;
     flex: 1;
 }
@@ -120,8 +122,9 @@
     border: 1px solid rgba(0, 212, 255, 0.3);
     border-left: none;
     border-radius: 0 8px 8px 0;
+    box-sizing: border-box;
     color: #00d4ff;
-    padding: 8px 10px;
+    padding: 12px 10px;
     cursor: pointer;
     font-size: 10px;
     transition: all 0.2s ease;
