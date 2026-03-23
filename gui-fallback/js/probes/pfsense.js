@@ -1,4 +1,26 @@
 /* ── pfSense DNS ──────────────────────────────────────────────────────── */
+
+let _dnsFilterTimer = null;  // debounce handle for dns-search input
+
+document.addEventListener('DOMContentLoaded', () => {
+  const dnsSearch     = document.getElementById('dns-search');
+  const dnsHideInact  = document.getElementById('dns-hide-inactive');
+
+  if (dnsSearch) {
+    dnsSearch.addEventListener('input', () => {
+      clearTimeout(_dnsFilterTimer);
+      _dnsFilterTimer = setTimeout(renderPfSenseDns, 250);
+    });
+  }
+  if (dnsHideInact) {
+    dnsHideInact.addEventListener('change', renderPfSenseDns);
+  }
+
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('pfsense-dns', 'pg-ctrl-pfsense-dns');
+  }
+});
+
 async function loadPfSenseDns() {
   const err = document.getElementById('dns-error');
   err.hidden = true;

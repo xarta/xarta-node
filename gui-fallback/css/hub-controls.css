@@ -138,6 +138,19 @@ select.hub-ctrl option {
     height: 0;
 }
 
+/* Checked state — slide the thumb and illuminate the track.
+   Uses .bm-toggle-track (defined in components.css) as the visual element.
+   NOTE: components.css only applies these rules to .bm-toggle-label — any
+   toggle using .hub-ctrl-toggle-label alone must have these rules here.
+   Colour: cyan-tinted to match the hub-menu design language (#00d4ff). */
+.hub-ctrl-toggle-label input[type="checkbox"]:checked + .bm-toggle-track {
+    background: rgba(0, 212, 255, 0.55);
+}
+.hub-ctrl-toggle-label input[type="checkbox"]:checked + .bm-toggle-track::after {
+    left: 19px;
+    background: #fff;
+}
+
 /* ── Page-control group container ───────────────────────────── */
 
 /* Wraps a set of controls for a single page/tab.

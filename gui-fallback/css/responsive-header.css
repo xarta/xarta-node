@@ -29,7 +29,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 6px 8px;
-    margin-bottom: 24px;
+    margin-bottom: 16px;
 }
 
 /* The split-menu system lives here — flex:0 0 auto keeps it from stretching */
