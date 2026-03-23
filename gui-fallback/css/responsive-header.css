@@ -109,6 +109,7 @@ html.header-compact #page-controls-slot {
         justify-content: flex-end;
         gap: 2px 8px;
         max-width: 120px;
+        margin-top: -5px;
     }
 
     html.header-compact .nm-compact-host {
@@ -147,5 +148,9 @@ html.header-compact .header-inner {
     #node-meta-compact {
         height: 40px;
         box-sizing: border-box;
+    }
+
+    .menu-zone {
+        margin-bottom: 5px;
     }
 }
