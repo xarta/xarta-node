@@ -214,7 +214,7 @@ function createHubMenu(cfg) {
                 const allDropdownItems = [...dropdownNavItems, ...visibleFnChildren];
 
                 const labelText = isGroupActive
-                    ? (activeMember.pageLabel || activeMember.label)
+                    ? (activeMember.icon ? activeMember.icon + '\u00a0' : '') + (activeMember.pageLabel || activeMember.label)
                     : item.label;
 
                 if (allDropdownItems.length > 0) {
@@ -353,7 +353,14 @@ function createHubMenu(cfg) {
             const labelEl = document.getElementById(cfg.currentLabelId);
             if (labelEl && activeId) {
                 const item = this.currentMenu.find(m => m.id === activeId);
-                if (item) labelEl.textContent = item.pageLabel || item.label;
+                if (item) {
+                    labelEl.textContent = item.pageLabel || item.label;
+                    const toggle = document.getElementById(cfg.toggleId);
+                    if (toggle) {
+                        const iconEl = toggle.querySelector('.hamburger-icon');
+                        if (iconEl && item.icon) iconEl.textContent = item.icon;
+                    }
+                }
             }
 
             // Re-render navbar with active state baked in
