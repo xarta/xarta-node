@@ -1,6 +1,8 @@
 /* ── Layout ── */
-header { background: var(--surface); border-bottom: 1px solid var(--border);
-         padding: 10px 20px; display: flex; align-items: center; gap: 0; flex-wrap: wrap; }
+/* header: full-bleed background; .header-inner: constrained to match main width */
+header { background: var(--surface); border-bottom: 1px solid var(--border); }
+.header-inner { max-width: 1400px; margin: 0 auto; padding: 10px 24px;
+                display: flex; align-items: center; gap: 0; flex-wrap: wrap; width: 100%; }
 header .brand { font-size: 15px; font-weight: 700; letter-spacing: .3px; white-space: nowrap;
                 color: var(--text); flex-shrink: 0; margin-right: 14px; }
 .header-left  { display: flex; align-items: center; gap: 0; flex: 1; min-width: 180px; }
@@ -58,7 +60,7 @@ h2 { font-size: 13px; font-weight: 600; text-transform: uppercase;
 
 @media (max-width: 600px) {
   main { padding: 10px; }
-  header { padding: 8px 12px; }
+  .header-inner { padding: 8px 12px; }
   .node-meta { gap: 8px; }
   .header-right { margin-left: 0; padding-left: 0; }
   .table-nav button { padding: 8px 10px; font-size: 12px; letter-spacing: .3px; }

@@ -13,21 +13,25 @@
   <link rel="stylesheet" href="css/probes-menu.css" />
   <link rel="stylesheet" href="css/settings-menu.css" />
   <link rel="stylesheet" href="css/synthesis-menu.css" />
+  <link rel="stylesheet" href="css/hub-controls.css" />
+  <link rel="stylesheet" href="css/responsive-header.css" />
 </head>
 <body>
 
 <header>
-  <div class="header-left">
-    <span id="header-host" class="brand">&#9670; —</span>
-    <div class="node-meta">
-      <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
-      <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
-      <span class="nm-item" id="nn-keys"><button class="badge badge-btn" id="keys-badge" onclick="switchGroup('settings');switchTab('keys');SettingsMenuConfig.updateActiveTab('keys')" style="display:none">&#9871; —</button></span>
-      <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
+  <div class="header-inner">
+    <div class="header-left">
+      <span id="header-host" class="brand">&#9670; —</span>
+      <div class="node-meta">
+        <span class="nm-item"><span class="nm-label">Gen</span>&thinsp;<span class="nm-val" id="nn-gen">—</span></span>
+        <span class="nm-item" id="nn-integrity"><span class="badge">—</span></span>
+        <span class="nm-item" id="nn-keys"><button class="badge badge-btn" id="keys-badge" onclick="switchGroup('settings');switchTab('keys');SettingsMenuConfig.updateActiveTab('keys')" style="display:none">&#9871; —</button></span>
+        <span class="nm-item"><span class="nm-label">Peers</span>&thinsp;<span class="nm-val" id="nn-peers">—</span></span>
+      </div>
     </div>
-  </div>
-  <div class="header-right">
-    <blueprints-node-selector></blueprints-node-selector>
+    <div class="header-right">
+      <blueprints-node-selector></blueprints-node-selector>
+    </div>
   </div>
 </header>
 
@@ -37,44 +41,86 @@
 
 
 
-  <!-- Synthesis split-dropdown menu — shown when synthesis group is active (default) -->
-  <div id="synthesisMenuWrapper" style="margin-bottom:4px">
-    <div class="hub-tabs-wrapper" style="margin-bottom:0">
-      <button class="hub-menu-toggle" id="synthesisMenuToggle">
-        <span class="hamburger-icon">☰</span>
-        <span class="current-tab-label" id="synthesisCurrentTabLabel">Synthesis</span>
-        <span class="dropdown-arrow">▼</span>
-      </button>
-      <div class="hub-tabs" id="synthesisHubTabs"></div>
-    </div>
-  </div>
-  <div id="synthesisMenuSaveNotification">✓ Saved</div>
+  <!-- ── Menu zone: split-nav + inline page controls + compact meta ── -->
+  <div class="menu-zone" id="menu-zone">
 
-  <!-- Probes split-dropdown menu — shown when probes group is active -->
-  <div id="probesMenuWrapper" style="display:none;margin-bottom:4px">
-    <div class="hub-tabs-wrapper" style="margin-bottom:0">
-      <button class="hub-menu-toggle" id="probesMenuToggle">
-        <span class="hamburger-icon">☰</span>
-        <span class="current-tab-label" id="probesCurrentTabLabel">Probes</span>
-        <span class="dropdown-arrow">▼</span>
-      </button>
-      <div class="hub-tabs" id="probesHubTabs"></div>
-    </div>
-  </div>
-  <div id="probesMenuSaveNotification">✓ Saved</div>
+    <!-- Split-dropdown menu wrappers (one per group, JS shows/hides) -->
+    <div class="menu-zone-nav" id="menu-zone-nav">
 
-  <!-- Settings split-dropdown menu — shown when settings group is active -->
-  <div id="settingsMenuWrapper" style="display:none;margin-bottom:4px">
-    <div class="hub-tabs-wrapper" style="margin-bottom:0">
-      <button class="hub-menu-toggle" id="settingsMenuToggle">
-        <span class="hamburger-icon">☰</span>
-        <span class="current-tab-label" id="settingsCurrentTabLabel">Settings</span>
-        <span class="dropdown-arrow">▼</span>
-      </button>
-      <div class="hub-tabs" id="settingsHubTabs"></div>
+      <!-- Synthesis split-dropdown menu — shown when synthesis group is active (default) -->
+      <div id="synthesisMenuWrapper">
+        <div class="hub-tabs-wrapper" style="margin-bottom:0">
+          <button class="hub-menu-toggle" id="synthesisMenuToggle">
+            <span class="hamburger-icon">☰</span>
+            <span class="current-tab-label" id="synthesisCurrentTabLabel">Synthesis</span>
+            <span class="dropdown-arrow">▼</span>
+          </button>
+          <div class="hub-tabs" id="synthesisHubTabs"></div>
+        </div>
+      </div>
+      <div id="synthesisMenuSaveNotification">✓ Saved</div>
+
+      <!-- Probes split-dropdown menu — shown when probes group is active -->
+      <div id="probesMenuWrapper" style="display:none">
+        <div class="hub-tabs-wrapper" style="margin-bottom:0">
+          <button class="hub-menu-toggle" id="probesMenuToggle">
+            <span class="hamburger-icon">☰</span>
+            <span class="current-tab-label" id="probesCurrentTabLabel">Probes</span>
+            <span class="dropdown-arrow">▼</span>
+          </button>
+          <div class="hub-tabs" id="probesHubTabs"></div>
+        </div>
+      </div>
+      <div id="probesMenuSaveNotification">✓ Saved</div>
+
+      <!-- Settings split-dropdown menu — shown when settings group is active -->
+      <div id="settingsMenuWrapper" style="display:none">
+        <div class="hub-tabs-wrapper" style="margin-bottom:0">
+          <button class="hub-menu-toggle" id="settingsMenuToggle">
+            <span class="hamburger-icon">☰</span>
+            <span class="current-tab-label" id="settingsCurrentTabLabel">Settings</span>
+            <span class="dropdown-arrow">▼</span>
+          </button>
+          <div class="hub-tabs" id="settingsHubTabs"></div>
+        </div>
+      </div>
+      <div id="settingsMenuSaveNotification">✓ Saved</div>
+
+    </div><!-- /.menu-zone-nav -->
+
+    <!-- Page controls slot: per-tab control groups shown/hidden by ResponsiveLayout.
+         Recipe for new pages: add a .page-control-group div with data-for-tab set,
+         then call ResponsiveLayout.registerTabControls(tabId, groupElId) in the page JS. -->
+    <div id="page-controls-slot">
+
+      <!-- Bookmarks main — search / tag filter / archived toggle.
+           Formerly in a .toolbar div inside #tab-bookmarks-main.
+           Event handlers wired in bookmarks.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-bookmarks-main"
+           data-for-tab="bookmarks-main" hidden>
+        <input class="hub-ctrl" type="text" id="bm-search"
+               placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" />
+        <select id="bm-tag-filter">
+          <option value="">All tags</option>
+        </select>
+        <label class="hub-ctrl-toggle-label bm-toggle-label">
+          <input type="checkbox" id="bm-show-archived" />
+          <span class="bm-toggle-track"></span>
+          Archived
+        </label>
+      </div>
+
+    </div><!-- /#page-controls-slot -->
+
+    <!-- Compact node meta — shown instead of full header-left when header is narrow.
+         Values mirrored from full header elements by health.js. -->
+    <div id="node-meta-compact" hidden>
+      <span id="nn-host-compact" class="nm-compact-host brand">&#9670; —</span>
+      <span id="nn-integrity-compact"></span>
+      <span id="nn-keys-compact"></span>
     </div>
-  </div>
-  <div id="settingsMenuSaveNotification">✓ Saved</div>
+
+  </div><!-- /.menu-zone -->
 
   <!-- Settings -->
   <section id="tab-settings" class="tab-panel">
@@ -685,18 +731,8 @@
     <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
     <!-- Hidden file input for Import HTML (triggered via menu or Setup tab) -->
     <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
-    <!-- Search / filter toolbar -->
-    <div class="toolbar" style="margin-bottom:10px">
-      <input type="text" id="bm-search" placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" oninput="_bmSearchDebounce()" style="flex:1;min-width:180px" />
-      <select id="bm-tag-filter" onchange="_bmSearchActive ? _renderBmSearchResults(_bmLastSearchResults) : renderBookmarks()" style="font-size:12px;padding:4px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">
-        <option value="">All tags</option>
-      </select>
-      <label class="bm-toggle-label">
-        <input type="checkbox" id="bm-show-archived" onchange="loadBookmarks()">
-        <span class="bm-toggle-track"></span>
-        Archived
-      </label>
-    </div>
+    <!-- Search/filter controls are in #pg-ctrl-bookmarks-main inside .menu-zone
+         (inline next to the split-menu on wide viewports; wraps below on narrow). -->
     <div id="bm-deadlink-panel" style="display:none;margin-bottom:8px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px"><span id="bm-deadlink-status" style="color:var(--text-dim)"></span><span id="bm-deadlink-results"></span></div>
     <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <!-- Bookmarks table -->
@@ -1140,6 +1176,8 @@
 <script src="js/probes/bookmarks.js"></script>
 <script src="js/probes/probes-menu.js"></script>
 <script src="js/settings/settings-menu.js"></script>
+<script src="js/hub-select.js"></script>
+<script src="js/responsive-layout.js"></script>
 <script src="js/app.js"></script>
 
 <!-- Restore confirmation modal -->

@@ -1678,6 +1678,29 @@ async function _bmFetchScoreExplain(query, result, focus, bodyEl) {
 
 // Event delegation: score cells in results table + drill-down links in overview modal
 document.addEventListener('DOMContentLoaded', () => {
+  // Wire the search/filter controls that now live in #pg-ctrl-bookmarks-main
+  // (moved from the tab-panel toolbar into the menu-zone page-controls slot).
+  const bmSearch   = document.getElementById('bm-search');
+  const bmTagFilt  = document.getElementById('bm-tag-filter');
+  const bmArchived = document.getElementById('bm-show-archived');
+  if (bmSearch)   bmSearch.addEventListener('input', _bmSearchDebounce);
+  if (bmTagFilt)  bmTagFilt.addEventListener('change', () => {
+    _bmSearchActive ? _renderBmSearchResults(_bmLastSearchResults) : renderBookmarks();
+  });
+  if (bmArchived) bmArchived.addEventListener('change', loadBookmarks);
+
+  // Replace native tag-filter select with custom fixed-popup dropdown.
+  // Must come AFTER the change listener above so the listener is already
+  // registered when HubSelect fires synthetic change events.
+  if (typeof HubSelect !== 'undefined') {
+    HubSelect.init('bm-tag-filter');
+  }
+
+  // Register with responsive layout so controls show/hide on tab switch
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('bookmarks-main', 'pg-ctrl-bookmarks-main');
+  }
+
   document.getElementById('bm-tbody')?.addEventListener('click', e => {
     const cell = e.target.closest('.bm-score-cell');
     if (cell) _bmOpenScoreModal(cell);

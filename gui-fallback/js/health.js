@@ -12,9 +12,20 @@ async function loadHealth() {
     if (dm && dm.open) dm.close();
     document.getElementById('nn-gen').textContent = d.gen ?? '—';
     const ok = d.integrity_ok;
-    document.getElementById('nn-integrity').innerHTML = ok
-      ? `<button class="badge badge-ok badge-btn" onclick="openIntegrityModal(true)">OK</button>`
-      : `<button class="badge badge-err badge-btn" onclick="openIntegrityModal(false)">FAILED</button>`;
+    const integBadge = ok
+      ? `<button class="badge badge-ok badge-btn">OK</button>`
+      : `<button class="badge badge-err badge-btn">FAILED</button>`;
+    document.getElementById('nn-integrity').innerHTML = integBadge;
+    // Wire integrity badge click via addEventListener (avoids inline onclick)
+    const integBtn = document.querySelector('#nn-integrity .badge-btn');
+    if (integBtn) integBtn.addEventListener('click', () => openIntegrityModal(ok));
+    // Mirror to compact meta
+    const integCompact = document.getElementById('nn-integrity-compact');
+    if (integCompact) {
+      integCompact.innerHTML = integBadge;
+      const integCompactBtn = integCompact.querySelector('.badge-btn');
+      if (integCompactBtn) integCompactBtn.addEventListener('click', () => openIntegrityModal(ok));
+    }
     lookupHostParent(d.node_id || _nodeName);
   } catch (e) {
     console.warn('health check failed:', e);
@@ -46,6 +57,20 @@ function updateKeyBadge(keys) {
     badge.className = 'badge badge-btn';
     badge.style.background = '#3d2e10';
     badge.style.color = 'var(--warn)';
+  }
+  // Mirror to compact meta keys slot
+  const keysCompact = document.getElementById('nn-keys-compact');
+  if (keysCompact) {
+    keysCompact.innerHTML = badge.outerHTML;
+    const compactBtn = keysCompact.querySelector('.badge-btn');
+    if (compactBtn) {
+      compactBtn.style.display = '';
+      compactBtn.addEventListener('click', () => {
+        switchGroup('settings');
+        switchTab('keys');
+        SettingsMenuConfig.updateActiveTab('keys');
+      });
+    }
   }
 }
 
@@ -107,6 +132,7 @@ function _setHostParentEl(parent) {
   if (!el) return;
   if (!parent || parent === 'Unknown') {
     el.innerHTML = `&#9670; ${parent || 'Unknown'}`;
+    _setHostCompact(parent || 'Unknown', null);
     return;
   }
   // Build Proxmox URL: replace the first hostname segment with the parent name,
@@ -114,6 +140,19 @@ function _setHostParentEl(parent) {
   const parts  = window.location.hostname.split('.');
   const domain = parts.length > 1 ? parts.slice(1).join('.') : window.location.hostname;
   const pveUrl = `https://${parent}.${domain}:8006`;
+  el.innerHTML = `&#9670; <a href="${pveUrl}" target="_blank" rel="noopener"
+    style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;cursor:pointer"
+    title="Open Proxmox: ${pveUrl}">${parent}</a>`;
+  _setHostCompact(parent, pveUrl);
+}
+
+function _setHostCompact(parent, pveUrl) {
+  const el = document.getElementById('nn-host-compact');
+  if (!el) return;
+  if (!pveUrl) {
+    el.innerHTML = `&#9670; ${parent}`;
+    return;
+  }
   el.innerHTML = `&#9670; <a href="${pveUrl}" target="_blank" rel="noopener"
     style="color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;cursor:pointer"
     title="Open Proxmox: ${pveUrl}">${parent}</a>`;
