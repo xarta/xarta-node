@@ -27,6 +27,9 @@ const SettingsMenuConfig = createHubMenu({
     editorListId:    'settingsMenuEditorList',
     notificationId:  'settingsMenuSaveNotification',
     resetConfirmMsg: 'Reset settings navbar to default layout?',
+    // Mobile: the layout/context button is pinned outside the hamburger menu
+    mobilePinnedId:  'settings-layout',
+    pinnedTabsId:    'settingsHubTabsPinned',
     defaultMenu: [
         { id: 'pve-hosts',       label: '🗄 PVE Hosts',       icon: '🗄', pageLabel: 'PVE Hosts',       parent: null,        order: 0 },
         { id: 'nodes',           label: '🤝 Nodes',           icon: '🤝', pageLabel: 'Fleet Nodes',     parent: 'pve-hosts', order: 0 },

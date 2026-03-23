@@ -23,6 +23,9 @@ const SynthesisMenuConfig = createHubMenu({
     editorListId:    'synthesisMenuEditorList',
     notificationId:  'synthesisMenuSaveNotification',
     resetConfirmMsg: 'Reset synthesis navbar to default layout?',
+    // Mobile: the layout/context button is pinned outside the hamburger menu
+    mobilePinnedId:  'synthesis-layout',
+    pinnedTabsId:    'synthesisHubTabsPinned',
     defaultMenu: [
         { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', pageLabel: 'Manual Links',          parent: null,              order: 0 },
         { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', pageLabel: 'Manual Links',          parent: 'manual-links',    order: 0 },
