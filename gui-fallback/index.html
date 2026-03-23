@@ -56,6 +56,8 @@
             <span class="dropdown-arrow">▼</span>
           </button>
           <div class="hub-tabs" id="synthesisHubTabs"></div>
+          <!-- Pinned context/layout button — always visible beside hamburger on mobile -->
+          <div class="hub-tabs-pinned" id="synthesisHubTabsPinned"></div>
         </div>
       </div>
       <div id="synthesisMenuSaveNotification">✓ Saved</div>
@@ -69,6 +71,8 @@
             <span class="dropdown-arrow">▼</span>
           </button>
           <div class="hub-tabs" id="probesHubTabs"></div>
+          <!-- Pinned context/layout button — always visible beside hamburger on mobile -->
+          <div class="hub-tabs-pinned" id="probesHubTabsPinned"></div>
         </div>
       </div>
       <div id="probesMenuSaveNotification">✓ Saved</div>
@@ -82,9 +86,19 @@
             <span class="dropdown-arrow">▼</span>
           </button>
           <div class="hub-tabs" id="settingsHubTabs"></div>
+          <!-- Pinned context/layout button — always visible beside hamburger on mobile -->
+          <div class="hub-tabs-pinned" id="settingsHubTabsPinned"></div>
         </div>
       </div>
       <div id="settingsMenuSaveNotification">✓ Saved</div>
+
+      <!-- Compact node meta — shown instead of full header-left when header is narrow.
+      Values mirrored from full header elements by health.js. -->
+      <div id="node-meta-compact" hidden>
+        <span id="nn-host-compact" class="nm-compact-host brand">&#9670; —</span>
+        <span id="nn-integrity-compact"></span>
+        <span id="nn-keys-compact"></span>
+      </div>
 
     </div><!-- /.menu-zone-nav -->
 
@@ -112,13 +126,7 @@
 
     </div><!-- /#page-controls-slot -->
 
-    <!-- Compact node meta — shown instead of full header-left when header is narrow.
-         Values mirrored from full header elements by health.js. -->
-    <div id="node-meta-compact" hidden>
-      <span id="nn-host-compact" class="nm-compact-host brand">&#9670; —</span>
-      <span id="nn-integrity-compact"></span>
-      <span id="nn-keys-compact"></span>
-    </div>
+
 
   </div><!-- /.menu-zone -->
 

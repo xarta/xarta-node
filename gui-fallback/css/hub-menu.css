@@ -27,6 +27,11 @@
 .hub-tabs-wrapper {
     position: relative;  /* anchor for absolutely-positioned .hub-tabs on mobile */
     margin-bottom: 20px;
+    /* Mobile: hamburger toggle + pinned context button sit side-by-side in a row */
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 4px;
 }
 
 /* Mobile hamburger toggle — hidden on desktop via media query */
@@ -56,7 +61,63 @@
 
 .hub-menu-toggle.open .dropdown-arrow { transform: rotate(180deg); }
 
-/* Main tab container */
+/* ── Pinned context/layout button (always visible beside hamburger on mobile) ── */
+
+/* Wraps the layout-editor split-button. Stays visible in mobile header row.
+   Its dropdown is absolutely positioned (floating, like desktop) rather than
+   inline-expanding — keeps the mobile header compact.
+   On desktop this container is transparent/no-border and merges into the
+   regular .hub-tabs flex row visually. */
+.hub-tabs-pinned {
+    position: relative;  /* anchor for its absolutely-positioned dropdown */
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    flex-shrink: 0;
+}
+
+/* Mobile: pinned item's dropdown floats absolutely (does not inline-expand) */
+.hub-tabs-pinned .hub-dropdown-menu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    left: auto;
+    min-width: 180px;
+    background: rgba(10, 12, 20, 0.95);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 8px;
+    padding: 5px;
+    margin-top: 5px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    flex-direction: column;
+    gap: 2px;
+    max-height: 0;
+    overflow: hidden;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-10px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    z-index: 500;
+}
+
+/* Frosted glass for the pinned dropdown — matches .hub-tabs glass effect */
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+    .hub-tabs-pinned .hub-dropdown-menu {
+        background: rgba(10, 12, 20, 0.72);
+        backdrop-filter: blur(18px) saturate(160%);
+        -webkit-backdrop-filter: blur(18px) saturate(160%);
+    }
+}
+
+.hub-tabs-pinned .hub-tab-dropdown.open .hub-dropdown-menu {
+    max-height: none;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+    overflow: visible;
+}
 .hub-tabs {
     display: none; /* mobile: hidden until toggled */
     flex-direction: column;
@@ -97,10 +158,9 @@
     border: 1px solid rgba(0, 212, 255, 0.3);
     box-sizing: border-box;
     color: #888;
-    padding: 12px 20px;
     cursor: pointer;
     border-radius: 8px;
-    font-size: 0.95em;
+    font-size: 1.2em;
     transition: all 0.2s ease;
     text-align: left;
     width: 100%;
@@ -434,6 +494,23 @@
     border-color: rgba(0, 212, 255, 0.25) !important;
 }
 
+/* ── Mobile: fixed 40px height for consistent row alignment ─────────────────
+   Applies only below 769px where the hamburger and pinned split-button are
+   both visible. Explicit height normalises the two elements to the same row
+   height regardless of padding/border/font-size micro-differences.
+   box-sizing: border-box ensures the 40px includes border and padding. */
+@media (max-width: 768px) {
+    .hub-menu-toggle {
+        height: 40px;
+        box-sizing: border-box;
+    }
+
+    .hub-tabs-pinned .hub-tab-split {
+        height: 40px;
+        box-sizing: border-box;
+    }
+}
+
 @media (min-width: 769px) {
     .hub-menu-toggle { display: none !important; }
 
@@ -455,12 +532,58 @@
         gap: 4px;
     }
 
+    /* Desktop: pinned container resets to a plain inline flex row — merges
+       visually into the .hub-tabs row (both sit inside .hub-tabs-wrapper flex). */
+    .hub-tabs-pinned {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0;
+        gap: 4px;
+    }
+
+    /* Desktop: pinned dropdown right-anchors to its button (avoids off-screen clip
+       for the last item in the nav bar). Overrides the base right:0 rule. */
+    .hub-tabs-pinned .hub-dropdown-menu {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        left: auto;
+        min-width: 180px;
+        background: rgba(15, 15, 25, 0.98);
+        border: 1px solid rgba(0, 212, 255, 0.3);
+        border-radius: 8px;
+        padding: 5px;
+        margin-top: 5px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        flex-direction: column;
+        max-height: 0;
+        overflow: hidden;
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transform: translateY(-10px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        z-index: 200;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+    }
+
+    .hub-tabs-pinned .hub-tab-dropdown.open .hub-dropdown-menu {
+        max-height: none;
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transform: translateY(0);
+        overflow: visible;
+    }
+
     .hub-tab {
         width: auto;
         white-space: nowrap;
         text-align: center;
         padding: 10px 18px;
-        font-size: 0.9em;
+        font-size: 0.95em;
         font-weight: 600;
         letter-spacing: 0.02em;
     }

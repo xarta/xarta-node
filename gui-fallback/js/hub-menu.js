@@ -178,7 +178,16 @@ function createHubMenu(cfg) {
             if (!navbar) return;
             navbar.innerHTML = '';
 
+            // Pinned item: rendered outside the hamburger dropdown, always visible on mobile.
+            const pinnedNavbar = cfg.pinnedTabsId ? document.getElementById(cfg.pinnedTabsId) : null;
+            if (pinnedNavbar) pinnedNavbar.innerHTML = '';
+
             this.getTopLevelItems().forEach(item => {
+                // Route pinned item to its own container; all others to the regular navbar.
+                const isPinned = cfg.mobilePinnedId && item.id === cfg.mobilePinnedId;
+                const target = isPinned ? pinnedNavbar : navbar;
+                if (!target) return;
+
                 const children     = this.getChildren(item.id);
                 const navChildren  = children.filter(c => !c.fn);
                 const fnChildren   = children.filter(c => !!c.fn);
@@ -281,7 +290,7 @@ function createHubMenu(cfg) {
                         });
                     });
 
-                    navbar.appendChild(dropdown);
+                    target.appendChild(dropdown);
 
                 } else if (item.fn) {
                     // ── Top-level function button (promoted fn item) ──────────
@@ -294,7 +303,7 @@ function createHubMenu(cfg) {
                         else console.warn('[HubMenu] No function registered for:', item.fn);
                         this.closeMenu();
                     });
-                    navbar.appendChild(btn);
+                    target.appendChild(btn);
 
                 } else {
                     // ── Standalone tab button ─────────────────────────────────
@@ -308,7 +317,7 @@ function createHubMenu(cfg) {
                         this.updateActiveTab(item.id);
                         this.closeMenu();
                     });
-                    navbar.appendChild(btn);
+                    target.appendChild(btn);
                 }
             });
 
@@ -319,7 +328,9 @@ function createHubMenu(cfg) {
         },
 
         closeDropdowns() {
-            document.querySelectorAll(`#${cfg.tabsId} .hub-tab-dropdown.open`)
+            const sel = `#${cfg.tabsId} .hub-tab-dropdown.open`;
+            const pinnedSel = cfg.pinnedTabsId ? `, #${cfg.pinnedTabsId} .hub-tab-dropdown.open` : '';
+            document.querySelectorAll(sel + pinnedSel)
                 .forEach(d => d.classList.remove('open'));
         },
 

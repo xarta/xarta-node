@@ -19,6 +19,9 @@ const ProbesMenuConfig = createHubMenu({
     editorListId:    'probesMenuEditorList',
     notificationId:  'probesMenuSaveNotification',
     resetConfirmMsg: 'Reset probes menu to default layout?',
+    // Mobile: the layout/context button is pinned outside the hamburger menu
+    mobilePinnedId:  'probes-settings',
+    pinnedTabsId:    'probesHubTabsPinned',
     defaultMenu: [
         { id: 'pfsense-dns',          label: '🔥 pfSense DNS',     icon: '🔥', pageLabel: 'pfSense DNS',       parent: null,              order: 0 },
         { id: 'proxmox-config',       label: '🖥 Proxmox Config',  icon: '🖥', pageLabel: 'Proxmox Config',    parent: null,              order: 1 },

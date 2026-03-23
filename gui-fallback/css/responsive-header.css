@@ -38,6 +38,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
+    width: 100%;
 }
 
 /* Kill the existing bottom-margin on hub-tabs-wrapper when inside the menu-zone
@@ -98,6 +99,24 @@ html.header-compact #page-controls-slot {
     width: 100%;
 }
 
+/* Compact meta responsive stacking — hostname above integrity+keys
+   on narrow viewports where the menu-zone row is tight.
+   Works via flex-wrap: the hostname gets flex-basis:100% forcing it to
+   its own line; integrity and keys then share the next row. */
+@media (max-width: 480px) {
+    html.header-compact #node-meta-compact {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 2px 8px;
+        max-width: 120px;
+    }
+
+    html.header-compact .nm-compact-host {
+        flex-basis: 100%;
+        text-align: right;
+    }
+}
+
 /* Keep header-right (node-selector) right-aligned even in compact mode.
    Overrides the @media (max-width:600px) rule in layout-nav.css that sets
    margin-left:0 on .header-right. */
@@ -121,5 +140,12 @@ html.header-compact .header-inner {
 
     input[type="text"].hub-ctrl {
         max-width: none;
+    }
+
+    /* Match node-meta-compact height to the hamburger/pinned buttons (40px)
+       so all three line up cleanly on the same menu-zone row. */
+    #node-meta-compact {
+        height: 40px;
+        box-sizing: border-box;
     }
 }
