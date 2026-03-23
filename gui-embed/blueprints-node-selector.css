@@ -9,7 +9,7 @@ blueprints-node-selector,
 .bp-node-selector {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   position: relative;
   font-family: 'Segoe UI', system-ui, sans-serif;
   font-size: 13px;
@@ -19,28 +19,29 @@ blueprints-node-selector,
 .bp-ns-actions {
   display: none;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 .bp-ns-actions.show { display: inline-flex; }
 
 .bp-ns-action-btn {
-  width: 30px;
-  height: 30px;
-  border: 1px solid rgba(255,255,255,.12);
-  border-radius: 5px;
-  background: rgba(255,255,255,.05);
-  color: #c8cedf;
+  width: 40px;
+  height: 40px;
+  border: 1px solid rgba(0, 212, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  color: #00d4ff;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 16px;
   line-height: 1;
+  box-sizing: border-box;
   transition: background .15s, border-color .15s;
 }
 .bp-ns-action-btn:hover {
-  background: rgba(255,255,255,.1);
-  border-color: rgba(255,255,255,.2);
+  background: rgba(0, 212, 255, 0.1);
+  border-color: rgba(0, 212, 255, 0.5);
 }
 
 /* Collapsed button */
@@ -48,16 +49,18 @@ blueprints-node-selector,
   display: flex;
   align-items: center;
   gap: 6px;
-  background: rgba(255,255,255,.05);
-  border: 1px solid rgba(255,255,255,.12);
-  border-radius: 5px;
-  padding: 5px 10px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(0, 212, 255, 0.3);
+  border-radius: 8px;
+  padding: 0 15px;
+  height: 40px;
+  box-sizing: border-box;
   cursor: pointer;
-  color: #c8cedf;
+  color: #e0e0e0;
   white-space: nowrap;
   transition: background .15s, border-color .15s;
 }
-.bp-ns-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); }
+.bp-ns-btn:hover { background: rgba(0, 0, 0, 0.45); border-color: rgba(0, 212, 255, 0.5); }
 
 /* Health dot */
 .bp-ns-dot {
@@ -79,8 +82,8 @@ blueprints-node-selector,
   position: absolute;
   right: 0; top: calc(100% + 6px);
   background: #1a1d27;
-  border: 1px solid #2d3148;
-  border-radius: 6px;
+  border: 1px solid rgba(0, 212, 255, 0.25);
+  border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0,0,0,.5);
   min-width: 260px;
   z-index: 9999;
@@ -94,7 +97,7 @@ blueprints-node-selector,
   text-transform: uppercase;
   letter-spacing: .6px;
   color: #5b6080;
-  border-bottom: 1px solid #2d3148;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.15);
 }
 
 .bp-ns-heart {

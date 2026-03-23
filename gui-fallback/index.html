@@ -124,6 +124,20 @@
         </label>
       </div>
 
+      <!-- pfSense DNS — search filter + hide-inactive toggle.
+           Moved from .toolbar inside #tab-pfsense-dns.
+           Event handlers wired in pfsense.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-pfsense-dns"
+           data-for-tab="pfsense-dns" hidden>
+        <input class="hub-ctrl" type="text" id="dns-search"
+               placeholder="Filter DNS entries…" />
+        <label class="hub-ctrl-toggle-label">
+          <input type="checkbox" id="dns-hide-inactive" />
+          <span class="bm-toggle-track"></span>
+          Hide inactive
+        </label>
+      </div>
+
     </div><!-- /#page-controls-slot -->
 
 
@@ -432,13 +446,6 @@
 
   <!-- pfSense DNS -->
   <section id="tab-pfsense-dns" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="dns-search" placeholder="Filter DNS entries…" oninput="renderPfSenseDns()" />
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="dns-hide-inactive" onchange="renderPfSenseDns()"> Hide inactive
-      </label>
-
-    </div>
     <p id="dns-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <p id="dns-sweep-status" style="font-size:12px;margin:2px 0 0" hidden></p>
     <div class="table-wrap">
