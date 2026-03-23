@@ -25,6 +25,7 @@
 /* ── 1. Base tab navigation ─────────────────────────────────── */
 
 .hub-tabs-wrapper {
+    position: relative;  /* anchor for absolutely-positioned .hub-tabs on mobile */
     margin-bottom: 20px;
 }
 
@@ -68,6 +69,11 @@
     margin-top: 5px;
     max-height: 70vh;
     overflow-y: auto;
+    /* Mobile: float over content instead of pushing it down */
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 500;
 }
 
 .hub-tabs.open { display: flex; }
@@ -151,13 +157,14 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 5px 5px 5px 20px;
+    padding: 0;          /* closed: no padding so it doesn't bleed height through max-height:0 */
     max-height: 0;
     overflow: hidden;
-    transition: max-height 0.2s ease;
+    transition: max-height 0.2s ease, padding 0.15s ease;
 }
 
 .hub-tab-dropdown.open .hub-dropdown-menu {
+    padding: 5px 5px 5px 20px;
     max-height: 500px;
 }
 
@@ -420,6 +427,7 @@
     .hub-tabs {
         display: flex !important;
         flex-direction: row;
+        position: static;   /* reset from mobile absolute — desktop tabs are in-flow */
         max-height: none;
         overflow: visible;
         border: none;
