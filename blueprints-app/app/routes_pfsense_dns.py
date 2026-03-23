@@ -216,8 +216,34 @@ async def probe_pfsense_dns() -> dict:
     # ── In-process bulk upsert (avoids re-entrant HTTP call to self) ──────────
     created = 0
     updated = 0
+    deactivated = 0
     with get_conn() as conn:
         gen = increment_gen(conn, "pfsense-probe")
+
+        # ── Staleness: mark entries absent from this probe as inactive ─────────
+        # Guard: only run if probe returned data (empty list would wipe everything)
+        incoming_ids = {e["dns_entry_id"] for e in entries_raw}
+        if incoming_ids:
+            currently_active = {
+                r["dns_entry_id"]
+                for r in conn.execute(
+                    "SELECT dns_entry_id FROM pfsense_dns WHERE active=1"
+                ).fetchall()
+            }
+            stale_ids = currently_active - incoming_ids
+            for stale_id in stale_ids:
+                conn.execute(
+                    "UPDATE pfsense_dns SET active=0, updated_at=datetime('now') WHERE dns_entry_id=?",
+                    (stale_id,),
+                )
+                stale_row = conn.execute(
+                    "SELECT * FROM pfsense_dns WHERE dns_entry_id=?", (stale_id,)
+                ).fetchone()
+                enqueue_for_all_peers(
+                    conn, "UPDATE", "pfsense_dns", stale_id, dict(stale_row), gen
+                )
+                deactivated += 1
+
         for entry in entries_raw:
             existing = conn.execute(
                 "SELECT dns_entry_id FROM pfsense_dns WHERE dns_entry_id=?",
@@ -270,6 +296,7 @@ async def probe_pfsense_dns() -> dict:
     return {
         "created":             created,
         "updated":             updated,
+        "deactivated":         deactivated,
         "total":               created + updated,
         "mac_addresses_found": stats_raw.get("mac_addresses_found", 0),
         "mac_enriched":        stats_raw.get("mac_enriched", 0),
