@@ -1,0 +1,245 @@
+/* ================================================================
+   hub-controls.css — Page Controls Styled to Match Split-Menu
+   xarta-node Blueprints GUI
+
+   Provides form controls (text inputs, selects, toggle switches)
+   that match the visual language of the hub-menu split-dropdown
+   buttons — same border colour, radius, height, and hover states.
+
+   These controls live in #page-controls-slot inside .menu-zone,
+   appearing inline to the right of the split-menu on wide viewports
+   and wrapping to the next row on narrow viewports.
+
+   Self-contained — no dependency on tokens.css or layout-nav.css.
+   ================================================================ */
+
+/* ── Core hub-ctrl base ─────────────────────────────────────── */
+
+/* Applied to any form control that sits in the page-controls slot.
+   Matches the hub-tab button height, border, and colour scheme. */
+.hub-ctrl {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 8px;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.9em;
+    padding: 10px 15px;
+    outline: none;
+    box-sizing: border-box;
+    transition: border-color 0.2s ease, background 0.2s ease;
+    height: 43px;           /* matches hub-tab computed height (padding 10 + font ~16 + 6) */
+    white-space: nowrap;
+}
+
+/* Use background-color (not the background shorthand) in all state rules.
+   The shorthand resets background-image to none, which would kill the
+   SVG chevron on select.hub-ctrl:focus. background-color: is safe. */
+.hub-ctrl:focus {
+    border-color: rgba(0, 212, 255, 0.7);
+    background-color: rgba(0, 0, 0, 0.45);
+}
+
+.hub-ctrl:hover {
+    border-color: rgba(0, 212, 255, 0.5);
+}
+
+/* ── Text input specifics ───────────────────────────────────── */
+
+/* input[type=text] in components.css has specificity 0,1,1 which beats
+   .hub-ctrl at 0,1,0. Re-declare all visual properties here at 0,2,1
+   so the cyan border/background/padding win. */
+input[type="text"].hub-ctrl {
+    min-width: 220px;
+    flex: 1 1 220px;
+    max-width: 400px;
+    /* override components.css input[type=text] */
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 8px;
+    padding: 10px 15px;
+    height: 43px;
+    font-size: 0.9em;
+    box-sizing: border-box;
+}
+
+input[type="text"].hub-ctrl:hover {
+    border-color: rgba(0, 212, 255, 0.5);
+    background-color: rgba(0, 0, 0, 0.3);
+}
+
+input[type="text"].hub-ctrl:focus {
+    border-color: rgba(0, 212, 255, 0.7);
+    background-color: rgba(0, 0, 0, 0.45);
+    outline: none;
+}
+
+input[type="text"].hub-ctrl::placeholder {
+    color: rgba(224, 224, 224, 0.35);
+    font-size: 0.92em;
+}
+
+/* ── Select (dropdown) specifics ────────────────────────────── */
+
+select.hub-ctrl {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    /* Custom ▼ chevron — matches hub-tab-caret colour (#00d4ff) */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2300d4ff' opacity='.8'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 11px center;
+    padding-right: 30px;
+    cursor: pointer;
+    white-space: nowrap;
+    min-width: 120px;
+    /* Max width prevents select from growing unboundedly when a long option
+       is selected, which would otherwise trigger a spurious layout reflow. */
+    max-width: 220px;
+}
+
+select.hub-ctrl option {
+    background: #0f0f19;
+    color: #e0e0e0;
+}
+
+/* ── Toggle switch — hub-ctrl variant ───────────────────────── */
+/* Wraps <input type="checkbox"> + <span class="bm-toggle-track"> + label text.
+   Outer label gets .hub-ctrl-toggle-label to match the hub-ctrl box style. */
+
+.hub-ctrl-toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 8px;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.9em;
+    padding: 10px 15px;
+    height: 43px;
+    box-sizing: border-box;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.hub-ctrl-toggle-label:hover {
+    border-color: rgba(0, 212, 255, 0.5);
+}
+
+/* Hide the native checkbox — the .bm-toggle-track handles the visual */
+.hub-ctrl-toggle-label input[type="checkbox"] {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+/* ── Page-control group container ───────────────────────────── */
+
+/* Wraps a set of controls for a single page/tab.
+   Hidden by default; shown by ResponsiveLayout.updateControlsForTab(). */
+.page-control-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.page-control-group[hidden] {
+    display: none !important;
+}
+
+/* ── Custom select widget (.hub-select) ─────────────────────── */
+/* JS half: hub-select.js                                         */
+/* Replaces native <select> to guarantee the popup opens downward.
+   The popup uses position:fixed, appended to <body>, so it is
+   never clipped by any ancestor overflow or z-index context.    */
+
+.hub-select {
+    position: relative;
+    display: inline-flex;
+}
+
+/* The visible trigger button — carries .hub-ctrl for base styling */
+.hub-select-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    cursor: pointer;
+    min-width: 120px;
+    max-width: 220px;
+    text-align: left;
+}
+
+.hub-select-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+}
+
+/* SVG chevron — identical to the old select.hub-ctrl chevron */
+.hub-select-caret {
+    width: 10px;
+    height: 6px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2300d4ff' opacity='.8'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: contain;
+    flex-shrink: 0;
+    transition: transform 0.15s ease;
+}
+
+/* Rotate caret when open */
+.hub-select-btn[aria-expanded="true"] .hub-select-caret {
+    transform: rotate(180deg);
+}
+
+/* Fixed popup — appended to <body>, never clipped */
+.hub-select-menu {
+    display: none;
+    position: fixed;
+    z-index: 9000;
+    background: rgba(15, 15, 25, 0.98);
+    border: 1px solid rgba(0, 212, 255, 0.3);
+    border-radius: 8px;
+    padding: 5px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    max-height: 60vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 212, 255, 0.3) transparent;
+}
+
+.hub-select-menu.hub-select-open {
+    display: flex;
+    flex-direction: column;
+}
+
+.hub-select-item {
+    background: transparent;
+    border: none;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.9em;
+    padding: 7px 12px;
+    text-align: left;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.hub-select-item:hover {
+    background-color: rgba(0, 212, 255, 0.12);
+    color: #00d4ff;
+}
+
+.hub-select-item-active {
+    color: #00d4ff;
+}

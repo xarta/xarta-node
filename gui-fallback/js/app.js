@@ -73,6 +73,8 @@ function switchTab(tab) {
   if (tab === 'bookmarks-history')                       loadVisits();
   if (tab === 'bookmarks'        && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks') { switchTab('bookmarks-main'); return; }
+  // Notify responsive layout so the correct page-controls group is shown/hidden
+  if (typeof ResponsiveLayout !== 'undefined') ResponsiveLayout.updateControlsForTab(tab);
   // self-diag: just show the shell — user clicks Run to trigger tests
   // PCT live status polling — only while nodes tab is open
   if (tab === 'nodes') {
@@ -98,6 +100,8 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSyncStatus();
   setInterval(loadHealth, 15_000);
   setInterval(loadSyncStatus, 30_000);
+  ResponsiveLayout.init();
+  window.addEventListener('beforeunload', () => ResponsiveLayout.destroy());
   _bmInitEmbedPanel();
   // Auto-resume progress display if reindex was running before page load
   _bmPollReindexProgress();
