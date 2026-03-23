@@ -447,10 +447,14 @@ function _bmRenderPagination(total, pageSize, page) {
   const el = document.getElementById('bm-pagination');
   if (!el) return;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  if (totalPages <= 1) { el.innerHTML = ''; return; }
   const sizeOpts = _BM_PAGE_SIZE_OPTIONS.map(n =>
     `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`
   ).join('');
+  const sizeSelect = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer">Per page:<select onchange="_bmSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select></label>`;
+  if (totalPages <= 1) {
+    el.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">${sizeSelect}</div>`;
+    return;
+  }
   const prevDis = page <= 1 ? ' disabled' : '';
   const nextDis = page >= totalPages ? ' disabled' : '';
   el.innerHTML = `
@@ -458,10 +462,7 @@ function _bmRenderPagination(total, pageSize, page) {
       <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_bmGoPage(${page - 1})">&#8592; Prev</button>
       <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
       <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_bmGoPage(${page + 1})">Next &#8594;</button>
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:8px">
-        Per page:
-        <select onchange="_bmSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select>
-      </label>
+      <span style="margin-left:8px">${sizeSelect}</span>
     </div>`;
 }
 
