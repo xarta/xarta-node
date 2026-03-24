@@ -975,6 +975,45 @@ class VisitOut(BaseModel):
 
 # ── Nav Items ─────────────────────────────────────────────────────────────────
 
+# ── Form Controls ────────────────────────────────────────────────────────────
+
+class FormControlCreate(BaseModel):
+    control_key: str
+    label: str
+    control_type: Optional[str] = None
+    context: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    sound_asset_off: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class FormControlUpdate(BaseModel):
+    label: Optional[str] = None
+    control_type: Optional[str] = None
+    context: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    sound_asset_off: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class FormControlOut(BaseModel):
+    control_id: str
+    control_key: str
+    label: str
+    control_type: Optional[str] = None
+    context: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    sound_asset_off: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+# ── Nav Items ─────────────────────────────────────────────────────────────────
+
 class NavItemCreate(BaseModel):
     menu_group: str
     item_key: str

@@ -38,6 +38,7 @@ const SettingsMenuConfig = createHubMenu({
         { id: 'arp-manual',      label: '🗺 Manual ARP',      icon: '🗺', pageLabel: 'Manual ARP',      parent: 'settings',  order: 0 },
         { id: 'ai-providers',    label: '🤖 AI Providers',    icon: '🤖', pageLabel: 'AI Providers',    parent: 'settings',  order: 1 },
         { id: 'nav-items',       label: '🧭 Nav Items',       icon: '🧭', pageLabel: 'Nav Items',       parent: 'settings',  order: 2 },
+        { id: 'form-controls',   label: '🎮 Form Controls',   icon: '🎮', pageLabel: 'Form Controls',   parent: 'settings',  order: 3 },
         { id: 'keys',            label: '🗝 Keys',            icon: '🗝', pageLabel: 'SSH Keys',        parent: null,        order: 2 },
         { id: 'certs',           label: '🔒 Certs',           icon: '🔒', pageLabel: 'Certificates',    parent: 'keys',      order: 0 },
         { id: 'docs',            label: '📄 Docs',            icon: '📄', pageLabel: 'Docs',            parent: null,        order: 3 },
@@ -84,7 +85,9 @@ const SettingsMenuConfig = createHubMenu({
 
         // ── Nav Items page function items ──────────────────────────────────
         { id: 'ni-fn-refresh',   label: '↺ Refresh',           icon: '↺', fn: 'ni.refresh',   activeOn: ['nav-items'],    parent: 'settings-layout', order: 0 },
-    ],
+        // ── Form Controls page function items ────────────────────────────────
+        { id: 'fc-fn-refresh',   label: '↺ Refresh',           icon: '↺', fn: 'fc.refresh',   activeOn: ['form-controls'], parent: 'settings-layout', order: 0 },
+        { id: 'fc-fn-add',       label: '➕ Add Key',          icon: '➕', fn: 'fc.add',       activeOn: ['form-controls'], parent: 'settings-layout', order: 1 },    ],
 });
 
 // ── Function registrations ───────────────────────────────────────────────────
@@ -150,4 +153,8 @@ SettingsMenuConfig.registerFunctions({
 
     // Nav Items
     'ni.refresh':   () => loadNavItems(),
+
+    // Form Controls
+    'fc.refresh':   () => loadFormControls(),
+    'fc.add':       () => _fcAddNew(),
 });

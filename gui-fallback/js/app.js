@@ -72,6 +72,7 @@ function switchTab(tab) {
   if (tab === 'docs-images')                               openDocImagesModal();
   if (tab === 'ai-providers' && !_aiProviders.length)      loadAiProviders();
   if (tab === 'nav-items'    && !_navItems.length)         loadNavItems();
+  if (tab === 'form-controls' && !_fcItems.length)         loadFormControls();
   if (tab === 'bookmarks-main'  && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks-history')                       loadVisits();
   if (tab === 'bookmarks'        && !_bookmarks.length)  loadBookmarks();
@@ -94,6 +95,7 @@ function switchTab(tab) {
 document.addEventListener('DOMContentLoaded', () => {
   if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
   if (typeof SoundManager !== 'undefined') SoundManager.init();
+  if (typeof FormControlManager !== 'undefined') { FormControlManager.init(); FormControlManager.load(); }
   const _urlGroup = new URLSearchParams(window.location.search).get('group');
   if (_urlGroup && ['synthesis', 'probes', 'settings'].includes(_urlGroup)) switchGroup(_urlGroup);
   loadFrontendSettings();
