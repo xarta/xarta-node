@@ -30,3 +30,9 @@ __pycache__/
 *.swo
 *~
 .certs/
+
+# Nav item assets — gitignored (may contain proprietary icons/sounds)
+# fallback.svg is NOT ignored — it ships with the repo as the default icon
+gui-fallback/assets/icons/*
+!gui-fallback/assets/icons/fallback.svg
+gui-fallback/assets/sounds/*

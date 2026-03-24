@@ -126,3 +126,34 @@ async function saveCidr() {
     status.hidden = false;
   }
 }
+
+/* ── Sound enabled toggle ─────────────────────────────────────────────── */
+function initSoundToggle() {
+  const checkbox = document.getElementById('sound-enabled-toggle');
+  if (!checkbox) return;
+  const current = getFrontendSetting('sound_enabled', 'false') === 'true';
+  checkbox.checked = current;
+}
+
+async function saveSoundEnabled(enabled) {
+  const statusEl = document.getElementById('sound-enabled-status');
+  try {
+    const r = await apiFetch('/api/v1/settings/frontend-settings/sound_enabled', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: enabled ? 'true' : 'false', description: 'Enable sound effects for nav item clicks' }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    // Update localStorage cache immediately
+    await loadFrontendSettings();
+    // Apply to the live SoundManager
+    if (typeof SoundManager !== 'undefined') SoundManager.setEnabled(enabled);
+    if (statusEl) { statusEl.textContent = `✓ Sound ${enabled ? 'on' : 'off'}`; }
+    setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2500);
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = `✗ ${e.message}`; }
+    // Revert the checkbox
+    const checkbox = document.getElementById('sound-enabled-toggle');
+    if (checkbox) checkbox.checked = !enabled;
+  }
+}

@@ -64,12 +64,14 @@ function switchTab(tab) {
   if (tab === 'manual-links-table')    { switchTab('manual-links'); manualLinksShowView('table');    return; }
   if (tab === 'manual-links-rendered') { switchTab('manual-links'); manualLinksShowView('rendered'); return; }
   if (tab === 'settings'       && !_settings.length)      loadSettings();
+  if (tab === 'settings')                                  initSoundToggle();
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'certs')                                     loadCerts();
   if (tab === 'docs' && !_docsAll.length)                  loadDocs();
   if (tab === 'docs-list') { if (!_docsAll.length) loadDocs(); else _docsRenderList(); }
   if (tab === 'docs-images')                               openDocImagesModal();
   if (tab === 'ai-providers' && !_aiProviders.length)      loadAiProviders();
+  if (tab === 'nav-items'    && !_navItems.length)         loadNavItems();
   if (tab === 'bookmarks-main'  && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks-history')                       loadVisits();
   if (tab === 'bookmarks'        && !_bookmarks.length)  loadBookmarks();
@@ -91,6 +93,7 @@ function switchTab(tab) {
 /* ── Bootstrap ────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
+  if (typeof SoundManager !== 'undefined') SoundManager.init();
   const _urlGroup = new URLSearchParams(window.location.search).get('group');
   if (_urlGroup && ['synthesis', 'probes', 'settings'].includes(_urlGroup)) switchGroup(_urlGroup);
   loadFrontendSettings();

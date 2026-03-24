@@ -270,6 +270,12 @@
       </div>
       <p style="font-size:11px;color:var(--text-dim);margin-top:6px;">Used for PVE host scanning (port 8006 sweep).</p>
     </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;display:flex;align-items:center;gap:12px;">
+      <label style="font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer" for="sound-enabled-toggle">🔊 Sound Effects</label>
+      <input type="checkbox" id="sound-enabled-toggle" style="width:16px;height:16px;cursor:pointer"
+        onchange="saveSoundEnabled(this.checked)">
+      <span id="sound-enabled-status" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -787,6 +793,13 @@
     <p id="ai-providers-error" class="error-msg" hidden></p>
   </section>
 
+  <!-- Nav Items -->
+  <section id="tab-nav-items" class="tab-panel">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">CMS-driven navigation items — edit labels, icons, sounds and sort order. Changes are fleet-synced automatically.</p>
+    <p id="nav-items-status" style="font-size:13px;margin-bottom:8px"></p>
+    <div id="nav-items-container"></div>
+  </section>
+
   <!-- SSH Targets -->
   <section id="tab-ssh-targets" class="tab-panel">
     <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
@@ -1225,6 +1238,7 @@
 <script src="js/synthesis/manual-links.js"></script>
 <script src="js/synthesis/services.js"></script>
 <script src="js/synthesis/machines.js"></script>
+<script src="js/sound-manager.js"></script>
 <script src="js/hub-menu.js"></script>
 <script src="js/synthesis/synthesis-menu.js"></script>
 <script src="js/settings/nodes.js"></script>
@@ -1238,6 +1252,7 @@
 <script src="js/settings/pve-hosts.js"></script>
 <script src="js/settings/arp-manual.js"></script>
 <script src="js/settings/ai-providers.js"></script>
+<script src="js/settings/nav-items.js"></script>
 <script src="js/probes/pfsense.js"></script>
 <script src="js/probes/proxmox-config.js"></script>
 <script src="js/probes/vlans.js"></script>

@@ -11,6 +11,7 @@
 
 const ProbesMenuConfig = createHubMenu({
     storageKey:      'blueprintsProbesMenuConfig',
+    group:           'probes',
     toggleId:        'probesMenuToggle',
     tabsId:          'probesHubTabs',
     currentLabelId:  'probesCurrentTabLabel',

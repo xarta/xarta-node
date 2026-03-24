@@ -99,11 +99,12 @@ fi
 echo "    ok"
 
 # ── 2b. Ensure network + DB tools are available ───────────────────────────
-echo "--- checking network/db tools (sqlite3, arping, net-tools)..."
+echo "--- checking network/db tools (sqlite3, arping, net-tools, p7zip-full)..."
 TOOLS_NEEDED=()
 dpkg -l sqlite3          >/dev/null 2>&1 || TOOLS_NEEDED+=(sqlite3)
 dpkg -l iputils-arping   >/dev/null 2>&1 || TOOLS_NEEDED+=(iputils-arping)
 dpkg -l net-tools        >/dev/null 2>&1 || TOOLS_NEEDED+=(net-tools)
+dpkg -l p7zip-full       >/dev/null 2>&1 || TOOLS_NEEDED+=(p7zip-full)
 if [[ ${#TOOLS_NEEDED[@]} -gt 0 ]]; then
     echo "    installing: ${TOOLS_NEEDED[*]}"
     apt-get install -y --no-install-recommends "${TOOLS_NEEDED[@]}"

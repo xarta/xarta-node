@@ -971,3 +971,51 @@ class VisitOut(BaseModel):
     visit_count: int = 1
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+# ── Nav Items ─────────────────────────────────────────────────────────────────
+
+class NavItemCreate(BaseModel):
+    menu_group: str
+    item_key: str
+    label: str
+    page_label: Optional[str] = None
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    parent_key: Optional[str] = None
+    sort_order: int = 0
+    is_fn: int = 0
+    fn_key: Optional[str] = None
+    active_on: Optional[str] = None   # JSON string e.g. '["bookmarks-main"]'
+
+
+class NavItemUpdate(BaseModel):
+    label: Optional[str] = None
+    page_label: Optional[str] = None
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    parent_key: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_fn: Optional[int] = None
+    fn_key: Optional[str] = None
+    active_on: Optional[str] = None
+
+
+class NavItemOut(BaseModel):
+    item_id: str
+    menu_group: str
+    item_key: str
+    label: str
+    page_label: Optional[str] = None
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    parent_key: Optional[str] = None
+    sort_order: int = 0
+    is_fn: int = 0
+    fn_key: Optional[str] = None
+    active_on: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

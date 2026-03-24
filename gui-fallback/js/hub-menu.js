@@ -41,6 +41,8 @@ function createHubMenu(cfg) {
         defaultMenu: cfg.defaultMenu,
         currentMenu: [],
         _activeId: null,
+        _dbItems: {},    // { item_key: nav_items DB row } — loaded from DB, overlays emoji with assets
+        _dbSeeded: false, // true once we've attempted seeding this group
         // Last content tab visited before the layout editor was opened.
         // Used to drive fn-item context dimming inside the editor.
         _lastContentId: null,
@@ -65,6 +67,9 @@ function createHubMenu(cfg) {
 
                 const resetBtn = document.getElementById(cfg.resetButtonId);
                 if (resetBtn) resetBtn.addEventListener('click', () => this.resetConfig());
+
+                // Load DB-driven icons and sounds in background; re-renders navbar when done
+                this.loadNavItemsFromDB();
             }
             this.updateActiveTab();
         },
@@ -120,6 +125,103 @@ function createHubMenu(cfg) {
             if (notif) {
                 notif.classList.add('show');
                 setTimeout(() => notif.classList.remove('show'), 2000);
+            }
+        },
+
+        // ── DB-driven icon/sound overlay ────────────────────────────
+
+        async loadNavItemsFromDB() {
+            if (!cfg.group) return;
+            try {
+                const resp = await apiFetch(`/api/v1/nav-items?group=${encodeURIComponent(cfg.group)}`);
+                if (!resp.ok) return;
+                const items = await resp.json();
+
+                // Auto-seed from JS defaults if DB has no items for this group yet
+                if (items.length === 0 && !this._dbSeeded) {
+                    this._dbSeeded = true;
+                    await this._seedDefaultsToDb();
+                    return;   // _seedDefaultsToDb will call loadNavItemsFromDB again
+                }
+
+                this._dbItems = {};
+                for (const dbRow of items) {
+                    this._dbItems[dbRow.item_key] = dbRow;
+                    // Preload sound assets in the background
+                    if (dbRow.sound_asset && typeof SoundManager !== 'undefined') {
+                        const ts = dbRow.updated_at ? new Date(dbRow.updated_at).getTime() : 0;
+                        SoundManager.preload(`/fallback-ui/assets/${dbRow.sound_asset}?v=${ts}`);
+                    }
+                }
+                // DB is the source of truth for label text — overlay clean labels onto currentMenu
+                for (const m of this.currentMenu) {
+                    const db = this._dbItems[m.id];
+                    if (!db) continue;
+                    if (db.label)      m.label     = db.label;
+                    if (db.page_label) m.pageLabel = db.page_label;
+                }
+                // Re-render everything including the hamburger icon, which was rendered before
+                // _dbItems was populated. updateActiveTab() re-sets the hamburger icon + label
+                // AND calls renderNavbar() for the tab buttons.
+                this.updateActiveTab();
+            } catch (e) {
+                // Silently fall back to emoji-only mode
+            }
+        },
+
+        async _seedDefaultsToDb() {
+            const payload = this.defaultMenu.map(item => ({
+                menu_group:  cfg.group,
+                item_key:    item.id,
+                label:       item.label.replace(item.icon || '', '').trim(),
+                page_label:  item.pageLabel || null,
+                icon_emoji:  item.icon || null,
+                icon_asset:  null,
+                sound_asset: null,
+                parent_key:  item.parent || null,
+                sort_order:  item.order || 0,
+                is_fn:       item.fn ? 1 : 0,
+                fn_key:      item.fn || null,
+                active_on:   item.activeOn ? JSON.stringify(item.activeOn) : null,
+            }));
+            try {
+                await apiFetch('/api/v1/nav-items/seed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                // Reload now that DB is seeded
+                await this.loadNavItemsFromDB();
+            } catch (e) {
+                // Silently ignore — menu will continue to work with emoji icons
+            }
+        },
+
+        // Returns a <span class="menu-icon"> (mask-image tinted by currentColor) when an
+        // icon_asset is set, the emoji character when only an emoji is available, or the
+        // fallback question-mark span.  mask-image means icons automatically inherit the
+        // parent button's colour in all states (hover, active) via CSS currentColor.
+        _iconHtml(itemKey, emojiIcon) {
+            const db = this._dbItems[itemKey];
+            if (db && db.icon_asset) {
+                const ts = db.updated_at ? new Date(db.updated_at).getTime() : 0;
+                const url = `/fallback-ui/assets/${db.icon_asset}?v=${ts}`;
+                return `<span class="menu-icon" style="--_icon-url:url('${url}')" aria-hidden="true"></span>`;
+            }
+            // DB icon_emoji takes precedence (admin can change it via CMS), then JS default
+            const emoji = (db && db.icon_emoji) || emojiIcon;
+            if (emoji) return emoji;
+            // Nothing defined — show the fallback question-mark icon
+            return `<span class="menu-icon" style="--_icon-url:url('/fallback-ui/assets/icons/fallback.svg')" aria-hidden="true"></span>`;
+        },
+
+        // Plays the sound assigned to a nav item (no-op if none or sound disabled).
+        _playItemSound(itemKey) {
+            if (!itemKey) return;
+            const db = this._dbItems[itemKey];
+            if (db && db.sound_asset && typeof SoundManager !== 'undefined') {
+                const ts = db.updated_at ? new Date(db.updated_at).getTime() : 0;
+                SoundManager.play(`/fallback-ui/assets/${db.sound_asset}?v=${ts}`);
             }
         },
 
@@ -214,18 +316,18 @@ function createHubMenu(cfg) {
                 const allDropdownItems = [...dropdownNavItems, ...visibleFnChildren];
 
                 const labelText = isGroupActive
-                    ? (activeMember.icon ? activeMember.icon + '\u00a0' : '') + (activeMember.pageLabel || activeMember.label)
-                    : item.label;
+                    ? this._iconHtml(activeMember.id, activeMember.icon) + '\u00a0' + (activeMember.pageLabel || activeMember.label.replace(activeMember.icon || '', '').trim())
+                    : this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
 
                 if (allDropdownItems.length > 0) {
                     // ── Split-button with dropdown ────────────────────────────
                     const hasSeparator = dropdownNavItems.length > 0 && visibleFnChildren.length > 0;
                     const navHtml  = dropdownNavItems.map(c =>
-                        `<button class="hub-dropdown-item" data-tab="${c.id}">${c.label}</button>`
+                        `<button class="hub-dropdown-item" data-tab="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${c.label.replace(c.icon || '', '').trim()}</button>`
                     ).join('');
                     const sepHtml  = hasSeparator ? '<hr class="hub-dropdown-separator">' : '';
                     const fnHtml   = visibleFnChildren.map(c =>
-                        `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}">${c.label}</button>`
+                        `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}" data-item-key="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${c.label.replace(c.icon || '', '').trim()}</button>`
                     ).join('');
 
                     const isActive = isGroupActive || (activeId === item.id);
@@ -248,6 +350,7 @@ function createHubMenu(cfg) {
                             ? activeMember.id
                             : (document.getElementById('tab-' + item.id) ? item.id : navChildren[0]?.id);
                         if (targetId) {
+                            this._playItemSound(targetId);
                             switchTab(targetId);
                             this.updateActiveTab(targetId);
                             this.closeMenu();
@@ -268,6 +371,7 @@ function createHubMenu(cfg) {
                         btn.addEventListener('click', (e) => {
                             e.stopPropagation();
                             const destId = btn.dataset.tab;
+                            this._playItemSound(destId);
                             const panel = document.getElementById('tab-' + destId);
                             const destChildren = this.getChildren(destId);
                             const targetId = panel ? destId : (destChildren[0]?.id || destId);
@@ -282,6 +386,7 @@ function createHubMenu(cfg) {
                     dropdown.querySelectorAll('.hub-dropdown-fn').forEach(btn => {
                         btn.addEventListener('click', (e) => {
                             e.stopPropagation();
+                            this._playItemSound(btn.dataset.itemKey);
                             const fn = this._fnRegistry[btn.dataset.fn];
                             if (typeof fn === 'function') fn();
                             else console.warn('[HubMenu] No function registered for:', btn.dataset.fn);
@@ -296,8 +401,9 @@ function createHubMenu(cfg) {
                     // ── Top-level function button (promoted fn item) ──────────
                     const btn = document.createElement('button');
                     btn.className = 'hub-tab';
-                    btn.textContent = item.label;
+                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
                     btn.addEventListener('click', () => {
+                        this._playItemSound(item.id);
                         const fn = this._fnRegistry[item.fn];
                         if (typeof fn === 'function') fn();
                         else console.warn('[HubMenu] No function registered for:', item.fn);
@@ -310,9 +416,10 @@ function createHubMenu(cfg) {
                     const btn = document.createElement('button');
                     btn.className = 'hub-tab';
                     btn.dataset.tab = item.id;
-                    btn.textContent = item.label;
+                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
                     if (isGroupActive) btn.classList.add('active');
                     btn.addEventListener('click', () => {
+                        this._playItemSound(item.id);
                         switchTab(item.id);
                         this.updateActiveTab(item.id);
                         this.closeMenu();
@@ -354,11 +461,12 @@ function createHubMenu(cfg) {
             if (labelEl && activeId) {
                 const item = this.currentMenu.find(m => m.id === activeId);
                 if (item) {
-                    labelEl.textContent = item.pageLabel || item.label;
+                    // Strip any embedded emoji from the label text the same way renderNavbar does
+                    labelEl.textContent = item.pageLabel || item.label.replace(item.icon || '', '').trim();
                     const toggle = document.getElementById(cfg.toggleId);
                     if (toggle) {
                         const iconEl = toggle.querySelector('.hamburger-icon');
-                        if (iconEl && item.icon) iconEl.textContent = item.icon;
+                        if (iconEl) iconEl.innerHTML = this._iconHtml(item.id, item.icon);
                     }
                 }
             }
@@ -618,3 +726,8 @@ function createHubMenu(cfg) {
         },
     };
 }
+
+// ── menu-icon spans use CSS mask-image; no load-error handler needed.
+// Missing assets simply render transparent (background-color still applies,
+// but the mask has no shape → invisible).  The fallback span is baked into
+// _iconHtml() so no runtime recovery is required.
