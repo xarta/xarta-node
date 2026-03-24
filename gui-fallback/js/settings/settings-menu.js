@@ -19,6 +19,7 @@
 
 const SettingsMenuConfig = createHubMenu({
     storageKey:      'blueprintsSettingsMenuConfig',
+    group:           'settings',
     toggleId:        'settingsMenuToggle',
     tabsId:          'settingsHubTabs',
     currentLabelId:  'settingsCurrentTabLabel',
@@ -36,6 +37,7 @@ const SettingsMenuConfig = createHubMenu({
         { id: 'settings',        label: '🔧 App Config',      icon: '🔧', pageLabel: 'App Config',      parent: null,        order: 1 },
         { id: 'arp-manual',      label: '🗺 Manual ARP',      icon: '🗺', pageLabel: 'Manual ARP',      parent: 'settings',  order: 0 },
         { id: 'ai-providers',    label: '🤖 AI Providers',    icon: '🤖', pageLabel: 'AI Providers',    parent: 'settings',  order: 1 },
+        { id: 'nav-items',       label: '🧭 Nav Items',       icon: '🧭', pageLabel: 'Nav Items',       parent: 'settings',  order: 2 },
         { id: 'keys',            label: '🗝 Keys',            icon: '🗝', pageLabel: 'SSH Keys',        parent: null,        order: 2 },
         { id: 'certs',           label: '🔒 Certs',           icon: '🔒', pageLabel: 'Certificates',    parent: 'keys',      order: 0 },
         { id: 'docs',            label: '📄 Docs',            icon: '📄', pageLabel: 'Docs',            parent: null,        order: 3 },
@@ -79,6 +81,9 @@ const SettingsMenuConfig = createHubMenu({
 
         // ── Self Diagnostic page function items ────────────────────────────
         { id: 'diag-fn-run',     label: '▶ Run Diagnostics',  icon: '▶', fn: 'diag.run',     activeOn: ['self-diag'],    parent: 'settings-layout', order: 0 },
+
+        // ── Nav Items page function items ──────────────────────────────────
+        { id: 'ni-fn-refresh',   label: '↺ Refresh',           icon: '↺', fn: 'ni.refresh',   activeOn: ['nav-items'],    parent: 'settings-layout', order: 0 },
     ],
 });
 
@@ -142,4 +147,7 @@ SettingsMenuConfig.registerFunctions({
 
     // Self Diagnostic
     'diag.run':     () => runSelfDiag(),
+
+    // Nav Items
+    'ni.refresh':   () => loadNavItems(),
 });

@@ -419,6 +419,27 @@ CREATE TABLE IF NOT EXISTS visit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_visit_events_norm_url   ON visit_events(normalized_url);
 CREATE INDEX IF NOT EXISTS idx_visit_events_visited_at ON visit_events(visited_at);
+
+-- ── CMS-driven navigation items ──────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS nav_items (
+    item_id       TEXT PRIMARY KEY,           -- UUID (auto-generated)
+    menu_group    TEXT NOT NULL,              -- 'probes', 'synthesis', 'settings'
+    item_key      TEXT NOT NULL,              -- the JS 'id' value e.g. 'pfsense-dns'
+    label         TEXT NOT NULL,              -- display label e.g. 'pfSense DNS'
+    page_label    TEXT,                       -- label shown when item is active tab
+    icon_emoji    TEXT,                       -- emoji icon (current system, backward compat)
+    icon_asset    TEXT,                       -- relative path to custom icon e.g. 'icons/pfsense.svg'
+    sound_asset   TEXT,                       -- relative path to sound e.g. 'sounds/beep.wav'
+    parent_key    TEXT,                       -- parent item_key for nesting (NULL = top-level)
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    is_fn         INTEGER NOT NULL DEFAULT 0, -- 1 if this is a function item
+    fn_key        TEXT,                       -- function registry key e.g. 'bm.add' (read-only ref)
+    active_on     TEXT,                       -- JSON array of tab IDs e.g. '["bookmarks-main"]'
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nav_items_group_key ON nav_items(menu_group, item_key);
 """
 
 _SEED_SQL = """
@@ -430,6 +451,7 @@ INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('gui_version',    'initial'
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_primary_node', '');
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('last_primary_at',   '');
 INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.bm_fetch_limit', '50000', 'Max bookmarks fetched for browse/filter in JS client');
+INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.sound_enabled', 'false', 'Enable sound playback on menu item clicks');
 """
 
 

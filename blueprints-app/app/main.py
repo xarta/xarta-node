@@ -60,6 +60,7 @@ from .routes_firewall import router as firewall_router
 from .routes_ai_providers import router as ai_providers_router
 from .routes_ai_project_assignments import router as ai_project_assignments_router
 from .routes_bookmarks import router as bookmarks_router
+from .routes_nav_items import router as nav_items_router
 from .seekdb_sync import start_seekdb_sync_loop
 from .sync.drain import start_drain_loop
 from .sync.queue import enqueue_for_all_peers
@@ -325,6 +326,7 @@ def create_app() -> FastAPI:
     application.include_router(ai_providers_router,            prefix="/api/v1")
     application.include_router(ai_project_assignments_router,  prefix="/api/v1")
     application.include_router(bookmarks_router,               prefix="/api/v1")
+    application.include_router(nav_items_router,               prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:

@@ -15,6 +15,7 @@
 
 const SynthesisMenuConfig = createHubMenu({
     storageKey:      'blueprintsSynthesisMenuConfig',
+    group:           'synthesis',
     toggleId:        'synthesisMenuToggle',
     tabsId:          'synthesisHubTabs',
     currentLabelId:  'synthesisCurrentTabLabel',
