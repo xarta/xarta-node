@@ -163,6 +163,7 @@ select.hub-ctrl option {
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
+    width: 100%;
 }
 
 .page-control-group[hidden] {

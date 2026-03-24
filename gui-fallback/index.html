@@ -100,147 +100,150 @@
         <span id="nn-keys-compact"></span>
       </div>
 
+
+      <!-- Page controls slot: per-tab control groups shown/hidden by ResponsiveLayout.
+          Recipe for new pages: add a .page-control-group div with data-for-tab set,
+          then call ResponsiveLayout.registerTabControls(tabId, groupElId) in the page JS. -->
+      <div id="page-controls-slot">
+
+        <!-- Bookmarks main — search / tag filter / archived toggle.
+            Formerly in a .toolbar div inside #tab-bookmarks-main.
+            Event handlers wired in bookmarks.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-bookmarks-main"
+            data-for-tab="bookmarks-main" hidden>
+          <input class="hub-ctrl" type="text" id="bm-search"
+                placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" />
+          <select id="bm-tag-filter">
+            <option value="">All tags</option>
+          </select>
+          <label class="hub-ctrl-toggle-label bm-toggle-label">
+            <input type="checkbox" id="bm-show-archived" />
+            <span class="bm-toggle-track"></span>
+            Archived
+          </label>
+        </div>
+
+        <!-- pfSense DNS — search filter + hide-inactive toggle.
+            Moved from .toolbar inside #tab-pfsense-dns.
+            Event handlers wired in pfsense.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-pfsense-dns"
+            data-for-tab="pfsense-dns" hidden>
+          <input class="hub-ctrl" type="text" id="dns-search"
+                placeholder="Filter DNS entries…" />
+          <label class="hub-ctrl-toggle-label">
+            <input type="checkbox" id="dns-hide-inactive" />
+            <span class="bm-toggle-track"></span>
+            Hide inactive
+          </label>
+        </div>
+
+        <!-- Proxmox Config — search filter.
+            Moved from .toolbar inside #tab-proxmox-config.
+            Event handlers wired in proxmox-config.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-proxmox-config"
+            data-for-tab="proxmox-config" hidden>
+          <input class="hub-ctrl" type="text" id="pve-search"
+                placeholder="Filter configs…" />
+        </div>
+
+        <!-- Dockge Stacks — search filter + hide-obsolete toggle.
+            Moved from .toolbar inside #tab-dockge-stacks.
+            Event handlers wired in dockge.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-dockge-stacks"
+            data-for-tab="dockge-stacks" hidden>
+          <input class="hub-ctrl" type="text" id="dockge-search"
+                placeholder="Filter stacks…" />
+          <label class="hub-ctrl-toggle-label">
+            <input type="checkbox" id="dockge-hide-obsolete" checked />
+            <span class="bm-toggle-track"></span>
+            Hide obsolete
+          </label>
+        </div>
+
+        <!-- Caddy Configs — search filter.
+            Moved from .toolbar inside #tab-caddy-configs.
+            Event handlers wired in caddy.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-caddy-configs"
+            data-for-tab="caddy-configs" hidden>
+          <input class="hub-ctrl" type="text" id="caddy-search"
+                placeholder="Filter configs…" />
+        </div>
+
+        <!-- Visit History — search filter + saved filter select.
+            Moved from .toolbar inside #tab-bookmarks-history.
+            Event handlers wired in bookmarks.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-bookmarks-history"
+            data-for-tab="bookmarks-history" hidden>
+          <input class="hub-ctrl" type="text" id="bm-visit-search"
+                placeholder="Filter visits…" />
+          <select class="hub-ctrl" id="bm-visit-saved-filter">
+            <option value="all">All</option>
+            <option value="unsaved">Unsaved only</option>
+            <option value="saved">Saved only</option>
+          </select>
+        </div>
+
+        <!-- Manual Links table — filter input.
+            Moved from .toolbar inside #ml-table-view.
+            Event handlers wired in manual-links.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-manual-links-table"
+            data-for-tab="manual-links-table" hidden>
+          <input class="hub-ctrl" type="text" id="ml-filter"
+                placeholder="Filter links…" />
+        </div>
+
+        <!-- Services — filter input.
+            Moved from .toolbar inside #tab-services.
+            Event handlers wired in services.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-services"
+            data-for-tab="services" hidden>
+          <input class="hub-ctrl" type="text" id="search-input"
+                placeholder="Filter services…" />
+        </div>
+
+        <!-- Machines — filter input.
+            Moved from .toolbar inside #tab-machines.
+            Event handlers wired in machines.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-machines"
+            data-for-tab="machines" hidden>
+          <input class="hub-ctrl" type="text" id="machine-search"
+                placeholder="Filter machines…" />
+        </div>
+
+        <!-- Fleet Nodes — retouch table select + button.
+            Event handlers wired in nodes.js via addEventListener. -->
+        <div class="page-control-group" id="pg-ctrl-nodes"
+            data-for-tab="nodes" hidden>
+          <select id="retouch-table-select">
+            <option value="">— select table —</option>
+            <option value="manual_links">manual_links</option>
+            <option value="services">services</option>
+            <option value="machines">machines</option>
+            <option value="settings">settings</option>
+            <option value="pfsense_dns">pfsense_dns</option>
+            <option value="proxmox_config">proxmox_config</option>
+            <option value="proxmox_nets">proxmox_nets</option>
+            <option value="vlans">vlans</option>
+            <option value="dockge_stacks">dockge_stacks</option>
+            <option value="dockge_stack_services">dockge_stack_services</option>
+            <option value="caddy_configs">caddy_configs</option>
+            <option value="pve_hosts">pve_hosts</option>
+            <option value="arp_manual">arp_manual</option>
+            <option value="ssh_targets">ssh_targets</option>
+            <option value="ai_providers">ai_providers</option>
+            <option value="ai_project_assignments">ai_project_assignments</option>
+            <option value="bookmarks">bookmarks</option>
+            <option value="visits">visits</option>
+          </select>
+          <button id="retouch-btn" class="hub-ctrl"
+                  title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
+        </div>
+
+      </div><!-- /#page-controls-slot -->
+
     </div><!-- /.menu-zone-nav -->
 
-    <!-- Page controls slot: per-tab control groups shown/hidden by ResponsiveLayout.
-         Recipe for new pages: add a .page-control-group div with data-for-tab set,
-         then call ResponsiveLayout.registerTabControls(tabId, groupElId) in the page JS. -->
-    <div id="page-controls-slot">
 
-      <!-- Bookmarks main — search / tag filter / archived toggle.
-           Formerly in a .toolbar div inside #tab-bookmarks-main.
-           Event handlers wired in bookmarks.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-bookmarks-main"
-           data-for-tab="bookmarks-main" hidden>
-        <input class="hub-ctrl" type="text" id="bm-search"
-               placeholder="Search bookmarks… (Enter triggers SeekDB hybrid search)" />
-        <select id="bm-tag-filter">
-          <option value="">All tags</option>
-        </select>
-        <label class="hub-ctrl-toggle-label bm-toggle-label">
-          <input type="checkbox" id="bm-show-archived" />
-          <span class="bm-toggle-track"></span>
-          Archived
-        </label>
-      </div>
-
-      <!-- pfSense DNS — search filter + hide-inactive toggle.
-           Moved from .toolbar inside #tab-pfsense-dns.
-           Event handlers wired in pfsense.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-pfsense-dns"
-           data-for-tab="pfsense-dns" hidden>
-        <input class="hub-ctrl" type="text" id="dns-search"
-               placeholder="Filter DNS entries…" />
-        <label class="hub-ctrl-toggle-label">
-          <input type="checkbox" id="dns-hide-inactive" />
-          <span class="bm-toggle-track"></span>
-          Hide inactive
-        </label>
-      </div>
-
-      <!-- Proxmox Config — search filter.
-           Moved from .toolbar inside #tab-proxmox-config.
-           Event handlers wired in proxmox-config.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-proxmox-config"
-           data-for-tab="proxmox-config" hidden>
-        <input class="hub-ctrl" type="text" id="pve-search"
-               placeholder="Filter configs…" />
-      </div>
-
-      <!-- Dockge Stacks — search filter + hide-obsolete toggle.
-           Moved from .toolbar inside #tab-dockge-stacks.
-           Event handlers wired in dockge.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-dockge-stacks"
-           data-for-tab="dockge-stacks" hidden>
-        <input class="hub-ctrl" type="text" id="dockge-search"
-               placeholder="Filter stacks…" />
-        <label class="hub-ctrl-toggle-label">
-          <input type="checkbox" id="dockge-hide-obsolete" checked />
-          <span class="bm-toggle-track"></span>
-          Hide obsolete
-        </label>
-      </div>
-
-      <!-- Caddy Configs — search filter.
-           Moved from .toolbar inside #tab-caddy-configs.
-           Event handlers wired in caddy.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-caddy-configs"
-           data-for-tab="caddy-configs" hidden>
-        <input class="hub-ctrl" type="text" id="caddy-search"
-               placeholder="Filter configs…" />
-      </div>
-
-      <!-- Visit History — search filter + saved filter select.
-           Moved from .toolbar inside #tab-bookmarks-history.
-           Event handlers wired in bookmarks.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-bookmarks-history"
-           data-for-tab="bookmarks-history" hidden>
-        <input class="hub-ctrl" type="text" id="bm-visit-search"
-               placeholder="Filter visits…" />
-        <select class="hub-ctrl" id="bm-visit-saved-filter">
-          <option value="all">All</option>
-          <option value="unsaved">Unsaved only</option>
-          <option value="saved">Saved only</option>
-        </select>
-      </div>
-
-      <!-- Manual Links table — filter input.
-           Moved from .toolbar inside #ml-table-view.
-           Event handlers wired in manual-links.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-manual-links-table"
-           data-for-tab="manual-links-table" hidden>
-        <input class="hub-ctrl" type="text" id="ml-filter"
-               placeholder="Filter links…" />
-      </div>
-
-      <!-- Services — filter input.
-           Moved from .toolbar inside #tab-services.
-           Event handlers wired in services.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-services"
-           data-for-tab="services" hidden>
-        <input class="hub-ctrl" type="text" id="search-input"
-               placeholder="Filter services…" />
-      </div>
-
-      <!-- Machines — filter input.
-           Moved from .toolbar inside #tab-machines.
-           Event handlers wired in machines.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-machines"
-           data-for-tab="machines" hidden>
-        <input class="hub-ctrl" type="text" id="machine-search"
-               placeholder="Filter machines…" />
-      </div>
-
-      <!-- Fleet Nodes — retouch table select + button.
-           Event handlers wired in nodes.js via addEventListener. -->
-      <div class="page-control-group" id="pg-ctrl-nodes"
-           data-for-tab="nodes" hidden>
-        <select id="retouch-table-select">
-          <option value="">— select table —</option>
-          <option value="manual_links">manual_links</option>
-          <option value="services">services</option>
-          <option value="machines">machines</option>
-          <option value="settings">settings</option>
-          <option value="pfsense_dns">pfsense_dns</option>
-          <option value="proxmox_config">proxmox_config</option>
-          <option value="proxmox_nets">proxmox_nets</option>
-          <option value="vlans">vlans</option>
-          <option value="dockge_stacks">dockge_stacks</option>
-          <option value="dockge_stack_services">dockge_stack_services</option>
-          <option value="caddy_configs">caddy_configs</option>
-          <option value="pve_hosts">pve_hosts</option>
-          <option value="arp_manual">arp_manual</option>
-          <option value="ssh_targets">ssh_targets</option>
-          <option value="ai_providers">ai_providers</option>
-          <option value="ai_project_assignments">ai_project_assignments</option>
-          <option value="bookmarks">bookmarks</option>
-          <option value="visits">visits</option>
-        </select>
-        <button id="retouch-btn" class="hub-ctrl"
-                title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
-      </div>
-
-    </div><!-- /#page-controls-slot -->
 
 
 
@@ -1334,6 +1337,16 @@
   };
 </script>
 <link  rel="stylesheet" href="embed/blueprints-node-selector.css" />
+<style>
+  /* Replace the 🏠 home emoji on the /ui/ button with a Starfleet combadge SVG icon. */
+  .bp-ns-action-btn[data-action="ui"] { font-size: 0; position: relative; }
+  .bp-ns-action-btn[data-action="ui"]::before {
+    content: ''; display: block; width: 22px; height: 22px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1.5L22.5 8.5L18.5 22L12 17L5.5 22L1.5 8.5Z' fill='%23c8a84b'/%3E%3Cpath d='M12 5L19.5 10.5L16.5 20.5L12 16L7.5 20.5L4.5 10.5Z' fill='%23030612' opacity='.9'/%3E%3Ccircle cx='12' cy='12.5' r='2' fill='%23c8a84b' opacity='.7'/%3E%3C/svg%3E");
+    background-size: contain; background-repeat: no-repeat; background-position: center;
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  }
+</style>
 <script src="embed/blueprints-node-selector.js"></script>
 
 <!-- Tag exclusion multi-select modal -->

@@ -39,6 +39,7 @@
     align-items: center;
     gap: 6px;
     width: 100%;
+    flex-wrap: wrap;
 }
 
 /* Kill the existing bottom-margin on hub-tabs-wrapper when inside the menu-zone
@@ -108,7 +109,7 @@ html.header-compact #page-controls-slot {
         flex-wrap: wrap;
         justify-content: flex-end;
         gap: 2px 8px;
-        max-width: 120px;
+        max-width: 100px;
         margin-top: -5px;
     }
 
@@ -184,4 +185,9 @@ html.header-compact .header-inner {
     .menu-zone {
         margin-bottom: 5px;
     }
+
+    .hub-menu-toggle {
+        padding-left: 10px;
+        padding-right: 10px;
+    }  
 }
