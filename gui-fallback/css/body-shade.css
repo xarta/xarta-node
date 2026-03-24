@@ -1,0 +1,130 @@
+/* ── Body Shade — mobile pull-up content shade ─────────────────────────────
+   Mobile-only (< 769px). Entirely additive — no existing rules overridden.
+   The handle sits between .menu-zone and tab content; dragging it up slides
+   content over the header/menu, maximising screen real estate.
+
+   Two states:
+     default   → handle + shade in normal document flow, transform-driven
+     .is-up    → handle + shade position:fixed (full-screen, own scroll)
+     .is-dragging → CSS transition suppressed during active gesture
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ── Handle — hidden on desktop ─────────────────────────────────────────── */
+.body-shade-handle {
+  display: none;
+}
+
+/* ── Grip pill ───────────────────────────────────────────────────────────── */
+.body-shade-grip {
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(var(--hub-accent-rgb), 0.4);
+  pointer-events: none;
+  transition: background 0.2s ease;
+}
+
+.body-shade-handle.is-grabbing .body-shade-grip {
+  background: rgba(var(--hub-accent-rgb), 0.7);
+}
+
+/* ── Mobile layout ───────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+
+  /* Handle — pill strip between menu-zone and content */
+  .body-shade-handle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 24px;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    position: relative;
+    z-index: 101;
+    background: var(--bg);
+    /* Extend to full viewport width (compensates main's 16px padding at this breakpoint) */
+    margin-left: -16px;
+    margin-right: -16px;
+    transform: translateY(var(--shade-y, 0px));
+    transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  }
+
+  /* Suppress transition during active drag */
+  .body-shade-handle.is-dragging {
+    transition: none;
+  }
+
+  .body-shade-handle.is-grabbing {
+    cursor: grabbing;
+  }
+
+  /* Fixed-up state: handle pinned to viewport top */
+  .body-shade-handle.is-up {
+    position: fixed !important;
+    top: 0;
+    left: 0;
+    right: 0;
+    margin: 0;
+    transform: none !important;
+    transition: none !important;
+    z-index: 101;
+  }
+
+  /* Shade wrapper — wraps all .tab-panel sections */
+  .body-shade {
+    position: relative;
+    z-index: 100;
+    background: var(--bg);
+    transform: translateY(var(--shade-y, 0px));
+    transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    /* Extend to full viewport width (compensates main's 16px padding at this breakpoint) */
+    margin-left: -16px;
+    margin-right: -16px;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  /* Suppress transition during active drag */
+  .body-shade.is-dragging {
+    transition: none;
+  }
+
+  /* Fixed-up state: shade fills viewport below handle */
+  .body-shade.is-up {
+    position: fixed !important;
+    top: 24px; /* = handle height */
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+    padding-left: 16px;
+    padding-right: 16px;
+    overflow-y: auto;
+    transform: none !important;
+    transition: none !important;
+    min-height: 0 !important;
+    z-index: 100;
+  }
+}
+
+/* ── Narrow mobile (≤600px): match main's 10px padding at this breakpoint ── */
+@media (max-width: 600px) {
+  .body-shade-handle {
+    margin-left: -10px;
+    margin-right: -10px;
+  }
+
+  .body-shade {
+    margin-left: -10px;
+    margin-right: -10px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .body-shade.is-up {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}

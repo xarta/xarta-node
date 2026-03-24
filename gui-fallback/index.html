@@ -15,6 +15,7 @@
   <link rel="stylesheet" href="css/synthesis-menu.css" />
   <link rel="stylesheet" href="css/hub-controls.css" />
   <link rel="stylesheet" href="css/responsive-header.css" />
+  <link rel="stylesheet" href="css/body-shade.css" />
 </head>
 <body>
 
@@ -248,6 +249,14 @@
 
 
   </div><!-- /.menu-zone -->
+
+  <!-- Body shade drag handle: mobile-only pull-to-slide trigger -->
+  <div id="body-shade-handle" class="body-shade-handle" aria-hidden="true">
+    <div class="body-shade-grip"></div>
+  </div>
+
+  <!-- Body shade wrapper: all tab panels live here -->
+  <div id="body-shade" class="body-shade">
 
   <!-- Settings -->
   <section id="tab-settings" class="tab-panel">
@@ -970,6 +979,7 @@
     </div>
   </section>
 
+  </div><!-- /#body-shade -->
 
 </main>
 
@@ -1239,6 +1249,7 @@
 <script src="js/settings/settings-menu.js"></script>
 <script src="js/hub-select.js"></script>
 <script src="js/responsive-layout.js"></script>
+<script src="js/body-shade.js"></script>
 <script src="js/app.js"></script>
 
 <!-- Restore confirmation modal -->
