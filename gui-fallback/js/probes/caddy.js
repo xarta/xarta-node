@@ -1,3 +1,15 @@
+document.addEventListener('DOMContentLoaded', () => {
+  let _caddyFilterTimer = null;
+  const searchEl = document.getElementById('caddy-search');
+  if (searchEl) searchEl.addEventListener('input', () => {
+    clearTimeout(_caddyFilterTimer);
+    _caddyFilterTimer = setTimeout(renderCaddyConfigs, 250);
+  });
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('caddy-configs', 'pg-ctrl-caddy-configs');
+  }
+});
+
 async function loadCaddyConfigs() {
   const err = document.getElementById('caddy-error');
   err.hidden = true;

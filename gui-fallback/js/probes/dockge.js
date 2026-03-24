@@ -1,5 +1,19 @@
-/* ── Dockge Stacks ────────────────────────────────────────────────────── */
 /* ── Dockge Stacks ──────────────────────────────────────────────────────── */
+
+document.addEventListener('DOMContentLoaded', () => {
+  let _dockgeFilterTimer = null;
+  const searchEl = document.getElementById('dockge-search');
+  const toggleEl = document.getElementById('dockge-hide-obsolete');
+  if (searchEl) searchEl.addEventListener('input', () => {
+    clearTimeout(_dockgeFilterTimer);
+    _dockgeFilterTimer = setTimeout(renderDockgeStacks, 250);
+  });
+  if (toggleEl) toggleEl.addEventListener('change', renderDockgeStacks);
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('dockge-stacks', 'pg-ctrl-dockge-stacks');
+  }
+});
+
 async function loadDockgeStacks() {
   const err = document.getElementById('dockge-error');
   err.hidden = true;

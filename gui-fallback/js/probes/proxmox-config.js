@@ -1,3 +1,31 @@
+/* ── Proxmox Config ───────────────────────────────────────────────────────── */
+
+let _pveFilterTimer = null;  // debounce handle for pve-search input
+
+document.addEventListener('DOMContentLoaded', () => {
+  const pveSearch = document.getElementById('pve-search');
+  if (pveSearch) {
+    pveSearch.addEventListener('input', () => {
+      clearTimeout(_pveFilterTimer);
+      _pveFilterTimer = setTimeout(renderProxmoxConfig, 250);
+    });
+  }
+
+  const wire = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+  wire('pve-probe-btn',                 () => probeProxmoxConfig());
+  wire('pve-enrich-btn',                () => enrichNetsFromPfsense());
+  wire('pve-enrich-arp-btn',            () => enrichFromPfsenseArp());
+  wire('pve-findips-btn',               () => findIpsByArp());
+  wire('pve-findips-pve-btn',           () => findIpsViaPve());
+  wire('pve-findips-qemu-btn',          () => findIpsViaQemuAgent());
+  wire('pve-findips-pfsense-sweep-btn', () => findIpsViaPfsenseSweep());
+  wire('pve-probe-services-btn',        () => probeVmServices());
+
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('proxmox-config', 'pg-ctrl-proxmox-config');
+  }
+});
+
 async function findIpsByArp() {
   const btn    = document.getElementById('pve-findips-btn');
   const status = document.getElementById('pve-probe-status');
