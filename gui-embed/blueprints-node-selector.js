@@ -27,6 +27,34 @@
   ).replace(/\/$/, '');
 
   const SEEDS = (typeof window !== 'undefined' && window.BLUEPRINTS_SEED_NODES) || [];
+
+  /* ── Internal authenticated fetch ───────────────────────────────────────
+   * Uses window.apiFetch when the host page provides it (e.g. full Blueprints
+   * GUI), otherwise derives a TOTP token from localStorage itself so the
+   * selector works self-contained on any page — no supporting scripts needed.
+   * Same HMAC-SHA256 / 5-second window scheme as api.js. */
+  async function _authFetch(url, options = {}) {
+    if (typeof window !== 'undefined' && typeof window.apiFetch === 'function') {
+      return window.apiFetch(url, options);
+    }
+    let token = '';
+    try {
+      const secretHex = (typeof localStorage !== 'undefined' && localStorage.getItem('blueprints_api_secret')) || '';
+      if (secretHex) {
+        const w  = Math.floor(Date.now() / 5000);
+        const kb = Uint8Array.from(secretHex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
+        const mb = new TextEncoder().encode(String(w));
+        const k  = await crypto.subtle.importKey('raw', kb, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        const s  = await crypto.subtle.sign('HMAC', k, mb);
+        token = Array.from(new Uint8Array(s)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch {}
+    return fetch(url, {
+      ...options,
+      headers: { ...(options.headers || {}), ...(token ? { 'X-API-Token': token } : {}) },
+    });
+  }
+
   let SELECTOR_CFG = {
     enabledButtons: [],
     pages: null,
@@ -160,8 +188,7 @@
 
     let peers = [];
     try {
-      const _apiFetch = window.apiFetch || fetch;
-      const r = await _apiFetch(`${origin}/api/v1/nodes`, { signal: AbortSignal.timeout(5000) });
+      const r = await _authFetch(`${origin}/api/v1/nodes`, { signal: AbortSignal.timeout(5000) });
       if (r.ok) peers = await r.json();
     } catch {}
 
