@@ -116,6 +116,37 @@ html.header-compact #page-controls-slot {
         flex-basis: 100%;
         text-align: right;
     }
+
+    /* Full-width node selector bar on narrow viewports.
+       The action icon buttons stay left-aligned; the selector button grows
+       to consume all remaining horizontal space. */
+    .header-right {
+        width: 100%;
+        flex-shrink: 1;
+        margin-left: 0 !important;  /* beats html.header-compact .header-right rule */
+        padding-left: 0;
+        box-sizing: border-box;
+    }
+
+    .header-right blueprints-node-selector {
+        display: flex;  /* override inline-flex so it obeys width: 100% */
+        width: 100%;
+    }
+
+    .header-right .bp-node-selector {
+        width: 100%;
+    }
+
+    /* Selector button grows to fill space left after action buttons */
+    .header-right .bp-ns-btn {
+        flex: 1;
+        min-width: 0;
+    }
+
+    /* Remove truncation cap — the button now determines the width */
+    .header-right .bp-ns-name {
+        max-width: none;
+    }
 }
 
 /* Keep header-right (node-selector) right-aligned even in compact mode.
