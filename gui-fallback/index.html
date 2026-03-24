@@ -211,6 +211,35 @@
                placeholder="Filter machines…" />
       </div>
 
+      <!-- Fleet Nodes — retouch table select + button.
+           Event handlers wired in nodes.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-nodes"
+           data-for-tab="nodes" hidden>
+        <select id="retouch-table-select">
+          <option value="">— select table —</option>
+          <option value="manual_links">manual_links</option>
+          <option value="services">services</option>
+          <option value="machines">machines</option>
+          <option value="settings">settings</option>
+          <option value="pfsense_dns">pfsense_dns</option>
+          <option value="proxmox_config">proxmox_config</option>
+          <option value="proxmox_nets">proxmox_nets</option>
+          <option value="vlans">vlans</option>
+          <option value="dockge_stacks">dockge_stacks</option>
+          <option value="dockge_stack_services">dockge_stack_services</option>
+          <option value="caddy_configs">caddy_configs</option>
+          <option value="pve_hosts">pve_hosts</option>
+          <option value="arp_manual">arp_manual</option>
+          <option value="ssh_targets">ssh_targets</option>
+          <option value="ai_providers">ai_providers</option>
+          <option value="ai_project_assignments">ai_project_assignments</option>
+          <option value="bookmarks">bookmarks</option>
+          <option value="visits">visits</option>
+        </select>
+        <button id="retouch-btn" class="hub-ctrl"
+                title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
+      </div>
+
     </div><!-- /#page-controls-slot -->
 
 
@@ -417,36 +446,10 @@
 
   <!-- Nodes -->
   <section id="tab-nodes" class="tab-panel">
-    <div class="toolbar" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
-      <span style="display:flex;align-items:center;gap:5px;flex-shrink:0">
-        <select id="retouch-table-select" style="font-size:12px;padding:3px 6px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--radius)">
-          <option value="">— select table —</option>
-          <option value="manual_links">manual_links</option>
-          <option value="services">services</option>
-          <option value="machines">machines</option>
-          <option value="settings">settings</option>
-          <option value="pfsense_dns">pfsense_dns</option>
-          <option value="proxmox_config">proxmox_config</option>
-          <option value="proxmox_nets">proxmox_nets</option>
-          <option value="vlans">vlans</option>
-          <option value="dockge_stacks">dockge_stacks</option>
-          <option value="dockge_stack_services">dockge_stack_services</option>
-          <option value="caddy_configs">caddy_configs</option>
-          <option value="pve_hosts">pve_hosts</option>
-          <option value="arp_manual">arp_manual</option>
-          <option value="ssh_targets">ssh_targets</option>
-          <option value="ai_providers">ai_providers</option>
-          <option value="ai_project_assignments">ai_project_assignments</option>
-          <option value="bookmarks">bookmarks</option>
-          <option value="visits">visits</option>
-        </select>
-        <button id="retouch-btn" class="secondary" onclick="retouchTable(this)" title="Re-enqueue all rows in selected table for sync to all peers">&#8635; Retouch</button>
-        <span id="retouch-status" style="font-size:12px;color:var(--text-dim)"></span>
-      </span>
-      <span style="font-size:12px;color:var(--text-dim);align-self:center">
-        <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
-      </span>
-    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:6px">
+      <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
+    </p>
+    <p id="retouch-status" style="font-size:12px;min-height:1.2em;margin-bottom:6px"></p>
     <div class="table-wrap">
       <table>
         <thead>
