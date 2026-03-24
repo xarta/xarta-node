@@ -10,7 +10,10 @@
    appearing inline to the right of the split-menu on wide viewports
    and wrapping to the next row on narrow viewports.
 
-   Self-contained — no dependency on tokens.css or layout-nav.css.
+   Requires tokens.css — uses --hub-accent, --hub-accent-rgb, --hub-bg,
+   --hub-bg-focus, --hub-text, --hub-radius custom properties.
+   NOTE: SVG data-URI chevrons hardcode the hex value; CSS vars cannot
+   be used inside data: URL strings.
    ================================================================ */
 
 /* ── Core hub-ctrl base ─────────────────────────────────────── */
@@ -18,10 +21,10 @@
 /* Applied to any form control that sits in the page-controls slot.
    Matches the hub-tab button height, border, and colour scheme. */
 .hub-ctrl {
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid rgba(0, 212, 255, 0.3);
-    border-radius: 8px;
-    color: #e0e0e0;
+    background: var(--hub-bg);
+    border: 1px solid rgba(var(--hub-accent-rgb), 0.3);
+    border-radius: var(--hub-radius);
+    color: var(--hub-text);
     font-family: inherit;
     font-size: 0.9em;
     padding: 10px 15px;
@@ -36,12 +39,12 @@
    The shorthand resets background-image to none, which would kill the
    SVG chevron on select.hub-ctrl:focus. background-color: is safe. */
 .hub-ctrl:focus {
-    border-color: rgba(0, 212, 255, 0.7);
-    background-color: rgba(0, 0, 0, 0.45);
+    border-color: rgba(var(--hub-accent-rgb), 0.7);
+    background-color: var(--hub-bg-focus);
 }
 
 .hub-ctrl:hover {
-    border-color: rgba(0, 212, 255, 0.5);
+    border-color: rgba(var(--hub-accent-rgb), 0.5);
 }
 
 /* ── Text input specifics ───────────────────────────────────── */
@@ -54,9 +57,9 @@ input[type="text"].hub-ctrl {
     flex: 1 1 220px;
     max-width: 400px;
     /* override components.css input[type=text] */
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid rgba(0, 212, 255, 0.3);
-    border-radius: 8px;
+    background: var(--hub-bg);
+    border: 1px solid rgba(var(--hub-accent-rgb), 0.3);
+    border-radius: var(--hub-radius);
     padding: 10px 15px;
     height: 43px;
     font-size: 0.9em;
@@ -64,13 +67,13 @@ input[type="text"].hub-ctrl {
 }
 
 input[type="text"].hub-ctrl:hover {
-    border-color: rgba(0, 212, 255, 0.5);
-    background-color: rgba(0, 0, 0, 0.3);
+    border-color: rgba(var(--hub-accent-rgb), 0.5);
+    background-color: var(--hub-bg);
 }
 
 input[type="text"].hub-ctrl:focus {
-    border-color: rgba(0, 212, 255, 0.7);
-    background-color: rgba(0, 0, 0, 0.45);
+    border-color: rgba(var(--hub-accent-rgb), 0.7);
+    background-color: var(--hub-bg-focus);
     outline: none;
 }
 
@@ -85,7 +88,7 @@ select.hub-ctrl {
     appearance: none;
     -webkit-appearance: none;
     -moz-appearance: none;
-    /* Custom ▼ chevron — matches hub-tab-caret colour (#00d4ff) */
+    /* Custom ▼ chevron — matches hub-tab-caret colour (var(--hub-accent)) */
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2300d4ff' opacity='.8'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
     background-position: right 11px center;
@@ -100,7 +103,7 @@ select.hub-ctrl {
 
 select.hub-ctrl option {
     background: #0f0f19;
-    color: #e0e0e0;
+    color: var(--hub-text);
 }
 
 /* ── Toggle switch — hub-ctrl variant ───────────────────────── */
@@ -111,10 +114,10 @@ select.hub-ctrl option {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    background: rgba(0, 0, 0, 0.3);
-    border: 1px solid rgba(0, 212, 255, 0.3);
-    border-radius: 8px;
-    color: #e0e0e0;
+    background: var(--hub-bg);
+    border: 1px solid rgba(var(--hub-accent-rgb), 0.3);
+    border-radius: var(--hub-radius);
+    color: var(--hub-text);
     font-family: inherit;
     font-size: 0.9em;
     padding: 10px 15px;
@@ -127,7 +130,7 @@ select.hub-ctrl option {
 }
 
 .hub-ctrl-toggle-label:hover {
-    border-color: rgba(0, 212, 255, 0.5);
+    border-color: rgba(var(--hub-accent-rgb), 0.5);
 }
 
 /* Hide the native checkbox — the .bm-toggle-track handles the visual */
@@ -142,9 +145,9 @@ select.hub-ctrl option {
    Uses .bm-toggle-track (defined in components.css) as the visual element.
    NOTE: components.css only applies these rules to .bm-toggle-label — any
    toggle using .hub-ctrl-toggle-label alone must have these rules here.
-   Colour: cyan-tinted to match the hub-menu design language (#00d4ff). */
+   Colour: cyan-tinted to match the hub-menu design language (var(--hub-accent)). */
 .hub-ctrl-toggle-label input[type="checkbox"]:checked + .bm-toggle-track {
-    background: rgba(0, 212, 255, 0.55);
+    background: rgba(var(--hub-accent-rgb), 0.55);
 }
 .hub-ctrl-toggle-label input[type="checkbox"]:checked + .bm-toggle-track::after {
     left: 19px;
@@ -220,14 +223,14 @@ select.hub-ctrl option {
     position: fixed;
     z-index: 9000;
     background: rgba(15, 15, 25, 0.98);
-    border: 1px solid rgba(0, 212, 255, 0.3);
-    border-radius: 8px;
+    border: 1px solid rgba(var(--hub-accent-rgb), 0.3);
+    border-radius: var(--hub-radius);
     padding: 5px;
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
     max-height: 60vh;
     overflow-y: auto;
     scrollbar-width: thin;
-    scrollbar-color: rgba(0, 212, 255, 0.3) transparent;
+    scrollbar-color: rgba(var(--hub-accent-rgb), 0.3) transparent;
 }
 
 .hub-select-menu.hub-select-open {
@@ -238,7 +241,7 @@ select.hub-ctrl option {
 .hub-select-item {
     background: transparent;
     border: none;
-    color: #e0e0e0;
+    color: var(--hub-text);
     font-family: inherit;
     font-size: 0.9em;
     padding: 7px 12px;
@@ -249,10 +252,54 @@ select.hub-ctrl option {
 }
 
 .hub-select-item:hover {
-    background-color: rgba(0, 212, 255, 0.12);
-    color: #00d4ff;
+    background-color: rgba(var(--hub-accent-rgb), 0.12);
+    color: var(--hub-accent);
 }
 
 .hub-select-item-active {
-    color: #00d4ff;
+    color: var(--hub-accent);
+}
+
+/* ── Action buttons — hub design language variant ───────────── */
+/* Applied to action buttons inside tab panels (e.g. pve-steps-panel).
+   Uses the established cyan border/dark bg design language.
+   .hub-primary marks the main trigger action with a stronger cyan tint.
+   Self-contained — no dependency on tokens.css. */
+
+.hub-action-btn {
+    background: var(--hub-bg);
+    border: 1px solid rgba(var(--hub-accent-rgb), 0.3);
+    border-radius: var(--hub-radius);
+    color: var(--hub-text);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 14px;
+    cursor: pointer;
+    box-sizing: border-box;
+    transition: background 0.2s ease, border-color 0.2s ease;
+    white-space: nowrap;
+}
+
+.hub-action-btn:hover {
+    background: rgba(var(--hub-accent-rgb), 0.08);
+    border-color: rgba(var(--hub-accent-rgb), 0.5);
+}
+
+.hub-action-btn:disabled,
+.hub-action-btn[disabled] {
+    opacity: 0.35;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+/* Primary variant — main trigger action, more visually prominent */
+.hub-action-btn.hub-primary {
+    background: rgba(var(--hub-accent-rgb), 0.12);
+    border-color: rgba(var(--hub-accent-rgb), 0.55);
+    color: var(--hub-accent);
+}
+
+.hub-action-btn.hub-primary:hover {
+    background: rgba(var(--hub-accent-rgb), 0.22);
+    border-color: rgba(var(--hub-accent-rgb), 0.8);
 }

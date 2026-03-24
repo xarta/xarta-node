@@ -138,6 +138,52 @@
         </label>
       </div>
 
+      <!-- Proxmox Config — search filter.
+           Moved from .toolbar inside #tab-proxmox-config.
+           Event handlers wired in proxmox-config.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-proxmox-config"
+           data-for-tab="proxmox-config" hidden>
+        <input class="hub-ctrl" type="text" id="pve-search"
+               placeholder="Filter configs…" />
+      </div>
+
+      <!-- Dockge Stacks — search filter + hide-obsolete toggle.
+           Moved from .toolbar inside #tab-dockge-stacks.
+           Event handlers wired in dockge.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-dockge-stacks"
+           data-for-tab="dockge-stacks" hidden>
+        <input class="hub-ctrl" type="text" id="dockge-search"
+               placeholder="Filter stacks…" />
+        <label class="hub-ctrl-toggle-label">
+          <input type="checkbox" id="dockge-hide-obsolete" checked />
+          <span class="bm-toggle-track"></span>
+          Hide obsolete
+        </label>
+      </div>
+
+      <!-- Caddy Configs — search filter.
+           Moved from .toolbar inside #tab-caddy-configs.
+           Event handlers wired in caddy.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-caddy-configs"
+           data-for-tab="caddy-configs" hidden>
+        <input class="hub-ctrl" type="text" id="caddy-search"
+               placeholder="Filter configs…" />
+      </div>
+
+      <!-- Visit History — search filter + saved filter select.
+           Moved from .toolbar inside #tab-bookmarks-history.
+           Event handlers wired in bookmarks.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-bookmarks-history"
+           data-for-tab="bookmarks-history" hidden>
+        <input class="hub-ctrl" type="text" id="bm-visit-search"
+               placeholder="Filter visits…" />
+        <select class="hub-ctrl" id="bm-visit-saved-filter">
+          <option value="all">All</option>
+          <option value="unsaved">Unsaved only</option>
+          <option value="saved">Saved only</option>
+        </select>
+      </div>
+
     </div><!-- /#page-controls-slot -->
 
 
@@ -472,18 +518,15 @@
 
   <!-- Proxmox Config -->
   <section id="tab-proxmox-config" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="pve-search" placeholder="Filter configs…" oninput="renderProxmoxConfig()" />
-    </div>
-    <div id="pve-steps-panel" style="display:none;flex-wrap:wrap;gap:4px;padding:4px 0 6px;border-bottom:1px solid var(--border,#30363d);margin-bottom:2px">
-      <button id="pve-probe-btn" onclick="probeProxmoxConfig()">&#9654; Probe PVE</button>
-      <button class="secondary" id="pve-enrich-btn" onclick="enrichNetsFromPfsense()">&#8657; Fill IPs from pfSense</button>
-      <button class="secondary" id="pve-enrich-arp-btn" onclick="enrichFromPfsenseArp()">&#8657; Fill IPs from pfSense ARP</button>
-      <button class="secondary" id="pve-findips-btn" onclick="findIpsByArp()">&#128270; Find IPs by ARP</button>
-      <button class="secondary" id="pve-findips-pve-btn" onclick="findIpsViaPve()">&#128270; Find IPs via PVE</button>
-      <button class="secondary" id="pve-findips-qemu-btn" onclick="findIpsViaQemuAgent()">&#128279; Find IPs via QEMU Agent</button>
-      <button class="secondary" id="pve-findips-pfsense-sweep-btn" onclick="findIpsViaPfsenseSweep()">&#128270; Find IPs via pfSense sweep</button>
-      <button class="secondary" id="pve-probe-services-btn" onclick="probeVmServices()">&#128065; Probe VM Services</button>
+    <div id="pve-steps-panel" style="display:none;flex-wrap:wrap;gap:4px;padding:4px 0 6px;border-bottom:1px solid rgba(0,212,255,0.15);margin-bottom:2px">
+      <button class="hub-action-btn hub-primary" id="pve-probe-btn">&#9654; Probe PVE</button>
+      <button class="hub-action-btn" id="pve-enrich-btn">&#8657; Fill IPs from pfSense</button>
+      <button class="hub-action-btn" id="pve-enrich-arp-btn">&#8657; Fill IPs from pfSense ARP</button>
+      <button class="hub-action-btn" id="pve-findips-btn">&#128270; Find IPs by ARP</button>
+      <button class="hub-action-btn" id="pve-findips-pve-btn">&#128270; Find IPs via PVE</button>
+      <button class="hub-action-btn" id="pve-findips-qemu-btn">&#128279; Find IPs via QEMU Agent</button>
+      <button class="hub-action-btn" id="pve-findips-pfsense-sweep-btn">&#128270; Find IPs via pfSense sweep</button>
+      <button class="hub-action-btn" id="pve-probe-services-btn">&#128065; Probe VM Services</button>
     </div>
     <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
@@ -500,12 +543,6 @@
 
   <!-- Dockge Stacks -->
   <section id="tab-dockge-stacks" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="dockge-search" placeholder="Filter stacks…" oninput="renderDockgeStacks()" />
-      <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text-dim)">
-        <input type="checkbox" id="dockge-hide-obsolete" checked onchange="renderDockgeStacks()"> Hide obsolete
-      </label>
-    </div>
     <p id="dockge-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
       <table>
@@ -520,9 +557,6 @@
 
   <!-- Caddy Configs -->
   <section id="tab-caddy-configs" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="caddy-search" placeholder="Filter configs…" oninput="renderCaddyConfigs()" />
-    </div>
     <p id="caddy-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="table-wrap">
       <table>
@@ -768,15 +802,9 @@
   <!-- Bookmarks — Visit History -->
   <section id="tab-bookmarks-history" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
-    <div class="toolbar" style="margin-bottom:8px">
-      <input type="text" id="bm-visit-search" placeholder="Filter visits&hellip;" oninput="renderVisits()" style="flex:1" />
-      <select id="bm-visit-saved-filter" onchange="renderVisits()" style="width:auto">
-        <option value="all">All</option>
-        <option value="unsaved">Unsaved only</option>
-        <option value="saved">Saved only</option>
-      </select>
-      <button id="vis-expand-all-btn" class="secondary" onclick="_visSetAllDomains(true)" hidden>&#9660; Expand all</button>
-      <button id="vis-collapse-all-btn" class="secondary" onclick="_visSetAllDomains(false)" hidden>&#9650; Collapse all</button>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <button id="vis-expand-all-btn" class="hub-action-btn" hidden>&#9660; Expand all</button>
+      <button id="vis-collapse-all-btn" class="hub-action-btn" hidden>&#9650; Collapse all</button>
     </div>
     <p id="vis-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <div class="table-wrap">

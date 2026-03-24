@@ -1713,6 +1713,23 @@ document.addEventListener('DOMContentLoaded', () => {
       _bmOpenScoreDetailModal(link.dataset.metric);
     }
   });
+
+  // Visit History controls (now in #pg-ctrl-bookmarks-history)
+  let _visFilterTimer = null;
+  const visSearch   = document.getElementById('bm-visit-search');
+  const visSaved    = document.getElementById('bm-visit-saved-filter');
+  const visExpand   = document.getElementById('vis-expand-all-btn');
+  const visCollapse = document.getElementById('vis-collapse-all-btn');
+  if (visSearch)   visSearch.addEventListener('input', () => {
+    clearTimeout(_visFilterTimer);
+    _visFilterTimer = setTimeout(renderVisits, 250);
+  });
+  if (visSaved)    visSaved.addEventListener('change', renderVisits);
+  if (visExpand)   visExpand.addEventListener('click', () => _visSetAllDomains(true));
+  if (visCollapse) visCollapse.addEventListener('click', () => _visSetAllDomains(false));
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('bookmarks-history', 'pg-ctrl-bookmarks-history');
+  }
 });
 
 // ── Sort explanation modal ───────────────────────────────────────────────
