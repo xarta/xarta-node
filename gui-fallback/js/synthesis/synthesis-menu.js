@@ -40,15 +40,27 @@ const SynthesisMenuConfig = createHubMenu({
 
         // ── Machines page function items ──────────────────────────────────
         { id: 'mch-fn-refresh', label: '↺ Refresh',      icon: '↺', fn: 'mch.refresh', activeOn: ['machines'], parent: 'synthesis-layout', order: 0 },
+
+        // ── Manual Links (table view) function items ──────────────────────
+        { id: 'ml-fn-add',      label: '➕ Add link',    icon: '➕', fn: 'ml.add',      activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 0 },
+        { id: 'ml-fn-refresh',  label: '↺ Refresh',      icon: '↺', fn: 'ml.refresh',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 1 },
+        { id: 'ml-fn-grp-none', label: '⊟ Group: None',  icon: '⊟', fn: 'ml.grpNone',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 2 },
+        { id: 'ml-fn-grp-grp',  label: '🗂 Group: Group', icon: '🗂', fn: 'ml.grpGroup', activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 3 },
+        { id: 'ml-fn-grp-host', label: '🖥 Group: Host',  icon: '🖥', fn: 'ml.grpHost',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 4 },
     ],
 });
 
 // ── Function registrations ───────────────────────────────────────────────────
-// synthesis-menu.js loads after services.js and machines.js so all referenced
-// globals are in scope.
+// synthesis-menu.js loads after services.js, machines.js, and manual-links.js
+// so all referenced globals are in scope.
 
 SynthesisMenuConfig.registerFunctions({
-    'svc.add':     () => openAddModal(),
-    'svc.refresh': () => loadServices(),
-    'mch.refresh': () => loadMachines(),
+    'svc.add':      () => openAddModal(),
+    'svc.refresh':  () => loadServices(),
+    'mch.refresh':  () => loadMachines(),
+    'ml.add':       () => openManualLinkModal(null),
+    'ml.refresh':   () => loadManualLinks(),
+    'ml.grpNone':   () => mlSetGroupBy('none'),
+    'ml.grpGroup':  () => mlSetGroupBy('group'),
+    'ml.grpHost':   () => mlSetGroupBy('host'),
 });

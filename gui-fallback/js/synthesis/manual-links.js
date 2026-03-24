@@ -1,11 +1,12 @@
 /* ── Manual Links ────────────────────────────────────────────────────────── */
 
 let _manualLinksView = 'rendered';   // 'table' | 'rendered' — default to rendered
-let _editingLinkId   = null;      // null = add mode, string = edit mode
+let _editingLinkId   = null;         // null = add mode, string = edit mode
 let _mlFilter    = '';               // table filter text
 let _mlSort      = { col: null, dir: 1 }; // active sort column + direction (1=asc, -1=desc)
 let _mlGroupBy   = 'none';          // 'none' | 'group' | 'host'
 let _mlCollapsed = new Set();       // collapsed group keys
+let _mlFilterTimer = null;          // debounce handle for ml-filter input
 
 /* ── View toggle ─────────────────────────────────────────────────────────── */
 
@@ -14,6 +15,8 @@ function manualLinksShowView(view) {
   document.getElementById('ml-table-view').style.display    = view === 'table'    ? '' : 'none';
   document.getElementById('ml-rendered-view').style.display = view === 'rendered' ? '' : 'none';
   if (typeof SynthesisMenuConfig !== 'undefined') SynthesisMenuConfig.updateActiveTab('manual-links-' + view);
+  // Show/hide the header filter input for the table sub-view
+  if (typeof ResponsiveLayout !== 'undefined') ResponsiveLayout.updateControlsForTab('manual-links-' + view);
   if (view === 'rendered') renderManualLinksRendered();
   if (view === 'table')    renderManualLinksTable();
 }
@@ -141,8 +144,6 @@ function renderManualLinksTable() {
 function mlSetGroupBy(by) {
   _mlGroupBy = by;
   _mlCollapsed.clear();
-  ['none','group','host'].forEach(k =>
-    document.getElementById(`ml-grp-${k}`)?.classList.toggle('active', k === by));
   renderManualLinksTable();
 }
 
@@ -380,3 +381,22 @@ async function deleteManualLink(linkId) {
 
 /* ── Helper: setEl (local fallback if not in utils.js) ──────────────────── */
 // No setEl in this codebase — direct DOM manipulation used instead (see above)
+
+/* ── Bootstrap ─────────────────────────────────────────────────────────────────────── */
+// Wire the header filter input and register the page-controls group
+// for the manual-links-table pseudo-tab (switchTab redirects to it via
+// manualLinksShowView, so ResponsiveLayout.updateControlsForTab is driven
+// from there rather than from the normal switchTab flow).
+
+document.addEventListener('DOMContentLoaded', () => {
+  const mlFilter = document.getElementById('ml-filter');
+  if (mlFilter) {
+    mlFilter.addEventListener('input', () => {
+      clearTimeout(_mlFilterTimer);
+      _mlFilterTimer = setTimeout(renderManualLinksTable, 250);
+    });
+  }
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('manual-links-table', 'pg-ctrl-manual-links-table');
+  }
+});

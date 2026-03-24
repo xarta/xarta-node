@@ -1,4 +1,18 @@
 /* ── Machines ─────────────────────────────────────────────────────────── */
+let _mchFilterTimer = null;  // debounce handle for machine-search
+
+document.addEventListener('DOMContentLoaded', () => {
+  const mchSearch = document.getElementById('machine-search');
+  if (mchSearch) {
+    mchSearch.addEventListener('input', () => {
+      clearTimeout(_mchFilterTimer);
+      _mchFilterTimer = setTimeout(renderMachines, 250);
+    });
+  }
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('machines', 'pg-ctrl-machines');
+  }
+});
 async function loadMachines() {
   const err = document.getElementById('machines-error');
   err.hidden = true;

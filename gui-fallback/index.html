@@ -184,6 +184,33 @@
         </select>
       </div>
 
+      <!-- Manual Links table — filter input.
+           Moved from .toolbar inside #ml-table-view.
+           Event handlers wired in manual-links.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-manual-links-table"
+           data-for-tab="manual-links-table" hidden>
+        <input class="hub-ctrl" type="text" id="ml-filter"
+               placeholder="Filter links…" />
+      </div>
+
+      <!-- Services — filter input.
+           Moved from .toolbar inside #tab-services.
+           Event handlers wired in services.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-services"
+           data-for-tab="services" hidden>
+        <input class="hub-ctrl" type="text" id="search-input"
+               placeholder="Filter services…" />
+      </div>
+
+      <!-- Machines — filter input.
+           Moved from .toolbar inside #tab-machines.
+           Event handlers wired in machines.js via addEventListener. -->
+      <div class="page-control-group" id="pg-ctrl-machines"
+           data-for-tab="machines" hidden>
+        <input class="hub-ctrl" type="text" id="machine-search"
+               placeholder="Filter machines…" />
+      </div>
+
     </div><!-- /#page-controls-slot -->
 
 
@@ -317,15 +344,6 @@
 
     <!-- TABLE VIEW -->
     <div id="ml-table-view" style="display:none">
-      <div class="toolbar" style="flex-wrap:wrap;gap:6px">
-        <button onclick="openManualLinkModal(null)">+ Add link</button>
-        <button class="secondary" onclick="loadManualLinks()">&#8635; Refresh</button>
-        <input type="text" id="ml-filter" placeholder="Filter&#8230;" oninput="renderManualLinksTable()" style="max-width:180px;flex:0 1 180px" />
-        <span style="font-size:12px;color:var(--text-dim);align-self:center;white-space:nowrap">Group by:</span>
-        <button id="ml-grp-none"  class="secondary active" onclick="mlSetGroupBy('none')"  style="padding:3px 8px;font-size:12px">None</button>
-        <button id="ml-grp-group" class="secondary"        onclick="mlSetGroupBy('group')" style="padding:3px 8px;font-size:12px">Group</button>
-        <button id="ml-grp-host"  class="secondary"        onclick="mlSetGroupBy('host')"  style="padding:3px 8px;font-size:12px">Host</button>
-      </div>
       <div class="table-wrap">
         <table>
           <thead><tr>
@@ -356,9 +374,6 @@
 
   <!-- Services -->
   <section id="tab-services" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="search-input" placeholder="Filter services…" oninput="renderServices()" />
-    </div>
     <div class="table-wrap">
       <table>
         <thead>
@@ -380,9 +395,6 @@
 
   <!-- Machines -->
   <section id="tab-machines" class="tab-panel">
-    <div class="toolbar">
-      <input type="text" id="machine-search" placeholder="Filter machines…" oninput="renderMachines()" />
-    </div>
     <div class="table-wrap">
       <table>
         <thead>
