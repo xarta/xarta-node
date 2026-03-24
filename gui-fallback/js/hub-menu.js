@@ -336,7 +336,7 @@ function createHubMenu(cfg) {
                     dropdown.innerHTML = `
                         <div class="hub-tab-split">
                             <button class="hub-tab hub-tab-label${isActive ? ' active' : ''}" data-tab="${item.id}">${labelText}</button>
-                            <button class="hub-tab-caret" aria-label="Toggle submenu">▼</button>
+                            <button class="hub-tab-caret" data-fc-key="nav.dropdown-open" aria-label="Toggle submenu">▼</button>
                         </div>
                         <div class="hub-dropdown-menu">
                             ${navHtml}${sepHtml}${fnHtml}

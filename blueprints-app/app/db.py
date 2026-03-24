@@ -440,6 +440,23 @@ CREATE TABLE IF NOT EXISTS nav_items (
     updated_at    TEXT DEFAULT (datetime('now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nav_items_group_key ON nav_items(menu_group, item_key);
+
+-- ── CMS-driven form controls (inputs, selects, toggles, buttons) ─────────────
+
+CREATE TABLE IF NOT EXISTS form_controls (
+    control_id    TEXT PRIMARY KEY,       -- UUID (auto-generated)
+    control_key   TEXT NOT NULL UNIQUE,   -- unique identifier e.g. 'bookmarks.filter.archived'
+    label         TEXT NOT NULL,          -- human-readable name e.g. 'Bookmarks: Archived Toggle'
+    control_type  TEXT,                   -- 'input', 'select', 'toggle', 'button', 'checkbox', 'range', 'textarea'
+    context       TEXT,                   -- informational: where this control appears
+    icon_asset      TEXT,                   -- relative path under assets/ e.g. 'icons/search.svg'
+    sound_asset     TEXT,                   -- relative path under assets/ e.g. 'sounds/click.wav' (on/default)
+    sound_asset_off TEXT,                   -- sound played when a toggle/checkbox is turned OFF
+    notes           TEXT,                   -- free-text human notes
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_form_controls_key ON form_controls(control_key);
 """
 
 _SEED_SQL = """
@@ -523,6 +540,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("sync_queue",   "guid",                "TEXT DEFAULT ''"),
         # visits: count of times a URL has been visited (2026-03-21)
         ("visits",       "visit_count",          "INTEGER NOT NULL DEFAULT 1"),
+        # form_controls: separate off-state sound for toggles/checkboxes (2026-03-24)
+        ("form_controls", "sound_asset_off",       "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
