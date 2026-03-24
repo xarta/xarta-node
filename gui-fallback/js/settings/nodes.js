@@ -1,4 +1,18 @@
 /* ── Nodes ────────────────────────────────────────────────────────────── */
+
+document.addEventListener('DOMContentLoaded', () => {
+  const retouchBtn = document.getElementById('retouch-btn');
+  if (retouchBtn) {
+    retouchBtn.addEventListener('click', function() { retouchTable(this); });
+  }
+  if (typeof HubSelect !== 'undefined') {
+    HubSelect.init('retouch-table-select');
+  }
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('nodes', 'pg-ctrl-nodes');
+  }
+});
+
 async function retouchTable(btn) {
   const sel = document.getElementById('retouch-table-select');
   const status = document.getElementById('retouch-status');
