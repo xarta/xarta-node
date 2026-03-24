@@ -316,7 +316,7 @@
 
 .drag-handle { color: #555; font-size: 1.2em; user-select: none; }
 .menu-item-icon { font-size: 1.1em; }
-.menu-item-label { flex: 1; color: var(--hub-text); font-weight: 500; }
+.menu-item-label { flex: 1; min-width: 0; color: var(--hub-text); font-weight: 500; }
 
 .has-children-badge {
     background: rgba(var(--hub-accent-rgb), 0.2);
@@ -511,6 +511,89 @@
     .hub-tabs-pinned .hub-tab-split {
         height: 40px;
         box-sizing: border-box;
+    }
+}
+
+/* ── 5. Mobile layout-editor overrides ──────────────────────── */
+
+/* Strip the visual "intermediate container" on narrow viewports and tighten
+   padding throughout so editor items use the full available page width.
+   These rules touch ONLY .menu-editor-* classes — not the nav/hamburger. */
+@media (max-width: 768px) {
+    /* Remove the surrounding box — no background, radius, or padding.
+       The page main already provides 10px side margins at this breakpoint. */
+    .menu-editor-container {
+        background: none;
+        border-radius: 0;
+        padding: 0;
+    }
+
+    .menu-editor-header {
+        margin-bottom: 12px;
+    }
+
+    .menu-editor-instructions {
+        padding: 8px 10px;
+        margin-bottom: 12px;
+    }
+
+    /* Tighten each item row */
+    .menu-item-header {
+        padding: 8px;
+        gap: 6px;
+    }
+
+    /* Allow label to shrink so it never pushes badges off-screen */
+    .menu-item-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* Right-side indicators: allow shrink + truncate */
+    .menu-item-page-label {
+        flex-shrink: 1;
+        min-width: 0;
+        max-width: 100px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.8em;
+    }
+
+    .menu-fn-badge {
+        flex-shrink: 1;
+        min-width: 0;
+        max-width: 90px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 9px;
+        padding: 1px 4px;
+    }
+
+    .menu-fn-context-badge {
+        flex-shrink: 1;
+        min-width: 0;
+        max-width: 70px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-size: 8px;
+        padding: 1px 4px;
+    }
+
+    /* Reduce children section left indent (35px → 16px) */
+    .menu-editor-children {
+        padding: 0 6px 8px 16px;
+    }
+
+    .menu-editor-child .menu-item-header {
+        padding: 6px 8px;
+    }
+
+    .drop-zone-child {
+        padding: 8px;
+        min-height: 32px;
     }
 }
 
