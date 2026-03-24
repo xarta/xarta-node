@@ -49,6 +49,7 @@ function switchTab(tab) {
   const panel = document.getElementById(`tab-${tab}`);
   if (panel) panel.classList.add('active');
   // Lazy-load data on first view
+  if (tab === 'services'       && !_services.length)      loadServices();
   if (tab === 'machines'       && !_machines.length)      loadMachines();
   if (tab === 'nodes'          && !_nodes.length)         loadNodes();
   if (tab === 'pfsense-dns'    && !_pfsenseDns.length)    loadPfSenseDns();

@@ -1,4 +1,18 @@
 /* ── Services ─────────────────────────────────────────────────────────── */
+let _svcFilterTimer = null;  // debounce handle for search-input
+
+document.addEventListener('DOMContentLoaded', () => {
+  const svcSearch = document.getElementById('search-input');
+  if (svcSearch) {
+    svcSearch.addEventListener('input', () => {
+      clearTimeout(_svcFilterTimer);
+      _svcFilterTimer = setTimeout(renderServices, 250);
+    });
+  }
+  if (typeof ResponsiveLayout !== 'undefined') {
+    ResponsiveLayout.registerTabControls('services', 'pg-ctrl-services');
+  }
+});
 async function loadServices() {
   const err = document.getElementById('services-error');
   err.hidden = true;
