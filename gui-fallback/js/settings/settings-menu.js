@@ -32,63 +32,64 @@ const SettingsMenuConfig = createHubMenu({
     mobilePinnedId:  'settings-layout',
     pinnedTabsId:    'settingsHubTabsPinned',
     defaultMenu: [
-        { id: 'pve-hosts',       label: '🗄 PVE Hosts',       icon: '🗄', pageLabel: 'PVE Hosts',       parent: null,        order: 0 },
-        { id: 'nodes',           label: '🤝 Nodes',           icon: '🤝', pageLabel: 'Fleet Nodes',     parent: 'pve-hosts', order: 0 },
-        { id: 'settings',        label: '🔧 App Config',      icon: '🔧', pageLabel: 'App Config',      parent: null,        order: 1 },
-        { id: 'arp-manual',      label: '🗺 Manual ARP',      icon: '🗺', pageLabel: 'Manual ARP',      parent: 'settings',  order: 0 },
-        { id: 'ai-providers',    label: '🤖 AI Providers',    icon: '🤖', pageLabel: 'AI Providers',    parent: 'settings',  order: 1 },
-        { id: 'nav-items',       label: '🧭 Nav Items',       icon: '🧭', pageLabel: 'Nav Items',       parent: 'settings',  order: 2 },
-        { id: 'form-controls',   label: '🎮 Form Controls',   icon: '🎮', pageLabel: 'Form Controls',   parent: 'settings',  order: 3 },
-        { id: 'keys',            label: '🗝 Keys',            icon: '🗝', pageLabel: 'SSH Keys',        parent: null,        order: 2 },
-        { id: 'certs',           label: '🔒 Certs',           icon: '🔒', pageLabel: 'Certificates',    parent: 'keys',      order: 0 },
-        { id: 'docs',            label: '📄 Docs',            icon: '📄', pageLabel: 'Docs',            parent: null,        order: 3 },
-        { id: 'docs-list',       label: '📋 Doc List',        icon: '📋', pageLabel: 'Doc List',        parent: 'docs',      order: 0 },
-        { id: 'docs-images',     label: '🖼️ Images',          icon: '🖼️', pageLabel: 'Doc Images',      parent: 'docs',      order: 1 },
-        { id: 'self-diag',       label: '🩺 Self Diagnostic', icon: '🩺', pageLabel: 'Self Diagnostic', parent: 'docs',      order: 2 },
-        { id: 'settings-layout', label: '☰',                  icon: '☰',  pageLabel: 'Navbar Layout',   parent: null,        order: 4 },
+        { id: 'pve-hosts',       label: 'PVE Hosts',      icon: 'icons/ui/proxmox-blue.svg', pageLabel: 'PVE Hosts',       parent: null,        order: 0 },
+        { id: 'nodes',           label: 'Nodes',          icon: HIEROGLYPHS.crookFlail, pageLabel: 'Fleet Nodes',     parent: 'pve-hosts', order: 0 },
+        { id: 'settings',        label: 'App Config',     icon: HIEROGLYPHS.djedPillar, pageLabel: 'App Config',      parent: null,        order: 1 },
+        { id: 'arp-manual',      label: 'Manual ARP',     icon: HIEROGLYPHS.obelisk,    pageLabel: 'Manual ARP',      parent: 'settings',  order: 0 },
+        { id: 'ai-providers',    label: 'AI Providers',   icon: HIEROGLYPHS.falcon,     pageLabel: 'AI Providers',    parent: 'settings',  order: 1 },
+        { id: 'nav-items',       label: 'Nav Items',      icon: HIEROGLYPHS.naosShrine, pageLabel: 'Nav Items',       parent: 'settings',  order: 2 },
+        { id: 'form-controls',   label: 'Form Controls',  icon: HIEROGLYPHS.adze,       pageLabel: 'Form Controls',   parent: 'settings',  order: 3 },
+        { id: 'keys',            label: 'Keys',           icon: HIEROGLYPHS.ankh,       pageLabel: 'SSH Keys',        parent: null,        order: 2 },
+        { id: 'certs',           label: 'Certs',          icon: HIEROGLYPHS.shen,       pageLabel: 'Certificates',    parent: 'keys',      order: 0 },
+        { id: 'docs',            label: 'Docs',           icon: HIEROGLYPHS.papyrus,    pageLabel: 'Docs',            parent: null,        order: 3 },
+        { id: 'docs-list',       label: 'Doc List',       icon: HIEROGLYPHS.papyrus,    pageLabel: 'Doc List',        parent: 'docs',      order: 0 },
+        { id: 'docs-images',     label: 'Images',         icon: HIEROGLYPHS.lotus,      pageLabel: 'Doc Images',      parent: 'docs',      order: 1 },
+        { id: 'self-diag',       label: 'Self Diagnostic',icon: HIEROGLYPHS.eyeOfHorus, pageLabel: 'Self Diagnostic', parent: 'docs',      order: 2 },
+        { id: 'settings-layout', label: '☰',              icon: HIEROGLYPHS.kheper,     pageLabel: 'Navbar Layout',   parent: null,        order: 4 },
 
         // ── PVE Hosts page function items ─────────────────────────────────
-        { id: 'pveh-fn-refresh', label: '↺ Refresh',          icon: '↺', fn: 'pveh.refresh', activeOn: ['pve-hosts'],    parent: 'settings-layout', order: 0 },
-        { id: 'pveh-fn-scan',    label: '▶ Scan for Proxmox', icon: '▶', fn: 'pveh.scan',    activeOn: ['pve-hosts'],    parent: 'settings-layout', order: 1 },
+        { id: 'pveh-fn-refresh', label: 'Refresh',          icon: HIEROGLYPHS.nefer,      fn: 'pveh.refresh', activeOn: ['pve-hosts'],    parent: 'settings-layout', order: 0 },
+        { id: 'pveh-fn-scan',    label: 'Scan for Proxmox', icon: HIEROGLYPHS.wasScepter, fn: 'pveh.scan',    activeOn: ['pve-hosts'],    parent: 'settings-layout', order: 1 },
 
         // ── Fleet Nodes page function items ───────────────────────────────
-        { id: 'nod-fn-refresh',  label: '↺ Refresh',          icon: '↺', fn: 'nod.refresh',  activeOn: ['nodes'],        parent: 'settings-layout', order: 0 },
-        { id: 'nod-fn-update',   label: '▲ Fleet Update',     icon: '▲', fn: 'nod.update',   activeOn: ['nodes'],        parent: 'settings-layout', order: 1 },
+        { id: 'nod-fn-refresh',  label: 'Refresh',          icon: HIEROGLYPHS.nefer,      fn: 'nod.refresh',  activeOn: ['nodes'],        parent: 'settings-layout', order: 0 },
+        { id: 'nod-fn-update',   label: 'Fleet Update',     icon: HIEROGLYPHS.crookFlail, fn: 'nod.update',   activeOn: ['nodes'],        parent: 'settings-layout', order: 1 },
 
         // ── App Config page function items ────────────────────────────────
-        { id: 'cfg-fn-add',      label: '➕ Add setting',      icon: '➕', fn: 'cfg.add',      activeOn: ['settings'],     parent: 'settings-layout', order: 0 },
-        { id: 'cfg-fn-refresh',  label: '↺ Refresh',          icon: '↺', fn: 'cfg.refresh',  activeOn: ['settings'],     parent: 'settings-layout', order: 1 },
-        { id: 'cfg-fn-cache',    label: '↺ Refresh cache',    icon: '↺', fn: 'cfg.cache',    activeOn: ['settings'],     parent: 'settings-layout', order: 2 },
+        { id: 'cfg-fn-add',      label: 'Add setting',      icon: HIEROGLYPHS.djedPillar, fn: 'cfg.add',      activeOn: ['settings'],     parent: 'settings-layout', order: 0 },
+        { id: 'cfg-fn-refresh',  label: 'Refresh',          icon: HIEROGLYPHS.nefer,      fn: 'cfg.refresh',  activeOn: ['settings'],     parent: 'settings-layout', order: 1 },
+        { id: 'cfg-fn-cache',    label: 'Refresh cache',    icon: HIEROGLYPHS.nefer,      fn: 'cfg.cache',    activeOn: ['settings'],     parent: 'settings-layout', order: 2 },
 
         // ── Manual ARP page function items ────────────────────────────────
-        { id: 'arp-fn-add',      label: '➕ Add entry',        icon: '➕', fn: 'arp.add',      activeOn: ['arp-manual'],   parent: 'settings-layout', order: 0 },
-        { id: 'arp-fn-refresh',  label: '↺ Refresh',          icon: '↺', fn: 'arp.refresh',  activeOn: ['arp-manual'],   parent: 'settings-layout', order: 1 },
+        { id: 'arp-fn-add',      label: 'Add entry',        icon: HIEROGLYPHS.obelisk,    fn: 'arp.add',      activeOn: ['arp-manual'],   parent: 'settings-layout', order: 0 },
+        { id: 'arp-fn-refresh',  label: 'Refresh',          icon: HIEROGLYPHS.nefer,      fn: 'arp.refresh',  activeOn: ['arp-manual'],   parent: 'settings-layout', order: 1 },
 
         // ── AI Providers page function items ──────────────────────────────
-        { id: 'ai-fn-addprov',   label: '➕ Add provider',     icon: '➕', fn: 'ai.addProv',   activeOn: ['ai-providers'], parent: 'settings-layout', order: 0 },
-        { id: 'ai-fn-refresh',   label: '↺ Refresh',          icon: '↺', fn: 'ai.refresh',   activeOn: ['ai-providers'], parent: 'settings-layout', order: 1 },
-        { id: 'ai-fn-addassign', label: '➕ Add assignment',   icon: '➕', fn: 'ai.addAssign', activeOn: ['ai-providers'], parent: 'settings-layout', order: 2 },
+        { id: 'ai-fn-addprov',   label: 'Add provider',     icon: HIEROGLYPHS.falcon,     fn: 'ai.addProv',   activeOn: ['ai-providers'], parent: 'settings-layout', order: 0 },
+        { id: 'ai-fn-refresh',   label: 'Refresh',          icon: HIEROGLYPHS.nefer,      fn: 'ai.refresh',   activeOn: ['ai-providers'], parent: 'settings-layout', order: 1 },
+        { id: 'ai-fn-addassign', label: 'Add assignment',   icon: HIEROGLYPHS.falcon,     fn: 'ai.addAssign', activeOn: ['ai-providers'], parent: 'settings-layout', order: 2 },
 
         // ── Docs page function items ───────────────────────────────────────
-        { id: 'doc-fn-reload',   label: '↺ Reload',           icon: '↺', fn: 'doc.reload',   activeOn: ['docs'],         parent: 'settings-layout', order: 0 },
-        { id: 'doc-fn-new',      label: '➕ New Doc',          icon: '➕', fn: 'doc.new',      activeOn: ['docs'],         parent: 'settings-layout', order: 1 },
-        { id: 'doc-fn-add',      label: '📂 Add Existing',    icon: '📂', fn: 'doc.add',      activeOn: ['docs'],         parent: 'settings-layout', order: 2 },
-        { id: 'doc-fn-preview',  label: '👁 Edit / Preview',  icon: '👁', fn: 'doc.preview',  activeOn: ['docs'],         parent: 'settings-layout', order: 3 },
-        { id: 'doc-fn-save',     label: '💾 Save',            icon: '💾', fn: 'doc.save',     activeOn: ['docs'],         parent: 'settings-layout', order: 4 },
-        { id: 'doc-fn-meta',     label: '✎ Meta',             icon: '✎', fn: 'doc.meta',     activeOn: ['docs'],         parent: 'settings-layout', order: 5 },
-        { id: 'doc-fn-delete',   label: '🗑 Delete',          icon: '🗑', fn: 'doc.delete',   activeOn: ['docs'],         parent: 'settings-layout', order: 6 },
+        { id: 'doc-fn-reload',   label: 'Reload',           icon: HIEROGLYPHS.nefer,      fn: 'doc.reload',   activeOn: ['docs'],         parent: 'settings-layout', order: 0 },
+        { id: 'doc-fn-new',      label: 'New Doc',          icon: HIEROGLYPHS.papyrus,    fn: 'doc.new',      activeOn: ['docs'],         parent: 'settings-layout', order: 1 },
+        { id: 'doc-fn-add',      label: 'Add Existing',     icon: 'icons/ui/group-folder-blue.svg', fn: 'doc.add', activeOn: ['docs'], parent: 'settings-layout', order: 2 },
+        { id: 'doc-fn-preview',  label: 'Edit / Preview',   icon: HIEROGLYPHS.khaHorizon, fn: 'doc.preview',  activeOn: ['docs'],         parent: 'settings-layout', order: 3 },
+        { id: 'doc-fn-save',     label: 'Save',             icon: HIEROGLYPHS.tjet,       fn: 'doc.save',     activeOn: ['docs'],         parent: 'settings-layout', order: 4 },
+        { id: 'doc-fn-meta',     label: 'Meta',             icon: HIEROGLYPHS.papyrus,    fn: 'doc.meta',     activeOn: ['docs'],         parent: 'settings-layout', order: 5 },
+        { id: 'doc-fn-delete',   label: 'Delete',           icon: 'icons/ui/trash-blue.svg', fn: 'doc.delete', activeOn: ['docs'], parent: 'settings-layout', order: 6 },
 
         // ── Doc List page function items ───────────────────────────────────
-        { id: 'dlist-fn-addgrp', label: '➕ Add Group',        icon: '➕', fn: 'dlist.addGrp', activeOn: ['docs-list'],    parent: 'settings-layout', order: 0 },
+        { id: 'dlist-fn-addgrp', label: 'Add Group',        icon: HIEROGLYPHS.papyrus,    fn: 'dlist.addGrp', activeOn: ['docs-list'],    parent: 'settings-layout', order: 0 },
 
         // ── Self Diagnostic page function items ────────────────────────────
-        { id: 'diag-fn-run',     label: '▶ Run Diagnostics',  icon: '▶', fn: 'diag.run',     activeOn: ['self-diag'],    parent: 'settings-layout', order: 0 },
+        { id: 'diag-fn-run',     label: 'Run Diagnostics',  icon: HIEROGLYPHS.wasScepter, fn: 'diag.run',     activeOn: ['self-diag'],    parent: 'settings-layout', order: 0 },
 
         // ── Nav Items page function items ──────────────────────────────────
-        { id: 'ni-fn-refresh',   label: '↺ Refresh',           icon: '↺', fn: 'ni.refresh',   activeOn: ['nav-items'],    parent: 'settings-layout', order: 0 },
+        { id: 'ni-fn-refresh',   label: 'Refresh',           icon: HIEROGLYPHS.nefer,     fn: 'ni.refresh',   activeOn: ['nav-items'],    parent: 'settings-layout', order: 0 },
         // ── Form Controls page function items ────────────────────────────────
-        { id: 'fc-fn-refresh',   label: '↺ Refresh',           icon: '↺', fn: 'fc.refresh',   activeOn: ['form-controls'], parent: 'settings-layout', order: 0 },
-        { id: 'fc-fn-add',       label: '➕ Add Key',          icon: '➕', fn: 'fc.add',       activeOn: ['form-controls'], parent: 'settings-layout', order: 1 },    ],
+        { id: 'fc-fn-refresh',   label: 'Refresh',           icon: HIEROGLYPHS.nefer,               fn: 'fc.refresh', activeOn: ['form-controls'], parent: 'settings-layout', order: 0 },
+        { id: 'fc-fn-add',       label: 'Add Key',           icon: 'icons/ui/plus-blue.svg',        fn: 'fc.add',     activeOn: ['form-controls'], parent: 'settings-layout', order: 1 },
+    ],
 });
 
 // ── Function registrations ───────────────────────────────────────────────────
