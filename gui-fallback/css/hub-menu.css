@@ -734,9 +734,9 @@
 */
 .menu-icon {
     display: inline-block;
-    width: 1.35em;
-    height: 1.35em;
-    vertical-align: -0.3em;
+    width: 22px;
+    height: 22px;
+    vertical-align: -6px;
     flex-shrink: 0;
     /* Shape from mask; colour from parent's currentColor */
     background-color: currentColor;
