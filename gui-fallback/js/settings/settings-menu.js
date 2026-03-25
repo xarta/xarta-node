@@ -72,10 +72,11 @@ const SettingsMenuConfig = createHubMenu({
         // ── Docs page function items ───────────────────────────────────────
         { id: 'doc-fn-reload',   label: '↺ Reload',           icon: '↺', fn: 'doc.reload',   activeOn: ['docs'],         parent: 'settings-layout', order: 0 },
         { id: 'doc-fn-new',      label: '➕ New Doc',          icon: '➕', fn: 'doc.new',      activeOn: ['docs'],         parent: 'settings-layout', order: 1 },
-        { id: 'doc-fn-preview',  label: '👁 Edit / Preview',  icon: '👁', fn: 'doc.preview',  activeOn: ['docs'],         parent: 'settings-layout', order: 2 },
-        { id: 'doc-fn-save',     label: '💾 Save',            icon: '💾', fn: 'doc.save',     activeOn: ['docs'],         parent: 'settings-layout', order: 3 },
-        { id: 'doc-fn-meta',     label: '✎ Meta',             icon: '✎', fn: 'doc.meta',     activeOn: ['docs'],         parent: 'settings-layout', order: 4 },
-        { id: 'doc-fn-delete',   label: '🗑 Delete',          icon: '🗑', fn: 'doc.delete',   activeOn: ['docs'],         parent: 'settings-layout', order: 5 },
+        { id: 'doc-fn-add',      label: '📂 Add Existing',    icon: '📂', fn: 'doc.add',      activeOn: ['docs'],         parent: 'settings-layout', order: 2 },
+        { id: 'doc-fn-preview',  label: '👁 Edit / Preview',  icon: '👁', fn: 'doc.preview',  activeOn: ['docs'],         parent: 'settings-layout', order: 3 },
+        { id: 'doc-fn-save',     label: '💾 Save',            icon: '💾', fn: 'doc.save',     activeOn: ['docs'],         parent: 'settings-layout', order: 4 },
+        { id: 'doc-fn-meta',     label: '✎ Meta',             icon: '✎', fn: 'doc.meta',     activeOn: ['docs'],         parent: 'settings-layout', order: 5 },
+        { id: 'doc-fn-delete',   label: '🗑 Delete',          icon: '🗑', fn: 'doc.delete',   activeOn: ['docs'],         parent: 'settings-layout', order: 6 },
 
         // ── Doc List page function items ───────────────────────────────────
         { id: 'dlist-fn-addgrp', label: '➕ Add Group',        icon: '➕', fn: 'dlist.addGrp', activeOn: ['docs-list'],    parent: 'settings-layout', order: 0 },
@@ -140,6 +141,7 @@ SettingsMenuConfig.registerFunctions({
     // Docs
     'doc.reload':   () => docsRefreshContent(),
     'doc.new':      () => openNewDocModal(),
+    'doc.add':      () => openAddDocModal(),
     'doc.preview':  () => docsTogglePreview(),
     'doc.save':     () => docsSave(),
     'doc.meta':     () => openEditDocModal(),

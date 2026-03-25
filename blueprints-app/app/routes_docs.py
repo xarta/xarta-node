@@ -66,6 +66,27 @@ async def list_docs() -> list[DocOut]:
     return [_row_to_out(r) for r in rows]
 
 
+# ── List unregistered files ───────────────────────────────────────────────────
+
+@router.get("/unregistered", response_model=list[str])
+async def list_unregistered_docs() -> list[str]:
+    """Return relative paths of .md files inside REPO_INNER_PATH not yet in the docs table."""
+    root = _inner_root()
+    with get_conn() as conn:
+        rows = conn.execute("SELECT path FROM docs").fetchall()
+    registered = {row["path"] for row in rows}
+    unregistered: list[str] = []
+    for p in sorted(root.rglob("*.md")):
+        parts = p.relative_to(root).parts
+        # Skip anything inside hidden directories (e.g. .git)
+        if any(part.startswith(".") for part in parts[:-1]):
+            continue
+        rel = "/".join(parts)
+        if rel not in registered:
+            unregistered.append(rel)
+    return unregistered
+
+
 # ── Get with content ──────────────────────────────────────────────────────────
 
 @router.get("/{doc_id}", response_model=DocWithContent)

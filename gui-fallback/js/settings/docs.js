@@ -326,8 +326,8 @@ async function _docsResolvePrevImgs(preview) {
 
 // ── New Doc modal ─────────────────────────────────────────────────────────────
 
-function _docsPopulateGroupSelect(currentGroupId) {
-  const sel = document.getElementById('docs-modal-group');
+function _docsPopulateGroupSelect(currentGroupId, selectId = 'docs-modal-group') {
+  const sel = document.getElementById(selectId);
   if (!sel) return;
   sel.innerHTML = '<option value="">— Undefined Group —</option>';
   _docsGroups.forEach(g => {
@@ -950,6 +950,13 @@ function _inlineMd(s) {
         return `<a href="#" onclick="docsOpenByPath('${safeHref}'); return false;" style="color:var(--accent);text-decoration:underline;text-decoration-style:dashed" title="Open: ${href}">${text}</a>`;
       }
       return `<a href="${href}" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    })
+    // Auto-link bare https:// URLs not already inside an HTML attribute value
+    .replace(/(?<![="'])https?:\/\/[^\s<>")\]]+/g, url => {
+      const m = url.match(/^(.+?)([.,;:!?)]+)$/);
+      const href  = m ? m[1] : url;
+      const trail = m ? m[2] : '';
+      return `<a href="${href}" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">${href}</a>${trail}`;
     });
 }
 
@@ -978,7 +985,116 @@ function docsOpenByPath(href) {
   }
 }
 
+// ── Add existing document modal ─────────────────────────────────────────────
+
+let _addDocAllFiles  = []; // all unregistered paths from API
+let _addDocFiltered  = []; // currently filtered subset
+
+async function openAddDocModal() {
+  // Reset form fields
+  document.getElementById('add-doc-filter').value      = '';
+  document.getElementById('add-doc-modal-label').value = '';
+  document.getElementById('add-doc-modal-desc').value  = '';
+  document.getElementById('add-doc-modal-tags').value  = 'menu';
+  document.getElementById('add-doc-modal-order').value = String(_docsAll.length * 10);
+  document.getElementById('add-doc-modal-error').textContent = '';
+  _docsPopulateGroupSelect(null, 'add-doc-modal-group');
+
+  const fileList  = document.getElementById('add-doc-file-list');
+  const countEl   = document.getElementById('add-doc-file-count');
+  fileList.innerHTML = '<option disabled value="">Loading…</option>';
+  countEl.textContent = '';
+  _addDocAllFiles = [];
+  _addDocFiltered = [];
+
+  HubModal.open(document.getElementById('add-doc-modal'));
+
+  try {
+    const r = await apiFetch('/api/v1/docs/unregistered');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    _addDocAllFiles = await r.json();
+  } catch (e) {
+    fileList.innerHTML = '<option disabled value="">Failed to load files</option>';
+    document.getElementById('add-doc-modal-error').textContent = `Error loading files: ${e.message}`;
+    return;
+  }
+
+  _addDocApplyFilter();
+  setTimeout(() => document.getElementById('add-doc-filter').focus(), 50);
+}
+
+function _addDocApplyFilter() {
+  const term = (document.getElementById('add-doc-filter').value || '').toLowerCase();
+  _addDocFiltered = _addDocAllFiles.filter(p => !term || p.toLowerCase().includes(term));
+
+  const sel  = document.getElementById('add-doc-file-list');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  _addDocFiltered.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    sel.appendChild(opt);
+  });
+  if (prev && _addDocFiltered.includes(prev)) sel.value = prev;
+
+  const shown = _addDocFiltered.length;
+  const total = _addDocAllFiles.length;
+  const countEl = document.getElementById('add-doc-file-count');
+  if (total === 0) {
+    countEl.textContent = 'No unregistered .md files found.';
+  } else if (shown === total) {
+    countEl.textContent = `${total} unregistered file${total === 1 ? '' : 's'}`;
+  } else {
+    countEl.textContent = `${shown} of ${total} files`;
+  }
+}
+
+function _addDocAutoFillLabel(path) {
+  if (!path) return;
+  const labelEl = document.getElementById('add-doc-modal-label');
+  const basename = path.split('/').pop().replace(/\.[^.]+$/, '');
+  labelEl.value = basename.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+async function _addDocSubmit() {
+  const fileList = document.getElementById('add-doc-file-list');
+  const path     = fileList.value;
+  const label    = document.getElementById('add-doc-modal-label').value.trim();
+  const desc     = document.getElementById('add-doc-modal-desc').value.trim();
+  const tags     = document.getElementById('add-doc-modal-tags').value.trim();
+  const order    = parseInt(document.getElementById('add-doc-modal-order').value, 10) || 0;
+  const groupId  = document.getElementById('add-doc-modal-group')?.value || '';
+  const errEl    = document.getElementById('add-doc-modal-error');
+
+  if (!path)  { errEl.textContent = 'Please select a file from the list.'; return; }
+  if (!label) { errEl.textContent = 'Label is required.'; return; }
+
+  const submit = document.getElementById('add-doc-modal-submit');
+  submit.disabled = true;
+  errEl.textContent = '';
+  try {
+    // Do NOT send initial_content — we're registering an existing file, not creating one.
+    const body = { label, description: desc || null, tags: tags || null, path, sort_order: order, group_id: groupId || null };
+    const r = await apiFetch('/api/v1/docs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
+    const created = await r.json();
+    HubModal.close(document.getElementById('add-doc-modal'));
+    await loadDocs();
+    docsSelectDoc(created.doc_id);
+  } catch (e) {
+    errEl.textContent = `Error: ${e.message}`;
+  } finally {
+    submit.disabled = false;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  // New / Edit doc modal submit
   const docsSubmitBtn = document.getElementById('docs-modal-submit');
   if (docsSubmitBtn) {
     docsSubmitBtn.addEventListener('click', () => {
@@ -986,4 +1102,14 @@ document.addEventListener('DOMContentLoaded', () => {
       else _docsModalSubmitEdit();
     });
   }
+
+  // Add existing doc modal wiring
+  const addDocFilter = document.getElementById('add-doc-filter');
+  if (addDocFilter) addDocFilter.addEventListener('input', _addDocApplyFilter);
+
+  const addDocList = document.getElementById('add-doc-file-list');
+  if (addDocList) addDocList.addEventListener('change', () => _addDocAutoFillLabel(addDocList.value));
+
+  const addDocSubmit = document.getElementById('add-doc-modal-submit');
+  if (addDocSubmit) addDocSubmit.addEventListener('click', _addDocSubmit);
 });
