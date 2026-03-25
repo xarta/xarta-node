@@ -141,13 +141,14 @@ async def list_assets(type: Literal["icons", "sounds"] = Query(...)):
     assets_dir = _assets_dir(type)
     allowed = _ICON_ALLOWED_EXTS if type == "icons" else _SOUND_ALLOWED_EXTS
     result = []
-    for f in sorted(assets_dir.iterdir()):
+    for f in sorted(assets_dir.rglob('*')):
         if f.is_file() and f.suffix.lower() in allowed:
+            rel = f.relative_to(assets_dir)  # e.g. 'hieroglyphs/ankh-blue.svg'
             result.append({
                 "filename": f.name,
-                "path":     f"{type}/{f.name}",
+                "path":     f"{type}/{rel}",
                 "size":     f.stat().st_size,
-                "url":      f"/fallback-ui/assets/{type}/{f.name}",
+                "url":      f"/fallback-ui/assets/{type}/{rel}",
             })
     return result
 
@@ -396,11 +397,14 @@ async def assign_asset(
 
     # Validate the path refers to an actually existing file within our assets dir
     assets_dir = _assets_dir(asset_type)
-    # asset_path is relative (e.g. "icons/foo.svg") — strip the type prefix for resolution
-    filename = Path(asset_path).name
-    candidate = assets_dir / filename
-    if not candidate.exists() or not candidate.is_file():
-        raise HTTPException(404, f"Asset file not found: {asset_path!r}")
+    # asset_path is relative to assets/ (e.g. "icons/foo.svg" or "icons/hieroglyphs/ankh-blue.svg")
+    # Strip the type prefix to get the path within the assets_dir
+    prefix = f"{asset_type}/"
+    if asset_path.startswith(prefix):
+        rel_within = asset_path[len(prefix):]
+    else:
+        rel_within = Path(asset_path).name
+    candidate = assets_dir / rel_within
 
     # Prevent path traversal
     try:
@@ -408,7 +412,10 @@ async def assign_asset(
     except ValueError:
         raise HTTPException(400, "invalid asset path")
 
-    relative_path = f"{asset_type}/{filename}"
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(404, f"Asset file not found: {asset_path!r}")
+
+    relative_path = f"{asset_type}/{rel_within}"
     asset_col = "icon_asset" if asset_type == "icons" else "sound_asset"
 
     with get_conn() as conn:
