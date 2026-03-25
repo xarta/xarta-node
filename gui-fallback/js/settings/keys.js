@@ -100,10 +100,10 @@ function renderKeysTable() {
       </td>
       <td style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
         <button class="secondary" style="padding:2px 8px;font-size:12px"
-          onclick="openKeyInfo('${esc(k.id)}')">&#9432; Info</button>
+          data-key-info="${esc(k.id)}">&#9432; Info</button>
         ${k.present || k.pub_present
           ? `<button class="secondary" style="padding:2px 8px;font-size:12px"
-              onclick="deleteKey('${esc(k.id)}','${esc(k.label)}')">Delete</button>`
+              data-key-del-id="${esc(k.id)}" data-key-del-label="${esc(k.label)}">Delete</button>`
           : ''}
       </td>
     </tr>`).join('');
@@ -149,7 +149,7 @@ function openKeyInfo(id) {
     <div style="background:rgba(91,156,246,.07);border:1px solid var(--accent-dim);border-radius:var(--radius);padding:10px 12px;font-size:12px;color:var(--text-dim);line-height:1.6">
       ${esc(info.notes)}
     </div>`;
-  modal.showModal();
+  HubModal.open(document.getElementById('key-info-modal'));
 }
 
 async function deleteKey(id, label) {
@@ -533,3 +533,11 @@ async function importFromStore() {
     result.style.color = 'var(--err)';
   }
 }
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('keys-status-tbody')?.addEventListener('click', e => {
+    const infoBtn = e.target.closest('[data-key-info]');
+    const delBtn  = e.target.closest('[data-key-del-id]');
+    if (infoBtn) openKeyInfo(infoBtn.dataset.keyInfo);
+    if (delBtn)  deleteKey(delBtn.dataset.keyDelId, delBtn.dataset.keyDelLabel);
+  });
+});

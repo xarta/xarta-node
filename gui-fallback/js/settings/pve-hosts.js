@@ -47,9 +47,9 @@ function renderPveHosts() {
       <td style="white-space:nowrap;color:var(--text-dim)">${esc(scanned)}</td>
       <td style="white-space:nowrap">
         <button class="secondary" style="padding:2px 8px;font-size:11px"
-          onclick="pveHostEdit('${id}', this)">Edit</button>
+          data-pve-edit="${id}">Edit</button>
         <button class="secondary" style="padding:2px 8px;font-size:11px;color:#f87171"
-          onclick="pveHostDelete('${id}', this)">Del</button>
+          data-pve-del="${id}">Del</button>
       </td>
     </tr>`;
   }).join('');
@@ -57,7 +57,7 @@ function renderPveHosts() {
 
 async function pveHostDelete(pveId, btn) {
   if (!confirm(`Delete PVE host ${pveId}?`)) return;
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   try {
     const r = await apiFetch(`/api/v1/pve-hosts/${encodeURIComponent(pveId)}`, { method: 'DELETE' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -65,24 +65,39 @@ async function pveHostDelete(pveId, btn) {
     _savePveHostsCache(_pveHosts);
     renderPveHosts();
   } catch (e) {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
     alert(`Delete failed: ${e.message}`);
   }
 }
 
-async function pveHostEdit(pveId, btn) {
+let _pveEditingId = null;
+
+function _openPveHostEditModal(pveId) {
   const host = _pveHosts.find(h => h.pve_id === pveId);
   if (!host) return;
-  const newName = prompt('PVE name (e.g. pveXXX):', host.pve_name || '');
-  if (newName === null) return;
-  const newTailnet = prompt('Tailnet IP (leave blank to clear):', host.tailnet_ip || '');
-  if (newTailnet === null) return;
-  btn.disabled = true;
+  _pveEditingId = pveId;
+  document.getElementById('pve-host-edit-name').value    = host.pve_name    || '';
+  document.getElementById('pve-host-edit-tailnet').value = host.tailnet_ip  || '';
+  document.getElementById('pve-host-edit-error').textContent = '';
+  document.getElementById('pve-host-edit-save-btn').disabled = false;
+  HubModal.open(document.getElementById('pve-host-edit-modal'));
+  document.getElementById('pve-host-edit-name').focus();
+}
+
+async function _submitPveHostEdit() {
+  const pveId = _pveEditingId;
+  if (!pveId) return;
+  const errorEl  = document.getElementById('pve-host-edit-error');
+  const saveBtn   = document.getElementById('pve-host-edit-save-btn');
+  const newName    = document.getElementById('pve-host-edit-name').value.trim();
+  const newTailnet = document.getElementById('pve-host-edit-tailnet').value.trim();
+  errorEl.textContent = '';
+  saveBtn.disabled = true;
   try {
     const r = await apiFetch(`/api/v1/pve-hosts/${encodeURIComponent(pveId)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pve_name: newName.trim() || null, tailnet_ip: newTailnet.trim() || null }),
+      body: JSON.stringify({ pve_name: newName || null, tailnet_ip: newTailnet || null }),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const updated = await r.json();
@@ -90,9 +105,10 @@ async function pveHostEdit(pveId, btn) {
     if (idx !== -1) _pveHosts[idx] = updated;
     _savePveHostsCache(_pveHosts);
     renderPveHosts();
+    HubModal.close(document.getElementById('pve-host-edit-modal'));
   } catch (e) {
-    btn.disabled = false;
-    alert(`Edit failed: ${e.message}`);
+    errorEl.textContent = `Save failed: ${e.message}`;
+    saveBtn.disabled = false;
   }
 }
 
@@ -123,3 +139,16 @@ async function scanPveHosts() {
     if (btn) { btn.disabled = false; btn.textContent = '▶ Scan for Proxmox'; }
   }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Table event delegation — Edit and Del buttons
+  document.getElementById('pve-hosts-tbody')?.addEventListener('click', e => {
+    const editBtn = e.target.closest('[data-pve-edit]');
+    const delBtn  = e.target.closest('[data-pve-del]');
+    if (editBtn) _openPveHostEditModal(editBtn.dataset.pveEdit);
+    if (delBtn)  pveHostDelete(delBtn.dataset.pveDel, delBtn);
+  });
+
+  // Edit modal Save button
+  document.getElementById('pve-host-edit-save-btn')?.addEventListener('click', _submitPveHostEdit);
+});

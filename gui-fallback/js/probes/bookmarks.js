@@ -217,7 +217,7 @@ function _bmOpenColsModal() {
       <span>${label}</span>
     </label>`;
   }).join('');
-  document.getElementById('bm-cols-modal').showModal();
+  HubModal.open(document.getElementById('bm-cols-modal'));
 }
 
 function _bmApplyColsModal() {
@@ -242,13 +242,12 @@ function _bmApplyColsModal() {
   } else {
     renderBookmarks({ keepPage: true }); // column toggle — stay on current page
   }
-  modal.close();
+  HubModal.close(document.getElementById('bm-cols-modal'));
 }
 
 async function _bmDownloadExtension(btn) {
-  const orig = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = 'Downloading…';
+  const orig = btn?.textContent;
+  if (btn) { btn.disabled = true; btn.textContent = 'Downloading…'; }
   try {
     const r = await apiFetch('/api/v1/bookmarks/extension-download');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -264,8 +263,7 @@ async function _bmDownloadExtension(btn) {
   } catch (e) {
     alert(`Download failed: ${e.message}`);
   } finally {
-    btn.disabled = false;
-    btn.textContent = orig;
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
   }
 }
 
@@ -589,7 +587,7 @@ function _visOpenColsModal() {
       <span>${label}</span>
     </label>`;
   }).join('');
-  document.getElementById('vis-cols-modal').showModal();
+  HubModal.open(document.getElementById('vis-cols-modal'));
 }
 
 function _visApplyColsModal() {
@@ -603,7 +601,7 @@ function _visApplyColsModal() {
   localStorage.setItem('vis-hidden-cols', JSON.stringify([..._visHiddenCols]));
   _visRebuildThead();
   renderVisits({ keepPage: true }); // column toggle — stay on current page
-  modal.close();
+  HubModal.close(document.getElementById('vis-cols-modal'));
 }
 
 async function loadVisits() {
@@ -983,7 +981,7 @@ function _bmOpenExclTagModal() {
   const excluded = new Set(_bmCurrentExclTags);
   _bmRenderExclTagModalList(excluded, '');
   _bmUpdateExclModalCount();
-  modal.showModal();
+  HubModal.open(modal);
   document.getElementById('bm-excl-modal-search').focus();
 }
 
@@ -1048,6 +1046,9 @@ function _bmInitEmbedPanel() {
   // No close button — close btn wiring is no longer needed.
   // Wire the remaining interactive controls.
 
+  // Bookmark modal Save button
+  document.getElementById('bm-modal-save-btn')?.addEventListener('click', saveBookmark);
+
   // Open tag exclusion modal
   document.getElementById('bm-excl-tag-edit-btn')?.addEventListener('click', () => {
     if (!_bmAllTags.length) {
@@ -1106,7 +1107,7 @@ function _bmInitEmbedPanel() {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       _bmCurrentExclTags = tags;
       _bmRenderExclTags(tags);
-      document.getElementById('bm-excl-tag-modal').close();
+      HubModal.close(document.getElementById('bm-excl-tag-modal'));
     } catch (e) {
       statusEl.textContent = `Error: ${e.message}`;
       applyBtn.disabled = false;
@@ -1269,7 +1270,7 @@ async function openBookmarkModal(id) {
   const modal = document.getElementById('bm-modal');
   document.getElementById('bm-modal-id').value = id || '';
   document.getElementById('bm-modal-heading').textContent = id ? 'Edit bookmark' : 'Add bookmark';
-  document.getElementById('bm-modal-error').hidden = true;
+  document.getElementById('bm-modal-error').textContent = '';
   if (id) {
     try {
       const r = await apiFetch(`/api/v1/bookmarks/${id}`);
@@ -1284,7 +1285,6 @@ async function openBookmarkModal(id) {
       document.getElementById('bm-modal-archived').checked  = b.archived || false;
     } catch (e) {
       document.getElementById('bm-modal-error').textContent = `Failed to load: ${e.message}`;
-      document.getElementById('bm-modal-error').hidden = false;
     }
   } else {
     document.getElementById('bm-modal-url').value         = '';
@@ -1295,15 +1295,15 @@ async function openBookmarkModal(id) {
     document.getElementById('bm-modal-notes').value       = '';
     document.getElementById('bm-modal-archived').checked  = false;
   }
-  modal.showModal();
+  HubModal.open(modal);
 }
 
 async function saveBookmark() {
   const id    = document.getElementById('bm-modal-id').value;
   const url   = document.getElementById('bm-modal-url').value.trim();
   const errEl = document.getElementById('bm-modal-error');
-  errEl.hidden = true;
-  if (!url) { errEl.textContent = 'URL is required.'; errEl.hidden = false; return; }
+  errEl.textContent = '';
+  if (!url) { errEl.textContent = 'URL is required.'; return; }
 
   const body = {
     url,
@@ -1324,11 +1324,10 @@ async function saveBookmark() {
       : await apiFetch('/api/v1/bookmarks',
           { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
-    document.getElementById('bm-modal').close();
+    HubModal.close(document.getElementById('bm-modal'));
     await loadBookmarks();
   } catch (e) {
     errEl.textContent = `Save failed: ${e.message}`;
-    errEl.hidden = false;
   }
 }
 
@@ -1618,7 +1617,7 @@ function _bmOpenScoreModal(cell) {
   document.getElementById('bm-score-modal-subtitle').textContent = `"${title.slice(0, 70)}"`;
   const body = document.getElementById('bm-score-modal-body');
   body.innerHTML = _bmScoreLoadingHtml();
-  document.getElementById('bm-score-modal').showModal();
+  HubModal.open(document.getElementById('bm-score-modal'));
   _bmFetchScoreExplain(query, result, null, body);
 }
 
@@ -1631,7 +1630,7 @@ function _bmOpenScoreDetailModal(metric) {
   document.getElementById('bm-score-detail-subtitle').textContent = label;
   const body = document.getElementById('bm-score-detail-body');
   body.innerHTML = _bmScoreLoadingHtml();
-  document.getElementById('bm-score-detail-modal').showModal();
+  HubModal.open(document.getElementById('bm-score-detail-modal'));
   _bmFetchScoreExplain(query, result, metric, body);
 }
 
@@ -1702,6 +1701,9 @@ document.addEventListener('DOMContentLoaded', () => {
     ResponsiveLayout.registerTabControls('bookmarks-main', 'pg-ctrl-bookmarks-main');
   }
 
+  document.getElementById('bm-cols-modal-apply')?.addEventListener('click', _bmApplyColsModal);
+  document.getElementById('vis-cols-modal-apply')?.addEventListener('click', _visApplyColsModal);
+
   document.getElementById('bm-tbody')?.addEventListener('click', e => {
     const cell = e.target.closest('.bm-score-cell');
     if (cell) _bmOpenScoreModal(cell);
@@ -1742,7 +1744,7 @@ async function _bmOpenSortExplainModal() {
   subtitle.textContent = `"${query}" — top ${top.length} results`;
   const body = document.getElementById('bm-sort-explain-body');
   body.innerHTML = _bmScoreLoadingHtml();
-  document.getElementById('bm-sort-explain-modal').showModal();
+  HubModal.open(document.getElementById('bm-sort-explain-modal'));
   try {
     const r = await apiFetch('/api/v1/bookmarks/sort-explain', {
       method: 'POST',

@@ -2,6 +2,8 @@
 let _svcFilterTimer = null;  // debounce handle for search-input
 
 document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('add-modal-save-btn')?.addEventListener('click', submitAddService);
+
   const svcSearch = document.getElementById('search-input');
   if (svcSearch) {
     svcSearch.addEventListener('input', () => {
@@ -71,15 +73,15 @@ function openAddModal() {
   ['m-id','m-name','m-host','m-lxc','m-desc','m-url'].forEach(id => {
     document.getElementById(id).value = '';
   });
-  document.getElementById('modal-error').hidden = true;
-  document.getElementById('add-modal').showModal();
+  document.getElementById('modal-error').textContent = '';
+  HubModal.open(document.getElementById('add-modal'));
 }
 
 async function submitAddService() {
   const id   = document.getElementById('m-id').value.trim();
   const name = document.getElementById('m-name').value.trim();
   const err  = document.getElementById('modal-error');
-  if (!id || !name) { err.textContent='ID and Name are required'; err.hidden=false; return; }
+  if (!id || !name) { err.textContent = 'ID and Name are required'; return; }
   try {
     const r = await apiFetch('/api/v1/services', {
       method: 'POST',
@@ -98,10 +100,9 @@ async function submitAddService() {
       }),
     });
     if (!r.ok) { const t=await r.text(); throw new Error(t); }
-    document.getElementById('add-modal').close();
+    HubModal.close(document.getElementById('add-modal'));
     await loadServices();
   } catch (e) {
     err.textContent = `Error: ${e.message}`;
-    err.hidden = false;
   }
 }

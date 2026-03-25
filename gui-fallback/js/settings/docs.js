@@ -10,6 +10,7 @@ const _docsViewModes = {}; // doc_id → true (preview) | false (edit); default 
 let _docsGroups    = [];   // array of DocGroupOut records
 let _docsDragId    = null;  // doc_id currently being dragged
 let _groupDragId   = null;  // group_id currently being dragged
+let _docsCurrentModalMode = 'new'; // 'new' | 'edit'
 
 // ── Load + Sidebar ───────────────────────────────────────────────────────────
 
@@ -347,7 +348,8 @@ function openNewDocModal() {
   document.getElementById('docs-modal-order').value = String(_docsAll.length * 10);
   document.getElementById('docs-modal-initial').value = '';
   _docsPopulateGroupSelect(null);
-  document.getElementById('docs-modal').showModal();
+  HubModal.open(document.getElementById('docs-modal'));
+  setTimeout(() => document.getElementById('docs-modal-label').focus(), 50);
 }
 
 // ── Edit doc metadata modal ───────────────────────────────────────────────────
@@ -364,26 +366,25 @@ function openEditDocModal() {
   document.getElementById('docs-modal-order').value = String(doc.sort_order);
   document.getElementById('docs-modal-initial').value = '';
   _docsPopulateGroupSelect(doc.group_id || null);
-  document.getElementById('docs-modal').showModal();
+  HubModal.open(document.getElementById('docs-modal'));
+  setTimeout(() => document.getElementById('docs-modal-label').focus(), 50);
 }
 
 function _docsModalMode(mode) {
+  _docsCurrentModalMode = mode;
   const title   = document.getElementById('docs-modal-title');
   const initRow = document.getElementById('docs-modal-init-row');
   const submit  = document.getElementById('docs-modal-submit');
   if (mode === 'new') {
-    title.textContent   = 'New Document';
+    title.textContent     = 'New Document';
     initRow.style.display = '';
-    submit.textContent  = 'Create';
-    submit.onclick      = _docsModalSubmit;
+    submit.textContent    = 'Create';
   } else {
-    title.textContent   = 'Edit Document Metadata';
+    title.textContent     = 'Edit Document Metadata';
     initRow.style.display = 'none';
-    submit.textContent  = 'Save';
-    submit.onclick      = _docsModalSubmitEdit;
+    submit.textContent    = 'Save';
   }
   document.getElementById('docs-modal-error').textContent = '';
-  document.getElementById('docs-modal-error').hidden = true;
 }
 
 async function _docsModalSubmit() {
@@ -395,8 +396,8 @@ async function _docsModalSubmit() {
   const initial = document.getElementById('docs-modal-initial').value;
   const groupId = document.getElementById('docs-modal-group')?.value || '';
   const errEl   = document.getElementById('docs-modal-error');
-  if (!label) { errEl.textContent = 'Label is required.'; errEl.hidden = false; return; }
-  if (!path)  { errEl.textContent = 'File path is required.'; errEl.hidden = false; return; }
+  if (!label) { errEl.textContent = 'Label is required.'; return; }
+  if (!path)  { errEl.textContent = 'File path is required.'; return; }
   const submit = document.getElementById('docs-modal-submit');
   submit.disabled = true;
   try {
@@ -409,12 +410,11 @@ async function _docsModalSubmit() {
     });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
     const created = await r.json();
-    document.getElementById('docs-modal').close();
+    HubModal.close(document.getElementById('docs-modal'));
     await loadDocs();
     docsSelectDoc(created.doc_id);
   } catch (e) {
     errEl.textContent = `Error: ${e.message}`;
-    errEl.hidden = false;
   } finally {
     submit.disabled = false;
   }
@@ -428,7 +428,7 @@ async function _docsModalSubmitEdit() {
   const order   = parseInt(document.getElementById('docs-modal-order').value, 10) || 0;
   const groupId = document.getElementById('docs-modal-group')?.value ?? '';
   const errEl   = document.getElementById('docs-modal-error');
-  if (!label) { errEl.textContent = 'Label is required.'; errEl.hidden = false; return; }
+  if (!label) { errEl.textContent = 'Label is required.'; return; }
   const submit = document.getElementById('docs-modal-submit');
   submit.disabled = true;
   try {
@@ -438,11 +438,10 @@ async function _docsModalSubmitEdit() {
       body: JSON.stringify({ label, description: desc || null, tags: tags || null, path: path || null, sort_order: order, group_id: groupId }),
     });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
-    document.getElementById('docs-modal').close();
+    HubModal.close(document.getElementById('docs-modal'));
     await loadDocs();
   } catch (e) {
     errEl.textContent = `Error: ${e.message}`;
-    errEl.hidden = false;
   } finally {
     submit.disabled = false;
   }
@@ -978,3 +977,13 @@ function docsOpenByPath(href) {
     docsSelectDoc(doc.doc_id);
   }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  const docsSubmitBtn = document.getElementById('docs-modal-submit');
+  if (docsSubmitBtn) {
+    docsSubmitBtn.addEventListener('click', () => {
+      if (_docsCurrentModalMode === 'new') _docsModalSubmit();
+      else _docsModalSubmitEdit();
+    });
+  }
+});

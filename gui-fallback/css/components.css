@@ -135,8 +135,9 @@ button.secondary:hover { color: var(--text); border-color: var(--text-dim); }
 }
 
 /* ── Responsive dialogs ── */
+/* Exclude .hub-modal — it has its own mobile sizing in hub-modal.css */
 @media (max-width: 520px) {
-  dialog {
+  dialog:not(.hub-modal) {
     min-width: 0 !important;
     width: 92vw !important;
     max-width: 92vw !important;

@@ -87,7 +87,7 @@ function renderCertsTable(certs, certsDir) {
         <td>${statusCell}</td>
         <td>${detailCell}</td>
         <td><button class="secondary" style="padding:2px 8px;font-size:12px"
-            onclick="openCertUpload('${esc(c.id)}','${esc(c.label)}','${esc(c.kind)}')">Upload</button></td>
+            data-cert-id="${esc(c.id)}" data-cert-label="${esc(c.label)}" data-cert-kind="${esc(c.kind)}">Upload</button></td>
       </tr>`;
     });
   }
@@ -95,20 +95,14 @@ function renderCertsTable(certs, certsDir) {
   tbody.innerHTML = html;
 }
 
-/* ── Upload panel ────────────────────────────────────────────────────────── */
+/* ── Upload modal ───────────────────────────────────────────────────────── */
 function openCertUpload(id, label, kind) {
-  const panel     = document.getElementById('certs-upload-panel');
-  const titleEl   = document.getElementById('certs-upload-title');
-  const hintEl    = document.getElementById('certs-upload-hint');
-  const textarea  = document.getElementById('certs-upload-pem');
-  const resultEl  = document.getElementById('certs-upload-result');
-  const idInput   = document.getElementById('certs-upload-id');
-
-  idInput.value      = id;
-  titleEl.textContent = `Upload: ${label}`;
-  textarea.value     = '';
-  resultEl.textContent = '';
-  resultEl.style.color = '';
+  document.getElementById('certs-upload-id').value   = id;
+  document.getElementById('certs-upload-title').textContent = `Upload: ${label}`;
+  document.getElementById('certs-upload-pem').value  = '';
+  document.getElementById('certs-upload-result').textContent = '';
+  document.getElementById('certs-upload-result').style.color = '';
+  document.getElementById('certs-upload-btn').disabled = false;
 
   const hints = {
     ca:   'Paste the CA certificate PEM (-----BEGIN CERTIFICATE-----). ' +
@@ -118,17 +112,14 @@ function openCertUpload(id, label, kind) {
     key:  'Paste the private key PEM (-----BEGIN ... PRIVATE KEY-----). ' +
           'A corresponding certificate must be uploaded to the matching cert slot.',
   };
-  hintEl.textContent = hints[kind] || '';
+  document.getElementById('certs-upload-hint').textContent = hints[kind] || '';
 
-  panel.style.display = 'block';
-  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  textarea.focus();
+  HubModal.open(document.getElementById('certs-upload-modal'));
+  setTimeout(() => document.getElementById('certs-upload-pem').focus(), 50);
 }
 
 function closeCertUpload() {
-  document.getElementById('certs-upload-panel').style.display = 'none';
-  document.getElementById('certs-upload-pem').value = '';
-  document.getElementById('certs-upload-result').textContent = '';
+  HubModal.close(document.getElementById('certs-upload-modal'));
 }
 
 /* File-from-disk loader — reads the file and fills the textarea */
@@ -183,8 +174,8 @@ async function submitCertUpload() {
       if (data.ca_installed) msg += ` CA: ${data.ca_installed}.`;
       resultEl.textContent = msg;
       resultEl.style.color = 'var(--ok)';
-      // Refresh the status table
       loadCerts();
+      setTimeout(() => HubModal.close(document.getElementById('certs-upload-modal')), 1200);
     }
   } catch (e) {
     resultEl.textContent = `Error: ${e.message}`;
@@ -193,3 +184,15 @@ async function submitCertUpload() {
     btn.disabled = false;
   }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Table event delegation — Upload buttons
+  document.getElementById('certs-status-tbody')?.addEventListener('click', e => {
+    const btn = e.target.closest('[data-cert-id]');
+    if (btn) openCertUpload(btn.dataset.certId, btn.dataset.certLabel, btn.dataset.certKind);
+  });
+
+  // Modal buttons
+  document.getElementById('certs-upload-btn')?.addEventListener('click', submitCertUpload);
+  document.getElementById('certs-load-file-btn')?.addEventListener('click', certLoadFile);
+});
