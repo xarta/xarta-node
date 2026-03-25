@@ -175,8 +175,10 @@ function createHubMenu(cfg) {
                 item_key:    item.id,
                 label:       item.label.replace(item.icon || '', '').trim(),
                 page_label:  item.pageLabel || null,
-                icon_emoji:  item.icon || null,
-                icon_asset:  null,
+                icon_emoji:  (item.icon && !item.icon.startsWith('icons/') && !item.icon.startsWith('data:')) ? item.icon : null,
+                icon_asset:  (item.icon && item.icon.startsWith('icons/'))  ? item.icon : null,
+                // data: URLs stored inline in icon_emoji (they are not uploadable file assets)
+                // _iconHtml detects 'data:' prefix and renders them as mask-image spans
                 sound_asset: null,
                 parent_key:  item.parent || null,
                 sort_order:  item.order || 0,
@@ -198,9 +200,8 @@ function createHubMenu(cfg) {
         },
 
         // Returns a <span class="menu-icon"> (mask-image tinted by currentColor) when an
-        // icon_asset is set, the emoji character when only an emoji is available, or the
-        // fallback question-mark span.  mask-image means icons automatically inherit the
-        // parent button's colour in all states (hover, active) via CSS currentColor.
+        // icon_asset is set; also handles data: URLs in icon_emoji (inline SVG); falls back
+        // to emoji character or the fallback question-mark span.
         _iconHtml(itemKey, emojiIcon) {
             const db = this._dbItems[itemKey];
             if (db && db.icon_asset) {
@@ -208,9 +209,25 @@ function createHubMenu(cfg) {
                 const url = `/fallback-ui/assets/${db.icon_asset}?v=${ts}`;
                 return `<span class="menu-icon" style="--_icon-url:url('${url}')" aria-hidden="true"></span>`;
             }
-            // DB icon_emoji takes precedence (admin can change it via CMS), then JS default
-            const emoji = (db && db.icon_emoji) || emojiIcon;
-            if (emoji) return emoji;
+            // When the JS default is an inline HIEROGLYPHS SVG (data: URL), it wins over any
+            // stale text emoji left in the DB from the initial seed (e.g. old '↺' or '🔗').
+            // If the admin has explicitly stored a data: URL in icon_emoji (via CMS), that
+            // is respected instead. For plain-text emoji JS defaults, DB still takes priority.
+            let emoji;
+            if (emojiIcon && emojiIcon.startsWith('data:')) {
+                emoji = (db && db.icon_emoji && db.icon_emoji.startsWith('data:'))
+                    ? db.icon_emoji : emojiIcon;
+            } else {
+                emoji = (db && db.icon_emoji) || emojiIcon;
+            }
+            if (emoji) {
+                // data: URL (inline SVG from HIEROGLYPHS constants) or icons/ path
+                if (emoji.startsWith('data:') || emoji.startsWith('icons/')) {
+                    const url = emoji.startsWith('data:') ? emoji : `/fallback-ui/assets/${emoji}`;
+                    return `<span class="menu-icon" style="--_icon-url:url('${url}')" aria-hidden="true"></span>`;
+                }
+                return emoji;
+            }
             // Nothing defined — show the fallback question-mark icon
             return `<span class="menu-icon" style="--_icon-url:url('/fallback-ui/assets/icons/fallback.svg')" aria-hidden="true"></span>`;
         },

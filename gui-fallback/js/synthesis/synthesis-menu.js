@@ -28,26 +28,26 @@ const SynthesisMenuConfig = createHubMenu({
     mobilePinnedId:  'synthesis-layout',
     pinnedTabsId:    'synthesisHubTabsPinned',
     defaultMenu: [
-        { id: 'manual-links',          label: '🔗 Manual',       icon: '🔗', pageLabel: 'Manual Links',          parent: null,              order: 0 },
-        { id: 'manual-links-rendered', label: '🌐 Rendered',     icon: '🌐', pageLabel: 'Manual Links',          parent: 'manual-links',    order: 0 },
-        { id: 'manual-links-table',    label: '≡ Table',         icon: '≡',  pageLabel: 'Manual Links (Table)',  parent: 'manual-links',    order: 1 },
-        { id: 'services',              label: '📋 Services',     icon: '📋', pageLabel: 'Services',              parent: null,              order: 1 },
-        { id: 'machines',              label: '🖥 Machines',     icon: '🖥', pageLabel: 'Machines',              parent: null,              order: 2 },
-        { id: 'synthesis-layout',      label: '☰',               icon: '☰',  pageLabel: 'Navbar Layout',         parent: null,              order: 3 },
+        { id: 'manual-links',          label: 'Manual',    icon: HIEROGLYPHS.ropeCoil,   pageLabel: 'Manual Links',          parent: null,              order: 0 },
+        { id: 'manual-links-rendered', label: 'Rendered',  icon: HIEROGLYPHS.khaHorizon, pageLabel: 'Manual Links',          parent: 'manual-links',    order: 0 },
+        { id: 'manual-links-table',    label: 'Table',     icon: HIEROGLYPHS.cartouche,  pageLabel: 'Manual Links (Table)',  parent: 'manual-links',    order: 1 },
+        { id: 'services',              label: 'Services',  icon: HIEROGLYPHS.sekhem,     pageLabel: 'Services',              parent: null,              order: 1 },
+        { id: 'machines',              label: 'Machines',  icon: HIEROGLYPHS.nemesCrown, pageLabel: 'Machines',              parent: null,              order: 2 },
+        { id: 'synthesis-layout',      label: '☰',         icon: HIEROGLYPHS.kheper,     pageLabel: 'Navbar Layout',         parent: null,              order: 3 },
 
         // ── Services page function items ──────────────────────────────────
-        { id: 'svc-fn-add',     label: '➕ Add service', icon: '➕', fn: 'svc.add',     activeOn: ['services'], parent: 'synthesis-layout', order: 0 },
-        { id: 'svc-fn-refresh', label: '↺ Refresh',      icon: '↺', fn: 'svc.refresh', activeOn: ['services'], parent: 'synthesis-layout', order: 1 },
+        { id: 'svc-fn-add',     label: 'Add service', icon: HIEROGLYPHS.sekhem,   fn: 'svc.add',     activeOn: ['services'], parent: 'synthesis-layout', order: 0 },
+        { id: 'svc-fn-refresh', label: 'Refresh',     icon: HIEROGLYPHS.nefer,    fn: 'svc.refresh', activeOn: ['services'], parent: 'synthesis-layout', order: 1 },
 
         // ── Machines page function items ──────────────────────────────────
-        { id: 'mch-fn-refresh', label: '↺ Refresh',      icon: '↺', fn: 'mch.refresh', activeOn: ['machines'], parent: 'synthesis-layout', order: 0 },
+        { id: 'mch-fn-refresh', label: 'Refresh',     icon: HIEROGLYPHS.nefer,    fn: 'mch.refresh', activeOn: ['machines'], parent: 'synthesis-layout', order: 0 },
 
         // ── Manual Links (table view) function items ──────────────────────
-        { id: 'ml-fn-add',      label: '➕ Add link',    icon: '➕', fn: 'ml.add',      activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 0 },
-        { id: 'ml-fn-refresh',  label: '↺ Refresh',      icon: '↺', fn: 'ml.refresh',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 1 },
-        { id: 'ml-fn-grp-none', label: '⊟ Group: None',  icon: '⊟', fn: 'ml.grpNone',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 2 },
-        { id: 'ml-fn-grp-grp',  label: '🗂 Group: Group', icon: '🗂', fn: 'ml.grpGroup', activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 3 },
-        { id: 'ml-fn-grp-host', label: '🖥 Group: Host',  icon: '🖥', fn: 'ml.grpHost',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 4 },
+        { id: 'ml-fn-add',      label: 'Add link',    icon: HIEROGLYPHS.ropeCoil, fn: 'ml.add',      activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 0 },
+        { id: 'ml-fn-refresh',  label: 'Refresh',     icon: HIEROGLYPHS.nefer,    fn: 'ml.refresh',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 1 },
+        { id: 'ml-fn-grp-none', label: 'Group: None',  icon: 'icons/ui/minus-box-blue.svg',    fn: 'ml.grpNone',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 2 },
+        { id: 'ml-fn-grp-grp',  label: 'Group: Group', icon: 'icons/ui/group-folder-blue.svg', fn: 'ml.grpGroup', activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 3 },
+        { id: 'ml-fn-grp-host', label: 'Group: Host',  icon: 'icons/ui/monitor-blue.svg',      fn: 'ml.grpHost',  activeOn: ['manual-links-table'], parent: 'synthesis-layout', order: 4 },
     ],
 });
 
