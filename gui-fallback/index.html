@@ -16,6 +16,7 @@
   <link rel="stylesheet" href="css/hub-controls.css" />
   <link rel="stylesheet" href="css/responsive-header.css" />
   <link rel="stylesheet" href="css/body-shade.css" />
+  <link rel="stylesheet" href="css/hub-modal.css" />
 </head>
 <body>
 
@@ -747,26 +748,6 @@
       </table>
     </div>
     <p id="certs-status-error" class="error-msg" hidden></p>
-
-    <!-- Upload panel (shown when Upload button is clicked) -->
-    <div id="certs-upload-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h3 id="certs-upload-title" style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0;">Upload</h3>
-        <button class="secondary" style="padding:2px 8px;font-size:12px" onclick="closeCertUpload()">&#10005; Close</button>
-      </div>
-      <p id="certs-upload-hint" style="font-size:12px;color:var(--text-dim);margin-bottom:8px;"></p>
-      <input type="hidden" id="certs-upload-id">
-      <textarea id="certs-upload-pem" rows="10"
-        style="width:100%;font-family:monospace;font-size:12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:8px;resize:vertical;"
-        placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
-      <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap;">
-        <button id="certs-upload-btn" onclick="submitCertUpload()">&#8593; Upload</button>
-        <button class="secondary" onclick="certLoadFile()">&#128193; Load from file&hellip;</button>
-        <!-- hidden file input, triggered programmatically -->
-        <input type="file" id="certs-file-input" accept=".pem,.crt,.cer,.key" style="display:none;">
-        <span id="certs-upload-result" style="font-size:12px;color:var(--text-dim);"></span>
-      </div>
-    </div>
   </section>
 
   <!-- AI Providers -->
@@ -1006,217 +987,393 @@
 </main>
 
 <!-- Bookmark Add / Edit modal -->
-<dialog id="bm-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:440px;max-width:600px;width:90vw;max-height:90vh;overflow-y:auto">
-  <h2 id="bm-modal-heading" style="margin-bottom:16px">Add bookmark</h2>
-  <input type="hidden" id="bm-modal-id" />
-  <div style="display:flex;flex-direction:column;gap:10px">
-    <label style="font-size:13px">URL <span style="color:var(--err)">*</span>
-      <input type="url" id="bm-modal-url" placeholder="https://&hellip;" style="width:100%;margin-top:3px" />
-    </label>
-    <label style="font-size:13px">Title
-      <input type="text" id="bm-modal-title-input" placeholder="Page title" style="width:100%;margin-top:3px" />
-    </label>
-    <label style="font-size:13px">Description
-      <input type="text" id="bm-modal-desc" placeholder="Short description" style="width:100%;margin-top:3px" />
-    </label>
-    <label style="font-size:13px">Tags <span style="font-size:11px;color:var(--text-dim)">(comma-separated)</span>
-      <input type="text" id="bm-modal-tags" placeholder="e.g. k8s, networking, howto" style="width:100%;margin-top:3px" />
-    </label>
-    <label style="font-size:13px">Folder <span style="font-size:11px;color:var(--text-dim)">(e.g. Dev/Kubernetes)</span>
-      <input type="text" id="bm-modal-folder" style="width:100%;margin-top:3px" />
-    </label>
-    <label style="font-size:13px">Notes
-      <textarea id="bm-modal-notes" rows="3" placeholder="Optional notes or analysis&hellip;"
-        style="width:100%;resize:vertical;font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px;margin-top:3px"></textarea>
-    </label>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+<dialog class="hub-modal" id="bm-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="bm-modal-heading">Add bookmark</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <input type="hidden" id="bm-modal-id" />
+    <div class="field">
+      <label for="bm-modal-url">URL <span style="color:var(--hub-accent,#00d4ff)">*</span></label>
+      <input type="url" id="bm-modal-url" placeholder="https://…" />
+    </div>
+    <div class="field">
+      <label for="bm-modal-title-input">Title</label>
+      <input type="text" id="bm-modal-title-input" placeholder="Page title" />
+    </div>
+    <div class="field">
+      <label for="bm-modal-desc">Description</label>
+      <input type="text" id="bm-modal-desc" placeholder="Short description" />
+    </div>
+    <div class="field">
+      <label for="bm-modal-tags">Tags <span class="field-hint" style="display:inline">(comma-separated)</span></label>
+      <input type="text" id="bm-modal-tags" placeholder="e.g. k8s, networking, howto" />
+    </div>
+    <div class="field">
+      <label for="bm-modal-folder">Folder <span class="field-hint" style="display:inline">(e.g. Dev/Kubernetes)</span></label>
+      <input type="text" id="bm-modal-folder" />
+    </div>
+    <div class="field">
+      <label for="bm-modal-notes">Notes</label>
+      <textarea id="bm-modal-notes" rows="3" placeholder="Optional notes or analysis…"></textarea>
+    </div>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.9em;color:var(--hub-text,#e0e0e0);font-weight:400;text-transform:none;letter-spacing:normal">
       <input type="checkbox" id="bm-modal-archived" /> Archived
     </label>
+    <p class="hub-modal-error" id="bm-modal-error"></p>
   </div>
-  <p id="bm-modal-error" class="error-msg" hidden></p>
-  <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
-    <button class="secondary" onclick="document.getElementById('bm-modal').close()">Cancel</button>
-    <button onclick="saveBookmark()">Save</button>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button" data-fc-key="modal.close">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="bm-modal-save-btn">Save</button>
   </div>
 </dialog>
 
 <!-- Manual Links: Add/Edit modal -->
-<dialog id="ml-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:440px;max-width:600px;width:90vw;max-height:90vh;overflow-y:auto">
-  <h2 id="ml-modal-title" style="margin-bottom:16px">Add link</h2>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px 16px">
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">VLAN IP (with port)
-      <input type="text" id="ml-vlan-ip" placeholder="e.g. 10.0.1.5:8080" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">VLAN URI (with port)
-      <input type="text" id="ml-vlan-uri" placeholder="e.g. myservice.vlan.local:8080" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Tailnet IP (with port)
-      <input type="text" id="ml-tailnet-ip" placeholder="e.g. 100.74.20.61:7900" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Tailnet URI (with port)
-      <input type="text" id="ml-tailnet-uri" placeholder="e.g. nodename.ts.net" /></label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Label / Description
-      <input type="text" id="ml-label" placeholder="Short display name" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Icon (emoji / URL / SVG)
-      <input type="text" id="ml-icon" placeholder="e.g. &#127758; or https://…/favicon.ico" /></label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Group
-      <input type="text" id="ml-group-name" placeholder="e.g. Monitoring" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Sort order
-      <input type="number" id="ml-sort-order" value="0" style="max-width:80px" /></label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Parent link
-      <select id="ml-parent-id" style="width:100%"><option value="">— none —</option></select></label>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;padding-top:18px">
-      <input type="checkbox" id="ml-is-internet" /> Internet-facing service</label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Proxmox host
-      <input type="text" id="ml-pve-host" placeholder="e.g. myproxmox" /></label>
-    <span></span>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">VM ID
-      <input type="text" id="ml-vm-id" placeholder="e.g. 842" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">VM name
-      <input type="text" id="ml-vm-name" placeholder="Arbitrary VM label" /></label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">LXC ID
-      <input type="text" id="ml-lxc-id" placeholder="e.g. 841" /></label>
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">LXC name
-      <input type="text" id="ml-lxc-name" placeholder="Arbitrary LXC label" /></label>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px">Location
-      <input type="text" id="ml-location" placeholder="e.g. rack-3 / mgmt-vlan / home lab" /></label>
-    <span></span>
-
-    <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;grid-column:1/-1">Notes
-      <textarea id="ml-notes" rows="3"
-        style="resize:vertical;font-size:13px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:6px 8px"
-        placeholder="Optional notes"></textarea></label>
+<dialog class="hub-modal" id="ml-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="ml-modal-title">Add link</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
   </div>
-  <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
-    <button class="secondary" onclick="document.getElementById('ml-modal').close()">Cancel</button>
-    <button onclick="submitManualLink()">Save</button>
+  <div class="hub-modal-body">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px 16px">
+
+      <div class="field">
+        <label for="ml-vlan-ip">VLAN IP <span class="field-hint" style="display:inline">(with port)</span></label>
+        <input type="text" id="ml-vlan-ip" placeholder="e.g. 10.0.1.5:8080" />
+      </div>
+      <div class="field">
+        <label for="ml-vlan-uri">VLAN URI <span class="field-hint" style="display:inline">(with port)</span></label>
+        <input type="text" id="ml-vlan-uri" placeholder="e.g. myservice.vlan.local:8080" />
+      </div>
+      <div class="field">
+        <label for="ml-tailnet-ip">Tailnet IP <span class="field-hint" style="display:inline">(with port)</span></label>
+        <input type="text" id="ml-tailnet-ip" placeholder="e.g. 100.74.20.61:7900" />
+      </div>
+      <div class="field">
+        <label for="ml-tailnet-uri">Tailnet URI <span class="field-hint" style="display:inline">(with port)</span></label>
+        <input type="text" id="ml-tailnet-uri" placeholder="e.g. nodename.ts.net" />
+      </div>
+
+      <div class="field">
+        <label for="ml-label">Label / Description</label>
+        <input type="text" id="ml-label" placeholder="Short display name" />
+      </div>
+      <div class="field">
+        <label for="ml-icon">Icon <span class="field-hint" style="display:inline">(emoji / URL / SVG)</span></label>
+        <input type="text" id="ml-icon" placeholder="e.g. &#x1F30E; or https://…/favicon.ico" />
+      </div>
+
+      <div class="field">
+        <label for="ml-group-name">Group</label>
+        <input type="text" id="ml-group-name" placeholder="e.g. Monitoring" />
+      </div>
+      <div class="field">
+        <label for="ml-sort-order">Sort order</label>
+        <input type="number" id="ml-sort-order" value="0" />
+      </div>
+
+      <div class="field">
+        <label for="ml-parent-id">Parent link</label>
+        <select id="ml-parent-id"><option value="">— none —</option></select>
+      </div>
+      <div class="field" style="justify-content:flex-end;padding-bottom:2px">
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:normal;font-size:0.9em;font-weight:400;color:var(--hub-text,#e0e0e0);cursor:pointer">
+          <input type="checkbox" id="ml-is-internet" /> Internet-facing service
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="ml-pve-host">Proxmox host</label>
+        <input type="text" id="ml-pve-host" placeholder="e.g. myproxmox" />
+      </div>
+      <div></div>
+
+      <div class="field">
+        <label for="ml-vm-id">VM ID</label>
+        <input type="text" id="ml-vm-id" placeholder="e.g. 842" />
+      </div>
+      <div class="field">
+        <label for="ml-vm-name">VM name</label>
+        <input type="text" id="ml-vm-name" placeholder="Arbitrary VM label" />
+      </div>
+
+      <div class="field">
+        <label for="ml-lxc-id">LXC ID</label>
+        <input type="text" id="ml-lxc-id" placeholder="e.g. 841" />
+      </div>
+      <div class="field">
+        <label for="ml-lxc-name">LXC name</label>
+        <input type="text" id="ml-lxc-name" placeholder="Arbitrary LXC label" />
+      </div>
+
+      <div class="field">
+        <label for="ml-location">Location</label>
+        <input type="text" id="ml-location" placeholder="e.g. rack-3 / mgmt-vlan / home lab" />
+      </div>
+      <div></div>
+
+      <div class="field" style="grid-column:1/-1">
+        <label for="ml-notes">Notes</label>
+        <textarea id="ml-notes" rows="3" placeholder="Optional notes"></textarea>
+      </div>
+    </div>
+    <p class="hub-modal-error" id="ml-modal-error"></p>
   </div>
-  <p id="ml-modal-error" class="error-msg" hidden></p>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button" data-fc-key="modal.close">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="ml-modal-save-btn">Save</button>
+  </div>
 </dialog>
 
-<!-- Quick-add service modal (minimal) -->
-<dialog id="add-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;">
-  <h2 style="margin-bottom:16px;">Add service</h2>
-  <div style="display:flex;flex-direction:column;gap:12px;">
-    <label>ID <input type="text" id="m-id" placeholder="e.g. my-service" style="width:100%;margin-top:4px;" /></label>
-    <label>Name <input type="text" id="m-name" placeholder="Display name" style="width:100%;margin-top:4px;" /></label>
-    <label>Host machine <input type="text" id="m-host" placeholder="e.g. my-server" style="width:100%;margin-top:4px;" /></label>
-    <label>VM / LXC <input type="text" id="m-lxc" placeholder="e.g. my-container" style="width:100%;margin-top:4px;" /></label>
-    <label>Description <input type="text" id="m-desc" placeholder="Short description" style="width:100%;margin-top:4px;" /></label>
-    <label>URL <input type="text" id="m-url" placeholder="https://… (optional)" style="width:100%;margin-top:4px;" /></label>
+<!-- Quick-add service modal -->
+<dialog class="hub-modal" id="add-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title">Add service</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
   </div>
-  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
-    <button class="secondary" onclick="document.getElementById('add-modal').close()">Cancel</button>
-    <button onclick="submitAddService()">Save</button>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="m-id">ID</label>
+      <input type="text" id="m-id" placeholder="e.g. my-service" />
+    </div>
+    <div class="field">
+      <label for="m-name">Name</label>
+      <input type="text" id="m-name" placeholder="Display name" />
+    </div>
+    <div class="field">
+      <label for="m-host">Host machine</label>
+      <input type="text" id="m-host" placeholder="e.g. my-server" />
+    </div>
+    <div class="field">
+      <label for="m-lxc">VM / LXC</label>
+      <input type="text" id="m-lxc" placeholder="e.g. my-container" />
+    </div>
+    <div class="field">
+      <label for="m-desc">Description</label>
+      <input type="text" id="m-desc" placeholder="Short description" />
+    </div>
+    <div class="field">
+      <label for="m-url">URL</label>
+      <input type="text" id="m-url" placeholder="https://… (optional)" />
+    </div>
+    <p class="hub-modal-error" id="modal-error"></p>
   </div>
-  <p id="modal-error" class="error-msg" hidden></p>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button" data-fc-key="modal.close">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="add-modal-save-btn">Save</button>
+  </div>
 </dialog>
 
 <!-- Integrity diagnostic modal (OK and FAILED) -->
-<dialog id="integrity-modal" style="background:var(--surface);border:1px solid var(--err);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:420px;max-width:600px;">
-  <h2 id="integrity-modal-title" style="color:var(--err);margin-bottom:8px;">&#9888; Integrity FAILED</h2>
-  <p id="integrity-modal-intro" style="color:var(--text-dim);font-size:13px;margin-bottom:16px;line-height:1.6;">
-    This node's database has been marked as <strong>degraded</strong>. Sync is paused — no outgoing
-    writes will be sent to peers, and this node will not accept incoming sync actions until recovery.
-  </p>
-  <div id="integrity-modal-cause" style="background:rgba(224,92,92,.08);border:1px solid var(--err);border-radius:var(--radius);
-       padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;">
-    <strong>Common cause:</strong> A <em>Force Restore</em> was applied (disaster recovery). The restored
-    database is flagged as degraded until a healthy peer pushes its full backup to this node.
+<dialog class="hub-modal" id="integrity-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="integrity-modal-title">&#9888; Integrity FAILED</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
   </div>
-  <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);
-      margin-bottom:10px;">Diagnostics</h3>
-  <div id="integrity-diag" style="font-size:13px;line-height:1.8;color:var(--text-dim);">
-    <span class="spinner"></span> Loading&hellip;
+  <div class="hub-modal-body">
+    <p id="integrity-modal-intro" style="color:var(--text-dim);font-size:13px;margin-bottom:16px;line-height:1.6;">
+      This node's database has been marked as <strong>degraded</strong>. Sync is paused &mdash; no outgoing
+      writes will be sent to peers, and this node will not accept incoming sync actions until recovery.
+    </p>
+    <div id="integrity-modal-cause" style="background:rgba(224,92,92,.08);border:1px solid var(--err);border-radius:var(--radius);
+         padding:12px 16px;margin-bottom:16px;font-size:13px;line-height:1.6;">
+      <strong>Common cause:</strong> A <em>Force Restore</em> was applied (disaster recovery). The restored
+      database is flagged as degraded until a healthy peer pushes its full backup to this node.
+    </div>
+    <p style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 4px;">Diagnostics</p>
+    <div id="integrity-diag" style="font-size:13px;line-height:1.8;color:var(--text-dim);">
+      <span class="spinner"></span> Loading&hellip;
+    </div>
+    <div id="integrity-modal-recovery">
+      <p style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:16px 0 4px;">How to recover</p>
+      <ol style="font-size:13px;line-height:1.9;padding-left:20px;margin:0;">
+        <li><strong>Wait</strong> &mdash; on every boot the app requests a full backup from the first reachable peer.
+            If peers are online, recovery is automatic within ~10&ndash;30&nbsp;s of (re)starting the service.</li>
+        <li><strong>Restart the service</strong> &mdash; if the node has been running for a while without recovering,
+            restarting triggers boot-catchup again:
+            <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
+            systemctl restart blueprints-app</code></li>
+        <li><strong>Manual restore</strong> &mdash; navigate to <em>Settings &rsaquo; Backups</em> and restore from a
+            known-good backup, then restart the service.</li>
+        <li><strong>No peers available?</strong> &mdash; if this is the only node, you can reset integrity manually
+            from the SQLite shell:
+            <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
+            UPDATE sync_meta SET value='true' WHERE key='integrity_ok';</code>
+            Only do this if you are certain the data is uncorrupted.</li>
+      </ol>
+    </div>
   </div>
-  <div id="integrity-modal-recovery">
-  <h3 style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);
-      margin:16px 0 10px;">How to recover</h3>
-  <ol style="font-size:13px;line-height:1.9;padding-left:20px;">
-    <li><strong>Wait</strong> — on every boot the app requests a full backup from the first reachable peer.
-        If peers are online, recovery is automatic within ~10–30&nbsp;s of (re)starting the service.</li>
-    <li><strong>Restart the service</strong> — if the node has been running for a while without recovering,
-        restarting triggers boot-catchup again:
-        <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
-        systemctl restart blueprints-app</code></li>
-    <li><strong>Manual restore</strong> — navigate to <em>Settings &rsaquo; Backups</em> and restore from a
-        known-good backup, then restart the service.</li>
-    <li><strong>No peers available?</strong> — if this is the only node, you can reset integrity manually
-        from the SQLite shell:
-        <code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:12px;">
-        UPDATE sync_meta SET value='true' WHERE key='integrity_ok';</code>
-        Only do this if you are certain the data is uncorrupted.</li>
-  </ol>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn hub-modal-close" type="button" data-fc-key="modal.close">Close</button>
   </div>
-  <div style="display:flex;justify-content:flex-end;margin-top:20px;">
-    <button class="secondary" onclick="document.getElementById('integrity-modal').close()">Close</button>
+</dialog>
+
+<!-- Edit VLAN modal -->
+<dialog class="hub-modal" id="vlan-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="vlan-modal-title">Edit VLAN</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="vlan-modal-cidr">CIDR</label>
+      <input type="text" id="vlan-modal-cidr" placeholder="e.g. 10.0.42.0/24" />
+    </div>
+    <div class="field">
+      <label for="vlan-modal-desc">Description <span class="field-hint" style="display:inline">(optional)</span></label>
+      <input type="text" id="vlan-modal-desc" placeholder="e.g. Management VLAN" />
+    </div>
+    <p class="hub-modal-error" id="vlan-modal-error"></p>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button" data-fc-key="modal.close">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="vlan-modal-save-btn">Save</button>
+  </div>
+</dialog>
+
+<!-- Cert upload modal -->
+<dialog class="hub-modal" id="certs-upload-modal" style="width:min(560px,95vw)">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="certs-upload-title">Upload</h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <p id="certs-upload-hint" class="muted"></p>
+    <input type="hidden" id="certs-upload-id">
+    <textarea id="certs-upload-pem" rows="10"
+      style="font-family:monospace;font-size:12px;resize:vertical;"
+      placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    <input type="file" id="certs-file-input" accept=".pem,.crt,.cer,.key" style="display:none;">
+  </div>
+  <div class="hub-modal-footer">
+    <span id="certs-upload-result" style="flex:1;font-size:12px;text-align:left"></span>
+    <button class="hub-modal-btn secondary" type="button" id="certs-load-file-btn">&#128193; Load from file…</button>
+    <button class="hub-modal-btn" type="button" id="certs-upload-btn">&#8593; Upload</button>
+  </div>
+</dialog>
+
+<!-- Edit PVE Host modal -->
+<!-- Add / Edit Manual ARP entry modal -->
+<dialog class="hub-modal" id="arp-manual-edit-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="arp-manual-edit-title">Add entry</h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="arp-manual-edit-ip">IP Address</label>
+      <input type="text" id="arp-manual-edit-ip" placeholder="e.g. 10.0.42.100" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="arp-manual-edit-mac">MAC Address</label>
+      <input type="text" id="arp-manual-edit-mac" placeholder="e.g. bc:24:11:db:20:46" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="arp-manual-edit-notes">Notes <span class="field-hint" style="display:inline">(optional)</span></label>
+      <input type="text" id="arp-manual-edit-notes" placeholder="e.g. Won't respond to pings" autocomplete="off" />
+    </div>
+    <p class="hub-modal-error" id="arp-manual-edit-error"></p>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="arp-manual-edit-save-btn">Save</button>
+  </div>
+</dialog>
+
+<dialog class="hub-modal" id="pve-host-edit-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title">Edit PVE Host</h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="pve-host-edit-name">Name <span class="field-hint" style="display:inline">(e.g. pveXXX)</span></label>
+      <input type="text" id="pve-host-edit-name" placeholder="e.g. proxmox-1" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="pve-host-edit-tailnet">Tailnet IP <span class="field-hint" style="display:inline">(optional)</span></label>
+      <input type="text" id="pve-host-edit-tailnet" placeholder="Leave blank to clear" autocomplete="off" />
+    </div>
+    <p class="hub-modal-error" id="pve-host-edit-error"></p>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="pve-host-edit-save-btn">Save</button>
   </div>
 </dialog>
 
 <!-- Add / Edit setting modal -->
-<dialog id="setting-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:360px;max-width:480px;">
-  <h2 id="setting-modal-title" style="margin-bottom:16px;">Add setting</h2>
-  <div style="display:flex;flex-direction:column;gap:12px;">
-    <label>Key <input type="text" id="setting-key" placeholder="e.g. mgmt_cidr" style="width:100%;margin-top:4px;" /></label>
-    <label>Value <input type="text" id="setting-val" placeholder="Setting value" style="width:100%;margin-top:4px;" /></label>
-    <label>Description <input type="text" id="setting-desc" placeholder="Optional description" style="width:100%;margin-top:4px;" /></label>
+<dialog class="hub-modal" id="setting-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="setting-modal-title">Add setting</h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
   </div>
-  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
-    <button class="secondary" onclick="document.getElementById('setting-modal').close()">Cancel</button>
-    <button onclick="submitSetting()">Save</button>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="setting-key">Key</label>
+      <input type="text" id="setting-key" placeholder="e.g. mgmt_cidr" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="setting-val">Value</label>
+      <input type="text" id="setting-val" placeholder="Setting value" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="setting-desc">Description <span class="field-hint" style="display:inline">(optional)</span></label>
+      <input type="text" id="setting-desc" placeholder="Optional description" autocomplete="off" />
+    </div>
+    <p class="hub-modal-error" id="setting-error"></p>
   </div>
-  <p id="setting-error" class="error-msg" hidden></p>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="setting-modal-save-btn">Save</button>
+  </div>
 </dialog>
 
 <!-- New / Edit doc modal -->
-<dialog id="docs-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:400px;max-width:520px;">
-  <h2 id="docs-modal-title" style="margin-bottom:16px;">New Document</h2>
-  <div style="display:flex;flex-direction:column;gap:12px;">
-    <label>Label (display name)
-      <input type="text" id="docs-modal-label" placeholder="e.g. Basic Assumptions" style="width:100%;margin-top:4px;" />
-    </label>
-    <label>Description
-      <input type="text" id="docs-modal-desc" placeholder="Short subtitle or explanation" style="width:100%;margin-top:4px;" />
-    </label>
-    <label>Tags <span style="font-size:11px;color:var(--text-dim)">(comma-separated; use &ldquo;menu&rdquo; to show in sidebar)</span>
-      <input type="text" id="docs-modal-tags" placeholder="menu,ops" style="width:100%;margin-top:4px;" />
-    </label>
-    <label>File path <span style="font-size:11px;color:var(--text-dim)">(relative to private repo root)</span>
-      <input type="text" id="docs-modal-path" placeholder="docs/my-doc.md" style="width:100%;margin-top:4px;" />
-    </label>
-    <label>Sort order
-      <input type="number" id="docs-modal-order" value="0" style="width:80px;margin-top:4px;" />
-    </label>
-    <label>Group
-      <select id="docs-modal-group" style="width:100%;margin-top:4px;padding:5px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px">
+<dialog class="hub-modal" id="docs-modal" style="width:min(540px,95vw)">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="docs-modal-title">New Document</h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <div class="field">
+      <label for="docs-modal-label">Label (display name)</label>
+      <input type="text" id="docs-modal-label" placeholder="e.g. Basic Assumptions" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="docs-modal-desc">Description</label>
+      <input type="text" id="docs-modal-desc" placeholder="Short subtitle or explanation" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="docs-modal-tags">Tags <span class="field-hint" style="display:inline">(comma-separated; use "menu" to show in sidebar)</span></label>
+      <input type="text" id="docs-modal-tags" placeholder="menu,ops" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="docs-modal-path">File path <span class="field-hint" style="display:inline">(relative to private repo root)</span></label>
+      <input type="text" id="docs-modal-path" placeholder="docs/my-doc.md" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="docs-modal-order">Sort order</label>
+      <input type="number" id="docs-modal-order" value="0" style="width:80px" />
+    </div>
+    <div class="field">
+      <label for="docs-modal-group">Group</label>
+      <select id="docs-modal-group" style="width:100%;padding:5px 8px;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px">
         <option value="">— Undefined Group —</option>
       </select>
-    </label>
-    <div id="docs-modal-init-row">
-      <label>Initial content <span style="font-size:11px;color:var(--text-dim)">(optional — leave blank for heading-only stub)</span>
-        <textarea id="docs-modal-initial" rows="4"
-          placeholder="# My Document&#10;&#10;Notes go here..."
-          style="width:100%;margin-top:4px;font-family:monospace;font-size:12px;
-                 background:var(--bg);color:var(--text);border:1px solid var(--border);
-                 border-radius:var(--radius);padding:8px;box-sizing:border-box"></textarea>
-      </label>
     </div>
+    <div id="docs-modal-init-row" class="field">
+      <label for="docs-modal-initial">Initial content <span class="field-hint" style="display:inline">(optional — leave blank for heading-only stub)</span></label>
+      <textarea id="docs-modal-initial" rows="5"
+        placeholder="# My Document&#10;&#10;Notes go here..."
+        style="width:100%;font-family:monospace;font-size:12px;box-sizing:border-box;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:8px;resize:vertical"></textarea>
+    </div>
+    <p class="hub-modal-error" id="docs-modal-error"></p>
   </div>
-  <p id="docs-modal-error" class="error-msg" hidden></p>
-  <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
-    <button class="secondary" onclick="document.getElementById('docs-modal').close()">Cancel</button>
-    <button id="docs-modal-submit" onclick="_docsModalSubmit()">Create</button>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button">Cancel</button>
+    <button class="hub-modal-btn" type="button" id="docs-modal-submit">Create</button>
   </div>
 </dialog>
 
@@ -1249,6 +1406,7 @@
 <script src="js/synthesis/machines.js"></script>
 <script src="js/sound-manager.js"></script>
 <script src="js/form-control-manager.js"></script>
+<script src="js/hub-modal.js"></script>
 <script src="js/hub-menu.js"></script>
 <script src="js/synthesis/synthesis-menu.js"></script>
 <script src="js/settings/nodes.js"></script>
@@ -1307,12 +1465,16 @@
 </dialog>
 
 <!-- Key info modal -->
-<dialog id="key-info-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:420px;max-width:580px;">
-  <h2 id="key-info-title" style="margin-bottom:16px;"></h2>
-  <div id="key-info-body" style="font-size:13px;line-height:1.6;"></div>
-  <div style="display:flex;justify-content:flex-end;margin-top:20px;">
-    <button class="secondary" onclick="document.getElementById('key-info-modal').close()">Close</button>
+<dialog class="hub-modal" id="key-info-modal">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title" id="key-info-title"></h2>
+    <button class="hub-modal-close" type="button">CLOSE</button>
+  </div>
+  <div class="hub-modal-body">
+    <div id="key-info-body"></div>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary hub-modal-close" type="button">Close</button>
   </div>
 </dialog>
 
@@ -1396,96 +1558,98 @@
   .bm-tc-counts { display:flex;gap:0;flex-shrink:0;font-size:12px;font-variant-numeric:tabular-nums }
   .bm-tc-active { min-width:46px;text-align:right;padding-right:6px;color:var(--ok,#4ade80) }
   .bm-tc-arch   { min-width:46px;text-align:right;padding-left:6px;border-left:1px solid var(--border);color:var(--text-dim) }
-  #bm-excl-tag-modal[open] { display:flex;flex-direction:column }
 </style>
-<dialog id="bm-excl-tag-modal" style="width:min(600px,95vw);height:90vh;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <span style="font-weight:700;font-size:14px">&#127991; Select tags to exclude from embeddings</span>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-excl-tag-modal').close()">&#10005;</button>
+<dialog class="hub-modal" id="bm-excl-tag-modal" style="width:min(600px,95vw)">
+  <div class="hub-modal-header" style="flex-direction:column;align-items:stretch;padding:0;gap:0">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 16px 12px">
+      <span class="hub-modal-title">&#127991; Select tags to exclude from embeddings</span>
+      <button class="hub-modal-close secondary">&#10005;</button>
+    </div>
+    <div style="padding:8px 16px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px">
+      <input type="text" id="bm-excl-modal-search" placeholder="Filter tags…" style="flex:1;font-size:13px;padding:5px 10px" autocomplete="off" />
+      <span id="bm-excl-modal-count" style="font-size:12px;color:var(--text-dim);white-space:nowrap"></span>
+    </div>
+    <div style="padding:4px 14px 6px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:.3px">
+      <span style="width:16px;flex-shrink:0"></span>
+      <span style="flex:1">TAG</span>
+      <span style="display:flex;gap:0;flex-shrink:0">
+        <span style="min-width:46px;text-align:right;padding-right:6px">ACTIVE</span>
+        <span style="min-width:46px;text-align:right;padding-left:6px;border-left:1px solid var(--border)">ARCH</span>
+      </span>
+    </div>
   </div>
-  <div style="padding:10px 18px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;gap:10px">
-    <input type="text" id="bm-excl-modal-search" placeholder="Filter tags…" style="flex:1;font-size:13px;padding:5px 10px" autocomplete="off" />
-    <span id="bm-excl-modal-count" style="font-size:12px;color:var(--text-dim);white-space:nowrap"></span>
+  <div class="hub-modal-body" style="padding:6px 8px">
+    <div id="bm-excl-modal-list"></div>
   </div>
-  <div style="padding:4px 14px 0;flex-shrink:0;display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:.3px">
-    <span style="width:16px;flex-shrink:0"></span>
-    <span style="flex:1">TAG</span>
-    <span style="display:flex;gap:0;flex-shrink:0">
-      <span style="min-width:46px;text-align:right;padding-right:6px">ACTIVE</span>
-      <span style="min-width:46px;text-align:right;padding-left:6px;border-left:1px solid var(--border)">ARCH</span>
-    </span>
-  </div>
-  <div id="bm-excl-modal-list" style="overflow-y:auto;flex:1;padding:6px 8px"></div>
-  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-shrink:0">
-    <span id="bm-excl-modal-status" style="font-size:12px;color:var(--text-dim);flex:1"></span>
-    <button class="secondary" onclick="document.getElementById('bm-excl-tag-modal').close()">Cancel</button>
+  <div class="hub-modal-footer" style="justify-content:flex-end">
+    <span id="bm-excl-modal-status" style="font-size:12px;color:var(--text-dim);flex:1;text-align:left"></span>
+    <button class="secondary hub-modal-close">Cancel</button>
     <button id="bm-excl-modal-apply-btn">&#10003; Apply &amp; Save</button>
   </div>
 </dialog>
 
-<style>#bm-cols-modal[open] { display:flex;flex-direction:column }</style>
-<dialog id="bm-cols-modal" style="width:min(380px,95vw);border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <span style="font-weight:700;font-size:14px">&#9776; Visible columns</span>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-cols-modal').close()">&#10005;</button>
+<dialog class="hub-modal" id="bm-cols-modal">
+  <div class="hub-modal-header">
+    <span class="hub-modal-title">&#9776; Visible columns</span>
+    <button class="hub-modal-close secondary">&#10005;</button>
   </div>
-  <div id="bm-cols-modal-list" style="padding:4px 18px;flex:1"></div>
-  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-shrink:0">
-    <button class="secondary" onclick="document.getElementById('bm-cols-modal').close()">Cancel</button>
-    <button onclick="_bmApplyColsModal()">&#10003; Apply</button>
+  <div class="hub-modal-body">
+    <div id="bm-cols-modal-list"></div>
   </div>
-</dialog>
-
-<style>#vis-cols-modal[open] { display:flex;flex-direction:column }</style>
-<dialog id="vis-cols-modal" style="width:min(380px,95vw);border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <span style="font-weight:700;font-size:14px">&#9776; Visit columns</span>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('vis-cols-modal').close()">&#10005;</button>
-  </div>
-  <div id="vis-cols-modal-list" style="padding:4px 18px;flex:1"></div>
-  <div style="padding:12px 18px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-shrink:0">
-    <button class="secondary" onclick="document.getElementById('vis-cols-modal').close()">Cancel</button>
-    <button onclick="_visApplyColsModal()">&#10003; Apply</button>
+  <div class="hub-modal-footer">
+    <button class="secondary hub-modal-close">Cancel</button>
+    <button id="bm-cols-modal-apply">&#10003; Apply</button>
   </div>
 </dialog>
 
-<style>#bm-score-modal[open],#bm-score-detail-modal[open]{display:flex;flex-direction:column}</style>
+<dialog class="hub-modal" id="vis-cols-modal">
+  <div class="hub-modal-header">
+    <span class="hub-modal-title">&#9776; Visit columns</span>
+    <button class="hub-modal-close secondary">&#10005;</button>
+  </div>
+  <div class="hub-modal-body">
+    <div id="vis-cols-modal-list"></div>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="secondary hub-modal-close">Cancel</button>
+    <button id="vis-cols-modal-apply">&#10003; Apply</button>
+  </div>
+</dialog>
 
 <!-- Score analysis overview modal -->
-<dialog id="bm-score-modal" style="width:min(920px,96vw);height:90vh;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <div>
+<dialog class="hub-modal" id="bm-score-modal" style="width:min(920px,96vw);max-width:96vw">
+  <div class="hub-modal-header">
+    <div style="flex:1;min-width:0">
       <span style="font-weight:700;font-size:15px">&#128269; Score Analysis</span>
       <span id="bm-score-modal-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
     </div>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-score-modal').close()">&#10005;</button>
+    <button class="hub-modal-close" type="button">&#10005;</button>
   </div>
-  <div id="bm-score-modal-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
+  <div class="hub-modal-body" id="bm-score-modal-body" style="padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
 </dialog>
 
 <!-- Score detail modal (per-metric drill-down, stacks on top of overview) -->
-<dialog id="bm-score-detail-modal" style="width:min(800px,94vw);height:84vh;border-radius:var(--radius);border:1px solid var(--accent);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <div>
+<dialog class="hub-modal" id="bm-score-detail-modal" style="width:min(800px,94vw);max-width:94vw;border-color:var(--accent)">
+  <div class="hub-modal-header">
+    <div style="flex:1;min-width:0">
       <span style="font-weight:700;font-size:14px">&#128270; Metric Detail</span>
       <span id="bm-score-detail-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
     </div>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-score-detail-modal').close()">&#8592; Back</button>
+    <button class="hub-modal-close" type="button">&#8592; Back</button>
   </div>
-  <div id="bm-score-detail-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
+  <div class="hub-modal-body" id="bm-score-detail-body" style="padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
 </dialog>
 
 <!-- Sort explanation modal -->
-<style>#bm-sort-explain-modal[open]{display:flex;flex-direction:column}</style>
-<dialog id="bm-sort-explain-modal" style="width:min(960px,96vw);height:90vh;border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0;margin:auto">
-  <div style="padding:14px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-    <div>
+<dialog class="hub-modal" id="bm-sort-explain-modal" style="width:min(960px,96vw);max-width:96vw">
+  <div class="hub-modal-header">
+    <div style="flex:1;min-width:0">
       <span style="font-weight:700;font-size:15px">&#128202; Sort Order Explanation</span>
       <span id="bm-sort-explain-subtitle" style="font-size:12px;color:var(--text-dim);margin-left:12px"></span>
     </div>
-    <button class="secondary" style="padding:2px 10px;font-size:12px" onclick="document.getElementById('bm-sort-explain-modal').close()">&#10005;</button>
+    <button class="hub-modal-close" type="button">&#10005;</button>
   </div>
-  <div id="bm-sort-explain-body" style="flex:1;overflow-y:auto;padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
+  <div class="hub-modal-body" id="bm-sort-explain-body" style="padding:20px 24px;font-size:13.5px;line-height:1.65"></div>
 </dialog>
 
 </body>

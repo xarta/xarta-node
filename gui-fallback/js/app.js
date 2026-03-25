@@ -96,6 +96,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (!localStorage.getItem(_LS_SECRET_KEY)) { openApiKeyModal(); }
   if (typeof SoundManager !== 'undefined') SoundManager.init();
   if (typeof FormControlManager !== 'undefined') { FormControlManager.init(); FormControlManager.load(); }
+  if (typeof HubModal !== 'undefined') HubModal.init();
   const _urlGroup = new URLSearchParams(window.location.search).get('group');
   if (_urlGroup && ['synthesis', 'probes', 'settings'].includes(_urlGroup)) switchGroup(_urlGroup);
   loadFrontendSettings();

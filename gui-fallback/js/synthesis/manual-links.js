@@ -291,7 +291,7 @@ function openManualLinkModal(linkId) {
   const dlg = document.getElementById('ml-modal');
   document.getElementById('ml-modal-title').textContent = linkId ? 'Edit link' : 'Add link';
   const modalErr = document.getElementById('ml-modal-error');
-  if (modalErr) modalErr.hidden = true;
+  if (modalErr) modalErr.textContent = '';
 
   const defaults = {
     link_id: '', vlan_ip: '', vlan_uri: '', tailnet_ip: '', tailnet_uri: '',
@@ -316,12 +316,12 @@ function openManualLinkModal(linkId) {
   document.getElementById('ml-is-internet').checked = !!lnk.is_internet;
   parentSel.value = lnk.parent_id || '';
 
-  dlg.showModal();
+  HubModal.open(dlg);
 }
 
 async function submitManualLink() {
   const modalErr = document.getElementById('ml-modal-error');
-  if (modalErr) modalErr.hidden = true;
+  if (modalErr) modalErr.textContent = '';
   const get = id => document.getElementById(id)?.value?.trim() ?? '';
   const body = {
     vlan_ip:     get('ml-vlan-ip')     || null,
@@ -359,10 +359,10 @@ async function submitManualLink() {
       });
       if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     }
-    document.getElementById('ml-modal').close();
+    HubModal.close(document.getElementById('ml-modal'));
     await loadManualLinks();
   } catch (e) {
-    if (modalErr) { modalErr.textContent = e.message; modalErr.hidden = false; }
+    if (modalErr) modalErr.textContent = e.message;
   }
 }
 
@@ -389,6 +389,8 @@ async function deleteManualLink(linkId) {
 // from there rather than from the normal switchTab flow).
 
 document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('ml-modal-save-btn')?.addEventListener('click', submitManualLink);
+
   const mlFilter = document.getElementById('ml-filter');
   if (mlFilter) {
     mlFilter.addEventListener('input', () => {

@@ -32,9 +32,9 @@ function renderSettings() {
       <td style="white-space:nowrap;color:var(--text-dim)">${esc(updated)}</td>
       <td style="white-space:nowrap">
         <button class="secondary" style="font-size:12px;padding:3px 10px"
-          onclick="editSetting('${keyEsc}','${valEsc}','${descEsc}')">Edit</button>
+          data-edit-key="${keyEsc}" data-edit-val="${valEsc}" data-edit-desc="${descEsc}">Edit</button>
         <button style="font-size:12px;padding:3px 10px;background:var(--err);border-color:var(--err);color:#fff"
-          onclick="deleteSetting('${keyEsc}')">&#10005;</button>
+          data-del-key="${keyEsc}">&#10005;</button>
       </td>
     </tr>`;
   }).join('');
@@ -46,8 +46,9 @@ function openAddSettingModal() {
   });
   document.getElementById('setting-modal-title').textContent = 'Add setting';
   document.getElementById('setting-key').readOnly = false;
-  document.getElementById('setting-error').hidden = true;
-  document.getElementById('setting-modal').showModal();
+  document.getElementById('setting-error').textContent = '';
+  document.getElementById('setting-modal-save-btn').disabled = false;
+  HubModal.open(document.getElementById('setting-modal'));
 }
 
 function editSetting(key, value, description) {
@@ -56,8 +57,9 @@ function editSetting(key, value, description) {
   document.getElementById('setting-desc').value = description;
   document.getElementById('setting-modal-title').textContent = 'Edit setting';
   document.getElementById('setting-key').readOnly = true;
-  document.getElementById('setting-error').hidden = true;
-  document.getElementById('setting-modal').showModal();
+  document.getElementById('setting-error').textContent = '';
+  document.getElementById('setting-modal-save-btn').disabled = false;
+  HubModal.open(document.getElementById('setting-modal'));
 }
 
 async function submitSetting() {
@@ -65,7 +67,10 @@ async function submitSetting() {
   const val  = document.getElementById('setting-val').value.trim();
   const desc = document.getElementById('setting-desc').value.trim();
   const err  = document.getElementById('setting-error');
-  if (!key) { err.textContent = 'Key is required'; err.hidden = false; return; }
+  const saveBtn = document.getElementById('setting-modal-save-btn');
+  if (!key) { err.textContent = 'Key is required'; return; }
+  saveBtn.disabled = true;
+  err.textContent = '';
   try {
     const r = await apiFetch(`/api/v1/settings/${encodeURIComponent(key)}`, {
       method: 'PUT',
@@ -73,12 +78,12 @@ async function submitSetting() {
       body: JSON.stringify({ value: val, description: desc || null }),
     });
     if (!r.ok) { const t = await r.text(); throw new Error(t); }
-    document.getElementById('setting-modal').close();
+    HubModal.close(document.getElementById('setting-modal'));
     _settings = [];
     await loadSettings();
   } catch (e) {
     err.textContent = `Error: ${e.message}`;
-    err.hidden = false;
+    saveBtn.disabled = false;
   }
 }
 
@@ -157,3 +162,16 @@ async function saveSoundEnabled(enabled) {
     if (checkbox) checkbox.checked = !enabled;
   }
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+  // Save button
+  document.getElementById('setting-modal-save-btn')?.addEventListener('click', submitSetting);
+
+  // Table event delegation — Edit and Delete buttons
+  document.getElementById('settings-tbody')?.addEventListener('click', e => {
+    const editBtn = e.target.closest('[data-edit-key]');
+    const delBtn  = e.target.closest('[data-del-key]');
+    if (editBtn) editSetting(editBtn.dataset.editKey, editBtn.dataset.editVal, editBtn.dataset.editDesc);
+    if (delBtn)  deleteSetting(delBtn.dataset.delKey);
+  });
+});

@@ -91,7 +91,7 @@ async function openIntegrityModal(isOk = false) {
   document.getElementById('integrity-modal-recovery').style.display = isOk ? 'none' : '';
 
   diag.innerHTML = '<span class="spinner"></span> Loading&hellip;';
-  modal.showModal();
+  HubModal.open(modal);
   try {
     const [hr, sr] = await Promise.all([
       apiFetch('/health'),
