@@ -517,7 +517,7 @@ function createHubMenu(cfg) {
             div.innerHTML = `
                 <div class="menu-item-header">
                     <span class="drag-handle">⋮⋮</span>
-                    <span class="menu-item-icon">${item.icon}</span>
+                    <span class="menu-item-icon">${this._iconHtml(item.id, item.icon)}</span>
                     <span class="menu-item-label">${item.label.replace(item.icon, '').trim()}</span>
                     ${hasChildren ? '<span class="has-children-badge">▼ ' + children.length + '</span>' : ''}
                     <span class="menu-item-page-label" title="Page label (shown when active)">→ ${item.pageLabel || '—'}</span>
@@ -564,7 +564,7 @@ function createHubMenu(cfg) {
                         <div class="menu-editor-item menu-editor-child${isFn ? ' menu-editor-fn-child' : ''}${inactiveClass}" data-id="${child.id}" draggable="true">
                             <div class="menu-item-header">
                                 <span class="drag-handle">⋮⋮</span>
-                                <span class="menu-item-icon">${child.icon}</span>
+                                <span class="menu-item-icon">${this._iconHtml(child.id, child.icon)}</span>
                                 <span class="menu-item-label">${child.label.replace(child.icon, '').trim()}</span>
                                 ${rightColHtml}
                                 <div class="menu-item-actions">
