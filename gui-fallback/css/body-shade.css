@@ -16,7 +16,18 @@
      up              → translateY held at -maxTravel; .is-up applied
    ────────────────────────────────────────────────────────────────────────── */
 
-/* ── Handle — all screen sizes ──────────────────────────────────────────── */
+/* ── Global CSS variables ───────────────────────────────────────────────────
+   --header-h : tracked by ResizeObserver in body-shade.js
+────────────────────────────────────────────────────────────────────────────── */
+:root {
+  --header-h: 0px;
+}
+
+/* When a fill tab is active, prevent the page from scrolling.
+   JS sizes .table-wrap--fill precisely; this locks any rounding overshoot. */
+body.has-fill-tab {
+  overflow: hidden;
+}
 .body-shade-handle {
   display: flex;
   align-items: center;
@@ -99,11 +110,19 @@ body.shade-is-up {
   overflow: hidden;
 }
 
-/* When shade is locked up, expand table-wraps to fill the newly freed viewport
-   space. Without this, .table-wrap keeps its original max-height (calculated
-   for the full header+menu layout) and leaves dead space at the bottom.
-   Handle is 20px; table-wrap fills the remaining 100vh below it. */
+/* When shade is locked up:
+   - .table-wrap (plain page-scroll tables): expand to fill viewport
+   - docs content: scroll within own element
+   - .table-wrap--fill inside fill tabs: JS resizes it after each state change */
 body.shade-is-up .table-wrap {
+  max-height: calc(100vh - 20px) !important;
+}
+body.shade-is-up #docs-editor {
+  max-height: calc(100vh - 20px) !important;
+  overflow-y: auto;
+  resize: none;
+}
+body.shade-is-up #docs-preview {
   max-height: calc(100vh - 20px) !important;
 }
 

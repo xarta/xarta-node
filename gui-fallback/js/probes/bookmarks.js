@@ -450,18 +450,16 @@ function _bmRenderPagination(total, pageSize, page) {
   ).join('');
   const sizeSelect = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer">Per page:<select onchange="_bmSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select></label>`;
   if (totalPages <= 1) {
-    el.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">${sizeSelect}</div>`;
+    el.innerHTML = sizeSelect;
     return;
   }
   const prevDis = page <= 1 ? ' disabled' : '';
   const nextDis = page >= totalPages ? ' disabled' : '';
   el.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">
-      <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_bmGoPage(${page - 1})">&#8592; Prev</button>
-      <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
-      <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_bmGoPage(${page + 1})">Next &#8594;</button>
-      <span style="margin-left:8px">${sizeSelect}</span>
-    </div>`;
+    <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_bmGoPage(${page - 1})">&#8592; Prev</button>
+    <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
+    <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_bmGoPage(${page + 1})">Next &#8594;</button>
+    ${sizeSelect}`;
 }
 
 function _bmGoPage(n) {
@@ -843,18 +841,16 @@ function _visRenderPagination(total, pageSize, page) {
   </label>`;
   if (totalPages <= 1) {
     // Always show the per-page selector even when everything fits on one page
-    el.innerHTML = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">${sizeSelect}</div>`;
+    el.innerHTML = sizeSelect;
     return;
   }
   const prevDis = page <= 1 ? ' disabled' : '';
   const nextDis = page >= totalPages ? ' disabled' : '';
   el.innerHTML = `
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);padding:8px 0 4px">
-      <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_visGoPage(${page - 1})">&#8592; Prev</button>
-      <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
-      <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_visGoPage(${page + 1})">Next &#8594;</button>
-      ${sizeSelect}
-    </div>`;
+    <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_visGoPage(${page - 1})">&#8592; Prev</button>
+    <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
+    <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_visGoPage(${page + 1})">Next &#8594;</button>
+    ${sizeSelect}`;
 }
 
 function _visGoPage(n) {

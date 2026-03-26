@@ -257,7 +257,7 @@
   <div id="body-shade" class="body-shade">
 
   <!-- Settings -->
-  <section id="tab-settings" class="tab-panel">
+  <section id="tab-settings" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Key-value configuration store. Changes sync automatically to all fleet nodes.</p>
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:16px;">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
@@ -279,7 +279,7 @@
       <span id="sound-enabled-status" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>Key</th><th>Value</th><th>Description</th><th>Updated</th><th>Actions</th>
@@ -429,9 +429,9 @@
   </section>
 
   <!-- Services -->
-  <section id="tab-services" class="tab-panel">
+  <section id="tab-services" class="tab-panel tab-panel--fill">
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead>
           <tr>
@@ -451,9 +451,9 @@
   </section>
 
   <!-- Machines -->
-  <section id="tab-machines" class="tab-panel">
+  <section id="tab-machines" class="tab-panel tab-panel--fill">
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead>
           <tr>
@@ -536,11 +536,11 @@
   </section>
 
   <!-- pfSense DNS -->
-  <section id="tab-pfsense-dns" class="tab-panel">
+  <section id="tab-pfsense-dns" class="tab-panel tab-panel--fill">
     <p id="dns-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <p id="dns-sweep-status" style="font-size:12px;margin:2px 0 0" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead>
           <tr>
@@ -563,7 +563,7 @@
   </section>
 
   <!-- Proxmox Config -->
-  <section id="tab-proxmox-config" class="tab-panel">
+  <section id="tab-proxmox-config" class="tab-panel tab-panel--fill">
     <div id="pve-steps-panel" style="display:none;flex-wrap:wrap;gap:4px;padding:4px 0 6px;border-bottom:1px solid rgba(0,212,255,0.15);margin-bottom:2px">
       <button class="hub-action-btn hub-primary" id="pve-probe-btn">&#9654; Probe PVE</button>
       <button class="hub-action-btn" id="pve-enrich-btn">&#8657; Fill IPs from pfSense</button>
@@ -576,7 +576,7 @@
     </div>
     <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>PVE</th><th>VMID</th><th>Type</th><th>Name</th><th>Status</th>
@@ -589,10 +589,10 @@
   </section>
 
   <!-- Dockge Stacks -->
-  <section id="tab-dockge-stacks" class="tab-panel">
+  <section id="tab-dockge-stacks" class="tab-panel tab-panel--fill">
     <p id="dockge-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>SVCS</th><th>PVE</th><th>VMID</th><th>TYPE</th><th>LXC</th><th>Stack</th><th>Status</th><th>.ENV</th><th>Host type</th><th>Parent</th><th>Obs</th><th>Notes</th><th>Last Probed</th>
@@ -604,10 +604,10 @@
   </section>
 
   <!-- Caddy Configs -->
-  <section id="tab-caddy-configs" class="tab-panel">
+  <section id="tab-caddy-configs" class="tab-panel tab-panel--fill">
     <p id="caddy-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>PVE</th><th>VMID</th><th>LXC</th><th>Path</th>
@@ -620,14 +620,14 @@
   </section>
 
   <!-- PVE Hosts -->
-  <section id="tab-pve-hosts" class="tab-panel">
+  <section id="tab-pve-hosts" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Discovered via port-8006 CIDR scan. Set <strong>Management CIDR</strong> in the Settings tab (&#9881; group),
       then click <em>Scan for Proxmox</em>.
     </p>
     <p id="pve-scan-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>IP</th><th>Name</th><th>Tailnet IP</th><th>Version</th><th>Port</th>
@@ -640,13 +640,13 @@
   </section>
 
   <!-- VLANs -->
-  <section id="tab-vlans" class="tab-panel">
+  <section id="tab-vlans" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Inferred from Proxmox Config probe. CIDRs marked <em>inferred</em> are guessed as /24 from IP data
       — correct them here if needed. These are also used as scan ranges by <em>Find IPs by ARP</em>.
     </p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>VLAN</th><th>CIDR</th><th>Source</th><th>Description</th><th>Actions</th>
@@ -658,14 +658,14 @@
   </section>
 
   <!-- Manual ARP -->
-  <section id="tab-arp-manual" class="tab-panel">
+  <section id="tab-arp-manual" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">
       Hand-entered IP ↔ MAC records for hosts that automated discovery can't reach
       (e.g. CARP backup appliances, offline machines, odd devices).
       Entries sync automatically to all fleet nodes.
     </p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>IP Address</th><th>MAC Address</th><th>Notes</th><th>Updated</th><th>Actions</th>
@@ -750,12 +750,12 @@
   </section>
 
   <!-- Certs -->
-  <section id="tab-certs" class="tab-panel">
+  <section id="tab-certs" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Manage TLS certificates on this node. Certificates are stored in <strong><span id="certs-dir-hint"></span></strong> and are never committed to any git repository.</p>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Upload only &mdash; no download. CA certificates are installed into the system trust store automatically on upload.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <!-- Status table -->
-    <div class="table-wrap" style="margin-bottom:20px;">
+    <div class="table-wrap table-wrap--fill" style="margin-bottom:20px;">
       <table>
         <thead><tr>
           <th>Name</th><th>Env Var</th><th>Path</th><th>Status</th><th>Details</th><th>Action</th>
@@ -809,11 +809,11 @@
   </section>
 
   <!-- SSH Targets -->
-  <section id="tab-ssh-targets" class="tab-panel">
+  <section id="tab-ssh-targets" class="tab-panel tab-panel--fill">
     <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
     <p id="ssh-targets-status" style="font-size:13px;color:var(--text-dim);margin-bottom:12px"></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table>
         <thead><tr>
           <th>IP Address</th><th>Host Name</th><th>Type</th><th>Key Env Var</th><th>Source IP</th><th>Notes</th><th>Updated</th><th></th>
@@ -825,7 +825,7 @@
   </section>
 
   <!-- Bookmarks -->
-  <section id="tab-bookmarks-main" class="tab-panel">
+  <section id="tab-bookmarks-main" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
     <!-- Hidden file input for Import HTML (triggered via menu or Setup tab) -->
     <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
@@ -836,7 +836,7 @@
     <p id="bm-search-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
     <!-- Bookmarks table -->
     <div id="bm-main-view">
-      <div class="table-wrap">
+      <div class="table-wrap table-wrap--fill">
         <table>
           <thead><tr></tr></thead>
           <tbody id="bm-tbody"><tr class="empty-row"><td colspan="8">Loading&hellip;</td></tr></tbody>
@@ -844,13 +844,13 @@
       </div>
     </div>
     <!-- Pagination controls (rendered by _bmRenderPagination in bookmarks.js) -->
-    <div id="bm-pagination"></div>
+    <div id="bm-pagination" class="table-pager"></div>
     <p id="bm-import-status" style="font-size:12px;margin:6px 0 0" hidden></p>
     <p id="bm-error" class="error-msg" hidden></p>
   </section>
 
   <!-- Bookmarks — Visit History -->
-  <section id="tab-bookmarks-history" class="tab-panel">
+  <section id="tab-bookmarks-history" class="tab-panel tab-panel--fill">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div style="display:flex;gap:6px;margin-bottom:8px">
@@ -858,13 +858,13 @@
       <button id="vis-collapse-all-btn" class="hub-action-btn" hidden>&#9650; Collapse all</button>
     </div>
     <p id="vis-status" style="font-size:12px;color:var(--text-dim);margin:0 0 6px" hidden></p>
-    <div class="table-wrap">
+    <div class="table-wrap table-wrap--fill">
       <table id="vis-table">
         <thead><tr id="vis-thead-row"></tr></thead>
         <tbody id="bm-visits-tbody"><tr class="empty-row"><td colspan="7">Loading&hellip;</td></tr></tbody>
       </table>
     </div>
-    <div id="vis-pagination"></div>
+    <div id="vis-pagination" class="table-pager"></div>
   </section>
 
   <!-- Bookmarks — Embeddings -->

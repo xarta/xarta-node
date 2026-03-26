@@ -65,6 +65,8 @@
     shade.classList.remove('is-dragging');
     if (handle) handle.classList.remove('is-dragging');
     document.body.classList.add('shade-is-up');
+    // Shade has settled at top — resize the fill table to the new position.
+    sizeFillTable();
   }
 
   /* ── Release held-up state (shade stays at same translateY visually) ────── */
@@ -143,6 +145,8 @@
       applyTranslate(0, false);
       // Snap went down — restore header and menu zone.
       document.body.classList.remove('shade-is-up');
+      // After the CSS transition settles, resize fill table to restored position.
+      setTimeout(sizeFillTable, TRANSITION + 50);
     }
   }
 
@@ -210,7 +214,32 @@
     maxTravel = 0;  // will be recomputed on next drag-start
   }
 
-  /* ── Initialise ─────────────────────────────────────────────────────────── */
+  /* ── Size the fill table in the active panel ───────────────────────────────
+     Old-school approach: measure exactly where .table-wrap--fill starts on
+     screen, set its height to fill the remaining viewport minus the pager.
+     No CSS variable arithmetic — just measure and set. ── */
+  function sizeFillTable() {
+    var panel = shade ? shade.querySelector('.tab-panel--fill.active') : null;
+    // Toggle body class so page scroll is locked exactly when a fill tab is on.
+    document.body.classList.toggle('has-fill-tab', !!panel);
+    if (!panel) return;
+    var fill = panel.querySelector('.table-wrap--fill');
+    if (!fill) return;
+    var pager = panel.querySelector('.table-pager');
+    var pagerH = pager ? 44 : 0;
+    // getBoundingClientRect gives viewport-relative position.
+    // has-fill-tab sets overflow:hidden so scroll is locked at 0 — accurate.
+    var top = fill.getBoundingClientRect().top;
+    fill.style.height = Math.max(50, window.innerHeight - top - pagerH) + 'px';
+  }
+
+  var _fillTimer = null;
+  function scheduleSizeFillTable() {
+    clearTimeout(_fillTimer);
+    _fillTimer = setTimeout(sizeFillTable, 50);
+  }
+
+  /* ─────────────────────────────────────────────────────────────────────── */
   function init() {
     shade = document.getElementById('body-shade');
     if (!shade) return;
@@ -223,8 +252,12 @@
         document.documentElement.style.setProperty('--header-h', siteHeader.offsetHeight + 'px');
       };
       updateHeaderH();
-      new ResizeObserver(updateHeaderH).observe(siteHeader);
+      var roHeader = new ResizeObserver(updateHeaderH);
+      roHeader.observe(siteHeader);
     }
+
+    // Resize fill table on window resize (e.g. orientation change).
+    window.addEventListener('resize', scheduleSizeFillTable);
 
     // Bind drag events to every handle inside the shade
     shade.querySelectorAll('.body-shade-handle').forEach(bindHandle);
@@ -232,6 +265,9 @@
     // Set the initially active tab's handle
     var activePanel = shade.querySelector('.tab-panel.active');
     handle = activePanel ? activePanel.querySelector('.body-shade-handle') : null;
+
+    // Initial fill-table sizing (deferred so the page has fully laid out).
+    scheduleSizeFillTable();
 
     // Patch window.switchTab to track handle changes on tab navigation.
     // We query the DOM after the switch rather than using the tab ID, so that
@@ -251,6 +287,8 @@
           handle    = newHandle;
           maxTravel = 0;
         }
+        // Resize fill table for the newly active panel.
+        scheduleSizeFillTable();
       };
     }
   }
