@@ -337,7 +337,9 @@
   <section id="tab-docs-list" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">All documents — drag to reorder or move between groups. Drag group headings to reorder groups.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div id="docs-list-pane" style="display:flex;flex-direction:column;overflow-y:auto;padding:4px 0"></div>
+    <div class="tab-scroll-shell">
+      <div id="docs-list-pane" style="display:flex;flex-direction:column;padding:4px 0"></div>
+    </div>
   </section>
 
   <!-- Docs — Images -->
@@ -361,8 +363,10 @@
       </select>
     </div>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <!-- Image list -->
-    <div id="doc-images-list"></div>
+    <div class="tab-scroll-shell">
+      <!-- Image list -->
+      <div id="doc-images-list"></div>
+    </div>
   </section>
 
   <!-- Self Diagnostic -->
@@ -370,7 +374,9 @@
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
     <p id="self-diag-status" style="font-size:12px;margin:0 0 10px" hidden></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div id="self-diag-results"></div>
+    <div class="tab-scroll-shell">
+      <div id="self-diag-results"></div>
+    </div>
   </section>
 
   <!-- Synthesis — Layout editor -->
@@ -680,6 +686,7 @@
   <section id="tab-keys" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Manage probe SSH keys on this node. Keys are stored at paths configured by env vars — paths are never supplied by the browser.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
+    <div class="tab-scroll-shell">
     <!-- Status table -->
     <div class="table-wrap" style="margin-bottom:20px;">
       <table>
@@ -747,6 +754,7 @@
         </div>
       </div>
     </div>
+    </div><!-- /tab-scroll-shell -->
   </section>
 
   <!-- Certs -->
@@ -754,6 +762,7 @@
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Manage TLS certificates on this node. Certificates are stored in <strong><span id="certs-dir-hint"></span></strong> and are never committed to any git repository.</p>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Upload only &mdash; no download. CA certificates are installed into the system trust store automatically on upload.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
+    <div class="tab-scroll-shell">
     <!-- Status table -->
     <div class="table-wrap table-wrap--fill" style="margin-bottom:20px;">
       <table>
@@ -764,12 +773,14 @@
       </table>
     </div>
     <p id="certs-status-error" class="error-msg" hidden></p>
+    </div><!-- /tab-scroll-shell -->
   </section>
 
   <!-- AI Providers -->
   <section id="tab-ai-providers" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
+    <div class="tab-scroll-shell">
     <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 8px">Providers</h3>
     <div class="table-wrap" style="margin-bottom:20px">
       <table>
@@ -790,6 +801,7 @@
       </table>
     </div>
     <p id="ai-providers-error" class="error-msg" hidden></p>
+    </div><!-- /tab-scroll-shell -->
   </section>
 
   <!-- Nav Items -->
@@ -797,7 +809,9 @@
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">CMS-driven navigation items — edit labels, icons, sounds and sort order. Changes are fleet-synced automatically.</p>
     <p id="nav-items-status" style="font-size:13px;margin-bottom:8px"></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div id="nav-items-container"></div>
+    <div class="tab-scroll-shell">
+      <div id="nav-items-container"></div>
+    </div>
   </section>
 
   <!-- Form Controls -->
@@ -805,7 +819,9 @@
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Assign sounds and icons to form controls (inputs, selects, toggles, buttons) by their <code>data-fc-key</code> identifier. Changes are fleet-synced. Bulk asset uploads are done via the Nav Items page — both pages share the same asset folder.</p>
     <p id="fc-status" style="font-size:13px;margin-bottom:8px"></p>
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
-    <div id="fc-container"></div>
+    <div class="tab-scroll-shell">
+      <div id="fc-container"></div>
+    </div>
   </section>
 
   <!-- SSH Targets -->
@@ -919,6 +935,7 @@
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Import guide for Edge Favourites and step-by-step browser extension install.</p>
     <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
     <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
+    <div class="tab-scroll-shell">
     <div id="bm-setup-panel">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Import from Edge card -->
@@ -965,6 +982,7 @@
         </div>
       </div>
     </div>
+    </div><!-- /tab-scroll-shell -->
   </section>
 
   <!-- Settings — Layout editor -->
