@@ -126,6 +126,28 @@ body.shade-is-up #docs-preview {
   max-height: calc(100vh - 20px) !important;
 }
 
+/* ── Scroll shell — non-fill / multi-content panels ─────────────────────── */
+/* Panels with substantial content below their handle (Template C and D      */
+/* variants) wrap that content in a <div class="tab-scroll-shell"> placed    */
+/* immediately after the .body-shade-handle.                                 */
+/* When shade is raised the shell becomes the vertical scroll viewport.      */
+/* SCOPE: only fires under body.shade-is-up — zero effect on normal state.  */
+/* Template A (fill) and Template B pages have no .tab-scroll-shell, so      */
+/* these rules do NOT touch them at all.                                     */
+body.shade-is-up .tab-scroll-shell {
+  overflow-y: auto;
+  max-height: calc(100vh - 20px);
+}
+
+/* Table-wraps inside a scroll shell: let the SHELL handle scrolling rather  */
+/* than each individual table. Cancel the independent max-height that the    */
+/* plain body.shade-is-up .table-wrap rule would otherwise impose, which     */
+/* would create a confusing double-scroll (table AND shell both scrolling).  */
+/* Higher specificity (0,3,0 vs 0,2,0) plus !important beats the base rule.  */
+body.shade-is-up .tab-scroll-shell .table-wrap {
+  max-height: none !important;
+}
+
 /* ── Narrow mobile (≤600px): match main's 10px padding ──────────────────── */
 @media (max-width: 600px) {
   .body-shade-handle {
