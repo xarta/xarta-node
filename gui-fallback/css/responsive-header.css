@@ -30,6 +30,12 @@
     align-items: center;
     gap: 6px 8px;
     margin-bottom: 16px;
+    /* Stick below the header so the nav controls stay visible during page scroll.
+       --header-h is set by body-shade.js ResizeObserver; 50px is a safe fallback. */
+    position: sticky;
+    top: var(--header-h, 50px);
+    z-index: 350;
+    background: var(--bg);
 }
 
 /* The split-menu system lives here — flex:0 0 auto keeps it from stretching */

@@ -215,6 +215,17 @@
     shade = document.getElementById('body-shade');
     if (!shade) return;
 
+    // Track header height and expose as --header-h so .menu-zone can
+    // sticky-pin immediately below the header on all screen sizes.
+    var siteHeader = document.querySelector('header');
+    if (siteHeader && window.ResizeObserver) {
+      var updateHeaderH = function () {
+        document.documentElement.style.setProperty('--header-h', siteHeader.offsetHeight + 'px');
+      };
+      updateHeaderH();
+      new ResizeObserver(updateHeaderH).observe(siteHeader);
+    }
+
     // Bind drag events to every handle inside the shade
     shade.querySelectorAll('.body-shade-handle').forEach(bindHandle);
 
