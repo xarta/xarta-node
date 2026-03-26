@@ -495,13 +495,6 @@ function _docsRenderList() {
   if (!pane) return;
   pane.innerHTML = '';
 
-  const header = document.createElement('div');
-  header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-shrink:0';
-  header.innerHTML = `
-    <span style="font-size:12px;color:var(--text-dim)">Drag documents to reorder or move between groups. Drag group headings to reorder groups.</span>
-  `;
-  pane.appendChild(header);
-
   const container = document.createElement('div');
   container.id = 'docs-list-container';
   container.style.cssText = 'display:flex;flex-direction:column;gap:10px;flex:1';

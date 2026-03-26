@@ -88,7 +88,13 @@ function renderFormControls() {
         </thead>
         <tbody id="fc-tbody"></tbody>
     `;
-    container.appendChild(table);
+    // Wrap in table-wrap to constrain horizontal overflow — prevents the wide
+    // table from spilling past the viewport width (which caused browser zoom on
+    // narrow/rotated mobile viewports).
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-wrap';
+    tableWrap.appendChild(table);
+    container.appendChild(tableWrap);
 
     const tbody = table.querySelector('#fc-tbody');
     const sorted = [..._fcItems].sort((a, b) =>
