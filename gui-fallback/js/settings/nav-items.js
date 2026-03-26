@@ -54,12 +54,18 @@ async function loadNavItems() {
 // ── Table rendering ───────────────────────────────────────────────────────────
 
 function renderNavItems() {
+    const bulkArea  = document.getElementById('nav-items-bulk-area');
     const container = document.getElementById('nav-items-container');
     if (!container) return;
-    container.innerHTML = '';
 
-    // Bulk upload panel (top of page, above the item tables)
-    container.appendChild(_niBulkUploadPanelEl());
+    // Bulk upload panel lives ABOVE the drag handle (hidden when shade drags up)
+    if (bulkArea) {
+        bulkArea.innerHTML = '';
+        bulkArea.appendChild(_niBulkUploadPanelEl());
+    }
+
+    // Group tables live BELOW the drag handle (remain visible when shade drags up)
+    container.innerHTML = '';
 
     const groups = ['probes', 'synthesis', 'settings'];
     for (const group of groups) {
