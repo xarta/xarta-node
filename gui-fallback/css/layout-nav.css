@@ -1,6 +1,7 @@
 /* ── Layout ── */
 /* header: full-bleed background; .header-inner: constrained to match main width */
-header { background: var(--surface); border-bottom: 1px solid var(--border); }
+header { background: var(--surface); border-bottom: 1px solid var(--border);
+         position: sticky; top: 0; z-index: 400; }
 .header-inner { max-width: 1400px; margin: 0 auto; padding: 10px 16px;
                 display: flex; align-items: center; gap: 0; flex-wrap: wrap; width: 100%; }
 header .brand { font-size: 15px; font-weight: 700; letter-spacing: .3px; white-space: nowrap;

@@ -94,6 +94,19 @@ body.shade-is-up .menu-zone {
   visibility: hidden;
 }
 
+/* Lock page scroll when shade is up — prevents the handle scrolling off-screen. */
+body.shade-is-up {
+  overflow: hidden;
+}
+
+/* When shade is locked up, expand table-wraps to fill the newly freed viewport
+   space. Without this, .table-wrap keeps its original max-height (calculated
+   for the full header+menu layout) and leaves dead space at the bottom.
+   Handle is 20px; table-wrap fills the remaining 100vh below it. */
+body.shade-is-up .table-wrap {
+  max-height: calc(100vh - 20px) !important;
+}
+
 /* ── Narrow mobile (≤600px): match main's 10px padding ──────────────────── */
 @media (max-width: 600px) {
   .body-shade-handle {
