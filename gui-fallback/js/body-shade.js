@@ -64,6 +64,7 @@
     if (handle) handle.classList.add('is-up');
     shade.classList.remove('is-dragging');
     if (handle) handle.classList.remove('is-dragging');
+    document.body.classList.add('shade-is-up');
   }
 
   /* ── Release held-up state (shade stays at same translateY visually) ────── */
@@ -71,6 +72,7 @@
     shade.classList.remove('is-up');
     if (handle) handle.classList.remove('is-up');
     isUp = false;
+    document.body.classList.remove('shade-is-up');
     // shadeY and --shade-y are already set to -maxTravel; leave them as-is
     // so when drag resumes the position is continuous.
   }
@@ -83,6 +85,9 @@
       // maxTravel is still valid from when we entered up — keep it
       startShadeY = shadeY;   // shadeY == -maxTravel
     } else {
+      // Hide header and menu zone immediately on drag-start so fixed/stacked
+      // elements don't paint over the shade during the drag animation.
+      document.body.classList.add('shade-is-up');
       var prevScrollY = window.scrollY;
       maxTravel   = computeMaxTravel();
       startShadeY = shadeY;
@@ -136,6 +141,8 @@
       setTimeout(enterUp, TRANSITION);
     } else {
       applyTranslate(0, false);
+      // Snap went down — restore header and menu zone.
+      document.body.classList.remove('shade-is-up');
     }
   }
 
@@ -216,13 +223,23 @@
     handle = activePanel ? activePanel.querySelector('.body-shade-handle') : null;
 
     // Patch window.switchTab to track handle changes on tab navigation.
-    // body-shade.js loads before app.js, so switchTab is already defined at
-    // this point, and the patch is in place before app.js DOMContentLoaded fires.
+    // We query the DOM after the switch rather than using the tab ID, so that
+    // alias IDs (e.g. 'manual-links-table' → tab-manual-links) work correctly.
     if (typeof window.switchTab === 'function') {
       var orig = window.switchTab;
       window.switchTab = function (tab) {
         orig.apply(this, arguments);
-        setActiveHandle(tab);
+        // Find whichever panel is now active and adopt its handle
+        var activePanel = shade.querySelector('.tab-panel.active');
+        var newHandle   = activePanel ? activePanel.querySelector('.body-shade-handle') : null;
+        if (newHandle !== handle) {
+          if (isUp) exitUp();
+          shade.classList.remove('is-dragging');
+          applyTranslate(0, false);
+          if (handle) handle.classList.remove('is-up', 'is-grabbing', 'is-dragging');
+          handle    = newHandle;
+          maxTravel = 0;
+        }
       };
     }
   }

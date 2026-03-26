@@ -87,6 +87,13 @@
   opacity: 1 !important;
 }
 
+/* When shade is locked up, hide the header and menu zone — their fixed/stacked
+   elements can't be painted over by a translateY element in normal flow. */
+body.shade-is-up header,
+body.shade-is-up .menu-zone {
+  visibility: hidden;
+}
+
 /* ── Narrow mobile (≤600px): match main's 10px padding ──────────────────── */
 @media (max-width: 600px) {
   .body-shade-handle {
