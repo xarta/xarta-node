@@ -1,130 +1,96 @@
-/* ── Body Shade — mobile pull-up content shade ─────────────────────────────
-   Mobile-only (< 769px). Entirely additive — no existing rules overridden.
-   The handle sits between .menu-zone and tab content; dragging it up slides
-   content over the header/menu, maximising screen real estate.
+/* ── Body Shade — pull-up content shade (all screen sizes) ──────────────────
+   Handles live INSIDE each tab panel, at the boundary between intro content
+   (title, description, controls) and the main data area (table, document…).
+   Dragging up slides the shade toward the bottom of the menu zone, maximising
+   the data area. Works on all screen sizes — desktop mouse drag AND touch.
 
-   Two states:
-     default   → handle + shade in normal document flow, transform-driven
-     .is-up    → handle + shade position:fixed (full-screen, own scroll)
-     .is-dragging → CSS transition suppressed during active gesture
+   Architecture:
+     Handle is a child of .body-shade — it moves with the shade automatically.
+     Only .body-shade receives the --shade-y / translateY treatment.
+     No position:fixed switching — shade stays in normal document flow at all
+     times. This keeps the header and menu zone fully accessible.
+
+   States:
+     down (default)  → translateY=0; is-up absent
+     dragging        → translateY tracks pointer; .is-dragging suppresses transition
+     up              → translateY held at -maxTravel; .is-up applied
    ────────────────────────────────────────────────────────────────────────── */
 
-/* ── Handle — hidden on desktop ─────────────────────────────────────────── */
+/* ── Handle — all screen sizes ──────────────────────────────────────────── */
 .body-shade-handle {
-  display: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 20px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  /* Extend to full width (cancels main's 16px side padding) */
+  margin-left: -16px;
+  margin-right: -16px;
+  /* Dim by default — hardens on hover or active grab */
+  opacity: 0.25;
+  transition: opacity 0.3s ease;
+}
+
+.body-shade-handle:hover {
+  opacity: 1;
+}
+
+.body-shade-handle.is-grabbing {
+  cursor: grabbing;
+  opacity: 1;
 }
 
 /* ── Grip pill ───────────────────────────────────────────────────────────── */
 .body-shade-grip {
-  width: 40px;
+  width: 36px;
   height: 4px;
   border-radius: 2px;
-  background: rgba(var(--hub-accent-rgb), 0.4);
+  background: rgba(var(--hub-accent-rgb), 0.6);
   pointer-events: none;
-  transition: background 0.2s ease;
+  transition: background 0.2s ease, width 0.2s ease;
 }
 
+.body-shade-handle:hover .body-shade-grip,
 .body-shade-handle.is-grabbing .body-shade-grip {
-  background: rgba(var(--hub-accent-rgb), 0.7);
+  background: rgba(var(--hub-accent-rgb), 1.0);
+  width: 52px;
 }
 
-/* ── Mobile layout ───────────────────────────────────────────────────────── */
-@media (max-width: 768px) {
-
-  /* Handle — pill strip between menu-zone and content */
-  .body-shade-handle {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 24px;
-    cursor: grab;
-    touch-action: none;
-    user-select: none;
-    -webkit-user-select: none;
-    position: relative;
-    z-index: 101;
-    background: var(--bg);
-    /* Extend to full viewport width (compensates main's 16px padding at this breakpoint) */
-    margin-left: -16px;
-    margin-right: -16px;
-    transform: translateY(var(--shade-y, 0px));
-    transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-  }
-
-  /* Suppress transition during active drag */
-  .body-shade-handle.is-dragging {
-    transition: none;
-  }
-
-  .body-shade-handle.is-grabbing {
-    cursor: grabbing;
-  }
-
-  /* Fixed-up state: handle pinned to viewport top */
-  .body-shade-handle.is-up {
-    position: fixed !important;
-    top: 0;
-    left: 0;
-    right: 0;
-    margin: 0;
-    transform: none !important;
-    transition: none !important;
-    z-index: 101;
-  }
-
-  /* Shade wrapper — wraps all .tab-panel sections */
-  .body-shade {
-    position: relative;
-    z-index: 100;
-    background: var(--bg);
-    transform: translateY(var(--shade-y, 0px));
-    transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-    /* Extend to full viewport width (compensates main's 16px padding at this breakpoint) */
-    margin-left: -16px;
-    margin-right: -16px;
-    padding-left: 16px;
-    padding-right: 16px;
-  }
-
-  /* Suppress transition during active drag */
-  .body-shade.is-dragging {
-    transition: none;
-  }
-
-  /* Fixed-up state: shade fills viewport below handle */
-  .body-shade.is-up {
-    position: fixed !important;
-    top: 24px; /* = handle height */
-    left: 0;
-    right: 0;
-    bottom: 0;
-    margin: 0;
-    padding-left: 16px;
-    padding-right: 16px;
-    overflow-y: auto;
-    transform: none !important;
-    transition: none !important;
-    min-height: 0 !important;
-    z-index: 100;
-  }
+/* ── Shade wrapper ───────────────────────────────────────────────────────── */
+.body-shade {
+  position: relative;
+  z-index: 1;          /* creates stacking context — paints over header/menu-zone when slid up */
+  background: var(--bg);
+  transform: translateY(var(--shade-y, 0px));
+  transition: transform 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 
-/* ── Narrow mobile (≤600px): match main's 10px padding at this breakpoint ── */
+/* Suppress transition during active drag */
+.body-shade.is-dragging {
+  transition: none;
+}
+
+/* Up state: shade is held at translateY(-maxTravel) — still in normal flow.
+   No position:fixed; header and menu zone remain visible and accessible. */
+.body-shade.is-up {
+  /* translateY is already set via --shade-y; no additional styles needed. */
+}
+
+/* Handle in up state — keep it fully visible so the user can drag back down */
+.body-shade-handle.is-up {
+  opacity: 1 !important;
+}
+
+/* ── Narrow mobile (≤600px): match main's 10px padding ──────────────────── */
 @media (max-width: 600px) {
   .body-shade-handle {
     margin-left: -10px;
     margin-right: -10px;
-  }
-
-  .body-shade {
-    margin-left: -10px;
-    margin-right: -10px;
-    padding-left: 10px;
-    padding-right: 10px;
-  }
-
-  .body-shade.is-up {
-    padding-left: 10px;
-    padding-right: 10px;
   }
 }

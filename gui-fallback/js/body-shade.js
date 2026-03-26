@@ -1,164 +1,230 @@
-/* ── Body Shade — mobile pull-up content shade ─────────────────────────────
+/* ── Body Shade — pull-up content shade (all screen sizes) ──────────────────
    Self-contained IIFE module. No external dependencies.
-   Only active on touch devices — desktop ignores the handle via CSS.
+   Works on every screen size — touch (mobile) + mouse (desktop).
+
+   Handles live INSIDE tab panels at the data boundary.
+   The handle is a child of .body-shade and moves with the shade automatically.
+   Only .body-shade receives the --shade-y / translateY transform.
 
    States:
-     down (default)  → handle + shade in normal document flow, translateY=0
-     dragging        → translateY follows finger; --shade-y drives CSS transform
-     up (fixed)      → handle + shade position:fixed; shade has own scroll
+     down (default)  → shade in normal flow, translateY=0
+     dragging        → translateY tracks pointer; transition suppressed
+     up              → shade held at translateY(-maxTravel), is-up class applied
 
-   Scroll strategy:
-     We call window.scrollTo(0, 0) before any snap-up animation so that
-     the translateY math (which references the handle's viewport position)
-     is consistent. In fixed-up state the shade provides its own overflow-y
-     scroll, so users can continue reading without the page scrolling.
+   No position:fixed switching. The shade stays in normal flow at all times.
+   maxTravel = distance from handle to the bottom of .menu-zone
+   (or the top of <main> if .menu-zone is absent). This ensures the handle
+   never travels above the persistent nav — the menu zone stays accessible.
 
-   Transition from fixed-up → dragging-down:
-     We pre-set --shade-y = -maxTravel BEFORE removing .is-up, so that
-     when position:fixed drops away, the translateY activates at the same
-     visual position (no jump). This relies on scrollY = 0 at that moment.
+   Tab switching:
+     window.switchTab is patched at init time (body-shade.js loads before
+     app.js, so patch is in place before app.js DOMContentLoaded fires).
 ──────────────────────────────────────────────────────────────────────────── */
 (function () {
   'use strict';
 
-  var HANDLE_H   = 24;   // px — must match .body-shade-handle height in CSS
   var SNAP_VELO  = 250;  // px/s — velocity threshold for fast-flick snap
   var TRANSITION = 300;  // ms — must match CSS transition duration
 
-  var handle, shade;
-  var shadeY    = 0;     // current translateY value (0 = down, negative = up)
-  var maxTravel = 0;     // px — handle's natural distance from viewport top (at scrollY=0)
+  var shade;
+  var handle    = null;  // active handle (inside currently visible tab panel)
+  var shadeY    = 0;     // current translateY (0 = down, negative = up)
+  var maxTravel = 0;     // max distance shade can travel upward
   var isUp      = false;
 
-  var dragging     = false;
-  var startTouchY  = 0;
-  var startShadeY  = 0;
-  var lastTouchY   = 0;
-  var lastTouchT   = 0;
-  var vel          = 0;  // px/s, EMA (negative = moving up)
+  var dragging      = false;
+  var startPointerY = 0;
+  var startShadeY   = 0;
+  var lastPointerY  = 0;
+  var lastPointerT  = 0;
+  var vel           = 0;   // px/s, EMA (negative = moving up)
 
-  /* ── Apply translateY to both elements via CSS custom property.
-     instant=true  → suppress CSS transition (during drag)
-     instant=false → allow CSS transition (snap animation)              */
+  /* ── Compute maxTravel for the current handle ───────────────────────────── */
+  /* maxTravel = pixels the shade must slide up so the handle reaches the
+     very top of the viewport (y=0), hiding header, menu zone, and description.
+     Must be measured at scrollY=0 so getBoundingClientRect gives true
+     page coordinates (handleTop == distance from viewport top in natural state). */
+  function computeMaxTravel() {
+    if (!handle) return 0;
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    return Math.max(0, handle.getBoundingClientRect().top);
+  }
+
+  /* ── Apply translateY to shade only (handle rides along as a child) ────── */
   function applyTranslate(y, instant) {
     shadeY = y;
-    handle.classList.toggle('is-dragging', instant);
-    shade.classList.toggle('is-dragging',  instant);
-    handle.style.setProperty('--shade-y', y + 'px');
-    shade.style.setProperty('--shade-y',  y + 'px');
+    shade.classList.toggle('is-dragging', instant);
+    shade.style.setProperty('--shade-y', y + 'px');
   }
 
-  /* ── Switch to position:fixed (fully-up state).
-     Called via setTimeout after the snap-up CSS transition completes.  */
-  function enterFixed() {
+  /* ── Mark shade as held-up (translateY already at -maxTravel) ───────────── */
+  function enterUp() {
     isUp = true;
-    handle.classList.add('is-up');
     shade.classList.add('is-up');
-    // --shade-y no longer needed; .is-up enforces transform:none via !important
-    handle.style.removeProperty('--shade-y');
-    shade.style.removeProperty('--shade-y');
-    handle.classList.remove('is-dragging');
+    if (handle) handle.classList.add('is-up');
     shade.classList.remove('is-dragging');
-    shadeY = 0;
+    if (handle) handle.classList.remove('is-dragging');
   }
 
-  /* ── Switch from position:fixed back to translateY without a visual jump.
-     Pre-sets --shade-y while .is-up is still active (transform:none!important
-     suppresses it visually). When .is-up is removed translateY activates
-     at the same visual position. Only safe when window.scrollY === 0.     */
-  function exitFixed() {
-    handle.style.setProperty('--shade-y', (-maxTravel) + 'px');
-    shade.style.setProperty('--shade-y',  (-maxTravel) + 'px');
-    handle.classList.add('is-dragging'); // suppress transition during switch
-    shade.classList.add('is-dragging');
-    handle.classList.remove('is-up');
+  /* ── Release held-up state (shade stays at same translateY visually) ────── */
+  function exitUp() {
     shade.classList.remove('is-up');
-    isUp   = false;
-    shadeY = -maxTravel;
+    if (handle) handle.classList.remove('is-up');
+    isUp = false;
+    // shadeY and --shade-y are already set to -maxTravel; leave them as-is
+    // so when drag resumes the position is continuous.
   }
 
-  /* ── Touch handlers ───────────────────────────────────────────────────── */
-  function onTouchStart(e) {
-    if (e.touches.length !== 1) return;
-    e.preventDefault();
-
+  /* ── Shared drag start (touch and mouse) ───────────────────────────────── */
+  function startDrag(clientY) {
+    if (!handle) return false;
     if (isUp) {
-      // Coming from fixed-up: ensure page at top so translateY math aligns
-      window.scrollTo(0, 0);
-      exitFixed();
-      startShadeY = -maxTravel;
+      exitUp();
+      // maxTravel is still valid from when we entered up — keep it
+      startShadeY = shadeY;   // shadeY == -maxTravel
     } else {
-      // Ensure page at top for consistent maxTravel calculation
-      if (window.scrollY !== 0) window.scrollTo(0, 0);
-      // maxTravel = handle's natural distance from viewport top.
-      // rect.top = naturalTop + shadeY (translate included).
-      // naturalTop = rect.top - shadeY. The shadeY terms cancel correctly for
-      // any current shadeY value (see: maxTravel = rect.top - shadeY = naturalTop).
-      var rect = handle.getBoundingClientRect();
-      maxTravel   = Math.max(0, rect.top - shadeY);
+      var prevScrollY = window.scrollY;
+      maxTravel   = computeMaxTravel();
       startShadeY = shadeY;
+      // If computeMaxTravel scrolled the page to top, the handle jumped in the
+      // viewport.  Re-anchor so the first moveDrag delta starts from zero.
+      if (prevScrollY !== 0) {
+        clientY = handle.getBoundingClientRect().top + handle.offsetHeight / 2;
+      }
     }
-
-    dragging    = true;
-    startTouchY = e.touches[0].clientY;
-    lastTouchY  = startTouchY;
-    lastTouchT  = Date.now();
-    vel         = 0;
+    dragging      = true;
+    startPointerY = clientY;
+    lastPointerY  = clientY;
+    lastPointerT  = Date.now();
+    vel           = 0;
     handle.classList.add('is-grabbing');
+    return true;
   }
 
-  function onTouchMove(e) {
-    if (!dragging || e.touches.length !== 1) return;
-    e.preventDefault();
-
-    var ty  = e.touches[0].clientY;
+  /* ── Shared drag move ───────────────────────────────────────────────────── */
+  function moveDrag(clientY) {
     var now = Date.now();
-    var dt  = now - lastTouchT;
+    var dt  = now - lastPointerT;
     if (dt > 0) {
-      var inst = (ty - lastTouchY) / (dt / 1000); // instantaneous px/s
-      vel = vel * 0.6 + inst * 0.4;               // exponential moving average
+      var inst = (clientY - lastPointerY) / (dt / 1000);
+      vel = vel * 0.6 + inst * 0.4;
     }
-    lastTouchY = ty;
-    lastTouchT = now;
-
-    var newY = Math.min(0, Math.max(-maxTravel, startShadeY + (ty - startTouchY)));
-    applyTranslate(newY, true /* instant — no transition during drag */);
+    lastPointerY = clientY;
+    lastPointerT = now;
+    var newY = Math.min(0, Math.max(-maxTravel, startShadeY + (clientY - startPointerY)));
+    applyTranslate(newY, true);
   }
 
-  function onTouchEnd() {
+  /* ── Shared drag end ────────────────────────────────────────────────────── */
+  function endDrag() {
     if (!dragging) return;
     dragging = false;
-    handle.classList.remove('is-grabbing');
+    if (handle) handle.classList.remove('is-grabbing');
 
     if (maxTravel <= 0) {
       applyTranslate(0, false);
       return;
     }
 
-    // Snap decision: velocity takes priority; position (50% threshold) as fallback
     var goUp = Math.abs(vel) >= SNAP_VELO
-      ? vel < 0         // fast upward flick
-      : shadeY < -(maxTravel * 0.5); // past halfway
+      ? vel < 0
+      : shadeY < -(maxTravel * 0.5);
 
     if (goUp) {
-      window.scrollTo(0, 0); // ensure scrollY=0 before fixed switch
-      applyTranslate(-maxTravel, false); // animate to fully up
-      setTimeout(enterFixed, TRANSITION); // switch to fixed after transition
+      applyTranslate(-maxTravel, false);
+      // After transition completes, lock the up state
+      setTimeout(enterUp, TRANSITION);
     } else {
-      applyTranslate(0, false); // animate to fully down
+      applyTranslate(0, false);
     }
   }
 
-  /* ── Initialise ───────────────────────────────────────────────────────── */
-  function init() {
-    handle = document.getElementById('body-shade-handle');
-    shade  = document.getElementById('body-shade');
-    if (!handle || !shade) return;
+  /* ── Touch handlers ─────────────────────────────────────────────────────── */
+  function onTouchStart(e) {
+    if (e.touches.length !== 1) return;
+    e.preventDefault();
+    startDrag(e.touches[0].clientY);
+  }
 
-    handle.addEventListener('touchstart',  onTouchStart, { passive: false });
-    handle.addEventListener('touchmove',   onTouchMove,  { passive: false });
-    handle.addEventListener('touchend',    onTouchEnd,   { passive: true });
-    handle.addEventListener('touchcancel', onTouchEnd,   { passive: true });
+  function onTouchMove(e) {
+    if (!dragging || e.touches.length !== 1) return;
+    e.preventDefault();
+    moveDrag(e.touches[0].clientY);
+  }
+
+  function onTouchEnd() { endDrag(); }
+
+  /* ── Mouse handlers (desktop drag) ─────────────────────────────────────── */
+  function onMouseDown(e) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    if (startDrag(e.clientY)) {
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup',   onMouseUp);
+    }
+  }
+
+  function onMouseMove(e) {
+    if (!dragging) return;
+    moveDrag(e.clientY);
+  }
+
+  function onMouseUp() {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup',   onMouseUp);
+    endDrag();
+  }
+
+  /* ── Bind all drag events to a handle element ───────────────────────────── */
+  function bindHandle(el) {
+    if (!el) return;
+    el.addEventListener('touchstart',  onTouchStart, { passive: false });
+    el.addEventListener('touchmove',   onTouchMove,  { passive: false });
+    el.addEventListener('touchend',    onTouchEnd,   { passive: true });
+    el.addEventListener('touchcancel', onTouchEnd,   { passive: true });
+    el.addEventListener('mousedown',   onMouseDown);
+  }
+
+  /* ── Update active handle when tab switches ─────────────────────────────── */
+  function setActiveHandle(tabId) {
+    var panel     = document.getElementById('tab-' + tabId);
+    var newHandle = panel ? panel.querySelector('.body-shade-handle') : null;
+    if (newHandle === handle) return;
+
+    // Snap shade back to down before switching tab context
+    if (isUp) {
+      exitUp();
+    }
+    shade.classList.remove('is-dragging');
+    applyTranslate(0, false);
+    if (handle) handle.classList.remove('is-up', 'is-grabbing', 'is-dragging');
+
+    handle    = newHandle;
+    maxTravel = 0;  // will be recomputed on next drag-start
+  }
+
+  /* ── Initialise ─────────────────────────────────────────────────────────── */
+  function init() {
+    shade = document.getElementById('body-shade');
+    if (!shade) return;
+
+    // Bind drag events to every handle inside the shade
+    shade.querySelectorAll('.body-shade-handle').forEach(bindHandle);
+
+    // Set the initially active tab's handle
+    var activePanel = shade.querySelector('.tab-panel.active');
+    handle = activePanel ? activePanel.querySelector('.body-shade-handle') : null;
+
+    // Patch window.switchTab to track handle changes on tab navigation.
+    // body-shade.js loads before app.js, so switchTab is already defined at
+    // this point, and the patch is in place before app.js DOMContentLoaded fires.
+    if (typeof window.switchTab === 'function') {
+      var orig = window.switchTab;
+      window.switchTab = function (tab) {
+        orig.apply(this, arguments);
+        setActiveHandle(tab);
+      };
+    }
   }
 
   document.readyState === 'loading'

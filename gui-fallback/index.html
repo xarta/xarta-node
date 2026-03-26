@@ -253,11 +253,6 @@
 
   </div><!-- /.menu-zone -->
 
-  <!-- Body shade drag handle: mobile-only pull-to-slide trigger -->
-  <div id="body-shade-handle" class="body-shade-handle" aria-hidden="true">
-    <div class="body-shade-grip"></div>
-  </div>
-
   <!-- Body shade wrapper: all tab panels live here -->
   <div id="body-shade" class="body-shade">
 
@@ -283,6 +278,7 @@
       <span id="sound-volume-label" style="font-size:12px;color:var(--text-dim);min-width:34px;white-space:nowrap;"></span>
       <span id="sound-enabled-status" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -317,6 +313,7 @@
           <div id="docs-active-label" style="font-size:15px;font-weight:700;color:var(--text)"></div>
           <div id="docs-active-desc"  style="font-size:12px;color:var(--text-dim);margin-top:1px"></div>
         </div>
+        <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
         <!-- Editor / preview fills remaining vertical space -->
         <textarea id="docs-editor"
           placeholder="# Document title&#10;&#10;Start writing here..."
@@ -339,6 +336,7 @@
   <!-- Docs — Doc List -->
   <section id="tab-docs-list" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">All documents — drag to reorder or move between groups. Drag group headings to reorder groups.</p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="docs-list-pane" style="display:flex;flex-direction:column;overflow-y:auto;padding:4px 0"></div>
   </section>
 
@@ -362,6 +360,7 @@
         <option value="">All tags</option>
       </select>
     </div>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <!-- Image list -->
     <div id="doc-images-list"></div>
   </section>
@@ -370,6 +369,7 @@
   <section id="tab-self-diag" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Tests connectivity and all passive (read-only) API endpoints on this node. No state is changed.</p>
     <p id="self-diag-status" style="font-size:12px;margin:0 0 10px" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="self-diag-results"></div>
   </section>
 
@@ -388,6 +388,7 @@
         <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
         <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
       </div>
+      <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
       <div id="synthesisMenuEditorList"></div>
     </div>
   </section>
@@ -395,6 +396,7 @@
   <!-- Manual Links -->
   <section id="tab-manual-links" class="tab-panel active">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Curated fallback links — VLAN and tailnet addresses for important services. Syncs across fleet.</p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
 
     <!-- TABLE VIEW -->
     <div id="ml-table-view" style="display:none">
@@ -428,6 +430,7 @@
 
   <!-- Services -->
   <section id="tab-services" class="tab-panel">
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead>
@@ -449,6 +452,7 @@
 
   <!-- Machines -->
   <section id="tab-machines" class="tab-panel">
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead>
@@ -475,6 +479,7 @@
       <strong style="color:var(--text)">GEN</strong> is each node&#8217;s local write counter — it increments independently on every node and is not comparable across nodes. Different GEN values between healthy nodes is normal. GEN is only used to detect DB corruption on restart.
     </p>
     <p id="retouch-status" style="font-size:12px;min-height:1.2em;margin-bottom:6px"></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead>
@@ -534,6 +539,7 @@
   <section id="tab-pfsense-dns" class="tab-panel">
     <p id="dns-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
     <p id="dns-sweep-status" style="font-size:12px;margin:2px 0 0" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead>
@@ -569,6 +575,7 @@
       <button class="hub-action-btn" id="pve-probe-services-btn">&#128065; Probe VM Services</button>
     </div>
     <p id="pve-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -584,6 +591,7 @@
   <!-- Dockge Stacks -->
   <section id="tab-dockge-stacks" class="tab-panel">
     <p id="dockge-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -598,6 +606,7 @@
   <!-- Caddy Configs -->
   <section id="tab-caddy-configs" class="tab-panel">
     <p id="caddy-probe-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -617,6 +626,7 @@
       then click <em>Scan for Proxmox</em>.
     </p>
     <p id="pve-scan-status" style="font-size:12px;margin:4px 0 0" hidden></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -635,6 +645,7 @@
       Inferred from Proxmox Config probe. CIDRs marked <em>inferred</em> are guessed as /24 from IP data
       — correct them here if needed. These are also used as scan ranges by <em>Find IPs by ARP</em>.
     </p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -653,6 +664,7 @@
       (e.g. CARP backup appliances, offline machines, odd devices).
       Entries sync automatically to all fleet nodes.
     </p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -667,7 +679,7 @@
   <!-- Keys -->
   <section id="tab-keys" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Manage probe SSH keys on this node. Keys are stored at paths configured by env vars — paths are never supplied by the browser.</p>
-
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <!-- Status table -->
     <div class="table-wrap" style="margin-bottom:20px;">
       <table>
@@ -741,7 +753,7 @@
   <section id="tab-certs" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Manage TLS certificates on this node. Certificates are stored in <strong><span id="certs-dir-hint"></span></strong> and are never committed to any git repository.</p>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Upload only &mdash; no download. CA certificates are installed into the system trust store automatically on upload.</p>
-
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <!-- Status table -->
     <div class="table-wrap" style="margin-bottom:20px;">
       <table>
@@ -757,7 +769,7 @@
   <!-- AI Providers -->
   <section id="tab-ai-providers" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Fleet-synced AI endpoint configuration. Providers store connection details; assignments link providers to named projects and roles.</p>
-
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <h3 style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-dim);margin:0 0 8px">Providers</h3>
     <div class="table-wrap" style="margin-bottom:20px">
       <table>
@@ -784,6 +796,7 @@
   <section id="tab-nav-items" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">CMS-driven navigation items — edit labels, icons, sounds and sort order. Changes are fleet-synced automatically.</p>
     <p id="nav-items-status" style="font-size:13px;margin-bottom:8px"></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="nav-items-container"></div>
   </section>
 
@@ -791,6 +804,7 @@
   <section id="tab-form-controls" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Assign sounds and icons to form controls (inputs, selects, toggles, buttons) by their <code>data-fc-key</code> identifier. Changes are fleet-synced. Bulk asset uploads are done via the Nav Items page — both pages share the same asset folder.</p>
     <p id="fc-status" style="font-size:13px;margin-bottom:8px"></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="fc-container"></div>
   </section>
 
@@ -798,6 +812,7 @@
   <section id="tab-ssh-targets" class="tab-panel">
     <p style="color:var(--text-dim);font-size:13px">Deterministic SSH key lookup by IP. Run <strong>Rebuild</strong> after any Proxmox Config probe to keep this table current. All probe scripts look up this table — no guessing.</p>
     <p id="ssh-targets-status" style="font-size:13px;color:var(--text-dim);margin-bottom:12px"></p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div class="table-wrap">
       <table>
         <thead><tr>
@@ -814,6 +829,7 @@
     <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Personal link manager. Fleet-synced via SQLite; hybrid keyword+vector search via local SeekDB index.</p>
     <!-- Hidden file input for Import HTML (triggered via menu or Setup tab) -->
     <input type="file" id="bm-import-file" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <!-- Search/filter controls are in #pg-ctrl-bookmarks-main inside .menu-zone
          (inline next to the split-menu on wide viewports; wraps below on narrow). -->
     <div id="bm-deadlink-panel" style="display:none;margin-bottom:8px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);font-size:12px"><span id="bm-deadlink-status" style="color:var(--text-dim)"></span><span id="bm-deadlink-results"></span></div>
@@ -836,6 +852,7 @@
   <!-- Bookmarks — Visit History -->
   <section id="tab-bookmarks-history" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Pages visited via the browser extension visit recorder. Click a row to see per-visit timestamps.</p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div style="display:flex;gap:6px;margin-bottom:8px">
       <button id="vis-expand-all-btn" class="hub-action-btn" hidden>&#9660; Expand all</button>
       <button id="vis-collapse-all-btn" class="hub-action-btn" hidden>&#9650; Collapse all</button>
@@ -853,6 +870,7 @@
   <!-- Bookmarks — Embeddings -->
   <section id="tab-bookmarks-embeddings" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Configure tag exclusions, rare domain weighting, and re-embed all bookmarks.</p>
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="bm-embed-panel">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Tag exclusion card -->
@@ -900,6 +918,7 @@
   <section id="tab-bookmarks-setup" class="tab-panel">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Import guide for Edge Favourites and step-by-step browser extension install.</p>
     <input type="file" id="bm-import-file2" accept=".html,.htm" style="display:none" onchange="importBookmarksFile(this)" />
+    <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
     <div id="bm-setup-panel">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
         <!-- Import from Edge card -->
@@ -963,6 +982,7 @@
         <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
         <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
       </div>
+      <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
       <div id="settingsMenuEditorList"></div>
     </div>
   </section>
@@ -982,6 +1002,7 @@
         <p>Drag items to reorder. Drag into the <strong>dashed drop zone</strong> inside a group to nest it as a submenu item.</p>
         <p><strong>⬆️</strong> promotes a nested item back to the top level. <strong>✏️</strong> renames the label. Changes are browser-local only.</p>
       </div>
+      <div class="body-shade-handle" aria-hidden="true"><div class="body-shade-grip"></div></div>
       <div id="probesMenuEditorList"></div>
     </div>
   </section>
