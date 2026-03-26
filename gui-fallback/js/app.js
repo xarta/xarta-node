@@ -64,7 +64,7 @@ function switchTab(tab) {
   if (tab === 'manual-links-table')    { switchTab('manual-links'); manualLinksShowView('table');    return; }
   if (tab === 'manual-links-rendered') { switchTab('manual-links'); manualLinksShowView('rendered'); return; }
   if (tab === 'settings'       && !_settings.length)      loadSettings();
-  if (tab === 'settings')                                  initSoundToggle();
+  if (tab === 'settings')                                  { initSoundToggle(); initVolumeSlider(); }
   if (tab === 'keys')                                      loadKeys();
   if (tab === 'certs')                                     loadCerts();
   if (tab === 'docs' && !_docsAll.length)                  loadDocs();

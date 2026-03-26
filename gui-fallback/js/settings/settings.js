@@ -132,6 +132,26 @@ async function saveCidr() {
   }
 }
 
+/* ── Sound volume slider (tab-local, stored in localStorage) ─────────── */
+function initVolumeSlider() {
+  const slider = document.getElementById('sound-volume-slider');
+  const label  = document.getElementById('sound-volume-label');
+  if (!slider) return;
+  const stored = parseFloat(localStorage.getItem('fe.sound_volume') ?? '0.8');
+  const v = isNaN(stored) ? 0.8 : Math.max(0, Math.min(1, stored));
+  slider.value = Math.round(v * 100);
+  if (label) label.textContent = `${Math.round(v * 100)}%`;
+  if (typeof SoundManager !== 'undefined') SoundManager.setVolume(v);
+}
+
+function setSoundVolume(pct) {
+  const v = Math.max(0, Math.min(100, parseInt(pct, 10))) / 100;
+  localStorage.setItem('fe.sound_volume', String(v));
+  if (typeof SoundManager !== 'undefined') SoundManager.setVolume(v);
+  const label = document.getElementById('sound-volume-label');
+  if (label) label.textContent = `${Math.round(v * 100)}%`;
+}
+
 /* ── Sound enabled toggle ─────────────────────────────────────────────── */
 function initSoundToggle() {
   const checkbox = document.getElementById('sound-enabled-toggle');

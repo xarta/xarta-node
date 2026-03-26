@@ -18,7 +18,9 @@
 
 const SoundManager = (() => {
     let _ctx = null;
+    let _gainNode = null;
     let _enabled = false;
+    let _volume = 0.8;
     let _cache = {};    // { url: AudioBuffer }
     let _loading = {};  // { url: Promise<void> }  — dedup concurrent loads
 
@@ -41,6 +43,18 @@ const SoundManager = (() => {
         }
     }
 
+    // Returns the shared GainNode (created once per AudioContext)
+    function _getGainNode() {
+        const ctx = _getCtx();
+        if (!ctx) return null;
+        if (!_gainNode) {
+            _gainNode = ctx.createGain();
+            _gainNode.gain.value = _volume;
+            _gainNode.connect(ctx.destination);
+        }
+        return _gainNode;
+    }
+
     // Wire up a one-time resume-on-first-interaction handler
     function _setupResumeOnGesture() {
         const handler = () => {
@@ -58,7 +72,19 @@ const SoundManager = (() => {
             if (typeof getFrontendSetting === 'function') {
                 _enabled = getFrontendSetting('sound_enabled', 'false') === 'true';
             }
+            // Read volume from localStorage (tab-local only — not synced to backend)
+            const stored = parseFloat(localStorage.getItem('fe.sound_volume') ?? '0.8');
+            _volume = isNaN(stored) ? 0.8 : Math.max(0, Math.min(1, stored));
             _setupResumeOnGesture();
+        },
+
+        setVolume(v) {
+            _volume = Math.max(0, Math.min(1, v));
+            if (_gainNode) _gainNode.gain.value = _volume;
+        },
+
+        getVolume() {
+            return _volume;
         },
 
         setEnabled(v) {
@@ -104,11 +130,13 @@ const SoundManager = (() => {
             if (!ctx) return;
             _resumeCtx();
 
+            const gainNode = _getGainNode();
+
             if (_cache[url]) {
                 try {
                     const source = ctx.createBufferSource();
                     source.buffer = _cache[url];
-                    source.connect(ctx.destination);
+                    source.connect(gainNode || ctx.destination);
                     source.start(0);
                 } catch (e) {
                     // Silently ignore playback errors
@@ -120,7 +148,7 @@ const SoundManager = (() => {
                         try {
                             const source = ctx.createBufferSource();
                             source.buffer = _cache[url];
-                            source.connect(ctx.destination);
+                            source.connect(gainNode || ctx.destination);
                             source.start(0);
                         } catch (e) {}
                     }
