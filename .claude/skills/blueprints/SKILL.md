@@ -13,7 +13,7 @@ See [references/architecture.md](references/architecture.md) for the full system
 |------|-------|
 | App code | `blueprints-app/` (this repo, public) |
 | Embed component | `gui-embed/` (this repo, public) |
-| Dashboard GUI | `.xarta/gui/` (private inner repo) |
+| Dashboard GUI (primary) | `gui-fallback/` (this repo, public) |
 | DB | `/opt/blueprints/data/db/` (not in git) |
 | Venv | `/opt/blueprints/venv/` (not in git) |
 | Node identity / peers / secrets | `.env` (gitignored) |
