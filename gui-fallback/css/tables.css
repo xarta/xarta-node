@@ -39,6 +39,9 @@
   background: var(--surface);
   border-top: 1px solid var(--border);
 }
+.table-pager[hidden] {
+  display: none !important;
+}
 .tab-panel--fill.active .table-pager {
   display: flex;
 }

@@ -121,11 +121,17 @@ let _bmLastSearchResults = []; // cached for re-render on column toggle
 // rendered slice changes.  All client-side filter/sort/search still operates
 // on the complete dataset — only the table render is sliced.
 const _BM_PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 1000, 2000, 5000, 10000];
-let _bmPage = 1;
-let _bmPageSize = (() => {
-  const n = parseInt(localStorage.getItem('bm-page-size') || '100', 10);
-  return _BM_PAGE_SIZE_OPTIONS.includes(n) ? n : 100;
-})();
+const _BM_PAGER = TablePager.create({
+  pagerId: 'bm-pagination',
+  pageSizeOptions: _BM_PAGE_SIZE_OPTIONS,
+  defaultPageSize: 100,
+  pageSizeStorageKey: 'bm-page-size',
+  enabledStorageKey: 'bm-pagination-enabled',
+  defaultEnabled: true,
+  onChange: function () {
+    renderBookmarks({ keepPage: true });
+  },
+});
 
 // Dynamic column list — derived from actual API response keys, not hardcoded
 let _bmDynCols = []; // populated by _bmDetectCols(); drives everything
@@ -358,9 +364,8 @@ async function _runBmSearch(q) {
 
 function _renderBmSearchResults(results) {
   _bmLastSearchResults = results;
-  // Search results replace the paginated browse view — clear pagination controls.
-  const pag = document.getElementById('bm-pagination');
-  if (pag) pag.innerHTML = '';
+  // Search results replace the paginated browse view — hide the pager entirely.
+  _BM_PAGER.hide();
   const tagFilter = document.getElementById('bm-tag-filter')?.value || '';
   let rows = tagFilter ? results.filter(r => (r.tags || []).includes(tagFilter)) : results;
   const tbody = document.getElementById('bm-tbody');
@@ -384,7 +389,7 @@ function _renderBmSearchResults(results) {
 
 function renderBookmarks(opts = {}) {
   if (_bmSearchActive) return;
-  if (!opts.keepPage) _bmPage = 1;
+  if (!opts.keepPage) _BM_PAGER.resetPage();
   const q = (document.getElementById('bm-search')?.value || '').toLowerCase();
   const tagFilter = document.getElementById('bm-tag-filter')?.value || '';
   let rows = _bookmarks;
@@ -400,7 +405,6 @@ function renderBookmarks(opts = {}) {
   if (tagFilter) {
     rows = rows.filter(b => (b.tags || []).includes(tagFilter));
   }
-  // Apply sort
   if (_bmSortCol) {
     rows = [...rows].sort((a, b) => {
       const av = _bmSortVal(a, _bmSortCol);
@@ -408,20 +412,13 @@ function renderBookmarks(opts = {}) {
       return _bmSortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
     });
   }
-  // Pagination: slice the filtered+sorted array for rendering.
-  // The full rows array is always processed above — only the table render is limited.
-  const totalRows = rows.length;
-  const totalPages = Math.max(1, Math.ceil(totalRows / _bmPageSize));
-  _bmPage = Math.max(1, Math.min(_bmPage, totalPages)); // clamp to valid range
-  const pageRows = totalRows > _bmPageSize
-    ? rows.slice((_bmPage - 1) * _bmPageSize, _bmPage * _bmPageSize)
-    : rows;
+  const pageData = _BM_PAGER.getSlice(rows);
+  const totalRows = pageData.totalItems;
+  const pageRows = pageData.items;
   const tbody = document.getElementById('bm-tbody');
   const status = document.getElementById('bm-search-status');
-  if (pageRows.length < totalRows) {
-    const from = (_bmPage - 1) * _bmPageSize + 1;
-    const to   = Math.min(_bmPage * _bmPageSize, totalRows);
-    status.textContent = `${totalRows} bookmark${totalRows === 1 ? '' : 's'} (showing ${from}\u2013${to})`;
+  if (pageData.enabled && pageData.paged) {
+    status.textContent = `${totalRows} bookmark${totalRows === 1 ? '' : 's'} (showing ${pageData.from}-${pageData.to})`;
   } else {
     status.textContent = totalRows + ' bookmark' + (totalRows === 1 ? '' : 's');
   }
@@ -430,51 +427,23 @@ function renderBookmarks(opts = {}) {
   if (!pageRows.length) {
     tbody.innerHTML = `<tr class="empty-row"><td colspan="${_bmColCount()}">No bookmarks found.</td></tr>`;
     _bmUpdateSortHeaders();
-    _bmRenderPagination(totalRows, _bmPageSize, _bmPage);
+    _BM_PAGER.render(totalRows);
     return;
   }
   tbody.innerHTML = pageRows.map(b => _bmBuildBookmarkRow(b)).join('');
   _bmUpdateSortHeaders();
   _bmInitColResize();
-  _bmRenderPagination(totalRows, _bmPageSize, _bmPage);
+  _BM_PAGER.render(totalRows);
 }
 
-// ── Pagination controls ──────────────────────────────────────────────────
-
-function _bmRenderPagination(total, pageSize, page) {
-  const el = document.getElementById('bm-pagination');
-  if (!el) return;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const sizeOpts = _BM_PAGE_SIZE_OPTIONS.map(n =>
-    `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`
-  ).join('');
-  const sizeSelect = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer">Per page:<select onchange="_bmSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select></label>`;
-  if (totalPages <= 1) {
-    el.innerHTML = sizeSelect;
-    return;
-  }
-  const prevDis = page <= 1 ? ' disabled' : '';
-  const nextDis = page >= totalPages ? ' disabled' : '';
-  el.innerHTML = `
-    <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_bmGoPage(${page - 1})">&#8592; Prev</button>
-    <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
-    <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_bmGoPage(${page + 1})">Next &#8594;</button>
-    ${sizeSelect}`;
+function _bmIsPaginationEnabled() {
+  return _BM_PAGER.isEnabled();
 }
 
-function _bmGoPage(n) {
-  _bmPage = n; // renderBookmarks will clamp to valid range via Math.min
-  renderBookmarks({ keepPage: true });
+function _bmTogglePagination() {
+  _BM_PAGER.toggleEnabled();
+  if (typeof ProbesMenuConfig !== 'undefined') ProbesMenuConfig.updateActiveTab();
 }
-
-function _bmSetPageSize(n) {
-  if (!_BM_PAGE_SIZE_OPTIONS.includes(n)) return;
-  _bmPageSize = n;
-  localStorage.setItem('bm-page-size', String(n));
-  _bmPage = 1;
-  renderBookmarks({ keepPage: true });
-}
-
 // ── Visits ──────────────────────────────────────────────────────────────
 
 // ── Visit column metadata ────────────────────────────────────────────────
@@ -511,11 +480,17 @@ let _visSortDir = 'desc';
 
 // Visual-only pagination for visits — same pattern as bookmarks
 const _VIS_PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 1000];
-let _visPage = 1;
-let _visPageSize = (() => {
-  const n = parseInt(localStorage.getItem('vis-page-size') || '100', 10);
-  return _VIS_PAGE_SIZE_OPTIONS.includes(n) ? n : 100;
-})();
+const _VIS_PAGER = TablePager.create({
+  pagerId: 'vis-pagination',
+  pageSizeOptions: _VIS_PAGE_SIZE_OPTIONS,
+  defaultPageSize: 100,
+  pageSizeStorageKey: 'vis-page-size',
+  enabledStorageKey: 'vis-pagination-enabled',
+  defaultEnabled: true,
+  onChange: function () {
+    renderVisits({ keepPage: true });
+  },
+});
 
 // Domain grouping — active when sorted by url or domain
 let _visExpandedDomains = new Set(); // domains currently expanded in group mode
@@ -618,7 +593,7 @@ async function loadVisits() {
 }
 
 function renderVisits(opts = {}) {
-  if (!opts.keepPage) _visPage = 1;
+  if (!opts.keepPage) _VIS_PAGER.resetPage();
   const q = (document.getElementById('bm-visit-search')?.value || '').toLowerCase();
   const savedFilter = document.getElementById('bm-visit-saved-filter')?.value || 'all';
   let rows = _bmVisits;
@@ -629,9 +604,8 @@ function renderVisits(opts = {}) {
       (v.domain || '').toLowerCase().includes(q)
     );
   }
-  if (savedFilter === 'saved')   rows = rows.filter(v => v.bookmark_id);
+  if (savedFilter === 'saved') rows = rows.filter(v => v.bookmark_id);
   if (savedFilter === 'unsaved') rows = rows.filter(v => !v.bookmark_id);
-  // Sort
   rows = [...rows].sort((a, b) => {
     const av = String(a[_visSortCol] ?? '').toLowerCase();
     const bv = String(b[_visSortCol] ?? '').toLowerCase();
@@ -641,27 +615,22 @@ function renderVisits(opts = {}) {
   });
 
   const groupMode = (_visSortCol === 'url' || _visSortCol === 'domain');
-  // Show/hide grouping controls
-  const expandBtn   = document.getElementById('vis-expand-all-btn');
+  const expandBtn = document.getElementById('vis-expand-all-btn');
   const collapseBtn = document.getElementById('vis-collapse-all-btn');
-  if (expandBtn)   expandBtn.hidden   = !groupMode;
+  if (expandBtn) expandBtn.hidden = !groupMode;
   if (collapseBtn) collapseBtn.hidden = !groupMode;
 
-  const cols  = _visVisibleCols();
+  const cols = _visVisibleCols();
   const tbody = document.getElementById('bm-visits-tbody');
   const status = document.getElementById('vis-status');
 
   if (!groupMode) {
-    // ── Non-group mode: paginate visit rows ──────────────────────────────
-    const total = rows.length;
-    const totalPages = Math.max(1, Math.ceil(total / _visPageSize));
-    _visPage = Math.max(1, Math.min(_visPage, totalPages));
-    const pageRows = rows.slice((_visPage - 1) * _visPageSize, _visPage * _visPageSize);
+    const pageData = _VIS_PAGER.getSlice(rows);
+    const total = pageData.totalItems;
+    const pageRows = pageData.items;
     if (status) {
-      if (total > _visPageSize) {
-        const from = (_visPage - 1) * _visPageSize + 1;
-        const to   = Math.min(_visPage * _visPageSize, total);
-        status.textContent = `${total} visit${total === 1 ? '' : 's'} (showing ${from}\u2013${to})`;
+      if (pageData.enabled && pageData.paged) {
+        status.textContent = `${total} visit${total === 1 ? '' : 's'} (showing ${pageData.from}-${pageData.to})`;
       } else {
         status.textContent = `${total} visit${total === 1 ? '' : 's'}`;
       }
@@ -670,7 +639,7 @@ function renderVisits(opts = {}) {
     if (!pageRows.length) {
       tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
       _visUpdateSortHeaders();
-      _visRenderPagination(total, _visPageSize, _visPage);
+      _VIS_PAGER.render(total);
       return;
     }
     const expandColspan = cols.length;
@@ -686,11 +655,10 @@ function renderVisits(opts = {}) {
     }).join('');
     _visInitColResize();
     _visUpdateSortHeaders();
-    _visRenderPagination(total, _visPageSize, _visPage);
+    _VIS_PAGER.render(total);
     return;
   }
 
-  // ── Group mode: group by domain, sub-group by first path segment ──────
   const domainOrder = [];
   const domainGroups = new Map();
   for (const v of rows) {
@@ -702,15 +670,13 @@ function renderVisits(opts = {}) {
     domainGroups.get(domain).push(v);
   }
 
-  // Build flat list of visible items (domain headers + optional slug headers + visit rows)
   const items = [];
   for (const domain of domainOrder) {
-    const visits  = domainGroups.get(domain);
+    const visits = domainGroups.get(domain);
     const expanded = _visExpandedDomains.has(domain);
-    const totalVisitCount = visits.reduce((s, v) => s + (v.visit_count || 1), 0);
+    const totalVisitCount = visits.reduce((sum, v) => sum + (v.visit_count || 1), 0);
     items.push({ type: 'domain-header', domain, urlCount: visits.length, totalVisitCount, expanded });
     if (expanded) {
-      // Only show slug sub-headers when there are multiple different first segments
       const slugSet = new Set(visits.map(v => _visFirstSlug(v.url || '')));
       const hasMultipleSlugs = slugSet.size > 1;
       let lastSlug = null;
@@ -725,23 +691,19 @@ function renderVisits(opts = {}) {
     }
   }
 
-  // Paginate over flat items
-  const totalItems = items.length;
-  const totalPages = Math.max(1, Math.ceil(totalItems / _visPageSize));
-  _visPage = Math.max(1, Math.min(_visPage, totalPages));
-  const pageItems = items.slice((_visPage - 1) * _visPageSize, _visPage * _visPageSize);
+  const pageData = _VIS_PAGER.getSlice(items);
+  const totalItems = pageData.totalItems;
+  const pageItems = pageData.items;
 
   if (status) {
     const totalDomains = domainOrder.length;
-    const totalVisits  = rows.reduce((s, v) => s + (v.visit_count || 1), 0);
-    const totalUrls    = rows.length;
+    const totalVisits = rows.reduce((sum, v) => sum + (v.visit_count || 1), 0);
+    const totalUrls = rows.length;
     const expandedCount = [..._visExpandedDomains].filter(d => domainGroups.has(d)).length;
     let statusText = `${totalVisits} visit${totalVisits === 1 ? '' : 's'} (${totalUrls} URL${totalUrls === 1 ? '' : 's'}) across ${totalDomains} domain${totalDomains === 1 ? '' : 's'}`;
     if (expandedCount) statusText += ` (${expandedCount} expanded)`;
-    if (totalItems > _visPageSize) {
-      const from = (_visPage - 1) * _visPageSize + 1;
-      const to   = Math.min(_visPage * _visPageSize, totalItems);
-      statusText += ` — rows ${from}\u2013${to} of ${totalItems}`;
+    if (pageData.enabled && pageData.paged) {
+      statusText += ` - rows ${pageData.from}-${pageData.to} of ${totalItems}`;
     }
     status.textContent = statusText;
     status.hidden = false;
@@ -750,7 +712,7 @@ function renderVisits(opts = {}) {
   if (!pageItems.length) {
     tbody.innerHTML = `<tr class="empty-row"><td colspan="${cols.length}">No visit history.</td></tr>`;
     _visUpdateSortHeaders();
-    _visRenderPagination(totalItems, _visPageSize, _visPage);
+    _VIS_PAGER.render(totalItems);
     return;
   }
 
@@ -772,7 +734,7 @@ function renderVisits(opts = {}) {
       html += `<tr class="vis-slug-header">
         <td colspan="${expandColspan}" style="padding:3px 10px 3px 28px;font-size:11px;color:var(--text-dim);border-top:1px solid rgba(255,255,255,0.06);background:rgba(0,0,0,0.12);font-style:italic">${esc(item.slug)}</td>
       </tr>`;
-    } else { // type === 'visit'
+    } else {
       const v = item.v;
       const expandId = `ve-${esc(v.visit_id)}`;
       const tds = cols.map(k => (_VIS_FIELD_META[k]?.render ?? (v => `<td>${esc(String(v[k] ?? ''))}</td>`))(v)).join('');
@@ -787,7 +749,7 @@ function renderVisits(opts = {}) {
   tbody.innerHTML = html;
   _visInitColResize();
   _visUpdateSortHeaders();
-  _visRenderPagination(totalItems, _visPageSize, _visPage);
+  _VIS_PAGER.render(totalItems);
 }
 
 function _visSortBy(col) {
@@ -823,47 +785,17 @@ function _visSetAllDomains(expanded) {
   } else {
     _visExpandedDomains = new Set();
   }
-  _visPage = 1;
+  _VIS_PAGER.resetPage();
   renderVisits({ keepPage: true });
 }
 
-// Pagination controls
-function _visRenderPagination(total, pageSize, page) {
-  const el = document.getElementById('vis-pagination');
-  if (!el) return;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const sizeOpts = _VIS_PAGE_SIZE_OPTIONS.map(n =>
-    `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`
-  ).join('');
-  const sizeSelect = `<label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-    Per page:
-    <select onchange="_visSetPageSize(parseInt(this.value,10))" style="font-size:12px;padding:2px 6px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface);color:var(--text)">${sizeOpts}</select>
-  </label>`;
-  if (totalPages <= 1) {
-    // Always show the per-page selector even when everything fits on one page
-    el.innerHTML = sizeSelect;
-    return;
-  }
-  const prevDis = page <= 1 ? ' disabled' : '';
-  const nextDis = page >= totalPages ? ' disabled' : '';
-  el.innerHTML = `
-    <button class="secondary" style="padding:2px 10px;font-size:12px"${prevDis} onclick="_visGoPage(${page - 1})">&#8592; Prev</button>
-    <span>Page <strong style="color:var(--text)">${page}</strong> of <strong style="color:var(--text)">${totalPages}</strong></span>
-    <button class="secondary" style="padding:2px 10px;font-size:12px"${nextDis} onclick="_visGoPage(${page + 1})">Next &#8594;</button>
-    ${sizeSelect}`;
+function _visIsPaginationEnabled() {
+  return _VIS_PAGER.isEnabled();
 }
 
-function _visGoPage(n) {
-  _visPage = n;
-  renderVisits({ keepPage: true });
-}
-
-function _visSetPageSize(n) {
-  if (!_VIS_PAGE_SIZE_OPTIONS.includes(n)) return;
-  _visPageSize = n;
-  localStorage.setItem('vis-page-size', String(n));
-  _visPage = 1;
-  renderVisits({ keepPage: true });
+function _visTogglePagination() {
+  _VIS_PAGER.toggleEnabled();
+  if (typeof ProbesMenuConfig !== 'undefined') ProbesMenuConfig.updateActiveTab();
 }
 
 function _visUpdateSortHeaders() {
