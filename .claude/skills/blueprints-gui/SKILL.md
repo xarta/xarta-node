@@ -13,64 +13,75 @@ JavaScript feature of the GUI.
 
 ## File layout
 
-All source lives in **`gui-fallback/`** (public outer repo).  The private inner
-repo (`/root/xarta-node/.xarta/gui/`) is a mirror.  Sync direction is always
-**fallback → private**:
+All source lives in **`gui-fallback/`** (public outer repo). This is the primary Blueprints dashboard GUI — all feature work, layout, and CSS changes start here.
 
-```bash
-# After any changes in gui-fallback/:
-cp gui-fallback/index.html        .xarta/gui/index.html
-cp -r gui-fallback/css/           .xarta/gui/
-cp -r gui-fallback/js/            .xarta/gui/
-
-# Or all at once (safest):
-rsync -a --delete \
-  gui-fallback/css/ gui-fallback/js/ \
-  gui-fallback/index.html \
-  gui-fallback/database-diagram.html gui-fallback/database-tables.html \
-  .xarta/gui/
-```
-
-The live app (`BLUEPRINTS_GUI_DIR=/root/xarta-node/.xarta/gui`) serves the
-private copy immediately — no restart needed after file changes.
+> ⚠️ The private inner repo (`.xarta/gui/`) contains an independent private GUI that diverged from `gui-fallback/` in 2026. **Do NOT copy or sync between `gui-fallback/` and `.xarta/gui/`** — they are maintained independently. The live app serves the private GUI from `BLUEPRINTS_GUI_DIR`; file changes there take effect immediately without a restart.
 
 ---
 
 ## Load order (index.html)
 
-CSS (in `<head>`):
+CSS (in `<head>`, in this order):
 ```
-css/tokens.css           ← CSS custom properties + global reset
-css/layout-nav.css       ← header, group-tabs, node-meta, table-nav, tab-panel
-css/tables.css           ← tables, tags, badges, status colours, ip-chip, kind-badge
-css/components.css       ← sync panel, toolbar, buttons, inputs, spinner, backup styles
+css/tokens.css              ← CSS custom properties + global reset
+css/layout-nav.css          ← header, group-tabs, node-meta, table-nav, tab-panel
+css/tables.css              ← tables, tags, badges, status colours, ip-chip, kind-badge
+css/components.css          ← sync panel, toolbar, buttons, inputs, spinner, backup styles
+css/hub-menu.css            ← hub-menu split-dropdown nav bar (shared across all groups)
+css/probes-menu.css         ← Probes group nav ID overrides
+css/settings-menu.css       ← Settings group nav ID overrides
+css/synthesis-menu.css      ← Synthesis group nav ID overrides
+css/hub-controls.css        ← form controls (inputs, selects) + HubSelect popup
+css/responsive-header.css   ← two-state responsive header + .header-inner compact rules
+css/body-shade.css          ← body shade drag handle + fill-table sizing
+css/hub-modal.css           ← hub-modal <dialog> component
 ```
 
 JavaScript (`<script src=...>` at end of `<body>`, **must stay in this order**):
 ```
-js/utils.js              ← esc() HTML-escape utility (used by everyone)
-js/api.js                ← TOTP auth, apiFetch(), openApiKeyModal(), saveApiKey()
-js/state.js              ← global mutable state (_services, _machines, …)
-js/connectivity.js       ← offline connectivity diagnostic modal + helpers
-js/health.js             ← loadHealth(), updateKeyBadge(), openIntegrityModal(), lookupHostParent()
-js/sync.js               ← loadSyncStatus()
-js/backups.js            ← loadBackups(), createBackup(), confirmRestore(), submitRestore()
-js/synthesis/services.js ← loadServices(), renderServices(), openAddModal(), submitAddService()
-js/synthesis/machines.js ← loadMachines(), renderMachines()
-js/settings/nodes.js     ← loadNodes(), renderNodes(), fleetUpdate(), nodeRestart/GiPull/PCT etc.
-js/settings/keys.js      ← all key management + key-store AES-256-GCM crypto + deploy UI
-js/settings/assumptions.js  ← Basic Assumptions tab + markdown renderer
-js/settings/self-diag.js    ← Self Diagnostic tab (_DIAG_ENDPOINTS, runSelfDiag)
-js/settings/settings.js     ← Settings key-value tab
-js/settings/pve-hosts.js    ← PVE Hosts tab
-js/settings/arp-manual.js   ← Manual ARP tab
+js/utils.js                  ← esc() HTML-escape utility (used by everyone)
+js/api.js                    ← TOTP auth, apiFetch(), openApiKeyModal(), saveApiKey()
+js/state.js                  ← global mutable state (_services, _machines, …)
+js/connectivity.js           ← offline connectivity diagnostic modal + helpers
+js/health.js                 ← loadHealth(), updateKeyBadge(), openIntegrityModal(), lookupHostParent()
+js/sync.js                   ← loadSyncStatus()
+js/backups.js                ← loadBackups(), createBackup(), confirmRestore(), submitRestore()
+js/synthesis/manual-links.js ← Manual Links tab (rendered view + table)
+js/synthesis/services.js     ← loadServices(), renderServices(), openAddModal(), submitAddService()
+js/synthesis/machines.js     ← loadMachines(), renderMachines()
+js/sound-manager.js          ← SoundManager IIFE (tab-switch audio cues)
+js/form-control-manager.js   ← FormControlManager IIFE (configurable key-value form controls)
+js/hub-modal.js              ← HubModal IIFE — must load before hub-menu.js
+js/hub-menu.js               ← createHubMenu() factory — shared nav engine
+js/hieroglyphs.js            ← HIEROGLYPHS constant — SVG data-URIs for nav icons
+js/synthesis/synthesis-menu.js  ← Synthesis group nav wrapper
+js/settings/nodes.js         ← Fleet Nodes tab, fleetUpdate(), nodeRestart/GiPull/PCT
+js/settings/keys.js          ← SSH key management + AES-256-GCM key store + deploy UI
+js/settings/certs.js         ← Certificates tab
+js/settings/docs-history.js  ← Docs history/version panel
+js/settings/docs.js          ← Docs editor tab
+js/settings/docs-images.js   ← Doc Images tab
+js/settings/self-diag.js     ← Self Diagnostic tab (_DIAG_ENDPOINTS, runSelfDiag)
+js/settings/settings.js      ← App Config key-value tab
+js/settings/pve-hosts.js     ← PVE Hosts tab
+js/settings/arp-manual.js    ← Manual ARP tab
+js/settings/ai-providers.js  ← AI Providers tab
+js/settings/nav-items.js     ← Nav Items tab
+js/settings/form-controls.js ← Form Controls tab
 js/probes/pfsense.js         ← pfSense DNS tab
 js/probes/proxmox-config.js  ← Proxmox Config tab (probe, nets, find-IPs)
 js/probes/vlans.js           ← VLANs tab
 js/probes/ssh-targets.js     ← SSH Targets tab
 js/probes/dockge.js          ← Dockge Stacks tab
 js/probes/caddy.js           ← Caddy Configs tab
-js/app.js                ← switchGroup(), switchTab(), DOMContentLoaded bootstrap ← MUST BE LAST
+js/table-pager.js            ← TablePager IIFE — shared pagination engine
+js/probes/bookmarks.js       ← Bookmarks/Visits tabs + browser extension feature
+js/probes/probes-menu.js     ← Probes group nav wrapper
+js/settings/settings-menu.js ← Settings group nav wrapper
+js/hub-select.js             ← HubSelect IIFE — custom dropdown with smart positioning
+js/responsive-layout.js      ← ResponsiveLayout IIFE — compact/full header observer
+js/body-shade.js             ← body-shade drag + fill-table sizing logic
+js/app.js                    ← switchGroup(), switchTab(), DOMContentLoaded bootstrap ← MUST BE LAST
 ```
 
 Embed component (after all app JS):
@@ -118,9 +129,7 @@ embed/blueprints-node-selector.js    (served via symlink)
 |---|---|
 | Colours, fonts, radius, CSS variables | `css/tokens.css` |
 | Overall page layout, `<header>`, `<main>` spacings | `css/layout-nav.css` |
-| Top-level nav (Synthesis / Probes / Settings buttons) | `css/layout-nav.css` — `.group-tab` |
 | Node meta badges (Gen, OK, FAILED, key count) | `css/layout-nav.css` — `.badge*` |
-| Secondary tab bar (Services, Machines … tabs) | `css/layout-nav.css` — `.table-nav` |
 | Tab panel show/hide | `css/layout-nav.css` — `.tab-panel` |
 | Data table headers, rows, hover | `css/tables.css` |
 | Coloured tags (`tag`), link badges, name links | `css/tables.css` |
@@ -132,6 +141,14 @@ embed/blueprints-node-selector.js    (served via symlink)
 | Sync status panel grid | `css/components.css` |
 | Backups table, restore / force-restore buttons | `css/components.css` |
 | Warning / error / success box colours | `css/components.css` |
+| Split-dropdown nav bar (all groups) | `css/hub-menu.css` |
+| Probes group nav overrides | `css/probes-menu.css` |
+| Settings group nav overrides | `css/settings-menu.css` |
+| Synthesis group nav overrides | `css/synthesis-menu.css` |
+| Form control inputs, HubSelect dropdown popup | `css/hub-controls.css` |
+| Responsive two-state header (compact / full) | `css/responsive-header.css` |
+| Body shade drag handle, fill-table sizing | `css/body-shade.css` |
+| Modal dialogs (`<dialog class="hub-modal">`) | `css/hub-modal.css` |
 
 ---
 
@@ -182,17 +199,32 @@ embed/blueprints-node-selector.js    (served via symlink)
 
 ## HTML modals index
 
-All modals use `<dialog>` elements in `index.html`:
+All modals use `<dialog>` elements in `index.html`. Those with `class="hub-modal"` use `HubModal.open()`; legacy dialogs use `.showModal()` directly.
 
 | Modal | HTML `id` | Opened by |
 |---|---|---|
+| Add/edit bookmark | `#bm-modal` | `_bmOpenModal()` in bookmarks.js |
+| Add/edit manual link | `#ml-modal` | `mlOpenModal()` in manual-links.js |
 | Add service | `#add-modal` | `openAddModal()` in services.js |
 | Integrity FAILED | `#integrity-modal` | `openIntegrityModal()` in health.js |
+| Edit VLAN CIDR | `#vlan-modal` | `editVlan()` in vlans.js |
+| Upload certificate | `#certs-upload-modal` | `openCertsUploadModal()` in certs.js |
+| Edit Manual ARP entry | `#arp-manual-edit-modal` | `openArpEdit()` in arp-manual.js |
+| Edit PVE host | `#pve-host-edit-modal` | `openPveHostEdit()` in pve-hosts.js |
 | Add/edit setting | `#setting-modal` | `openAddSettingModal()` / `editSetting()` in settings.js |
+| Add doc | `#add-doc-modal` | `openAddDocModal()` in docs.js |
+| View doc | `#docs-modal` | `openDocsModal()` in docs.js |
+| Delete doc confirm | `#docs-delete-modal` | `openDocsDeleteModal()` in docs.js |
 | Restore confirmation | `#restore-modal` | `confirmRestore()` in backups.js |
 | Key info | `#key-info-modal` | `openKeyInfo()` in keys.js |
 | Connectivity diagnostic | `#diag-modal` | `showConnectivityDiagnostic()` in connectivity.js |
 | API key | `#api-key-modal` | `openApiKeyModal()` in api.js |
+| Bookmark excluded tags | `#bm-excl-tag-modal` | `_bmOpenExclTagModal()` in bookmarks.js |
+| Bookmark column visibility | `#bm-cols-modal` | `_bmOpenColsModal()` in bookmarks.js |
+| Visit column visibility | `#vis-cols-modal` | `_visOpenColsModal()` in bookmarks.js |
+| Score explain | `#bm-score-modal` | `_bmOpenScoreModal()` in bookmarks.js |
+| Score detail (drill-down) | `#bm-score-detail-modal` | `_bmOpenScoreDetailModal()` in bookmarks.js |
+| Sort explain | `#bm-sort-explain-modal` | `_bmOpenSortExplainModal()` in bookmarks.js |
 
 ---
 
