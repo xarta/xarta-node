@@ -42,8 +42,9 @@ const ProbesMenuConfig = createHubMenu({
         { id: 'bm-fn-import', label: 'Import HTML',  icon: HIEROGLYPHS.papyrus,                fn: 'bm.import',      activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 1 },
         { id: 'bm-fn-refresh',label: 'Refresh',      icon: HIEROGLYPHS.nefer,                  fn: 'bm.refresh',     activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 2 },
         { id: 'bm-fn-cols',   label: 'Columns',      icon: 'icons/ui/table-columns-blue.svg',  fn: 'bm.cols',        activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 3 },
-        { id: 'bm-fn-expl',   label: 'Explain Sort',    icon: HIEROGLYPHS.eyeOfHorus,  fn: 'bm.explainSort', activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 4 },
-        { id: 'bm-fn-dead',   label: 'Dead links',      icon: HIEROGLYPHS.shen,        fn: 'bm.deadLinks',   activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 5 },
+        { id: 'bm-fn-pagination', label: 'Pagination', icon: 'icons/ui/table-columns-blue.svg', fn: 'bm.pagination', activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 4 },
+        { id: 'bm-fn-expl',   label: 'Explain Sort',    icon: HIEROGLYPHS.eyeOfHorus,  fn: 'bm.explainSort', activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 5 },
+        { id: 'bm-fn-dead',   label: 'Dead links',      icon: HIEROGLYPHS.shen,        fn: 'bm.deadLinks',   activeOn: ['bookmarks-main'], parent: 'probes-settings', order: 6 },
 
         // ── pfSense DNS page function items ───────────────────────────────
         { id: 'dns-fn-refresh',  label: 'Refresh',       icon: HIEROGLYPHS.nefer,      fn: 'dns.refresh',    activeOn: ['pfsense-dns'], parent: 'probes-settings', order: 0 },
@@ -78,6 +79,7 @@ const ProbesMenuConfig = createHubMenu({
         // ── Visit History page function items ──────────────────────────────
         { id: 'vis-fn-refresh',     label: 'Refresh',             icon: HIEROGLYPHS.nefer,      fn: 'vis.refresh',     activeOn: ['bookmarks-history'], parent: 'probes-settings', order: 0 },
         { id: 'vis-fn-cols',        label: 'Columns',              icon: 'icons/ui/table-columns-blue.svg', fn: 'vis.cols', activeOn: ['bookmarks-history'], parent: 'probes-settings', order: 1 },
+        { id: 'vis-fn-pagination',  label: 'Pagination',           icon: 'icons/ui/table-columns-blue.svg', fn: 'vis.pagination', activeOn: ['bookmarks-history'], parent: 'probes-settings', order: 2 },
 
         // ── Setup & Import page function items ─────────────────────────────
         { id: 'setup-fn-import',    label: 'Import HTML',         icon: HIEROGLYPHS.papyrus,    fn: 'setup.import',    activeOn: ['bookmarks-setup'],   parent: 'probes-settings', order: 0 },
@@ -98,6 +100,7 @@ ProbesMenuConfig.registerFunctions({
     'bm.import':      () => document.getElementById('bm-import-file').click(),
     'bm.refresh':     () => loadBookmarks(),
     'bm.cols':        () => _bmOpenColsModal(),
+    'bm.pagination':  () => _bmTogglePagination(),
     'bm.explainSort': () => {
         if (!_bmSearchActive) {
             const st = document.getElementById('bm-search-status');
@@ -145,8 +148,14 @@ ProbesMenuConfig.registerFunctions({
     // Visit History
     'vis.refresh':    () => loadVisits(),
     'vis.cols':       () => _visOpenColsModal(),
+    'vis.pagination': () => _visTogglePagination(),
 
     // Setup & Import
     'setup.import':   () => { const inp = document.getElementById('bm-import-file2'); if (inp) inp.click(); },
     'setup.ext':      () => _bmDownloadExtension(null),
+});
+
+ProbesMenuConfig.registerLabelGetters({
+    'bm-fn-pagination': () => _bmIsPaginationEnabled() ? 'Pagination: On' : 'Pagination: Off',
+    'vis-fn-pagination': () => _visIsPaginationEnabled() ? 'Pagination: On' : 'Pagination: Off',
 });

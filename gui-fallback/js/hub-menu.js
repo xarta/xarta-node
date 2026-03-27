@@ -33,9 +33,14 @@ function createHubMenu(cfg) {
         // Keys are dot-namespaced strings ('bm.add', 'svc.refresh', etc.).
         // Values are zero-argument functions — never serialised to localStorage.
         _fnRegistry: {},
+        _labelGetters: {},
 
         registerFunctions(map) {
             Object.assign(this._fnRegistry, map);
+        },
+
+        registerLabelGetters(map) {
+            Object.assign(this._labelGetters, map);
         },
 
         defaultMenu: cfg.defaultMenu,
@@ -242,6 +247,15 @@ function createHubMenu(cfg) {
             }
         },
 
+        _displayLabel(item) {
+            const getter = this._labelGetters[item.id];
+            if (typeof getter === 'function') {
+                const label = getter();
+                if (typeof label === 'string' && label.trim()) return label.trim();
+            }
+            return item.label.replace(item.icon || '', '').trim();
+        },
+
         // ── Data helpers ───────────────────────────────────────────
 
         getTopLevelItems() {
@@ -334,17 +348,17 @@ function createHubMenu(cfg) {
 
                 const labelText = isGroupActive
                     ? this._iconHtml(activeMember.id, activeMember.icon) + '\u00a0' + (activeMember.pageLabel || activeMember.label.replace(activeMember.icon || '', '').trim())
-                    : this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
+                    : this._iconHtml(item.id, item.icon) + '\u00a0' + this._displayLabel(item);
 
                 if (allDropdownItems.length > 0) {
                     // ── Split-button with dropdown ────────────────────────────
                     const hasSeparator = dropdownNavItems.length > 0 && visibleFnChildren.length > 0;
                     const navHtml  = dropdownNavItems.map(c =>
-                        `<button class="hub-dropdown-item" data-tab="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${c.label.replace(c.icon || '', '').trim()}</button>`
+                        `<button class="hub-dropdown-item" data-tab="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${this._displayLabel(c)}</button>`
                     ).join('');
                     const sepHtml  = hasSeparator ? '<hr class="hub-dropdown-separator">' : '';
                     const fnHtml   = visibleFnChildren.map(c =>
-                        `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}" data-item-key="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${c.label.replace(c.icon || '', '').trim()}</button>`
+                        `<button class="hub-dropdown-item hub-dropdown-fn" data-fn="${c.fn}" data-item-key="${c.id}">${this._iconHtml(c.id, c.icon)}\u00a0${this._displayLabel(c)}</button>`
                     ).join('');
 
                     const isActive = isGroupActive || (activeId === item.id);
@@ -418,7 +432,7 @@ function createHubMenu(cfg) {
                     // ── Top-level function button (promoted fn item) ──────────
                     const btn = document.createElement('button');
                     btn.className = 'hub-tab';
-                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
+                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + this._displayLabel(item);
                     btn.addEventListener('click', () => {
                         this._playItemSound(item.id);
                         const fn = this._fnRegistry[item.fn];
@@ -433,7 +447,7 @@ function createHubMenu(cfg) {
                     const btn = document.createElement('button');
                     btn.className = 'hub-tab';
                     btn.dataset.tab = item.id;
-                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + item.label.replace(item.icon || '', '').trim();
+                    btn.innerHTML = this._iconHtml(item.id, item.icon) + '\u00a0' + this._displayLabel(item);
                     if (isGroupActive) btn.classList.add('active');
                     btn.addEventListener('click', () => {
                         this._playItemSound(item.id);
@@ -518,7 +532,7 @@ function createHubMenu(cfg) {
                 <div class="menu-item-header">
                     <span class="drag-handle">⋮⋮</span>
                     <span class="menu-item-icon">${this._iconHtml(item.id, item.icon)}</span>
-                    <span class="menu-item-label">${item.label.replace(item.icon, '').trim()}</span>
+                    <span class="menu-item-label">${this._displayLabel(item)}</span>
                     ${hasChildren ? '<span class="has-children-badge">▼ ' + children.length + '</span>' : ''}
                     <span class="menu-item-page-label" title="Page label (shown when active)">→ ${item.pageLabel || '—'}</span>
                     <div class="menu-item-actions">
@@ -565,7 +579,7 @@ function createHubMenu(cfg) {
                             <div class="menu-item-header">
                                 <span class="drag-handle">⋮⋮</span>
                                 <span class="menu-item-icon">${this._iconHtml(child.id, child.icon)}</span>
-                                <span class="menu-item-label">${child.label.replace(child.icon, '').trim()}</span>
+                                <span class="menu-item-label">${this._displayLabel(child)}</span>
                                 ${rightColHtml}
                                 <div class="menu-item-actions">
                                     ${editPageBtnHtml}

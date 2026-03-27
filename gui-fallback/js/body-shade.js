@@ -227,7 +227,7 @@
     var fill = panel.querySelector('.table-wrap--fill');
     if (!fill) return;
     var pager = panel.querySelector('.table-pager');
-    var pagerH = pager ? 44 : 0;
+    var pagerH = pager && !pager.hidden ? pager.offsetHeight : 0;
     // getBoundingClientRect gives viewport-relative position.
     // has-fill-tab sets overflow:hidden so scroll is locked at 0 — accurate.
     var top = fill.getBoundingClientRect().top;
@@ -307,6 +307,10 @@
       };
     }
   }
+
+  window.BodyShade = window.BodyShade || {};
+  window.BodyShade.sizeFillTable = sizeFillTable;
+  window.BodyShade.scheduleSizeFillTable = scheduleSizeFillTable;
 
   document.readyState === 'loading'
     ? document.addEventListener('DOMContentLoaded', init)
