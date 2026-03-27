@@ -11,10 +11,9 @@
      dragging        → translateY tracks pointer; transition suppressed
      up              → shade held at translateY(-maxTravel), is-up class applied
 
-   No position:fixed switching. The shade stays in normal flow at all times.
-   maxTravel = distance from handle to the bottom of .menu-zone
-   (or the top of <main> if .menu-zone is absent). This ensures the handle
-   never travels above the persistent nav — the menu zone stays accessible.
+  No position:fixed switching. The shade stays in normal document flow.
+  For fill sizing, the module measures from scrollY=0 so the handle/fill top
+  offsets are stable even after mobile viewport or browser-chrome changes.
 
    Tab switching:
      window.switchTab is patched at init time (body-shade.js loads before
@@ -31,6 +30,8 @@
   var shadeY    = 0;     // current translateY (0 = down, negative = up)
   var maxTravel = 0;     // max distance shade can travel upward
   var isUp      = false;
+  var _fillTimer = null;
+  var _fillSettleTimers = [];
 
   var dragging      = false;
   var startPointerY = 0;
@@ -39,11 +40,10 @@
   var lastPointerT  = 0;
   var vel           = 0;   // px/s, EMA (negative = moving up)
 
-  /* ── Compute maxTravel for the current handle ───────────────────────────── */
-  /* maxTravel = pixels the shade must slide up so the handle reaches the
-     very top of the viewport (y=0), hiding header, menu zone, and description.
-     Must be measured at scrollY=0 so getBoundingClientRect gives true
-     page coordinates (handleTop == distance from viewport top in natural state). */
+    /* ── Compute maxTravel for the current handle ───────────────────────────── */
+    /* maxTravel = pixels the shade must slide up so the handle reaches the
+      top of the viewport (y=0). Measured at scrollY=0 so fill-table sizing and
+      handle travel use stable natural-state coordinates. */
   function computeMaxTravel() {
     if (!handle) return 0;
     if (window.scrollY !== 0) window.scrollTo(0, 0);
@@ -214,10 +214,11 @@
     maxTravel = 0;  // will be recomputed on next drag-start
   }
 
-  /* ── Size the fill table in the active panel ───────────────────────────────
-     Old-school approach: measure exactly where .table-wrap--fill starts on
-     screen, set its height to fill the remaining viewport minus the pager.
-     No CSS variable arithmetic — just measure and set. ── */
+    /* ── Size the fill table in the active panel ───────────────────────────────
+      Measure where .table-wrap--fill starts on screen, then set its height to
+      fill the remaining viewport minus the pager. This is intentionally re-run
+      after tab switches, shade state changes, resize/orientation changes, and
+      short follow-up settle delays for mobile viewport stabilization. ── */
   function sizeFillTable() {
     var panel = shade ? shade.querySelector('.tab-panel--fill.active') : null;
     // Toggle body class so page scroll is locked exactly when a fill tab is on.
@@ -233,10 +234,20 @@
     fill.style.height = Math.max(50, window.innerHeight - top - pagerH) + 'px';
   }
 
-  var _fillTimer = null;
   function scheduleSizeFillTable() {
+    _fillSettleTimers.forEach(clearTimeout);
+    _fillSettleTimers = [];
     clearTimeout(_fillTimer);
+    // First pass: near-immediate for normal tab switches.
     _fillTimer = setTimeout(sizeFillTable, 50);
+
+    // Follow-up passes: mobile emulation/orientation changes can settle the
+    // visual viewport, menu-zone height, and browser chrome slightly later.
+    // Re-measure a few times with short delays so the active fill tab lands on
+    // the correct final height without requiring a manual shade drag.
+    [180, 360, 700].forEach(function (delay) {
+      _fillSettleTimers.push(setTimeout(sizeFillTable, delay));
+    });
   }
 
   /* ─────────────────────────────────────────────────────────────────────── */
@@ -258,6 +269,10 @@
 
     // Resize fill table on window resize (e.g. orientation change).
     window.addEventListener('resize', scheduleSizeFillTable);
+    window.addEventListener('orientationchange', scheduleSizeFillTable);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', scheduleSizeFillTable);
+    }
 
     // Bind drag events to every handle inside the shade
     shade.querySelectorAll('.body-shade-handle').forEach(bindHandle);
