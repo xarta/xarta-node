@@ -153,13 +153,13 @@
   /* ── Touch handlers ─────────────────────────────────────────────────────── */
   function onTouchStart(e) {
     if (e.touches.length !== 1) return;
-    e.preventDefault();
+    if (e.cancelable) e.preventDefault();
     startDrag(e.touches[0].clientY);
   }
 
   function onTouchMove(e) {
     if (!dragging || e.touches.length !== 1) return;
-    e.preventDefault();
+    if (e.cancelable) e.preventDefault();
     moveDrag(e.touches[0].clientY);
   }
 
