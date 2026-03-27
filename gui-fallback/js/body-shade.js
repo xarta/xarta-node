@@ -308,9 +308,57 @@
     }
   }
 
+  // Snap the shade back to the down position from outside the module.
+  // Does NOT change the active handle — shade stays on the same tab panel.
+  //
+  // opts.instant = true  → suppress the CSS transition so the snap is
+  //   imperceptible (same frame). The is-dragging class is removed in the
+  //   next animation frame so the transition is re-enabled for the subsequent
+  //   snapUp() animation without triggering a spurious downward transition.
+  //   Use this when you intend to call snapUp() after new content renders.
+  //
+  // opts.instant = false (default) → 300ms animated snap down (existing
+  //   behaviour — unchanged from before).
+  function snapDown(opts) {
+    if (!shade) return;
+    var instant = !!(opts && opts.instant);
+    if (isUp) exitUp();
+    if (instant) {
+      // Add is-dragging (transition:none) and set --shade-y:0 in the same
+      // JS execution so the browser batches them into one instant paint.
+      shade.classList.add('is-dragging');
+      shade.style.setProperty('--shade-y', '0px');
+      shadeY = 0;
+      // Remove is-dragging in the NEXT animation frame — not the same
+      // execution — so the instant snap is committed before the transition
+      // is re-enabled. Without the rAF, all three changes are batched and
+      // the browser sees is-dragging=false at paint time → uses transition.
+      requestAnimationFrame(function () { shade.classList.remove('is-dragging'); });
+    } else {
+      applyTranslate(0, false);
+    }
+    if (handle) handle.classList.remove('is-up', 'is-grabbing', 'is-dragging');
+    maxTravel = 0; // force recompute on next drag-start from new settled layout
+  }
+
+  // Re-raise the shade to the up position after doc navigation,
+  // recomputing maxTravel from the freshly rendered layout.
+  // getBoundingClientRect() inside computeMaxTravel() forces a layout
+  // recalculation so values are accurate immediately after a DOM update.
+  function snapUp() {
+    if (!shade || !handle) return;
+    if (isUp) return; // already up — nothing to do
+    maxTravel = computeMaxTravel();
+    if (maxTravel <= 0) return;
+    applyTranslate(-maxTravel, false); // animate up via CSS transition (300ms)
+    setTimeout(enterUp, TRANSITION);   // lock up state once animation settles
+  }
+
   window.BodyShade = window.BodyShade || {};
   window.BodyShade.sizeFillTable = sizeFillTable;
   window.BodyShade.scheduleSizeFillTable = scheduleSizeFillTable;
+  window.BodyShade.snapDown = snapDown;
+  window.BodyShade.snapUp = snapUp;
 
   document.readyState === 'loading'
     ? document.addEventListener('DOMContentLoaded', init)
