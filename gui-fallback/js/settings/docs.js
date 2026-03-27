@@ -130,8 +130,26 @@ async function docsSelectDoc(docId, opts = {}) {
   // Default to preview on first open; restore last-used mode on revisits
   if (!(docId in _docsViewModes)) _docsViewModes[docId] = true;
   _docsPreview = _docsViewModes[docId];
+  // Body-shade correction for in-tab doc navigation:
+  // DOM elements above the handle (_docsRenderSidebar + _docsHidePane) are
+  // about to change height. If the shade is held up its stale translateY
+  // would leave a gap or push the handle off-screen.
+  //
+  // Strategy: record whether shade was up, snap it down *instantly*
+  // (imperceptible — same paint frame, transition suppressed), let the DOM
+  // mutations settle during the fetch, then animate it back up once the new
+  // document has rendered. The user sees one smooth upward motion per navigation.
+  const wasShadeUp = document.body.classList.contains('shade-is-up');
+  if (wasShadeUp && window.BodyShade && typeof window.BodyShade.snapDown === 'function') {
+    window.BodyShade.snapDown({ instant: true });
+  }
   _docsRenderSidebar();
   const ok = await _docsOpenDoc(docId);
+  // Re-raise after render. Only if the load succeeded — on error the shade
+  // stays down so the user can see the error message.
+  if (wasShadeUp && ok && window.BodyShade && typeof window.BodyShade.snapUp === 'function') {
+    window.BodyShade.snapUp();
+  }
   if (ok && !fromHistory && typeof docsHistRecordDirect === 'function') {
     docsHistRecordDirect(docId);
   }
@@ -922,14 +940,25 @@ function _mdToHtml(md) {
 }
 
 function _inlineMd(s) {
-  return s
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/`([^`]+)`/g, (_,c) => `<code style="background:var(--surface);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:0.88em">${c.replace(/&lt;/g,'<').replace(/&gt;/g,'>')}</code>`)
+  // Stash code spans before any other processing so their content is never
+  // touched by bold/italic/link regexes, and so HTML-special chars inside them
+  // (e.g. `<dialog>`) are escaped correctly instead of injected as raw HTML.
+  const stash = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => {
+    const idx = stash.length;
+    stash.push(`<code style="background:var(--surface);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:0.88em">${c.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</code>`);
+    return `\x00${idx}\x00`;
+  });
+  // HTML-escape the remaining (non-code) text
+  s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  s = s
     .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-    .replace(/_([^_]+)_/g, '<em>$1</em>')
+    // __ bold: only match when not adjacent to a word character (avoids snake__case)
+    .replace(/(?<![a-zA-Z0-9])__([^_]+)__(?![a-zA-Z0-9])/g, '<strong>$1</strong>')
+    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+    // _ italic: only match when not adjacent to a word character (avoids snake_case)
+    .replace(/(?<![a-zA-Z0-9])_([^_\n]+)_(?![a-zA-Z0-9])/g, '<em>$1</em>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>')
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => {
       const m = src.match(/\/api\/v1\/doc-images\/([a-f0-9-]+)\/file/);
@@ -951,16 +980,42 @@ function _inlineMd(s) {
       const trail = m ? m[2] : '';
       return `<a href="${href}" style="color:var(--accent);text-decoration:underline" target="_blank" rel="noopener noreferrer">${href}</a>${trail}`;
     });
+  // Restore stashed code spans
+  s = s.replace(/\x00(\d+)\x00/g, (_, i) => stash[Number(i)]);
+  return s;
 }
 
 // Navigate to a doc by relative path or basename (called from inline preview links)
 function docsOpenByPath(href) {
-  const base = href.split('/').pop().toLowerCase();
-  const doc = _docsAll.find(d => {
-    if (!d.path) return false;
-    return d.path.toLowerCase() === href.toLowerCase() ||
-           d.path.split('/').pop().toLowerCase() === base;
-  });
+  // 1. Exact match against stored path (e.g. href already is "docs/security/README.md")
+  let doc = _docsAll.find(d => d.path && d.path.toLowerCase() === href.toLowerCase());
+
+  // 2. Resolve relative to the current document's directory (standard markdown behaviour).
+  //    e.g. current doc is "docs/security/SECURITY.md", href is "README.md"
+  //    → resolves to "docs/security/README.md"
+  if (!doc && _docsActiveId) {
+    const cur = _docsAll.find(d => d.doc_id === _docsActiveId);
+    if (cur && cur.path) {
+      const curDir = cur.path.split('/').slice(0, -1).join('/');
+      const parts  = (curDir + '/' + href).split('/');
+      const resolved = [];
+      for (const p of parts) {
+        if (p === '..') resolved.pop();
+        else if (p !== '.') resolved.push(p);
+      }
+      const resolvedPath = resolved.join('/');
+      doc = _docsAll.find(d => d.path && d.path.toLowerCase() === resolvedPath.toLowerCase());
+    }
+  }
+
+  // 3. Basename fallback — last resort for unambiguous filenames
+  if (!doc) {
+    const base = href.split('/').pop().toLowerCase();
+    doc = _docsAll.find(d => {
+      if (!d.path) return false;
+      return d.path.split('/').pop().toLowerCase() === base;
+    });
+  }
   if (!doc) {
     const status = document.getElementById('docs-status');
     if (status) {
