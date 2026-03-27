@@ -435,7 +435,7 @@ async function _docsModalSubmitEdit() {
     const r = await apiFetch(`/api/v1/docs/${_docsActiveId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label, description: desc || null, tags: tags || null, path: path || null, sort_order: order, group_id: groupId }),
+      body: JSON.stringify({ label, description: desc || null, tags: tags, path: path || null, sort_order: order, group_id: groupId }),
     });
     if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${r.status}`); }
     HubModal.close(document.getElementById('docs-modal'));
