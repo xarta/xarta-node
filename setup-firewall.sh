@@ -10,6 +10,7 @@
 #        - TCP 22   (SSH)
 #        - TCP 80   (Caddy HTTP → HTTPS redirect)
 #        - TCP 443  (Caddy HTTPS)
+#        - TCP 3389 (XRDP) when XARTA_ENABLE_XRDP=true
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
 #        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
 #        - TCP+UDP 22000 (Syncthing BEP asset sync)  — per-peer-IP from .nodes.json only
@@ -39,6 +40,17 @@
 # before saving / deploying fleet-wide.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+fi
+
+XARTA_ENABLE_XRDP="${XARTA_ENABLE_XRDP:-false}"
+XARTA_XRDP_ALLOWED_CIDRS="${XARTA_XRDP_ALLOWED_CIDRS:-}"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -106,6 +118,22 @@ echo "    added: TCP 80 (HTTP/Caddy redirect) → ACCEPT"
 # HTTPS — Caddy reverse proxy (Blueprints GUI + API).
 iptables -A XARTA_INPUT -p tcp --dport 443 -j ACCEPT
 echo "    added: TCP 443 (HTTPS/Caddy) → ACCEPT"
+
+# XRDP — optional remote desktop access for the transitional xarta user.
+if [[ "$XARTA_ENABLE_XRDP" == "true" ]]; then
+    if [[ -n "$XARTA_XRDP_ALLOWED_CIDRS" ]]; then
+        IFS=',' read -r -a xrdp_cidrs <<< "$XARTA_XRDP_ALLOWED_CIDRS"
+        for cidr in "${xrdp_cidrs[@]}"; do
+            cidr="${cidr// /}"
+            [[ -z "$cidr" ]] && continue
+            iptables -A XARTA_INPUT -p tcp --dport 3389 -s "$cidr" -j ACCEPT
+            echo "    added: TCP 3389 from $cidr (XRDP) → ACCEPT"
+        done
+    else
+        iptables -A XARTA_INPUT -p tcp --dport 3389 -j ACCEPT
+        echo "    added: TCP 3389 (XRDP) → ACCEPT"
+    fi
+fi
 
 # Tailscale WireGuard — direct peer connections.
 # Without this, Tailscale falls back to slower DERP relay.
@@ -213,5 +241,6 @@ echo ""
 echo -e "${YELLOW}IMPORTANT — test connectivity before deploying fleet-wide:${NC}"
 echo "  1. Verify SSH still works from another terminal."
 echo "  2. Verify HTTPS (Blueprints GUI) still reachable."
-echo "  3. Verify Tailscale peers can still connect: tailscale ping <peer>"
-echo "  4. Only then: commit, push, and run fleet-pull scripts."
+echo "  3. If XRDP was enabled, verify RDP access on TCP 3389."
+echo "  4. Verify Tailscale peers can still connect: tailscale ping <peer>"
+echo "  5. Only then: commit, push, and run fleet-pull scripts."
