@@ -114,6 +114,7 @@ fi
 
 CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
 UI_HOST=$(url_host "${BLUEPRINTS_UI_URL:-localhost}")
+REFERENCE_UI_ROOT="${REPO_INNER_PATH:-$SCRIPT_DIR/.xarta}/gui-reference"
 
 # Build the full comma-separated hostname list for the Caddy site blocks.
 # Always includes the primary UI host; appends CADDY_EXTRA_NAMES if set.
@@ -173,6 +174,14 @@ ${HTTPS_NAMES} {
     redir /fallback-ui /fallback-ui/ permanent
     handle_path /fallback-ui/* {
         root * ${REPO_OUTER_PATH}/gui-fallback
+        file_server
+    }
+
+    # Reference UI — private web-design pattern library and live demos.
+    # Served directly by Caddy from gui-reference/ in the private repo.
+    redir /reference-ui /reference-ui/ permanent
+    handle_path /reference-ui/* {
+        root * ${REFERENCE_UI_ROOT}
         file_server
     }
 
