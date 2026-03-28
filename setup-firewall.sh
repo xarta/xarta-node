@@ -211,9 +211,15 @@ if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -F INPUT   2>/dev/null || true
     ip6tables -F FORWARD 2>/dev/null || true
     ip6tables -F OUTPUT  2>/dev/null || true
+    ip6tables -A INPUT -i lo -j ACCEPT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ip6tables -P INPUT   DROP
     ip6tables -P FORWARD DROP
     ip6tables -P OUTPUT  DROP
+    echo "    added: IPv6 loopback INPUT/OUTPUT → ACCEPT"
+    echo "    added: IPv6 ESTABLISHED,RELATED INPUT/OUTPUT → ACCEPT"
     echo -e "    ${GREEN}set${NC}: ip6tables INPUT/FORWARD/OUTPUT policy → DROP"
 else
     echo -e "    ${YELLOW}skipped${NC}: ip6tables not found (IPv6 kernel support absent — already safe)"
