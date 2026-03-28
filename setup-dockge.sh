@@ -2,7 +2,7 @@
 
 # setup-dockge.sh
 # Installs Dockge as a Docker Compose stack backed by the node-local
-# .lone-wolf repo under /xarta-node/.lone-wolf by default.
+# repo and its stacks directory.
 
 set -euo pipefail
 
@@ -16,7 +16,10 @@ fi
 
 source "$ENV_FILE"
 
-DOCKGE_STACKS_DIR="${DOCKGE_STACKS_DIR:-/xarta-node/.lone-wolf/stacks}"
+XARTA_NODE_ROOT="${XARTA_NODE_ROOT:-/xarta-node}"
+NODE_LOCAL_REPO_NAME="${NODE_LOCAL_REPO_NAME:-.lone-wolf}"
+NODE_LOCAL_REPO_DIR="${NODE_LOCAL_REPO_DIR:-${XARTA_NODE_ROOT}/${NODE_LOCAL_REPO_NAME}}"
+DOCKGE_STACKS_DIR="${DOCKGE_STACKS_DIR:-${NODE_LOCAL_REPO_DIR}/stacks}"
 DOCKGE_DATA_DIR="${DOCKGE_DATA_DIR:-$DOCKGE_STACKS_DIR/dockge/data}"
 DOCKGE_STACK_DIR="${DOCKGE_STACK_DIR:-$DOCKGE_STACKS_DIR/dockge}"
 DOCKGE_PORT="${DOCKGE_PORT:-5001}"

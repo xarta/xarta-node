@@ -115,6 +115,34 @@
     _buttonPage = Number.isInteger(page) && page >= 0 ? page : 0;
   }
 
+  function normalizeOrigin(url) {
+    if (!url) return '';
+    try {
+      return new URL(url, window.location.origin).origin;
+    } catch {
+      return '';
+    }
+  }
+
+  function nodeMatchesCurrentOrigin(node) {
+    if (!node || typeof window === 'undefined') return false;
+    const currentOrigin = window.location.origin;
+    const candidates = [node.uiUrl, ...(node.altAddresses || [])]
+      .map(normalizeOrigin)
+      .filter(Boolean);
+    return candidates.includes(currentOrigin);
+  }
+
+  function syncCurrentToLocation() {
+    const match = _nodes.find(nodeMatchesCurrentOrigin);
+    if (!match) return false;
+    if (_current !== match.id) {
+      _current = match.id;
+      lsSet(LS_CURRENT, _current);
+    }
+    return true;
+  }
+
   function saveButtonPage() {
     lsSet(LS_BUTTON_PAGE, _buttonPage);
   }
@@ -177,11 +205,17 @@
       const r = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(5000) });
       if (r.ok) {
         const h = await r.json();
+        const uiUrl = (h.ui_url || origin).replace(/\/$/, '');
+        const currentOrigin = normalizeOrigin(origin);
+        const altAddresses = currentOrigin && currentOrigin !== normalizeOrigin(uiUrl)
+          ? [currentOrigin]
+          : [];
         selfNode = {
           id: h.node_id,
           name: h.node_name || h.node_id,
-          uiUrl: (h.ui_url || origin).replace(/\/$/, ''),
+          uiUrl,
           healthUrl: `${origin}/health`,
+          altAddresses,
         };
       }
     } catch {}
@@ -277,7 +311,7 @@
         : {},
     ));
 
-    if (!_current || !_nodes.find(n => n.id === _current)) {
+    if (!syncCurrentToLocation() && (!_current || !_nodes.find(n => n.id === _current))) {
       _current = (selfNode && selfNode.id) || (_nodes[0] && _nodes[0].id) || null;
     }
 
@@ -462,6 +496,7 @@
     if (cached && cached.nodes && (Date.now() - cached.ts) < LS_TTL) {
       _nodes = cached.nodes;
       _current = lsGet(LS_CURRENT) || (_nodes[0] && _nodes[0].id) || null;
+      syncCurrentToLocation();
     } else if (SEEDS.length) {
       _nodes = SEEDS.map(s => {
         const nodeUrl = (s.url || '').replace(/\/$/, '');
@@ -546,6 +581,11 @@
     return `${base}/${rel}`;
   }
 
+  function getPreferredBaseUrl(node) {
+    if (nodeMatchesCurrentOrigin(node)) return window.location.origin;
+    return (node && node.uiUrl) || window.location.origin;
+  }
+
   function getDbBasePath() {
     const pathname = window.location.pathname || '';
     if (pathname.startsWith('/fallback-ui/')) return '/fallback-ui/db';
@@ -554,7 +594,7 @@
 
   function navigateToNodePath(path) {
     const node = getCurrentNode();
-    const baseUrl = node ? node.uiUrl : window.location.origin;
+    const baseUrl = getPreferredBaseUrl(node);
     window.location.href = toAbsoluteUrl(baseUrl, path);
   }
 
@@ -645,7 +685,7 @@
     const now = Date.now();
     list.innerHTML = _nodes.map(n => `
       <div class="bp-ns-node${n.id === _current ? ' active' : ''}"
-           data-id="${esc(n.id)}" data-url="${esc(n.uiUrl)}">
+           data-id="${esc(n.id)}" data-url="${esc(getPreferredBaseUrl(n))}">
         <span class="bp-ns-node-name${n.localMode ? ' bp-ns-node-local' : ''}"${n.fleetPeer === false ? ' style="text-decoration:line-through;opacity:0.55"' : ''}>${esc(n.name)}</span>
         <span class="bp-ns-node-metric ${esc(metricClass(n, now))}${n.localMode ? ' bp-ns-node-local' : ''}"${n.localMode ? ' title="via LAN"' : ''}>${esc(metricText(n, now))}</span>
       </div>`).join('');

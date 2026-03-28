@@ -5,8 +5,10 @@ set -euo pipefail
 PUBLIC_ROOT="${PUBLIC_ROOT:-/root/xarta-node}"
 PRIVATE_ROOT="${PRIVATE_ROOT:-/root/xarta-node/.xarta}"
 
-OLD_REPO_PATH="${OLD_REPO_PATH:-/root/xarta-node/.lone-wolf}"
-OLD_CADDYFILE_PATH="${OLD_CADDYFILE_PATH:-/root/xarta-node/.lone-wolf/Caddyfile}"
+LEGACY_OUTER_ROOT="${LEGACY_OUTER_ROOT:-/root/xarta-node}"
+NODE_LOCAL_REPO_NAME="${NODE_LOCAL_REPO_NAME:-.lone-wolf}"
+OLD_REPO_PATH="${OLD_REPO_PATH:-${LEGACY_OUTER_ROOT}/${NODE_LOCAL_REPO_NAME}}"
+OLD_CADDYFILE_PATH="${OLD_CADDYFILE_PATH:-${OLD_REPO_PATH}/Caddyfile}"
 
 have_rg=0
 if command -v rg >/dev/null 2>&1; then
