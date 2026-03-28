@@ -75,6 +75,7 @@ function switchTab(tab) {
   if (tab === 'form-controls' && !_fcItems.length)         loadFormControls();
   if (tab === 'bookmarks-main'  && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks-history')                       loadVisits();
+  if (tab === 'bookmarks-embeddings')                    _bmLoadEmbedCfg();
   if (tab === 'bookmarks'        && !_bookmarks.length)  loadBookmarks();
   if (tab === 'bookmarks') { switchTab('bookmarks-main'); return; }
   // Notify responsive layout so the correct page-controls group is shown/hidden
