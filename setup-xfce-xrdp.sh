@@ -22,6 +22,9 @@ XARTA_HOME="${XARTA_HOME:-/home/$XARTA_USER}"
 XARTA_ENABLE_XRDP="${XARTA_ENABLE_XRDP:-true}"
 POLKIT_RULE_FILE="/etc/polkit-1/rules.d/49-${XARTA_USER}-colord.rules"
 AUTOSTART_DIR="$XARTA_HOME/.config/autostart"
+CHAN_SOCK_FIX_SCRIPT="/usr/local/sbin/xrdp-fix-chansrv-sockets.sh"
+CHAN_SOCK_FIX_SERVICE="/etc/systemd/system/xrdp-fix-chansrv-sockets.service"
+CHAN_SOCK_FIX_TIMER="/etc/systemd/system/xrdp-fix-chansrv-sockets.timer"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -85,6 +88,54 @@ OnlyShowIn=XFCE;
 X-GNOME-Autostart-enabled=true
 EOF
 chown -R "$XARTA_USER:$XARTA_USER" "$XARTA_HOME/.config"
+
+cat > "$CHAN_SOCK_FIX_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+sockdir="/run/xrdp/sockdir"
+
+[[ -d "$sockdir" ]] || exit 0
+
+for api_socket in "$sockdir"/xrdpapi_*; do
+    [[ -S "$api_socket" ]] || continue
+    display="${api_socket##*_}"
+    compat_socket="$sockdir/xrdp_chansrv_socket_${display}"
+
+    ln -sfn "$api_socket" "$compat_socket"
+    chown -h xrdp:xrdp "$compat_socket"
+done
+EOF
+chmod 755 "$CHAN_SOCK_FIX_SCRIPT"
+
+cat > "$CHAN_SOCK_FIX_SERVICE" <<EOF
+[Unit]
+Description=Create XRDP chansrv compatibility socket symlinks
+
+[Service]
+Type=oneshot
+ExecStart=$CHAN_SOCK_FIX_SCRIPT
+EOF
+
+cat > "$CHAN_SOCK_FIX_TIMER" <<EOF
+[Unit]
+Description=Periodically create XRDP chansrv compatibility links
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=2s
+Unit=$(basename "$CHAN_SOCK_FIX_SERVICE")
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl disable --now xrdp-fix-chansrv-sockets.path >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/multi-user.target.wants/xrdp-fix-chansrv-sockets.path \
+    /etc/systemd/system/xrdp-fix-chansrv-sockets.path
+systemctl enable --now xrdp-fix-chansrv-sockets.timer
+systemctl start xrdp-fix-chansrv-sockets.service
 
 # In this LXC setup, xrdp's Xorg backend works reliably on IPv4 localhost,
 # while xrdp-sesman needs to accept the xrdp control connection on IPv4.
