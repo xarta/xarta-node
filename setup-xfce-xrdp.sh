@@ -52,6 +52,12 @@ fi
 echo "=== XFCE + XRDP setup ==="
 echo ""
 
+# Keep unrelated legacy Microsoft repo definitions from breaking apt update.
+rm -f \
+    /etc/apt/sources.list.d/vscode.sources \
+    /etc/apt/sources.list.d/archive_uri-https_packages_microsoft_com_repos_code-*.list \
+    /etc/apt/sources.list.d/archive_uri-https_packages_microsoft_com_repos_edge-*.list
+
 apt-get update
 apt-get install -y xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11 autocutsel xclip xsel
 
