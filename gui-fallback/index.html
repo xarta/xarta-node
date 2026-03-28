@@ -1574,22 +1574,24 @@
 </dialog>
 
 <!-- Connectivity diagnostic modal -->
-<dialog id="diag-modal" style="background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:24px;min-width:400px;max-width:520px;
-  max-height:90vh;overflow-y:auto;">
-  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px">
-    <h2 style="margin:0">&#128270; Connection issue</h2>
+<dialog class="hub-modal" id="diag-modal" style="width:min(760px,96vw);max-width:96vw">
+  <div class="hub-modal-header">
+    <h2 class="hub-modal-title">Connection Issue</h2>
+    <button class="hub-modal-close" type="button" data-fc-key="modal.close">CLOSE</button>
   </div>
-  <p style="margin:6px 0 14px;font-size:13px;color:var(--text-dim)">
-    Cannot reach
-    <strong id="diag-node-name" style="color:var(--text)"></strong>
-    <span id="diag-host-name" style="color:var(--text-dim)"></span>
-  </p>
-  <div id="diag-modal-body"></div>
-  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap">
-    <button class="secondary" onclick="openApiKeyModal()" title="Configure API key">&#128273; API Key</button>
-    <button class="secondary" onclick="_diagRunning=false;showConnectivityDiagnostic()">&#8635; Retry</button>
-    <button onclick="document.getElementById('diag-modal').close()">Close</button>
+  <div class="hub-modal-body">
+    <p class="muted" style="margin-bottom:14px">
+      Cannot reach
+      <strong id="diag-node-name" style="color:var(--text)"></strong>
+      <span id="diag-host-name"></span>
+    </p>
+    <p class="muted" id="diag-modal-status" style="display:none;margin-bottom:12px"></p>
+    <div id="diag-modal-body"></div>
+  </div>
+  <div class="hub-modal-footer">
+    <button class="hub-modal-btn secondary" type="button" id="diag-api-key-btn" title="Configure API key">&#128273; API Key</button>
+    <button class="hub-modal-btn secondary" type="button" id="diag-retry-btn">&#8635; Retry</button>
+    <button class="hub-modal-btn hub-modal-close" type="button" data-fc-key="modal.close">Close</button>
   </div>
 </dialog>
 
