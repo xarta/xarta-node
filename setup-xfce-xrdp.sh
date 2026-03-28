@@ -21,6 +21,7 @@ XARTA_USER="${XARTA_USER:-xarta}"
 XARTA_HOME="${XARTA_HOME:-/home/$XARTA_USER}"
 XARTA_ENABLE_XRDP="${XARTA_ENABLE_XRDP:-true}"
 POLKIT_RULE_FILE="/etc/polkit-1/rules.d/49-${XARTA_USER}-colord.rules"
+AUTOSTART_DIR="$XARTA_HOME/.config/autostart"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -52,11 +53,32 @@ echo "=== XFCE + XRDP setup ==="
 echo ""
 
 apt-get update
-apt-get install -y xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11
+apt-get install -y xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11 autocutsel xclip xsel
 
 printf 'startxfce4\n' > "$XARTA_HOME/.xsession"
 chown "$XARTA_USER:$XARTA_USER" "$XARTA_HOME/.xsession"
 chmod 644 "$XARTA_HOME/.xsession"
+
+install -d -m 755 "$AUTOSTART_DIR"
+cat > "$AUTOSTART_DIR/autocutsel-clipboard.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Autocutsel Clipboard
+Exec=autocutsel -fork
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true
+EOF
+cat > "$AUTOSTART_DIR/autocutsel-primary.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Autocutsel Primary
+Exec=autocutsel -selection PRIMARY -fork
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true
+EOF
+chown -R "$XARTA_USER:$XARTA_USER" "$XARTA_HOME/.config"
 
 # In this LXC setup, xrdp's Xorg backend works reliably on IPv4 localhost,
 # while xrdp-sesman needs to accept the xrdp control connection on IPv4.
