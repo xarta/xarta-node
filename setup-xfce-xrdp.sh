@@ -22,9 +22,6 @@ XARTA_HOME="${XARTA_HOME:-/home/$XARTA_USER}"
 XARTA_ENABLE_XRDP="${XARTA_ENABLE_XRDP:-true}"
 POLKIT_RULE_FILE="/etc/polkit-1/rules.d/49-${XARTA_USER}-colord.rules"
 AUTOSTART_DIR="$XARTA_HOME/.config/autostart"
-CHAN_SOCK_FIX_SCRIPT="/usr/local/sbin/xrdp-fix-chansrv-sockets.sh"
-CHAN_SOCK_FIX_SERVICE="/etc/systemd/system/xrdp-fix-chansrv-sockets.service"
-CHAN_SOCK_FIX_TIMER="/etc/systemd/system/xrdp-fix-chansrv-sockets.timer"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -64,7 +61,7 @@ rm -f \
 apt-get update
 apt-get install -y xfce4 xfce4-goodies xrdp xorgxrdp dbus-x11 autocutsel xclip xsel
 
-printf 'startxfce4\n' > "$XARTA_HOME/.xsession"
+printf 'xfce4-session\n' > "$XARTA_HOME/.xsession"
 chown "$XARTA_USER:$XARTA_USER" "$XARTA_HOME/.xsession"
 chmod 644 "$XARTA_HOME/.xsession"
 
@@ -89,65 +86,30 @@ X-GNOME-Autostart-enabled=true
 EOF
 chown -R "$XARTA_USER:$XARTA_USER" "$XARTA_HOME/.config"
 
-cat > "$CHAN_SOCK_FIX_SCRIPT" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-sockdir="/run/xrdp/sockdir"
-
-[[ -d "$sockdir" ]] || exit 0
-
-for api_socket in "$sockdir"/xrdpapi_*; do
-    [[ -S "$api_socket" ]] || continue
-    display="${api_socket##*_}"
-    compat_socket="$sockdir/xrdp_chansrv_socket_${display}"
-
-    ln -sfn "$api_socket" "$compat_socket"
-    chown -h xrdp:xrdp "$compat_socket"
-done
-EOF
-chmod 755 "$CHAN_SOCK_FIX_SCRIPT"
-
-cat > "$CHAN_SOCK_FIX_SERVICE" <<EOF
-[Unit]
-Description=Create XRDP chansrv compatibility socket symlinks
-
-[Service]
-Type=oneshot
-ExecStart=$CHAN_SOCK_FIX_SCRIPT
-EOF
-
-cat > "$CHAN_SOCK_FIX_TIMER" <<EOF
-[Unit]
-Description=Periodically create XRDP chansrv compatibility links
-
-[Timer]
-OnBootSec=5s
-OnUnitActiveSec=2s
-Unit=$(basename "$CHAN_SOCK_FIX_SERVICE")
-
-[Install]
-WantedBy=multi-user.target
-EOF
+rm -f \
+    /etc/systemd/system/xrdp.service.d/runtime-prep.conf \
+    /etc/systemd/system/xrdp-sesman.service.d/runtime-prep.conf
 
 systemctl daemon-reload
-systemctl disable --now xrdp-fix-chansrv-sockets.path >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/multi-user.target.wants/xrdp-fix-chansrv-sockets.path \
-    /etc/systemd/system/xrdp-fix-chansrv-sockets.path
-systemctl enable --now xrdp-fix-chansrv-sockets.timer
-systemctl start xrdp-fix-chansrv-sockets.service
+systemctl disable --now xrdp-fix-chansrv-sockets.timer xrdp-fix-chansrv-sockets.path >/dev/null 2>&1 || true
+rm -f /usr/local/sbin/xrdp-fix-chansrv-sockets.sh \
+    /etc/systemd/system/xrdp-fix-chansrv-sockets.service \
+    /etc/systemd/system/xrdp-fix-chansrv-sockets.timer \
+    /etc/systemd/system/xrdp-fix-chansrv-sockets.path \
+    /etc/systemd/system/multi-user.target.wants/xrdp-fix-chansrv-sockets.timer \
+    /etc/systemd/system/multi-user.target.wants/xrdp-fix-chansrv-sockets.path
+systemctl reset-failed xrdp-fix-chansrv-sockets.service xrdp-fix-chansrv-sockets.timer xrdp-fix-chansrv-sockets.path >/dev/null 2>&1 || true
 
-# In this LXC setup, xrdp's Xorg backend works reliably on IPv4 localhost,
-# while xrdp-sesman needs to accept the xrdp control connection on IPv4.
-# Keep the Xorg session target on 127.0.0.1 and let sesman listen broadly;
-# the host firewall does not expose TCP 3350 externally.
+# In this Debian 12 XRDP build, chansrv only creates the Unix clipboard
+# socket when sesman is bound to 127.0.0.1. Keep both the Xorg backend and
+# sesman control path on IPv4 localhost so clipboard redirection works.
 if [[ -f /etc/xrdp/xrdp.ini ]]; then
     sed -i 's/^ip=::1$/ip=127.0.0.1/' /etc/xrdp/xrdp.ini
 fi
 
 if [[ -f /etc/xrdp/sesman.ini ]]; then
-    sed -i 's/^ListenAddress=127\.0\.0\.1$/ListenAddress=0.0.0.0/' /etc/xrdp/sesman.ini
-    sed -i 's/^ListenAddress=::1$/ListenAddress=0.0.0.0/' /etc/xrdp/sesman.ini
+    sed -i 's/^ListenAddress=0\.0\.0\.0$/ListenAddress=127.0.0.1/' /etc/xrdp/sesman.ini
+    sed -i 's/^ListenAddress=::1$/ListenAddress=127.0.0.1/' /etc/xrdp/sesman.ini
 fi
 
 install -d -m 755 /etc/polkit-1/rules.d
