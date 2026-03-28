@@ -218,6 +218,32 @@ else
     echo "    Skipped mTLS :8443 block (SYNC_TLS_CA/CERT/KEY not set — plain HTTP only)"
 fi
 
+# ── Syncthing GUI block — appended when SYNCTHING_HOSTNAME is set ─────────────
+# The Syncthing GUI binds to loopback:8384 only. This block exposes it over
+# HTTPS via the node's syncthing hostname (from SYNCTHING_HOSTNAME in .env).
+# header_up sets Host: localhost so Syncthing's built-in host check passes.
+# Requires pfSense DNS record: SYNCTHING_HOSTNAME → this node's primary_ip.
+if [[ -n "${SYNCTHING_HOSTNAME:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_SYNCTHING
+
+# Syncthing GUI — reverse proxy to the local Syncthing web interface.
+# GUI binds to loopback:8384 only; exposed over HTTPS at ${SYNCTHING_HOSTNAME}.
+https://${SYNCTHING_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+    reverse_proxy localhost:8384 {
+        header_up Host localhost
+    }
+}
+
+http://${SYNCTHING_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_SYNCTHING
+    echo "    Appended Syncthing GUI block (https://${SYNCTHING_HOSTNAME})"
+else
+    echo "    Skipped Syncthing GUI block (SYNCTHING_HOSTNAME not set in .env)"
+fi
+
 echo "    Written: $CADDYFILE"
 echo ""
 

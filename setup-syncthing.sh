@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# setup-syncthing.sh — install and configure Syncthing for xarta-node fleet
+#
+# What this script does (idempotent):
+#   1. Installs Syncthing from the official apt repository + python3-bcrypt.
+#   2. Ensures gui-fallback/assets/icons/ and gui-fallback/assets/sounds/ exist
+#      with Syncthing .stfolder marker files.
+#   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
+#   4. Temporarily starts syncthing@root.service so Syncthing generates its
+#      device certificate, then reads the device ID from the local REST API.
+#   5. Generates config.xml from .nodes.json + .env: GUI credentials, peer
+#      device IDs (via primary_ip), shared folder paths, discovery disabled.
+#   6. Writes SYNCTHING_DEVICE_ID to .env.
+#   7. Restarts syncthing@root.service with the new config.
+#
+# Two-pass rollout for the fleet:
+#   Pass 1 (first run on a node):
+#     → Script prints this node's Syncthing device ID.
+#     → Operator adds it to .nodes.json (syncthing_device_id for this node_id).
+#     → Run: bash bp-nodes-push.sh
+#     → Re-run: bash setup-syncthing.sh  (pass 2)
+#   Pass 2 (after all nodes have device IDs in .nodes.json):
+#     → Full peer mesh is configured. Peers with empty device IDs are skipped.
+#
+# After this script: re-run setup-caddy.sh to expose the Syncthing GUI at
+#   https://$SYNCTHING_HOSTNAME (block is generated when SYNCTHING_HOSTNAME
+#   is set in .env).
+#
+# Required .env vars before running:
+#   BLUEPRINTS_NODE_ID      — e.g. my-node-1
+#   REPO_OUTER_PATH         — e.g. /root/xarta-node
+#   SYNCTHING_HOSTNAME      — e.g. sync.<your-domain>
+#   SYNCTHING_GUI_USER      — e.g. admin (defaults to admin if not set)
+#   SYNCTHING_GUI_PASSWORD  — set a strong password before running
+#   CERT_FILE, CERT_KEY     — fleet TLS cert paths (used by setup-caddy.sh)
+#
+# Safe to re-run.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+NODES_JSON="$SCRIPT_DIR/.nodes.json"
+SYNCTHING_HOME="/root/.local/state/syncthing"
+
+# ── Colours ────────────────────────────────────────────────────────────────────
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}Error:${NC} must be run as root." >&2
+    exit 1
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo -e "${RED}Error:${NC} .env not found at $ENV_FILE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$NODES_JSON" ]]; then
+    echo -e "${RED}Error:${NC} .nodes.json not found — run bp-nodes-push.sh first." >&2
+    exit 1
+fi
+
+source "$ENV_FILE"
+
+NODE_ID="${BLUEPRINTS_NODE_ID:?BLUEPRINTS_NODE_ID not set in .env}"
+REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
+SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
+SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
+SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+env_set() {
+    local key="$1" value="$2"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+        echo -e "    ${CYAN}updated${NC}: ${key}"
+    else
+        echo "" >> "$ENV_FILE"
+        echo "${key}=${value}" >> "$ENV_FILE"
+        echo -e "    ${CYAN}added${NC}:   ${key}"
+    fi
+}
+
+echo "=== Syncthing setup ==="
+echo "Node         : $NODE_ID"
+echo "Config dir   : $SYNCTHING_HOME"
+echo "GUI hostname : $SYNCTHING_HOSTNAME"
+echo "Repo path    : $REPO_OUTER_PATH"
+echo ""
+
+# ── Step 1 — Install Syncthing from official apt repository ──────────────────
+echo "Step 1: Installing Syncthing..."
+if command -v syncthing >/dev/null 2>&1; then
+    echo -e "    already installed: $(syncthing --version 2>/dev/null | head -1)"
+else
+    echo "    Adding official Syncthing apt repository..."
+    apt-get install -y --no-install-recommends curl gpg >/dev/null 2>&1
+    curl -1sLf 'https://syncthing.net/release-key.gpg' \
+        | gpg --dearmor --yes -o /usr/share/keyrings/syncthing-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg] \
+https://apt.syncthing.net/ syncthing stable" \
+        > /etc/apt/sources.list.d/syncthing.list
+    apt-get update -qq
+    apt-get install -y syncthing
+    echo -e "    ${GREEN}installed:${NC} $(syncthing --version 2>/dev/null | head -1)"
+fi
+
+echo "    Checking python3-bcrypt..."
+dpkg -l python3-bcrypt >/dev/null 2>&1 || apt-get install -y python3-bcrypt
+echo -e "    ${GREEN}ok${NC}"
+echo ""
+
+# ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
+echo "Step 2: Ensuring shared asset directories exist..."
+ICONS_DIR="$REPO_OUTER_PATH/gui-fallback/assets/icons"
+SOUNDS_DIR="$REPO_OUTER_PATH/gui-fallback/assets/sounds"
+mkdir -p "$ICONS_DIR" "$SOUNDS_DIR"
+# .stfolder is Syncthing's required presence marker. Without it Syncthing will
+# refuse to sync the folder (treats a missing marker as an accidental deletion).
+touch "$ICONS_DIR/.stfolder"
+touch "$SOUNDS_DIR/.stfolder"
+echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo ""
+
+# ── Step 3 — Stable API key (generated once, persisted in .env) ──────────────
+echo "Step 3: Checking Syncthing API key..."
+if [[ -z "${SYNCTHING_API_KEY:-}" ]]; then
+    SYNCTHING_API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(20))")
+    env_set "SYNCTHING_API_KEY" "$SYNCTHING_API_KEY"
+    echo -e "    ${CYAN}generated${NC} new API key — written to .env"
+else
+    echo "    API key present in .env — keeping existing"
+fi
+echo ""
+
+# ── Step 4 — Start service briefly to generate cert and obtain device ID ──────
+echo "Step 4: Starting syncthing@root.service to generate device certificate..."
+systemctl enable syncthing@root.service >/dev/null 2>&1
+systemctl start syncthing@root.service
+
+# Syncthing generates config.xml and its cert/key on first startup.
+echo "    Waiting for config.xml (up to 30s)..."
+for i in $(seq 1 30); do
+    [[ -f "$SYNCTHING_HOME/config.xml" ]] && break
+    sleep 1
+done
+
+if [[ ! -f "$SYNCTHING_HOME/config.xml" ]]; then
+    echo -e "${RED}Error:${NC} Syncthing did not create config.xml within 30s." >&2
+    echo "  If config is elsewhere, set SYNCTHING_HOME at the top of this script." >&2
+    echo "  Syncthing 1.30+ uses ~/.local/state/syncthing/ (XDG state dir)." >&2
+    echo "  Scan: find /root -name config.xml 2>/dev/null" >&2
+    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
+    exit 1
+fi
+echo -e "    ${GREEN}found${NC}: $SYNCTHING_HOME/config.xml"
+
+# Read the auto-generated API key from the fresh config to authenticate the API.
+INITIAL_API_KEY=$(python3 -c "
+import xml.etree.ElementTree as ET
+root = ET.parse('$SYNCTHING_HOME/config.xml').getroot()
+print(root.findtext('./gui/apikey') or '')
+" 2>/dev/null)
+
+# Poll until the REST API responds (up to 30s).
+echo "    Waiting for local REST API on 127.0.0.1:8384 (up to 30s)..."
+API_UP=0
+for i in $(seq 1 30); do
+    if curl -sf -H "X-API-Key: $INITIAL_API_KEY" \
+            http://127.0.0.1:8384/rest/system/ping >/dev/null 2>&1; then
+        API_UP=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ $API_UP -eq 0 ]]; then
+    echo -e "${RED}Error:${NC} Syncthing API did not respond within 30s." >&2
+    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
+    systemctl stop syncthing@root.service || true
+    exit 1
+fi
+
+# Read this node's device ID from the running instance.
+OWN_DEVICE_ID=$(curl -sf \
+    -H "X-API-Key: $INITIAL_API_KEY" \
+    http://127.0.0.1:8384/rest/system/status \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['myID'])")
+
+echo -e "    ${GREEN}Device ID:${NC} $OWN_DEVICE_ID"
+systemctl stop syncthing@root.service
+echo ""
+
+# ── Step 5 — Write device ID to .env ─────────────────────────────────────────
+echo "Step 5: Writing device ID to .env..."
+env_set "SYNCTHING_DEVICE_ID" "$OWN_DEVICE_ID"
+source "$ENV_FILE"
+echo ""
+
+# ── Step 6 — Generate config.xml from .nodes.json ────────────────────────────
+echo "Step 6: Generating config.xml from .nodes.json + .env..."
+
+# Bcrypt the GUI password at runtime. The plain password stays in .env;
+# only the hash is written to config.xml — Syncthing expects bcrypt cost 10.
+GUI_PASS_HASH=$(SYNCTHING_GUI_PASSWORD="$SYNCTHING_GUI_PASSWORD" python3 -c "
+import bcrypt, os
+pw = os.environ['SYNCTHING_GUI_PASSWORD'].encode()
+print(bcrypt.hashpw(pw, bcrypt.gensalt(10)).decode())
+")
+
+# Write the Python patcher to a tempfile so args are passed cleanly.
+TMPPY=$(mktemp /tmp/syncthing-patch-XXXXXXXX.py)
+trap "rm -f '$TMPPY'" EXIT
+
+cat > "$TMPPY" << 'PYEOF'
+"""Patch Syncthing config.xml with fleet settings from .nodes.json and .env.
+
+Args (positional):
+    config_path     — path to config.xml
+    nodes_json      — path to .nodes.json
+    node_id         — e.g. my-node-1
+    own_device_id   — Syncthing device ID for this node
+    gui_user        — Syncthing GUI username
+    gui_pass_hash   — bcrypt hash of the GUI password
+    api_key         — Syncthing REST API key
+    repo_path       — REPO_OUTER_PATH (e.g. /root/xarta-node)
+"""
+import sys
+import json
+import xml.etree.ElementTree as ET
+
+if len(sys.argv) != 9:
+    print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <repo_path>",
+          file=sys.stderr)
+    sys.exit(1)
+
+(config_path, nodes_json_path, node_id, own_device_id,
+ gui_user, gui_pass_hash, api_key, repo_path) = sys.argv[1:]
+
+with open(nodes_json_path) as nf:
+    nodes = json.load(nf)['nodes']
+
+own_node = next((n for n in nodes if n['node_id'] == node_id), None)
+if own_node is None:
+    print(f"ERROR: node_id '{node_id}' not found in .nodes.json", file=sys.stderr)
+    sys.exit(1)
+
+peers = [n for n in nodes if n['node_id'] != node_id]
+
+tree = ET.parse(config_path)
+root = tree.getroot()
+
+
+def sub_text(parent, tag, text):
+    """Set text of an existing child element or create the element if absent."""
+    el = parent.find(tag)
+    if el is None:
+        el = ET.SubElement(parent, tag)
+    el.text = text
+    return el
+
+
+# ── GUI ───────────────────────────────────────────────────────────────────────
+gui = root.find('gui')
+if gui is None:
+    gui = ET.SubElement(root, 'gui')
+gui.set('enabled', 'true')
+gui.set('tls', 'false')         # Caddy provides TLS; keep Syncthing GUI plain HTTP
+sub_text(gui, 'address', '127.0.0.1:8384')
+sub_text(gui, 'user', gui_user)
+sub_text(gui, 'password', gui_pass_hash)
+sub_text(gui, 'apikey', api_key)
+sub_text(gui, 'theme', 'default')
+# Caddy sends Host: localhost (header_up Host localhost) so Syncthing's
+# built-in host check passes without the insecureSkipHostcheck override.
+sub_text(gui, 'insecureSkipHostcheck', 'false')
+
+# ── Options ───────────────────────────────────────────────────────────────────
+opts = root.find('options')
+if opts is None:
+    opts = ET.SubElement(root, 'options')
+sub_text(opts, 'listenAddress', 'tcp://0.0.0.0:22000')
+sub_text(opts, 'localAnnounceEnabled', 'false')   # fleet uses static peer IPs
+sub_text(opts, 'localAnnouncePort', '21027')
+sub_text(opts, 'globalAnnounceEnabled', 'false')  # no external discovery
+sub_text(opts, 'relaysEnabled', 'false')           # direct fleet-only sync
+sub_text(opts, 'natEnabled', 'false')
+sub_text(opts, 'startBrowser', 'false')
+sub_text(opts, 'autoUpgradeIntervalH', '0')        # versions managed by apt
+sub_text(opts, 'urAccepted', '-1')                 # opt out of telemetry
+
+# ── Devices ───────────────────────────────────────────────────────────────────
+# Remove all existing device entries and rebuild cleanly from .nodes.json.
+for dev in list(root.findall('device')):
+    root.remove(dev)
+
+# Own device (address stays 'dynamic' — syncthing resolves from its listen port).
+own_dev = ET.SubElement(root, 'device')
+own_dev.set('id', own_device_id)
+own_dev.set('name', node_id)
+own_dev.set('compression', 'metadata')
+own_dev.set('introduceClients', 'false')
+own_dev.set('skipIntroductionRemovals', 'false')
+own_dev.set('introducedBy', '')
+ET.SubElement(own_dev, 'address').text = 'dynamic'
+
+# Peer devices — only those with populated syncthing_device_id.
+# On pass 1 (device IDs not yet known) these are all skipped; that is expected.
+peer_device_ids = []
+skipped_peers = []
+for peer in peers:
+    dev_id = peer.get('syncthing_device_id', '').strip()
+    if not dev_id:
+        skipped_peers.append(peer['node_id'])
+        continue
+    peer_dev = ET.SubElement(root, 'device')
+    peer_dev.set('id', dev_id)
+    peer_dev.set('name', peer['node_id'])
+    peer_dev.set('compression', 'metadata')
+    peer_dev.set('introduceClients', 'false')
+    peer_dev.set('skipIntroductionRemovals', 'false')
+    peer_dev.set('introducedBy', '')
+    ip = peer.get('primary_ip', '')
+    ET.SubElement(peer_dev, 'address').text = (
+        f'tcp://{ip}:22000' if ip else 'dynamic'
+    )
+    peer_device_ids.append(dev_id)
+
+# ── Shared Folders ────────────────────────────────────────────────────────────
+# Remove our two managed folders (by stable ID) and rebuild from current state.
+for fid in ('xarta-icons', 'xarta-sounds'):
+    for f in list(root.findall(f'folder[@id="{fid}"]')):
+        root.remove(f)
+
+all_device_ids = [own_device_id] + peer_device_ids
+
+
+def add_folder(fid, label, path):
+    f = ET.SubElement(root, 'folder')
+    f.set('id', fid)
+    f.set('label', label)
+    f.set('path', path)
+    f.set('type', 'sendreceive')
+    f.set('rescanIntervalS', '3600')
+    f.set('fsWatcherEnabled', 'true')
+    f.set('fsWatcherDelayS', '10')
+    f.set('autoNormalize', 'true')
+    f.set('paused', 'false')
+    for did in all_device_ids:
+        d = ET.SubElement(f, 'device')
+        d.set('id', did)
+        d.set('introducedBy', '')
+    ET.SubElement(f, 'maxConflicts').text = '10'
+    ET.SubElement(f, 'markerName').text = '.stfolder'
+
+
+add_folder('xarta-icons', 'Assets - Icons',
+           repo_path + '/gui-fallback/assets/icons')
+add_folder('xarta-sounds', 'Assets - Sounds',
+           repo_path + '/gui-fallback/assets/sounds')
+
+# ── Write ─────────────────────────────────────────────────────────────────────
+ET.indent(tree, space='    ')
+with open(config_path, 'wb') as fh:
+    tree.write(fh, xml_declaration=True, encoding='utf-8')
+
+print(f"    Written: {config_path}")
+print(f"    Own device:       {own_device_id}")
+print(f"    Peers configured: {len(peer_device_ids)} of {len(peers)}")
+if skipped_peers:
+    print(f"    Skipped (no device ID yet): {', '.join(skipped_peers)}")
+PYEOF
+
+python3 "$TMPPY" \
+    "$SYNCTHING_HOME/config.xml" \
+    "$NODES_JSON" \
+    "$NODE_ID" \
+    "$OWN_DEVICE_ID" \
+    "$SYNCTHING_GUI_USER" \
+    "$GUI_PASS_HASH" \
+    "$SYNCTHING_API_KEY" \
+    "$REPO_OUTER_PATH"
+echo ""
+
+# ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
+echo "Step 7: Enabling and restarting syncthing@root.service..."
+systemctl enable syncthing@root.service >/dev/null 2>&1
+systemctl restart syncthing@root.service
+sleep 2
+
+if systemctl is-active --quiet syncthing@root.service; then
+    echo -e "    ${GREEN}running${NC}: syncthing@root.service"
+else
+    echo -e "${RED}Error:${NC} syncthing@root.service failed to start." >&2
+    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
+    exit 1
+fi
+echo ""
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+PEER_STATUS=$(python3 -c "
+import json
+nodes = json.load(open('$NODES_JSON'))['nodes']
+peers = [n for n in nodes if n.get('node_id') != '$NODE_ID']
+done = sum(1 for p in peers if p.get('syncthing_device_id', '').strip())
+print(f'{done}/{len(peers)}')
+")
+
+echo "=== Syncthing setup complete ==="
+echo ""
+echo "  Node         : $NODE_ID"
+echo "  Device ID    : $OWN_DEVICE_ID"
+echo "  Peers        : $PEER_STATUS device IDs configured in .nodes.json"
+echo "  Service      : syncthing@root.service ($(systemctl is-active syncthing@root.service))"
+echo "  Config       : $SYNCTHING_HOME/config.xml"
+echo ""
+echo "Next steps:"
+echo ""
+echo "  1. Add this device ID to .nodes.json under node '$NODE_ID':"
+echo "       \"syncthing_device_id\": \"$OWN_DEVICE_ID\""
+echo ""
+echo "  2. Distribute updated .nodes.json to all fleet nodes:"
+echo "       bash bp-nodes-push.sh"
+echo ""
+echo "  3. Re-run this script (pass 2) to inject configured peer device IDs."
+echo ""
+echo "  4. Add pfSense DNS record: $SYNCTHING_HOSTNAME → <this node's primary_ip>"
+echo ""
+echo "  5. Re-run setup-caddy.sh to expose the Syncthing GUI at:"
+echo "       https://$SYNCTHING_HOSTNAME"
+echo ""
+echo "  6. Repeat on each remaining fleet node."
+echo ""
