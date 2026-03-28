@@ -49,6 +49,7 @@ SKIP_KEYS=(
     "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
     "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure
     "SEEKDB_DB"                 # value is "blueprints" — the project name, present everywhere
+    "SYNCTHING_GUI_USER"        # default value is "admin" — generic word present throughout public code and docs
 )
 
 # Colours

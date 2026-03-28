@@ -12,6 +12,7 @@
 #        - TCP 443  (Caddy HTTPS)
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
 #        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
+#        - TCP+UDP 22000 (Syncthing BEP asset sync)  — per-peer-IP from .nodes.json only
 #   Note: TCP 8080 is intentionally NOT opened to peers — uvicorn on 8080 is
 #         loopback-only. All inter-node sync uses mTLS on port 8443.
 #   4. Inserts a jump to XARTA_INPUT at position 1 of the INPUT chain
@@ -141,6 +142,13 @@ for ip in sorted(ips):
         while IFS= read -r ip; do
             iptables -A XARTA_INPUT -p tcp --dport 8443 -s "$ip" -j ACCEPT
             echo "    added: TCP 8443 from $ip (fleet peer sync, mTLS) → ACCEPT"
+        done <<< "$PEER_IPS"
+        # Syncthing BEP asset sync — per-peer-IP from .nodes.json only.
+        # TCP for reliable block-exchange, UDP for QUIC transport.
+        while IFS= read -r ip; do
+            iptables -A XARTA_INPUT -p tcp --dport 22000 -s "$ip" -j ACCEPT
+            iptables -A XARTA_INPUT -p udp --dport 22000 -s "$ip" -j ACCEPT
+            echo "    added: TCP+UDP 22000 from $ip (Syncthing BEP) → ACCEPT"
         done <<< "$PEER_IPS"
     fi
 fi
