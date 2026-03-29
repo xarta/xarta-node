@@ -46,11 +46,12 @@ Every write increments a `gen` counter in the DB metadata. Used to:
 - Guard against a fresh node overwriting an established one (HTTP 409 if `sender_gen <= my_gen` and node is healthy)
 
 ### Git-sync actions
-Two system action types that flow through the same queue:
+Three system action types that flow through the same queue:
 - `sync_git_outer` — triggers `git pull` on `REPO_OUTER_PATH` (app code)
-- `sync_git_inner` — triggers `git pull` on `REPO_INNER_PATH` (GUI/config)
+- `sync_git_non_root` — triggers `git pull` on `REPO_NON_ROOT_PATH` (non-root public repo)
+- `sync_git_inner` — triggers `git pull` on `REPO_INNER_PATH` (private repo)
 
-Triggered via `POST /api/v1/sync/git-pull` with `{"scope": "outer"|"inner"|"both"}`. The receiving node runs the pull and restarts the service if new commits landed (using `SERVICE_RESTART_CMD` from `.env`). These actions are fire-and-forget — they don't touch the DB and don't re-propagate.
+Triggered via `POST /api/v1/sync/git-pull` with `{"scope": "outer"|"non_root"|"inner"|"both"|"all"}`. The receiving node runs the pull locally. `outer` and `inner` restart the service when configured; `non_root` updates in place without a service restart. The Fleet Nodes GUI orchestrates staged `outer` → `non_root` → `inner` update with a 10-second settle window, commit verification across all nodes, and one retry per stage. These actions are fire-and-forget at the sync layer — they don't touch the DB and don't re-propagate.
 
 ## Boot sequence
 
