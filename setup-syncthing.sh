@@ -403,8 +403,9 @@ for peer in peers:
     peer_device_ids.append(dev_id)
 
 # ── Shared Folders ────────────────────────────────────────────────────────────
-# Remove our two managed folders (by stable ID) and rebuild from current state.
-for fid in ('xarta-icons', 'xarta-sounds'):
+# Remove all known managed folders plus the Syncthing default folder (which
+# points to a path that may not exist on this node) and rebuild from scratch.
+for fid in ('xarta-icons', 'xarta-sounds', 'default'):
     for f in list(root.findall(f'folder[@id="{fid}"]')):
         root.remove(f)
 
