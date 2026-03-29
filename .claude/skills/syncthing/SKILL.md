@@ -18,8 +18,8 @@ Both paths are gitignored (except `assets/icons/fallback.svg`). The `nav_items` 
 
 ## Key facts
 
-- **Service**: `syncthing@root.service` (not `syncthing.service`)
-- **Config**: `/root/.local/state/syncthing/config.xml` (XDG path — Syncthing 1.30+)
+- **Service**: `syncthing@xarta.service` (not `syncthing.service`)
+- **Config**: `/home/xarta/.local/state/syncthing/config.xml` (XDG state dir — Syncthing 1.30+)
 - **Config is generated** by `setup-syncthing.sh` from `.nodes.json` + `.env`. Do not hand-edit — changes will be overwritten on next run.
 - **GUI** bound to loopback only; exposed via Caddy reverse proxy using `SYNCTHING_HOSTNAME` from `.env`
 - **API key** stored in `.env` as `SYNCTHING_API_KEY`; used for local curl calls to `127.0.0.1:8384`
@@ -40,14 +40,14 @@ When adding a new node to an existing mesh, pass 2 must also be re-run on all ex
 
 ```bash
 # Add an asset — copy to the folder on any node; propagates automatically
-cp my-icon.svg /root/xarta-node/gui-fallback/assets/icons/
+cp my-icon.svg /xarta-node/gui-fallback/assets/icons/
 
 # Service status / restart
-systemctl status syncthing@root.service
-systemctl restart syncthing@root.service
+systemctl status syncthing@xarta.service
+systemctl restart syncthing@xarta.service
 
 # Live logs
-journalctl -u syncthing@root -f
+journalctl -u syncthing@xarta -f
 
 # Read own device ID
 curl -sf -H "X-API-Key: $SYNCTHING_API_KEY" \
@@ -62,7 +62,7 @@ curl -sf -H "X-API-Key: $SYNCTHING_API_KEY" \
     "http://127.0.0.1:8384/rest/db/status?folder=xarta-icons" | python3 -m json.tool
 
 # Find conflict files
-find /root/xarta-node/gui-fallback/assets/ -name '*.sync-conflict*'
+find /xarta-node/gui-fallback/assets/ -name '*.sync-conflict*'
 ```
 
 ## Detailed docs
