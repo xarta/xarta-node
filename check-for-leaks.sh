@@ -36,6 +36,7 @@ SKIP_VALUES=(
 # Keys whose values are intentionally referenced in committed files and should
 # not be treated as leaks (e.g. paths baked into templates, service names in scripts).
 SKIP_KEYS=(
+    "REPO_CADDY_PATH"           # node-local repo path is intentionally documented in migration work
     "REPO_OUTER_PATH"
     "REPO_INNER_PATH"           # paths appear in docs/templates — not secrets
     "SERVICE_RESTART_CMD"
@@ -48,6 +49,10 @@ SKIP_KEYS=(
     "TAILSCALE_EXIT_NODE"       # value is "true" — too generic to scan for
     "PROXMOX_SSH_KEY"           # standard path convention, present in onboarding templates
     "NODES_JSON_PATH"           # default path is a public convention — not a secret
+    "BLUEPRINTS_FALLBACK_GUI_DIR" # staged local path override — intentionally documented
+    "BLUEPRINTS_SHARED_DB_DIR"    # staged local path override — intentionally documented
+    "BLUEPRINTS_EMBED_DIR"        # staged local path override — intentionally documented
+    "BLUEPRINTS_ASSETS_DIR"       # staged local path override — intentionally documented
     "BLUEPRINTS_GUI_DIR"        # derived from REPO_INNER_PATH — documented public structure
     "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
     "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure

@@ -54,6 +54,7 @@ BLUEPRINTS_GUI_DIR="${BLUEPRINTS_GUI_DIR:-/data/gui}"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-$SCRIPT_DIR/gui-fallback}"
 BLUEPRINTS_SHARED_DB_DIR="${BLUEPRINTS_SHARED_DB_DIR:-$SCRIPT_DIR/gui-db}"
 BLUEPRINTS_EMBED_DIR="${BLUEPRINTS_EMBED_DIR:-$SCRIPT_DIR/gui-embed}"
+BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-$BLUEPRINTS_FALLBACK_GUI_DIR/assets}"
 
 chown_like() {
     local ref_path="$1"
@@ -72,6 +73,7 @@ echo "GUI dir  : $BLUEPRINTS_GUI_DIR"
 echo "Fallback : $BLUEPRINTS_FALLBACK_GUI_DIR"
 echo "Shared DB: $BLUEPRINTS_SHARED_DB_DIR"
 echo "Embed dir: $BLUEPRINTS_EMBED_DIR"
+echo "Assets   : $BLUEPRINTS_ASSETS_DIR"
 echo ""
 
 if [[ ! -d "$BLUEPRINTS_FALLBACK_GUI_DIR" ]]; then
@@ -86,6 +88,11 @@ fi
 
 if [[ ! -d "$BLUEPRINTS_EMBED_DIR" ]]; then
     echo "ERROR: embed directory not found at $BLUEPRINTS_EMBED_DIR"
+    exit 1
+fi
+
+if [[ ! -d "$BLUEPRINTS_ASSETS_DIR" ]]; then
+    echo "ERROR: assets directory not found at $BLUEPRINTS_ASSETS_DIR"
     exit 1
 fi
 
@@ -131,6 +138,13 @@ rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
 ln -s "$BLUEPRINTS_SHARED_DB_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
 chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
 echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
+
+# Also expose shared assets under /fallback-ui/assets.
+echo "--- linking assets into gui-fallback directory..."
+rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+ln -s "$BLUEPRINTS_ASSETS_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/assets -> $BLUEPRINTS_ASSETS_DIR"
 
 # ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."

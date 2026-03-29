@@ -71,6 +71,7 @@ source "$ENV_FILE"
 NODE_ID="${BLUEPRINTS_NODE_ID:?BLUEPRINTS_NODE_ID not set in .env}"
 REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-$REPO_OUTER_PATH/gui-fallback}"
+BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-$BLUEPRINTS_FALLBACK_GUI_DIR/assets}"
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
@@ -106,7 +107,7 @@ echo "Node         : $NODE_ID"
 echo "Config dir   : $SYNCTHING_HOME"
 echo "GUI hostname : $SYNCTHING_HOSTNAME"
 echo "Repo path    : $REPO_OUTER_PATH"
-echo "Assets path  : $BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+echo "Assets path  : $BLUEPRINTS_ASSETS_DIR"
 echo ""
 
 # ── Step 1 — Install Syncthing from official apt repository ──────────────────
@@ -133,12 +134,12 @@ echo ""
 
 # ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
 echo "Step 2: Ensuring shared asset directories exist..."
-ICONS_DIR="$BLUEPRINTS_FALLBACK_GUI_DIR/assets/icons"
-SOUNDS_DIR="$BLUEPRINTS_FALLBACK_GUI_DIR/assets/sounds"
-mkdir -p "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$ICONS_DIR" "$SOUNDS_DIR"
-chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
-chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$ICONS_DIR"
-chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$SOUNDS_DIR"
+ICONS_DIR="$BLUEPRINTS_ASSETS_DIR/icons"
+SOUNDS_DIR="$BLUEPRINTS_ASSETS_DIR/sounds"
+mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR"
+chown_like "$(dirname "$BLUEPRINTS_ASSETS_DIR")" "$BLUEPRINTS_ASSETS_DIR"
+chown_like "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR"
+chown_like "$BLUEPRINTS_ASSETS_DIR" "$SOUNDS_DIR"
 # .stfolder is Syncthing's required presence marker. Without it Syncthing will
 # refuse to sync the folder (treats a missing marker as an accidental deletion).
 touch "$ICONS_DIR/.stfolder"
@@ -250,7 +251,7 @@ Args (positional):
     gui_user        — Syncthing GUI username
     gui_pass_hash   — bcrypt hash of the GUI password
     api_key         — Syncthing REST API key
-    repo_path       — REPO_OUTER_PATH (e.g. /root/xarta-node)
+    assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
 """
 import sys
 import json
@@ -258,12 +259,12 @@ import xml.etree.ElementTree as ET
 
 if len(sys.argv) != 9:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <repo_path>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
- gui_user, gui_pass_hash, api_key, repo_path) = sys.argv[1:]
+ gui_user, gui_pass_hash, api_key, assets_dir) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -383,9 +384,9 @@ def add_folder(fid, label, path):
 
 
 add_folder('xarta-icons', 'Assets - Icons',
-           repo_path + '/gui-fallback/assets/icons')
+           assets_dir + '/icons')
 add_folder('xarta-sounds', 'Assets - Sounds',
-           repo_path + '/gui-fallback/assets/sounds')
+           assets_dir + '/sounds')
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 ET.indent(tree, space='    ')
@@ -407,7 +408,7 @@ python3 "$TMPPY" \
     "$SYNCTHING_GUI_USER" \
     "$GUI_PASS_HASH" \
     "$SYNCTHING_API_KEY" \
-    "$REPO_OUTER_PATH"
+    "$BLUEPRINTS_ASSETS_DIR"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
