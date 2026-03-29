@@ -60,11 +60,12 @@ Push to GitHub, then update the fleet with the SSH-to-loopback scripts:
 ```bash
 bash bp-nodes-push.sh
 bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-public.sh
+bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-non-root.sh
 bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-private.sh
 ```
 The scripts SSH to each node and trigger loopback-only `git-pull` actions safely.
 
-For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback.
+For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback. The API supports `outer`, `non_root`, `inner`, `both`, and `all`. The Fleet Nodes GUI uses staged pulls with a 10-second settle window, commit verification across all nodes, and one retry per repo stage.
 
 ## Sync protocol & commit guard
 
@@ -81,7 +82,7 @@ The sync system uses a persistent queue in `sync_queue` (SQLite). Each data writ
 - `config.py` caches `COMMIT_HASH` (short hash) and `COMMIT_TS` (unix epoch from `git log -1 --format=%ct`) **once at process startup**.
 - Outgoing payloads (`drain.py`) include `source_commit_ts`.
 - On `receive_actions()`, if `payload.source_commit_ts < cfg.COMMIT_TS`, all DB-write actions are **rejected with HTTP 409**.
-- System actions (`sync_git_outer`, `sync_git_inner`) are **always accepted** regardless of commit age — so a newer node can tell a stale peer to pull.
+- System actions (`sync_git_outer`, `sync_git_non_root`, `sync_git_inner`) are **always accepted** regardless of commit age — so a newer node can tell a stale peer to pull.
 - When the drain loop receives a 409, it calls `purge_unsent_db_actions(peer_id)` — marks all unsent DB-write queue entries as sent (discards them). System actions in the queue are preserved.
 
 **Why this matters:** during a rolling fleet update (T1 gets new code first, peers still on old), the old-code peers would otherwise push stale-schema data to T1 and overwrite correct rows. The commit guard stops this.
@@ -240,7 +241,7 @@ The embed uses `window.apiFetch || fetch` for `/api/v1/nodes` — picks up the p
 
 ### fleet-pull scripts
 
-`fleet-pull-public.sh` and `fleet-pull-private.sh` use SSH-to-loopback on each peer and call `http://127.0.0.1:8080/api/v1/sync/git-pull`. Because the call is loopback-local on the peer, no TOTP token is required in the fleet-pull scripts.
+`fleet-pull-public.sh`, `fleet-pull-non-root.sh`, and `fleet-pull-private.sh` use SSH-to-loopback on each peer and call `http://127.0.0.1:8080/api/v1/sync/git-pull` or run the equivalent local git pull workflow. Because the sync API call is loopback-local on the peer, no TOTP token is required in the fleet-pull scripts.
 
 ### Onboarding new nodes
 
