@@ -4,7 +4,8 @@ set -euo pipefail
 
 PUBLIC_ROOT="${PUBLIC_ROOT:-/root/xarta-node}"
 PRIVATE_ROOT="${PRIVATE_ROOT:-/root/xarta-node/.xarta}"
-NODE_LOCAL_ROOT="${NODE_LOCAL_ROOT:-/xarta-node/.lone-wolf}"
+NODE_LOCAL_PARENT="${NODE_LOCAL_PARENT:-/xarta-node}"
+NODE_LOCAL_ROOT="${NODE_LOCAL_ROOT:-${NODE_LOCAL_PARENT}/.lone-wolf}"
 AUDIT_ARCHIVE_ROOT="${AUDIT_ARCHIVE_ROOT:-${PRIVATE_ROOT}/.audit/gui-migration-paths}"
 TMP_REPORT=""
 PREVIOUS_LATEST=""

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # setup-lone-wolf.sh — run after .env is loaded on any fleet node
-# Manages .lone-wolf/.gitignore docs entry and the docs symlink
-# based on THIS_NODE_DOCS_BACKUP from .env
+# Manages .lone-wolf/.gitignore docs entry and cron backup.
+# DOCS_ROOT is set in .env; no symlink needed (Option B).
 
 set -euo pipefail
 
-LONE_WOLF="/xarta-node/.lone-wolf"
+NODE_LOCAL_PARENT="/xarta-node"
+LONE_WOLF="${NODE_LOCAL_PARENT}/.lone-wolf"
 GITIGNORE="$LONE_WOLF/.gitignore"
-SYMLINK="/root/xarta-node/.xarta/docs"
-LONE_WOLF_DOCS="$LONE_WOLF/docs"
+STALE_SYMLINK="/root/xarta-node/.xarta/docs"
 
 # Load .env
 # shellcheck disable=SC1091
@@ -18,15 +18,14 @@ DOCS_BACKUP="${THIS_NODE_DOCS_BACKUP:-false}"
 
 echo "=== setup-lone-wolf.sh ==="
 
-# --- Symlink ---
-if [[ -L "$SYMLINK" ]]; then
-    echo "  symlink: already exists → $(readlink "$SYMLINK")"
-elif [[ -e "$SYMLINK" ]]; then
-    echo "  ERROR: $SYMLINK exists but is not a symlink — manual intervention required"
-    exit 1
+# --- Remove stale symlink (Option B cleanup) ---
+if [[ -L "$STALE_SYMLINK" ]]; then
+    rm -f "$STALE_SYMLINK"
+    echo "  symlink: removed stale $STALE_SYMLINK (Option B: DOCS_ROOT used instead)"
+elif [[ -e "$STALE_SYMLINK" ]]; then
+    echo "  WARNING: $STALE_SYMLINK exists but is not a symlink — leaving untouched, review manually"
 else
-    ln -s "$LONE_WOLF_DOCS" "$SYMLINK"
-    echo "  symlink: created $SYMLINK → $LONE_WOLF_DOCS"
+    echo "  symlink: not present — OK"
 fi
 
 # --- .gitignore ---

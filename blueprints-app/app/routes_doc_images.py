@@ -34,15 +34,15 @@ _IMAGES_SUBDIR = "docs/images"   # relative to REPO_INNER_PATH
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _inner_root() -> Path:
-    inner = cfg.REPO_INNER_PATH
-    if not inner:
-        raise HTTPException(503, "REPO_INNER_PATH not configured")
-    return Path(inner)
+def _docs_root() -> Path:
+    root = cfg.DOCS_ROOT or cfg.REPO_INNER_PATH
+    if not root:
+        raise HTTPException(503, "DOCS_ROOT (or REPO_INNER_PATH) not configured")
+    return Path(root)
 
 
 def _images_dir() -> Path:
-    d = _inner_root() / _IMAGES_SUBDIR
+    d = _docs_root() / _IMAGES_SUBDIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -76,12 +76,10 @@ def _get_used_image_ids(inner_root: Path) -> set[str]:
         return set()
     used: set[str] = set()
     root_str = str(inner_root.resolve()) + "/"
-    docs_link = inner_root / "docs"
-    docs_target_str = (str(docs_link.resolve()) + "/") if docs_link.is_symlink() else None
     for row in doc_rows:
         p = (inner_root / row["path"]).resolve()
         p_str = str(p)
-        if not p_str.startswith(root_str) and (docs_target_str is None or not p_str.startswith(docs_target_str)):
+        if not p_str.startswith(root_str):
             continue  # path traversal guard
         if p.exists():
             try:
@@ -106,7 +104,7 @@ async def list_doc_images(
         ).fetchall()
     results = [_row_to_out(r) for r in rows]
     if unused:
-        root = _inner_root()
+        root = _docs_root()
         used = _get_used_image_ids(root)
         results = [r for r in results if r.image_id not in used]
     return results
