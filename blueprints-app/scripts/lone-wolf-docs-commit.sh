@@ -15,9 +15,14 @@ set -euo pipefail
 NODE_LOCAL_PARENT="/xarta-node"
 LONE_WOLF="${NODE_LOCAL_PARENT}/.lone-wolf"
 SENTINEL="${LONE_WOLF}/.docs-pending-commit"
+OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-fix-owner.sh"
 DELAY=300  # seconds — 5 minutes
 
 [[ -f "$SENTINEL" ]] || exit 0
+
+if [[ -f "$OWNER_FIX_SCRIPT" ]]; then
+    bash "$OWNER_FIX_SCRIPT"
+fi
 
 now=$(date +%s)
 mtime=$(stat -c %Y "$SENTINEL" 2>/dev/null || echo "$now")
