@@ -141,10 +141,16 @@ echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
 
 # Also expose shared assets under /fallback-ui/assets.
 echo "--- linking assets into gui-fallback directory..."
-rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
-ln -s "$BLUEPRINTS_ASSETS_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
-chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
-echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/assets -> $BLUEPRINTS_ASSETS_DIR"
+_ASSETS_LINK="$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+if [[ "$BLUEPRINTS_ASSETS_DIR" == "$_ASSETS_LINK" ]]; then
+    # Assets dir is already the canonical subdirectory — no symlink needed.
+    echo "    ok: $BLUEPRINTS_ASSETS_DIR is already at canonical location"
+else
+    rm -rf "$_ASSETS_LINK"
+    ln -s "$BLUEPRINTS_ASSETS_DIR" "$_ASSETS_LINK"
+    chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$_ASSETS_LINK"
+    echo "    ok: $_ASSETS_LINK -> $BLUEPRINTS_ASSETS_DIR"
+fi
 
 # ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."
