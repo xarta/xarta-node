@@ -67,10 +67,10 @@ find /xarta-node/gui-fallback/assets/ -name '*.sync-conflict*'
 
 ## Detailed docs
 
-Full procedures live in the private inner repo:
+Full procedures live in the lone-wolf docs tree:
 
-- `docs/syncthing/INSTALLATION.md` — two-pass fleet rollout, prerequisites, known quirks
-- `docs/syncthing/OPERATIONS.md` — day-to-day: assets, health, conflicts, add/remove nodes
-- `docs/syncthing/README.md` — architecture overview
+- `/xarta-node/.lone-wolf/docs/syncthing/INSTALLATION.md` — two-pass fleet rollout, prerequisites, known quirks
+- `/xarta-node/.lone-wolf/docs/syncthing/OPERATIONS.md` — day-to-day: assets, health, conflicts, add/remove nodes
+- `/xarta-node/.lone-wolf/docs/syncthing/README.md` — architecture overview
 
 Read these before performing any fleet mesh changes.
