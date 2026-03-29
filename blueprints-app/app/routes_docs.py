@@ -24,6 +24,17 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 
+_DOCS_SENTINEL = Path("/xarta-node/.lone-wolf/.docs-pending-commit")
+
+
+def _touch_docs_sentinel() -> None:
+    """Touch the sentinel file so the lone-wolf commit cron picks up the change."""
+    try:
+        _DOCS_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+        _DOCS_SENTINEL.touch()
+    except Exception as exc:  # non-fatal — backup is best-effort
+        log.warning("docs: could not touch sentinel %s: %s", _DOCS_SENTINEL, exc)
+
 
 def _inner_root() -> Path:
     inner = cfg.REPO_INNER_PATH
@@ -189,6 +200,9 @@ async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
     try:
         p.write_text(body.content, encoding="utf-8")
         log.info("docs: wrote %d chars to %s", len(body.content), p)
+        _touch_docs_sentinel()
+    except HTTPException:
+        raise
     except Exception as exc:
         log.error("docs: failed to write %s: %s", p, exc)
         raise HTTPException(500, f"Failed to write file: {exc}") from exc
