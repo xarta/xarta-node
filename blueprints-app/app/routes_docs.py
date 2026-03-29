@@ -24,7 +24,8 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 
-_DOCS_SENTINEL = Path("/xarta-node/.lone-wolf/.docs-pending-commit")
+_NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
+_DOCS_SENTINEL = _NODE_LOCAL_ROOT / ".docs-pending-commit"
 
 
 def _touch_docs_sentinel() -> None:
@@ -36,37 +37,20 @@ def _touch_docs_sentinel() -> None:
         log.warning("docs: could not touch sentinel %s: %s", _DOCS_SENTINEL, exc)
 
 
-def _inner_root() -> Path:
-    inner = cfg.REPO_INNER_PATH
-    if not inner:
-        raise HTTPException(503, "REPO_INNER_PATH not configured — cannot locate docs")
-    return Path(inner)
+def _docs_root() -> Path:
+    root = cfg.DOCS_ROOT or cfg.REPO_INNER_PATH
+    if not root:
+        raise HTTPException(503, "DOCS_ROOT (or REPO_INNER_PATH) not configured — cannot locate docs")
+    return Path(root)
 
 
 def _safe_resolve(root: Path, rel_path: str) -> Path:
-    """Resolve rel_path under root, raising 400 if traversal escapes root.
-
-    The docs/ subdirectory may be a symlink to an external path (e.g. lone-wolf).
-    Fully-resolved paths are checked against both the repo root and the resolved
-    docs symlink target so that symlinked subtrees are allowed.
-    """
+    """Resolve rel_path under root, raising 400 on path traversal."""
     resolved = (root / rel_path).resolve()
     root_resolved = str(root.resolve())
-
-    def _under(base: str) -> bool:
-        return str(resolved).startswith(base + "/") or str(resolved) == base
-
-    if _under(root_resolved):
+    if str(resolved).startswith(root_resolved + "/") or str(resolved) == root_resolved:
         return resolved
-
-    # Allow paths that resolve under the docs symlink target (if docs/ is a symlink)
-    docs_link = root / "docs"
-    if docs_link.is_symlink():
-        docs_target = str(docs_link.resolve())
-        if _under(docs_target):
-            return resolved
-
-    raise HTTPException(400, "Path escapes repository root")
+    raise HTTPException(400, "Path escapes docs root")
 
 
 def _row_to_out(row) -> DocOut:
@@ -99,8 +83,8 @@ async def list_docs() -> list[DocOut]:
 
 @router.get("/unregistered", response_model=list[str])
 async def list_unregistered_docs() -> list[str]:
-    """Return relative paths of .md files inside REPO_INNER_PATH not yet in the docs table."""
-    root = _inner_root()
+    """Return relative paths of .md files inside DOCS_ROOT not yet in the docs table."""
+    root = _docs_root()
     with get_conn() as conn:
         rows = conn.execute("SELECT path FROM docs").fetchall()
     registered = {row["path"] for row in rows}
@@ -125,7 +109,7 @@ async def get_doc(doc_id: str) -> DocWithContent:
     if not row:
         raise HTTPException(404, "doc not found")
     out = DocWithContent(**_row_to_out(row).model_dump())
-    p = _safe_resolve(_inner_root(), row["path"])
+    p = _safe_resolve(_docs_root(), row["path"])
     if p.exists():
         try:
             out.content = p.read_text(encoding="utf-8")
@@ -140,7 +124,7 @@ async def get_doc(doc_id: str) -> DocWithContent:
 @router.post("", response_model=DocOut, status_code=201)
 async def create_doc(body: DocCreate) -> DocOut:
     doc_id = str(uuid.uuid4())
-    root = _inner_root()
+    root = _docs_root()
     p = _safe_resolve(root, body.path)
     p.parent.mkdir(parents=True, exist_ok=True)
     if not p.exists() or body.initial_content is not None:
@@ -194,7 +178,7 @@ async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
         if not row:
             raise HTTPException(404, "doc not found")
         path_str = row["path"]
-    root = _inner_root()
+    root = _docs_root()
     p = _safe_resolve(root, path_str)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -231,7 +215,7 @@ async def delete_doc(
         gen = increment_gen(conn, "human")
         enqueue_for_all_peers(conn, "DELETE", "docs", doc_id, {}, gen)
     if delete_file:
-        root = _inner_root()
+        root = _docs_root()
         p = _safe_resolve(root, path_str)
         if p.exists():
             try:

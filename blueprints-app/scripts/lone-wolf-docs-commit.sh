@@ -12,8 +12,9 @@
 
 set -euo pipefail
 
-SENTINEL="/xarta-node/.lone-wolf/.docs-pending-commit"
-LONE_WOLF="/xarta-node/.lone-wolf"
+NODE_LOCAL_PARENT="/xarta-node"
+LONE_WOLF="${NODE_LOCAL_PARENT}/.lone-wolf"
+SENTINEL="${LONE_WOLF}/.docs-pending-commit"
 DELAY=300  # seconds — 5 minutes
 
 [[ -f "$SENTINEL" ]] || exit 0

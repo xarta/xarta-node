@@ -188,6 +188,10 @@ SYNC_BATCH_SIZE: int = 50           # actions posted per drain cycle
 # ── Git repos (bare-systemd nodes only) ───────────────────────────────────────
 REPO_OUTER_PATH: str = os.environ.get("REPO_OUTER_PATH", "")
 REPO_INNER_PATH: str = os.environ.get("REPO_INNER_PATH", "")
+# Docs root: the directory whose sub-path 'docs/' holds markdown files.
+# Defaults to REPO_INNER_PATH for backward compatibility.
+# Point this at the node-local repo root so docs resolve outside the private git repo.
+DOCS_ROOT: str = os.environ.get("DOCS_ROOT", "")
 
 # Shell command to restart the blueprints service after a git pull.
 SERVICE_RESTART_CMD: str = os.environ.get("SERVICE_RESTART_CMD", "")
