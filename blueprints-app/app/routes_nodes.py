@@ -24,7 +24,7 @@ from starlette.responses import Response
 from . import config as cfg
 from .auth import compute_token
 from .db import get_conn
-from .models import NodeOut
+from .models import NodeOut, RepoVersionsOut
 
 log = logging.getLogger(__name__)
 
@@ -253,6 +253,36 @@ async def proxy_node_restart(node_id: str) -> Response:
         raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
     log.info("proxied restart to %s (%s)", node_id, target)
     return Response(status_code=204)
+
+
+@router.get("/{node_id}/repo-versions", response_model=RepoVersionsOut)
+async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
+    """Return outer/inner/non-root repo versions for the named node."""
+    if node_id == cfg.NODE_ID:
+        from .routes_health import repo_versions
+        return await repo_versions()
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
+        ).fetchone()
+    if not row or not row["addresses"]:
+        raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
+    addrs: list[str] = json.loads(row["addresses"])
+    if not addrs:
+        raise HTTPException(422, f"node '{node_id}' has no addresses configured")
+    target = addrs[0].rstrip("/")
+    try:
+        async with _make_sync_client(timeout=10.0) as client:
+            resp = await client.get(
+                f"{target}/health/repos",
+                headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"failed to reach {node_id} at {target}: {exc}") from exc
+    if resp.status_code != 200:
+        raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
+    return RepoVersionsOut(**resp.json())
 
 
 class PctAction(BaseModel):
