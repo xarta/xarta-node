@@ -30,8 +30,21 @@ fi
 
 # --- .gitignore ---
 COMMIT_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-commit.sh"
+OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-fix-owner.sh"
 CRON_MARKER="lone-wolf-docs-commit"
 CRON_LINE="* * * * * root bash $COMMIT_SCRIPT"
+OWNER_CRON_FILE="/etc/cron.d/lone-wolf-docs-owner"
+OWNER_CRON_MARKER="lone-wolf-docs-fix-owner"
+OWNER_CRON_LINE="* * * * * root bash $OWNER_FIX_SCRIPT"
+
+if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
+    echo "# $OWNER_CRON_MARKER" > "$OWNER_CRON_FILE"
+    echo "$OWNER_CRON_LINE" >> "$OWNER_CRON_FILE"
+    chmod 644 "$OWNER_CRON_FILE"
+    echo "  docs-owner-cron: installed — ownership normalization runs every minute"
+else
+    echo "  docs-owner-cron: already installed — OK"
+fi
 
 if [[ "$DOCS_BACKUP" == "true" ]]; then
     # Backup node: docs/ must NOT be gitignored

@@ -9,6 +9,7 @@ DELETE /api/v1/docs/{doc_id}            → delete record; ?delete_file=true als
 """
 
 import logging
+import os
 import uuid
 from pathlib import Path
 
@@ -42,6 +43,26 @@ def _docs_root() -> Path:
     if not root:
         raise HTTPException(503, "DOCS_ROOT (or REPO_INNER_PATH) not configured — cannot locate docs")
     return Path(root)
+
+
+def _normalize_ownership(root: Path, target: Path) -> None:
+    """Hand ownership of created doc paths back to the docs root owner."""
+    try:
+        owner = root.stat()
+    except Exception as exc:
+        log.warning("docs: could not stat docs root %s for ownership hand-back: %s", root, exc)
+        return
+
+    current = target
+    while True:
+        try:
+            if current.exists():
+                os.chown(current, owner.st_uid, owner.st_gid)
+        except Exception as exc:
+            log.warning("docs: could not normalize ownership on %s: %s", current, exc)
+        if current == root or current.parent == current:
+            break
+        current = current.parent
 
 
 def _safe_resolve(root: Path, rel_path: str) -> Path:
@@ -127,9 +148,11 @@ async def create_doc(body: DocCreate) -> DocOut:
     root = _docs_root()
     p = _safe_resolve(root, body.path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    _normalize_ownership(root, p.parent)
     if not p.exists() or body.initial_content is not None:
         content = body.initial_content if body.initial_content is not None else f"# {body.label}\n"
         p.write_text(content, encoding="utf-8")
+        _normalize_ownership(root, p)
         log.info("docs: created file %s", p)
     with get_conn() as conn:
         conn.execute(
@@ -181,8 +204,10 @@ async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
     root = _docs_root()
     p = _safe_resolve(root, path_str)
     p.parent.mkdir(parents=True, exist_ok=True)
+    _normalize_ownership(root, p.parent)
     try:
         p.write_text(body.content, encoding="utf-8")
+        _normalize_ownership(root, p)
         log.info("docs: wrote %d chars to %s", len(body.content), p)
         _touch_docs_sentinel()
     except HTTPException:
