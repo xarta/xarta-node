@@ -6,12 +6,12 @@
 #   2. Ensures gui-fallback/assets/icons/ and gui-fallback/assets/sounds/ exist
 #      with Syncthing .stfolder marker files.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
-#   4. Temporarily starts syncthing@root.service so Syncthing generates its
+#   4. Temporarily starts syncthing@syncthing.service so Syncthing generates its
 #      device certificate, then reads the device ID from the local REST API.
 #   5. Generates config.xml from .nodes.json + .env: GUI credentials, peer
 #      device IDs (via primary_ip), shared folder paths, discovery disabled.
 #   6. Writes SYNCTHING_DEVICE_ID to .env.
-#   7. Restarts syncthing@root.service with the new config.
+#   7. Restarts syncthing@syncthing.service with the new config.
 #
 # Two-pass rollout for the fleet:
 #   Pass 1 (first run on a node):
@@ -41,7 +41,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 NODES_JSON="$SCRIPT_DIR/.nodes.json"
-SYNCTHING_HOME="/root/.local/state/syncthing"
+SYNCTHING_HOME="/var/lib/syncthing/.local/state/syncthing"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -132,6 +132,17 @@ dpkg -l python3-bcrypt >/dev/null 2>&1 || apt-get install -y python3-bcrypt
 echo -e "    ${GREEN}ok${NC}"
 echo ""
 
+# ── Step 1b — Ensure syncthing system user exists ────────────────────────────
+echo "Step 1b: Ensuring syncthing system user exists..."
+if ! id syncthing &>/dev/null; then
+    useradd --system --home-dir /var/lib/syncthing --create-home \
+            --shell /usr/sbin/nologin syncthing
+    echo -e "    ${GREEN}created${NC}: syncthing system user (home: /var/lib/syncthing)"
+else
+    echo "    syncthing user already exists"
+fi
+echo ""
+
 # ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
 echo "Step 2: Ensuring shared asset directories exist..."
 ICONS_DIR="$BLUEPRINTS_ASSETS_DIR/icons"
@@ -148,6 +159,8 @@ chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
 chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
+chown -R syncthing:syncthing "$BLUEPRINTS_ASSETS_DIR"
+echo -e "    ${CYAN}ownership${NC}: syncthing:syncthing → $BLUEPRINTS_ASSETS_DIR"
 echo ""
 
 # ── Step 3 — Stable API key (generated once, persisted in .env) ──────────────
@@ -161,10 +174,29 @@ else
 fi
 echo ""
 
+# ── Step 3b — Migrate certs from old home if present (preserves device ID) ───────
+OLD_SYNCTHING_HOME="/root/.local/state/syncthing"
+echo "Step 3b: Checking for Syncthing certificates to migrate..."
+if [[ -f "$OLD_SYNCTHING_HOME/cert.pem" ]] && [[ ! -f "$SYNCTHING_HOME/cert.pem" ]]; then
+    echo "    Found certs in old home (‘$OLD_SYNCTHING_HOME’) — migrating to preserve device ID..."
+    mkdir -p "$SYNCTHING_HOME"
+    cp "$OLD_SYNCTHING_HOME/cert.pem" "$SYNCTHING_HOME/cert.pem"
+    cp "$OLD_SYNCTHING_HOME/key.pem"  "$SYNCTHING_HOME/key.pem"
+    chown -R syncthing:syncthing /var/lib/syncthing
+    echo -e "    ${GREEN}migrated${NC}: cert.pem + key.pem → $SYNCTHING_HOME"
+elif [[ -f "$SYNCTHING_HOME/cert.pem" ]]; then
+    echo "    Certs already present in $SYNCTHING_HOME — no migration needed"
+else
+    echo "    No existing certs found — Syncthing will generate a new device identity"
+    mkdir -p "$SYNCTHING_HOME"
+    chown -R syncthing:syncthing /var/lib/syncthing
+fi
+echo ""
+
 # ── Step 4 — Start service briefly to generate cert and obtain device ID ──────
-echo "Step 4: Starting syncthing@root.service to generate device certificate..."
-systemctl enable syncthing@root.service >/dev/null 2>&1
-systemctl start syncthing@root.service
+echo "Step 4: Starting syncthing@syncthing.service to generate device certificate..."
+systemctl enable syncthing@syncthing.service >/dev/null 2>&1
+systemctl start syncthing@syncthing.service
 
 # Syncthing generates config.xml and its cert/key on first startup.
 echo "    Waiting for config.xml (up to 30s)..."
@@ -175,10 +207,9 @@ done
 
 if [[ ! -f "$SYNCTHING_HOME/config.xml" ]]; then
     echo -e "${RED}Error:${NC} Syncthing did not create config.xml within 30s." >&2
-    echo "  If config is elsewhere, set SYNCTHING_HOME at the top of this script." >&2
-    echo "  Syncthing 1.30+ uses ~/.local/state/syncthing/ (XDG state dir)." >&2
-    echo "  Scan: find /root -name config.xml 2>/dev/null" >&2
-    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
+    echo "  Running as user 'syncthing', home dir: /var/lib/syncthing" >&2
+    echo "  Expected config: $SYNCTHING_HOME/config.xml" >&2
+    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
     exit 1
 fi
 echo -e "    ${GREEN}found${NC}: $SYNCTHING_HOME/config.xml"
@@ -204,8 +235,8 @@ done
 
 if [[ $API_UP -eq 0 ]]; then
     echo -e "${RED}Error:${NC} Syncthing API did not respond within 30s." >&2
-    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
-    systemctl stop syncthing@root.service || true
+    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
+    systemctl stop syncthing@syncthing.service || true
     exit 1
 fi
 
@@ -216,7 +247,7 @@ OWN_DEVICE_ID=$(curl -sf \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['myID'])")
 
 echo -e "    ${GREEN}Device ID:${NC} $OWN_DEVICE_ID"
-systemctl stop syncthing@root.service
+systemctl stop syncthing@syncthing.service
 echo ""
 
 # ── Step 5 — Write device ID to .env ─────────────────────────────────────────
@@ -412,16 +443,22 @@ python3 "$TMPPY" \
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
-echo "Step 7: Enabling and restarting syncthing@root.service..."
-systemctl enable syncthing@root.service >/dev/null 2>&1
-systemctl restart syncthing@root.service
+echo "Step 7: Enabling and restarting syncthing@syncthing.service..."
+if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
+    echo "    Stopping old syncthing@root.service..."
+    systemctl stop syncthing@root.service || true
+    systemctl disable syncthing@root.service 2>/dev/null || true
+    echo -e "    ${CYAN}disabled${NC}: syncthing@root.service"
+fi
+systemctl enable syncthing@syncthing.service >/dev/null 2>&1
+systemctl restart syncthing@syncthing.service
 sleep 2
 
-if systemctl is-active --quiet syncthing@root.service; then
-    echo -e "    ${GREEN}running${NC}: syncthing@root.service"
+if systemctl is-active --quiet syncthing@syncthing.service; then
+    echo -e "    ${GREEN}running${NC}: syncthing@syncthing.service"
 else
-    echo -e "${RED}Error:${NC} syncthing@root.service failed to start." >&2
-    echo "  Logs: journalctl -u syncthing@root -n 50" >&2
+    echo -e "${RED}Error:${NC} syncthing@syncthing.service failed to start." >&2
+    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
     exit 1
 fi
 echo ""
@@ -440,7 +477,7 @@ echo ""
 echo "  Node         : $NODE_ID"
 echo "  Device ID    : $OWN_DEVICE_ID"
 echo "  Peers        : $PEER_STATUS device IDs configured in .nodes.json"
-echo "  Service      : syncthing@root.service ($(systemctl is-active syncthing@root.service))"
+echo "  Service      : syncthing@syncthing.service ($(systemctl is-active syncthing@syncthing.service))"
 echo "  Config       : $SYNCTHING_HOME/config.xml"
 echo ""
 echo "Next steps:"
