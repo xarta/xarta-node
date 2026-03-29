@@ -35,7 +35,7 @@ fi
 # Debounce window elapsed — commit anything changed under docs/
 cd "$LONE_WOLF"
 
-if git diff --quiet docs/ && git diff --cached --quiet docs/; then
+if [[ -z "$(git status --porcelain --untracked-files=all -- docs/)" ]]; then
     # Nothing actually changed in docs/ (sentinel may be stale)
     rm -f "$SENTINEL"
     exit 0
