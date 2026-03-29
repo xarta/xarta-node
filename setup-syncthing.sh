@@ -70,6 +70,7 @@ source "$ENV_FILE"
 
 NODE_ID="${BLUEPRINTS_NODE_ID:?BLUEPRINTS_NODE_ID not set in .env}"
 REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
+BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-$REPO_OUTER_PATH/gui-fallback}"
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
@@ -87,11 +88,25 @@ env_set() {
     fi
 }
 
+chown_like() {
+    local ref_path="$1"
+    local target_path="$2"
+    local owner
+
+    owner="$(stat -c '%u:%g' "$ref_path")"
+    if [[ -L "$target_path" ]]; then
+        chown -h "$owner" "$target_path"
+    else
+        chown "$owner" "$target_path"
+    fi
+}
+
 echo "=== Syncthing setup ==="
 echo "Node         : $NODE_ID"
 echo "Config dir   : $SYNCTHING_HOME"
 echo "GUI hostname : $SYNCTHING_HOSTNAME"
 echo "Repo path    : $REPO_OUTER_PATH"
+echo "Assets path  : $BLUEPRINTS_FALLBACK_GUI_DIR/assets"
 echo ""
 
 # ── Step 1 — Install Syncthing from official apt repository ──────────────────
@@ -118,13 +133,18 @@ echo ""
 
 # ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
 echo "Step 2: Ensuring shared asset directories exist..."
-ICONS_DIR="$REPO_OUTER_PATH/gui-fallback/assets/icons"
-SOUNDS_DIR="$REPO_OUTER_PATH/gui-fallback/assets/sounds"
-mkdir -p "$ICONS_DIR" "$SOUNDS_DIR"
+ICONS_DIR="$BLUEPRINTS_FALLBACK_GUI_DIR/assets/icons"
+SOUNDS_DIR="$BLUEPRINTS_FALLBACK_GUI_DIR/assets/sounds"
+mkdir -p "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$ICONS_DIR" "$SOUNDS_DIR"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/assets"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$ICONS_DIR"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR/assets" "$SOUNDS_DIR"
 # .stfolder is Syncthing's required presence marker. Without it Syncthing will
 # refuse to sync the folder (treats a missing marker as an accidental deletion).
 touch "$ICONS_DIR/.stfolder"
 touch "$SOUNDS_DIR/.stfolder"
+chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
+chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo ""

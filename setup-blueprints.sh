@@ -51,6 +51,43 @@ echo ""
 # shellcheck source=.env
 source "$ENV_FILE"
 BLUEPRINTS_GUI_DIR="${BLUEPRINTS_GUI_DIR:-/data/gui}"
+BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-$SCRIPT_DIR/gui-fallback}"
+BLUEPRINTS_SHARED_DB_DIR="${BLUEPRINTS_SHARED_DB_DIR:-$SCRIPT_DIR/gui-db}"
+BLUEPRINTS_EMBED_DIR="${BLUEPRINTS_EMBED_DIR:-$SCRIPT_DIR/gui-embed}"
+
+chown_like() {
+    local ref_path="$1"
+    local target_path="$2"
+    local owner
+
+    owner="$(stat -c '%u:%g' "$ref_path")"
+    if [[ -L "$target_path" ]]; then
+        chown -h "$owner" "$target_path"
+    else
+        chown "$owner" "$target_path"
+    fi
+}
+
+echo "GUI dir  : $BLUEPRINTS_GUI_DIR"
+echo "Fallback : $BLUEPRINTS_FALLBACK_GUI_DIR"
+echo "Shared DB: $BLUEPRINTS_SHARED_DB_DIR"
+echo "Embed dir: $BLUEPRINTS_EMBED_DIR"
+echo ""
+
+if [[ ! -d "$BLUEPRINTS_FALLBACK_GUI_DIR" ]]; then
+    echo "ERROR: fallback GUI directory not found at $BLUEPRINTS_FALLBACK_GUI_DIR"
+    exit 1
+fi
+
+if [[ ! -d "$BLUEPRINTS_SHARED_DB_DIR" ]]; then
+    echo "ERROR: shared GUI DB directory not found at $BLUEPRINTS_SHARED_DB_DIR"
+    exit 1
+fi
+
+if [[ ! -d "$BLUEPRINTS_EMBED_DIR" ]]; then
+    echo "ERROR: embed directory not found at $BLUEPRINTS_EMBED_DIR"
+    exit 1
+fi
 
 # ── 1. Data directories ───────────────────────────────────────────────────────
 # DB lives in /opt/blueprints/data/db (not in git — persisted separately).
@@ -64,31 +101,36 @@ echo "    ok"
 # via a symlink so there is only one copy of the source files.
 echo "--- linking gui-embed into GUI directory..."
 mkdir -p "$BLUEPRINTS_GUI_DIR"
+chown_like "$(dirname "$BLUEPRINTS_GUI_DIR")" "$BLUEPRINTS_GUI_DIR"
 # Remove any existing embed/ dir or stale symlink before (re-)creating it
 rm -rf "$BLUEPRINTS_GUI_DIR/embed"
-ln -s "$SCRIPT_DIR/gui-embed" "$BLUEPRINTS_GUI_DIR/embed"
-echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $SCRIPT_DIR/gui-embed"
+ln -s "$BLUEPRINTS_EMBED_DIR" "$BLUEPRINTS_GUI_DIR/embed"
+chown_like "$BLUEPRINTS_GUI_DIR" "$BLUEPRINTS_GUI_DIR/embed"
+echo "    ok: $BLUEPRINTS_GUI_DIR/embed -> $BLUEPRINTS_EMBED_DIR"
 
 # ── 1bb. Link shared gui-db/ into the GUI directory ──────────────────────────
 # gui-db/ lives in the public outer repo and is shared by /ui and /fallback-ui.
 echo "--- linking gui-db into GUI directory..."
 rm -rf "$BLUEPRINTS_GUI_DIR/db"
-ln -s "$SCRIPT_DIR/gui-db" "$BLUEPRINTS_GUI_DIR/db"
-echo "    ok: $BLUEPRINTS_GUI_DIR/db -> $SCRIPT_DIR/gui-db"
+ln -s "$BLUEPRINTS_SHARED_DB_DIR" "$BLUEPRINTS_GUI_DIR/db"
+chown_like "$BLUEPRINTS_GUI_DIR" "$BLUEPRINTS_GUI_DIR/db"
+echo "    ok: $BLUEPRINTS_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
 
 # ── 1c. Link gui-embed/ into the gui-fallback directory ─────────────────────
 # gui-fallback/ is the frozen public copy of the UI, served by Caddy at
 # /fallback-ui.  It needs the same embed component symlink.
 echo "--- linking gui-embed into gui-fallback directory..."
-rm -rf "$SCRIPT_DIR/gui-fallback/embed"
-ln -s "$SCRIPT_DIR/gui-embed" "$SCRIPT_DIR/gui-fallback/embed"
-echo "    ok: $SCRIPT_DIR/gui-fallback/embed -> $SCRIPT_DIR/gui-embed"
+rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
+ln -s "$BLUEPRINTS_EMBED_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
+echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/embed -> $BLUEPRINTS_EMBED_DIR"
 
 # Also expose shared db pages under /fallback-ui/db.
 echo "--- linking gui-db into gui-fallback directory..."
-rm -rf "$SCRIPT_DIR/gui-fallback/db"
-ln -s "$SCRIPT_DIR/gui-db" "$SCRIPT_DIR/gui-fallback/db"
-echo "    ok: $SCRIPT_DIR/gui-fallback/db -> $SCRIPT_DIR/gui-db"
+rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
+ln -s "$BLUEPRINTS_SHARED_DB_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
+chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
+echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
 
 # ── 2. Ensure Python 3.11 venv support is available ───────────────────────
 echo "--- checking python3.11-venv..."
