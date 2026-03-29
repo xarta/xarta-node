@@ -50,6 +50,19 @@ env_set() {
     fi
 }
 
+chown_like() {
+    local ref_path="$1"
+    local target_path="$2"
+    local owner
+
+    owner="$(stat -c '%u:%g' "$ref_path")"
+    if [[ -L "$target_path" ]]; then
+        chown -h "$owner" "$target_path"
+    else
+        chown "$owner" "$target_path"
+    fi
+}
+
 # Extract hostname (no scheme, no port) from a URL.
 url_host() { echo "$1" | sed 's|^https\?://||' | sed 's|:.*||' | sed 's|/.*||'; }
 
@@ -115,6 +128,7 @@ fi
 CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
 UI_HOST=$(url_host "${BLUEPRINTS_UI_URL:-localhost}")
 REFERENCE_UI_ROOT="${REPO_INNER_PATH:-$SCRIPT_DIR/.xarta}/gui-reference"
+BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-${REPO_OUTER_PATH:-$SCRIPT_DIR}/gui-fallback}"
 
 # Build the full comma-separated hostname list for the Caddy site blocks.
 # Always includes the primary UI host; appends CADDY_EXTRA_NAMES if set.
@@ -173,7 +187,7 @@ ${HTTPS_NAMES} {
     # This copy is not updated when the private GUI is overhauled.
     redir /fallback-ui /fallback-ui/ permanent
     handle_path /fallback-ui/* {
-        root * ${REPO_OUTER_PATH}/gui-fallback
+        root * ${BLUEPRINTS_FALLBACK_GUI_DIR}
         file_server
     }
 
@@ -195,6 +209,8 @@ ${HTTP_NAMES} {
     redir https://{host}{uri} permanent
 }
 CADDY
+
+chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
 
 # ── mTLS sync block (:8443) — appended when cert env vars are all set ────────
 if [[ -n "${SYNC_TLS_CA:-}" && -n "${SYNC_TLS_CERT:-}" && -n "${SYNC_TLS_KEY:-}" ]]; then
@@ -222,6 +238,7 @@ https://:8443 {
     reverse_proxy localhost:8080
 }
 CADDY_MTLS
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended mTLS :8443 sync block (https://:8443 — SNI-free catch-all)"
 else
     echo "    Skipped mTLS :8443 block (SYNC_TLS_CA/CERT/KEY not set — plain HTTP only)"
@@ -248,6 +265,7 @@ http://${SYNCTHING_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_SYNCTHING
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Syncthing GUI block (https://${SYNCTHING_HOSTNAME})"
 else
     echo "    Skipped Syncthing GUI block (SYNCTHING_HOSTNAME not set in .env)"
