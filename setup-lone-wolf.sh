@@ -30,6 +30,10 @@ else
 fi
 
 # --- .gitignore ---
+COMMIT_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-commit.sh"
+CRON_MARKER="lone-wolf-docs-commit"
+CRON_LINE="* * * * * root bash $COMMIT_SCRIPT"
+
 if [[ "$DOCS_BACKUP" == "true" ]]; then
     # Backup node: docs/ must NOT be gitignored
     if grep -qx 'docs' "$GITIGNORE" 2>/dev/null; then
@@ -40,6 +44,15 @@ if [[ "$DOCS_BACKUP" == "true" ]]; then
     else
         echo "  gitignore: 'docs' not present — OK (backup node)"
     fi
+    # Install cron entry if not already present
+    if ! grep -q "$CRON_MARKER" /etc/cron.d/lone-wolf-docs 2>/dev/null; then
+        echo "# $CRON_MARKER" > /etc/cron.d/lone-wolf-docs
+        echo "$CRON_LINE" >> /etc/cron.d/lone-wolf-docs
+        chmod 644 /etc/cron.d/lone-wolf-docs
+        echo "  cron: installed lone-wolf-docs-commit (backup node)"
+    else
+        echo "  cron: already installed — OK (backup node)"
+    fi
 else
     # Non-backup node: docs must be gitignored
     if ! grep -qx 'docs' "$GITIGNORE" 2>/dev/null; then
@@ -49,6 +62,13 @@ else
         echo "  gitignore: added 'docs' entry (non-backup node)"
     else
         echo "  gitignore: 'docs' already present — OK (non-backup node)"
+    fi
+    # Remove cron entry if present (non-backup node must not commit docs)
+    if [[ -f /etc/cron.d/lone-wolf-docs ]]; then
+        rm -f /etc/cron.d/lone-wolf-docs
+        echo "  cron: removed lone-wolf-docs-commit (non-backup node)"
+    else
+        echo "  cron: not installed — OK (non-backup node)"
     fi
 fi
 
