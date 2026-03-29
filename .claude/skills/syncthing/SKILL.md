@@ -67,10 +67,9 @@ find /xarta-node/gui-fallback/assets/ -name '*.sync-conflict*'
 
 ## Detailed docs
 
-Full procedures live in the lone-wolf docs tree:
+This public skill is intentionally self-contained so it still works in a
+standalone public checkout.
 
-- `/xarta-node/.lone-wolf/docs/syncthing/INSTALLATION.md` — two-pass fleet rollout, prerequisites, known quirks
-- `/xarta-node/.lone-wolf/docs/syncthing/OPERATIONS.md` — day-to-day: assets, health, conflicts, add/remove nodes
-- `/xarta-node/.lone-wolf/docs/syncthing/README.md` — architecture overview
-
-Read these before performing any fleet mesh changes.
+On deployed xarta-node fleet nodes, extra node-local operational notes may also
+exist in the lone-wolf docs tree, but they are optional and must not be relied
+on as the only instructions here.
