@@ -10,6 +10,9 @@ ENV_FILE="$SCRIPT_DIR/.env"
 VENV_DIR="/opt/blueprints/venv"
 SEEKDB_CONFIG_FILE="/etc/seekdb/seekdb.cnf"
 SEEKDB_DATA_ROOT="/var/lib/oceanbase"
+OCEANBASE_KEY_URL="http://mirrors.oceanbase.com/oceanbase/oceanbase_deb.pub"
+OCEANBASE_KEYRING="/usr/share/keyrings/oceanbase-archive-keyring.gpg"
+OCEANBASE_LIST_FILE="/etc/apt/sources.list.d/oceanbase.list"
 MIN_DATA_FREE_GB=5
 RECOMMENDED_DATA_FREE_GB=15
 ALLOW_LOW_DISK="${SEEKDB_ALLOW_LOW_DISK:-0}"
@@ -69,11 +72,41 @@ upsert_cfg_key() {
     fi
 }
 
+oceanbase_repo_line() {
+    local distro codename arch
+    # Prefer /etc/os-release so we do not depend on lsb-release before apt is usable.
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    distro="${ID}"
+    codename="${VERSION_CODENAME}"
+    arch="$(dpkg --print-architecture)"
+    printf 'deb [signed-by=%s] http://mirrors.aliyun.com/oceanbase/community/stable/%s/%s/%s/ ./\n' \
+        "$OCEANBASE_KEYRING" "$distro" "$codename" "$arch"
+}
+
+ensure_oceanbase_repo() {
+    if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
+        echo "    skip: curl/gpg not yet available to refresh OceanBase repo key"
+        return 0
+    fi
+
+    install -d -m 0755 /usr/share/keyrings
+    install -d -m 0755 /etc/apt/sources.list.d
+    curl -fsSL "$OCEANBASE_KEY_URL" | gpg --dearmor > "$OCEANBASE_KEYRING"
+    chmod 0644 "$OCEANBASE_KEYRING"
+    oceanbase_repo_line > "$OCEANBASE_LIST_FILE"
+}
+
 echo "=== SeekDB setup (package-manager/systemd) ==="
 
-echo "--- ensuring prerequisites (curl, jq, mysql client) ..."
+if [[ -f "$OCEANBASE_LIST_FILE" ]] || dpkg -s seekdb >/dev/null 2>&1; then
+    echo "--- refreshing OceanBase apt repo signing config ..."
+    ensure_oceanbase_repo
+fi
+
+echo "--- ensuring prerequisites (curl, jq, mysql client, gpg, ca-certificates) ..."
 apt-get update -qq
-apt-get install -y --no-install-recommends curl jq default-mysql-client >/dev/null
+apt-get install -y --no-install-recommends curl jq default-mysql-client gpg ca-certificates >/dev/null
 
 echo "--- upgrading pyseekdb in $VENV_DIR ..."
 "$VENV_DIR/bin/pip" install --upgrade pyseekdb >/dev/null
@@ -101,13 +134,8 @@ fi
 
 echo "--- ensuring seekdb package is installed ..."
 if ! dpkg -s seekdb >/dev/null 2>&1; then
-    echo "    seekdb not found — adding OceanBase apt repo and installing ..."
-    apt-get install -y --no-install-recommends lsb-release >/dev/null
-    DISTRO="$(lsb_release -is | awk '{print tolower($0)}')"
-    CODENAME="$(lsb_release -cs)"
-    ARCH="$(dpkg --print-architecture)"
-    REPO_LINE="deb [trusted=yes] http://mirrors.aliyun.com/oceanbase/community/stable/${DISTRO}/${CODENAME}/${ARCH}/ ./"
-    echo "$REPO_LINE" | tee /etc/apt/sources.list.d/oceanbase.list
+    echo "    seekdb not found — refreshing OceanBase apt repo and installing ..."
+    ensure_oceanbase_repo
     apt-get update -qq
     apt-get install -y seekdb
 fi
