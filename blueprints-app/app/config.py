@@ -188,6 +188,7 @@ SYNC_BATCH_SIZE: int = 50           # actions posted per drain cycle
 # ── Git repos (bare-systemd nodes only) ───────────────────────────────────────
 REPO_OUTER_PATH: str = os.environ.get("REPO_OUTER_PATH", "")
 REPO_INNER_PATH: str = os.environ.get("REPO_INNER_PATH", "")
+REPO_NON_ROOT_PATH: str = os.environ.get("REPO_NON_ROOT_PATH", "/xarta-node")
 # Docs root: the directory whose sub-path 'docs/' holds markdown files.
 # Defaults to REPO_INNER_PATH for backward compatibility.
 # Point this at the node-local repo root so docs resolve outside the private git repo.

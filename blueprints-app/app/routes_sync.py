@@ -59,12 +59,12 @@ _ALLOWED_TABLES = {
 }
 
 # Action types that trigger local execution rather than a DB write
-_SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner"}
+_SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
 
 
 # ── Git pull helpers ──────────────────────────────────────────────────────────
 
-async def _git_pull_and_restart(repo_path: str, label: str) -> None:
+async def _git_pull_and_restart(repo_path: str, label: str, restart_service: bool = True) -> None:
     """Run git pull on a repo, then restart the service."""
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         log.info("git pull [%s] skipped: no repo at %r", label, repo_path)
@@ -78,7 +78,7 @@ async def _git_pull_and_restart(repo_path: str, label: str) -> None:
     if proc.returncode == 0:
         result = stdout.decode().strip()
         log.info("git pull [%s]: %s", label, result)
-        if cfg.SERVICE_RESTART_CMD:
+        if restart_service and cfg.SERVICE_RESTART_CMD:
             await _restart_service()
     else:
         log.warning("git pull [%s] failed: %s", label, stderr.decode().strip())
@@ -267,6 +267,9 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
         elif action.action_type == "sync_git_inner":
             asyncio.create_task(_git_pull_and_restart(cfg.REPO_INNER_PATH, "inner"))
             log.info("scheduled git pull [inner] from %s", payload.source_node_id)
+        elif action.action_type == "sync_git_non_root":
+            asyncio.create_task(_git_pull_and_restart(cfg.REPO_NON_ROOT_PATH, "non_root", restart_service=False))
+            log.info("scheduled git pull [non_root] from %s", payload.source_node_id)
 
     if not db_actions:
         return Response(status_code=204)
@@ -359,13 +362,24 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
 async def trigger_git_pull(payload: GitPullRequest) -> Response:
     """
     Trigger a git pull on this node and enqueue sync_git actions for all peers.
-    scope: "outer" | "inner" | "both"
+    scope: "outer" | "inner" | "both" | "non_root" | "all"
     Any peer that receives the action will pull its own local repo.
     """
-    if payload.scope not in ("outer", "inner", "both"):
-        raise HTTPException(400, "scope must be 'outer', 'inner', or 'both'")
+    if payload.scope not in ("outer", "inner", "both", "non_root", "all"):
+        raise HTTPException(400, "scope must be 'outer', 'inner', 'both', 'non_root', or 'all'")
 
-    scopes = ["outer", "inner"] if payload.scope == "both" else [payload.scope]
+    if payload.scope == "both":
+        scopes = ["outer", "inner"]
+    elif payload.scope == "all":
+        scopes = ["outer", "non_root", "inner"]
+    else:
+        scopes = [payload.scope]
+
+    repo_map = {
+        "outer": (cfg.REPO_OUTER_PATH, True),
+        "inner": (cfg.REPO_INNER_PATH, True),
+        "non_root": (cfg.REPO_NON_ROOT_PATH, False),
+    }
 
     with get_conn() as conn:
         gen = get_gen(conn)
@@ -374,8 +388,8 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
             enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
 
     for scope in scopes:
-        repo = cfg.REPO_OUTER_PATH if scope == "outer" else cfg.REPO_INNER_PATH
-        asyncio.create_task(_git_pull_and_restart(repo, scope))
+        repo, restart_service = repo_map[scope]
+        asyncio.create_task(_git_pull_and_restart(repo, scope, restart_service=restart_service))
         log.info("triggered git pull [%s] locally + queued for all peers", scope)
 
     return Response(status_code=204)
