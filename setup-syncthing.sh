@@ -6,12 +6,12 @@
 #   2. Ensures gui-fallback/assets/icons/ and gui-fallback/assets/sounds/ exist
 #      with Syncthing .stfolder marker files.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
-#   4. Temporarily starts syncthing@syncthing.service so Syncthing generates its
+#   4. Temporarily starts syncthing@xarta.service so Syncthing generates its
 #      device certificate, then reads the device ID from the local REST API.
 #   5. Generates config.xml from .nodes.json + .env: GUI credentials, peer
 #      device IDs (via primary_ip), shared folder paths, discovery disabled.
 #   6. Writes SYNCTHING_DEVICE_ID to .env.
-#   7. Restarts syncthing@syncthing.service with the new config.
+#   7. Restarts syncthing@xarta.service with the new config.
 #
 # Two-pass rollout for the fleet:
 #   Pass 1 (first run on a node):
@@ -41,7 +41,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 NODES_JSON="$SCRIPT_DIR/.nodes.json"
-SYNCTHING_HOME="/var/lib/syncthing/.local/state/syncthing"
+SYNCTHING_HOME="/home/xarta/.local/state/syncthing"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -132,15 +132,11 @@ dpkg -l python3-bcrypt >/dev/null 2>&1 || apt-get install -y python3-bcrypt
 echo -e "    ${GREEN}ok${NC}"
 echo ""
 
-# ── Step 1b — Ensure syncthing system user exists ────────────────────────────
-echo "Step 1b: Ensuring syncthing system user exists..."
-if ! id syncthing &>/dev/null; then
-    useradd --system --home-dir /var/lib/syncthing --create-home \
-            --shell /usr/sbin/nologin syncthing
-    echo -e "    ${GREEN}created${NC}: syncthing system user (home: /var/lib/syncthing)"
-else
-    echo "    syncthing user already exists"
-fi
+# ── Step 1b — Ensure Syncthing state directory exists under xarta ─────────────
+echo "Step 1b: Ensuring Syncthing state directory..."
+mkdir -p "$SYNCTHING_HOME"
+chown -R xarta:xarta "/home/xarta/.local" 2>/dev/null || true
+echo -e "    ${GREEN}ok${NC}: $SYNCTHING_HOME (owned by xarta)"
 echo ""
 
 # ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
@@ -159,8 +155,8 @@ chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
 chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
-chown -R syncthing:syncthing "$BLUEPRINTS_ASSETS_DIR"
-echo -e "    ${CYAN}ownership${NC}: syncthing:syncthing → $BLUEPRINTS_ASSETS_DIR"
+chown -R xarta:xarta "$BLUEPRINTS_ASSETS_DIR"
+echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $BLUEPRINTS_ASSETS_DIR"
 echo ""
 
 # ── Step 3 — Stable API key (generated once, persisted in .env) ──────────────
@@ -175,26 +171,37 @@ fi
 echo ""
 
 # ── Step 3b — Migrate certs from old home if present (preserves device ID) ───────
-OLD_SYNCTHING_HOME="/root/.local/state/syncthing"
+OLD_SYNCTHING_HOMES=(
+    "/root/.local/state/syncthing"
+    "/var/lib/syncthing/.local/state/syncthing"
+)
 echo "Step 3b: Checking for Syncthing certificates to migrate..."
-if [[ -f "$OLD_SYNCTHING_HOME/cert.pem" ]] && [[ ! -f "$SYNCTHING_HOME/cert.pem" ]]; then
-    echo "    Found certs in old home (‘$OLD_SYNCTHING_HOME’) — migrating to preserve device ID..."
-    mkdir -p "$SYNCTHING_HOME"
-    cp "$OLD_SYNCTHING_HOME/cert.pem" "$SYNCTHING_HOME/cert.pem"
-    cp "$OLD_SYNCTHING_HOME/key.pem"  "$SYNCTHING_HOME/key.pem"
-    chown -R syncthing:syncthing /var/lib/syncthing
-    echo -e "    ${GREEN}migrated${NC}: cert.pem + key.pem → $SYNCTHING_HOME"
-elif [[ -f "$SYNCTHING_HOME/cert.pem" ]]; then
-    echo "    Certs already present in $SYNCTHING_HOME — no migration needed"
-else
-    echo "    No existing certs found — Syncthing will generate a new device identity"
-    mkdir -p "$SYNCTHING_HOME"
-    chown -R syncthing:syncthing /var/lib/syncthing
+migrated=0
+for OLD_HOME in "${OLD_SYNCTHING_HOMES[@]}"; do
+    if [[ -f "$OLD_HOME/cert.pem" ]] && [[ ! -f "$SYNCTHING_HOME/cert.pem" ]]; then
+        echo "    Found certs in '$OLD_HOME' — migrating to preserve device ID..."
+        mkdir -p "$SYNCTHING_HOME"
+        cp "$OLD_HOME/cert.pem" "$SYNCTHING_HOME/cert.pem"
+        cp "$OLD_HOME/key.pem"  "$SYNCTHING_HOME/key.pem"
+        chown -R xarta:xarta "/home/xarta/.local"
+        echo -e "    ${GREEN}migrated${NC}: cert.pem + key.pem → $SYNCTHING_HOME"
+        migrated=1
+        break
+    fi
+done
+if [[ $migrated -eq 0 ]]; then
+    if [[ -f "$SYNCTHING_HOME/cert.pem" ]]; then
+        echo "    Certs already present in $SYNCTHING_HOME — no migration needed"
+    else
+        echo "    No existing certs found — Syncthing will generate a new device identity"
+        mkdir -p "$SYNCTHING_HOME"
+        chown -R xarta:xarta "/home/xarta/.local"
+    fi
 fi
 echo ""
 
 # ── Step 4 — Start service briefly to generate cert and obtain device ID ──────
-echo "Step 4: Starting syncthing@syncthing.service to generate device certificate..."
+echo "Step 4: Starting syncthing@xarta.service to generate device certificate..."
 # Stop old service first so it frees port 8384 (new service will start on the
 # default port 8384 when the port is available and no config.xml forces a different port).
 if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
@@ -204,8 +211,8 @@ fi
 # Remove any stale config.xml from previous runs so Syncthing generates a clean
 # default that listens on 8384 (its hardcoded default when no config exists).
 rm -f "$SYNCTHING_HOME/config.xml" "$SYNCTHING_HOME/config.xml.v0"
-systemctl enable syncthing@syncthing.service >/dev/null 2>&1
-systemctl start syncthing@syncthing.service
+systemctl enable syncthing@xarta.service >/dev/null 2>&1
+systemctl start syncthing@xarta.service
 
 # Syncthing generates config.xml and its cert/key on first startup.
 echo "    Waiting for config.xml (up to 30s)..."
@@ -216,9 +223,9 @@ done
 
 if [[ ! -f "$SYNCTHING_HOME/config.xml" ]]; then
     echo -e "${RED}Error:${NC} Syncthing did not create config.xml within 30s." >&2
-    echo "  Running as user 'syncthing', home dir: /var/lib/syncthing" >&2
+    echo "  Running as user 'xarta', home dir: /home/xarta" >&2
     echo "  Expected config: $SYNCTHING_HOME/config.xml" >&2
-    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
+    echo "  Logs: journalctl -u syncthing@xarta -n 50" >&2
     exit 1
 fi
 echo -e "    ${GREEN}found${NC}: $SYNCTHING_HOME/config.xml"
@@ -244,8 +251,8 @@ done
 
 if [[ $API_UP -eq 0 ]]; then
     echo -e "${RED}Error:${NC} Syncthing API did not respond within 30s." >&2
-    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
-    systemctl stop syncthing@syncthing.service || true
+    echo "  Logs: journalctl -u syncthing@xarta -n 50" >&2
+    systemctl stop syncthing@xarta.service || true
     exit 1
 fi
 
@@ -256,7 +263,7 @@ OWN_DEVICE_ID=$(curl -sf \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['myID'])")
 
 echo -e "    ${GREEN}Device ID:${NC} $OWN_DEVICE_ID"
-systemctl stop syncthing@syncthing.service
+systemctl stop syncthing@xarta.service
 echo ""
 
 # ── Step 5 — Write device ID to .env ─────────────────────────────────────────
@@ -452,22 +459,28 @@ python3 "$TMPPY" \
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
-echo "Step 7: Enabling and restarting syncthing@syncthing.service..."
+echo "Step 7: Enabling and restarting syncthing@xarta.service..."
 if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
     echo "    Stopping old syncthing@root.service..."
     systemctl stop syncthing@root.service || true
     systemctl disable syncthing@root.service 2>/dev/null || true
     echo -e "    ${CYAN}disabled${NC}: syncthing@root.service"
 fi
-systemctl enable syncthing@syncthing.service >/dev/null 2>&1
-systemctl restart syncthing@syncthing.service
+if systemctl is-active --quiet syncthing@syncthing.service 2>/dev/null; then
+    echo "    Stopping legacy syncthing@syncthing.service..."
+    systemctl stop syncthing@syncthing.service || true
+    systemctl disable syncthing@syncthing.service 2>/dev/null || true
+    echo -e "    ${CYAN}disabled${NC}: syncthing@syncthing.service"
+fi
+systemctl enable syncthing@xarta.service >/dev/null 2>&1
+systemctl restart syncthing@xarta.service
 sleep 2
 
-if systemctl is-active --quiet syncthing@syncthing.service; then
-    echo -e "    ${GREEN}running${NC}: syncthing@syncthing.service"
+if systemctl is-active --quiet syncthing@xarta.service; then
+    echo -e "    ${GREEN}running${NC}: syncthing@xarta.service"
 else
-    echo -e "${RED}Error:${NC} syncthing@syncthing.service failed to start." >&2
-    echo "  Logs: journalctl -u syncthing@syncthing -n 50" >&2
+    echo -e "${RED}Error:${NC} syncthing@xarta.service failed to start." >&2
+    echo "  Logs: journalctl -u syncthing@xarta -n 50" >&2
     exit 1
 fi
 echo ""
@@ -486,7 +499,7 @@ echo ""
 echo "  Node         : $NODE_ID"
 echo "  Device ID    : $OWN_DEVICE_ID"
 echo "  Peers        : $PEER_STATUS device IDs configured in .nodes.json"
-echo "  Service      : syncthing@syncthing.service ($(systemctl is-active syncthing@syncthing.service))"
+echo "  Service      : syncthing@xarta.service ($(systemctl is-active syncthing@xarta.service))"
 echo "  Config       : $SYNCTHING_HOME/config.xml"
 echo ""
 echo "Next steps:"
