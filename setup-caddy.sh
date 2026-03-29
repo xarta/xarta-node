@@ -66,6 +66,31 @@ chown_like() {
 # Extract hostname (no scheme, no port) from a URL.
 url_host() { echo "$1" | sed 's|^https\?://||' | sed 's|:.*||' | sed 's|/.*||'; }
 
+derive_nodes_json_host() {
+    local field_name="$1"
+
+    if [[ -z "${NODES_JSON_PATH:-}" || -z "${BLUEPRINTS_NODE_ID:-}" || ! -f "$NODES_JSON_PATH" ]]; then
+        return 0
+    fi
+
+    python3 - "$NODES_JSON_PATH" "$BLUEPRINTS_NODE_ID" "$field_name" <<'PYEOF'
+import json
+import sys
+
+nodes_json_path, node_id, field_name = sys.argv[1:4]
+with open(nodes_json_path) as f:
+    nodes = json.load(f).get("nodes", [])
+
+node = next((n for n in nodes if n.get("node_id") == node_id), None)
+if not node:
+    sys.exit(0)
+
+value = (node.get(field_name) or "").strip()
+if value:
+    print(value)
+PYEOF
+}
+
 echo "=== Caddy setup ==="
 echo ""
 
@@ -127,6 +152,13 @@ fi
 
 CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
 UI_HOST=$(url_host "${BLUEPRINTS_UI_URL:-localhost}")
+if [[ -z "$UI_HOST" || "$UI_HOST" == "localhost" ]]; then
+    DERIVED_PRIMARY_HOST="$(derive_nodes_json_host primary_hostname)"
+    if [[ -n "$DERIVED_PRIMARY_HOST" ]]; then
+        UI_HOST="$DERIVED_PRIMARY_HOST"
+        echo "    Derived primary UI host from .nodes.json: $UI_HOST"
+    fi
+fi
 REFERENCE_UI_ROOT="${REPO_INNER_PATH:-$SCRIPT_DIR/.xarta}/gui-reference"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-${REPO_OUTER_PATH:-$SCRIPT_DIR}/gui-fallback}"
 
@@ -139,6 +171,7 @@ if [[ -n "${CADDY_EXTRA_NAMES:-}" ]]; then
     for name in "${EXTRA[@]}"; do
         name="${name// /}"  # trim whitespace
         [[ -z "$name" ]] && continue
+        [[ "$name" == "$UI_HOST" ]] && continue
         HTTPS_NAMES+=", https://${name}"
         HTTP_NAMES+=", http://${name}"
     done
