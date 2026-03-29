@@ -195,6 +195,15 @@ echo ""
 
 # ── Step 4 — Start service briefly to generate cert and obtain device ID ──────
 echo "Step 4: Starting syncthing@syncthing.service to generate device certificate..."
+# Stop old service first so it frees port 8384 (new service will start on the
+# default port 8384 when the port is available and no config.xml forces a different port).
+if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
+    echo "    Stopping syncthing@root.service (frees port 8384)..."
+    systemctl stop syncthing@root.service
+fi
+# Remove any stale config.xml from previous runs so Syncthing generates a clean
+# default that listens on 8384 (its hardcoded default when no config exists).
+rm -f "$SYNCTHING_HOME/config.xml" "$SYNCTHING_HOME/config.xml.v0"
 systemctl enable syncthing@syncthing.service >/dev/null 2>&1
 systemctl start syncthing@syncthing.service
 
