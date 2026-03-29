@@ -682,7 +682,7 @@ class SyncAction(BaseModel):
 
 
 class GitPullRequest(BaseModel):
-    scope: str = "outer"   # "outer" | "inner" | "both"
+    scope: str = "outer"   # "outer" | "inner" | "both" | "non_root" | "all"
 
 
 class SyncActionsPayload(BaseModel):
