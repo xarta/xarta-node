@@ -76,9 +76,12 @@ def _get_used_image_ids(inner_root: Path) -> set[str]:
         return set()
     used: set[str] = set()
     root_str = str(inner_root.resolve()) + "/"
+    docs_link = inner_root / "docs"
+    docs_target_str = (str(docs_link.resolve()) + "/") if docs_link.is_symlink() else None
     for row in doc_rows:
         p = (inner_root / row["path"]).resolve()
-        if not str(p).startswith(root_str):
+        p_str = str(p)
+        if not p_str.startswith(root_str) and (docs_target_str is None or not p_str.startswith(docs_target_str)):
             continue  # path traversal guard
         if p.exists():
             try:

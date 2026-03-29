@@ -33,11 +33,29 @@ def _inner_root() -> Path:
 
 
 def _safe_resolve(root: Path, rel_path: str) -> Path:
-    """Resolve rel_path under root, raising 400 if traversal escapes root."""
+    """Resolve rel_path under root, raising 400 if traversal escapes root.
+
+    The docs/ subdirectory may be a symlink to an external path (e.g. lone-wolf).
+    Fully-resolved paths are checked against both the repo root and the resolved
+    docs symlink target so that symlinked subtrees are allowed.
+    """
     resolved = (root / rel_path).resolve()
-    if not str(resolved).startswith(str(root.resolve()) + "/") and resolved != root.resolve():
-        raise HTTPException(400, "Path escapes repository root")
-    return resolved
+    root_resolved = str(root.resolve())
+
+    def _under(base: str) -> bool:
+        return str(resolved).startswith(base + "/") or str(resolved) == base
+
+    if _under(root_resolved):
+        return resolved
+
+    # Allow paths that resolve under the docs symlink target (if docs/ is a symlink)
+    docs_link = root / "docs"
+    if docs_link.is_symlink():
+        docs_target = str(docs_link.resolve())
+        if _under(docs_target):
+            return resolved
+
+    raise HTTPException(400, "Path escapes repository root")
 
 
 def _row_to_out(row) -> DocOut:
