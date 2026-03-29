@@ -829,6 +829,23 @@ class HealthOut(BaseModel):
     commit_ts: int = 0             # unix epoch of HEAD commit (for commit-guard ordering)
 
 
+class RepoVersionOut(BaseModel):
+    label: str
+    path: str
+    exists: bool = False
+    branch: Optional[str] = None
+    commit: Optional[str] = None
+    commit_ts: int = 0
+    dirty: bool = False
+
+
+class RepoVersionsOut(BaseModel):
+    node_id: str
+    outer: RepoVersionOut
+    inner: RepoVersionOut
+    non_root: RepoVersionOut
+
+
 # ── AI Providers ─────────────────────────────────────────────────────────────
 
 class AiProviderCreate(BaseModel):
