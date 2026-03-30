@@ -37,6 +37,10 @@ Keep `SKILL.md` concise (target under 500 lines). Move heavy guidance to `refere
 4. Move long guidance/examples into `references/`.
 5. Run conformance audit before finalizing.
 
+If the skill governs GUI, modal, or reusable component work, encode the shared-first principle
+directly in the skill text: prefer one named shared module plus small page-specific adapters over
+duplicated per-page implementations.
+
 ## Conformance audit script
 
 Use:

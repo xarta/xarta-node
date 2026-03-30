@@ -9,6 +9,10 @@ Work on the Blueprints GUI — the HTML/CSS/JS dashboard served at `/ui` on ever
 xarta-node.  Use when editing visual behaviour, tab content, styling, or any
 JavaScript feature of the GUI.
 
+Prefer shared GUI components over page-local duplication. If two pages need the same chooser,
+picker, modal body, or editor behavior, extract the shared part into one named module and keep
+page-specific behavior in small adapters or callbacks.
+
 ---
 
 ## File layout

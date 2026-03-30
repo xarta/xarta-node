@@ -2,6 +2,7 @@
 
 GET    /api/v1/form-controls                   → list[FormControlOut]
 GET    /api/v1/form-controls/assets            → list asset files (?type=icons|sounds)
+GET    /api/v1/form-controls/discover-keys     → discover data-fc-key values from gui-fallback sources
 GET    /api/v1/form-controls/{control_id}      → FormControlOut
 POST   /api/v1/form-controls                   → FormControlOut  (201)
 PUT    /api/v1/form-controls/{control_id}      → FormControlOut
@@ -17,6 +18,7 @@ All data writes call enqueue_for_all_peers() for fleet sync.
 """
 
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,12 @@ router = APIRouter(prefix="/form-controls", tags=["form-controls"])
 
 _ICON_ALLOWED_EXTS  = {".svg", ".png", ".ico", ".jpg", ".jpeg", ".webp"}
 _SOUND_ALLOWED_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".webm", ".m4a"}
+_FC_SCAN_SUFFIXES   = {".html", ".js"}
+_FC_KEY_PATTERNS = [
+    re.compile(r'data-fc-key\s*=\s*["\']([^"\']+)["\']'),
+    re.compile(r'dataset\.fcKey\s*=\s*["\']([^"\']+)["\']'),
+    re.compile(r'setAttribute\(\s*["\']data-fc-key["\']\s*,\s*["\']([^"\']+)["\']\s*\)'),
+]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -46,13 +54,74 @@ def _outer_root() -> Path:
     return Path(outer)
 
 
+def _gui_fallback_root() -> Path:
+    candidates: list[Path] = []
+
+    non_root = getattr(cfg, "REPO_NON_ROOT_PATH", "")
+    if non_root:
+        candidates.append(Path(non_root) / "gui-fallback")
+
+    outer = getattr(cfg, "REPO_OUTER_PATH", "")
+    if outer:
+        candidates.append(Path(outer) / "gui-fallback")
+
+    for root in candidates:
+        if (root / "assets").is_dir():
+            return root
+
+    for root in candidates:
+        if root.is_dir():
+            return root
+
+    if candidates:
+        root = candidates[0]
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    raise HTTPException(503, "No gui-fallback path configured")
+
+
 def _assets_dir(asset_type: str) -> Path:
     """Return (and create) the shared icon or sound assets directory."""
     if asset_type not in ("icons", "sounds"):
         raise HTTPException(400, "asset_type must be 'icons' or 'sounds'")
-    d = _outer_root() / "gui-fallback" / "assets" / asset_type
+    d = _gui_fallback_root() / "assets" / asset_type
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _strip_source_comments(text: str, suffix: str) -> str:
+    if suffix == ".html":
+        return re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+
+    if suffix == ".js":
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+        text = re.sub(r'(^|\s)//.*?$', r'\1', text, flags=re.MULTILINE)
+    return text
+
+
+def _discover_fc_keys() -> dict[str, list[str]]:
+    gui_root = _gui_fallback_root()
+    found: dict[str, set[str]] = {}
+
+    for path in sorted(gui_root.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in _FC_SCAN_SUFFIXES:
+            continue
+        try:
+            raw = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            raw = path.read_text(encoding='utf-8', errors='ignore')
+        text = _strip_source_comments(raw, path.suffix.lower())
+        rel = str(path.relative_to(gui_root))
+
+        for pattern in _FC_KEY_PATTERNS:
+            for match in pattern.finditer(text):
+                key = match.group(1).strip()
+                if not key:
+                    continue
+                found.setdefault(key, set()).add(rel)
+
+    return {key: sorted(paths) for key, paths in sorted(found.items())}
 
 
 def _row_to_out(row) -> FormControlOut:
@@ -98,15 +167,34 @@ async def list_fc_assets(type: Literal["icons", "sounds"] = Query(...)):
     assets_dir = _assets_dir(type)
     allowed = _ICON_ALLOWED_EXTS if type == "icons" else _SOUND_ALLOWED_EXTS
     result = []
-    for f in sorted(assets_dir.iterdir()):
+    for f in sorted(assets_dir.rglob('*')):
         if f.is_file() and f.suffix.lower() in allowed:
+            rel = f.relative_to(assets_dir)
             result.append({
                 "filename": f.name,
-                "path":     f"{type}/{f.name}",
+                "path":     f"{type}/{rel}",
                 "size":     f.stat().st_size,
-                "url":      f"/fallback-ui/assets/{type}/{f.name}",
+                "url":      f"/fallback-ui/assets/{type}/{rel}",
             })
     return result
+
+
+@router.get("/discover-keys")
+async def discover_form_control_keys():
+    """Discover legitimate data-fc-key strings from the fixed gui-fallback source tree.
+
+    Security: this endpoint accepts no path or pattern input. It scans only the configured
+    gui-fallback directory for .html and .js files, strips comments, extracts literal
+    data-fc-key usages, and returns a de-duplicated list.
+    """
+    found = _discover_fc_keys()
+    return {
+        "keys": [
+            {"key": key, "sources": sources}
+            for key, sources in found.items()
+        ],
+        "count": len(found),
+    }
 
 
 # ── Bulk seed ─────────────────────────────────────────────────────────────────
@@ -208,12 +296,18 @@ async def assign_fc_asset(
     # For file lookup, map sounds_off → sounds folder
     folder_type = "icons" if asset_type == "icons" else "sounds"
     assets_dir = _assets_dir(folder_type)
-    filename = Path(asset_path).name
-    dest = assets_dir / filename
+    relative = Path(asset_path)
+    if relative.is_absolute() or '..' in relative.parts:
+        raise HTTPException(400, "invalid asset path")
+    if relative.parts[0] != folder_type:
+        raise HTTPException(400, f"asset path must start with '{folder_type}/'")
+
+    rel_inside = Path(*relative.parts[1:])
+    dest = assets_dir / rel_inside
     if not dest.exists():
         raise HTTPException(404, f"asset file not found: {asset_path!r}")
 
-    relative_path = f"{folder_type}/{filename}"
+    relative_path = f"{folder_type}/{rel_inside}"
     asset_col = {"icons": "icon_asset", "sounds": "sound_asset", "sounds_off": "sound_asset_off"}[asset_type]
 
     with get_conn() as conn:

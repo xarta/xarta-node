@@ -11,7 +11,7 @@ GET    /api/v1/nav-items/assets             → list of asset files  (?type=icon
 POST   /api/v1/nav-items/assign-asset       → assign an existing asset to a nav item
 POST   /api/v1/nav-items/upload-bulk        → bulk extract a zip/tar/7z archive into assets dir
 
-Assets are stored under {REPO_OUTER_PATH}/gui-fallback/assets/{icons|sounds}/ and served
+Assets are stored under the active gui-fallback/assets/{icons|sounds}/ tree and served
 by Caddy at /fallback-ui/assets/{icons|sounds}/  — no extra server config required.
 
 All data writes call enqueue_for_all_peers() for fleet sync.
@@ -62,11 +62,38 @@ def _outer_root() -> Path:
     return Path(outer)
 
 
+def _gui_fallback_root() -> Path:
+    candidates: list[Path] = []
+
+    non_root = getattr(cfg, "REPO_NON_ROOT_PATH", "")
+    if non_root:
+        candidates.append(Path(non_root) / "gui-fallback")
+
+    outer = getattr(cfg, "REPO_OUTER_PATH", "")
+    if outer:
+        candidates.append(Path(outer) / "gui-fallback")
+
+    for root in candidates:
+        if (root / "assets").is_dir():
+            return root
+
+    for root in candidates:
+        if root.is_dir():
+            return root
+
+    if candidates:
+        root = candidates[0]
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    raise HTTPException(503, "No gui-fallback path configured")
+
+
 def _assets_dir(asset_type: str) -> Path:
     """Return (and create) the icon or sound assets directory."""
     if asset_type not in ("icons", "sounds"):
         raise HTTPException(400, "asset_type must be 'icons' or 'sounds'")
-    d = _outer_root() / "gui-fallback" / "assets" / asset_type
+    d = _gui_fallback_root() / "assets" / asset_type
     d.mkdir(parents=True, exist_ok=True)
     return d
 
