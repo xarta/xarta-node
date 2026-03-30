@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 # bp-restore.sh — restore a local DB backup (works even when blueprints-app is down)
 #
-# ⚠ This only restores THIS node's DB.  Other nodes are NOT automatically
-#   updated.  The restored gen will usually be below current peer gens, so
-#   peers will push their state back to this node at next sync, eventually
-#   overwriting the restore.
+# ⚠ Normal restore only updates THIS node's DB.
 #
-#   Use --force to query peers for their max gen and set the restored DB's
-#   gen to max+1.  This node will then win the gen guard on next sync and
-#   propagate the restored state to all peers.  Only use this for disaster
-#   recovery / corruption fix scenarios.
+#   With --api --force, the API restores the backup locally, then broadcasts
+#   the restored DB to all configured peers via the full-restore endpoint.
+#   Use this only for disaster recovery / corruption fix scenarios.
+#
+#   Direct mode without --api remains a local restore path.
 #
 # Usage:
 #   ./bp-restore.sh                      — interactive selection
 #   ./bp-restore.sh <filename>           — restore specific backup
-#   ./bp-restore.sh <filename> --force   — restore + bump gen above all peers
+#   ./bp-restore.sh <filename> --force   — local restore only (direct mode)
 #   ./bp-restore.sh --api <filename>     — use HTTP API (app must be running)
+#   ./bp-restore.sh --api <filename> --force  — local restore + fleet broadcast
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,8 +67,8 @@ if [[ "$API_MODE" == true ]]; then
   echo ""
   echo "⚠  WARNING: This will replace the live DB on this node."
   if [[ "$FORCE" == true ]]; then
-    echo "⚠  FORCE mode: gen will be bumped above all peers."
-    echo "   All peers will be overwritten on next sync."
+    echo "⚠  FORCE mode: after local restore, the API will attempt to send"
+    echo "   the same restored DB to all configured peers."
   fi
   read -rp "Continue? [y/N] " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
@@ -129,13 +128,12 @@ echo "╠═══════════════════════�
 echo "║  This will replace the live DB on THIS node only.           ║"
 echo "║  Other nodes will NOT be updated automatically.             ║"
 echo "║                                                              ║"
-echo "║  Without --force: the restored gen will be below peer gens. ║"
-echo "║  Peers will push their current state back to this node at   ║"
-echo "║  next sync, overwriting this restore.                       ║"
+echo "║  Without --force: this is a local-only restore.             ║"
+echo "║  Other nodes are not updated automatically.                 ║"
 if [[ "$FORCE" == true ]]; then
 echo "║                                                              ║"
-echo "║  ⚠  FORCE MODE ACTIVE — gen will be bumped above ALL peers  ║"
-echo "║  All peers will be overwritten on next sync drain.          ║"
+echo "║  ⚠  FORCE MODE ACTIVE (direct mode) does NOT fleet-broadcast║"
+echo "║  Use --api --force for a full fleet overwrite operation.    ║"
 echo "║  Only use this for disaster recovery / corruption fixes.    ║"
 fi
 echo "╚══════════════════════════════════════════════════════════════╝"
