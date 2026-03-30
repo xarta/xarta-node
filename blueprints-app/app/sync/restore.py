@@ -18,6 +18,7 @@ import io
 import logging
 import os
 import shutil
+import sqlite3
 import zipfile
 
 from .. import config as cfg
@@ -49,6 +50,38 @@ def make_full_backup() -> tuple[bytes, str]:
         "created full backup: %d bytes, sha256=%s", len(zip_bytes), sha256_hex[:16]
     )
     return zip_bytes, sha256_hex
+
+
+def validate_sqlite_file(path: str) -> bool:
+    """Run PRAGMA integrity_check against a candidate SQLite file."""
+    try:
+        with sqlite3.connect(path) as conn:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        ok = bool(row and row[0] == "ok")
+        if not ok:
+            detail = row[0] if row else "no result"
+            log.error("restore candidate integrity_check failed: %s", detail)
+        return ok
+    except Exception:
+        log.exception("restore candidate integrity_check raised unexpectedly")
+        return False
+
+
+def post_restore_housekeeping() -> bool:
+    """Re-initialise schema, restore local node records, and verify integrity."""
+    try:
+        from ..db import check_integrity, init_db
+        from ..routes_nodes import _upsert_nodes_from_config
+
+        init_db()
+        _upsert_nodes_from_config()
+        ok = check_integrity()
+        if not ok:
+            log.error("post-restore integrity check failed — node remains degraded")
+        return ok
+    except Exception:
+        log.exception("post-restore housekeeping failed")
+        return False
 
 
 # ── Restore ───────────────────────────────────────────────────────────────────
@@ -90,6 +123,14 @@ def _apply_restore_sync(zip_bytes: bytes, expected_sha256: str) -> bool:
         log.exception("unexpected error extracting restore zip")
         return False
 
+    # 2b. Validate the extracted DB before replacing the live file
+    if not validate_sqlite_file(tmp_path):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
     # 3. Atomically swap the DB file
     try:
         os.replace(tmp_path, cfg.DB_PATH)
@@ -101,12 +142,8 @@ def _apply_restore_sync(zip_bytes: bytes, expected_sha256: str) -> bool:
             pass
         return False
 
-    # 4. Re-run schema init (idempotent — adds any missing tables/indices)
-    try:
-        from ..db import init_db
-        init_db()
-    except Exception:
-        log.exception("schema re-init after restore failed — DB may be inconsistent")
+    # 4. Re-run schema init, reassert local nodes.json state, and verify integrity
+    if not post_restore_housekeeping():
         return False
 
     log.info("DB restore applied successfully from %d-byte zip", len(zip_bytes))

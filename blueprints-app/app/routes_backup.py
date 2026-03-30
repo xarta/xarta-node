@@ -4,47 +4,43 @@ routes_backup.py — local DB backup and restore endpoints.
 GET  /api/v1/backup                          — list available backups
 POST /api/v1/backup                          — create a new backup
 POST /api/v1/backup/restore/{filename}       — restore a backup locally
-  ?force=true                                — bump gen above all peers first
+    ?force=true                                — restore locally, then broadcast the
+                                                                                             restored DB to all peers via the
+                                                                                             full-restore endpoint
 
 Backups are plain SQLite files (not zipped) saved to BLUEPRINTS_BACKUP_DIR.
 The sync_queue table is always cleared in backups — there is no point
 preserving stale outbound queue items from backup time.
-
-⚠ RESTORE NOTE
-Local restore reverts this node's gen to backup-time gen, which is below
-current peer gens.  The gen guard will then cause peers to push their state
-back to this node at the next drain cycle, overwriting the restore.
-
-Use ?force=true to query peers for their max gen and bump the restored
-DB's gen to max+1 before applying.  This causes THIS node to win the gen
-guard check when it next syncs, propagating the restored state to all peers.
-Only use this for disaster recovery / corruption fix scenarios.
 """
 
-import io
-import json
 import logging
 import os
 import re
 import sqlite3
 import tarfile
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from starlette.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import config as cfg
+from .auth import compute_token
 from .db import get_conn, get_gen
+from .sync.drain import _make_sync_client
+from .sync.restore import make_full_backup, post_restore_housekeeping, validate_sqlite_file
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/backup", tags=["backup"])
 
 _SAFE_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-blueprints\.db\.tar\.gz$")
+_FORCE_RESTORE_HEADER = "x-blueprints-force-restore"
+_RESTORE_OP_HEADER = "x-blueprints-restore-op"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -101,33 +97,98 @@ def _create_backup_file(dest_path: Path) -> None:
             pass
 
 
-def _peer_addresses() -> list[str]:
-    """Return all known peer API base URLs from the nodes table."""
-    addresses: list[str] = []
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT addresses FROM nodes WHERE node_id != ?", (cfg.NODE_ID,)
-        ).fetchall()
-    for row in rows:
-        try:
-            addrs = json.loads(row[0] or "[]")
-            addresses.extend(addrs)
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return addresses
+def _extract_backup_to_temp(src_path: Path, tmp_path: Path) -> int:
+    """Extract a backup archive to a temp DB file and return its generation."""
+    with tarfile.open(str(src_path), "r:gz") as tar:
+        member = tar.getmember("blueprints.db")
+        with tar.extractfile(member) as f_in, open(str(tmp_path), "wb") as f_out:
+            f_out.write(f_in.read())
 
-
-async def _fetch_peer_gen(address: str) -> int | None:
-    """GET {address}/health and return the gen field, or None on failure."""
-    url = address.rstrip("/") + "/health"
+    conn_tmp = sqlite3.connect(str(tmp_path))
     try:
-        async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                return r.json().get("gen")
-    except Exception as exc:
-        log.debug("force-restore: could not reach %s: %s", url, exc)
-    return None
+        conn_tmp.execute("DELETE FROM sync_queue")
+        conn_tmp.commit()
+        row = conn_tmp.execute(
+            "SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn_tmp.close()
+
+
+class PeerRestoreResult(BaseModel):
+    node_id: str
+    ok: bool
+    address: str | None = None
+    detail: str = ""
+
+
+async def _broadcast_live_db_to_peers(operation_id: str) -> list[PeerRestoreResult]:
+    """Send the current local DB to every configured peer as an authoritative restore."""
+    with get_conn() as conn:
+        current_gen = get_gen(conn)
+
+    zip_bytes, sha256_hex = make_full_backup()
+    headers = {
+        "content-type": "application/octet-stream",
+        "x-blueprints-checksum": sha256_hex,
+        "x-blueprints-gen": str(current_gen),
+        _FORCE_RESTORE_HEADER: "true",
+        _RESTORE_OP_HEADER: operation_id,
+    }
+    if cfg.SYNC_SECRET:
+        headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
+
+    results: list[PeerRestoreResult] = []
+    async with _make_sync_client(60.0) as client:
+        for node_id, peer_urls in cfg.PEER_SYNC_URLS.items():
+            if not peer_urls:
+                results.append(PeerRestoreResult(
+                    node_id=node_id,
+                    ok=False,
+                    detail="no sync addresses configured",
+                ))
+                continue
+
+            last_detail = "all configured addresses failed"
+            last_address: str | None = None
+            success = False
+
+            for url in peer_urls:
+                last_address = url
+                try:
+                    resp = await client.post(
+                        f"{url}/api/v1/sync/restore",
+                        content=zip_bytes,
+                        headers=headers,
+                    )
+                    if resp.status_code == 204:
+                        results.append(PeerRestoreResult(
+                            node_id=node_id,
+                            ok=True,
+                            address=url,
+                            detail="restore applied",
+                        ))
+                        success = True
+                        break
+                    body = resp.text.strip()
+                    last_detail = f"HTTP {resp.status_code}"
+                    if body:
+                        last_detail = f"{last_detail} — {body}"
+                except httpx.ConnectError:
+                    last_detail = f"connect failed at {url}"
+                except Exception as exc:
+                    last_detail = f"{type(exc).__name__}: {exc}"
+
+            if not success:
+                results.append(PeerRestoreResult(
+                    node_id=node_id,
+                    ok=False,
+                    address=last_address,
+                    detail=last_detail,
+                ))
+
+    return results
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -155,6 +216,8 @@ class RestoreResponse(BaseModel):
     gen_before: int
     gen_after: int
     warning: str | None = None
+    fleet_success: bool | None = None
+    peer_results: list[PeerRestoreResult] = Field(default_factory=list)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -202,19 +265,15 @@ def create_backup() -> BackupCreatedResponse:
 @router.post("/restore/{filename}", response_model=RestoreResponse)
 async def restore_backup(
     filename: str,
-    force: bool = Query(default=False, description="Bump gen above all peers before restoring"),
+    force: bool = Query(default=False, description="Restore locally, then broadcast the restored DB to peers"),
 ) -> RestoreResponse:
     """
     Restore a local backup to the live DB.
 
-    ⚠ This only restores THIS node's DB.  Other nodes are NOT automatically
-    updated.  Without ?force=true the restored gen will be below peer gens,
-    so peers will push their current state back to this node at next sync,
-    eventually overwriting the restore.
+    Normal restore applies only to this node.
 
-    Use ?force=true to query peers for their max gen and set the restored
-    DB's gen to max+1.  This node will then win the gen guard on next sync
-    and propagate the restored state to all peers.
+    Force restore applies locally first, then sends the restored database to
+    all configured peers via the Layer 1 full-restore endpoint.
     """
     if not _SAFE_NAME.match(filename):
         raise HTTPException(status_code=400, detail="Invalid backup filename.")
@@ -228,38 +287,13 @@ async def restore_backup(
     with get_conn() as conn:
         gen_before = get_gen(conn)
 
-    # If force: query peers for their max gen
     gen_after = gen_before  # updated below
     warning: str | None = None
-    force_gen: int | None = None
+    fleet_success: bool | None = None
+    peer_results: list[PeerRestoreResult] = []
 
-    if force:
-        peer_addresses = _peer_addresses()
-        if not peer_addresses:
-            warning = (
-                "Force requested but no peers are registered — "
-                "gen was not bumped.  Restore applied with original backup gen."
-            )
-        else:
-            import asyncio
-            peer_gens = await asyncio.gather(
-                *[_fetch_peer_gen(addr) for addr in peer_addresses]
-            )
-            reachable = [g for g in peer_gens if g is not None]
-            if reachable:
-                force_gen = max(reachable) + 1
-                log.info(
-                    "force-restore: peer gens=%s, will set gen=%d in backup",
-                    reachable, force_gen,
-                )
-            else:
-                warning = (
-                    "Force requested but could not reach any peers — "
-                    "gen was not bumped.  Restore applied with original backup gen."
-                )
-
-    # Extract the .tar.gz to a temp .db file alongside the live DB, patch gen,
-    # then atomically replace without touching the backup original.
+    # Extract the .tar.gz to a temp .db file alongside the live DB, then
+    # atomically replace without touching the backup original.
     db_dir = Path(cfg.DB_PATH).parent
     with tempfile.NamedTemporaryFile(
         dir=db_dir, suffix=".db.tmp", delete=False
@@ -267,40 +301,31 @@ async def restore_backup(
         tmp_path = Path(tmp.name)
 
     try:
-        # Extract blueprints.db from archive into tmp_path
-        with tarfile.open(str(src_path), "r:gz") as tar:
-            member = tar.getmember("blueprints.db")
-            with tar.extractfile(member) as f_in, open(str(tmp_path), "wb") as f_out:
-                f_out.write(f_in.read())
-
-        # Clear sync_queue in the working copy (backup should already be clear,
-        # but be defensive)
-        conn_tmp = sqlite3.connect(str(tmp_path))
-        try:
-            conn_tmp.execute("DELETE FROM sync_queue")
-            if force_gen is not None:
-                conn_tmp.execute(
-                    "UPDATE sync_meta SET value=? WHERE key='gen'",
-                    (str(force_gen),),
-                )
-                conn_tmp.execute(
-                    "UPDATE sync_meta SET value='false' WHERE key='integrity_ok'"
-                )
-            conn_tmp.commit()
-            # Read the actual gen that will be applied
-            row = conn_tmp.execute(
-                "SELECT value FROM sync_meta WHERE key='gen'"
-            ).fetchone()
-            gen_after = int(row[0]) if row else gen_before
-        finally:
-            conn_tmp.close()
+        gen_after = _extract_backup_to_temp(src_path, tmp_path)
+        if not validate_sqlite_file(str(tmp_path)):
+            raise HTTPException(
+                status_code=422,
+                detail="Restore failed — backup DB did not pass SQLite integrity_check.",
+            )
 
         # Atomically replace the live DB
         os.replace(str(tmp_path), cfg.DB_PATH)
+        if not post_restore_housekeeping():
+            raise HTTPException(
+                status_code=500,
+                detail="Restore applied but post-restore integrity check failed.",
+            )
         log.info(
             "restore applied: %s — gen %d → %d (force=%s)",
             filename, gen_before, gen_after, force,
         )
+
+    except HTTPException:
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
+        raise
 
     except Exception:
         # Clean up temp file if replace failed
@@ -312,13 +337,32 @@ async def restore_backup(
             status_code=500, detail="Restore failed — live DB was not modified."
         )
 
-    if force_gen is not None and warning is None:
-        warning = (
-            "FORCE RESTORE applied.  This node's gen is now "
-            f"{gen_after}, above all known peers.  On next sync drain, "
-            "this node will push the restored state to all peers, "
-            "overwriting their current data.  This is intentional."
-        )
+    if force:
+        operation_id = uuid.uuid4().hex
+        if not cfg.PEER_SYNC_URLS:
+            fleet_success = True
+            warning = "Force restore applied locally, but no peers are configured on this node."
+        else:
+            try:
+                peer_results = await _broadcast_live_db_to_peers(operation_id)
+            except Exception as exc:
+                log.exception("force restore broadcast failed unexpectedly")
+                fleet_success = False
+                warning = f"Force restore applied locally, but peer broadcast failed before completion: {exc}"
+            else:
+                fleet_success = all(result.ok for result in peer_results)
+                if fleet_success:
+                    warning = None
+                else:
+                    failed = ", ".join(
+                        f"{result.node_id} ({result.detail})"
+                        for result in peer_results
+                        if not result.ok
+                    )
+                    warning = (
+                        "Force restore applied locally, but some peers did not accept the restored DB: "
+                        f"{failed}"
+                    )
 
     return RestoreResponse(
         restored_from=filename,
@@ -326,6 +370,8 @@ async def restore_backup(
         gen_before=gen_before,
         gen_after=gen_after,
         warning=warning,
+        fleet_success=fleet_success,
+        peer_results=peer_results,
     )
 
 

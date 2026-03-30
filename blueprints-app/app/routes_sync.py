@@ -33,6 +33,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
+_FORCE_RESTORE_HEADER = "x-blueprints-force-restore"
+_RESTORE_OP_HEADER = "x-blueprints-restore-op"
+
 # Tables that actions are permitted to touch (safeguard against bad payloads)
 # NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
 # populated from .nodes.json on each node. Incoming sync entries for nodes
@@ -444,6 +447,9 @@ async def receive_restore(request: Request) -> Response:
     if not sha256_hex:
         raise HTTPException(400, "missing X-Blueprints-Checksum header")
 
+    force_restore = request.headers.get(_FORCE_RESTORE_HEADER, "").lower() == "true"
+    restore_op = request.headers.get(_RESTORE_OP_HEADER, "")
+
     zip_bytes = await request.body()
     if not zip_bytes:
         raise HTTPException(400, "empty restore payload")
@@ -453,7 +459,7 @@ async def receive_restore(request: Request) -> Response:
     # gen<=N. This prevents a fresh empty node from wiping an established one.
     # Nodes that are degraded (integrity_ok=false) always accept any backup.
     sender_gen_str = request.headers.get("x-blueprints-gen", "")
-    if sender_gen_str:
+    if not force_restore and sender_gen_str:
         try:
             sender_gen = int(sender_gen_str)
             with get_conn() as conn:
@@ -476,9 +482,16 @@ async def receive_restore(request: Request) -> Response:
 
     ok = await apply_restore(zip_bytes, sha256_hex)
     if not ok:
-        raise HTTPException(422, "restore failed — checksum mismatch or corrupt zip")
+        raise HTTPException(422, "restore failed — checksum mismatch, integrity failure, or corrupt payload")
 
-    log.info("full DB restore applied (%d bytes)", len(zip_bytes))
+    if force_restore:
+        log.warning(
+            "authoritative full DB restore applied (%d bytes)%s",
+            len(zip_bytes),
+            f" op={restore_op}" if restore_op else "",
+        )
+    else:
+        log.info("full DB restore applied (%d bytes)", len(zip_bytes))
     return Response(status_code=204)
 
 

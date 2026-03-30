@@ -22,7 +22,7 @@ import httpx
 
 from .. import config as cfg
 from ..auth import compute_token
-from ..db import get_conn, get_meta
+from ..db import get_conn, get_gen, get_meta
 from ..sync.queue import (
     get_peers_with_pending,
     get_pending_actions,
@@ -220,6 +220,8 @@ async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
     delivery.  If all addresses fail the peer remains queued for retry.
     """
     try:
+        with get_conn() as conn:
+            current_gen = get_gen(conn)
         zip_bytes, sha256_hex = make_full_backup()
     except Exception:
         log.exception("failed to create full backup for peer %s", node_id)
@@ -228,6 +230,7 @@ async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
     _restore_headers = {
         "content-type": "application/octet-stream",
         "x-blueprints-checksum": sha256_hex,
+        "x-blueprints-gen": str(current_gen),
     }
     if cfg.SYNC_SECRET:
         _restore_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
