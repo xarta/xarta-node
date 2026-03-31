@@ -63,6 +63,114 @@ chown_like() {
     fi
 }
 
+read_fallback_cache_mode() {
+    local state_file="$1"
+
+    if [[ ! -f "$state_file" ]]; then
+        echo "production"
+        return 0
+    fi
+
+    python3 - "$state_file" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    print("production")
+    raise SystemExit(0)
+
+mode = str(data.get("desired_mode") or data.get("current_mode") or "production").strip().lower()
+print(mode if mode in {"production", "development"} else "production")
+PYEOF
+}
+
+compute_fallback_asset_version() {
+    local mode="$1"
+    local repo_path="${REPO_NON_ROOT_PATH:-/xarta-node}"
+    local fallback_root="$2"
+
+    if [[ "$mode" == "development" ]]; then
+        date -u +dev-%Y%m%d%H%M%S
+        return 0
+    fi
+
+    if [[ -n "$repo_path" && -d "$repo_path/.git" ]]; then
+        local head ts dirty
+        if head="$(git -C "$repo_path" rev-parse --short HEAD 2>/dev/null)" \
+            && ts="$(git -C "$repo_path" log -1 --format=%ct 2>/dev/null)"; then
+            dirty="$(git -C "$repo_path" status --porcelain 2>/dev/null || true)"
+            if [[ -n "$dirty" ]]; then
+                printf 'prod-%s-%s-dirty\n' "$head" "$ts"
+            else
+                printf 'prod-%s-%s\n' "$head" "$ts"
+            fi
+            return 0
+        fi
+    fi
+
+    python3 - "$fallback_root" <<'PYEOF'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+latest = 0
+if root.exists():
+    try:
+        latest = int(root.stat().st_mtime)
+    except OSError:
+        latest = 0
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            latest = max(latest, int(path.stat().st_mtime))
+        except OSError:
+            continue
+print(f"prod-mtime-{latest}")
+PYEOF
+}
+
+write_fallback_cache_state() {
+    local state_file="$1"
+    local desired_mode="$2"
+    local current_mode="$3"
+    local asset_version="$4"
+    local fallback_root="$5"
+
+    mkdir -p "$(dirname "$state_file")"
+
+    python3 - "$state_file" "$desired_mode" "$current_mode" "$asset_version" "$fallback_root" <<'PYEOF'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, desired_mode, current_mode, asset_version, fallback_root = sys.argv[1:6]
+data = {}
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+
+data.update({
+    "desired_mode": desired_mode,
+    "current_mode": current_mode,
+    "asset_version": asset_version,
+    "fallback_root": fallback_root,
+    "last_applied_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    "last_apply_ok": True,
+})
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+PYEOF
+}
+
 # Extract hostname (no scheme, no port) from a URL.
 url_host() { echo "$1" | sed 's|^https\?://||' | sed 's|:.*||' | sed 's|/.*||'; }
 
@@ -161,6 +269,27 @@ if [[ -z "$UI_HOST" || "$UI_HOST" == "localhost" ]]; then
 fi
 REFERENCE_UI_ROOT="${REPO_INNER_PATH:-$SCRIPT_DIR/.xarta}/gui-reference"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-${REPO_OUTER_PATH:-$SCRIPT_DIR}/gui-fallback}"
+BLUEPRINTS_DB_DIR="${BLUEPRINTS_DB_DIR:-/opt/blueprints/data/db}"
+FALLBACK_CACHE_STATE_FILE="${FALLBACK_CACHE_STATE_FILE:-${BLUEPRINTS_DB_DIR}/fallback-ui-cache-state.json}"
+FALLBACK_CACHE_MODE="$(read_fallback_cache_mode "$FALLBACK_CACHE_STATE_FILE")"
+FALLBACK_ASSET_VERSION="$(compute_fallback_asset_version "$FALLBACK_CACHE_MODE" "$BLUEPRINTS_FALLBACK_GUI_DIR")"
+
+if [[ "$FALLBACK_CACHE_MODE" == "development" ]]; then
+    FALLBACK_ASSET_CACHE_HEADERS=$(cat <<'EOF'
+        header @fallback_assets Cache-Control "no-cache, no-store, must-revalidate"
+        header @fallback_assets Pragma "no-cache"
+        header @fallback_assets Expires "0"
+EOF
+)
+else
+    FALLBACK_ASSET_CACHE_HEADERS=$(cat <<'EOF'
+        header @fallback_assets Cache-Control "public, max-age=0, must-revalidate"
+EOF
+)
+fi
+
+echo "    Fallback UI cache mode: $FALLBACK_CACHE_MODE"
+echo "    Fallback UI asset version: $FALLBACK_ASSET_VERSION"
 
 # Build the full comma-separated hostname list for the Caddy site blocks.
 # Always includes the primary UI host; appends CADDY_EXTRA_NAMES if set.
@@ -221,14 +350,17 @@ ${HTTPS_NAMES} {
     redir /fallback-ui /fallback-ui/ permanent
     handle_path /fallback-ui/* {
         root * ${BLUEPRINTS_FALLBACK_GUI_DIR}
+        vars bp_asset_version "${FALLBACK_ASSET_VERSION}"
+        vars bp_cache_mode "${FALLBACK_CACHE_MODE}"
 
-        # HTML is the routing / asset-manifest layer, so keep it non-cacheable.
+        # HTML is the routing / asset-manifest template layer, so keep it non-cacheable.
         @fallback_html {
             path / *.html
         }
 
-        # Static assets are safe to cache aggressively because the GUI uses
-        # explicit ?v=... query strings on local CSS/JS/embed asset URLs.
+        # Static assets use a Caddy-injected asset token in HTML.
+        # Production revalidates on reuse so manual ?v= bumps are unnecessary.
+        # Development disables browser storage entirely for live device testing.
         @fallback_assets {
             not path / *.html
         }
@@ -237,7 +369,9 @@ ${HTTPS_NAMES} {
         header @fallback_html Pragma "no-cache"
         header @fallback_html Expires "0"
 
-        header @fallback_assets Cache-Control "public, max-age=31536000, immutable"
+${FALLBACK_ASSET_CACHE_HEADERS}
+
+        templates
 
         file_server
     }
@@ -378,6 +512,13 @@ else
     echo "    Caddy may still be starting. Check: systemctl status caddy"
 fi
 echo ""
+
+write_fallback_cache_state \
+    "$FALLBACK_CACHE_STATE_FILE" \
+    "$FALLBACK_CACHE_MODE" \
+    "$FALLBACK_CACHE_MODE" \
+    "$FALLBACK_ASSET_VERSION" \
+    "$BLUEPRINTS_FALLBACK_GUI_DIR"
 
 # ── Step 8 — Remind about BLUEPRINTS_UI_URL ──────────────────────────────────
 CURRENT_UI_URL="${BLUEPRINTS_UI_URL:-}"
