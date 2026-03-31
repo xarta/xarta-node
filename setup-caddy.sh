@@ -221,6 +221,24 @@ ${HTTPS_NAMES} {
     redir /fallback-ui /fallback-ui/ permanent
     handle_path /fallback-ui/* {
         root * ${BLUEPRINTS_FALLBACK_GUI_DIR}
+
+        # HTML is the routing / asset-manifest layer, so keep it non-cacheable.
+        @fallback_html {
+            path / *.html
+        }
+
+        # Static assets are safe to cache aggressively because the GUI uses
+        # explicit ?v=... query strings on local CSS/JS/embed asset URLs.
+        @fallback_assets {
+            not path / *.html
+        }
+
+        header @fallback_html Cache-Control "no-cache, no-store, must-revalidate"
+        header @fallback_html Pragma "no-cache"
+        header @fallback_html Expires "0"
+
+        header @fallback_assets Cache-Control "public, max-age=31536000, immutable"
+
         file_server
     }
 
