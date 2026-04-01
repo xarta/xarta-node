@@ -23,6 +23,26 @@ All source lives in **`gui-fallback/`** (public outer repo). This is the primary
 
 ---
 
+## Required reading for shared table and bucket work
+
+Before changing shared table behavior, read the relevant node-local docs first:
+
+- `/xarta-node/.lone-wolf/docs/web-design/TABLE-MIGRATION.md` for moving a page-local table onto the shared frontend table layer
+- `/xarta-node/.lone-wolf/docs/web-design/TABLE-BUCKET-MIGRATION.md` for moving an already-shared table onto `table_layout_catalog` and `table_layouts`
+- `/xarta-node/.lone-wolf/docs/web-design/COLUMN-SIZE-INDEXING.md` for the canonical `RRUUTTBB` bucket contract
+
+If the target is the Nav Items or Form Controls system, read these too before changing storage or layout behavior:
+
+- `/xarta-node/.lone-wolf/docs/web-design/NAV-ITEMS.md`
+- `/xarta-node/.lone-wolf/docs/web-design/FORM-CONTROLS.md`
+
+For shared modal, chooser, or reusable admin-surface work, also read:
+
+- `/xarta-node/.lone-wolf/docs/web-design/MODAL.md`
+- `/xarta-node/.lone-wolf/docs/web-design/COMPONENT-LIBRARY.md`
+
+---
+
 ## Load order (index.html)
 
 CSS (in `<head>`, in this order):
