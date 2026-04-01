@@ -59,6 +59,8 @@ _ALLOWED_TABLES = {
     "visit_events",
     "nav_items",
     "form_controls",
+    "table_layout_catalog",
+    "table_layouts",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -169,6 +171,8 @@ def _pk_for_table(table: str) -> str:
         "visit_events":            "event_id",
         "nav_items":               "item_id",
         "form_controls":           "control_id",
+        "table_layout_catalog":    "table_code",
+        "table_layouts":           "layout_key",
     }
     return pk_map.get(table, "id")
 
