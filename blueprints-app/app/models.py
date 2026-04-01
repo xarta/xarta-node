@@ -669,6 +669,75 @@ class SshTargetOut(BaseModel):
     updated_at: str
 
 
+# ── Table Layouts ─────────────────────────────────────────────────────────────
+
+class TableLayoutCatalogCreate(BaseModel):
+    table_code: str
+    table_name: str
+    table_meta: dict[str, Any]
+
+
+class TableLayoutCatalogUpdate(BaseModel):
+    table_name: Optional[str] = None
+    table_meta: Optional[dict[str, Any]] = None
+
+
+class TableLayoutCatalogOut(BaseModel):
+    table_code: str
+    table_name: str
+    table_meta: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class TableLayoutBucketBits(BaseModel):
+    shade_up: bool = False
+    horizontal_scroll: bool = False
+    mobile: bool = False
+    portrait: bool = False
+    wide: bool = False
+
+
+class TableLayoutColumnSeed(BaseModel):
+    column_key: Optional[str] = None
+    display_name: str
+    sqlite_column: Optional[str] = None
+    width_px: Optional[int] = None
+    min_width_px: Optional[int] = None
+    max_width_px: Optional[int] = None
+    position: Optional[int] = None
+    sort_direction: Optional[str] = None
+    sort_priority: Optional[int] = None
+    hidden: bool = False
+    data_type: Optional[str] = None
+    sample_max_length: Optional[int] = None
+
+
+class TableLayoutResolveRequest(BaseModel):
+    table_code: Optional[str] = None
+    table_name: Optional[str] = None
+    reserved_code: str = "00"
+    user_code: str = "00"
+    bucket_code: Optional[str] = None
+    bucket_bits: Optional[TableLayoutBucketBits] = None
+    columns: list[TableLayoutColumnSeed] = Field(default_factory=list)
+
+
+class TableLayoutUpsert(BaseModel):
+    layout_data: dict[str, Any]
+
+
+class TableLayoutOut(BaseModel):
+    layout_key: str
+    reserved_code: str
+    user_code: str
+    table_code: str
+    bucket_code: str
+    layout_data: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):

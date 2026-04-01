@@ -9,6 +9,7 @@ ordering across all committed writes — critical for the sync engine.
 import logging
 import os
 import sqlite3
+import json
 from contextlib import contextmanager
 from typing import Generator
 
@@ -457,7 +458,189 @@ CREATE TABLE IF NOT EXISTS form_controls (
     updated_at    TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_form_controls_key ON form_controls(control_key);
+
+CREATE TABLE IF NOT EXISTS table_layout_catalog (
+    table_code   TEXT PRIMARY KEY,
+    table_name   TEXT NOT NULL UNIQUE,
+    table_meta   TEXT NOT NULL,
+    created_at   TEXT DEFAULT (datetime('now')),
+    updated_at   TEXT DEFAULT (datetime('now')),
+    CHECK(length(table_code) = 2)
+);
+CREATE INDEX IF NOT EXISTS idx_table_layout_catalog_name
+    ON table_layout_catalog(table_name);
+
+CREATE TABLE IF NOT EXISTS table_layouts (
+    layout_key     TEXT PRIMARY KEY,
+    reserved_code  TEXT NOT NULL,
+    user_code      TEXT NOT NULL,
+    table_code     TEXT NOT NULL,
+    bucket_code    TEXT NOT NULL,
+    layout_data    TEXT NOT NULL,
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now')),
+    CHECK(length(layout_key) = 8),
+    CHECK(length(reserved_code) = 2),
+    CHECK(length(user_code) = 2),
+    CHECK(length(table_code) = 2),
+    CHECK(length(bucket_code) = 2)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_table_layouts_parts
+    ON table_layouts(reserved_code, user_code, table_code, bucket_code);
+CREATE INDEX IF NOT EXISTS idx_table_layouts_lookup
+    ON table_layouts(table_code, user_code, bucket_code);
 """
+
+_TABLE_LAYOUT_CATALOG_SEED = [
+    ("01", "settings", {
+        "display_name": "Settings",
+        "sql_table": "settings",
+        "table_kind": "table",
+        "dom_table_id": "settings-table",
+        "tab_id": "settings",
+    }),
+    ("02", "docs-images", {
+        "display_name": "Docs Images",
+        "sql_table": "doc_images",
+        "table_kind": "table",
+        "dom_table_id": "doc-images-table",
+        "tab_id": "docs-images",
+    }),
+    ("03", "manual-links", {
+        "display_name": "Manual Links",
+        "sql_table": "manual_links",
+        "table_kind": "table",
+        "dom_table_id": "ml-table",
+        "tab_id": "manual-links",
+    }),
+    ("04", "services", {
+        "display_name": "Services",
+        "sql_table": "services",
+        "table_kind": "table",
+        "dom_table_id": "services-table",
+        "tab_id": "services",
+    }),
+    ("05", "machines", {
+        "display_name": "Machines",
+        "sql_table": "machines",
+        "table_kind": "table",
+        "dom_table_id": "machines-table",
+        "tab_id": "machines",
+    }),
+    ("06", "fleet-nodes", {
+        "display_name": "Fleet Nodes",
+        "sql_table": "nodes",
+        "table_kind": "table",
+        "dom_table_id": "nodes-table",
+        "tab_id": "fleet-nodes",
+    }),
+    ("07", "node-backups", {
+        "display_name": "Node Backups",
+        "sql_table": None,
+        "table_kind": "table",
+        "dom_table_id": "backups-table",
+        "tab_id": "fleet-nodes",
+        "route_path": "/api/v1/backup",
+    }),
+    ("08", "pfsense-dns", {
+        "display_name": "pfSense DNS",
+        "sql_table": "pfsense_dns",
+        "table_kind": "table",
+        "dom_table_id": "dns-table",
+        "tab_id": "pfsense-dns",
+    }),
+    ("09", "proxmox-config", {
+        "display_name": "Proxmox Config",
+        "sql_table": "proxmox_config",
+        "table_kind": "table",
+        "dom_table_id": "pve-config-table",
+        "tab_id": "proxmox-config",
+    }),
+    ("0A", "dockge-stacks", {
+        "display_name": "Dockge Stacks",
+        "sql_table": "dockge_stacks",
+        "table_kind": "table",
+        "dom_table_id": "dockge-table",
+        "tab_id": "dockge-stacks",
+    }),
+    ("0B", "caddy-configs", {
+        "display_name": "Caddy Configs",
+        "sql_table": "caddy_configs",
+        "table_kind": "table",
+        "dom_table_id": "caddy-table",
+        "tab_id": "caddy-configs",
+    }),
+    ("0C", "pve-hosts", {
+        "display_name": "PVE Hosts",
+        "sql_table": "pve_hosts",
+        "table_kind": "table",
+        "dom_table_id": "pve-hosts-table",
+        "tab_id": "pve-hosts",
+    }),
+    ("0D", "vlans", {
+        "display_name": "VLANs",
+        "sql_table": "vlans",
+        "table_kind": "table",
+        "dom_table_id": "vlans-table",
+        "tab_id": "vlans",
+    }),
+    ("0E", "arp-manual", {
+        "display_name": "Manual ARP",
+        "sql_table": "arp_manual",
+        "table_kind": "table",
+        "dom_table_id": "arp-manual-table",
+        "tab_id": "arp-manual",
+    }),
+    ("0F", "keys-status", {
+        "display_name": "SSH Keys Status",
+        "sql_table": None,
+        "table_kind": "table",
+        "dom_table_id": "keys-status-table",
+        "tab_id": "keys",
+    }),
+    ("10", "certs-status", {
+        "display_name": "Certificates Status",
+        "sql_table": None,
+        "table_kind": "table",
+        "dom_table_id": "certs-status-table",
+        "tab_id": "certs",
+    }),
+    ("11", "ai-providers", {
+        "display_name": "AI Providers",
+        "sql_table": "ai_providers",
+        "table_kind": "table",
+        "dom_table_id": "ai-providers-table",
+        "tab_id": "ai-providers",
+    }),
+    ("12", "ai-project-assignments", {
+        "display_name": "AI Project Assignments",
+        "sql_table": "ai_project_assignments",
+        "table_kind": "table",
+        "dom_table_id": "ai-assignments-table",
+        "tab_id": "ai-providers",
+    }),
+    ("13", "ssh-targets", {
+        "display_name": "SSH Targets",
+        "sql_table": "ssh_targets",
+        "table_kind": "table",
+        "dom_table_id": "ssh-targets-table",
+        "tab_id": "ssh-targets",
+    }),
+    ("14", "bookmarks", {
+        "display_name": "Bookmarks",
+        "sql_table": "bookmarks",
+        "table_kind": "table",
+        "dom_table_id": "bm-table",
+        "tab_id": "bookmarks-main",
+    }),
+    ("15", "visits", {
+        "display_name": "Visit History",
+        "sql_table": "visits",
+        "table_kind": "table",
+        "dom_table_id": "vis-table",
+        "tab_id": "bookmarks-history",
+    }),
+]
 
 _SEED_SQL = """
 INSERT OR IGNORE INTO sync_meta (key, value) VALUES ('gen',             '0');
@@ -684,6 +867,18 @@ def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
             )
 
 
+def _seed_table_layout_catalog(conn: sqlite3.Connection) -> None:
+    """Ensure the table layout catalog covers the current GUI table surfaces."""
+    for table_code, table_name, meta in _TABLE_LAYOUT_CATALOG_SEED:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO table_layout_catalog (table_code, table_name, table_meta)
+            VALUES (?, ?, ?)
+            """,
+            (table_code, table_name, json.dumps(meta, ensure_ascii=True, sort_keys=True)),
+        )
+
+
 def init_db() -> None:
     """Create schema, run migrations, and seed sync_meta on first use."""
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -694,6 +889,7 @@ def init_db() -> None:
         _dedup_visits(conn)
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
+        _seed_table_layout_catalog(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 
 
