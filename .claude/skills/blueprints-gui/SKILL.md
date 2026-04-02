@@ -41,6 +41,15 @@ For shared modal, chooser, or reusable admin-surface work, also read:
 - `/xarta-node/.lone-wolf/docs/web-design/MODAL.md`
 - `/xarta-node/.lone-wolf/docs/web-design/COMPONENT-LIBRARY.md`
 
+If working on Dockge or Caddy probe tabs, also read:
+
+- `/xarta-node/.lone-wolf/docs/dockge/README.md`
+- `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+- `/xarta-node/.lone-wolf/docs/caddy/CADDY.md`
+
+These node-local docs may be unavailable on some LXCs/workspaces. If missing,
+continue using this skill and the codebase as the authoritative source.
+
 ---
 
 ## Load order (index.html)

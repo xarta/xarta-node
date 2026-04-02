@@ -7,6 +7,13 @@ description: Discover Caddy reverse proxy configurations across all LXCs in the 
 
 Dynamically discovers running LXCs on each Proxmox host, checks each for a Caddyfile at `/etc/caddy/Caddyfile` (or `/etc/caddy/caddy.conf`), and populates the `caddy_configs` table with domain/upstream data.
 
+For node-local Caddy operating model and route ownership guidance, also read:
+- `/xarta-node/.lone-wolf/docs/caddy/CADDY.md`
+- `/xarta-node/.lone-wolf/docs/web-design/CADDY.md`
+
+If those node-local docs are unavailable on the current LXC/workspace, continue
+with this skill as authoritative for probe behavior and API usage.
+
 ## What it does
 
 For each running LXC on each PVE host (connected via `pct exec`):
@@ -82,3 +89,12 @@ Location: `/root/xarta-node/.claude/skills/blueprints-caddy-configs/scripts/bp-c
 | `/api/v1/caddy-configs/probe/status` | GET | Check if probe key is available |
 | `/api/v1/caddy-configs/probe` | POST | Run probe and upsert results |
 | `/api/v1/caddy-configs/{caddy_id}` | GET/PUT/DELETE | CRUD for one record |
+
+## References
+
+- `/xarta-node/.lone-wolf/docs/caddy/CADDY.md`
+- `/xarta-node/.lone-wolf/docs/web-design/CADDY.md`
+- `/xarta-node/.lone-wolf/docs/security/SECURITY-FIREWALL.md`
+
+These are optional node-local references for deployed nodes and may not exist in
+standalone/public-only environments.

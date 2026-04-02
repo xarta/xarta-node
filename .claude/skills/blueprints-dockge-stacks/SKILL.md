@@ -9,6 +9,16 @@ Discovers Docker Compose stacks managed by Dockge across all known Dockge hosts
 (LXCs and VMs), then populates the `dockge_stacks` and `dockge_stack_services`
 tables in the Blueprints database.
 
+This skill is for fleet inventory/probing. Canonical per-stack runbooks and
+planning notes are maintained in node-local docs under:
+
+- `/xarta-node/.lone-wolf/docs/dockge/README.md`
+- `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+
+If those node-local docs are unavailable on the current LXC/workspace, continue
+with this skill for discovery/probe operations; treat the node-local docs as
+optional supplemental context.
+
 ## Architecture Overview
 
 1. **Source of truth**: `proxmox_config.dockge_json` tells us which machines
@@ -140,3 +150,11 @@ Portainer is tracked separately via `proxmox_config.portainer_json`. It does
 **not** share this table. Portainer API access requires tokens and is
 fundamentally different from Dockge's file-based approach. A dedicated
 `portainer_stacks` table and probe are planned for the future.
+
+## References
+
+- `/xarta-node/.lone-wolf/docs/dockge/README.md`
+- `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+- `/xarta-node/.lone-wolf/docs/setup/DOCKGE.md`
+
+These are optional node-local references and may not exist in standalone/public-only environments.
