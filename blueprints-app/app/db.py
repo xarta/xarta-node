@@ -640,6 +640,20 @@ _TABLE_LAYOUT_CATALOG_SEED = [
         "dom_table_id": "vis-table",
         "tab_id": "bookmarks-history",
     }),
+    ("16", "nav-items", {
+        "display_name": "Nav Items",
+        "sql_table": "nav_items",
+        "table_kind": "table",
+        "dom_table_id": "ni-table",
+        "tab_id": "nav-items",
+    }),
+    ("17", "form-controls", {
+        "display_name": "Form Controls",
+        "sql_table": "form_controls",
+        "table_kind": "table",
+        "dom_table_id": "fc-table",
+        "tab_id": "form-controls",
+    }),
 ]
 
 _SEED_SQL = """
