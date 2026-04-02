@@ -204,6 +204,15 @@ POST /api/v1/backup/restore/{filename}   → restore (add ?force=true to propaga
 - `/fallback-ui/*` → Caddy `file_server` direct from `gui-fallback/` (frozen public GUI copy, never changes)
 - `/` → 301 to `/ui/`
 
+Node-local Caddy and Dockge references:
+- `/xarta-node/.lone-wolf/docs/caddy/CADDY.md` (infrastructure-level Caddy model)
+- `/xarta-node/.lone-wolf/docs/web-design/CADDY.md` (GUI route ownership/cache context)
+- `/xarta-node/.lone-wolf/docs/dockge/README.md` (per-stack docs index)
+- `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md` (Open Notebook planning, Syncthing/Obsidian notes)
+
+These are optional node-local references for deployed nodes and may be
+unavailable in standalone/public-only checkouts.
+
 ## API Authentication (TOTP middleware)
 
 `app/middleware_auth.py` — `AuthMiddleware` (Starlette `BaseHTTPMiddleware`) sits before CORS. Two protection layers:

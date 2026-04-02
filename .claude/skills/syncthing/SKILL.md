@@ -7,6 +7,13 @@ description: Syncthing fleet asset distribution — manage binary icon and sound
 
 Syncthing provides peer-to-peer fleet sync for binary assets that are unsuitable for git.
 
+Scope note:
+- This skill covers fleet asset sync (`gui-fallback/assets/*`) and Syncthing service operations.
+- For docs-folder ingestion workflows (including select local Obsidian folders on this LXC), use the node-local Dockge docs as the planning source:
+    - `/xarta-node/.lone-wolf/docs/dockge/README.md`
+    - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+    If node-local docs are unavailable on the current LXC/workspace, continue with this skill for Syncthing operations.
+
 ## What it syncs
 
 | Folder ID | Local path | Contents |
@@ -73,3 +80,9 @@ standalone public checkout.
 On deployed xarta-node fleet nodes, extra node-local operational notes may also
 exist in the lone-wolf docs tree, but they are optional and must not be relied
 on as the only instructions here.
+
+Relevant node-local docs for cross-tool document workflows:
+- `/xarta-node/.lone-wolf/docs/dockge/README.md`
+- `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+
+These references are optional and may not exist in standalone/public-only environments.
