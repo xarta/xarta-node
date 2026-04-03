@@ -41,14 +41,17 @@ For shared modal, chooser, or reusable admin-surface work, also read:
 - `/xarta-node/.lone-wolf/docs/web-design/MODAL.md`
 - `/xarta-node/.lone-wolf/docs/web-design/COMPONENT-LIBRARY.md`
 
+For ultrawide sidecar debug panel behavior and extending debug scenarios:
+
+- `/xarta-node/.lone-wolf/docs/web-design/ULTRA-WIDE-DEBUG-PANELS.md`
+
 If working on Dockge or Caddy probe tabs, also read:
 
 - `/xarta-node/.lone-wolf/docs/dockge/README.md`
 - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
 - `/xarta-node/.lone-wolf/docs/caddy/CADDY.md`
 
-These node-local docs may be unavailable on some LXCs/workspaces. If missing,
-continue using this skill and the codebase as the authoritative source.
+These node-local docs may be unavailable on some LXCs/workspaces, especially in public-scope skill contexts that cannot see node-local/private paths. If missing, continue using this skill and the codebase as the authoritative source.
 
 ---
 
