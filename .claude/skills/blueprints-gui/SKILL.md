@@ -126,6 +126,12 @@ embed/blueprints-node-selector.css   (served via symlink)
 embed/blueprints-node-selector.js    (served via symlink)
 ```
 
+Current selector contract to keep in mind before editing it:
+- `pageSize` defines a fixed action-slot region, not a hard-coded three-button worldview
+- short pages are left-padded with placeholder circles so the right edge stays stable
+- when enabled, the last two positions stay fixed as scarab paging button then origin button
+- if `/xarta-node/.lone-wolf/docs/web-design/EMBEDDED-GUI.md` exists on the current node, read it before changing embed behavior; otherwise inspect the current selector source directly
+
 ---
 
 ## Navigation groups → tabs → JS file quick-reference
