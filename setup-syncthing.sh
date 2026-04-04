@@ -42,6 +42,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 NODES_JSON="$SCRIPT_DIR/.nodes.json"
 SYNCTHING_HOME="/home/xarta/.local/state/syncthing"
+ASSETS_OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/syncthing-assets-fix-owner.sh"
+ASSETS_OWNER_CRON_FILE="/etc/cron.d/syncthing-assets-owner"
+ASSETS_OWNER_CRON_MARKER="syncthing-assets-fix-owner"
+ASSETS_OWNER_CRON_LINE="* * * * * root bash $ASSETS_OWNER_FIX_SCRIPT"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -157,6 +161,20 @@ echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfol
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
 chown -R xarta:xarta "$BLUEPRINTS_ASSETS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $BLUEPRINTS_ASSETS_DIR"
+
+if [[ -f "$ASSETS_OWNER_FIX_SCRIPT" ]]; then
+    chmod 755 "$ASSETS_OWNER_FIX_SCRIPT"
+    if ! grep -q "$ASSETS_OWNER_CRON_MARKER" "$ASSETS_OWNER_CRON_FILE" 2>/dev/null; then
+        echo "# $ASSETS_OWNER_CRON_MARKER" > "$ASSETS_OWNER_CRON_FILE"
+        echo "$ASSETS_OWNER_CRON_LINE" >> "$ASSETS_OWNER_CRON_FILE"
+        chmod 644 "$ASSETS_OWNER_CRON_FILE"
+        echo -e "    ${CYAN}owner-guard${NC}: installed $ASSETS_OWNER_CRON_FILE (runs every minute)"
+    else
+        echo -e "    ${GREEN}owner-guard${NC}: already installed"
+    fi
+else
+    echo -e "    ${YELLOW}owner-guard skipped${NC}: missing $ASSETS_OWNER_FIX_SCRIPT"
+fi
 echo ""
 
 # ── Step 3 — Stable API key (generated once, persisted in .env) ──────────────

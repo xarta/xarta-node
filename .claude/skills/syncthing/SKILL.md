@@ -70,7 +70,24 @@ curl -sf -H "X-API-Key: $SYNCTHING_API_KEY" \
 
 # Find conflict files
 find /xarta-node/gui-fallback/assets/ -name '*.sync-conflict*'
+
+# Validate assets owner-guard + add/delete sync end to end
+bash /root/xarta-node/.claude/skills/syncthing/scripts/validate-assets-owner-guard.sh
 ```
+
+## Owner-Guard Validation
+
+Use this validator when troubleshooting or proving that root-owned drift under
+`assets/icons` does not break fleet sync.
+
+- Script: `/root/xarta-node/.claude/skills/syncthing/scripts/validate-assets-owner-guard.sh`
+- Requires root (it intentionally creates a root-owned temporary test file)
+- Verifies:
+    - owner-guard cron wiring exists
+    - temporary root-owned file flips to `xarta:xarta` automatically
+    - `xarta-icons` status has zero errors/needs
+    - all peers report `completion=100` with file present and after file deletion
+- Cleans up test file automatically
 
 ## Detailed docs
 
