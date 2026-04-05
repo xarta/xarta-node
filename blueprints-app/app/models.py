@@ -903,6 +903,10 @@ class RepoVersionOut(BaseModel):
     path: str
     exists: bool = False
     branch: Optional[str] = None
+    upstream: Optional[str] = None
+    upstream_tracked: Optional[bool] = None
+    ahead: Optional[int] = None
+    behind: Optional[int] = None
     commit: Optional[str] = None
     commit_ts: int = 0
     dirty: bool = False

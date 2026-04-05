@@ -36,11 +36,45 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip())
+
+        upstream = None
+        upstream_tracked = None
+        ahead = None
+        behind = None
+
+        try:
+            upstream = subprocess.check_output(
+                ["git", "-C", path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            upstream_tracked = bool(upstream)
+        except Exception:
+            upstream_tracked = False
+
+        if upstream_tracked:
+            try:
+                counts = subprocess.check_output(
+                    ["git", "-C", path, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ).strip().split()
+                if len(counts) >= 2:
+                    behind = int(counts[0])
+                    ahead = int(counts[1])
+            except Exception:
+                ahead = None
+                behind = None
+
         return RepoVersionOut(
             label=label,
             path=path,
             exists=True,
             branch=branch,
+            upstream=upstream,
+            upstream_tracked=upstream_tracked,
+            ahead=ahead,
+            behind=behind,
             commit=commit,
             commit_ts=commit_ts,
             dirty=dirty,
