@@ -21,6 +21,14 @@ All source lives in **`gui-fallback/`** (public outer repo). This is the primary
 
 > ⚠️ The private inner repo (`.xarta/gui/`) contains an independent private GUI that diverged from `gui-fallback/` in 2026. **Do NOT copy or sync between `gui-fallback/` and `.xarta/gui/`** — they are maintained independently. The live app serves the private GUI from `BLUEPRINTS_GUI_DIR`; file changes there take effect immediately without a restart.
 
+## PWA / WebAPK manifest behavior (current)
+
+- `gui-fallback/index.html` should reference the dynamic manifest endpoint:
+	- `/api/v1/pwa/manifest`
+- The backend route is `GET /api/v1/pwa/manifest` (public/token-exempt for install flows).
+- Per-node branding (name, short_name, icon paths, theme color) is derived from `.nodes.json` `pwa_*` fields with sane fallbacks.
+- Prefer updating `.nodes.json` branding metadata over editing a static `manifest.webmanifest` when the goal is per-node WebAPK differentiation.
+
 ---
 
 ## Required reading for shared table and bucket work

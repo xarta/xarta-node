@@ -62,6 +62,22 @@ call. The `nodes` SQLite table is derived from it — not the other way around.
 
 Unknown extra fields are tolerated by validation and can be used for tooling metadata.
 
+### Optional PWA/WebAPK branding fields
+
+These optional fields are consumed by `GET /api/v1/pwa/manifest` for per-node
+installed app identity on Android Chrome WebAPK installs:
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `pwa_name` | optional | Full app name shown by launcher/settings |
+| `pwa_short_name` | optional | Short launcher label |
+| `pwa_icon_192` | optional | Path to 192x192 PNG icon (usually under `/fallback-ui/assets/icons/webapp/`) |
+| `pwa_icon_512` | optional | Path to 512x512 PNG icon |
+| `pwa_theme_color` | optional | Per-node app/chrome theme color |
+| `pwa_background_color` | optional | Manifest background color (defaults to dark UI base) |
+
+If omitted, the manifest route applies node-based defaults.
+
 ---
 
 ## Shell scripts
