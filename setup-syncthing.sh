@@ -3,8 +3,8 @@
 #
 # What this script does (idempotent):
 #   1. Installs Syncthing from the official apt repository + python3-bcrypt.
-#   2. Ensures gui-fallback/assets/icons/ and gui-fallback/assets/sounds/ exist
-#      with Syncthing .stfolder marker files.
+#   2. Ensures managed share paths exist with Syncthing .stfolder markers:
+#      gui-fallback/assets/icons/, sounds/, fonts/, and .lone-wolf/docs/.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
 #   4. Temporarily starts syncthing@xarta.service so Syncthing generates its
 #      device certificate, then reads the device ID from the local REST API.
@@ -76,6 +76,7 @@ NODE_ID="${BLUEPRINTS_NODE_ID:?BLUEPRINTS_NODE_ID not set in .env}"
 REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-/xarta-node/gui-fallback}"
 BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-/xarta-node/gui-fallback/assets}"
+BLUEPRINTS_DOCS_DIR="${BLUEPRINTS_DOCS_DIR:-/xarta-node/.lone-wolf/docs}"
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
@@ -112,6 +113,7 @@ echo "Config dir   : $SYNCTHING_HOME"
 echo "GUI hostname : $SYNCTHING_HOSTNAME"
 echo "Repo path    : $REPO_OUTER_PATH"
 echo "Assets path  : $BLUEPRINTS_ASSETS_DIR"
+echo "Docs path    : $BLUEPRINTS_DOCS_DIR"
 echo ""
 
 # ── Step 1 — Install Syncthing from official apt repository ──────────────────
@@ -143,24 +145,36 @@ chown -R xarta:xarta "/home/xarta/.local" 2>/dev/null || true
 echo -e "    ${GREEN}ok${NC}: $SYNCTHING_HOME (owned by xarta)"
 echo ""
 
-# ── Step 2 — Asset directories with Syncthing .stfolder markers ──────────────
-echo "Step 2: Ensuring shared asset directories exist..."
+# ── Step 2 — Managed share directories with Syncthing .stfolder markers ──────
+echo "Step 2: Ensuring managed shared directories exist..."
 ICONS_DIR="$BLUEPRINTS_ASSETS_DIR/icons"
 SOUNDS_DIR="$BLUEPRINTS_ASSETS_DIR/sounds"
-mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR"
+FONTS_DIR="$BLUEPRINTS_ASSETS_DIR/fonts"
+DOCS_DIR="$BLUEPRINTS_DOCS_DIR"
+mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR"
 chown_like "$(dirname "$BLUEPRINTS_ASSETS_DIR")" "$BLUEPRINTS_ASSETS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$SOUNDS_DIR"
+chown_like "$BLUEPRINTS_ASSETS_DIR" "$FONTS_DIR"
+chown_like "$(dirname "$DOCS_DIR")" "$DOCS_DIR"
 # .stfolder is Syncthing's required presence marker. Without it Syncthing will
 # refuse to sync the folder (treats a missing marker as an accidental deletion).
 touch "$ICONS_DIR/.stfolder"
 touch "$SOUNDS_DIR/.stfolder"
+touch "$FONTS_DIR/.stfolder"
+touch "$DOCS_DIR/.stfolder"
 chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
 chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
+chown_like "$FONTS_DIR" "$FONTS_DIR/.stfolder"
+chown_like "$DOCS_DIR" "$DOCS_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo -e "    ${GREEN}ok${NC}: $FONTS_DIR ($(find "$FONTS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo -e "    ${GREEN}ok${NC}: $DOCS_DIR ($(find "$DOCS_DIR" -not -name '.stfolder' | wc -l) files)"
 chown -R xarta:xarta "$BLUEPRINTS_ASSETS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $BLUEPRINTS_ASSETS_DIR"
+chown -R xarta:xarta "$DOCS_DIR"
+echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $DOCS_DIR"
 
 if [[ -f "$ASSETS_OWNER_FIX_SCRIPT" ]]; then
     chmod 755 "$ASSETS_OWNER_FIX_SCRIPT"
@@ -221,14 +235,11 @@ echo ""
 # ── Step 4 — Start service briefly to generate cert and obtain device ID ──────
 echo "Step 4: Starting syncthing@xarta.service to generate device certificate..."
 # Stop old service first so it frees port 8384 (new service will start on the
-# default port 8384 when the port is available and no config.xml forces a different port).
+# default port 8384 when the port is available.
 if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
     echo "    Stopping syncthing@root.service (frees port 8384)..."
     systemctl stop syncthing@root.service
 fi
-# Remove any stale config.xml from previous runs so Syncthing generates a clean
-# default that listens on 8384 (its hardcoded default when no config exists).
-rm -f "$SYNCTHING_HOME/config.xml" "$SYNCTHING_HOME/config.xml.v0"
 systemctl enable syncthing@xarta.service >/dev/null 2>&1
 systemctl start syncthing@xarta.service
 
@@ -248,6 +259,20 @@ if [[ ! -f "$SYNCTHING_HOME/config.xml" ]]; then
 fi
 echo -e "    ${GREEN}found${NC}: $SYNCTHING_HOME/config.xml"
 
+# Reuse whatever GUI address Syncthing is currently configured for. This avoids
+# deleting config.xml on reruns (which would drop unmanaged shared folders).
+GUI_LISTEN_ADDR=$(python3 -c "
+import xml.etree.ElementTree as ET
+root = ET.parse('$SYNCTHING_HOME/config.xml').getroot()
+print(root.findtext('./gui/address') or '127.0.0.1:8384')
+" 2>/dev/null)
+
+if [[ "$GUI_LISTEN_ADDR" != 127.0.0.1:* && "$GUI_LISTEN_ADDR" != localhost:* ]]; then
+    GUI_LISTEN_ADDR="127.0.0.1:8384"
+fi
+GUI_API_URL="http://$GUI_LISTEN_ADDR"
+echo "    Using API endpoint: $GUI_API_URL"
+
 # Read the auto-generated API key from the fresh config to authenticate the API.
 INITIAL_API_KEY=$(python3 -c "
 import xml.etree.ElementTree as ET
@@ -256,11 +281,11 @@ print(root.findtext('./gui/apikey') or '')
 " 2>/dev/null)
 
 # Poll until the REST API responds (up to 30s).
-echo "    Waiting for local REST API on 127.0.0.1:8384 (up to 30s)..."
+echo "    Waiting for local REST API on $GUI_API_URL (up to 30s)..."
 API_UP=0
 for i in $(seq 1 30); do
     if curl -sf -H "X-API-Key: $INITIAL_API_KEY" \
-            http://127.0.0.1:8384/rest/system/ping >/dev/null 2>&1; then
+            "$GUI_API_URL/rest/system/ping" >/dev/null 2>&1; then
         API_UP=1
         break
     fi
@@ -277,7 +302,7 @@ fi
 # Read this node's device ID from the running instance.
 OWN_DEVICE_ID=$(curl -sf \
     -H "X-API-Key: $INITIAL_API_KEY" \
-    http://127.0.0.1:8384/rest/system/status \
+    "$GUI_API_URL/rest/system/status" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['myID'])")
 
 echo -e "    ${GREEN}Device ID:${NC} $OWN_DEVICE_ID"
@@ -317,19 +342,20 @@ Args (positional):
     gui_pass_hash   — bcrypt hash of the GUI password
     api_key         — Syncthing REST API key
     assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
+    docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
 """
 import sys
 import json
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 9:
+if len(sys.argv) != 10:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
- gui_user, gui_pass_hash, api_key, assets_dir) = sys.argv[1:]
+ gui_user, gui_pass_hash, api_key, assets_dir, docs_dir) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -423,7 +449,7 @@ for peer in peers:
 # ── Shared Folders ────────────────────────────────────────────────────────────
 # Remove all known managed folders plus the Syncthing default folder (which
 # points to a path that may not exist on this node) and rebuild from scratch.
-for fid in ('xarta-icons', 'xarta-sounds', 'default'):
+for fid in ('xarta-icons', 'xarta-sounds', 'xarta-fonts', 'xarta-node-docs', 'default'):
     for f in list(root.findall(f'folder[@id="{fid}"]')):
         root.remove(f)
 
@@ -453,6 +479,10 @@ add_folder('xarta-icons', 'Assets - Icons',
            assets_dir + '/icons')
 add_folder('xarta-sounds', 'Assets - Sounds',
            assets_dir + '/sounds')
+add_folder('xarta-fonts', 'Assets - Fonts',
+           assets_dir + '/fonts')
+add_folder('xarta-node-docs', 'xarta-node-docs',
+           docs_dir)
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 ET.indent(tree, space='    ')
@@ -474,20 +504,25 @@ python3 "$TMPPY" \
     "$SYNCTHING_GUI_USER" \
     "$GUI_PASS_HASH" \
     "$SYNCTHING_API_KEY" \
-    "$BLUEPRINTS_ASSETS_DIR"
+    "$BLUEPRINTS_ASSETS_DIR" \
+    "$BLUEPRINTS_DOCS_DIR"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
 echo "Step 7: Enabling and restarting syncthing@xarta.service..."
-if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
-    echo "    Stopping old syncthing@root.service..."
-    systemctl stop syncthing@root.service || true
+if systemctl is-enabled --quiet syncthing@root.service 2>/dev/null; then
+    if systemctl is-active --quiet syncthing@root.service 2>/dev/null; then
+        echo "    Stopping old syncthing@root.service..."
+        systemctl stop syncthing@root.service || true
+    fi
     systemctl disable syncthing@root.service 2>/dev/null || true
     echo -e "    ${CYAN}disabled${NC}: syncthing@root.service"
 fi
-if systemctl is-active --quiet syncthing@syncthing.service 2>/dev/null; then
-    echo "    Stopping legacy syncthing@syncthing.service..."
-    systemctl stop syncthing@syncthing.service || true
+if systemctl is-enabled --quiet syncthing@syncthing.service 2>/dev/null; then
+    if systemctl is-active --quiet syncthing@syncthing.service 2>/dev/null; then
+        echo "    Stopping legacy syncthing@syncthing.service..."
+        systemctl stop syncthing@syncthing.service || true
+    fi
     systemctl disable syncthing@syncthing.service 2>/dev/null || true
     echo -e "    ${CYAN}disabled${NC}: syncthing@syncthing.service"
 fi

@@ -9,9 +9,11 @@ source /root/xarta-node/.env 2>/dev/null || true
 ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-/xarta-node/gui-fallback/assets}"
 ICONS_DIR="$ASSETS_DIR/icons"
 SOUNDS_DIR="$ASSETS_DIR/sounds"
+FONTS_DIR="$ASSETS_DIR/fonts"
 
 [[ -d "$ICONS_DIR" ]] || exit 0
 [[ -d "$SOUNDS_DIR" ]] || exit 0
+[[ -d "$FONTS_DIR" ]] || exit 0
 
 REFERENCE_ROOT="$(dirname "$ASSETS_DIR")"
 [[ -d "$REFERENCE_ROOT" ]] || exit 0
@@ -20,12 +22,12 @@ OWNER_UID="$(stat -c '%u' "$REFERENCE_ROOT")"
 OWNER_GID="$(stat -c '%g' "$REFERENCE_ROOT")"
 
 # Only touch paths that have drifted; avoid unnecessary inode metadata churn.
-if ! find "$ICONS_DIR" "$SOUNDS_DIR" \
+if ! find "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" \
     \( ! -uid "$OWNER_UID" -o ! -gid "$OWNER_GID" \) \
     -print -quit 2>/dev/null | grep -q .; then
     exit 0
 fi
 
-find "$ICONS_DIR" "$SOUNDS_DIR" \
+find "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" \
     \( ! -uid "$OWNER_UID" -o ! -gid "$OWNER_GID" \) \
     -exec chown "$OWNER_UID:$OWNER_GID" {} +
