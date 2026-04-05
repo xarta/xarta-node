@@ -117,6 +117,7 @@ js/settings/settings-menu.js ← Settings group nav wrapper
 js/hub-select.js             ← HubSelect IIFE — custom dropdown with smart positioning
 js/responsive-layout.js      ← ResponsiveLayout IIFE — compact/full header observer
 js/body-shade.js             ← body-shade drag + fill-table sizing logic
+js/origin-menu-state.js      ← origin button menu FSM (IDLE/PRIMARY/CONTEXT); must load before app.js
 js/app.js                    ← switchGroup(), switchTab(), DOMContentLoaded bootstrap ← MUST BE LAST
 ```
 
