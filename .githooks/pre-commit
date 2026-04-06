@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_ROOT"
+
+is_env_backup_name() {
+  local name="$1"
+  case "$name" in
+    .env.bak|.env.bak-*|.env.bak.*|.env.backup|.env.backup-*|.env.backup.*|.env.*.bak|.env.*.bak-*|.env.*.bak.*|.env.*.backup|.env.*.backup-*|.env.*.backup.*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+collect_env_backup_hits() {
+  local mode="$1"
+  local path
+  if [[ "$mode" == "tracked" ]]; then
+    git ls-files
+  else
+    git diff --cached --name-only --diff-filter=ACMR
+  fi | while IFS= read -r path; do
+    local bn
+    bn="$(basename "$path")"
+    if is_env_backup_name "$bn"; then
+      echo "$path"
+    fi
+  done
+}
+
+mapfile -t TRACKED_HITS < <(collect_env_backup_hits tracked)
+mapfile -t STAGED_HITS < <(collect_env_backup_hits staged)
+
+if [[ ${#TRACKED_HITS[@]} -gt 0 || ${#STAGED_HITS[@]} -gt 0 ]]; then
+  echo "[pre-commit] BLOCKED: .env backup artifacts detected in git state." >&2
+  if [[ ${#TRACKED_HITS[@]} -gt 0 ]]; then
+    echo "Tracked:" >&2
+    printf '  %s\n' "${TRACKED_HITS[@]}" >&2
+  fi
+  if [[ ${#STAGED_HITS[@]} -gt 0 ]]; then
+    echo "Staged:" >&2
+    printf '  %s\n' "${STAGED_HITS[@]}" >&2
+  fi
+  echo "Remove these files from git and keep them ignored." >&2
+  exit 1
+fi
+
+echo "[pre-commit] Running public leak check..."
+bash "$REPO_ROOT/check-for-leaks.sh"
+
+echo "[pre-commit] OK"
