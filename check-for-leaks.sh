@@ -73,6 +73,49 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 
+is_env_backup_name() {
+    local name="$1"
+    case "$name" in
+        .env.bak|.env.bak-*|.env.bak.*|.env.backup|.env.backup-*|.env.backup.*|.env.*.bak|.env.*.bak-*|.env.*.bak.*|.env.*.backup|.env.*.backup-*|.env.*.backup.*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Hard stop if env backup artifacts are tracked or staged.
+mapfile -t TRACKED_ENV_BACKUPS < <(
+    git -C "$REPO_DIR" ls-files | while IFS= read -r p; do
+        bn="$(basename "$p")"
+        if is_env_backup_name "$bn"; then
+            echo "$p"
+        fi
+    done
+)
+
+mapfile -t STAGED_ENV_BACKUPS < <(
+    git -C "$REPO_DIR" diff --cached --name-only --diff-filter=ACMR | while IFS= read -r p; do
+        bn="$(basename "$p")"
+        if is_env_backup_name "$bn"; then
+            echo "$p"
+        fi
+    done
+)
+
+if [ "${#TRACKED_ENV_BACKUPS[@]}" -gt 0 ] || [ "${#STAGED_ENV_BACKUPS[@]}" -gt 0 ]; then
+    echo -e "${RED}BLOCKED${NC}: .env backup artifacts detected in git state."
+    if [ "${#TRACKED_ENV_BACKUPS[@]}" -gt 0 ]; then
+        echo "Tracked:"
+        printf '  %s\n' "${TRACKED_ENV_BACKUPS[@]}"
+    fi
+    if [ "${#STAGED_ENV_BACKUPS[@]}" -gt 0 ]; then
+        echo "Staged:"
+        printf '  %s\n' "${STAGED_ENV_BACKUPS[@]}"
+    fi
+    echo "Remove these files from git history/index and keep them ignored."
+    exit 1
+fi
+
 # Get the list of files committed (or staged) in the outer repo,
 # excluding .env itself and anything inside .xarta/.
 mapfile -t SCAN_FILES < <(
