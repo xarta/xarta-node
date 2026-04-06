@@ -4,7 +4,8 @@
 # What this script does (idempotent):
 #   1. Installs Syncthing from the official apt repository + python3-bcrypt.
 #   2. Ensures managed share paths exist with Syncthing .stfolder markers:
-#      gui-fallback/assets/icons/, sounds/, fonts/, and .lone-wolf/docs/.
+#      gui-fallback/assets/icons/, sounds/, fonts/, .lone-wolf/docs/,
+#      and .lone-wolf/syncthing/tts/voices/.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
 #   4. Temporarily starts syncthing@xarta.service so Syncthing generates its
 #      device certificate, then reads the device ID from the local REST API.
@@ -77,6 +78,7 @@ REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-/xarta-node/gui-fallback}"
 BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-/xarta-node/gui-fallback/assets}"
 BLUEPRINTS_DOCS_DIR="${BLUEPRINTS_DOCS_DIR:-/xarta-node/.lone-wolf/docs}"
+BLUEPRINTS_TTS_VOICES_DIR="${BLUEPRINTS_TTS_VOICES_DIR:-/xarta-node/.lone-wolf/syncthing/tts/voices}"
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
@@ -114,6 +116,7 @@ echo "GUI hostname : $SYNCTHING_HOSTNAME"
 echo "Repo path    : $REPO_OUTER_PATH"
 echo "Assets path  : $BLUEPRINTS_ASSETS_DIR"
 echo "Docs path    : $BLUEPRINTS_DOCS_DIR"
+echo "TTS voices   : $BLUEPRINTS_TTS_VOICES_DIR"
 echo ""
 
 # ── Step 1 — Install Syncthing from official apt repository ──────────────────
@@ -151,30 +154,37 @@ ICONS_DIR="$BLUEPRINTS_ASSETS_DIR/icons"
 SOUNDS_DIR="$BLUEPRINTS_ASSETS_DIR/sounds"
 FONTS_DIR="$BLUEPRINTS_ASSETS_DIR/fonts"
 DOCS_DIR="$BLUEPRINTS_DOCS_DIR"
-mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR"
+TTS_VOICES_DIR="$BLUEPRINTS_TTS_VOICES_DIR"
+mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR" "$TTS_VOICES_DIR"
 chown_like "$(dirname "$BLUEPRINTS_ASSETS_DIR")" "$BLUEPRINTS_ASSETS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$SOUNDS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$FONTS_DIR"
 chown_like "$(dirname "$DOCS_DIR")" "$DOCS_DIR"
+chown_like "$(dirname "$TTS_VOICES_DIR")" "$TTS_VOICES_DIR"
 # .stfolder is Syncthing's required presence marker. Without it Syncthing will
 # refuse to sync the folder (treats a missing marker as an accidental deletion).
 touch "$ICONS_DIR/.stfolder"
 touch "$SOUNDS_DIR/.stfolder"
 touch "$FONTS_DIR/.stfolder"
 touch "$DOCS_DIR/.stfolder"
+touch "$TTS_VOICES_DIR/.stfolder"
 chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
 chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
 chown_like "$FONTS_DIR" "$FONTS_DIR/.stfolder"
 chown_like "$DOCS_DIR" "$DOCS_DIR/.stfolder"
+chown_like "$TTS_VOICES_DIR" "$TTS_VOICES_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $FONTS_DIR ($(find "$FONTS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $DOCS_DIR ($(find "$DOCS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo -e "    ${GREEN}ok${NC}: $TTS_VOICES_DIR ($(find "$TTS_VOICES_DIR" -not -name '.stfolder' | wc -l) files)"
 chown -R xarta:xarta "$BLUEPRINTS_ASSETS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $BLUEPRINTS_ASSETS_DIR"
 chown -R xarta:xarta "$DOCS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $DOCS_DIR"
+chown -R xarta:xarta "$TTS_VOICES_DIR"
+echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $TTS_VOICES_DIR"
 
 if [[ -f "$ASSETS_OWNER_FIX_SCRIPT" ]]; then
     chmod 755 "$ASSETS_OWNER_FIX_SCRIPT"
@@ -343,19 +353,20 @@ Args (positional):
     api_key         — Syncthing REST API key
     assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
     docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
+    tts_voices_dir  — shared TTS voices root (e.g. /xarta-node/.lone-wolf/syncthing/tts/voices)
 """
 import sys
 import json
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 10:
+if len(sys.argv) != 11:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
- gui_user, gui_pass_hash, api_key, assets_dir, docs_dir) = sys.argv[1:]
+ gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -449,7 +460,7 @@ for peer in peers:
 # ── Shared Folders ────────────────────────────────────────────────────────────
 # Remove all known managed folders plus the Syncthing default folder (which
 # points to a path that may not exist on this node) and rebuild from scratch.
-for fid in ('xarta-icons', 'xarta-sounds', 'xarta-fonts', 'xarta-node-docs', 'default'):
+for fid in ('xarta-icons', 'xarta-sounds', 'xarta-fonts', 'xarta-node-docs', 'xarta-tts-voices', 'default'):
     for f in list(root.findall(f'folder[@id="{fid}"]')):
         root.remove(f)
 
@@ -483,6 +494,8 @@ add_folder('xarta-fonts', 'Assets - Fonts',
            assets_dir + '/fonts')
 add_folder('xarta-node-docs', 'xarta-node-docs',
            docs_dir)
+add_folder('xarta-tts-voices', 'tts-voices',
+           tts_voices_dir)
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 ET.indent(tree, space='    ')
@@ -505,7 +518,8 @@ python3 "$TMPPY" \
     "$GUI_PASS_HASH" \
     "$SYNCTHING_API_KEY" \
     "$BLUEPRINTS_ASSETS_DIR" \
-    "$BLUEPRINTS_DOCS_DIR"
+    "$BLUEPRINTS_DOCS_DIR" \
+    "$BLUEPRINTS_TTS_VOICES_DIR"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
