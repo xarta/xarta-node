@@ -1218,3 +1218,40 @@ class NavItemOut(BaseModel):
     active_on: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+# ── Embedded Menu Items ──────────────────────────────────────────────────────
+
+class EmbedMenuItemCreate(BaseModel):
+    item_key: str
+    label: str
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    page_index: int = 0
+    sort_order: int = 0
+    enabled: int = 1
+
+
+class EmbedMenuItemUpdate(BaseModel):
+    label: Optional[str] = None
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    page_index: Optional[int] = None
+    sort_order: Optional[int] = None
+    enabled: Optional[int] = None
+
+
+class EmbedMenuItemOut(BaseModel):
+    item_id: str
+    item_key: str
+    label: str
+    icon_emoji: Optional[str] = None
+    icon_asset: Optional[str] = None
+    sound_asset: Optional[str] = None
+    page_index: int = 0
+    sort_order: int = 0
+    enabled: int = 1
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
