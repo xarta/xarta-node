@@ -283,8 +283,11 @@ async def get_embed_menu_config(
             """,
         ).fetchall() if context != "embed" else []
 
+    _PLACEHOLDER_ITEM: dict = {"key": "placeholder-circle"}
+
     def _build_pages(rows: list, page_offset: int = 0) -> tuple[dict, str]:
-        pages_map: dict[int, list[dict]] = {}
+        # Build sparse by (page_index, sort_order) to preserve intentional gaps.
+        pages_sparse: dict[int, dict[int, dict]] = {}
         last_updated = ""
         seen_keys: set[str] = set()
         for row in rows:
@@ -293,17 +296,24 @@ async def get_embed_menu_config(
                 continue
             seen_keys.add(key)
             page_index = row["page_index"] if isinstance(row["page_index"], int) else 0
-            if page_index < 0:
+            sort_order = row["sort_order"] if isinstance(row["sort_order"], int) else 0
+            if page_index < 0 or sort_order < 0:
                 continue
             item: dict = {"key": key}
             if row["icon_asset"]:
                 item["icon_asset"] = row["icon_asset"]
             if row["label"]:
                 item["label"] = row["label"]
-            pages_map.setdefault(page_index + page_offset, []).append(item)
+            pages_sparse.setdefault(page_index + page_offset, {})[sort_order] = item
             updated_at = row["updated_at"] or ""
             if updated_at > last_updated:
                 last_updated = updated_at
+        # Convert sparse slots to dense lists, filling gaps with placeholder-circle.
+        pages_map: dict[int, list[dict]] = {}
+        for page_idx in sorted(pages_sparse.keys()):
+            slot_map = pages_sparse[page_idx]
+            max_sort = max(slot_map.keys())
+            pages_map[page_idx] = [slot_map.get(i, _PLACEHOLDER_ITEM) for i in range(max_sort + 1)]
         return pages_map, last_updated
 
     ctx_pages_map, ctx_updated = _build_pages(context_rows, page_offset=0)
@@ -311,32 +321,37 @@ async def get_embed_menu_config(
     # Determine next free page index for appending embed items.
     next_page = (max(ctx_pages_map.keys()) + 1) if ctx_pages_map else 0
     # Collect keys already present so embed rows don't duplicate them.
-    ctx_keys: set[str] = {item["key"] for page in ctx_pages_map.values() for item in page}
+    ctx_keys: set[str] = {
+        item["key"] for page in ctx_pages_map.values()
+        for item in page if item.get("key") != "placeholder-circle"
+    }
 
     embed_pages_map, embed_updated = {}, ""
     if embed_rows:
-        # Re-bucket embed rows relative to next_page, skipping already-seen keys.
-        raw_embed_map: dict[int, list] = {}
+        # Re-bucket embed rows relative to next_page, preserving sort_order gaps.
+        raw_embed_sparse: dict[int, dict[int, dict]] = {}
         for row in embed_rows:
             key = row["item_key"]
             if key not in _ALLOWED_KEYS or key in ctx_keys:
                 continue
             pidx = row["page_index"] if isinstance(row["page_index"], int) else 0
-            if pidx < 0:
+            sidx = row["sort_order"] if isinstance(row["sort_order"], int) else 0
+            if pidx < 0 or sidx < 0:
                 continue
-            raw_embed_map.setdefault(pidx, []).append(row)
-        for orig_pidx in sorted(raw_embed_map.keys()):
+            item: dict = {"key": key}
+            if row["icon_asset"]:
+                item["icon_asset"] = row["icon_asset"]
+            if row["label"]:
+                item["label"] = row["label"]
+            raw_embed_sparse.setdefault(pidx, {})[sidx] = item
+            updated_at = row["updated_at"] or ""
+            if updated_at > embed_updated:
+                embed_updated = updated_at
+        for orig_pidx in sorted(raw_embed_sparse.keys()):
             new_pidx = next_page + orig_pidx
-            for row in raw_embed_map[orig_pidx]:
-                item: dict = {"key": row["item_key"]}
-                if row["icon_asset"]:
-                    item["icon_asset"] = row["icon_asset"]
-                if row["label"]:
-                    item["label"] = row["label"]
-                embed_pages_map.setdefault(new_pidx, []).append(item)
-                updated_at = row["updated_at"] or ""
-                if updated_at > embed_updated:
-                    embed_updated = updated_at
+            slot_map = raw_embed_sparse[orig_pidx]
+            max_sort = max(slot_map.keys())
+            embed_pages_map[new_pidx] = [slot_map.get(i, _PLACEHOLDER_ITEM) for i in range(max_sort + 1)]
 
     combined = {**ctx_pages_map, **embed_pages_map}
     last_updated = max(ctx_updated, embed_updated)
