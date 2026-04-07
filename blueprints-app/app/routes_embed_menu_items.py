@@ -398,7 +398,8 @@ async def get_embed_menu_config(
     if context not in _VALID_CONTEXTS:
         context = "embed"
     with get_conn() as conn:
-        rows = conn.execute(
+        # Always fetch the requested context rows.
+        context_rows = conn.execute(
             """
             SELECT item_key, icon_asset, label, page_index, sort_order, updated_at
             FROM embed_menu_items
@@ -407,27 +408,76 @@ async def get_embed_menu_config(
             """,
             (context,),
         ).fetchall()
+        # Always also fetch 'embed' context rows (shared controls such as
+        # embed-menu, api-key, etc.) and append them after context-specific pages.
+        # When context IS 'embed' the extra query returns nothing new.
+        embed_rows = conn.execute(
+            """
+            SELECT item_key, icon_asset, label, page_index, sort_order, updated_at
+            FROM embed_menu_items
+            WHERE enabled=1 AND menu_context='embed'
+            ORDER BY page_index, sort_order, item_key
+            """,
+        ).fetchall() if context != "embed" else []
 
-    pages_map: dict[int, list[dict]] = {}
-    last_updated = ""
-    for row in rows:
-        key = row["item_key"]
-        if key not in _ALLOWED_KEYS:
-            continue
-        page_index = row["page_index"] if isinstance(row["page_index"], int) else 0
-        if page_index < 0:
-            continue
-        item: dict = {"key": key}
-        if row["icon_asset"]:
-            item["icon_asset"] = row["icon_asset"]
-        if row["label"]:
-            item["label"] = row["label"]
-        pages_map.setdefault(page_index, []).append(item)
-        updated_at = row["updated_at"] or ""
-        if updated_at > last_updated:
-            last_updated = updated_at
+    def _build_pages(rows: list, page_offset: int = 0) -> tuple[dict, str]:
+        pages_map: dict[int, list[dict]] = {}
+        last_updated = ""
+        seen_keys: set[str] = set()
+        for row in rows:
+            key = row["item_key"]
+            if key not in _ALLOWED_KEYS or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            page_index = row["page_index"] if isinstance(row["page_index"], int) else 0
+            if page_index < 0:
+                continue
+            item: dict = {"key": key}
+            if row["icon_asset"]:
+                item["icon_asset"] = row["icon_asset"]
+            if row["label"]:
+                item["label"] = row["label"]
+            pages_map.setdefault(page_index + page_offset, []).append(item)
+            updated_at = row["updated_at"] or ""
+            if updated_at > last_updated:
+                last_updated = updated_at
+        return pages_map, last_updated
 
-    pages = [pages_map[i] for i in sorted(pages_map.keys()) if pages_map[i]]
+    ctx_pages_map, ctx_updated = _build_pages(context_rows, page_offset=0)
+
+    # Determine next free page index for appending embed items.
+    next_page = (max(ctx_pages_map.keys()) + 1) if ctx_pages_map else 0
+    # Collect keys already present so embed rows don't duplicate them.
+    ctx_keys: set[str] = {item["key"] for page in ctx_pages_map.values() for item in page}
+
+    embed_pages_map, embed_updated = {}, ""
+    if embed_rows:
+        # Re-bucket embed rows relative to next_page, skipping already-seen keys.
+        raw_embed_map: dict[int, list] = {}
+        for row in embed_rows:
+            key = row["item_key"]
+            if key not in _ALLOWED_KEYS or key in ctx_keys:
+                continue
+            pidx = row["page_index"] if isinstance(row["page_index"], int) else 0
+            if pidx < 0:
+                continue
+            raw_embed_map.setdefault(pidx, []).append(row)
+        for orig_pidx in sorted(raw_embed_map.keys()):
+            new_pidx = next_page + orig_pidx
+            for row in raw_embed_map[orig_pidx]:
+                item: dict = {"key": row["item_key"]}
+                if row["icon_asset"]:
+                    item["icon_asset"] = row["icon_asset"]
+                if row["label"]:
+                    item["label"] = row["label"]
+                embed_pages_map.setdefault(new_pidx, []).append(item)
+                updated_at = row["updated_at"] or ""
+                if updated_at > embed_updated:
+                    embed_updated = updated_at
+
+    combined = {**ctx_pages_map, **embed_pages_map}
+    last_updated = max(ctx_updated, embed_updated)
+    pages = [combined[i] for i in sorted(combined.keys()) if combined[i]]
     return {
         "pages": pages,
         "count": sum(len(page) for page in pages),
