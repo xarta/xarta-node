@@ -463,7 +463,7 @@ CREATE INDEX IF NOT EXISTS idx_form_controls_key ON form_controls(control_key);
 
 CREATE TABLE IF NOT EXISTS embed_menu_items (
     item_id       TEXT PRIMARY KEY,          -- UUID (auto-generated)
-    item_key      TEXT NOT NULL UNIQUE,      -- selector action key (e.g. 'database-tables')
+    item_key      TEXT NOT NULL,             -- selector action key (e.g. 'database-tables')
     label         TEXT NOT NULL,             -- display label
     icon_emoji    TEXT,                      -- fallback emoji/icon glyph
     icon_asset    TEXT,                      -- relative path under assets/ (optional)
@@ -471,11 +471,12 @@ CREATE TABLE IF NOT EXISTS embed_menu_items (
     page_index    INTEGER NOT NULL DEFAULT 0,
     sort_order    INTEGER NOT NULL DEFAULT 0,
     enabled       INTEGER NOT NULL DEFAULT 1,
+    menu_context  TEXT NOT NULL DEFAULT 'embed',  -- embed | fallback-ui | db
     created_at    TEXT DEFAULT (datetime('now')),
     updated_at    TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_embed_menu_items_page_sort
-    ON embed_menu_items(page_index, sort_order, item_key);
+-- composite unique index is created by _migrate_embed_menu_items_composite_unique()
+-- which runs after _run_migrations() adds the menu_context column on existing tables
 
 CREATE TABLE IF NOT EXISTS table_layout_catalog (
     table_code   TEXT PRIMARY KEY,
@@ -762,6 +763,57 @@ INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.sound_enabl
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _migrate_embed_menu_items_composite_unique(conn: sqlite3.Connection) -> None:
+    """Replace per-column UNIQUE(item_key) with UNIQUE(item_key, menu_context).
+
+    Existing nodes were created with 'item_key TEXT NOT NULL UNIQUE' which
+    prevents the same action key appearing in multiple contexts.  This
+    migration detects that and recreates the table with the composite index.
+
+    Idempotent: detected by presence of idx_embed_menu_items_key_ctx.
+    """
+    idx = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_embed_menu_items_key_ctx'"
+    ).fetchone()
+    if idx:
+        return  # already on new schema
+
+    log.info("migration: recreating embed_menu_items with composite unique(item_key, menu_context)")
+    conn.executescript("""
+        ALTER TABLE embed_menu_items RENAME TO _embed_menu_items_old;
+
+        CREATE TABLE embed_menu_items (
+            item_id       TEXT PRIMARY KEY,
+            item_key      TEXT NOT NULL,
+            label         TEXT NOT NULL,
+            icon_emoji    TEXT,
+            icon_asset    TEXT,
+            sound_asset   TEXT,
+            page_index    INTEGER NOT NULL DEFAULT 0,
+            sort_order    INTEGER NOT NULL DEFAULT 0,
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            menu_context  TEXT NOT NULL DEFAULT 'embed',
+            created_at    TEXT DEFAULT (datetime('now')),
+            updated_at    TEXT DEFAULT (datetime('now'))
+        );
+
+        INSERT INTO embed_menu_items
+            SELECT item_id, item_key, label, icon_emoji, icon_asset, sound_asset,
+                   page_index, sort_order, enabled,
+                   COALESCE(menu_context, 'embed'),
+                   created_at, updated_at
+            FROM _embed_menu_items_old;
+
+        DROP TABLE _embed_menu_items_old;
+
+        CREATE UNIQUE INDEX idx_embed_menu_items_key_ctx
+            ON embed_menu_items(item_key, menu_context);
+        CREATE INDEX IF NOT EXISTS idx_embed_menu_items_page_sort
+            ON embed_menu_items(menu_context, page_index, sort_order, item_key);
+    """)
+    log.info("migration: embed_menu_items composite unique applied")
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after initial deploy."""
     migrations = [
@@ -830,6 +882,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("visits",       "visit_count",          "INTEGER NOT NULL DEFAULT 1"),
         # form_controls: separate off-state sound for toggles/checkboxes (2026-03-24)
         ("form_controls", "sound_asset_off",       "TEXT"),
+        # embed_menu_items: multi-context support — embed / fallback-ui / db (2026-04-07)
+        ("embed_menu_items", "menu_context", "TEXT NOT NULL DEFAULT 'embed'"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -991,6 +1045,7 @@ def init_db() -> None:
         conn.executescript(_SCHEMA_SQL)
         conn.executescript(_SEED_SQL)
         _run_migrations(conn)
+        _migrate_embed_menu_items_composite_unique(conn)
         _dedup_visits(conn)
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
