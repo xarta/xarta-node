@@ -28,6 +28,7 @@ _DEFAULT_SEED = [
         "item_key": "embed-menu",
         "label": "Embed Menu",
         "icon_emoji": "🪲",
+        "icon_asset": "icons/hieroglyphs/kheper-gold-inverted.svg",
         "page_index": 0,
         "sort_order": 0,
         "enabled": 1,
@@ -36,6 +37,7 @@ _DEFAULT_SEED = [
         "item_key": "fallback-ui",
         "label": "Fallback UI",
         "icon_emoji": "🧰",
+        "icon_asset": "icons/ui/house-gold.svg",
         "page_index": 0,
         "sort_order": 1,
         "enabled": 1,
@@ -44,6 +46,7 @@ _DEFAULT_SEED = [
         "item_key": "ui",
         "label": "UI",
         "icon_emoji": "🏠",
+        "icon_asset": "icons/ui/starfleet-gold.svg",
         "page_index": 0,
         "sort_order": 2,
         "enabled": 1,
@@ -52,6 +55,7 @@ _DEFAULT_SEED = [
         "item_key": "database-tables",
         "label": "Database Tables",
         "icon_emoji": "🗂️",
+        "icon_asset": "icons/ui/database-tables-gold.svg",
         "page_index": 1,
         "sort_order": 0,
         "enabled": 1,
@@ -60,6 +64,7 @@ _DEFAULT_SEED = [
         "item_key": "database-diagram",
         "label": "Database Diagram",
         "icon_emoji": "🕸️",
+        "icon_asset": "icons/ui/database-diagram-gold.svg",
         "page_index": 1,
         "sort_order": 1,
         "enabled": 1,
@@ -68,6 +73,7 @@ _DEFAULT_SEED = [
         "item_key": "api-key",
         "label": "API Key",
         "icon_emoji": "🔑",
+        "icon_asset": "icons/hieroglyphs/ankh.svg",
         "page_index": 2,
         "sort_order": 0,
         "enabled": 1,
@@ -76,6 +82,7 @@ _DEFAULT_SEED = [
         "item_key": "api-key-test",
         "label": "Test Embedded API Key Modal",
         "icon_emoji": "🗝️",
+        "icon_asset": "icons/hieroglyphs/ankh-purple.svg",
         "page_index": 2,
         "sort_order": 1,
         "enabled": 1,
@@ -84,6 +91,7 @@ _DEFAULT_SEED = [
         "item_key": "cache-mode",
         "label": "Toggle Fallback Cache Mode",
         "icon_emoji": "♺",
+        "icon_asset": "icons/ui/cache-mode-gold.svg",
         "page_index": 2,
         "sort_order": 2,
         "enabled": 1,
@@ -153,22 +161,23 @@ async def list_embed_menu_items() -> list[EmbedMenuItemOut]:
 
 @router.get("/config")
 async def get_embed_menu_config() -> dict:
-    """Return sanitized selector pages payload.
+    """Return sanitized selector pages payload with icon/label metadata.
 
-    Contract is intentionally narrow so the selector can hard-fallback to its
-    local defaults if this endpoint fails or returns malformed data.
+    Each page is a list of item objects:  {key, icon_asset?, label?}
+    The selector applies icon_asset as --bp-ns-icon-asset CSS var and falls
+    back to its hardcoded CSS data-URIs if this endpoint fails or the field is absent.
     """
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT item_key, page_index, sort_order, updated_at
+            SELECT item_key, icon_asset, label, page_index, sort_order, updated_at
             FROM embed_menu_items
             WHERE enabled=1
             ORDER BY page_index, sort_order, item_key
             """
         ).fetchall()
 
-    pages_map: dict[int, list[str]] = {}
+    pages_map: dict[int, list[dict]] = {}
     last_updated = ""
     for row in rows:
         key = row["item_key"]
@@ -177,7 +186,12 @@ async def get_embed_menu_config() -> dict:
         page_index = row["page_index"] if isinstance(row["page_index"], int) else 0
         if page_index < 0:
             continue
-        pages_map.setdefault(page_index, []).append(key)
+        item: dict = {"key": key}
+        if row["icon_asset"]:
+            item["icon_asset"] = row["icon_asset"]
+        if row["label"]:
+            item["label"] = row["label"]
+        pages_map.setdefault(page_index, []).append(item)
         updated_at = row["updated_at"] or ""
         if updated_at > last_updated:
             last_updated = updated_at
@@ -287,7 +301,7 @@ async def seed_embed_menu_items() -> dict:
                     item["item_key"],
                     item["label"],
                     item["icon_emoji"],
-                    None,
+                    item.get("icon_asset"),
                     None,
                     item["page_index"],
                     item["sort_order"],
