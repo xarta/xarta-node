@@ -38,7 +38,7 @@ A distributed, peer-to-peer service index. Every node holds an identical SQLite 
 ### Layer 2 — incremental actions
 - `POST /api/v1/sync/actions` — receives a batch of INSERT/UPDATE/DELETE row actions
 - Per-peer FIFO queue in SQLite, drained every 1–20s (random jitter)
-- Batch size: 50 actions. Overflow threshold: 1000 pending → falls back to full backup
+- Batch size: 50 actions. Overflow threshold: 1000 pending → tries full backup first, then falls back to batched actions if restore is rejected (for example HTTP 409 generation guard)
 
 ### Generation counter
 Every write increments a `gen` counter in the DB metadata. Used to:

@@ -148,8 +148,12 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
             node_id,
             depth,
         )
-        await _send_full_backup(node_id, peer_urls)
-        return
+        if await _send_full_backup(node_id, peer_urls):
+            return
+        log.warning(
+            "full backup path not accepted for peer %s — falling back to batched action drain",
+            node_id,
+        )
 
     actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
     if not actions:
@@ -213,11 +217,11 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
         log.debug("peer %s unreachable on all addresses — will retry next cycle", node_id)
 
 
-async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
+async def _send_full_backup(node_id: str, peer_urls: list[str]) -> bool:
     """Send a full DB backup zip to a peer's Layer 1 restore endpoint.
 
     Tries each URL in peer_urls in order, stopping at the first successful
-    delivery.  If all addresses fail the peer remains queued for retry.
+    delivery.  Returns True on success; False when not delivered.
     """
     try:
         with get_conn() as conn:
@@ -225,7 +229,7 @@ async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
         zip_bytes, sha256_hex = make_full_backup()
     except Exception:
         log.exception("failed to create full backup for peer %s", node_id)
-        return
+        return False
 
     _restore_headers = {
         "content-type": "application/octet-stream",
@@ -246,13 +250,12 @@ async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
                 if resp.status_code == 204:
                     log.info("full backup sent to peer %s via %s", node_id, url)
                     # Mark all pending actions as sent — the backup supersedes them
-                    from ..db import get_conn
                     with get_conn() as conn:
                         conn.execute(
                             "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
                             (node_id,),
                         )
-                    return
+                    return True
                 else:
                     log.warning(
                         "peer %s rejected full backup via %s: HTTP %d — trying next address",
@@ -263,3 +266,4 @@ async def _send_full_backup(node_id: str, peer_urls: list[str]) -> None:
             except Exception:
                 log.exception("error sending full backup to peer %s at %s", node_id, url)
         log.debug("peer %s unreachable on all addresses for full backup — will retry", node_id)
+    return False
