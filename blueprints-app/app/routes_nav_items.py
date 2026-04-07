@@ -8,8 +8,9 @@ DELETE /api/v1/nav-items/{item_id}          → 204
 POST   /api/v1/nav-items/seed               → {"inserted": N, "skipped": M}  (idempotent)
 POST   /api/v1/nav-items/upload-asset       → {"path": "icons/foo.svg", "item_id": "..."}
 GET    /api/v1/nav-items/assets             → list of asset files  (?type=icons|sounds)
+DELETE /api/v1/nav-items/assets             → delete an uploaded asset file if not referenced
 POST   /api/v1/nav-items/assign-asset       → assign an existing asset to a nav item
-POST   /api/v1/nav-items/upload-bulk        → bulk extract a zip/tar/7z archive into assets dir
+POST   /api/v1/nav-items/upload-bulk        → upload a single asset file OR extract an archive into assets dir
 
 Assets are stored under the active gui-fallback/assets/{icons|sounds}/ tree and served
 by Caddy at /fallback-ui/assets/{icons|sounds}/  — no extra server config required.
@@ -98,6 +99,22 @@ def _assets_dir(asset_type: str) -> Path:
     return d
 
 
+def _asset_reference_counts(conn, asset_path: str) -> dict:
+    nav_icon = conn.execute("SELECT COUNT(*) AS c FROM nav_items WHERE icon_asset=?", (asset_path,)).fetchone()["c"]
+    nav_sound = conn.execute("SELECT COUNT(*) AS c FROM nav_items WHERE sound_asset=?", (asset_path,)).fetchone()["c"]
+    fc_icon = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE icon_asset=?", (asset_path,)).fetchone()["c"]
+    fc_sound_on = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE sound_asset=?", (asset_path,)).fetchone()["c"]
+    fc_sound_off = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE sound_asset_off=?", (asset_path,)).fetchone()["c"]
+    return {
+        "nav_items_icon": nav_icon,
+        "nav_items_sound": nav_sound,
+        "form_controls_icon": fc_icon,
+        "form_controls_sound_on": fc_sound_on,
+        "form_controls_sound_off": fc_sound_off,
+        "total": nav_icon + nav_sound + fc_icon + fc_sound_on + fc_sound_off,
+    }
+
+
 def _row_to_out(row) -> NavItemOut:
     return NavItemOut(
         item_id=row["item_id"],
@@ -178,6 +195,49 @@ async def list_assets(type: Literal["icons", "sounds"] = Query(...)):
                 "url":      f"/fallback-ui/assets/{type}/{rel}",
             })
     return result
+
+
+@router.delete("/assets")
+async def delete_asset(
+    type: Literal["icons", "sounds"] = Query(...),
+    asset_path: str = Query(...),
+):
+    """Delete an uploaded asset file when it is not referenced by nav_items/form_controls."""
+    relative = Path(asset_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise HTTPException(400, "invalid asset path")
+    if not relative.parts or relative.parts[0] != type:
+        raise HTTPException(400, f"asset path must start with '{type}/'")
+
+    rel_inside = Path(*relative.parts[1:])
+    assets_dir = _assets_dir(type)
+    target = (assets_dir / rel_inside).resolve()
+    base = assets_dir.resolve()
+    if not target.is_relative_to(base):
+        raise HTTPException(400, "invalid asset path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "asset file not found")
+
+    normalized_path = f"{type}/{rel_inside.as_posix()}"
+    with get_conn() as conn:
+        refs = _asset_reference_counts(conn, normalized_path)
+    if refs["total"] > 0:
+        raise HTTPException(
+            409,
+            {
+                "message": "asset is currently assigned; clear assignments before deleting",
+                "asset_path": normalized_path,
+                "references": refs,
+            },
+        )
+
+    try:
+        target.unlink()
+    except Exception as exc:
+        raise HTTPException(500, f"failed to delete asset: {exc}") from exc
+
+    log.info("nav_items: deleted asset %s", target)
+    return {"deleted": True, "asset_path": normalized_path}
 
 
 @router.get("/{item_id}", response_model=NavItemOut)
@@ -564,29 +624,53 @@ async def upload_bulk_assets(
     file: UploadFile = File(...),
     asset_type: str = Form(...),   # "icons" or "sounds"
 ):
-    """Upload a zip / tar.* / 7z archive and extract matching asset files into the assets directory.
+    """Upload a single asset file or an archive into the assets directory.
 
-    Only files with allowed extensions for the given asset_type are extracted.
+    For archives, only files with allowed extensions for the given asset_type are extracted.
+    For single-file uploads, the file extension must be allowed for the given asset_type.
     All paths are flattened (subdirectories inside the archive are ignored).
-    Returns {"extracted": [...filenames...], "skipped": N}.
+    Returns {"extracted": [...filenames...], "count": N, "mode": "single"|"archive"}.
     """
     if asset_type not in ("icons", "sounds"):
         raise HTTPException(400, "asset_type must be 'icons' or 'sounds'")
 
-    original_name = file.filename or "archive"
+    original_name = file.filename or "upload"
     ext = "".join(Path(original_name).suffixes).lower()  # e.g. ".tar.gz"
     # Also check just the last suffix
     last_ext = Path(original_name).suffix.lower()
 
-    if last_ext not in _BULK_ARCHIVE_EXTS:
-        raise HTTPException(
-            400,
-            f"unsupported archive format {last_ext!r}; "
-            f"supported: {', '.join(sorted(_BULK_ARCHIVE_EXTS))}",
-        )
-
     allowed = _ICON_ALLOWED_EXTS if asset_type == "icons" else _SOUND_ALLOWED_EXTS
     assets_dir = _assets_dir(asset_type)
+
+    # Non-archive upload path: treat as a single asset file upload.
+    if last_ext not in _BULK_ARCHIVE_EXTS:
+        if last_ext not in allowed:
+            raise HTTPException(
+                400,
+                f"file type {last_ext!r} not allowed for {asset_type}; "
+                f"permitted: {', '.join(sorted(allowed))}",
+            )
+
+        safe_name = Path(original_name).name.replace(" ", "_")
+        if not safe_name or safe_name.startswith(".") or "/" in safe_name or "\\" in safe_name:
+            raise HTTPException(400, "invalid filename")
+
+        content = await file.read()
+        dest = assets_dir / safe_name
+        if dest.exists():
+            stem = Path(safe_name).stem
+            suffix = Path(safe_name).suffix
+            safe_name = f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+            dest = assets_dir / safe_name
+
+        try:
+            dest.write_bytes(content)
+        except Exception as exc:
+            log.error("bulk upload: failed to save single file %s: %s", dest, exc)
+            raise HTTPException(500, f"failed to save file: {exc}") from exc
+
+        log.info("bulk upload: saved single file %s", dest)
+        return {"extracted": [safe_name], "count": 1, "mode": "single"}
 
     # Write upload to a temp file for processing
     with tempfile.NamedTemporaryFile(suffix=last_ext, delete=False) as tmp:
@@ -610,4 +694,4 @@ async def upload_bulk_assets(
         tmp_path.unlink(missing_ok=True)
 
     log.info("bulk upload: extracted %d files into %s", len(extracted), assets_dir)
-    return {"extracted": extracted, "count": len(extracted)}
+    return {"extracted": extracted, "count": len(extracted), "mode": "archive"}
