@@ -2,6 +2,7 @@
 
 GET    /api/v1/form-controls                   → list[FormControlOut]
 GET    /api/v1/form-controls/assets            → list asset files (?type=icons|sounds)
+DELETE /api/v1/form-controls/assets            → delete asset file if not referenced
 GET    /api/v1/form-controls/discover-keys     → discover data-fc-key values from gui-fallback sources
 GET    /api/v1/form-controls/{control_id}      → FormControlOut
 POST   /api/v1/form-controls                   → FormControlOut  (201)
@@ -88,6 +89,22 @@ def _assets_dir(asset_type: str) -> Path:
     d = _gui_fallback_root() / "assets" / asset_type
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _asset_reference_counts(conn, asset_path: str) -> dict:
+    nav_icon = conn.execute("SELECT COUNT(*) AS c FROM nav_items WHERE icon_asset=?", (asset_path,)).fetchone()["c"]
+    nav_sound = conn.execute("SELECT COUNT(*) AS c FROM nav_items WHERE sound_asset=?", (asset_path,)).fetchone()["c"]
+    fc_icon = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE icon_asset=?", (asset_path,)).fetchone()["c"]
+    fc_sound_on = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE sound_asset=?", (asset_path,)).fetchone()["c"]
+    fc_sound_off = conn.execute("SELECT COUNT(*) AS c FROM form_controls WHERE sound_asset_off=?", (asset_path,)).fetchone()["c"]
+    return {
+        "nav_items_icon": nav_icon,
+        "nav_items_sound": nav_sound,
+        "form_controls_icon": fc_icon,
+        "form_controls_sound_on": fc_sound_on,
+        "form_controls_sound_off": fc_sound_off,
+        "total": nav_icon + nav_sound + fc_icon + fc_sound_on + fc_sound_off,
+    }
 
 
 def _strip_source_comments(text: str, suffix: str) -> str:
@@ -177,6 +194,49 @@ async def list_fc_assets(type: Literal["icons", "sounds"] = Query(...)):
                 "url":      f"/fallback-ui/assets/{type}/{rel}",
             })
     return result
+
+
+@router.delete("/assets")
+async def delete_fc_asset(
+    type: Literal["icons", "sounds"] = Query(...),
+    asset_path: str = Query(...),
+):
+    """Delete an uploaded asset file when it is not referenced by nav_items/form_controls."""
+    relative = Path(asset_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise HTTPException(400, "invalid asset path")
+    if not relative.parts or relative.parts[0] != type:
+        raise HTTPException(400, f"asset path must start with '{type}/'")
+
+    rel_inside = Path(*relative.parts[1:])
+    assets_dir = _assets_dir(type)
+    target = (assets_dir / rel_inside).resolve()
+    base = assets_dir.resolve()
+    if not target.is_relative_to(base):
+        raise HTTPException(400, "invalid asset path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "asset file not found")
+
+    normalized_path = f"{type}/{rel_inside.as_posix()}"
+    with get_conn() as conn:
+        refs = _asset_reference_counts(conn, normalized_path)
+    if refs["total"] > 0:
+        raise HTTPException(
+            409,
+            {
+                "message": "asset is currently assigned; clear assignments before deleting",
+                "asset_path": normalized_path,
+                "references": refs,
+            },
+        )
+
+    try:
+        target.unlink()
+    except Exception as exc:
+        raise HTTPException(500, f"failed to delete asset: {exc}") from exc
+
+    log.info("form_controls: deleted asset %s", target)
+    return {"deleted": True, "asset_path": normalized_path}
 
 
 @router.get("/discover-keys")
