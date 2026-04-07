@@ -89,6 +89,38 @@ The sync system uses a persistent queue in `sync_queue` (SQLite). Each data writ
 
 **Startup guarantee:** `_git_pull_and_restart` restarts the process after every git pull, so `COMMIT_TS` always reflects the running code. No cron needed.
 
+### Queue overflow behavior (updated 2026-04-07)
+
+When a peer queue depth reaches `SYNC_QUEUE_MAX_DEPTH`, `drain.py` first tries
+Layer 1 full-backup restore (`POST /api/v1/sync/restore`).
+
+- Healthy peers can reject restore with HTTP 409 when `sender_gen <= my_gen`.
+- Drain must not deadlock in this state.
+- Current behavior: on restore failure/rejection, drain logs the condition and
+    falls back to normal batched actions (`POST /api/v1/sync/actions`) in the
+    same cycle.
+
+This keeps queues draining even when restore guardrails are working as designed.
+
+Operator symptom for this failure mode: pending count appears frozen at a high
+value (for example 1362 per peer) and logs repeatedly show `queue overflow`
+plus restore `HTTP 409` with no successful action posts.
+
+Quick validation before fleet rollout:
+
+```bash
+# 1) Confirm backlog is decreasing
+sqlite3 /opt/blueprints/data/db/blueprints.db \
+    "select target_node_id, count(*) from sync_queue where sent=0 group by target_node_id order by target_node_id;"
+
+# 2) Confirm fallback is active and actions are accepted
+journalctl -u blueprints-app -n 200 --no-pager | \
+    rg -i "full backup path not accepted|/api/v1/sync/actions|HTTP/1.1 204"
+```
+
+Hold fleet update/pull actions until pending counts are trending down or fully
+drained.
+
 ### `nodes` table — excluded from sync
 
 `"nodes"` is absent from `_ALLOWED_TABLES` in `routes_sync.py`. The nodes table is populated from `.nodes.json` at startup (`_load_nodes_from_json()`) and must never be overwritten by peer sync. Peer-synced `nodes` entries would carry stale addresses.

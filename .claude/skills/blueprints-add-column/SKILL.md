@@ -161,7 +161,12 @@ migration runs, the retry succeeds. **No data is lost.**
 
 Overflow safety net: if retries accumulate to `SYNC_QUEUE_MAX_DEPTH`, the drain
 switches to sending a full DB backup to that peer (which already contains the
-migrated schema and all data). Fully self-correcting.
+migrated schema and all data).
+
+Important (2026-04-07): restore can be rejected with HTTP 409 by the receiver's
+generation guard (`sender_gen <= my_gen`). In that case drain must fall back to
+batched `/api/v1/sync/actions` delivery and continue draining, not stay pinned
+at overflow depth.
 
 ### Optional: wait for peers before writing new-column data
 
@@ -172,6 +177,14 @@ curl http://<peer>/api/v1/sync/status
 ```
 
 Verify `gen` matches the originating node's gen, then write freely.
+
+Before any fleet-wide pull/update action, verify pending queue rows are trending
+down (or fully drained) on the origin node:
+
+```bash
+sqlite3 /opt/blueprints/data/db/blueprints.db \
+    "select target_node_id, count(*) from sync_queue where sent=0 group by target_node_id order by target_node_id;"
+```
 
 ---
 
