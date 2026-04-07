@@ -19,6 +19,25 @@ If those node-local docs are unavailable on the current LXC/workspace, continue
 with this skill for discovery/probe operations; treat the node-local docs as
 optional supplemental context.
 
+## Critical Copy Rule (Operator Intent)
+
+When the user asks to "copy a Dockge stack" from another host/location, this
+MUST be interpreted as copying both:
+
+1. stack definitions (`compose.yaml`, `.env.example`, and local `.env` guidance)
+2. required runtime data for functional parity (for example `data/`,
+   `volumes/`, cache directories, model caches, vector caches, and other
+   non-git runtime state the service requires)
+
+Do not treat "copy stack" as "copy compose only" unless the user explicitly
+asks for a compose-only scaffold.
+
+Before declaring migration complete, explicitly report:
+
+- which runtime paths were copied
+- which runtime paths were intentionally excluded
+- proof checks (file counts/sizes and at least one functional endpoint test)
+
 ## Architecture Overview
 
 1. **Source of truth**: `proxmox_config.dockge_json` tells us which machines
