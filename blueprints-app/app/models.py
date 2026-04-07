@@ -1231,6 +1231,7 @@ class EmbedMenuItemCreate(BaseModel):
     page_index: int = 0
     sort_order: int = 0
     enabled: int = 1
+    menu_context: str = 'embed'
 
 
 class EmbedMenuItemUpdate(BaseModel):
@@ -1241,6 +1242,7 @@ class EmbedMenuItemUpdate(BaseModel):
     page_index: Optional[int] = None
     sort_order: Optional[int] = None
     enabled: Optional[int] = None
+    menu_context: Optional[str] = None
 
 
 class EmbedMenuItemOut(BaseModel):
@@ -1253,5 +1255,6 @@ class EmbedMenuItemOut(BaseModel):
     page_index: int = 0
     sort_order: int = 0
     enabled: int = 1
+    menu_context: str = 'embed'
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
