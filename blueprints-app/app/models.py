@@ -738,6 +738,76 @@ class TableLayoutOut(BaseModel):
     updated_at: str
 
 
+# ── PocketTTS ────────────────────────────────────────────────────────────────
+
+class PocketttsTagCreate(BaseModel):
+    tag_id: Optional[str] = None
+    slug: Optional[str] = None
+    label: str
+    color_hex: str = "#5c6ef8"
+    parent_tag_id: Optional[str] = None
+    sort_order: int = 0
+    is_seed_default: int = 0
+    is_active: int = 1
+
+
+class PocketttsTagUpdate(BaseModel):
+    slug: Optional[str] = None
+    label: Optional[str] = None
+    color_hex: Optional[str] = None
+    parent_tag_id: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_seed_default: Optional[int] = None
+    is_active: Optional[int] = None
+
+
+class PocketttsTagOut(BaseModel):
+    tag_id: str
+    slug: str
+    label: str
+    color_hex: str
+    parent_tag_id: Optional[str] = None
+    sort_order: int = 0
+    is_seed_default: int = 0
+    is_active: int = 1
+    voice_count: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PocketttsTagOrderUpdate(BaseModel):
+    scope_key: str = "global-default"
+    order: list[str]
+
+
+class PocketttsVoiceMetaPatch(BaseModel):
+    hidden: Optional[bool] = None
+    note: Optional[str] = None
+    tags: Optional[list[str]] = None
+    display_name: Optional[str] = None
+    source_type: Optional[str] = None
+    is_user_uploaded: Optional[bool] = None
+
+
+class PocketttsVoiceMetaOut(BaseModel):
+    voice_id: str
+    hidden: bool = False
+    tags: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class PocketttsSeedDefaultsRequest(BaseModel):
+    scope_key: str = "global-default"
+    include_builtin_assignments: bool = True
+
+
+class PocketttsImportRequest(BaseModel):
+    base_url: str = "/tts/pockettts"
+    include_seed_defaults: bool = True
+    include_voice_meta: bool = True
+    verify_tls: bool = False
+
+
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
 class SyncAction(BaseModel):

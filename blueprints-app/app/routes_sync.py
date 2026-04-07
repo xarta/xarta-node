@@ -61,6 +61,11 @@ _ALLOWED_TABLES = {
     "form_controls",
     "table_layout_catalog",
     "table_layouts",
+    "pockettts_tags",
+    "pockettts_voices",
+    "pockettts_voice_meta",
+    "pockettts_voice_tags",
+    "pockettts_tag_order",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -173,6 +178,11 @@ def _pk_for_table(table: str) -> str:
         "form_controls":           "control_id",
         "table_layout_catalog":    "table_code",
         "table_layouts":           "layout_key",
+        "pockettts_tags":          "tag_id",
+        "pockettts_voices":        "voice_id",
+        "pockettts_voice_meta":    "voice_id",
+        "pockettts_voice_tags":    "assignment_id",
+        "pockettts_tag_order":     "order_id",
     }
     return pk_map.get(table, "id")
 

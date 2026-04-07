@@ -384,6 +384,13 @@ ${FALLBACK_ASSET_CACHE_HEADERS}
         file_server
     }
 
+    # PocketTTS local test UI/API on a dedicated path.
+    # handle_path strips /tts/pockettts before proxying to the stack.
+    redir /tts/pockettts /tts/pockettts/ permanent
+    handle_path /tts/pockettts* {
+        reverse_proxy localhost:18884
+    }
+
     # Reverse proxy all traffic to the local uvicorn process.
     # Includes /health, /api/v1/*, and /ui/* (GUI + embed component).
     reverse_proxy localhost:8080

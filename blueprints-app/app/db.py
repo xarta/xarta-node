@@ -489,6 +489,72 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_table_layouts_parts
     ON table_layouts(reserved_code, user_code, table_code, bucket_code);
 CREATE INDEX IF NOT EXISTS idx_table_layouts_lookup
     ON table_layouts(table_code, user_code, bucket_code);
+
+-- ── PocketTTS metadata (PocketTTS-specific, not generic TTS) ───────────────
+
+CREATE TABLE IF NOT EXISTS pockettts_tags (
+    tag_id          TEXT PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,
+    label           TEXT NOT NULL,
+    color_hex       TEXT NOT NULL DEFAULT '#5c6ef8',
+    parent_tag_id   TEXT,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    is_seed_default INTEGER NOT NULL DEFAULT 0,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pockettts_tags_parent
+    ON pockettts_tags(parent_tag_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS pockettts_voices (
+    voice_id          TEXT PRIMARY KEY,
+    display_name      TEXT,
+    source_type       TEXT NOT NULL DEFAULT 'unknown',
+    is_user_uploaded  INTEGER NOT NULL DEFAULT 0,
+    is_active         INTEGER NOT NULL DEFAULT 1,
+    first_seen_at     TEXT DEFAULT (datetime('now')),
+    last_seen_at      TEXT DEFAULT (datetime('now')),
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pockettts_voices_source
+    ON pockettts_voices(source_type);
+
+CREATE TABLE IF NOT EXISTS pockettts_voice_meta (
+    voice_id      TEXT PRIMARY KEY,
+    hidden        INTEGER NOT NULL DEFAULT 0,
+    note          TEXT,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pockettts_voice_tags (
+    assignment_id      TEXT PRIMARY KEY,
+    voice_id           TEXT NOT NULL,
+    tag_id             TEXT NOT NULL,
+    assignment_source  TEXT NOT NULL DEFAULT 'user',
+    confidence         TEXT,
+    created_at         TEXT DEFAULT (datetime('now')),
+    updated_at         TEXT DEFAULT (datetime('now')),
+    UNIQUE(voice_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pockettts_voice_tags_tag
+    ON pockettts_voice_tags(tag_id);
+CREATE INDEX IF NOT EXISTS idx_pockettts_voice_tags_voice
+    ON pockettts_voice_tags(voice_id);
+
+CREATE TABLE IF NOT EXISTS pockettts_tag_order (
+    order_id      TEXT PRIMARY KEY,
+    scope_key     TEXT NOT NULL,
+    tag_id        TEXT NOT NULL,
+    order_index   INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(scope_key, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pockettts_tag_order_scope
+    ON pockettts_tag_order(scope_key, order_index);
 """
 
 _TABLE_LAYOUT_CATALOG_SEED = [
