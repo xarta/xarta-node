@@ -67,6 +67,22 @@ The scripts SSH to each node and trigger loopback-only `git-pull` actions safely
 
 For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback. The API supports `outer`, `non_root`, `inner`, `both`, and `all`. The Fleet Nodes GUI uses staged pulls with a 10-second settle window, commit verification across all nodes, and one retry per repo stage.
 
+## Mandatory testing discipline
+
+After changing backend app code under `blueprints-app/app` (routes, models,
+db schema, middleware, sync logic), restart `blueprints-app` before endpoint or
+GUI testing:
+
+```bash
+systemctl restart blueprints-app
+```
+
+This is proactive and mandatory: perform the restart automatically as part of
+the test workflow, without waiting for an explicit user reminder.
+
+Do not trust API/UI test results until restart completes and `/health` is green.
+This avoids stale-process false negatives such as 404 on newly added routes.
+
 ## Sync protocol & commit guard
 
 The sync system uses a persistent queue in `sync_queue` (SQLite). Each data write is enqueued for all peer nodes and drained in the background every 1–20 s.

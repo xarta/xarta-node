@@ -459,6 +459,24 @@ CREATE TABLE IF NOT EXISTS form_controls (
 );
 CREATE INDEX IF NOT EXISTS idx_form_controls_key ON form_controls(control_key);
 
+-- ── CMS-driven embedded selector menu items (action slots only) ────────────
+
+CREATE TABLE IF NOT EXISTS embed_menu_items (
+    item_id       TEXT PRIMARY KEY,          -- UUID (auto-generated)
+    item_key      TEXT NOT NULL UNIQUE,      -- selector action key (e.g. 'database-tables')
+    label         TEXT NOT NULL,             -- display label
+    icon_emoji    TEXT,                      -- fallback emoji/icon glyph
+    icon_asset    TEXT,                      -- relative path under assets/ (optional)
+    sound_asset   TEXT,                      -- relative path under assets/ (optional)
+    page_index    INTEGER NOT NULL DEFAULT 0,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT DEFAULT (datetime('now')),
+    updated_at    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_embed_menu_items_page_sort
+    ON embed_menu_items(page_index, sort_order, item_key);
+
 CREATE TABLE IF NOT EXISTS table_layout_catalog (
     table_code   TEXT PRIMARY KEY,
     table_name   TEXT NOT NULL UNIQUE,
@@ -719,6 +737,13 @@ _TABLE_LAYOUT_CATALOG_SEED = [
         "table_kind": "table",
         "dom_table_id": "fc-table",
         "tab_id": "form-controls",
+    }),
+    ("18", "embed-menu", {
+        "display_name": "Embed Menu",
+        "sql_table": "embed_menu_items",
+        "table_kind": "table",
+        "dom_table_id": "em-table",
+        "tab_id": "embed-menu",
     }),
 ]
 

@@ -5,6 +5,28 @@ description: Add a brand-new table to the Blueprints app with full CRUD API, fle
 
 # Blueprints — Adding a New Table
 
+## Mandatory defaults (do not skip)
+
+When the new table is exposed in `gui-fallback`, implement the shared table-bucket
+system in the same change set. Do not treat bucket/layout integration as a later
+cleanup task.
+
+Required baseline for new GUI-backed tables:
+
+- add `table_layout_catalog` seed entry in `blueprints-app/app/db.py`
+- add stable table attributes in HTML (`data-layout-table-name`, `data-layout-table-code`)
+- use `TableView.create(...)` + `TableBucketLayouts.create(...)` in page JS
+- expose `Columns` and `Layout Context` actions in the page function menu
+- run both validators before sign-off:
+    - `bash /root/xarta-node/.xarta/.claude/skills/table-bucket-migration/scripts/validate-shared-table-buckets.sh`
+    - `bash /root/xarta-node/.xarta/.claude/skills/table-bucket-migration/scripts/validate-shared-table-buckets-api.sh`
+
+Also mandatory: after backend code/schema edits, restart `blueprints-app` before
+any HTTP testing. Testing without restart validates stale code and produces false
+404/contract mismatches.
+
+Treat this as an automatic step in the workflow (no user prompt required).
+
 ## Overview
 
 Adding a new table requires changes in **six files** (plus an optional GUI
@@ -254,7 +276,7 @@ In `.xarta/gui/index.html`:
 ```
 1. git commit -am "feat: add my_table — ..."
 2. git push
-3. Restart local service (picks up DDL, creates table):
+3. Restart local service before any endpoint/UI test (picks up DDL, routes, models):
    systemctl restart blueprints-app
 4. Trigger fleet pull (outer):
    curl -X POST http://localhost:8080/api/v1/sync/git-pull \

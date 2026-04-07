@@ -62,6 +62,7 @@ from .routes_ai_project_assignments import router as ai_project_assignments_rout
 from .routes_bookmarks import router as bookmarks_router
 from .routes_form_controls import router as form_controls_router
 from .routes_nav_items import router as nav_items_router
+from .routes_embed_menu_items import router as embed_menu_items_router
 from .routes_pockettts import router as pockettts_router
 from .routes_pwa import router as pwa_router
 from .routes_table_layouts import router as table_layouts_router
@@ -333,6 +334,7 @@ def create_app() -> FastAPI:
     application.include_router(bookmarks_router,               prefix="/api/v1")
     application.include_router(form_controls_router,           prefix="/api/v1")
     application.include_router(nav_items_router,               prefix="/api/v1")
+    application.include_router(embed_menu_items_router,        prefix="/api/v1")
     application.include_router(pockettts_router,               prefix="/api/v1")
     application.include_router(pwa_router,                     prefix="/api/v1")
     application.include_router(table_layouts_router,           prefix="/api/v1")
