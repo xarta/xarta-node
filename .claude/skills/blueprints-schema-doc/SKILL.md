@@ -136,3 +136,11 @@ erDiagram
 - Scarab paging control is always shown when multiple pages exist, except when touch ribbon mode is actively in use.
 - Fallback is allowed only for embedded controls, and only when DB config fetch fails.
 - Do not hardcode or merge local page layouts in a way that overrides DB-defined page order/positions.
+
+## MANDATORY - App-Specific Selector Context Guardrail (2026-04-08)
+
+- Never assume `menu_context='embed'` for new app work.
+- Do not add or modify `embed_menu_items` rows in shared contexts (`embed`, `fallback-ui`, `db`) unless the user explicitly requests cross-app/shared rollout.
+- Treat `embed` context as shared across all embed consumers (not app-local).
+- For app-local selector behavior, require an app-specific context and explicit route-context wiring before any DB row additions.
+- Default for new app work: no embed-menu DB writes unless explicitly requested.
