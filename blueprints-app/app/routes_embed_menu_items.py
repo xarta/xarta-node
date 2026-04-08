@@ -266,7 +266,7 @@ _DEFAULT_SEED = [
         "item_key": "pockettts-hard-refresh",
         "label": "Hard Refresh",
         "icon_emoji": "",
-        "icon_asset": "icons/hieroglyphs/nefer-gold.svg",
+        "icon_asset": "icons/hieroglyphs/rope-coil-gold.svg",
         "page_index": 3,
         "sort_order": 0,
         "enabled": 1,
@@ -302,17 +302,21 @@ _ALLOWED_KEYS = {
 
 
 def _row_to_out(row) -> EmbedMenuItemOut:
+    item_id = row["item_id"] if row["item_id"] else gen_uuid()
+    item_key = row["item_key"] if row["item_key"] is not None else ""
+    label = row["label"] if row["label"] is not None else ""
+    menu_context = row["menu_context"] if "menu_context" in row.keys() and row["menu_context"] else "embed"
     return EmbedMenuItemOut(
-        item_id=row["item_id"],
-        item_key=row["item_key"],
-        label=row["label"],
+        item_id=item_id,
+        item_key=item_key,
+        label=label,
         icon_emoji=row["icon_emoji"],
         icon_asset=row["icon_asset"],
         sound_asset=row["sound_asset"],
-        page_index=row["page_index"],
-        sort_order=row["sort_order"],
-        enabled=row["enabled"],
-        menu_context=row["menu_context"] if "menu_context" in row.keys() else "embed",
+        page_index=row["page_index"] if row["page_index"] is not None else 0,
+        sort_order=row["sort_order"] if row["sort_order"] is not None else 0,
+        enabled=row["enabled"] if row["enabled"] is not None else 1,
+        menu_context=menu_context,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
