@@ -262,6 +262,16 @@ _DEFAULT_SEED = [
         "enabled": 1,
         "menu_context": "pockettts",
     },
+    {
+        "item_key": "pockettts-hard-refresh",
+        "label": "Hard Refresh",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/nefer-gold.svg",
+        "page_index": 3,
+        "sort_order": 0,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
 ]
 
 _ALLOWED_KEYS = {
@@ -287,6 +297,7 @@ _ALLOWED_KEYS = {
     "pockettts-matrix",
     "pockettts-monitor",
     "pockettts-test",
+    "pockettts-hard-refresh",
 }
 
 
