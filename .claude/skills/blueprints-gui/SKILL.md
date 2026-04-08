@@ -334,3 +334,12 @@ Separate HTML pages for DB schema viewing:
 - `gui-fallback/database-tables.html`  → uses `gui-db/database-tables.css`  + `gui-db/database-tables.js`
 
 These are standalone pages, not part of the main SPA.
+
+## MANDATORY - Embedded Menu DB Authority Contract (2026-04-08)
+
+- Database is authoritative for embedded selector action pages in all contexts.
+- `page_index` and `sort_order` from DB define order and slot positions.
+- JS/runtime may insert placeholder circles only to preserve intentional DB slot gaps.
+- Scarab paging control is always shown when multiple pages exist, except when touch ribbon mode is actively in use.
+- Fallback is allowed only for embedded controls, and only when DB config fetch fails.
+- Do not hardcode or merge local page layouts in a way that overrides DB-defined page order/positions.

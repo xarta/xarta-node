@@ -255,3 +255,12 @@ sqlite3 /opt/blueprints/data/db/blueprints.db \
 Both `proxmox_config` and `proxmox_nets` are in `_ALLOWED_TABLES` and sync
 automatically to all peers via the standard gen-based protocol. The probe only
 needs to run on the node that has SSH access to PVE hosts (`PROXMOX_SSH_KEY`).
+
+## MANDATORY - Embedded Menu DB Authority Contract (2026-04-08)
+
+- Database is authoritative for embedded selector action pages in all contexts.
+- `page_index` and `sort_order` from DB define order and slot positions.
+- JS/runtime may insert placeholder circles only to preserve intentional DB slot gaps.
+- Scarab paging control is always shown when multiple pages exist, except when touch ribbon mode is actively in use.
+- Fallback is allowed only for embedded controls, and only when DB config fetch fails.
+- Do not hardcode or merge local page layouts in a way that overrides DB-defined page order/positions.
