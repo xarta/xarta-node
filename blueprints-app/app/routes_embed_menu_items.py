@@ -7,10 +7,11 @@ GET    /api/v1/embed-menu-items/{item_id}          → EmbedMenuItemOut
 PUT    /api/v1/embed-menu-items/{item_id}          → EmbedMenuItemOut
 POST   /api/v1/embed-menu-items/seed              → idempotent seed from defaults
 
-menu_context values: 'embed' | 'fallback-ui' | 'db'
+menu_context values: 'embed' | 'fallback-ui' | 'db' | 'pockettts'
   embed       — buttons shown when the selector is embedded in external services
   fallback-ui — buttons shown when on the gui-fallback dashboard pages
   db          — buttons shown when on the database-tables/diagram pages
+    pockettts   — buttons shown when on /tts/pockettts pages
 
 This table controls action-slot pages only. System controls (paging scarab and
 origin button) are intentionally outside the table and remain fixed by selector
@@ -29,7 +30,7 @@ from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/embed-menu-items", tags=["embed-menu-items"])
 
-_VALID_CONTEXTS = {'embed', 'fallback-ui', 'db'}
+_VALID_CONTEXTS = {'embed', 'fallback-ui', 'db', 'pockettts'}
 
 _DEFAULT_SEED = [
     # ── context: embed ──────────────────────────────────────────────────────
@@ -170,6 +171,97 @@ _DEFAULT_SEED = [
     # ── context: db ──────────────────────────────────────────────────────────
     # db context has no unique items — embed context rows are automatically
     # appended by /config. Nothing to seed here.
+    # ── context: pockettts ───────────────────────────────────────────────────
+    {
+        "item_key": "pockettts-dashboard",
+        "label": "Dashboard",
+        "icon_emoji": "",
+        "icon_asset": "icons/ui/house-gold.svg",
+        "page_index": 0,
+        "sort_order": 0,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-config",
+        "label": "Config",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/djed-pillar-gold.svg",
+        "page_index": 0,
+        "sort_order": 1,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-voices",
+        "label": "Voices",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/sistrum-gold.svg",
+        "page_index": 0,
+        "sort_order": 2,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-cloning",
+        "label": "Cloning",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/double-plume-gold.svg",
+        "page_index": 1,
+        "sort_order": 0,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-tags",
+        "label": "Tags",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/cartouche-gold.svg",
+        "page_index": 1,
+        "sort_order": 1,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-texts",
+        "label": "Texts",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/papyrus-gold.svg",
+        "page_index": 1,
+        "sort_order": 2,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-matrix",
+        "label": "Matrix",
+        "icon_emoji": "",
+        "icon_asset": "icons/ui/table-columns-gold.svg",
+        "page_index": 2,
+        "sort_order": 0,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-monitor",
+        "label": "Monitor",
+        "icon_emoji": "",
+        "icon_asset": "icons/ui/monitor-gold.svg",
+        "page_index": 2,
+        "sort_order": 1,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
+        "item_key": "pockettts-test",
+        "label": "Test Page",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/eye-of-horus-gold.svg",
+        "page_index": 2,
+        "sort_order": 2,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
 ]
 
 _ALLOWED_KEYS = {
@@ -186,6 +278,15 @@ _ALLOWED_KEYS = {
     "hard-refresh",
     "diag-chip",
     "embed-menu",
+    "pockettts-dashboard",
+    "pockettts-config",
+    "pockettts-voices",
+    "pockettts-cloning",
+    "pockettts-tags",
+    "pockettts-texts",
+    "pockettts-matrix",
+    "pockettts-monitor",
+    "pockettts-test",
 }
 
 
@@ -225,7 +326,7 @@ def _row_to_dict(row) -> dict:
 
 @router.get("", response_model=list[EmbedMenuItemOut])
 async def list_embed_menu_items(
-    context: str = Query(default=None, description="Filter by menu_context (embed/fallback-ui/db)")
+    context: str = Query(default=None, description="Filter by menu_context (embed/fallback-ui/db/pockettts)")
 ) -> list[EmbedMenuItemOut]:
     with get_conn() as conn:
         if context and context in _VALID_CONTEXTS:
@@ -249,7 +350,7 @@ async def list_embed_menu_items(
 
 @router.get("/config")
 async def get_embed_menu_config(
-    context: str = Query(default="embed", description="menu_context: embed / fallback-ui / db"),
+    context: str = Query(default="embed", description="menu_context: embed / fallback-ui / db / pockettts"),
 ) -> dict:
     """Return sanitized selector pages payload with icon/label/sound metadata.
 
