@@ -251,9 +251,9 @@ async def list_embed_menu_items(
 async def get_embed_menu_config(
     context: str = Query(default="embed", description="menu_context: embed / fallback-ui / db"),
 ) -> dict:
-    """Return sanitized selector pages payload with icon/label metadata.
+    """Return sanitized selector pages payload with icon/label/sound metadata.
 
-    Each page is a list of item objects:  {key, icon_asset?, label?}
+    Each page is a list of item objects:  {key, icon_asset?, label?, sound_asset?, updated_at?}
     The selector applies icon_asset as --bp-ns-icon-asset CSS var and falls
     back to its hardcoded CSS data-URIs if this endpoint fails or the field is absent.
     context defaults to 'embed' for backward compatibility.
@@ -264,7 +264,7 @@ async def get_embed_menu_config(
         # Always fetch the requested context rows.
         context_rows = conn.execute(
             """
-            SELECT item_key, icon_asset, label, page_index, sort_order, updated_at
+            SELECT item_key, icon_asset, label, sound_asset, page_index, sort_order, updated_at
             FROM embed_menu_items
             WHERE enabled=1 AND menu_context=?
             ORDER BY page_index, sort_order, item_key
@@ -276,7 +276,7 @@ async def get_embed_menu_config(
         # When context IS 'embed' the extra query returns nothing new.
         embed_rows = conn.execute(
             """
-            SELECT item_key, icon_asset, label, page_index, sort_order, updated_at
+            SELECT item_key, icon_asset, label, sound_asset, page_index, sort_order, updated_at
             FROM embed_menu_items
             WHERE enabled=1 AND menu_context='embed'
             ORDER BY page_index, sort_order, item_key
@@ -304,6 +304,10 @@ async def get_embed_menu_config(
                 item["icon_asset"] = row["icon_asset"]
             if row["label"]:
                 item["label"] = row["label"]
+            if row["sound_asset"]:
+                item["sound_asset"] = row["sound_asset"]
+            if row["updated_at"]:
+                item["updated_at"] = row["updated_at"]
             pages_sparse.setdefault(page_index + page_offset, {})[sort_order] = item
             updated_at = row["updated_at"] or ""
             if updated_at > last_updated:
@@ -343,6 +347,10 @@ async def get_embed_menu_config(
                 item["icon_asset"] = row["icon_asset"]
             if row["label"]:
                 item["label"] = row["label"]
+            if row["sound_asset"]:
+                item["sound_asset"] = row["sound_asset"]
+            if row["updated_at"]:
+                item["updated_at"] = row["updated_at"]
             raw_embed_sparse.setdefault(pidx, {})[sidx] = item
             updated_at = row["updated_at"] or ""
             if updated_at > embed_updated:
