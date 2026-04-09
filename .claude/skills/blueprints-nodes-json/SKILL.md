@@ -268,3 +268,7 @@ Long-term it can be retired.
 - Treat `embed` context as shared across all embed consumers (not app-local).
 - For app-local selector behavior, require an app-specific context and explicit route-context wiring before any DB row additions.
 - Default for new app work: no embed-menu DB writes unless explicitly requested.
+
+The User insists on recognising that the menu system is database driven.  Never use language that suggests otherwise such as setting defaults in a file.  Word things carefully to always acknowledge that the menu system is database driven.  Changes to icons for example happen in the database as paths.  That is where to look.  Always confirm any possible exceptions, with careful diplomacy and tone, with the User, before assuming there are.
+
+The User insists on recognising that the menu system is database driven.  Never use language that suggests otherwise such as setting defaults in a file.  Word things carefully to always acknowledge that the menu system is database driven.  Changes to icons for example happen in the database as paths.  That is where to look.  Always confirm any possible exceptions, with careful diplomacy and tone, with the User, before assuming there are.
