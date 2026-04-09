@@ -55,6 +55,7 @@ class SpeakRequest(BaseModel):
     format: str | None = None
     event_kind: str | None = None
     fallback_kind: str | None = None
+    sentiment: str | None = None
 
 
 class StopRequest(BaseModel):
@@ -99,6 +100,13 @@ def _resolve_fallback_file(path_value: str) -> Path:
         return Path(raw)
     # Database stores asset-relative paths such as sounds/foo.mp3.
     return Path(cfg.REPO_NON_ROOT_PATH) / "gui-fallback" / "assets" / raw
+
+
+def _resolve_fallback_kind(body: SpeakRequest, default_kind: str = "positive") -> str:
+    raw = (body.fallback_kind or body.sentiment or default_kind or "positive").strip().lower()
+    if raw in {"negative", "neg", "error", "fail", "failure"}:
+        return "negative"
+    return "positive"
 
 
 def _fallback_response(
@@ -242,7 +250,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
                 },
             )
 
-        fallback_kind = (body.fallback_kind or "positive").strip().lower()
+        fallback_kind = _resolve_fallback_kind(body, default_kind="positive")
         return _fallback_response(
             settings=settings,
             fallback_kind=fallback_kind,
@@ -262,7 +270,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
         "stream": effective_mode == "stream",
     }
 
-    fallback_kind = (body.fallback_kind or "negative").strip().lower()
+    fallback_kind = _resolve_fallback_kind(body, default_kind="positive")
     client = httpx.AsyncClient(timeout=timeout_ms / 1000.0)
     resp = None
     try:
