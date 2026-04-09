@@ -263,6 +263,16 @@ _DEFAULT_SEED = [
         "menu_context": "pockettts",
     },
     {
+        "item_key": "pockettts-test2",
+        "label": "Test2 Page",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/eye-of-horus-gold.svg",
+        "page_index": 2,
+        "sort_order": 3,
+        "enabled": 1,
+        "menu_context": "pockettts",
+    },
+    {
         "item_key": "pockettts-hard-refresh",
         "label": "Hard Refresh",
         "icon_emoji": "",
@@ -297,6 +307,7 @@ _ALLOWED_KEYS = {
     "pockettts-matrix",
     "pockettts-monitor",
     "pockettts-test",
+    "pockettts-test2",
     "pockettts-hard-refresh",
 }
 

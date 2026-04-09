@@ -64,6 +64,7 @@ from .routes_form_controls import router as form_controls_router
 from .routes_nav_items import router as nav_items_router
 from .routes_embed_menu_items import router as embed_menu_items_router
 from .routes_pockettts import router as pockettts_router
+from .routes_tts import router as tts_router
 from .routes_pwa import router as pwa_router
 from .routes_table_layouts import router as table_layouts_router
 from .routes_ui_cache import router as ui_cache_router
@@ -336,6 +337,7 @@ def create_app() -> FastAPI:
     application.include_router(nav_items_router,               prefix="/api/v1")
     application.include_router(embed_menu_items_router,        prefix="/api/v1")
     application.include_router(pockettts_router,               prefix="/api/v1")
+    application.include_router(tts_router,                     prefix="/api/v1")
     application.include_router(pwa_router,                     prefix="/api/v1")
     application.include_router(table_layouts_router,           prefix="/api/v1")
     application.include_router(ui_cache_router,                prefix="/api/v1")
