@@ -37,6 +37,7 @@ Before changing shared table behavior, read the relevant node-local docs first:
 
 - `/xarta-node/.lone-wolf/docs/web-design/TABLE-MIGRATION.md` for moving a page-local table onto the shared frontend table layer
 - `/xarta-node/.lone-wolf/docs/web-design/TABLE-BUCKET-MIGRATION.md` for moving an already-shared table onto `table_layout_catalog` and `table_layouts`
+- `/xarta-node/.lone-wolf/docs/web-design/TABLE-BUCKET-MIGRATION-BOOKMARKS.md` for the completed bookmarks migration (browse/14, search/19, visits/15) — includes all implementation records, verification steps, and post-migration additions
 - `/xarta-node/.lone-wolf/docs/web-design/COLUMN-SIZE-INDEXING.md` for the canonical `RRUUTTBB` bucket contract
 
 If the target is the Nav Items or Form Controls system, read these too before changing storage or layout behavior:

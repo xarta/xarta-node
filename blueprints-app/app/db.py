@@ -746,6 +746,13 @@ _TABLE_LAYOUT_CATALOG_SEED = [
         "dom_table_id": "em-table",
         "tab_id": "embed-menu",
     }),
+    ("19", "bookmarks-search", {
+        "display_name": "Bookmarks Search",
+        "sql_table": "bookmarks",
+        "table_kind": "table",
+        "dom_table_id": "bm-table",
+        "tab_id": "bookmarks-main",
+    }),
 ]
 
 _SEED_SQL = """
