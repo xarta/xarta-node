@@ -284,6 +284,18 @@ CERT_CONFIGS: dict[str, dict] = {
             "Installed into the system trust store on upload."
         ),
     },
+    "cert_ca_intermediate": {
+        "label": "Caddy CA Intermediate (Optional)",
+        "env_var": "CERT_CA_INTERMEDIATE",
+        "default_name": "caddy-ca-intermediate.crt",
+        "mode": 0o644,
+        "kind": "ca",
+        "group": "caddy",
+        "description": (
+            "Optional intermediate CA for the Caddy TLS chain. "
+            "Installed into the system trust store on upload when provided."
+        ),
+    },
     "caddy_cert": {
         "label": "Caddy Server Cert",
         "env_var": "CERT_FILE",

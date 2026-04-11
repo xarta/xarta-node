@@ -100,6 +100,14 @@ install_ca() {
     echo -e "    ${YELLOW}Tip:${NC} Export ${ca_cert} and import it into client browsers / OS trust stores."
 }
 
+# Install optional intermediate CA if configured and present.
+install_optional_intermediate_ca() {
+    local int_ca="${CERT_CA_INTERMEDIATE:-}"
+    if [[ -n "$int_ca" && -f "$int_ca" ]]; then
+        install_ca "$int_ca"
+    fi
+}
+
 # Find a CA cert+key pair in CERTS_DIR that can be used for signing.
 # Sets CA_SIGN_CERT and CA_SIGN_KEY globals. Returns 0 if found, 1 if not.
 CA_SIGN_CERT=""
@@ -162,6 +170,7 @@ if [[ -n "${CERT_FILE:-}" && -n "${CERT_KEY:-}" ]]; then
         # Ensure CA is installed in system trust store even if cert hasn't changed.
         if [[ -n "${CERT_CA:-}" && -f "${CERT_CA}" ]]; then
             install_ca "$CERT_CA"
+            install_optional_intermediate_ca
             echo ""
         fi
         echo "No changes needed."
@@ -235,8 +244,17 @@ if [[ -n "$selected_cert" ]]; then
     env_set "CERT_KEY"  "$selected_key"
     if [[ -n "$selected_ca" ]]; then
         env_set "CERT_CA" "$selected_ca"
+
+        # If an adjacent intermediate exists, set optional env var for consistency.
+        selected_ca_dir="$(dirname "$selected_ca")"
+        guess_int_generic="$selected_ca_dir/caddy-ca-intermediate.crt"
+        if [[ -f "$guess_int_generic" ]]; then
+            env_set "CERT_CA_INTERMEDIATE" "$guess_int_generic"
+        fi
+
         echo ""
         install_ca "$selected_ca"
+        install_optional_intermediate_ca
     fi
     echo ""
     echo -e "${GREEN}Done.${NC}"
@@ -390,6 +408,7 @@ echo ""
 
 # ── Install CA into system trust store ────────────────────────────────────────
 install_ca "$CA_SIGN_CERT"
+install_optional_intermediate_ca
 echo ""
 
 # ── Update .env ───────────────────────────────────────────────────────────────
@@ -397,6 +416,11 @@ echo "Updating .env..."
 env_set "CERT_FILE" "$NEW_CERT"
 env_set "CERT_KEY"  "$NEW_KEY"
 env_set "CERT_CA"   "$CA_SIGN_CERT"
+
+guess_int="$(dirname "$CA_SIGN_CERT")/caddy-ca-intermediate.crt"
+if [[ -f "$guess_int" ]]; then
+    env_set "CERT_CA_INTERMEDIATE" "$guess_int"
+fi
 echo ""
 
 echo -e "${GREEN}Done.${NC}"

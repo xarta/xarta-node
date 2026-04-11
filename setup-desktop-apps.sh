@@ -30,6 +30,7 @@ CODE_LIST="/etc/apt/sources.list.d/vscode.list"
 XARTA_USER="${XARTA_USER:-xarta}"
 XARTA_HOME="${XARTA_HOME:-/home/$XARTA_USER}"
 CERT_CA="${CERT_CA:-}"
+CERT_CA_INTERMEDIATE="${CERT_CA_INTERMEDIATE:-}"
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -105,6 +106,7 @@ apt-get install -y microsoft-edge-stable code
 dpkg --configure -a >/dev/null 2>&1 || true
 
 import_ca_into_nss "$CERT_CA" "$XARTA_USER" "$XARTA_HOME"
+import_ca_into_nss "$CERT_CA_INTERMEDIATE" "$XARTA_USER" "$XARTA_HOME"
 
 echo ""
 echo -e "${GREEN}Done.${NC}"
