@@ -174,6 +174,15 @@ if [[ ${#TOOLS_NEEDED[@]} -gt 0 ]]; then
 fi
 echo "    ok"
 
+# ── 2c. Ensure Python dev tools are available ─────────────────────────────
+echo "--- checking Python dev tools (uv, ruff)..."
+if [[ -x "$SCRIPT_DIR/setup-python-dev-tools.sh" ]]; then
+    "$SCRIPT_DIR/setup-python-dev-tools.sh"
+else
+    echo "    warning: setup-python-dev-tools.sh not found or not executable; skipping uv/ruff install"
+fi
+echo "    ok"
+
 # ── 3. Create venv ────────────────────────────────────────────────────────────
 # Remove broken venv (created before python3-venv package was available)
 if [[ -d "$VENV_DIR" && ! -f "$VENV_DIR/bin/pip" ]]; then

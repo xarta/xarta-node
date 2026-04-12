@@ -1,0 +1,43 @@
+# ruff.toml — Ruff linter + formatter configuration for xarta-node
+# Docs: https://docs.astral.sh/ruff/configuration/
+# Installed via: bash setup-python-dev-tools.sh
+
+# Exclude paths that should not be linted.
+exclude = [
+    ".git",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    # Runtime venv is outside the repo, but guard anyway
+    "/opt",
+]
+
+# Match the app's Python requirement from setup-blueprints.sh
+target-version = "py311"
+
+# Black-compatible line length
+line-length = 100
+indent-width = 4
+
+[lint]
+# Essentials: pycodestyle errors, Pyflakes, and import sorting.
+# Expand carefully — review each new rule category against existing code first.
+select = ["E", "F", "W", "I"]
+
+# Globally ignored rules:
+#   E501 — line-too-long: formatter handles this; noisy in docstrings
+#   W503/W504 — line break before/after binary operator: style preference
+ignore = ["E501"]
+
+# Allow autofix for all selected rules
+fixable = ["ALL"]
+unfixable = []
+
+[format]
+# Black-compatible defaults
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
