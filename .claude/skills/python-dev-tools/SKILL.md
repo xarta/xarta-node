@@ -93,16 +93,35 @@ uv self update
 
 ## uv and the blueprints venv
 
-The Blueprints app venv at `/opt/blueprints/venv` is managed by pip via `setup-blueprints.sh`.
-It is **not** a uv-managed project. `uv pip` can be used as a drop-in replacement for pip operations
-against it if desired:
+**As of 2026-04-12:** The Blueprints app dependency management has migrated to uv.
+
+The Blueprints app now uses:
+- **`pyproject.toml`** — project configuration with all dependencies pinned
+- **`uv.lock`** — reproducible lock file (committed to git)
+- **`setup-blueprints-uv.sh`** — setup script using `uv sync --frozen`
+- **Venv location:** `/root/xarta-node/.venv` (project root, uv convention)
+
+### Setup Blueprints App (uv-based)
 
 ```bash
-uv pip install --python /opt/blueprints/venv/bin/python -r blueprints-app/requirements.txt
+cd /root/xarta-node
+uv sync --frozen     # Install exactly what's in uv.lock
 ```
 
-Do not use `uv sync` or `uv add` against the Blueprints venv — those are for uv-managed projects
-with `pyproject.toml` + lockfiles, not the existing setup.
+### Lock File Discipline
+
+Always regenerate `uv.lock` before committing any change to `pyproject.toml`:
+
+```bash
+uv lock                         # Regenerate from pyproject.toml
+git add pyproject.toml uv.lock
+git commit -m "Update dependencies: ..."
+```
+
+### Backward Compatibility
+
+The old pip-based `setup-blueprints.sh` remains in the repo for compatibility.
+Both scripts work; the uv script takes precedence if `pyproject.toml` is present.
 
 ## Running utility scripts ephemerally
 

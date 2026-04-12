@@ -1,0 +1,53 @@
+[project]
+name = "blueprints-app"
+version = "1.0.0"
+description = "xarta-node distributed service index and fleet sync engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "xarta-node operators"},
+]
+
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "pydantic>=2.0.0",
+    "aiofiles>=24.0.0",
+    "httpx>=0.28.0",
+    "python-multipart>=0.0.9",
+    "pyseekdb==1.1.0.post3",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.28.0",
+]
+
+[tool.uv]
+# Managed by uv — lock file generation with uv sync
+managed = true
+
+[tool.uv.sources]
+# Can add git sources or path sources here if needed in the future
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
