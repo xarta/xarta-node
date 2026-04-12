@@ -69,6 +69,24 @@ chown_like() {
     fi
 }
 
+link_target_for_dir() {
+    local link_dir="$1"
+    local target_path="$2"
+
+    # Prefer relative symlinks so tracked repo links do not drift to absolute paths.
+    if [[ "$target_path" = /* ]] && command -v realpath >/dev/null 2>&1; then
+        local rel
+        if rel="$(realpath --relative-to="$link_dir" "$target_path" 2>/dev/null)"; then
+            if [[ "$rel" != /* ]]; then
+                printf '%s\n' "$rel"
+                return
+            fi
+        fi
+    fi
+
+    printf '%s\n' "$target_path"
+}
+
 echo "GUI dir  : $BLUEPRINTS_GUI_DIR"
 echo "Fallback : $BLUEPRINTS_FALLBACK_GUI_DIR"
 echo "Shared DB: $BLUEPRINTS_SHARED_DB_DIR"
@@ -128,16 +146,18 @@ echo "    ok: $BLUEPRINTS_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
 # /fallback-ui.  It needs the same embed component symlink.
 echo "--- linking gui-embed into gui-fallback directory..."
 rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
-ln -s "$BLUEPRINTS_EMBED_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
+_fallback_embed_target="$(link_target_for_dir "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_EMBED_DIR")"
+ln -s "$_fallback_embed_target" "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
 chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/embed"
-echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/embed -> $BLUEPRINTS_EMBED_DIR"
+echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/embed -> $_fallback_embed_target"
 
 # Also expose shared db pages under /fallback-ui/db.
 echo "--- linking gui-db into gui-fallback directory..."
 rm -rf "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
-ln -s "$BLUEPRINTS_SHARED_DB_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
+_fallback_db_target="$(link_target_for_dir "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_SHARED_DB_DIR")"
+ln -s "$_fallback_db_target" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
 chown_like "$BLUEPRINTS_FALLBACK_GUI_DIR" "$BLUEPRINTS_FALLBACK_GUI_DIR/db"
-echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/db -> $BLUEPRINTS_SHARED_DB_DIR"
+echo "    ok: $BLUEPRINTS_FALLBACK_GUI_DIR/db -> $_fallback_db_target"
 
 # Also expose shared assets under /fallback-ui/assets.
 echo "--- linking assets into gui-fallback directory..."
