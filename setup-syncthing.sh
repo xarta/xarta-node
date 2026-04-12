@@ -90,6 +90,11 @@ SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set
 #   - raw IP/host (auto-converted to tcp://<value>:22000)
 #   - full Syncthing address (e.g. tcp://<windows-ip>:22000)
 SYNCTHING_EXTRA_DEVICES_JSON="${SYNCTHING_EXTRA_DEVICES_JSON:-[]}"
+# Optional JSON object mapping folder IDs to extra external device IDs that
+# should be included in the folder's device membership on rerun.
+# Example:
+#   SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON='{"xarta-node-docs":["AAAA...","BBBB..."]}'
+SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON="${SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON:-{}}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 env_set() {
@@ -363,20 +368,21 @@ Args (positional):
     docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
     tts_voices_dir  — shared TTS voices root (e.g. /xarta-node/.lone-wolf/syncthing/tts/voices)
     extra_devices_json — JSON array of external/non-fleet Syncthing devices
+    extra_folder_device_ids_json — JSON object: folder_id -> [device_id,...]
 """
 import sys
 import json
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 12:
+if len(sys.argv) != 13:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <extra_devices_json>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <extra_devices_json> <extra_folder_device_ids_json>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
  gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir,
- extra_devices_json) = sys.argv[1:]
+ extra_devices_json, extra_folder_device_ids_json) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -396,6 +402,25 @@ except json.JSONDecodeError as exc:
 
 if not isinstance(extra_devices, list):
     print("ERROR: SYNCTHING_EXTRA_DEVICES_JSON must be a JSON array", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    extra_folder_device_ids = (
+        json.loads(extra_folder_device_ids_json)
+        if extra_folder_device_ids_json.strip() else {}
+    )
+except json.JSONDecodeError as exc:
+    print(
+        f"ERROR: SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON is invalid JSON: {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if not isinstance(extra_folder_device_ids, dict):
+    print(
+        "ERROR: SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON must be a JSON object",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 tree = ET.parse(config_path)
@@ -557,7 +582,45 @@ for fid in ('xarta-icons', 'xarta-sounds', 'xarta-fonts', 'xarta-node-docs', 'xa
 all_device_ids = [own_device_id] + peer_device_ids
 
 
-def add_folder(fid, label, path):
+folder_extra_applied = {}
+folder_extra_skipped = []
+
+
+def folder_extra_ids(folder_id):
+    """Return valid extra device IDs for a managed folder."""
+    raw = extra_folder_device_ids.get(folder_id, [])
+    if isinstance(raw, str):
+        candidates = [raw]
+    elif isinstance(raw, list):
+        candidates = raw
+    else:
+        candidates = []
+
+    out = []
+    for val in candidates:
+        sid = str(val).strip()
+        if not sid:
+            continue
+        if sid not in device_ids_seen:
+            folder_extra_skipped.append(f"{folder_id}:{sid}")
+            continue
+        if sid not in out:
+            out.append(sid)
+
+    if out:
+        folder_extra_applied[folder_id] = out
+    return out
+
+
+def add_folder(fid, label, path, extra_ids=None):
+    if extra_ids is None:
+        extra_ids = []
+
+    folder_device_ids = []
+    for did in all_device_ids + list(extra_ids):
+        if did not in folder_device_ids:
+            folder_device_ids.append(did)
+
     f = ET.SubElement(root, 'folder')
     f.set('id', fid)
     f.set('label', label)
@@ -568,7 +631,7 @@ def add_folder(fid, label, path):
     f.set('fsWatcherDelayS', '10')
     f.set('autoNormalize', 'true')
     f.set('paused', 'false')
-    for did in all_device_ids:
+    for did in folder_device_ids:
         d = ET.SubElement(f, 'device')
         d.set('id', did)
         d.set('introducedBy', '')
@@ -577,15 +640,20 @@ def add_folder(fid, label, path):
 
 
 add_folder('xarta-icons', 'Assets - Icons',
-           assets_dir + '/icons')
+           assets_dir + '/icons',
+           folder_extra_ids('xarta-icons'))
 add_folder('xarta-sounds', 'Assets - Sounds',
-           assets_dir + '/sounds')
+           assets_dir + '/sounds',
+           folder_extra_ids('xarta-sounds'))
 add_folder('xarta-fonts', 'Assets - Fonts',
-           assets_dir + '/fonts')
+           assets_dir + '/fonts',
+           folder_extra_ids('xarta-fonts'))
 add_folder('xarta-node-docs', 'xarta-node-docs',
-           docs_dir)
+           docs_dir,
+           folder_extra_ids('xarta-node-docs'))
 add_folder('xarta-tts-voices', 'tts-voices',
-           tts_voices_dir)
+           tts_voices_dir,
+           folder_extra_ids('xarta-tts-voices'))
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 ET.indent(tree, space='    ')
@@ -602,6 +670,11 @@ if extra_added:
     print(f"    External IDs added: {', '.join(extra_added)}")
 if extra_skipped:
     print(f"    External entries skipped: {', '.join(extra_skipped)}")
+if folder_extra_applied:
+    for fid, ids in folder_extra_applied.items():
+        print(f"    Folder extra members [{fid}]: {', '.join(ids)}")
+if folder_extra_skipped:
+    print(f"    Folder extra entries skipped: {', '.join(folder_extra_skipped)}")
 PYEOF
 
 python3 "$TMPPY" \
@@ -615,7 +688,8 @@ python3 "$TMPPY" \
     "$BLUEPRINTS_ASSETS_DIR" \
     "$BLUEPRINTS_DOCS_DIR" \
     "$BLUEPRINTS_TTS_VOICES_DIR" \
-    "$SYNCTHING_EXTRA_DEVICES_JSON"
+    "$SYNCTHING_EXTRA_DEVICES_JSON" \
+    "$SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
