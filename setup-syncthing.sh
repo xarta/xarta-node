@@ -82,6 +82,14 @@ BLUEPRINTS_TTS_VOICES_DIR="${BLUEPRINTS_TTS_VOICES_DIR:-/xarta-node/.lone-wolf/s
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
+# Optional JSON array of non-fleet Syncthing devices to keep in config.
+# Example:
+#   SYNCTHING_EXTRA_DEVICES_JSON='[{"device_id":"AAAA...","name":"my-windows","addresses":["<windows-ip>","dynamic"]}]'
+# Address values may be:
+#   - "dynamic"
+#   - raw IP/host (auto-converted to tcp://<value>:22000)
+#   - full Syncthing address (e.g. tcp://<windows-ip>:22000)
+SYNCTHING_EXTRA_DEVICES_JSON="${SYNCTHING_EXTRA_DEVICES_JSON:-[]}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 env_set() {
@@ -354,19 +362,21 @@ Args (positional):
     assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
     docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
     tts_voices_dir  — shared TTS voices root (e.g. /xarta-node/.lone-wolf/syncthing/tts/voices)
+    extra_devices_json — JSON array of external/non-fleet Syncthing devices
 """
 import sys
 import json
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 11:
+if len(sys.argv) != 12:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <extra_devices_json>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
- gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir) = sys.argv[1:]
+ gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir,
+ extra_devices_json) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -377,6 +387,16 @@ if own_node is None:
     sys.exit(1)
 
 peers = [n for n in nodes if n['node_id'] != node_id]
+
+try:
+    extra_devices = json.loads(extra_devices_json) if extra_devices_json.strip() else []
+except json.JSONDecodeError as exc:
+    print(f"ERROR: SYNCTHING_EXTRA_DEVICES_JSON is invalid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(extra_devices, list):
+    print("ERROR: SYNCTHING_EXTRA_DEVICES_JSON must be a JSON array", file=sys.stderr)
+    sys.exit(1)
 
 tree = ET.parse(config_path)
 root = tree.getroot()
@@ -439,6 +459,7 @@ ET.SubElement(own_dev, 'address').text = 'dynamic'
 # On pass 1 (device IDs not yet known) these are all skipped; that is expected.
 peer_device_ids = []
 skipped_peers = []
+device_ids_seen = {own_device_id}
 for peer in peers:
     dev_id = peer.get('syncthing_device_id', '').strip()
     if not dev_id:
@@ -456,6 +477,75 @@ for peer in peers:
         f'tcp://{ip}:22000' if ip else 'dynamic'
     )
     peer_device_ids.append(dev_id)
+    device_ids_seen.add(dev_id)
+
+
+def normalize_addresses(raw):
+    """Convert address value(s) into Syncthing address entries."""
+    if raw is None:
+        return ['dynamic']
+
+    if isinstance(raw, str):
+        candidates = [raw]
+    elif isinstance(raw, list):
+        candidates = raw
+    else:
+        return ['dynamic']
+
+    out = []
+    for val in candidates:
+        if not isinstance(val, str):
+            continue
+        s = val.strip()
+        if not s:
+            continue
+        if s == 'dynamic':
+            out.append('dynamic')
+        elif '://' in s:
+            out.append(s)
+        else:
+            out.append(f'tcp://{s}:22000')
+
+    if not out:
+        return ['dynamic']
+    return out
+
+
+extra_added = []
+extra_skipped = []
+for item in extra_devices:
+    if not isinstance(item, dict):
+        extra_skipped.append('<non-object-entry>')
+        continue
+
+    dev_id = str(
+        item.get('device_id') or item.get('deviceID') or item.get('id') or ''
+    ).strip()
+    if not dev_id:
+        extra_skipped.append('<missing-device-id>')
+        continue
+
+    if dev_id in device_ids_seen:
+        extra_skipped.append(dev_id)
+        continue
+
+    name = str(item.get('name') or f'external-{dev_id[:7]}').strip()
+    if not name:
+        name = f'external-{dev_id[:7]}'
+
+    dev = ET.SubElement(root, 'device')
+    dev.set('id', dev_id)
+    dev.set('name', name)
+    dev.set('compression', 'metadata')
+    dev.set('introduceClients', 'false')
+    dev.set('skipIntroductionRemovals', 'false')
+    dev.set('introducedBy', '')
+
+    for addr in normalize_addresses(item.get('addresses', item.get('address'))):
+        ET.SubElement(dev, 'address').text = addr
+
+    extra_added.append(dev_id)
+    device_ids_seen.add(dev_id)
 
 # ── Shared Folders ────────────────────────────────────────────────────────────
 # Remove all known managed folders plus the Syncthing default folder (which
@@ -507,6 +597,11 @@ print(f"    Own device:       {own_device_id}")
 print(f"    Peers configured: {len(peer_device_ids)} of {len(peers)}")
 if skipped_peers:
     print(f"    Skipped (no device ID yet): {', '.join(skipped_peers)}")
+print(f"    External devices added: {len(extra_added)}")
+if extra_added:
+    print(f"    External IDs added: {', '.join(extra_added)}")
+if extra_skipped:
+    print(f"    External entries skipped: {', '.join(extra_skipped)}")
 PYEOF
 
 python3 "$TMPPY" \
@@ -519,7 +614,8 @@ python3 "$TMPPY" \
     "$SYNCTHING_API_KEY" \
     "$BLUEPRINTS_ASSETS_DIR" \
     "$BLUEPRINTS_DOCS_DIR" \
-    "$BLUEPRINTS_TTS_VOICES_DIR"
+    "$BLUEPRINTS_TTS_VOICES_DIR" \
+    "$SYNCTHING_EXTRA_DEVICES_JSON"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
