@@ -50,4 +50,19 @@ fi
 echo "[pre-commit] Running public leak check..."
 bash "$REPO_ROOT/check-for-leaks.sh"
 
+# ── Ruff: lint staged Python files ───────────────────────────────────────────
+mapfile -t STAGED_PY < <(git diff --cached --name-only --diff-filter=ACMR | grep '\.py$' || true)
+
+if [[ ${#STAGED_PY[@]} -gt 0 ]]; then
+  if command -v ruff >/dev/null 2>&1; then
+    echo "[pre-commit] Running ruff check on ${#STAGED_PY[@]} staged Python file(s)..."
+    ruff check "${STAGED_PY[@]}" || {
+      echo "[pre-commit] BLOCKED: ruff found lint errors. Fix them or use 'git commit --no-verify' to skip." >&2
+      exit 1
+    }
+  else
+    echo "[pre-commit] WARN: ruff not found — skipping lint (run setup-python-dev-tools.sh)" >&2
+  fi
+fi
+
 echo "[pre-commit] OK"
