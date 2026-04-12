@@ -1,0 +1,19 @@
+[Unit]
+Description=Blueprints App (xarta-node) - uv-based
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/xarta-node/blueprints-app
+EnvironmentFile=__ENV_FILE__
+# uv-based setup uses .venv in project root (recommended)
+ExecStart=/root/xarta-node/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
