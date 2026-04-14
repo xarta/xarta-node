@@ -284,36 +284,14 @@ _DEFAULT_SEED = [
     },
 ]
 
-_ALLOWED_KEYS = {
-    "fallback-ui",
-    "ui",
-    "synthesis",
-    "probes",
-    "settings",
-    "database-tables",
-    "database-diagram",
-    "api-key",
-    "api-key-test",
-    "cache-mode",
-    "hard-refresh",
-    "diag-chip",
-    "embed-menu",
-    "pockettts-dashboard",
-    "pockettts-config",
-    "pockettts-voices",
-    "pockettts-cloning",
-    "pockettts-tags",
-    "pockettts-texts",
-    "pockettts-matrix",
-    "pockettts-monitor",
-    "pockettts-test",
-    "pockettts-test2",
-    "pockettts-hard-refresh",
-}
+# _ALLOWED_KEYS was removed — the server returns all enabled DB items as-is.
+# The JS selector (_sanitizeDbPages) already filters against BUTTON_DEFS on the
+# client side. A server-side duplicate list causes "button in DB but not showing"
+# bugs every time a new key is added without touching this file.
 
 
 def _row_to_out(row) -> EmbedMenuItemOut:
-    item_id = row["item_id"] if row["item_id"] else gen_uuid()
+    item_id = row["item_id"] if row["item_id"] else str(uuid.uuid4())
     item_key = row["item_key"] if row["item_key"] is not None else ""
     label = row["label"] if row["label"] is not None else ""
     menu_context = row["menu_context"] if "menu_context" in row.keys() and row["menu_context"] else "embed"
@@ -419,7 +397,7 @@ async def get_embed_menu_config(
         seen_keys: set[str] = set()
         for row in rows:
             key = row["item_key"]
-            if key not in _ALLOWED_KEYS or key in seen_keys:
+            if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
             page_index = row["page_index"] if isinstance(row["page_index"], int) else 0
@@ -463,7 +441,7 @@ async def get_embed_menu_config(
         raw_embed_sparse: dict[int, dict[int, dict]] = {}
         for row in embed_rows:
             key = row["item_key"]
-            if key not in _ALLOWED_KEYS or key in ctx_keys:
+            if not key or key in ctx_keys:
                 continue
             pidx = row["page_index"] if isinstance(row["page_index"], int) else 0
             sidx = row["sort_order"] if isinstance(row["sort_order"], int) else 0
@@ -531,9 +509,7 @@ async def update_embed_menu_item(item_id: str, body: EmbedMenuItemUpdate) -> Emb
         if next_enabled not in (0, 1):
             raise HTTPException(400, "enabled must be 0 or 1")
 
-        next_item_key = existing["item_key"]
-        if next_item_key not in _ALLOWED_KEYS:
-            raise HTTPException(400, f"unsupported item_key '{next_item_key}'")
+        # next_item_key = existing["item_key"]
 
         conn.execute(
             """
