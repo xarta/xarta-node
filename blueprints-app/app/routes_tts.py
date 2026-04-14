@@ -106,6 +106,8 @@ def _resolve_fallback_kind(body: SpeakRequest, default_kind: str = "positive") -
     raw = (body.fallback_kind or body.sentiment or default_kind or "positive").strip().lower()
     if raw in {"negative", "neg", "error", "fail", "failure"}:
         return "negative"
+    if raw in {"neutral", "info", "acknowledge", "ack"}:
+        return "neutral"
     return "positive"
 
 
@@ -120,6 +122,8 @@ def _fallback_response(
 ) -> FileResponse | JSONResponse:
     if fallback_kind == "negative":
         fallback_path = settings.get("tts.fallback.negative_sound_path", "")
+    elif fallback_kind == "neutral":
+        fallback_path = settings.get("tts.fallback.neutral_sound_path", "")
     else:
         fallback_path = settings.get("tts.fallback.positive_sound_path", "")
 
