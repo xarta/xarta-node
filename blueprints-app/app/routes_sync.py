@@ -456,8 +456,9 @@ def _table_content_hash(table_name: str) -> dict:
     """Return row_count + SHA-256 digest of sorted serialised row data for a table."""
     if table_name not in _ALLOWED_TABLES:
         raise HTTPException(400, f"Table '{table_name}' is not in the syncable table list")
+    pk_col = _pk_for_table(table_name)
     with get_conn() as conn:
-        rows = conn.execute(f"SELECT * FROM {table_name} ORDER BY rowid").fetchall()
+        rows = conn.execute(f"SELECT * FROM {table_name} ORDER BY {pk_col}").fetchall()
     row_count = len(rows)
     h = hashlib.sha256()
     for row in rows:
