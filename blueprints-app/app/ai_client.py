@@ -38,6 +38,7 @@ Three call-time options:
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -64,6 +65,22 @@ def _split_think(text: str) -> dict[str, str]:
 
 
 # ── Provider lookup ───────────────────────────────────────────────────────────
+
+
+def _apply_local_litellm_override(provider: dict[str, Any]) -> dict[str, Any]:
+    """Use node-local LiteLLM transport for the stable local aliases when configured."""
+    model_name = str(provider.get("model_name") or "").strip().upper()
+    if not model_name.startswith(("PRIMARY-LOCAL", "EMBEDDINGS-LOCAL", "RERANKER-LOCAL")):
+        return provider
+    base_url = (os.getenv("LITELLM_BASE_URL") or "").strip()
+    api_key = (os.getenv("LITELLM_API_KEY") or "").strip()
+    if not base_url:
+        return provider
+    updated = dict(provider)
+    updated["base_url"] = base_url
+    if api_key:
+        updated["api_key"] = api_key
+    return updated
 
 
 def _get_provider(project_name: str, role: str) -> dict[str, Any]:
@@ -98,7 +115,7 @@ def _get_provider(project_name: str, role: str) -> dict[str, Any]:
         provider["_opts"] = json.loads(raw_opts)
     except (json.JSONDecodeError, TypeError):
         provider["_opts"] = {}
-    return provider
+    return _apply_local_litellm_override(provider)
 
 
 def _http_client(provider: dict) -> httpx.AsyncClient:
