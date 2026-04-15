@@ -1,15 +1,18 @@
 """
 routes_sync.py — endpoints that implement the Layer 1 + Layer 2 sync protocol.
 
-POST /api/v1/sync/actions   — receive a batch of CRUD actions from a peer
-                             (commit guard: rejects DB writes from older commits)
-POST /api/v1/sync/restore   — receive a full DB backup zip (Layer 1) + SHA-256
-GET  /api/v1/sync/export    — serve the current DB backup zip for a peer to pull
-GET  /api/v1/sync/status    — current sync state summary
-POST /api/v1/sync/git-pull  — trigger a git pull on this node + queue for peers
+POST /api/v1/sync/actions             — receive a batch of CRUD actions from a peer
+                                       (commit guard: rejects DB writes from older commits)
+POST /api/v1/sync/restore             — receive a full DB backup zip (Layer 1) + SHA-256
+GET  /api/v1/sync/export              — serve the current DB backup zip for a peer to pull
+GET  /api/v1/sync/status              — current sync state summary
+POST /api/v1/sync/git-pull            — trigger a git pull on this node + queue for peers
+GET  /api/v1/sync/table-hash/{table}  — return row-count + SHA-256 digest of table content
+GET  /api/v1/sync/parity/{table}      — compare local table hash against all peers
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -449,7 +452,113 @@ async def retouch_table(table_name: str):
     return {"requeued": len(rows), "table": table_name}
 
 
-@router.post("/restore", status_code=204)
+def _table_content_hash(table_name: str) -> dict:
+    """Return row_count + SHA-256 digest of sorted serialised row data for a table."""
+    if table_name not in _ALLOWED_TABLES:
+        raise HTTPException(400, f"Table '{table_name}' is not in the syncable table list")
+    with get_conn() as conn:
+        rows = conn.execute(f"SELECT * FROM {table_name} ORDER BY rowid").fetchall()
+    row_count = len(rows)
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(json.dumps(dict(row), sort_keys=True, default=str).encode())
+    return {"table": table_name, "row_count": row_count, "checksum": h.hexdigest()}
+
+
+@router.get("/table-hash/{table_name}")
+async def table_hash(table_name: str) -> dict:
+    """
+    Return the row count and SHA-256 digest of all row data in a syncable table.
+
+    Used by the Retouch All parity check to determine whether a table on this
+    node matches the same table on peer nodes.  Safe, read-only, no side effects.
+    """
+    return _table_content_hash(table_name)
+
+
+@router.get("/parity/{table_name}")
+async def table_parity(table_name: str) -> dict:
+    """
+    Compare this node's table content against all peer nodes.
+
+    Returns:
+      - local: {row_count, checksum}
+      - peers: [{node_id, row_count, checksum, match, error}]
+      - needs_retouch: True if any peer hash differs or returned an error
+    """
+    local = _table_content_hash(table_name)
+
+    peer_results = []
+    needs_retouch = False
+
+    async def _fetch_peer_hash(node_id: str, urls: list[str], client: httpx.AsyncClient) -> dict:
+        for url in urls:
+            try:
+                r = await client.get(
+                    f"{url}/api/v1/sync/table-hash/{table_name}",
+                    headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    match = data.get("checksum") == local["checksum"]
+                    return {
+                        "node_id": node_id,
+                        "row_count": data.get("row_count"),
+                        "checksum": data.get("checksum"),
+                        "match": match,
+                        "error": None,
+                    }
+                return {
+                    "node_id": node_id,
+                    "row_count": None,
+                    "checksum": None,
+                    "match": False,
+                    "error": f"HTTP {r.status_code}",
+                }
+            except httpx.ConnectError:
+                continue
+            except httpx.TimeoutException:
+                return {
+                    "node_id": node_id,
+                    "row_count": None,
+                    "checksum": None,
+                    "match": False,
+                    "error": "timeout",
+                }
+            except Exception as e:
+                return {
+                    "node_id": node_id,
+                    "row_count": None,
+                    "checksum": None,
+                    "match": False,
+                    "error": str(e),
+                }
+        return {
+            "node_id": node_id,
+            "row_count": None,
+            "checksum": None,
+            "match": False,
+            "error": "all addresses unreachable",
+        }
+
+    if cfg._peer_nodes:
+        async with _probe_client(timeout=10.0) as client:
+            tasks = [
+                _fetch_peer_hash(n["node_id"], cfg.PEER_SYNC_URLS.get(n["node_id"], []), client)
+                for n in cfg._peer_nodes
+            ]
+            peer_results = list(await asyncio.gather(*tasks))
+        needs_retouch = any(not r["match"] for r in peer_results)
+
+    return {
+        "table": table_name,
+        "local": {"row_count": local["row_count"], "checksum": local["checksum"]},
+        "peers": peer_results,
+        "needs_retouch": needs_retouch,
+    }
+
+
+
 async def receive_restore(request: Request) -> Response:
     """
     Layer 1 restore endpoint.
@@ -546,31 +655,10 @@ async def export_backup() -> Response:
     )
 
 
-@router.get("/status", response_model=SyncStatus)
-async def sync_status() -> SyncStatus:
-    """Return a sync-state summary for the dashboard and monitoring."""
-    from .sync.queue import get_queue_depths
-
-    with get_conn() as conn:
-        gen = get_gen(conn)
-        integrity_ok = get_meta(conn, "integrity_ok") == "true"
-        last_write_at = get_meta(conn, "last_write_at") or ""
-        last_write_by = get_meta(conn, "last_write_by") or ""
-        peer_rows = conn.execute(
-            "SELECT node_id FROM nodes WHERE node_id != ?", (cfg.NODE_ID,)
-        ).fetchall()
-
-    peer_ids = [r["node_id"] for r in peer_rows]
-    return SyncStatus(
-        node_id=cfg.NODE_ID,
-        node_name=cfg.NODE_NAME,
-        gen=gen,
-        integrity_ok=integrity_ok,
-        last_write_at=last_write_at,
-        last_write_by=last_write_by,
-        queue_depths=get_queue_depths(peer_ids),
-        peer_count=len(peer_ids),
-    )
+@router.get("/tables")
+async def list_sync_tables() -> dict:
+    """Return the sorted list of tables that participate in fleet sync."""
+    return {"tables": sorted(_ALLOWED_TABLES)}
 
 
 @router.get("/status", response_model=SyncStatus)
