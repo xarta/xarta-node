@@ -14,7 +14,9 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
+from .ai_observability import get_ai_observability_backend
 from .db import get_conn, increment_gen
 from .models import AiProviderCreate, AiProviderOut, AiProviderUpdate
 from .sync.queue import enqueue_for_all_peers
@@ -28,6 +30,23 @@ def _row_to_out(row) -> AiProviderOut:
     return AiProviderOut(**d)
 
 
+def _list_provider_dicts() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ai_providers ORDER BY model_type, name"
+        ).fetchall()
+    providers: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["enabled"] = bool(item.get("enabled", 1))
+        providers.append(item)
+    return providers
+
+
+class _AiObservabilityTestBody(BaseModel):
+    alias: str
+
+
 @router.get("", response_model=list[AiProviderOut])
 async def list_ai_providers() -> list[AiProviderOut]:
     with get_conn() as conn:
@@ -35,6 +54,25 @@ async def list_ai_providers() -> list[AiProviderOut]:
             "SELECT * FROM ai_providers ORDER BY model_type, name"
         ).fetchall()
     return [_row_to_out(r) for r in rows]
+
+
+@router.get("/observability", response_model=dict)
+async def get_ai_provider_observability() -> dict:
+    """Return node-local AI observability data for the active backend, if present."""
+    backend = get_ai_observability_backend()
+    return await backend.describe(_list_provider_dicts())
+
+
+@router.post("/observability/test", response_model=dict)
+async def test_ai_provider_observability(body: _AiObservabilityTestBody) -> dict:
+    alias = (body.alias or "").strip()
+    if not alias:
+        raise HTTPException(400, "alias is required")
+    backend = get_ai_observability_backend()
+    result = await backend.test_alias(alias, _list_provider_dicts())
+    if result.get("status") == "alias_not_found":
+        raise HTTPException(404, result.get("detail") or f"Alias {alias!r} not found")
+    return result
 
 
 @router.post("", response_model=AiProviderOut, status_code=201)
