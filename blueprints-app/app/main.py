@@ -38,6 +38,7 @@ from .routes_backup import router as backup_router
 from .routes_bookmarks import router as bookmarks_router
 from .routes_caddy_configs import router as caddy_configs_router
 from .routes_certs import router as certs_router
+from .routes_crawl4ai import router as crawl4ai_router
 from .routes_doc_groups import router as doc_groups_router
 from .routes_doc_images import router as doc_images_router
 from .routes_dockge_stacks import router as dockge_stacks_router
@@ -338,6 +339,7 @@ def create_app() -> FastAPI:
     application.include_router(table_layouts_router, prefix="/api/v1")
     application.include_router(ui_cache_router, prefix="/api/v1")
     application.include_router(litellm_router, prefix="/api/v1")
+    application.include_router(crawl4ai_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
