@@ -64,8 +64,12 @@ async def crawl4ai_health() -> dict:
 
 # ── POST /crawl4ai/crawl ──────────────────────────────────────────────────────
 
-class _CrawlBody(BaseModel):
+class _UrlBody(BaseModel):
     url: str
+
+
+# Alias kept for back-compat; crawl endpoint also uses _UrlBody
+_CrawlBody = _UrlBody
 
 
 @router.post("/crawl")
@@ -110,3 +114,128 @@ async def crawl4ai_crawl(body: _CrawlBody) -> dict:
         raise
     except Exception as exc:
         raise HTTPException(502, f"Crawl4AI crawl failed: {exc}") from exc
+
+
+# ── POST /crawl4ai/screenshot ─────────────────────────────────────────────────
+
+@router.post("/screenshot")
+async def crawl4ai_screenshot(body: _UrlBody) -> dict:
+    """Capture a full-page screenshot via the local Crawl4AI stack.
+
+    Returns the base64-encoded PNG and its decoded byte size.
+    The URL is validated to be an http/https address before forwarding.
+    """
+    if not body.url.startswith(("http://", "https://")):
+        raise HTTPException(400, "URL must start with http:// or https://")
+
+    if not await _crawl4ai_reachable():
+        raise HTTPException(503, "Crawl4AI stack not reachable")
+
+    base = _base_url()
+    payload = {"url": body.url, "screenshot_wait_for": 2, "wait_for_images": False}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
+            r = await client.post(f"{base}/screenshot", json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text[:500])
+
+        import base64 as _b64
+
+        data = r.json()
+        b64 = data.get("screenshot") or data.get("screenshot_data") or ""
+        size_bytes = len(_b64.b64decode(b64)) if b64 else 0
+        return {
+            "ok": bool(b64),
+            "url": body.url,
+            "screenshot_b64": b64,
+            "size_bytes": size_bytes,
+            "_via": {"endpoint": f"{base}/screenshot"},
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Crawl4AI screenshot failed: {exc}") from exc
+
+
+# ── POST /crawl4ai/pdf ────────────────────────────────────────────────────────
+
+@router.post("/pdf")
+async def crawl4ai_pdf(body: _UrlBody) -> dict:
+    """Generate a PDF of the page via the local Crawl4AI stack.
+
+    Returns the base64-encoded PDF and its decoded byte size.
+    The actual PDF data is NOT forwarded to the browser — only the size is returned
+    so the GUI can confirm the operation succeeded without transferring large blobs.
+    The URL is validated to be an http/https address before forwarding.
+    """
+    if not body.url.startswith(("http://", "https://")):
+        raise HTTPException(400, "URL must start with http:// or https://")
+
+    if not await _crawl4ai_reachable():
+        raise HTTPException(503, "Crawl4AI stack not reachable")
+
+    base = _base_url()
+    payload = {"url": body.url}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
+            r = await client.post(f"{base}/pdf", json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text[:500])
+
+        import base64 as _b64
+
+        data = r.json()
+        b64 = data.get("pdf") or data.get("pdf_data") or data.get("content") or ""
+        size_bytes = len(_b64.b64decode(b64)) if b64 else 0
+        return {
+            "ok": bool(b64),
+            "url": body.url,
+            "size_bytes": size_bytes,
+            # PDF blob is intentionally NOT forwarded — size is sufficient proof
+            "_via": {"endpoint": f"{base}/pdf"},
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Crawl4AI PDF failed: {exc}") from exc
+
+
+# ── GET /crawl4ai/mcp-schema ──────────────────────────────────────────────────
+
+@router.get("/mcp-schema")
+async def crawl4ai_mcp_schema() -> dict:
+    """Fetch Crawl4AI's own MCP tool schema directly from its /mcp/schema endpoint.
+
+    This is distinct from LiteLLM's /mcp/ endpoint — it probes the Crawl4AI
+    service's built-in MCP server directly to confirm it is up and list its tools.
+    """
+    if not await _crawl4ai_reachable():
+        raise HTTPException(503, "Crawl4AI stack not reachable")
+
+    base = _base_url()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            r = await client.get(f"{base}/mcp/schema")
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text[:500])
+
+        data = r.json()
+        # Schema shape may vary by version; normalise to a list of tool names + descriptions
+        tools = []
+        raw = data if isinstance(data, list) else data.get("tools", data.get("functions", []))
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, dict):
+                tools.append({
+                    "name": item.get("name", ""),
+                    "description": item.get("description", ""),
+                })
+        return {
+            "ok": True,
+            "tool_count": len(tools),
+            "tools": tools,
+            "_via": {"endpoint": f"{base}/mcp/schema"},
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Crawl4AI MCP schema fetch failed: {exc}") from exc
