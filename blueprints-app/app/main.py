@@ -50,6 +50,7 @@ from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_keys import router as keys_router
 from .routes_litellm import router as litellm_router
+from .routes_liteparse import router as liteparse_router
 from .routes_machines import router as machines_router
 from .routes_manual_links import router as manual_links_router
 from .routes_nav_items import router as nav_items_router
@@ -340,6 +341,7 @@ def create_app() -> FastAPI:
     application.include_router(table_layouts_router, prefix="/api/v1")
     application.include_router(ui_cache_router, prefix="/api/v1")
     application.include_router(litellm_router, prefix="/api/v1")
+    application.include_router(liteparse_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
     application.include_router(scrapling_router, prefix="/api/v1")
 
