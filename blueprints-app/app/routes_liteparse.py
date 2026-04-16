@@ -6,7 +6,7 @@ No DB writes; no enqueue_for_all_peers — these are local-node-only operations.
 """
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from .db import get_conn, get_setting
@@ -22,9 +22,9 @@ class _ParseBody(BaseModel):
     url: str | None = None
     file_path: str | None = None
     output_format: str = "text"
-    max_pages: int | None = None  # None → service default (env LITEPARSE_MAX_DOWNLOAD_MB)
+    max_pages: int | None = None  # None -> service default
     no_ocr: bool = True
-    max_chars: int | None = None  # None → service default (env LITEPARSE_MAX_OUTPUT_CHARS)
+    max_chars: int | None = None  # None -> service default
 
 
 def _base_url() -> str:
@@ -118,3 +118,46 @@ async def liteparse_parse(body: _ParseBody) -> dict:
         raise
     except Exception as exc:
         raise HTTPException(502, f"LiteParse parse failed: {exc}") from exc
+
+
+@router.post("/parse-upload")
+async def liteparse_parse_upload(
+    file: UploadFile = File(...),
+    output_format: str = Form("text"),
+    max_pages: int | None = Form(None),
+    no_ocr: bool = Form(True),
+    max_chars: int | None = Form(None),
+) -> dict:
+    """Parse an uploaded PDF/document via the LiteParse stack."""
+    if not await _liteparse_reachable():
+        raise HTTPException(503, "LiteParse stack not reachable")
+
+    blob = await file.read()
+    if not blob:
+        raise HTTPException(400, "Uploaded file is empty")
+
+    base = _base_url()
+    form_data = {
+        "output_format": output_format,
+        "no_ocr": "true" if no_ocr else "false",
+    }
+    if max_pages is not None:
+        form_data["max_pages"] = str(max_pages)
+    if max_chars is not None:
+        form_data["max_chars"] = str(max_chars)
+
+    files = {
+        "file": (file.filename or "upload.pdf", blob, file.content_type or "application/octet-stream")
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
+            r = await client.post(f"{base}/parse-upload", data=form_data, files=files)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text[:500])
+        data = r.json()
+        data["_via"] = {"endpoint": f"{base}/parse-upload"}
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"LiteParse upload parse failed: {exc}") from exc
