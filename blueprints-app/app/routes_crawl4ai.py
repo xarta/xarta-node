@@ -132,7 +132,7 @@ async def crawl4ai_screenshot(body: _UrlBody) -> dict:
         raise HTTPException(503, "Crawl4AI stack not reachable")
 
     base = _base_url()
-    payload = {"url": body.url, "screenshot_wait_for": 2, "wait_for_images": False}
+    payload = {"url": body.url, "screenshot_wait_for": 3, "wait_for_images": True}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
             r = await client.post(f"{base}/screenshot", json=payload)
@@ -190,8 +190,8 @@ async def crawl4ai_pdf(body: _UrlBody) -> dict:
         return {
             "ok": bool(b64),
             "url": body.url,
+            "pdf_b64": b64,
             "size_bytes": size_bytes,
-            # PDF blob is intentionally NOT forwarded — size is sufficient proof
             "_via": {"endpoint": f"{base}/pdf"},
         }
     except HTTPException:
