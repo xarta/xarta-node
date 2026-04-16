@@ -20,7 +20,7 @@ router = APIRouter(prefix="/litellm", tags=["litellm"])
 
 # ── Default paths (overridden by DB settings) ──────────────────────────────
 _DEFAULT_CONFIG_PATH = "/xarta-node/.lone-wolf/stacks/litellm/config.yaml"
-_DEFAULT_BASE_URL    = "http://127.0.0.1:4000"
+_DEFAULT_BASE_URL    = "http://localhost:4000"
 _DEFAULT_ENV_PATH    = "/xarta-node/.lone-wolf/stacks/litellm/.env"
 _CONNECT_TIMEOUT     = 5.0
 _READ_TIMEOUT        = 60.0
