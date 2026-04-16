@@ -157,6 +157,8 @@ If `/ClonedRepos/uv` and `/ClonedRepos/ruff` are available:
 - `/ClonedRepos/ruff/docs/tutorial.md` — ruff + uv workflow tutorial
 - `/ClonedRepos/ruff/docs/editors/setup.md` — VS Code extension setup
 
+These `/ClonedRepos/*` paths are offline reference sources only. Do not treat those clones as edit targets during normal work.
+
 ## Updating tools
 
 ```bash
