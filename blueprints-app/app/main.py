@@ -30,44 +30,46 @@ from . import db
 from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .middleware_auth import AuthMiddleware
-from .routes_gui_sync import router as gui_sync_router
-from .routes_health import router as health_router
-from .routes_machines import router as machines_router
-from .routes_nodes import router as nodes_router, _upsert_nodes_from_config
-from .routes_schema import router as schema_router
-from .routes_services import router as services_router
-from .routes_backup import router as backup_router
-from .routes_pfsense_dns import router as pfsense_dns_router
-from .routes_proxmox_config import router as proxmox_config_router
-from .routes_proxmox_nets   import router as proxmox_nets_router
-from .routes_vlans          import router as vlans_router
-from .routes_dockge_stacks import router as dockge_stacks_router
-from .routes_caddy_configs import router as caddy_configs_router
-from .routes_settings   import router as settings_router
-from .routes_pve_hosts   import router as pve_hosts_router
-from .routes_arp_manual    import router as arp_manual_router
-from .routes_ssh_targets   import router as ssh_targets_router
-from .routes_manual_links  import router as manual_links_router
-from .routes_sync import router as sync_router
-from .routes_keys import router as keys_router
-from .routes_certs import router as certs_router
+from .routes_ai_project_assignments import router as ai_project_assignments_router
+from .routes_ai_providers import router as ai_providers_router
+from .routes_arp_manual import router as arp_manual_router
 from .routes_assumptions import router as assumptions_router
-from .routes_todo import router as todo_router
-from .routes_docs import router as docs_router
+from .routes_backup import router as backup_router
+from .routes_bookmarks import router as bookmarks_router
+from .routes_caddy_configs import router as caddy_configs_router
+from .routes_certs import router as certs_router
 from .routes_doc_groups import router as doc_groups_router
 from .routes_doc_images import router as doc_images_router
-from .routes_firewall import router as firewall_router
-from .routes_ai_providers import router as ai_providers_router
-from .routes_ai_project_assignments import router as ai_project_assignments_router
-from .routes_bookmarks import router as bookmarks_router
-from .routes_form_controls import router as form_controls_router
-from .routes_nav_items import router as nav_items_router
+from .routes_dockge_stacks import router as dockge_stacks_router
+from .routes_docs import router as docs_router
 from .routes_embed_menu_items import router as embed_menu_items_router
+from .routes_firewall import router as firewall_router
+from .routes_form_controls import router as form_controls_router
+from .routes_gui_sync import router as gui_sync_router
+from .routes_health import router as health_router
+from .routes_keys import router as keys_router
+from .routes_litellm import router as litellm_router
+from .routes_machines import router as machines_router
+from .routes_manual_links import router as manual_links_router
+from .routes_nav_items import router as nav_items_router
+from .routes_nodes import _upsert_nodes_from_config
+from .routes_nodes import router as nodes_router
+from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_pockettts import router as pockettts_router
-from .routes_tts import router as tts_router
+from .routes_proxmox_config import router as proxmox_config_router
+from .routes_proxmox_nets import router as proxmox_nets_router
+from .routes_pve_hosts import router as pve_hosts_router
 from .routes_pwa import router as pwa_router
+from .routes_schema import router as schema_router
+from .routes_services import router as services_router
+from .routes_settings import router as settings_router
+from .routes_ssh_targets import router as ssh_targets_router
+from .routes_sync import router as sync_router
 from .routes_table_layouts import router as table_layouts_router
+from .routes_todo import router as todo_router
+from .routes_tts import router as tts_router
 from .routes_ui_cache import router as ui_cache_router
+from .routes_vlans import router as vlans_router
 from .seekdb_sync import start_seekdb_sync_loop
 from .sync.drain import start_drain_loop
 from .sync.queue import enqueue_for_all_peers
@@ -97,9 +99,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Integrity check — log warning but don't abort startup
     ok = db.check_integrity()
     if not ok:
-        log.warning(
-            "DB integrity check FAILED — sync-out is disabled until restored"
-        )
+        log.warning("DB integrity check FAILED — sync-out is disabled until restored")
 
     # Mount GUI static files (GUI dir must exist before mounting)
     if os.path.isdir(cfg.GUI_DIR):
@@ -209,9 +209,7 @@ async def _boot_catchup() -> None:
     # Only pull from nodes whose address is in our configured PEER_SYNC_URLS.
     # Ghost/retired nodes in the DB must never be used as restore sources.
     trusted_urls: set[str] = {
-        url.rstrip("/")
-        for urls in cfg.PEER_SYNC_URLS.values()
-        for url in urls
+        url.rstrip("/") for urls in cfg.PEER_SYNC_URLS.values() for url in urls
     }
 
     best_peer_url: str | None = None
@@ -283,8 +281,6 @@ async def _boot_catchup() -> None:
         log.exception("boot_catchup: unexpected error fetching backup from %s", best_peer_id)
 
 
-
-
 def create_app() -> FastAPI:
     application = FastAPI(
         title="Blueprints",
@@ -306,41 +302,42 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(services_router, prefix="/api/v1")
     application.include_router(machines_router, prefix="/api/v1")
-    application.include_router(nodes_router,    prefix="/api/v1")
-    application.include_router(schema_router,   prefix="/api/v1")
-    application.include_router(sync_router,     prefix="/api/v1")
-    application.include_router(backup_router,   prefix="/api/v1")
-    application.include_router(pfsense_dns_router,    prefix="/api/v1")
+    application.include_router(nodes_router, prefix="/api/v1")
+    application.include_router(schema_router, prefix="/api/v1")
+    application.include_router(sync_router, prefix="/api/v1")
+    application.include_router(backup_router, prefix="/api/v1")
+    application.include_router(pfsense_dns_router, prefix="/api/v1")
     application.include_router(proxmox_config_router, prefix="/api/v1")
-    application.include_router(proxmox_nets_router,   prefix="/api/v1")
-    application.include_router(vlans_router,          prefix="/api/v1")
-    application.include_router(dockge_stacks_router,  prefix="/api/v1")
-    application.include_router(caddy_configs_router,  prefix="/api/v1")
-    application.include_router(settings_router,       prefix="/api/v1")
-    application.include_router(pve_hosts_router,      prefix="/api/v1")
-    application.include_router(arp_manual_router,     prefix="/api/v1")
-    application.include_router(ssh_targets_router,    prefix="/api/v1")
-    application.include_router(manual_links_router,   prefix="/api/v1")
-    application.include_router(keys_router,           prefix="/api/v1")
-    application.include_router(certs_router,          prefix="/api/v1")
-    application.include_router(gui_sync_router,       prefix="/api/v1")
-    application.include_router(assumptions_router,    prefix="/api/v1")
-    application.include_router(todo_router,           prefix="/api/v1")
-    application.include_router(docs_router,           prefix="/api/v1")
-    application.include_router(doc_groups_router,     prefix="/api/v1")
-    application.include_router(doc_images_router,      prefix="/api/v1")
-    application.include_router(firewall_router,               prefix="/api/v1")
-    application.include_router(ai_providers_router,            prefix="/api/v1")
-    application.include_router(ai_project_assignments_router,  prefix="/api/v1")
-    application.include_router(bookmarks_router,               prefix="/api/v1")
-    application.include_router(form_controls_router,           prefix="/api/v1")
-    application.include_router(nav_items_router,               prefix="/api/v1")
-    application.include_router(embed_menu_items_router,        prefix="/api/v1")
-    application.include_router(pockettts_router,               prefix="/api/v1")
-    application.include_router(tts_router,                     prefix="/api/v1")
-    application.include_router(pwa_router,                     prefix="/api/v1")
-    application.include_router(table_layouts_router,           prefix="/api/v1")
-    application.include_router(ui_cache_router,                prefix="/api/v1")
+    application.include_router(proxmox_nets_router, prefix="/api/v1")
+    application.include_router(vlans_router, prefix="/api/v1")
+    application.include_router(dockge_stacks_router, prefix="/api/v1")
+    application.include_router(caddy_configs_router, prefix="/api/v1")
+    application.include_router(settings_router, prefix="/api/v1")
+    application.include_router(pve_hosts_router, prefix="/api/v1")
+    application.include_router(arp_manual_router, prefix="/api/v1")
+    application.include_router(ssh_targets_router, prefix="/api/v1")
+    application.include_router(manual_links_router, prefix="/api/v1")
+    application.include_router(keys_router, prefix="/api/v1")
+    application.include_router(certs_router, prefix="/api/v1")
+    application.include_router(gui_sync_router, prefix="/api/v1")
+    application.include_router(assumptions_router, prefix="/api/v1")
+    application.include_router(todo_router, prefix="/api/v1")
+    application.include_router(docs_router, prefix="/api/v1")
+    application.include_router(doc_groups_router, prefix="/api/v1")
+    application.include_router(doc_images_router, prefix="/api/v1")
+    application.include_router(firewall_router, prefix="/api/v1")
+    application.include_router(ai_providers_router, prefix="/api/v1")
+    application.include_router(ai_project_assignments_router, prefix="/api/v1")
+    application.include_router(bookmarks_router, prefix="/api/v1")
+    application.include_router(form_controls_router, prefix="/api/v1")
+    application.include_router(nav_items_router, prefix="/api/v1")
+    application.include_router(embed_menu_items_router, prefix="/api/v1")
+    application.include_router(pockettts_router, prefix="/api/v1")
+    application.include_router(tts_router, prefix="/api/v1")
+    application.include_router(pwa_router, prefix="/api/v1")
+    application.include_router(table_layouts_router, prefix="/api/v1")
+    application.include_router(ui_cache_router, prefix="/api/v1")
+    application.include_router(litellm_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
@@ -348,7 +345,7 @@ def create_app() -> FastAPI:
             '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
             '<rect width="32" height="32" rx="4" fill="#1a5c30"/>'
             '<text x="16" y="22.5" text-anchor="middle"'
-            ' font-family="\'Arial Black\',Arial,sans-serif"'
+            " font-family=\"'Arial Black',Arial,sans-serif\""
             ' font-weight="900" font-size="15" fill="#ffffff"'
             ' letter-spacing="0.5">FAB</text></svg>'
         )
