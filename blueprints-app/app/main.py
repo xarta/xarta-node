@@ -62,6 +62,7 @@ from .routes_proxmox_nets import router as proxmox_nets_router
 from .routes_pve_hosts import router as pve_hosts_router
 from .routes_pwa import router as pwa_router
 from .routes_schema import router as schema_router
+from .routes_scrapling import router as scrapling_router
 from .routes_services import router as services_router
 from .routes_settings import router as settings_router
 from .routes_ssh_targets import router as ssh_targets_router
@@ -340,6 +341,7 @@ def create_app() -> FastAPI:
     application.include_router(ui_cache_router, prefix="/api/v1")
     application.include_router(litellm_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
+    application.include_router(scrapling_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
