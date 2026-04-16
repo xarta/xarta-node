@@ -58,6 +58,7 @@ from .routes_nav_items import router as nav_items_router
 from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
 from .routes_pfsense_dns import router as pfsense_dns_router
+from .routes_playwright import router as playwright_router
 from .routes_pockettts import router as pockettts_router
 from .routes_proxmox_config import router as proxmox_config_router
 from .routes_proxmox_nets import router as proxmox_nets_router
@@ -346,6 +347,7 @@ def create_app() -> FastAPI:
     application.include_router(markitdown_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
     application.include_router(scrapling_router, prefix="/api/v1")
+    application.include_router(playwright_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
