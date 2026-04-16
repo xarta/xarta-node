@@ -69,7 +69,9 @@ class _UrlBody(BaseModel):
 
 
 # Alias kept for back-compat; crawl endpoint also uses _UrlBody
-_CrawlBody = _UrlBody
+class _CrawlBody(BaseModel):
+    url: str
+    accept_cookies: bool = True
 
 
 @router.post("/crawl")
@@ -86,9 +88,19 @@ async def crawl4ai_crawl(body: _CrawlBody) -> dict:
         raise HTTPException(503, "Crawl4AI stack not reachable")
 
     base = _base_url()
+    crawler_config: dict = {"headless": True}
+    if body.accept_cookies:
+        crawler_config["magic"] = True
+        crawler_config["simulate_user"] = True
+        crawler_config["js_code"] = (
+            "document.querySelectorAll('button,a').forEach(el => {"
+            " if (/accept|agree|consent|ok|got it|allow all/i.test(el.textContent)) el.click(); "
+            "});"
+        )
     payload = {
         "urls": [body.url],
-        "crawler_params": {"headless": True},
+        "browser_config": {"headless": True},
+        "crawler_config": crawler_config,
     }
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
