@@ -74,6 +74,23 @@ class _CrawlBody(BaseModel):
     accept_cookies: bool = True
 
 
+def _crawl_payload(url: str, *, accept_cookies: bool = True, screenshot: bool = False, pdf: bool = False) -> dict:
+    """Build a /crawl payload with optional consent-handling and output types."""
+    crawler_config: dict = {"wait_for_images": True}
+    if accept_cookies:
+        crawler_config["magic"] = True
+        crawler_config["simulate_user"] = True
+    if screenshot:
+        crawler_config["screenshot"] = True
+    if pdf:
+        crawler_config["pdf"] = True
+    return {
+        "urls": [url],
+        "browser_config": {"headless": True},
+        "crawler_config": crawler_config,
+    }
+
+
 @router.post("/crawl")
 async def crawl4ai_crawl(body: _CrawlBody) -> dict:
     """POST a URL crawl request to the local Crawl4AI stack and return markdown.
@@ -88,20 +105,7 @@ async def crawl4ai_crawl(body: _CrawlBody) -> dict:
         raise HTTPException(503, "Crawl4AI stack not reachable")
 
     base = _base_url()
-    crawler_config: dict = {"headless": True}
-    if body.accept_cookies:
-        crawler_config["magic"] = True
-        crawler_config["simulate_user"] = True
-        crawler_config["js_code"] = (
-            "document.querySelectorAll('button,a').forEach(el => {"
-            " if (/accept|agree|consent|ok|got it|allow all/i.test(el.textContent)) el.click(); "
-            "});"
-        )
-    payload = {
-        "urls": [body.url],
-        "browser_config": {"headless": True},
-        "crawler_config": crawler_config,
-    }
+    payload = _crawl_payload(body.url, accept_cookies=body.accept_cookies)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
             r = await client.post(f"{base}/crawl", json=payload)
@@ -134,8 +138,9 @@ async def crawl4ai_crawl(body: _CrawlBody) -> dict:
 async def crawl4ai_screenshot(body: _UrlBody) -> dict:
     """Capture a full-page screenshot via the local Crawl4AI stack.
 
+    Uses the /crawl endpoint with magic+simulate_user so consent banners are
+    dismissed and images are fully loaded before the screenshot is taken.
     Returns the base64-encoded PNG and its decoded byte size.
-    The URL is validated to be an http/https address before forwarding.
     """
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
@@ -143,25 +148,27 @@ async def crawl4ai_screenshot(body: _UrlBody) -> dict:
     if not await _crawl4ai_reachable():
         raise HTTPException(503, "Crawl4AI stack not reachable")
 
+    import base64 as _b64
+
     base = _base_url()
-    payload = {"url": body.url, "screenshot_wait_for": 3, "wait_for_images": True}
+    payload = _crawl_payload(body.url, accept_cookies=True, screenshot=True)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
-            r = await client.post(f"{base}/screenshot", json=payload)
+            r = await client.post(f"{base}/crawl", json=payload)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text[:500])
 
-        import base64 as _b64
-
         data = r.json()
-        b64 = data.get("screenshot") or data.get("screenshot_data") or ""
+        results = data.get("results") or [data]
+        result = results[0] if results else {}
+        b64 = result.get("screenshot") or ""
         size_bytes = len(_b64.b64decode(b64)) if b64 else 0
         return {
             "ok": bool(b64),
-            "url": body.url,
+            "url": result.get("url", body.url),
             "screenshot_b64": b64,
             "size_bytes": size_bytes,
-            "_via": {"endpoint": f"{base}/screenshot"},
+            "_via": {"endpoint": f"{base}/crawl"},
         }
     except HTTPException:
         raise
@@ -175,10 +182,9 @@ async def crawl4ai_screenshot(body: _UrlBody) -> dict:
 async def crawl4ai_pdf(body: _UrlBody) -> dict:
     """Generate a PDF of the page via the local Crawl4AI stack.
 
+    Uses the /crawl endpoint with magic+simulate_user so consent banners are
+    dismissed and images are fully loaded before the PDF is generated.
     Returns the base64-encoded PDF and its decoded byte size.
-    The actual PDF data is NOT forwarded to the browser — only the size is returned
-    so the GUI can confirm the operation succeeded without transferring large blobs.
-    The URL is validated to be an http/https address before forwarding.
     """
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
@@ -186,25 +192,27 @@ async def crawl4ai_pdf(body: _UrlBody) -> dict:
     if not await _crawl4ai_reachable():
         raise HTTPException(503, "Crawl4AI stack not reachable")
 
+    import base64 as _b64
+
     base = _base_url()
-    payload = {"url": body.url}
+    payload = _crawl_payload(body.url, accept_cookies=True, pdf=True)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
-            r = await client.post(f"{base}/pdf", json=payload)
+            r = await client.post(f"{base}/crawl", json=payload)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text[:500])
 
-        import base64 as _b64
-
         data = r.json()
-        b64 = data.get("pdf") or data.get("pdf_data") or data.get("content") or ""
+        results = data.get("results") or [data]
+        result = results[0] if results else {}
+        b64 = result.get("pdf") or ""
         size_bytes = len(_b64.b64decode(b64)) if b64 else 0
         return {
             "ok": bool(b64),
-            "url": body.url,
+            "url": result.get("url", body.url),
             "pdf_b64": b64,
             "size_bytes": size_bytes,
-            "_via": {"endpoint": f"{base}/pdf"},
+            "_via": {"endpoint": f"{base}/crawl"},
         }
     except HTTPException:
         raise
