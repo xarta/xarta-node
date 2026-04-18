@@ -51,7 +51,7 @@ Three system action types that flow through the same queue:
 - `sync_git_non_root` — triggers `git pull` on `REPO_NON_ROOT_PATH` (non-root public repo)
 - `sync_git_inner` — triggers `git pull` on `REPO_INNER_PATH` (private repo)
 
-Triggered via `POST /api/v1/sync/git-pull` with `{"scope": "outer"|"non_root"|"inner"|"both"|"all"}`. The receiving node runs the pull locally. `outer` and `inner` restart the service when configured; `non_root` updates in place without a service restart. The Fleet Nodes GUI orchestrates staged `outer` → `non_root` → `inner` update with a 10-second settle window, commit verification across all nodes, and one retry per stage. These actions are fire-and-forget at the sync layer — they don't touch the DB and don't re-propagate.
+Triggered via `POST /api/v1/sync/git-pull` with `{"scope": "outer"|"non_root"|"inner"|"both"|"all"}`. The receiving node runs the pull locally. `outer` and `inner` restart the service when configured; `non_root` updates in place without a service restart. The Fleet Nodes GUI orchestrates a staged `outer` → `non_root` → `inner` update with commit verification across all nodes; the private `inner` stage gets a longer settle window and multiple verification attempts because Blueprints is expected to restart there, and transient `HTTP 502`/`503` or fetch failures during that restart window are treated as timing noise unless commit mismatches persist. These actions are fire-and-forget at the sync layer — they don't touch the DB and don't re-propagate.
 
 ## Boot sequence
 
