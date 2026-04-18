@@ -2,6 +2,11 @@
 
 Routes
 ------
+POST /api/v1/litellm-hook/sync-now
+    Run the node-local LiteLLM hook-sync reconcile path immediately. This queries the
+    current running-models feed, updates the node-local alias config if needed, reloads
+    the LiteLLM container, and returns the resulting summary.
+
 POST /api/v1/litellm-hook/trigger-test
     Fire a synthetic model.changed event via the xarta hook API trigger endpoint.
     The hook API broadcasts to all registered subscribers; if this node's listener
@@ -41,6 +46,10 @@ router = APIRouter(prefix="/litellm-hook", tags=["litellm-hook"])
 _CONNECT_TIMEOUT = 10.0
 _LISTENER_SERVICE = "xarta-litellm-model-hook.service"
 _RUNTIME_DIR = Path("/tmp/xarta-litellm-model-hook")
+_SYNC_HELPER = Path(
+    "/root/xarta-node/.xarta/.claude/skills/litellm-local-hook-sync/scripts/xarta-litellm-hook.sh"
+)
+_SYNC_TIMEOUT = 300
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -113,7 +122,100 @@ def _last_runtime_json(filename: str) -> dict[str, Any]:
     return {}
 
 
+def _parse_json_tail(text: str) -> dict[str, Any]:
+    """Extract the final JSON object from helper stdout if present."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    starts = [idx for idx, ch in enumerate(raw) if ch == "{"]
+    for idx in starts:
+        try:
+            return json.loads(raw[idx:])
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+
+@router.post("/sync-now")
+async def sync_now_route() -> JSONResponse:
+    """Force an immediate node-local LiteLLM alias reconcile run.
+
+    This is the same operator action exposed by the AI Providers page button.
+    It runs the existing hook-sync helper in apply mode so the latest upstream
+    running-models feed is queried and the local LiteLLM config is updated if
+    the live model set has changed.
+    """
+    if not _SYNC_HELPER.is_file():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": "LiteLLM sync helper is not available on this node.",
+            },
+        )
+
+    bases = _hook_bases()
+    if not bases:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "error": "XARTA_HOOK_API_BASES is not configured in the node .env file.",
+            },
+        )
+
+    try:
+        result = subprocess.run(
+            ["bash", str(_SYNC_HELPER), "sync-now", "--apply"],
+            capture_output=True,
+            text=True,
+            timeout=_SYNC_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "ok": False,
+                "error": "LiteLLM sync-now timed out before it finished.",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sync-now launch failed: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": f"LiteLLM sync-now failed to start: {exc}",
+            },
+        )
+
+    summary = _parse_json_tail(result.stdout)
+    ok = result.returncode == 0 and summary.get("ok", True)
+    message = summary.get("message") or (
+        "Local LiteLLM aliases reconciled." if ok else "LiteLLM sync-now reported a failure."
+    )
+
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "message": message,
+        "returncode": result.returncode,
+        "summary": summary,
+        "hook_bases": bases,
+        "triggered_at": time.time(),
+    }
+    if not ok:
+        payload["error"] = summary.get("message") or (result.stderr or result.stdout or "sync-now failed").strip()
+        payload["stderr"] = (result.stderr or "").strip()[-4000:]
+        payload["stdout"] = (result.stdout or "").strip()[-4000:]
+
+    return JSONResponse(status_code=200 if ok else 500, content=payload)
 
 
 @router.post("/trigger-test")
