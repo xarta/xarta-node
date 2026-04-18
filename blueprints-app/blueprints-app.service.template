@@ -8,9 +8,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/xarta-node/blueprints-app
 EnvironmentFile=__ENV_FILE__
-ExecStart=/opt/blueprints/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
+ExecStart=/opt/blueprints/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 --timeout-graceful-shutdown 4
+ExecStop=-/usr/bin/curl --silent --show-error --max-time 2 --output /dev/null -X POST http://127.0.0.1:8080/api/v1/events/close-all
 Restart=always
 RestartSec=5
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 

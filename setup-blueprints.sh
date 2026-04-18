@@ -224,6 +224,9 @@ echo "    ok: $("$VENV_DIR/bin/pip" show fastapi uvicorn httpx 2>/dev/null \
 echo "--- installing systemd service..."
 # Substitute the actual paths into the template so it works regardless of
 # where xarta-node was cloned (not everyone clones to /root/xarta-node).
+# The service template now also includes a loopback pre-stop hook to close
+# live SSE subscribers before SIGTERM, keeping restarts fast even when the
+# dashboard has an active event-stream connection open.
 sed -e "s|/root/xarta-node/blueprints-app|$APP_DIR|g" \
     -e "s|__ENV_FILE__|$ENV_FILE|g" \
     "$APP_DIR/blueprints-app.service.template" \
