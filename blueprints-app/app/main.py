@@ -29,6 +29,7 @@ from . import config as cfg
 from . import db
 from .auth import compute_token
 from .cors import DynamicCORSMiddleware
+from .events import bus as events_bus
 from .middleware_auth import AuthMiddleware
 from .routes_ai_project_assignments import router as ai_project_assignments_router
 from .routes_ai_providers import router as ai_providers_router
@@ -44,6 +45,7 @@ from .routes_doc_images import router as doc_images_router
 from .routes_dockge_stacks import router as dockge_stacks_router
 from .routes_docs import router as docs_router
 from .routes_embed_menu_items import router as embed_menu_items_router
+from .routes_events import router as events_router
 from .routes_firewall import router as firewall_router
 from .routes_form_controls import router as form_controls_router
 from .routes_gui_sync import router as gui_sync_router
@@ -133,7 +135,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     yield  # application is running
 
-    # Shutdown — nothing to clean up in Phase 1
+    # Shutdown — close SSE bus so all connected clients receive the sentinel
+    await events_bus.close_all()
 
 
 def _load_nodes_from_json() -> None:
@@ -348,6 +351,7 @@ def create_app() -> FastAPI:
     application.include_router(crawl4ai_router, prefix="/api/v1")
     application.include_router(scrapling_router, prefix="/api/v1")
     application.include_router(playwright_router, prefix="/api/v1")
+    application.include_router(events_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:

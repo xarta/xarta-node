@@ -48,10 +48,12 @@ _SYNC_PREFIX = "/api/v1/sync/"
 # All other sync routes (status, git-pull, gui/*) are browser-accessible and accept either secret.
 _SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
 # Bookmarks endpoints that are auth-exempt (aggregate/non-sensitive data, open CORS for extension).
-_BOOKMARKS_OPEN_PATHS = frozenset({
-    "/api/v1/bookmarks/health",
-    "/api/v1/bookmarks/extension-version",
-})
+_BOOKMARKS_OPEN_PATHS = frozenset(
+    {
+        "/api/v1/bookmarks/health",
+        "/api/v1/bookmarks/extension-version",
+    }
+)
 
 
 def _client_ip(request: Request) -> str:
@@ -78,9 +80,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             try:
                 ip_obj = ipaddress.ip_address(ip_str)
                 if not any(ip_obj in net for net in _allowed_networks):
-                    log.warning(
-                        "auth: blocked request from %s — not in allowlist", ip_str
-                    )
+                    log.warning("auth: blocked request from %s — not in allowlist", ip_str)
                     return JSONResponse({"detail": "Forbidden"}, status_code=403)
             except ValueError:
                 log.warning("auth: could not parse client IP %r — blocking", ip_str)
@@ -91,7 +91,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path in _BOOKMARKS_OPEN_PATHS:
             return await call_next(request)
         if not any(path.startswith(p) for p in _TOKEN_EXEMPT_PREFIXES):
+            # Prefer the header; fall back to query param so EventSource (which
+            # cannot set custom headers) can pass its TOTP token in the URL.
             token = request.headers.get("x-api-token", "")
+            if not token:
+                token = request.query_params.get("token", "")
 
             if any(path.startswith(p) for p in _SYNC_WRITE_PATHS):
                 # Node-to-node sync writes: SYNC_SECRET only.
@@ -104,9 +108,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # All other routes (including browser-facing sync routes):
                 # accept API_SECRET or SYNC_SECRET — whichever the caller has.
                 if cfg.API_SECRET or cfg.SYNC_SECRET:
-                    valid = (
-                        (cfg.API_SECRET and verify_token(cfg.API_SECRET, token))
-                        or (cfg.SYNC_SECRET and verify_token(cfg.SYNC_SECRET, token))
+                    valid = (cfg.API_SECRET and verify_token(cfg.API_SECRET, token)) or (
+                        cfg.SYNC_SECRET and verify_token(cfg.SYNC_SECRET, token)
                     )
                     if not valid:
                         log.warning("auth: invalid token from %s for %s", ip_str, path)
