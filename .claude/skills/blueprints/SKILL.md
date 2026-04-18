@@ -65,7 +65,7 @@ bash /root/xarta-node/.xarta/.claude/skills/fleet-pull/scripts/fleet-pull-privat
 ```
 The scripts SSH to each node and trigger loopback-only `git-pull` actions safely.
 
-For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback. The API supports `outer`, `non_root`, `inner`, `both`, and `all`. The Fleet Nodes GUI uses staged pulls with a 10-second settle window, commit verification across all nodes, and one retry per repo stage.
+For targeted operations, `POST /api/v1/sync/git-pull` still works when called on a local node via loopback. The API supports `outer`, `non_root`, `inner`, `both`, and `all`. The Fleet Nodes GUI uses staged pulls with commit verification across all nodes; the private `inner` stage allows a longer settle window and multiple verification attempts because Blueprints is expected to restart there, and transient `HTTP 502`/`503` or network fetch failures in that window are treated as restart-time conditions rather than immediate fleet failure.
 
 ## Mandatory testing discipline
 
