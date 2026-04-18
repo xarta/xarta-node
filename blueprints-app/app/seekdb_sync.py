@@ -10,7 +10,7 @@ from collections import Counter
 from urllib.parse import urlparse
 
 from .ai_client import embed
-from .db import get_conn, get_setting, set_setting, increment_gen
+from .db import get_conn, get_setting, increment_gen, set_setting
 from .seekdb import (
     bookmark_embedding_by_normalized_url,
     bookmarks_col,
@@ -33,11 +33,14 @@ DEFAULT_EXCLUDED_TAGS = "favourites-bar,web,interests"
 DEFAULT_DOMAIN_THRESHOLD = "3"
 
 SYNC_INTERVAL_SECONDS = 60
-SYNC_JITTER_SECONDS = 20   # each node sleeps 60 + randint(0, 20) between cycles
+SYNC_JITTER_SECONDS = 20  # each node sleeps 60 + randint(0, 20) between cycles
 EMBED_BATCH_PAUSE_SECONDS = 2  # pause between LiteLLM batches to avoid thundering herd
-SYNC_MAX_STALE_PER_CYCLE = 200  # max bookmarks/visits embedded per sync cycle; remainder deferred to next
+SYNC_MAX_STALE_PER_CYCLE = (
+    200  # max bookmarks/visits embedded per sync cycle; remainder deferred to next
+)
 
 _loop_started = False
+_loop_task: asyncio.Task | None = None
 
 # Progress state for full reindex operations (in-memory, resets on restart)
 _reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
@@ -151,10 +154,19 @@ def analyze_domains(threshold: int | None = None) -> list[str]:
             description="Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
         )
         gen = increment_gen(conn)
-        enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_RARE_DOMAINS,
-            {"key": SETTING_RARE_DOMAINS, "value": rare_json,
-             "description": "Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
-             "updated_at": None}, gen)
+        enqueue_for_all_peers(
+            conn,
+            "INSERT",
+            "settings",
+            SETTING_RARE_DOMAINS,
+            {
+                "key": SETTING_RARE_DOMAINS,
+                "value": rare_json,
+                "description": "Domains appearing <= domain_threshold times (auto-computed; included in embeddings)",
+                "updated_at": None,
+            },
+            gen,
+        )
         set_setting(
             conn,
             SETTING_DOMAIN_THRESHOLD,
@@ -162,12 +174,26 @@ def analyze_domains(threshold: int | None = None) -> list[str]:
             description="Max occurrences for a domain to be treated as rare (informative) in embeddings",
         )
         gen2 = increment_gen(conn)
-        enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_DOMAIN_THRESHOLD,
-            {"key": SETTING_DOMAIN_THRESHOLD, "value": str(threshold),
-             "description": "Max occurrences for a domain to be treated as rare (informative) in embeddings",
-             "updated_at": None}, gen2)
+        enqueue_for_all_peers(
+            conn,
+            "INSERT",
+            "settings",
+            SETTING_DOMAIN_THRESHOLD,
+            {
+                "key": SETTING_DOMAIN_THRESHOLD,
+                "value": str(threshold),
+                "description": "Max occurrences for a domain to be treated as rare (informative) in embeddings",
+                "updated_at": None,
+            },
+            gen2,
+        )
 
-    log.info("analyze_domains: threshold=%d, rare=%d of %d total domains", threshold, len(rare), len(counts))
+    log.info(
+        "analyze_domains: threshold=%d, rare=%d of %d total domains",
+        threshold,
+        len(rare),
+        len(counts),
+    )
     return rare
 
 
@@ -185,14 +211,16 @@ async def reindex_all() -> None:
         rare_domains = _get_rare_domains()
 
         with get_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM bookmarks ORDER BY updated_at ASC"
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM bookmarks ORDER BY updated_at ASC").fetchall()
 
         row_dicts = [dict(r) for r in rows]
         _reindex_state["total"] = len(row_dicts)
-        log.info("reindex_all: starting, %d bookmarks, excluded_tags=%r, rare_domains=%d",
-                 len(row_dicts), excluded_tags, len(rare_domains))
+        log.info(
+            "reindex_all: starting, %d bookmarks, excluded_tags=%r, rare_domains=%d",
+            len(row_dicts),
+            excluded_tags,
+            len(rare_domains),
+        )
 
         for i in range(0, len(row_dicts), EMBED_BATCH_SIZE):
             batch = row_dicts[i : i + EMBED_BATCH_SIZE]
@@ -271,8 +299,7 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     raw_ids = raw.get("ids") or []
     raw_metas = raw.get("metadatas") or []
     seekdb_map: dict[str, str] = {
-        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "")
-        for i in range(len(raw_ids))
+        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "") for i in range(len(raw_ids))
     }
 
     # Delete SeekDB entries with no matching SQLite row (bookmark was deleted)
@@ -284,9 +311,9 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
 
     # Find bookmarks with missing or outdated embeddings
     stale = [
-        row for bid, row in sqlite_dict.items()
-        if bid not in seekdb_map
-        or (row.get("updated_at") or "") > seekdb_map[bid]
+        row
+        for bid, row in sqlite_dict.items()
+        if bid not in seekdb_map or (row.get("updated_at") or "") > seekdb_map[bid]
     ]
 
     if not stale:
@@ -339,8 +366,7 @@ async def _sync_visits_stale() -> tuple[int, int]:
     raw_ids = raw.get("ids") or []
     raw_metas = raw.get("metadatas") or []
     seekdb_map: dict[str, str] = {
-        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "")
-        for i in range(len(raw_ids))
+        raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "") for i in range(len(raw_ids))
     }
 
     # Delete SeekDB entries with no matching SQLite row (visit was deleted)
@@ -352,9 +378,9 @@ async def _sync_visits_stale() -> tuple[int, int]:
 
     # Find visits with missing or outdated embeddings
     stale = [
-        row for vid, row in sqlite_dict.items()
-        if vid not in seekdb_map
-        or (row.get("updated_at") or "") > seekdb_map[vid]
+        row
+        for vid, row in sqlite_dict.items()
+        if vid not in seekdb_map or (row.get("updated_at") or "") > seekdb_map[vid]
     ]
 
     if not stale:
@@ -399,7 +425,12 @@ async def sync_once() -> dict[str, int]:
     """
     if _reindex_state["running"]:
         log.debug("seekdb_sync: reindex in progress — skipping incremental sync cycle")
-        return {"bookmarks_synced": 0, "bookmarks_deleted": 0, "visits_synced": 0, "visits_deleted": 0}
+        return {
+            "bookmarks_synced": 0,
+            "bookmarks_deleted": 0,
+            "visits_synced": 0,
+            "visits_deleted": 0,
+        }
 
     init_seekdb()
 
@@ -432,17 +463,34 @@ async def _sync_loop() -> None:
             stats = await sync_once()
             if any(stats.values()):
                 log.info("seekdb_sync: %s", stats)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("seekdb_sync: sync cycle failed")
         await asyncio.sleep(SYNC_INTERVAL_SECONDS + random.randint(0, SYNC_JITTER_SECONDS))
 
 
 def start_seekdb_sync_loop() -> None:
-    global _loop_started
+    global _loop_started, _loop_task
     if _loop_started:
         return
     _loop_started = True
-    asyncio.create_task(_sync_loop())
+    _loop_task = asyncio.create_task(_sync_loop())
+
+
+async def stop_seekdb_sync_loop() -> None:
+    """Cancel the background SeekDB sync loop and wait for it to exit."""
+    global _loop_started, _loop_task
+    task = _loop_task
+    _loop_started = False
+    _loop_task = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.info("seekdb_sync: loop stopped")
 
 
 def trigger_seekdb_sync() -> None:

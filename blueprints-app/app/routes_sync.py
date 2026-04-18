@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from . import config as cfg
 from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, increment_gen
+from .events import bus as events_bus
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
 from .sync.queue import enqueue, enqueue_for_all_peers, get_queue_depths
 from .sync.restore import apply_restore, make_full_backup
@@ -45,14 +46,22 @@ _RESTORE_OP_HEADER = "x-blueprints-restore-op"
 # are silently dropped to prevent stale peer data overwriting the JSON-derived
 # addresses and config.
 _ALLOWED_TABLES = {
-    "services", "machines",
+    "services",
+    "machines",
     "pfsense_dns",
-    "proxmox_config", "proxmox_nets", "vlans", "dockge_stacks", "dockge_stack_services", "caddy_configs",
-    "settings", "pve_hosts",
+    "proxmox_config",
+    "proxmox_nets",
+    "vlans",
+    "dockge_stacks",
+    "dockge_stack_services",
+    "caddy_configs",
+    "settings",
+    "pve_hosts",
     "arp_manual",
     "ssh_targets",
     "manual_links",
-    "docs", "doc_groups",
+    "docs",
+    "doc_groups",
     "doc_images",
     "ai_providers",
     "ai_project_assignments",
@@ -78,13 +87,18 @@ _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
 
 # ── Git pull helpers ──────────────────────────────────────────────────────────
 
+
 async def _git_pull_and_restart(repo_path: str, label: str, restart_service: bool = True) -> None:
     """Run git pull on a repo, then restart the service."""
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         log.info("git pull [%s] skipped: no repo at %r", label, repo_path)
         return
     proc = await asyncio.create_subprocess_exec(
-        "git", "-C", repo_path, "pull", "--ff-only",
+        "git",
+        "-C",
+        repo_path,
+        "pull",
+        "--ff-only",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -104,6 +118,10 @@ async def _restart_service() -> None:
     Sleep briefly first so the HTTP response that triggered this call
     has time to be flushed through Caddy before the process is killed.
     """
+    subscriber_count = events_bus.subscriber_count
+    if subscriber_count:
+        log.info("closing %d SSE subscriber(s) before restart", subscriber_count)
+        await events_bus.close_all()
     await asyncio.sleep(1)
     parts = cfg.SERVICE_RESTART_CMD.split()
     proc = await asyncio.create_subprocess_exec(
@@ -119,6 +137,7 @@ async def _restart_service() -> None:
 
 
 # ── Internal helper: apply one sync action ────────────────────────────────────
+
 
 def _apply_action(conn, action) -> None:
     """
@@ -154,45 +173,46 @@ def _apply_action(conn, action) -> None:
 
 def _pk_for_table(table: str) -> str:
     pk_map = {
-        "services":       "service_id",
-        "machines":       "machine_id",
-        "nodes":          "node_id",
-        "pfsense_dns":    "dns_entry_id",
+        "services": "service_id",
+        "machines": "machine_id",
+        "nodes": "node_id",
+        "pfsense_dns": "dns_entry_id",
         "proxmox_config": "config_id",
-        "proxmox_nets":   "net_id",
-        "vlans":          "vlan_id",
-        "dockge_stacks":         "stack_id",
-        "dockge_stack_services":  "service_id",
-        "caddy_configs":          "caddy_id",
-        "settings":       "key",
-        "pve_hosts":      "pve_id",
-        "arp_manual":     "entry_id",
-        "ssh_targets":    "ip_address",
-        "manual_links":   "link_id",
-        "docs":                    "doc_id",
-        "doc_groups":              "group_id",
-        "doc_images":              "image_id",
-        "ai_providers":            "provider_id",
-        "ai_project_assignments":  "assignment_id",
-        "bookmarks":               "bookmark_id",
-        "visits":                  "visit_id",
-        "bookmark_deletions":      "bookmark_id",
-        "visit_events":            "event_id",
-        "nav_items":               "item_id",
-        "form_controls":           "control_id",
-        "embed_menu_items":        "item_id",
-        "table_layout_catalog":    "table_code",
-        "table_layouts":           "layout_key",
-        "pockettts_tags":          "tag_id",
-        "pockettts_voices":        "voice_id",
-        "pockettts_voice_meta":    "voice_id",
-        "pockettts_voice_tags":    "assignment_id",
-        "pockettts_tag_order":     "order_id",
+        "proxmox_nets": "net_id",
+        "vlans": "vlan_id",
+        "dockge_stacks": "stack_id",
+        "dockge_stack_services": "service_id",
+        "caddy_configs": "caddy_id",
+        "settings": "key",
+        "pve_hosts": "pve_id",
+        "arp_manual": "entry_id",
+        "ssh_targets": "ip_address",
+        "manual_links": "link_id",
+        "docs": "doc_id",
+        "doc_groups": "group_id",
+        "doc_images": "image_id",
+        "ai_providers": "provider_id",
+        "ai_project_assignments": "assignment_id",
+        "bookmarks": "bookmark_id",
+        "visits": "visit_id",
+        "bookmark_deletions": "bookmark_id",
+        "visit_events": "event_id",
+        "nav_items": "item_id",
+        "form_controls": "control_id",
+        "embed_menu_items": "item_id",
+        "table_layout_catalog": "table_code",
+        "table_layouts": "layout_key",
+        "pockettts_tags": "tag_id",
+        "pockettts_voices": "voice_id",
+        "pockettts_voice_meta": "voice_id",
+        "pockettts_voice_tags": "assignment_id",
+        "pockettts_tag_order": "order_id",
     }
     return pk_map.get(table, "id")
 
 
 # ── Forwarding helpers (Phase 2 — GUID-deduplicated relay) ───────────────────
+
 
 def _can_reach_directly(source: dict, target: dict) -> bool:
     """Return True if source node can reach target via any direct network path.
@@ -203,11 +223,7 @@ def _can_reach_directly(source: dict, target: dict) -> bool:
     """
     if source.get("primary_ip") and target.get("primary_ip"):
         return True
-    if (
-        source.get("tailnet")
-        and target.get("tailnet")
-        and source["tailnet"] == target["tailnet"]
-    ):
+    if source.get("tailnet") and target.get("tailnet") and source["tailnet"] == target["tailnet"]:
         return True
     return False
 
@@ -234,9 +250,9 @@ def _forward_actions(
         return  # Unknown originator — no forwarding
 
     relay_peers = [
-        n for n in cfg.PEER_NODES
-        if not _can_reach_directly(source_node, n)
-        and _can_reach_directly(cfg.SELF_NODE, n)
+        n
+        for n in cfg.PEER_NODES
+        if not _can_reach_directly(source_node, n) and _can_reach_directly(cfg.SELF_NODE, n)
     ]
     if not relay_peers:
         return
@@ -245,23 +261,32 @@ def _forward_actions(
         for action in actions:
             try:
                 enqueue(
-                    conn, peer["node_id"],
-                    action.action_type, action.table_name,
-                    action.row_id, action.row_data,
-                    action.gen, guid=action.guid,
+                    conn,
+                    peer["node_id"],
+                    action.action_type,
+                    action.table_name,
+                    action.row_id,
+                    action.row_data,
+                    action.gen,
+                    guid=action.guid,
                 )
             except Exception:
                 log.exception(
                     "failed to forward action %s/%s to relay peer %s",
-                    action.table_name, action.row_id, peer["node_id"],
+                    action.table_name,
+                    action.row_id,
+                    peer["node_id"],
                 )
     log.debug(
         "forwarded %d action(s) from %s to relay peer(s) %s",
-        len(actions), source_node_id, [p["node_id"] for p in relay_peers],
+        len(actions),
+        source_node_id,
+        [p["node_id"] for p in relay_peers],
     )
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
+
 
 @router.post("/actions", status_code=204)
 async def receive_actions(payload: SyncActionsPayload) -> Response:
@@ -290,7 +315,9 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
             asyncio.create_task(_git_pull_and_restart(cfg.REPO_INNER_PATH, "inner"))
             log.info("scheduled git pull [inner] from %s", payload.source_node_id)
         elif action.action_type == "sync_git_non_root":
-            asyncio.create_task(_git_pull_and_restart(cfg.REPO_NON_ROOT_PATH, "non_root", restart_service=False))
+            asyncio.create_task(
+                _git_pull_and_restart(cfg.REPO_NON_ROOT_PATH, "non_root", restart_service=False)
+            )
             log.info("scheduled git pull [non_root] from %s", payload.source_node_id)
 
     if not db_actions:
@@ -300,8 +327,7 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
     if cfg.COMMIT_TS and payload.source_commit_ts:
         if payload.source_commit_ts < cfg.COMMIT_TS:
             log.warning(
-                "commit guard: rejecting %d DB actions from %s "
-                "(source_ts=%d < local_ts=%d)",
+                "commit guard: rejecting %d DB actions from %s (source_ts=%d < local_ts=%d)",
                 len(db_actions),
                 payload.source_node_id,
                 payload.source_commit_ts,
@@ -338,7 +364,8 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                 except sqlite3.IntegrityError:
                     log.debug(
                         "GUID %s already seen — skipping duplicate from %s",
-                        action.guid[:8], payload.source_node_id,
+                        action.guid[:8],
+                        payload.source_node_id,
                     )
                     continue
 
@@ -359,7 +386,9 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
         if failures:
             log.warning(
                 "skipped %d action(s) from %s due to errors: %s",
-                len(failures), payload.source_node_id, ", ".join(failures),
+                len(failures),
+                payload.source_node_id,
+                ", ".join(failures),
             )
 
         # Update last_seen for the source node
@@ -497,7 +526,9 @@ async def table_parity(table_name: str) -> dict:
             try:
                 r = await client.get(
                     f"{url}/api/v1/sync/table-hash/{table_name}",
-                    headers={"x-api-token": compute_token(cfg.SYNC_SECRET)} if cfg.SYNC_SECRET else {},
+                    headers={"x-api-token": compute_token(cfg.SYNC_SECRET)}
+                    if cfg.SYNC_SECRET
+                    else {},
                 )
                 if r.status_code == 200:
                     data = r.json()
@@ -559,7 +590,6 @@ async def table_parity(table_name: str) -> dict:
     }
 
 
-
 async def receive_restore(request: Request) -> Response:
     """
     Layer 1 restore endpoint.
@@ -593,9 +623,9 @@ async def receive_restore(request: Request) -> Response:
                 integrity_ok = get_meta(conn, "integrity_ok") == "true"
             if integrity_ok and sender_gen <= my_gen:
                 log.info(
-                    "receive_restore: rejecting stale backup "
-                    "(sender gen=%d <= my gen=%d)",
-                    sender_gen, my_gen,
+                    "receive_restore: rejecting stale backup (sender gen=%d <= my gen=%d)",
+                    sender_gen,
+                    my_gen,
                 )
                 raise HTTPException(
                     409,
@@ -608,7 +638,9 @@ async def receive_restore(request: Request) -> Response:
 
     ok = await apply_restore(zip_bytes, sha256_hex)
     if not ok:
-        raise HTTPException(422, "restore failed — checksum mismatch, integrity failure, or corrupt payload")
+        raise HTTPException(
+            422, "restore failed — checksum mismatch, integrity failure, or corrupt payload"
+        )
 
     if force_restore:
         log.warning(
@@ -691,6 +723,7 @@ async def sync_status() -> SyncStatus:
 
 # ── Diagnostic probe endpoints ────────────────────────────────────────────────
 
+
 def _probe_client(timeout: float) -> httpx.AsyncClient:
     """Return an httpx.AsyncClient configured identically to the sync drain.
 
@@ -748,11 +781,29 @@ async def mtls_probe() -> dict:
                 if ("[SSL:" in err or "CERTIFICATE" in err or "handshake" in err.lower())
                 else "refused"
             )
-            return {"node_id": node_id, "address": health_url, "status": status, "http_status": None, "error": err}
+            return {
+                "node_id": node_id,
+                "address": health_url,
+                "status": status,
+                "http_status": None,
+                "error": err,
+            }
         except httpx.TimeoutException:
-            return {"node_id": node_id, "address": health_url, "status": "timeout", "http_status": None, "error": "connection timed out"}
+            return {
+                "node_id": node_id,
+                "address": health_url,
+                "status": "timeout",
+                "http_status": None,
+                "error": "connection timed out",
+            }
         except Exception as e:
-            return {"node_id": node_id, "address": health_url, "status": "error", "http_status": None, "error": str(e)}
+            return {
+                "node_id": node_id,
+                "address": health_url,
+                "status": "error",
+                "http_status": None,
+                "error": str(e),
+            }
 
     async with _probe_client(timeout=8.0) as client:
         for n in cfg._peer_nodes:
@@ -760,13 +811,15 @@ async def mtls_probe() -> dict:
             peer_urls = cfg.PEER_SYNC_URLS.get(node_id, [])
             if not peer_urls:
                 # Peer has no configured sync addresses (misconfigured node)
-                results.append({
-                    "node_id": node_id,
-                    "address": None,
-                    "status": "error",
-                    "http_status": None,
-                    "error": "no sync addresses configured",
-                })
+                results.append(
+                    {
+                        "node_id": node_id,
+                        "address": None,
+                        "status": "error",
+                        "http_status": None,
+                        "error": "no sync addresses configured",
+                    }
+                )
                 continue
             for url in peer_urls:
                 result = await _probe_address(node_id, url, client)
@@ -809,11 +862,16 @@ async def ssh_probe() -> dict:
         node_id = n["node_id"]
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-n",
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "ConnectTimeout=5",
-                "-i", ssh_key,
+                "ssh",
+                "-n",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "ConnectTimeout=5",
+                "-i",
+                ssh_key,
                 f"root@{ip}",
                 "echo ok",
                 stdout=asyncio.subprocess.PIPE,
@@ -835,9 +893,19 @@ async def ssh_probe() -> dict:
                 return {"node_id": node_id, "ip": ip, "status": "no_route", "error": err}
             if "Connection timed out" in err or "Operation timed out" in err:
                 return {"node_id": node_id, "ip": ip, "status": "timeout", "error": err}
-            return {"node_id": node_id, "ip": ip, "status": "error", "error": err or f"exit {rc}: {out}"}
+            return {
+                "node_id": node_id,
+                "ip": ip,
+                "status": "error",
+                "error": err or f"exit {rc}: {out}",
+            }
         except asyncio.TimeoutError:
-            return {"node_id": node_id, "ip": ip, "status": "timeout", "error": "SSH timed out (12s)"}
+            return {
+                "node_id": node_id,
+                "ip": ip,
+                "status": "timeout",
+                "error": "SSH timed out (12s)",
+            }
         except Exception as e:
             return {"node_id": node_id, "ip": ip, "status": "error", "error": str(e)}
 
@@ -887,20 +955,20 @@ async def failover_probe() -> dict:
 
     async def _probe_one(n: dict, client: httpx.AsyncClient) -> dict:
         node_id = n["node_id"]
-        scheme  = n.get("sync_scheme", "http")
+        scheme = n.get("sync_scheme", "http")
         peer_ip = n.get("primary_ip") or "127.0.0.1"
 
         dead_url = f"{scheme}://{peer_ip}:{_FAILOVER_DEAD_PORT}"
         real_urls = cfg.PEER_SYNC_URLS.get(node_id, [])
-        real_url  = real_urls[0] if real_urls else None
+        real_url = real_urls[0] if real_urls else None
 
         # ── Step 1: attempt the dead URL ─────────────────────────────────
         t0 = time.monotonic()
         dead_status = "unknown"
-        dead_error  = None
+        dead_error = None
         try:
             await client.get(f"{dead_url}/health")
-            dead_status = "open"   # unexpected — port 19999 should be closed
+            dead_status = "open"  # unexpected — port 19999 should be closed
         except httpx.ConnectError as e:
             err = str(e)
             dead_status = (
@@ -911,22 +979,22 @@ async def failover_probe() -> dict:
             dead_error = err
         except httpx.TimeoutException:
             dead_status = "timeout"
-            dead_error  = "connection timed out"
+            dead_error = "connection timed out"
         except Exception as e:
             dead_status = "error"
-            dead_error  = str(e)
+            dead_error = str(e)
         dead_ms = round((time.monotonic() - t0) * 1000)
 
         # ── Step 2: attempt the real URL ─────────────────────────────────
-        real_status      = "no_url"
+        real_status = "no_url"
         real_http_status = None
-        real_error       = None
-        real_ms          = 0
+        real_error = None
+        real_ms = 0
         if real_url:
             t1 = time.monotonic()
             try:
                 r = await client.get(f"{real_url}/health")
-                real_status      = "ok" if r.is_success else "http_error"
+                real_status = "ok" if r.is_success else "http_error"
                 real_http_status = r.status_code
             except httpx.ConnectError as e:
                 err = str(e)
@@ -938,26 +1006,26 @@ async def failover_probe() -> dict:
                 real_error = err
             except httpx.TimeoutException:
                 real_status = "timeout"
-                real_error  = "connection timed out"
+                real_error = "connection timed out"
             except Exception as e:
                 real_status = "error"
-                real_error  = str(e)
+                real_error = str(e)
             real_ms = round((time.monotonic() - t1) * 1000)
 
         failover_ok = (dead_status in ("refused", "timeout")) and real_status == "ok"
 
         return {
-            "node_id":         node_id,
-            "dead_url":        f"{dead_url}/health",
-            "dead_status":     dead_status,
-            "dead_ms":         dead_ms,
-            "dead_error":      dead_error,
-            "real_url":        f"{real_url}/health" if real_url else None,
-            "real_status":     real_status,
+            "node_id": node_id,
+            "dead_url": f"{dead_url}/health",
+            "dead_status": dead_status,
+            "dead_ms": dead_ms,
+            "dead_error": dead_error,
+            "real_url": f"{real_url}/health" if real_url else None,
+            "real_status": real_status,
             "real_http_status": real_http_status,
-            "real_ms":         real_ms,
-            "real_error":      real_error,
-            "failover_ok":     failover_ok,
+            "real_ms": real_ms,
+            "real_error": real_error,
+            "failover_ok": failover_ok,
         }
 
     results = []
@@ -967,10 +1035,10 @@ async def failover_probe() -> dict:
 
     all_passed = all(r["failover_ok"] for r in results) if results else False
     return {
-        "method":     f"synthetic dead-port (port {_FAILOVER_DEAD_PORT}) + real configured URL",
-        "dead_port":  _FAILOVER_DEAD_PORT,
+        "method": f"synthetic dead-port (port {_FAILOVER_DEAD_PORT}) + real configured URL",
+        "dead_port": _FAILOVER_DEAD_PORT,
         "all_passed": all_passed,
-        "peers":      results,
+        "peers": results,
     }
 
 
@@ -1002,10 +1070,10 @@ async def guid_probe() -> dict:
 
     # ── Test 1: GUID dedup ────────────────────────────────────────────────────
     test_guid = f"__probe__{uuid.uuid4().hex}"
-    first_insert   = "error"
-    second_insert  = "error"
-    cleanup        = "ok"
-    dedup_ok       = False
+    first_insert = "error"
+    second_insert = "error"
+    cleanup = "ok"
+    dedup_ok = False
 
     try:
         with get_conn() as conn:
@@ -1033,13 +1101,13 @@ async def guid_probe() -> dict:
 
             # Cleanup — remove the probe GUID
             try:
-                conn.execute(
-                    "DELETE FROM sync_seen_guids WHERE guid=?", (test_guid,)
-                )
+                conn.execute("DELETE FROM sync_seen_guids WHERE guid=?", (test_guid,))
             except Exception as e:
                 cleanup = f"failed: {e}"
 
-        dedup_ok = (first_insert == "accepted" and second_insert == "deduplicated" and cleanup == "ok")
+        dedup_ok = (
+            first_insert == "accepted" and second_insert == "deduplicated" and cleanup == "ok"
+        )
 
     except Exception as e:
         first_insert = f"db_error: {e}"
@@ -1047,25 +1115,27 @@ async def guid_probe() -> dict:
     # ── Test 2: Fleet forwarding topology ─────────────────────────────────────
     topology = []
     for peer in cfg.PEER_NODES:
-        topology.append({
-            "peer_node_id":       peer["node_id"],
-            "peer_has_primary_ip": bool(peer.get("primary_ip")),
-            "peer_tailnet":        peer.get("tailnet", ""),
-            "self_can_reach":     _can_reach_directly(cfg.SELF_NODE, peer),
-        })
+        topology.append(
+            {
+                "peer_node_id": peer["node_id"],
+                "peer_has_primary_ip": bool(peer.get("primary_ip")),
+                "peer_tailnet": peer.get("tailnet", ""),
+                "self_can_reach": _can_reach_directly(cfg.SELF_NODE, peer),
+            }
+        )
 
     # ── Test 3: Mock remote node relay ────────────────────────────────────────
     # Simulate a source with no primary_ip (VPS) on the same tailnet as self.
     self_tailnet = cfg.SELF_NODE.get("tailnet", "")
     mock_source = {
-        "node_id":    "__mock_vps__",
+        "node_id": "__mock_vps__",
         "primary_ip": "",
-        "tailnet":    self_tailnet,
+        "tailnet": self_tailnet,
     }
     relay_peers = [
-        p["node_id"] for p in cfg.PEER_NODES
-        if not _can_reach_directly(mock_source, p)
-        and _can_reach_directly(cfg.SELF_NODE, p)
+        p["node_id"]
+        for p in cfg.PEER_NODES
+        if not _can_reach_directly(mock_source, p) and _can_reach_directly(cfg.SELF_NODE, p)
     ]
     # In the current 6-node on-prem fleet (all have primary_ip, all same-tailnet covered),
     # expected relay count depends on peer tailnet membership:
@@ -1074,28 +1144,27 @@ async def guid_probe() -> dict:
     # Peers sharing self_tailnet: mock_source CAN reach them via tailnet (same tailnet).
     # Peers NOT on self_tailnet: only reachable via relay.
     peers_not_on_self_tailnet = [
-        p["node_id"] for p in cfg.PEER_NODES
-        if p.get("tailnet", "") != self_tailnet
+        p["node_id"] for p in cfg.PEER_NODES if p.get("tailnet", "") != self_tailnet
     ]
     expected_relay_ids = set(peers_not_on_self_tailnet)
     relay_ok = set(relay_peers) == expected_relay_ids
 
     mock_relay = {
         "mock_source_has_primary_ip": False,
-        "mock_source_tailnet":        self_tailnet or "(none)",
-        "relay_peers":                relay_peers,
-        "expected_relay_peers":       sorted(expected_relay_ids),
-        "relay_ok":                   relay_ok,
+        "mock_source_tailnet": self_tailnet or "(none)",
+        "relay_peers": relay_peers,
+        "expected_relay_peers": sorted(expected_relay_ids),
+        "relay_ok": relay_ok,
     }
 
     all_passed = dedup_ok and relay_ok
     return {
         "all_passed": all_passed,
         "dedup": {
-            "ok":           dedup_ok,
+            "ok": dedup_ok,
             "first_insert": first_insert,
             "second_insert": second_insert,
-            "cleanup":      cleanup,
+            "cleanup": cleanup,
         },
         "topology": topology,
         "mock_relay": mock_relay,
@@ -1121,17 +1190,24 @@ async def sync_roundtrip_test() -> dict:
     Timeout: 25s — covers more than one drain cycle (drain sleeps 1-20s randomly).
     """
     if not cfg._peer_nodes:
-        return {"status": "no_peers", "elapsed_ms": 0, "propagated_to": None,
-                "error": "no active peer nodes configured"}
+        return {
+            "status": "no_peers",
+            "elapsed_ms": 0,
+            "propagated_to": None,
+            "error": "no active peer nodes configured",
+        }
     if not cfg.SYNC_SECRET:
-        return {"status": "no_secret", "elapsed_ms": 0, "propagated_to": None,
-                "error": "BLUEPRINTS_SYNC_SECRET not configured — cannot authenticate peer read"}
+        return {
+            "status": "no_secret",
+            "elapsed_ms": 0,
+            "propagated_to": None,
+            "error": "BLUEPRINTS_SYNC_SECRET not configured — cannot authenticate peer read",
+        }
 
     canary_key = f"_bp_diag_canary_{uuid.uuid4().hex[:16]}"
     peer = cfg._peer_nodes[0]
     peer_base = (
-        f"{peer.get('sync_scheme', 'http')}://{peer['primary_ip']}"
-        f":{peer.get('sync_port', 8080)}"
+        f"{peer.get('sync_scheme', 'http')}://{peer['primary_ip']}:{peer.get('sync_port', 8080)}"
     )
     start_ts = time.monotonic()
     propagated = False
@@ -1196,8 +1272,7 @@ async def sync_roundtrip_test() -> dict:
                             "elapsed_ms": elapsed,
                             "propagated_to": None,
                             "error": (
-                                f"peer {peer['node_id']} rejected token (HTTP 401)"
-                                f"{totp_note}"
+                                f"peer {peer['node_id']} rejected token (HTTP 401){totp_note}"
                             ),
                         }
                         break
@@ -1225,7 +1300,9 @@ async def sync_roundtrip_test() -> dict:
             "propagated_to": peer["node_id"],
             "error": None,
         }
-    log.warning("roundtrip-test: timeout after %dms — canary not found on %s", elapsed, peer["node_id"])
+    log.warning(
+        "roundtrip-test: timeout after %dms — canary not found on %s", elapsed, peer["node_id"]
+    )
     return {
         "status": "timeout",
         "elapsed_ms": elapsed,
