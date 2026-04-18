@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 import httpx
@@ -78,8 +78,8 @@ from .routes_todo import router as todo_router
 from .routes_tts import router as tts_router
 from .routes_ui_cache import router as ui_cache_router
 from .routes_vlans import router as vlans_router
-from .seekdb_sync import start_seekdb_sync_loop
-from .sync.drain import start_drain_loop
+from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
+from .sync.drain import start_drain_loop, stop_drain_loop
 from .sync.queue import enqueue_for_all_peers
 from .sync.restore import apply_restore
 
@@ -90,6 +90,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+async def _cancel_background_task(task: asyncio.Task | None, label: str) -> None:
+    """Cancel a background task and wait for it to exit."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    log.info("background task stopped: %s", label)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     log.info(
@@ -97,6 +107,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         cfg.NODE_NAME,
         cfg.INSTANCE,
     )
+
+    boot_catchup_task: asyncio.Task | None = None
+    seeded_vlans_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -127,10 +140,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     start_seekdb_sync_loop()
 
     # Boot catch-up: if DB integrity failed, pull full backup from a trusted peer
-    asyncio.create_task(_boot_catchup())
+    boot_catchup_task = asyncio.create_task(_boot_catchup())
 
     # Enqueue any vlans rows that were seeded locally but not yet distributed
-    asyncio.create_task(_enqueue_seeded_vlans())
+    seeded_vlans_task = asyncio.create_task(_enqueue_seeded_vlans())
 
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
@@ -138,6 +151,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     # Shutdown — close SSE bus so all connected clients receive the sentinel
     await events_bus.close_all()
+    await _cancel_background_task(boot_catchup_task, "boot_catchup")
+    await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
+    await stop_seekdb_sync_loop()
+    await stop_drain_loop()
 
 
 def _load_nodes_from_json() -> None:
