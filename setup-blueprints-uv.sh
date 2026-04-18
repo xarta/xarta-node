@@ -240,8 +240,10 @@ echo "    ok: dependencies installed from uv.lock"
 
 # ── 4. Install systemd service ────────────────────────────────────────────────
 echo "--- installing systemd service..."
-# Substitute the actual paths into the template
-# Note: Update ExecStart path to use project .venv instead of /opt/blueprints/venv
+# Substitute the actual paths into the template.
+# Note: Update ExecStart path to use project .venv instead of /opt/blueprints/venv.
+# The template includes a loopback pre-stop hook so active SSE subscribers are
+# closed before SIGTERM, preventing long restart stalls.
 VENV_UVICORN="$VENV_DIR/bin/uvicorn"
 sed -e "s|/root/xarta-node/blueprints-app|$APP_DIR|g" \
     -e "s|__ENV_FILE__|$ENV_FILE|g" \

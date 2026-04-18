@@ -197,14 +197,19 @@ async def _sse_generator(
 
 
 @router.get("/stream")
-async def sse_stream(request: Request) -> StreamingResponse:
+async def sse_stream(
+    request: Request,
+    last_event_id_qs: str | None = Query(default=None, alias="lastEventId"),
+) -> StreamingResponse:
     """Long-lived SSE stream.
 
     Clients should pass the TOTP token via the ``token`` query parameter
-    because ``EventSource`` cannot set custom headers.  The ``Last-Event-ID``
-    header is honoured for seamless reconnect catch-up.
+    because ``EventSource`` cannot set custom headers. The reconnect wrapper
+    may also send ``lastEventId`` in the query string when opening a fresh
+    EventSource instance, so accept that as a fallback when the native
+    ``Last-Event-ID`` header is absent.
     """
-    last_event_id = request.headers.get("last-event-id")
+    last_event_id = request.headers.get("last-event-id") or last_event_id_qs
     return StreamingResponse(
         _sse_generator(request, last_event_id),
         media_type="text/event-stream",
@@ -230,6 +235,21 @@ async def get_recent_events(
     if since_id:
         after_ts = _ts_for_event_id(since_id)
     return _load_events(limit=limit, after_ts=after_ts)
+
+
+@router.post("/close-all")
+async def close_all_streams() -> dict[str, int | str]:
+    """Close all live SSE subscribers immediately.
+
+    Intended for loopback/systemd pre-stop use so a direct ``systemctl restart``
+    does not sit in Uvicorn's "Waiting for connections to close" state when
+    browser EventSource clients are attached.
+    """
+    closed = bus.subscriber_count
+    if closed:
+        log.info("events: closing %d SSE subscriber(s) on pre-stop request", closed)
+    await bus.close_all()
+    return {"closed": closed, "status": "ok"}
 
 
 @router.post("", response_model=EventOut, status_code=201)
