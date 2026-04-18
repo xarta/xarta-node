@@ -75,6 +75,18 @@ async def test_ai_provider_observability(body: _AiObservabilityTestBody) -> dict
     return result
 
 
+@router.post("/observability/vision-test", response_model=dict)
+async def test_ai_provider_observability_vision(body: _AiObservabilityTestBody) -> dict:
+    alias = (body.alias or "").strip()
+    if not alias:
+        raise HTTPException(400, "alias is required")
+    backend = get_ai_observability_backend()
+    result = await backend.test_vision_alias(alias, _list_provider_dicts())
+    if result.get("status") == "alias_not_found":
+        raise HTTPException(404, result.get("detail") or f"Alias {alias!r} not found")
+    return result
+
+
 @router.post("", response_model=AiProviderOut, status_code=201)
 async def create_ai_provider(body: AiProviderCreate) -> AiProviderOut:
     provider_id = str(uuid.uuid4())

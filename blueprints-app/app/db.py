@@ -6,10 +6,10 @@ read concurrency. The generation counter in sync_meta provides a total
 ordering across all committed writes — critical for the sync engine.
 """
 
+import json
 import logging
 import os
 import sqlite3
-import json
 from contextlib import contextmanager
 from typing import Generator
 
@@ -574,185 +574,301 @@ CREATE TABLE IF NOT EXISTS pockettts_tag_order (
 );
 CREATE INDEX IF NOT EXISTS idx_pockettts_tag_order_scope
     ON pockettts_tag_order(scope_key, order_index);
+
+-- ── Node-local push-notification events (NOT fleet-synced) ───────────────────
+-- Each node maintains its own event log.  Events are pruned after 7 days.
+-- Excluded from _ALLOWED_TABLES in routes_sync.py — never replicated to peers.
+CREATE TABLE IF NOT EXISTS events (
+    event_id      TEXT PRIMARY KEY,
+    event_type    TEXT NOT NULL,   -- e.g. "model.changed", "alias.tests.completed"
+    severity      TEXT NOT NULL DEFAULT 'info',  -- info | warn | error
+    title         TEXT NOT NULL DEFAULT '',
+    message       TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'blueprints-app',
+    created_at    REAL NOT NULL,   -- unix epoch float
+    payload_json  TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_type       ON events(event_type);
 """
 
 _TABLE_LAYOUT_CATALOG_SEED = [
-    ("01", "settings", {
-        "display_name": "Settings",
-        "sql_table": "settings",
-        "table_kind": "table",
-        "dom_table_id": "settings-table",
-        "tab_id": "settings",
-    }),
-    ("02", "docs-images", {
-        "display_name": "Docs Images",
-        "sql_table": "doc_images",
-        "table_kind": "table",
-        "dom_table_id": "doc-images-table",
-        "tab_id": "docs-images",
-    }),
-    ("03", "manual-links", {
-        "display_name": "Manual Links",
-        "sql_table": "manual_links",
-        "table_kind": "table",
-        "dom_table_id": "ml-table",
-        "tab_id": "manual-links",
-    }),
-    ("04", "services", {
-        "display_name": "Services",
-        "sql_table": "services",
-        "table_kind": "table",
-        "dom_table_id": "services-table",
-        "tab_id": "services",
-    }),
-    ("05", "machines", {
-        "display_name": "Machines",
-        "sql_table": "machines",
-        "table_kind": "table",
-        "dom_table_id": "machines-table",
-        "tab_id": "machines",
-    }),
-    ("06", "fleet-nodes", {
-        "display_name": "Fleet Nodes",
-        "sql_table": "nodes",
-        "table_kind": "table",
-        "dom_table_id": "nodes-table",
-        "tab_id": "fleet-nodes",
-    }),
-    ("07", "node-backups", {
-        "display_name": "Node Backups",
-        "sql_table": None,
-        "table_kind": "table",
-        "dom_table_id": "backups-table",
-        "tab_id": "fleet-nodes",
-        "route_path": "/api/v1/backup",
-    }),
-    ("08", "pfsense-dns", {
-        "display_name": "pfSense DNS",
-        "sql_table": "pfsense_dns",
-        "table_kind": "table",
-        "dom_table_id": "dns-table",
-        "tab_id": "pfsense-dns",
-    }),
-    ("09", "proxmox-config", {
-        "display_name": "Proxmox Config",
-        "sql_table": "proxmox_config",
-        "table_kind": "table",
-        "dom_table_id": "pve-config-table",
-        "tab_id": "proxmox-config",
-    }),
-    ("0A", "dockge-stacks", {
-        "display_name": "Dockge Stacks",
-        "sql_table": "dockge_stacks",
-        "table_kind": "table",
-        "dom_table_id": "dockge-table",
-        "tab_id": "dockge-stacks",
-    }),
-    ("0B", "caddy-configs", {
-        "display_name": "Caddy Configs",
-        "sql_table": "caddy_configs",
-        "table_kind": "table",
-        "dom_table_id": "caddy-table",
-        "tab_id": "caddy-configs",
-    }),
-    ("0C", "pve-hosts", {
-        "display_name": "PVE Hosts",
-        "sql_table": "pve_hosts",
-        "table_kind": "table",
-        "dom_table_id": "pve-hosts-table",
-        "tab_id": "pve-hosts",
-    }),
-    ("0D", "vlans", {
-        "display_name": "VLANs",
-        "sql_table": "vlans",
-        "table_kind": "table",
-        "dom_table_id": "vlans-table",
-        "tab_id": "vlans",
-    }),
-    ("0E", "arp-manual", {
-        "display_name": "Manual ARP",
-        "sql_table": "arp_manual",
-        "table_kind": "table",
-        "dom_table_id": "arp-manual-table",
-        "tab_id": "arp-manual",
-    }),
-    ("0F", "keys-status", {
-        "display_name": "SSH Keys Status",
-        "sql_table": None,
-        "table_kind": "table",
-        "dom_table_id": "keys-status-table",
-        "tab_id": "keys",
-    }),
-    ("10", "certs-status", {
-        "display_name": "Certificates Status",
-        "sql_table": None,
-        "table_kind": "table",
-        "dom_table_id": "certs-status-table",
-        "tab_id": "certs",
-    }),
-    ("11", "ai-providers", {
-        "display_name": "AI Providers",
-        "sql_table": "ai_providers",
-        "table_kind": "table",
-        "dom_table_id": "ai-providers-table",
-        "tab_id": "ai-providers",
-    }),
-    ("12", "ai-project-assignments", {
-        "display_name": "AI Project Assignments",
-        "sql_table": "ai_project_assignments",
-        "table_kind": "table",
-        "dom_table_id": "ai-assignments-table",
-        "tab_id": "ai-providers",
-    }),
-    ("13", "ssh-targets", {
-        "display_name": "SSH Targets",
-        "sql_table": "ssh_targets",
-        "table_kind": "table",
-        "dom_table_id": "ssh-targets-table",
-        "tab_id": "ssh-targets",
-    }),
-    ("14", "bookmarks", {
-        "display_name": "Bookmarks",
-        "sql_table": "bookmarks",
-        "table_kind": "table",
-        "dom_table_id": "bm-table",
-        "tab_id": "bookmarks-main",
-    }),
-    ("15", "visits", {
-        "display_name": "Visit History",
-        "sql_table": "visits",
-        "table_kind": "table",
-        "dom_table_id": "vis-table",
-        "tab_id": "bookmarks-history",
-    }),
-    ("16", "nav-items", {
-        "display_name": "Nav Items",
-        "sql_table": "nav_items",
-        "table_kind": "table",
-        "dom_table_id": "ni-table",
-        "tab_id": "nav-items",
-    }),
-    ("17", "form-controls", {
-        "display_name": "Form Controls",
-        "sql_table": "form_controls",
-        "table_kind": "table",
-        "dom_table_id": "fc-table",
-        "tab_id": "form-controls",
-    }),
-    ("18", "embed-menu", {
-        "display_name": "Embed Menu",
-        "sql_table": "embed_menu_items",
-        "table_kind": "table",
-        "dom_table_id": "em-table",
-        "tab_id": "embed-menu",
-    }),
-    ("19", "bookmarks-search", {
-        "display_name": "Bookmarks Search",
-        "sql_table": "bookmarks",
-        "table_kind": "table",
-        "dom_table_id": "bm-table",
-        "tab_id": "bookmarks-main",
-    }),
+    (
+        "01",
+        "settings",
+        {
+            "display_name": "Settings",
+            "sql_table": "settings",
+            "table_kind": "table",
+            "dom_table_id": "settings-table",
+            "tab_id": "settings",
+        },
+    ),
+    (
+        "02",
+        "docs-images",
+        {
+            "display_name": "Docs Images",
+            "sql_table": "doc_images",
+            "table_kind": "table",
+            "dom_table_id": "doc-images-table",
+            "tab_id": "docs-images",
+        },
+    ),
+    (
+        "03",
+        "manual-links",
+        {
+            "display_name": "Manual Links",
+            "sql_table": "manual_links",
+            "table_kind": "table",
+            "dom_table_id": "ml-table",
+            "tab_id": "manual-links",
+        },
+    ),
+    (
+        "04",
+        "services",
+        {
+            "display_name": "Services",
+            "sql_table": "services",
+            "table_kind": "table",
+            "dom_table_id": "services-table",
+            "tab_id": "services",
+        },
+    ),
+    (
+        "05",
+        "machines",
+        {
+            "display_name": "Machines",
+            "sql_table": "machines",
+            "table_kind": "table",
+            "dom_table_id": "machines-table",
+            "tab_id": "machines",
+        },
+    ),
+    (
+        "06",
+        "fleet-nodes",
+        {
+            "display_name": "Fleet Nodes",
+            "sql_table": "nodes",
+            "table_kind": "table",
+            "dom_table_id": "nodes-table",
+            "tab_id": "fleet-nodes",
+        },
+    ),
+    (
+        "07",
+        "node-backups",
+        {
+            "display_name": "Node Backups",
+            "sql_table": None,
+            "table_kind": "table",
+            "dom_table_id": "backups-table",
+            "tab_id": "fleet-nodes",
+            "route_path": "/api/v1/backup",
+        },
+    ),
+    (
+        "08",
+        "pfsense-dns",
+        {
+            "display_name": "pfSense DNS",
+            "sql_table": "pfsense_dns",
+            "table_kind": "table",
+            "dom_table_id": "dns-table",
+            "tab_id": "pfsense-dns",
+        },
+    ),
+    (
+        "09",
+        "proxmox-config",
+        {
+            "display_name": "Proxmox Config",
+            "sql_table": "proxmox_config",
+            "table_kind": "table",
+            "dom_table_id": "pve-config-table",
+            "tab_id": "proxmox-config",
+        },
+    ),
+    (
+        "0A",
+        "dockge-stacks",
+        {
+            "display_name": "Dockge Stacks",
+            "sql_table": "dockge_stacks",
+            "table_kind": "table",
+            "dom_table_id": "dockge-table",
+            "tab_id": "dockge-stacks",
+        },
+    ),
+    (
+        "0B",
+        "caddy-configs",
+        {
+            "display_name": "Caddy Configs",
+            "sql_table": "caddy_configs",
+            "table_kind": "table",
+            "dom_table_id": "caddy-table",
+            "tab_id": "caddy-configs",
+        },
+    ),
+    (
+        "0C",
+        "pve-hosts",
+        {
+            "display_name": "PVE Hosts",
+            "sql_table": "pve_hosts",
+            "table_kind": "table",
+            "dom_table_id": "pve-hosts-table",
+            "tab_id": "pve-hosts",
+        },
+    ),
+    (
+        "0D",
+        "vlans",
+        {
+            "display_name": "VLANs",
+            "sql_table": "vlans",
+            "table_kind": "table",
+            "dom_table_id": "vlans-table",
+            "tab_id": "vlans",
+        },
+    ),
+    (
+        "0E",
+        "arp-manual",
+        {
+            "display_name": "Manual ARP",
+            "sql_table": "arp_manual",
+            "table_kind": "table",
+            "dom_table_id": "arp-manual-table",
+            "tab_id": "arp-manual",
+        },
+    ),
+    (
+        "0F",
+        "keys-status",
+        {
+            "display_name": "SSH Keys Status",
+            "sql_table": None,
+            "table_kind": "table",
+            "dom_table_id": "keys-status-table",
+            "tab_id": "keys",
+        },
+    ),
+    (
+        "10",
+        "certs-status",
+        {
+            "display_name": "Certificates Status",
+            "sql_table": None,
+            "table_kind": "table",
+            "dom_table_id": "certs-status-table",
+            "tab_id": "certs",
+        },
+    ),
+    (
+        "11",
+        "ai-providers",
+        {
+            "display_name": "AI Providers",
+            "sql_table": "ai_providers",
+            "table_kind": "table",
+            "dom_table_id": "ai-providers-table",
+            "tab_id": "ai-providers",
+        },
+    ),
+    (
+        "12",
+        "ai-project-assignments",
+        {
+            "display_name": "AI Project Assignments",
+            "sql_table": "ai_project_assignments",
+            "table_kind": "table",
+            "dom_table_id": "ai-assignments-table",
+            "tab_id": "ai-providers",
+        },
+    ),
+    (
+        "13",
+        "ssh-targets",
+        {
+            "display_name": "SSH Targets",
+            "sql_table": "ssh_targets",
+            "table_kind": "table",
+            "dom_table_id": "ssh-targets-table",
+            "tab_id": "ssh-targets",
+        },
+    ),
+    (
+        "14",
+        "bookmarks",
+        {
+            "display_name": "Bookmarks",
+            "sql_table": "bookmarks",
+            "table_kind": "table",
+            "dom_table_id": "bm-table",
+            "tab_id": "bookmarks-main",
+        },
+    ),
+    (
+        "15",
+        "visits",
+        {
+            "display_name": "Visit History",
+            "sql_table": "visits",
+            "table_kind": "table",
+            "dom_table_id": "vis-table",
+            "tab_id": "bookmarks-history",
+        },
+    ),
+    (
+        "16",
+        "nav-items",
+        {
+            "display_name": "Nav Items",
+            "sql_table": "nav_items",
+            "table_kind": "table",
+            "dom_table_id": "ni-table",
+            "tab_id": "nav-items",
+        },
+    ),
+    (
+        "17",
+        "form-controls",
+        {
+            "display_name": "Form Controls",
+            "sql_table": "form_controls",
+            "table_kind": "table",
+            "dom_table_id": "fc-table",
+            "tab_id": "form-controls",
+        },
+    ),
+    (
+        "18",
+        "embed-menu",
+        {
+            "display_name": "Embed Menu",
+            "sql_table": "embed_menu_items",
+            "table_kind": "table",
+            "dom_table_id": "em-table",
+            "tab_id": "embed-menu",
+        },
+    ),
+    (
+        "19",
+        "bookmarks-search",
+        {
+            "display_name": "Bookmarks Search",
+            "sql_table": "bookmarks",
+            "table_kind": "table",
+            "dom_table_id": "bm-table",
+            "tab_id": "bookmarks-main",
+        },
+    ),
 ]
 
 _SEED_SQL = """
@@ -769,6 +885,7 @@ INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.sound_enabl
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 def _migrate_embed_menu_items_composite_unique(conn: sqlite3.Connection) -> None:
     """Replace per-column UNIQUE(item_key) with UNIQUE(item_key, menu_context).
@@ -824,71 +941,71 @@ def _migrate_embed_menu_items_composite_unique(conn: sqlite3.Connection) -> None
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after initial deploy."""
     migrations = [
-        ("nodes",    "ui_url",                "TEXT"),
+        ("nodes", "ui_url", "TEXT"),
         # ── Phase-1 schema evolution (2026-03-11) ─────────────────────────
         # services: structured hosting, classification, health, flexibility
-        ("services", "host_machine_id",       "TEXT"),
-        ("services", "service_kind",          "TEXT DEFAULT 'app'"),
-        ("services", "exposure_level",        "TEXT DEFAULT 'internal'"),
-        ("services", "health_path",           "TEXT"),
+        ("services", "host_machine_id", "TEXT"),
+        ("services", "service_kind", "TEXT DEFAULT 'app'"),
+        ("services", "exposure_level", "TEXT DEFAULT 'internal'"),
+        ("services", "health_path", "TEXT"),
         ("services", "health_expected_status", "INTEGER DEFAULT 200"),
-        ("services", "runtime_notes_json",    "TEXT"),
+        ("services", "runtime_notes_json", "TEXT"),
         # machines: richer type taxonomy, platform, status, extensibility
-        ("machines", "machine_kind",          "TEXT"),
-        ("machines", "platform",              "TEXT"),
-        ("machines", "status",                "TEXT DEFAULT 'active'"),
-        ("machines", "labels",                "TEXT"),
-        ("machines", "properties_json",       "TEXT"),
+        ("machines", "machine_kind", "TEXT"),
+        ("machines", "platform", "TEXT"),
+        ("machines", "status", "TEXT DEFAULT 'active'"),
+        ("machines", "labels", "TEXT"),
+        ("machines", "properties_json", "TEXT"),
         # nodes: canonical machine mapping
-        ("nodes",    "machine_id",            "TEXT"),
+        ("nodes", "machine_id", "TEXT"),
         # pfsense_dns: local ping sweep enrichment (2026-03-12)
-        ("pfsense_dns", "ping_ms",                  "REAL"),
-        ("pfsense_dns", "last_ping_check",           "TEXT"),
+        ("pfsense_dns", "ping_ms", "REAL"),
+        ("pfsense_dns", "last_ping_check", "TEXT"),
         # proxmox_config: multi-VLAN + service detection (2026-03-12)
-        ("proxmox_config", "vlans_json",        "TEXT"),
-        ("proxmox_config", "has_docker",        "INTEGER DEFAULT 0"),
+        ("proxmox_config", "vlans_json", "TEXT"),
+        ("proxmox_config", "has_docker", "INTEGER DEFAULT 0"),
         ("proxmox_config", "dockge_stacks_dir", "TEXT"),
-        ("proxmox_config", "has_portainer",     "INTEGER DEFAULT 0"),
-        ("proxmox_config", "portainer_method",  "TEXT"),
-        ("proxmox_config", "has_caddy",         "INTEGER DEFAULT 0"),
-        ("proxmox_config", "caddy_conf_path",   "TEXT"),
+        ("proxmox_config", "has_portainer", "INTEGER DEFAULT 0"),
+        ("proxmox_config", "portainer_method", "TEXT"),
+        ("proxmox_config", "has_caddy", "INTEGER DEFAULT 0"),
+        ("proxmox_config", "caddy_conf_path", "TEXT"),
         # proxmox_config: JSON service paths (2026-03-13)
-        ("proxmox_config", "dockge_json",       "TEXT"),
-        ("proxmox_config", "portainer_json",    "TEXT"),
-        ("proxmox_config", "caddy_json",        "TEXT"),
+        ("proxmox_config", "dockge_json", "TEXT"),
+        ("proxmox_config", "portainer_json", "TEXT"),
+        ("proxmox_config", "caddy_json", "TEXT"),
         # proxmox_nets: per-interface network rows (2026-03-12)
         # (table created in DDL above; no ALTER TABLE needed for it)
         # vlans: VLAN CIDR map (2026-03-12)
         # (table created in DDL above; no ALTER TABLE needed for it)
         # dockge_stacks: parentage + direct SSH metadata (2026-03-13)
-        ("dockge_stacks", "vm_type",          "TEXT"),
-        ("dockge_stacks", "ip_address",        "TEXT"),
-        ("dockge_stacks", "parent_context",    "TEXT"),
+        ("dockge_stacks", "vm_type", "TEXT"),
+        ("dockge_stacks", "ip_address", "TEXT"),
+        ("dockge_stacks", "parent_context", "TEXT"),
         ("dockge_stacks", "parent_stack_name", "TEXT"),
         # dockge_stacks: user-managed fields — obsolete flag + notes (2026-03-13)
-        ("dockge_stacks", "obsolete",          "INTEGER DEFAULT 0"),
-        ("dockge_stacks", "notes",             "TEXT"),
+        ("dockge_stacks", "obsolete", "INTEGER DEFAULT 0"),
+        ("dockge_stacks", "notes", "TEXT"),
         # dockge_stack_services: relational per-container rows (2026-03-13)
         # (table created in DDL above; no ALTER TABLE needed for it)
         # pve_hosts: tailnet IP discovered during scan (2026-03-15)
-        ("pve_hosts", "tailnet_ip",           "TEXT"),
+        ("pve_hosts", "tailnet_ip", "TEXT"),
         # nodes: display order from .nodes.json (2026-03-15)
-        ("nodes",    "display_order",          "INTEGER DEFAULT 0"),
+        ("nodes", "display_order", "INTEGER DEFAULT 0"),
         # nodes: HTTPS hostnames from .nodes.json (2026-03-15)
-        ("nodes",    "primary_hostname",       "TEXT"),
-        ("nodes",    "tailnet_hostname",       "TEXT"),
+        ("nodes", "primary_hostname", "TEXT"),
+        ("nodes", "tailnet_hostname", "TEXT"),
         # manual_links: physical/logical location label (2026-03-16)
-        ("manual_links", "location",           "TEXT"),
+        ("manual_links", "location", "TEXT"),
         # doc_images: user-defined tags for filtering (2026-03-17)
-        ("doc_images",   "tags",               "TEXT"),
+        ("doc_images", "tags", "TEXT"),
         # docs: group assignment (2026-03-17)
-        ("docs",         "group_id",            "TEXT"),
+        ("docs", "group_id", "TEXT"),
         # sync_queue: GUID for dedup + forwarding (Phase 2, 2026-03-19)
-        ("sync_queue",   "guid",                "TEXT DEFAULT ''"),
+        ("sync_queue", "guid", "TEXT DEFAULT ''"),
         # visits: count of times a URL has been visited (2026-03-21)
-        ("visits",       "visit_count",          "INTEGER NOT NULL DEFAULT 1"),
+        ("visits", "visit_count", "INTEGER NOT NULL DEFAULT 1"),
         # form_controls: separate off-state sound for toggles/checkboxes (2026-03-24)
-        ("form_controls", "sound_asset_off",       "TEXT"),
+        ("form_controls", "sound_asset_off", "TEXT"),
         # embed_menu_items: multi-context support — embed / fallback-ui / db (2026-04-07)
         ("embed_menu_items", "menu_context", "TEXT NOT NULL DEFAULT 'embed'"),
     ]
@@ -911,6 +1028,7 @@ def _backfill_visit_events(conn: sqlite3.Connection) -> None:
     to call on every startup; skips rows that already have an event.
     """
     import uuid as _uuid
+
     rows = conn.execute(
         "SELECT v.normalized_url, v.visited_at "
         "FROM visits v "
@@ -937,8 +1055,7 @@ def _dedup_visits(conn: sqlite3.Connection) -> None:
     and deletes the rest.
     """
     dups = conn.execute(
-        "SELECT normalized_url, COUNT(*) as cnt FROM visits "
-        "GROUP BY normalized_url HAVING cnt > 1"
+        "SELECT normalized_url, COUNT(*) as cnt FROM visits GROUP BY normalized_url HAVING cnt > 1"
     ).fetchall()
     if not dups:
         return
@@ -951,8 +1068,7 @@ def _dedup_visits(conn: sqlite3.Connection) -> None:
             (nurl,),
         ).fetchone()
         keeper = conn.execute(
-            "SELECT visit_id FROM visits WHERE normalized_url=? "
-            "ORDER BY visited_at DESC LIMIT 1",
+            "SELECT visit_id FROM visits WHERE normalized_url=? ORDER BY visited_at DESC LIMIT 1",
             (nurl,),
         ).fetchone()
         conn.execute(
@@ -990,9 +1106,7 @@ def _seed_vlans_from_proxmox_nets(conn: sqlite3.Connection) -> None:
         log.info("startup: seeded %d vlans row(s) from proxmox_nets", seeded)
 
     # Infer /24 CIDR from first real IP seen for each vlan that still has no CIDR
-    no_cidr = conn.execute(
-        "SELECT vlan_id FROM vlans WHERE cidr IS NULL OR cidr = ''"
-    ).fetchall()
+    no_cidr = conn.execute("SELECT vlan_id FROM vlans WHERE cidr IS NULL OR cidr = ''").fetchall()
     for row in no_cidr:
         vid = row[0]
         ip_row = conn.execute(
@@ -1076,9 +1190,7 @@ def check_integrity() -> bool:
 
     flag = "true" if ok else "false"
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE sync_meta SET value=? WHERE key='integrity_ok'", (flag,)
-        )
+        conn.execute("UPDATE sync_meta SET value=? WHERE key='integrity_ok'", (flag,))
     if not ok:
         log.error("DB integrity check FAILED — node will NOT sync out to peers")
     return ok
@@ -1111,23 +1223,16 @@ def increment_gen(conn: sqlite3.Connection, source: str = "human") -> int:
     Returns the new gen value.
     """
     conn.execute(
-        "UPDATE sync_meta "
-        "SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
-        "WHERE key = 'gen'"
+        "UPDATE sync_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'gen'"
     )
-    conn.execute(
-        "UPDATE sync_meta SET value=datetime('now') WHERE key='last_write_at'"
-    )
-    conn.execute(
-        "UPDATE sync_meta SET value=? WHERE key='last_write_by'", (source,)
-    )
-    row = conn.execute(
-        "SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'"
-    ).fetchone()
+    conn.execute("UPDATE sync_meta SET value=datetime('now') WHERE key='last_write_at'")
+    conn.execute("UPDATE sync_meta SET value=? WHERE key='last_write_by'", (source,))
+    row = conn.execute("SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'").fetchone()
     return int(row[0]) if row else 0
 
 
 # ── Settings helpers ─────────────────────────────────────────────────────────
+
 
 def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
     """Return the current value for *key*, or *default* if not set."""
@@ -1135,8 +1240,9 @@ def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) 
     return row["value"] if row else default
 
 
-def set_setting(conn: sqlite3.Connection, key: str, value: str,
-                description: str | None = None) -> None:
+def set_setting(
+    conn: sqlite3.Connection, key: str, value: str, description: str | None = None
+) -> None:
     """Upsert a setting.  Preserves existing description when none supplied."""
     conn.execute(
         """
@@ -1162,15 +1268,11 @@ def get_setting_or_raise(conn: sqlite3.Connection, key: str, hint: str = "") -> 
 
 def get_gen(conn: sqlite3.Connection) -> int:
     """Return current generation counter (read-only)."""
-    row = conn.execute(
-        "SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'"
-    ).fetchone()
+    row = conn.execute("SELECT CAST(value AS INTEGER) FROM sync_meta WHERE key='gen'").fetchone()
     return int(row[0]) if row else 0
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str:
     """Return a sync_meta value by key, or empty string if missing."""
-    row = conn.execute(
-        "SELECT value FROM sync_meta WHERE key=?", (key,)
-    ).fetchone()
+    row = conn.execute("SELECT value FROM sync_meta WHERE key=?", (key,)).fetchone()
     return row[0] if row else ""
