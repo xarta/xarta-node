@@ -3,9 +3,9 @@
 Routes
 ------
 POST /api/v1/litellm-hook/sync-now
-    Run the node-local LiteLLM hook-sync reconcile path immediately. This queries the
-    current running-models feed, updates the node-local alias config if needed, reloads
-    the LiteLLM container, and returns the resulting summary.
+    Run the LiteLLM reconcile path immediately. This queries the current running-models
+    feed, updates the node-local alias config, runs the secondary LiteLLM sync path,
+    reloads what is needed, and returns the combined summary.
 
 POST /api/v1/litellm-hook/trigger-test
     Fire a synthetic model.changed event via the xarta hook API trigger endpoint.
@@ -202,11 +202,53 @@ async def sync_now_route() -> JSONResponse:
         "Local LiteLLM aliases reconciled." if ok else "LiteLLM sync-now reported a failure."
     )
 
+    related_targets: dict[str, Any] = {
+        "local": {
+            "ok": bool(summary.get("verify", {}).get("ok") and summary.get("alias_smoke", {}).get("ok")),
+            "changed": bool(summary.get("applied") or summary.get("reloaded")),
+            "message": summary.get("message") or "",
+        },
+        "secondary": summary.get("secondary"),
+        "third_surface": None,
+    }
+    for key, value in summary.items():
+        if key in {
+            "ok",
+            "hook_base",
+            "mode_id",
+            "timestamp",
+            "running_model_count",
+            "selected",
+            "spec_path",
+            "running_models_path",
+            "alias_matrix_path",
+            "check",
+            "applied",
+            "reloaded",
+            "message",
+            "verify",
+            "alias_smoke",
+            "secondary",
+            "backup_path",
+            "reload_stdout",
+            "reload_stderr",
+            "apply",
+            "apply_stdout",
+            "apply_stderr",
+        }:
+            continue
+        if isinstance(value, dict) and (
+            "ok" in value or "returncode" in value or "summary" in value
+        ):
+            related_targets["third_surface"] = value
+            break
+
     payload: dict[str, Any] = {
         "ok": ok,
         "message": message,
         "returncode": result.returncode,
         "summary": summary,
+        "sync_targets": related_targets,
         "hook_bases": bases,
         "triggered_at": time.time(),
     }
