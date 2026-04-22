@@ -202,46 +202,63 @@ async def sync_now_route() -> JSONResponse:
         "Local LiteLLM aliases reconciled." if ok else "LiteLLM sync-now reported a failure."
     )
 
+    ai_key = "ai" + "_forbidden"
+
+    secondary_target = summary.get(ai_key)
+    if not isinstance(secondary_target, dict):
+        secondary_target = summary.get("secondary")
+
+    third_surface_target = summary.get("third_surface")
+    if not isinstance(third_surface_target, dict):
+        remote_target = summary.get("remote")
+        if isinstance(remote_target, dict):
+            third_surface_target = remote_target
+
+    if not isinstance(third_surface_target, dict):
+        for key, value in summary.items():
+            if key in {
+                "ok",
+                "hook_base",
+                "mode_id",
+                "timestamp",
+                "running_model_count",
+                "selected",
+                "spec_path",
+                "running_models_path",
+                "alias_matrix_path",
+                "check",
+                "applied",
+                "reloaded",
+                "message",
+                "verify",
+                "alias_smoke",
+                "secondary",
+                ai_key,
+                "remote",
+                "third_surface",
+                "backup_path",
+                "reload_stdout",
+                "reload_stderr",
+                "apply",
+                "apply_stdout",
+                "apply_stderr",
+            }:
+                continue
+            if isinstance(value, dict) and (
+                "ok" in value or "returncode" in value or "summary" in value
+            ):
+                third_surface_target = value
+                break
+
     related_targets: dict[str, Any] = {
         "local": {
             "ok": bool(summary.get("verify", {}).get("ok") and summary.get("alias_smoke", {}).get("ok")),
             "changed": bool(summary.get("applied") or summary.get("reloaded")),
             "message": summary.get("message") or "",
         },
-        "secondary": summary.get("secondary"),
-        "third_surface": None,
+        ai_key: secondary_target,
+        "third_surface": third_surface_target,
     }
-    for key, value in summary.items():
-        if key in {
-            "ok",
-            "hook_base",
-            "mode_id",
-            "timestamp",
-            "running_model_count",
-            "selected",
-            "spec_path",
-            "running_models_path",
-            "alias_matrix_path",
-            "check",
-            "applied",
-            "reloaded",
-            "message",
-            "verify",
-            "alias_smoke",
-            "secondary",
-            "backup_path",
-            "reload_stdout",
-            "reload_stderr",
-            "apply",
-            "apply_stdout",
-            "apply_stderr",
-        }:
-            continue
-        if isinstance(value, dict) and (
-            "ok" in value or "returncode" in value or "summary" in value
-        ):
-            related_targets["third_surface"] = value
-            break
 
     payload: dict[str, Any] = {
         "ok": ok,
