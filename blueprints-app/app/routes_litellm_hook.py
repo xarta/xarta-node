@@ -64,6 +64,21 @@ def _hook_bases() -> list[str]:
     return [b.strip() for b in raw.split(",") if b.strip()]
 
 
+def _secondary_sync_target_key() -> str:
+    """Return the API key name used for the secondary sync surface."""
+    raw = (os.environ.get("LITELLM_SYNC_SECONDARY_TARGET_KEY") or "").strip()
+    key = raw or "secondary_surface"
+    # Keep the response key conservative and JSON-friendly.
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in key)
+    return safe.strip("_") or "secondary_surface"
+
+
+def _secondary_sync_target_label() -> str:
+    """Return the operator-facing label for the secondary sync surface."""
+    raw = (os.environ.get("LITELLM_SYNC_SECONDARY_TARGET_LABEL") or "").strip()
+    return raw or "secondary isolated LiteLLM surface"
+
+
 def _service_status() -> dict[str, Any]:
     """Return basic systemd service status for the hook listener."""
     try:
@@ -202,9 +217,10 @@ async def sync_now_route() -> JSONResponse:
         "Local LiteLLM aliases reconciled." if ok else "LiteLLM sync-now reported a failure."
     )
 
-    ai_key = "ai" + "_forbidden"
+    secondary_key = _secondary_sync_target_key()
+    secondary_label = _secondary_sync_target_label()
 
-    secondary_target = summary.get(ai_key)
+    secondary_target = summary.get(secondary_key)
     if not isinstance(secondary_target, dict):
         secondary_target = summary.get("secondary")
 
@@ -233,7 +249,7 @@ async def sync_now_route() -> JSONResponse:
                 "verify",
                 "alias_smoke",
                 "secondary",
-                ai_key,
+                secondary_key,
                 "remote",
                 "third_surface",
                 "backup_path",
@@ -256,7 +272,8 @@ async def sync_now_route() -> JSONResponse:
             "changed": bool(summary.get("applied") or summary.get("reloaded")),
             "message": summary.get("message") or "",
         },
-        ai_key: secondary_target,
+        secondary_key: secondary_target,
+        "secondary": secondary_target,
         "third_surface": third_surface_target,
     }
 
@@ -266,6 +283,8 @@ async def sync_now_route() -> JSONResponse:
         "returncode": result.returncode,
         "summary": summary,
         "sync_targets": related_targets,
+        "secondary_target_key": secondary_key,
+        "secondary_target_label": secondary_label,
         "hook_bases": bases,
         "triggered_at": time.time(),
     }
