@@ -13,6 +13,13 @@ Prefer shared GUI components over page-local duplication. If two pages need the 
 picker, modal body, or editor behavior, extract the shared part into one named module and keep
 page-specific behavior in small adapters or callbacks.
 
+For broad GUI audits, use `cost-efficient-subagents` to review one file, diff,
+component, or tab behavior at a time with fresh context. Helpers can identify
+duplication, accessibility risks, layout regressions, or shared-component
+opportunities, but the orchestrator owns edits, browser checks, and final
+testing. Configure helper models through environment-driven LiteLLM-compatible
+aliases only.
+
 ---
 
 ## File layout

@@ -15,6 +15,17 @@ The repository has many `setup-*.sh` scripts, but not all are intended to run in
 - Controlled remediation by profile (`baseline`, `network`, `ops`, `desktop`, `containers`, `sync`)
 - Dry-run first, apply only when explicitly requested
 
+## Cost-efficient helper opportunity
+
+For multi-node or large inventory reviews, use `cost-efficient-subagents` to
+analyze one inventory or dry-run report per fresh-context helper call. Helpers
+can classify drift, risk, likely remediation profile, and follow-up checks.
+
+The orchestrator keeps remediation execution, `--apply`, network-affecting
+changes, and operator approval deterministic. Model choice must be configured
+through environment variables and LiteLLM-compatible aliases rather than
+hardcoded public values.
+
 ## Scripts
 
 - `/root/xarta-node/.claude/skills/setup-visibility-control/scripts/setup-inventory.sh`

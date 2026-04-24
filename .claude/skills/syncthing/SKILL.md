@@ -14,6 +14,13 @@ Scope note:
     - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
     If node-local docs are unavailable on the current LXC/workspace, continue with this skill for Syncthing operations.
 
+For large status reviews, use `cost-efficient-subagents` to analyze one
+connections, folder-status, conflict-file, or peer report per fresh-context
+helper call. Helpers can summarize likely cause and next checks, while the
+orchestrator keeps API calls, service restarts, config generation, and file
+operations deterministic. Configure helper models through environment-driven
+LiteLLM-compatible aliases only.
+
 ## What it syncs
 
 | Folder ID | Local path | Contents |

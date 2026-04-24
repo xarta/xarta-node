@@ -19,6 +19,18 @@ See [references/architecture.md](references/architecture.md) for the full system
 | Node identity / peers / secrets | `.env` (gitignored) |
 | Systemd service template | `blueprints-app/blueprints-app.service.template` |
 
+## Cost-efficient helper opportunity
+
+For troubleshooting runs that produce many independent queue entries, health
+reports, commit-guard events, sync logs, or node diagnostics, use
+`cost-efficient-subagents` to summarize one compact report per fresh-context
+helper call. Helpers can classify likely cause, severity, next check, and
+confidence.
+
+The orchestrator keeps service restarts, git-pull actions, API calls, and fleet
+rollout decisions deterministic. Model routing belongs in environment variables
+and LiteLLM-compatible aliases, not hardcoded in this public skill.
+
 ## Setup scripts
 
 | Script | Purpose |

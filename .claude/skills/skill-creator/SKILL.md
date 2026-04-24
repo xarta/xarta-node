@@ -13,7 +13,7 @@ Use this skill to create or refactor skills in `/root/xarta-node/.claude/skills`
 .claude/skills/
 └── <skill-name>/
     ├── SKILL.md         ← required: YAML frontmatter (name, description) + instructions
-  ├── scripts/         ← executable helper scripts for deterministic/repetitive tasks
+    ├── scripts/         ← executable helper scripts for deterministic/repetitive tasks
     ├── references/      ← large docs loaded on demand
     └── assets/          ← templates, static files
 ```
@@ -32,14 +32,36 @@ Keep `SKILL.md` concise (target under 500 lines). Move heavy guidance to `refere
 ## Workflow
 
 1. Capture intent: what the skill does, and when it should trigger.
-2. Write or refactor `SKILL.md` with strong trigger description.
-3. Place deterministic helpers in `scripts/` and reference them from `SKILL.md`.
-4. Move long guidance/examples into `references/`.
-5. Run conformance audit before finalizing.
+2. Choose the execution shape: deterministic script, single-agent workflow, or
+   fresh-context helper fan-out.
+3. Write or refactor `SKILL.md` with strong trigger description.
+4. Place deterministic helpers in `scripts/` and reference them from `SKILL.md`.
+5. Move long guidance/examples into `references/`.
+6. Run conformance audit before finalizing.
 
 If the skill governs GUI, modal, or reusable component work, encode the shared-first principle
 directly in the skill text: prefer one named shared module plus small page-specific adapters over
 duplicated per-page implementations.
+
+## Fresh-context helper pattern
+
+When a skill loops over many independent docs, files, repos, nodes, stack
+reports, leak-scan findings, git diffs, or API responses, consider a
+fresh-context helper pattern instead of one large prompt. The orchestrator
+should run deterministic discovery and validation, then pass one compact item at
+a time to a configured cost-efficient model helper.
+
+For public skills, describe model routing generically:
+
+- use LiteLLM-compatible aliases from environment variables
+- allow local or lower-cost cloud models depending on the operator's `.env`
+- never hardcode private endpoints, keys, hostnames, IP addresses, node names,
+  or deployment-specific model aliases
+- keep filesystem writes, API writes, commits, pushes, and remediation in the
+  orchestrator after deterministic checks
+
+See `/root/xarta-node/.claude/skills/cost-efficient-subagents/SKILL.md` for the
+reusable public-safe pattern.
 
 ## Conformance audit script
 
@@ -58,6 +80,8 @@ The audit checks:
 ## References
 
 - `references/skill-patterns.md` for recommended anatomy and migration guidance.
+- `../cost-efficient-subagents/SKILL.md` for public-safe fresh-context helper
+  fan-out using configured local or lower-cost models.
 
 ## Updating an existing skill
 
