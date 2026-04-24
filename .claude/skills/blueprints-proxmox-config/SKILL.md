@@ -255,24 +255,3 @@ sqlite3 /opt/blueprints/data/db/blueprints.db \
 Both `proxmox_config` and `proxmox_nets` are in `_ALLOWED_TABLES` and sync
 automatically to all peers via the standard gen-based protocol. The probe only
 needs to run on the node that has SSH access to PVE hosts (`PROXMOX_SSH_KEY`).
-
-## MANDATORY - Embedded Menu DB Authority Contract (2026-04-08)
-
-- Database is authoritative for embedded selector action pages in all contexts.
-- `page_index` and `sort_order` from DB define order and slot positions.
-- JS/runtime may insert placeholder circles only to preserve intentional DB slot gaps.
-- Scarab paging control is always shown when multiple pages exist, except when touch ribbon mode is actively in use.
-- Fallback is allowed only for embedded controls, and only when DB config fetch fails.
-- Do not hardcode or merge local page layouts in a way that overrides DB-defined page order/positions.
-
-## MANDATORY - App-Specific Selector Context Guardrail (2026-04-08)
-
-- Never assume `menu_context='embed'` for new app work.
-- Do not add or modify `embed_menu_items` rows in shared contexts (`embed`, `fallback-ui`, `db`) unless the user explicitly requests cross-app/shared rollout.
-- Treat `embed` context as shared across all embed consumers (not app-local).
-- For app-local selector behavior, require an app-specific context and explicit route-context wiring before any DB row additions.
-- Default for new app work: no embed-menu DB writes unless explicitly requested.
-
-The User insists on recognising that the menu system is database driven.  Never use language that suggests otherwise such as setting defaults in a file.  Word things carefully to always acknowledge that the menu system is database driven.  Changes to icons for example happen in the database as paths.  That is where to look.  Always confirm any possible exceptions, with careful diplomacy and tone, with the User, before assuming there are.
-
-The User insists on recognising that the menu system is database driven.  Never use language that suggests otherwise such as setting defaults in a file.  Word things carefully to always acknowledge that the menu system is database driven.  Changes to icons for example happen in the database as paths.  That is where to look.  Always confirm any possible exceptions, with careful diplomacy and tone, with the User, before assuming there are.
