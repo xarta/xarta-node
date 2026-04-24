@@ -24,6 +24,17 @@ For each running LXC on each PVE host (connected via `pct exec`):
 - Parses `reverse_proxy` upstreams
 - One row per LXC that has Caddy
 
+## Cost-efficient helper opportunity
+
+If a probe returns many Caddyfiles or ambiguous route fragments, use the
+`cost-efficient-subagents` pattern to analyze one config or probe entry per
+fresh-context helper call. Helpers may summarize domains, upstreams, likely
+ownership, and parsing ambiguities.
+
+The probe, parser, bulk API write, and any remediation stay deterministic in
+the orchestrator. Route model selection through environment variables and a
+LiteLLM-compatible alias rather than hardcoded public-skill values.
+
 ## Known Caddy LXCs (as of last discovery)
 
 > The probe dynamically enumerates **all running LXCs** — no instances are hardcoded.

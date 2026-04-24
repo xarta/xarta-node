@@ -105,6 +105,17 @@ config files under `/etc/pve/`, and upserts `proxmox_config` + `proxmox_nets`
 rows. After probe it calls `fill_vlan_tags_from_cidrs` to back-fill any
 missing `vlan_tag` values.
 
+## Cost-efficient helper opportunity
+
+When a probe or enrichment run returns many missing-IP, NIC, VLAN, or MAC
+findings, use `cost-efficient-subagents` to review one compact finding per
+fresh-context helper call. Helpers may propose likely next discovery method,
+confidence, and a short reason.
+
+The orchestrator keeps SSH/API execution, database writes, conflict handling,
+and safety checks deterministic. Configure helper models with environment
+variables and LiteLLM-compatible aliases rather than public hardcoding.
+
 ---
 
 ## IP Discovery Methods

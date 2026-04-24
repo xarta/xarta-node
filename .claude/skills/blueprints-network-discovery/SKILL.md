@@ -81,6 +81,14 @@ Review before ingesting:
 cat scan-results.json | jq '.'
 ```
 
+For large scan outputs, use the `cost-efficient-subagents` pattern to classify
+one host or service tuple per fresh-context helper call. Helpers may propose
+machine/service categories, duplicate risks, tags, and dependency hints.
+
+Keep scanning, staging, lock handling, ingest output, and any database writes in
+the deterministic orchestrator workflow. Configure helper models through
+environment-driven LiteLLM-compatible aliases only.
+
 ### 4. Ingest to staging
 
 ```bash

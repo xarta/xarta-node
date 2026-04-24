@@ -51,6 +51,17 @@ Before declaring migration complete, explicitly report:
    whether Dockge itself is running as a Dockge stack, plain docker-compose,
    docker run, or a Portainer stack.
 
+## Cost-efficient helper opportunity
+
+When a probe returns many stacks, compose files, service lists, or migration
+reports, use `cost-efficient-subagents` to analyze one compact stack/report per
+fresh-context helper call. Helpers can summarize service purpose, port/volume
+risks, parentage clues, migration caveats, and follow-up checks.
+
+The orchestrator keeps SSH access, compose copying, runtime data transfer, API
+writes, and endpoint proof tests deterministic. Model routing must remain
+environment-driven through LiteLLM-compatible aliases.
+
 ## stack_id Format
 
 `{pve_host_safe}_{vmid}_{stacks_dir_slug}_{stack_name}`

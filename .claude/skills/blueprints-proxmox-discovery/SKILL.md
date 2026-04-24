@@ -10,6 +10,18 @@ chains together SSH probing, config file parsing, MAC cross-referencing, Docker
 enumeration, Tailscale extraction, DNS forward/reverse sweeps, and Caddy domain
 harvesting to build and enrich the Blueprints `machines` table.
 
+## Cost-efficient helper opportunity
+
+When discovery produces many VM/LXC, Docker, DNS, Caddy, or MAC-correlation
+findings, use `cost-efficient-subagents` to analyze one compact finding per
+fresh-context helper call. Helpers can propose machine identity, parentage,
+service hints, duplicate risks, and confidence.
+
+Keep SSH probing, parsing, API writes, and final machine/service creation in the
+orchestrator. Helper model choice must be configured through environment-driven
+LiteLLM-compatible aliases, with no private deployment details in this public
+skill.
+
 ## Prerequisites
 
 - **SSH agent forwarding must be enabled** on the session connecting to the

@@ -17,6 +17,18 @@ discovery scan results and proposing database updates.
 - User asks to find and propose dependencies between services.
 - User asks to populate machines from known infrastructure.
 
+## Cost-efficient helper opportunity
+
+For large enrichment jobs, use `cost-efficient-subagents` to review one service,
+machine, scan finding, or dependency proposal per fresh-context helper call.
+Helpers can produce proposed classifications, tags, missing fields, and a short
+rationale.
+
+The orchestrator must still query the live schema, check for duplicates,
+present full proposed API calls, and keep writes behind the approval rules
+below. Model aliases and runtime selection belong in `.env`, not in this public
+skill.
+
 ## API endpoints
 
 All operations go through the Blueprints REST API at `http://localhost:8080`:

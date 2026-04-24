@@ -68,6 +68,18 @@ Set in `.env` on the node running probes (do **not** add to `.env.example`):
 6. pfSense runs FreeBSD — standard GNU tools (`head`, `tail`, `awk`) may
    behave differently or be absent. Prefer `cat` piped to local processing.
 
+## Cost-efficient helper opportunity
+
+When DNS, ARP, DHCP, or firewall-derived reports are large or ambiguous, use
+`cost-efficient-subagents` to analyze one compact parsed record group per
+fresh-context helper call. Helpers can flag likely aliases, stale records,
+record-type uncertainty, or enrichment candidates.
+
+All SSH reads, parsing, API writes, and pfSense safety decisions stay in the
+orchestrator. Public instructions must keep model choice generic and
+environment-driven; never bake private appliance details or model aliases into
+this skill.
+
 ## Feature 1 — DNS Resolver Harvest
 
 Extracts DNS entries from the Unbound DNS resolver config on pfSense and

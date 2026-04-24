@@ -40,6 +40,19 @@ with the corrected code.
 > `OperationalError`, and returned HTTP 500 — blocking the drain queue for all
 > fleet peers until the fix was deployed. **Always add both entries.**
 
+## Cost-efficient helper opportunity
+
+When adding or reviewing several table touch points, use the public
+`cost-efficient-subagents` pattern for fresh-context semantic checks over one
+compact item at a time. Good helper jobs include reviewing a proposed schema,
+checking one generated route file against this checklist, or sanity-checking
+the `_ALLOWED_TABLES` and `_pk_for_table` entries.
+
+Keep code edits, validator execution, app restarts, and final API/fleet safety
+decisions in the orchestrator. Model routing must stay environment-driven via a
+LiteLLM-compatible alias; do not hardcode deployment details in this public
+skill.
+
 ---
 
 ## Touch-point checklist
