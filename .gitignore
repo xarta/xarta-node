@@ -40,3 +40,6 @@ __pycache__/
 gui-fallback/assets/icons/*
 !gui-fallback/assets/icons/fallback.svg
 gui-fallback/assets/sounds/*
+
+# Roo skill index — generated, never commit
+.roo/skills/skill-discovery/references/SKILL-INDEX.md
