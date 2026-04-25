@@ -2,8 +2,9 @@
 # setup-python-dev-tools.sh — install uv and ruff on xarta-node LXCs.
 #
 # What this script does (idempotent):
-#   1. Installs uv  — fast Python package manager / project tool runner.
-#   2. Installs ruff — Python linter and formatter.
+#   1. Installs PyYAML for system Python validation scripts.
+#   2. Installs uv  — fast Python package manager / project tool runner.
+#   3. Installs ruff — Python linter and formatter.
 #
 # Both are installed to /usr/local/bin so they are available system-wide
 # (root and all users). Safe to re-run — already-installed tools are skipped.
@@ -11,6 +12,7 @@
 # Notes:
 #   - Intended for Debian 12 xarta-node LXCs.
 #   - Requires curl and python3-pip (installed as part of setup-blueprints.sh).
+#   - python3-yaml is installed through apt so system Python can import yaml.
 #   - uv is installed via the official astral.sh binary installer.
 #   - ruff is installed via pip3 --break-system-packages (Debian 12 externally
 #     managed environment requires this flag for system-wide pip installs).
@@ -28,6 +30,21 @@ fi
 
 echo "=== Python dev tools setup ==="
 echo ""
+
+# ── PyYAML for system Python ─────────────────────────────────────────────────
+
+if python3 -c "import yaml" >/dev/null 2>&1; then
+    echo -e "${GREEN}already installed:${NC} python3-yaml"
+else
+    echo "--- installing python3-yaml..."
+    apt-get update
+    apt-get install -y --no-install-recommends python3-yaml
+    if ! python3 -c "import yaml" >/dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} python3-yaml installation failed" >&2
+        exit 1
+    fi
+    echo -e "${GREEN}installed:${NC} python3-yaml"
+fi
 
 # ── uv ────────────────────────────────────────────────────────────────────────
 
