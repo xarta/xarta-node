@@ -15,6 +15,7 @@ does not match any entry in the nodes array.
 import json
 import logging
 import os
+import subprocess as _sp
 
 log = logging.getLogger(__name__)
 
@@ -194,12 +195,16 @@ REPO_NON_ROOT_PATH: str = os.environ.get("REPO_NON_ROOT_PATH", "/xarta-node")
 # Point this at the node-local repo root so docs resolve outside the private git repo.
 DOCS_ROOT: str = os.environ.get("DOCS_ROOT", "")
 
+# Node-local TurboVec Docs retrieval service. Browsers should use the
+# Blueprints API proxy instead of calling this service directly.
+TURBOVEC_DOCS_URL: str = os.environ.get("TURBOVEC_DOCS_URL", "http://127.0.0.1:19080")
+TURBOVEC_DOCS_TIMEOUT: float = float(os.environ.get("TURBOVEC_DOCS_TIMEOUT", "12"))
+
 # Shell command to restart the blueprints service after a git pull.
 SERVICE_RESTART_CMD: str = os.environ.get("SERVICE_RESTART_CMD", "")
 
 # ── Git commit identity (computed once at import, cached for process lifetime) ─
 # After git pull + restart, the new process will re-compute these values.
-import subprocess as _sp
 
 def _get_commit_info() -> tuple[str | None, int]:
     """Return (short_hash, unix_epoch) of HEAD in the outer repo.
@@ -351,4 +356,3 @@ CERT_CONFIGS: dict[str, dict] = {
         "description": "Private key for the mTLS node certificate.",
     },
 }
-
