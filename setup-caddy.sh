@@ -273,6 +273,8 @@ BLUEPRINTS_DB_DIR="${BLUEPRINTS_DB_DIR:-/opt/blueprints/data/db}"
 FALLBACK_CACHE_STATE_FILE="${FALLBACK_CACHE_STATE_FILE:-${BLUEPRINTS_DB_DIR}/fallback-ui-cache-state.json}"
 FALLBACK_CACHE_MODE="$(read_fallback_cache_mode "$FALLBACK_CACHE_STATE_FILE")"
 FALLBACK_ASSET_VERSION="$(compute_fallback_asset_version "$FALLBACK_CACHE_MODE" "$BLUEPRINTS_FALLBACK_GUI_DIR")"
+CODE_SERVER_HOSTNAME="${CODE_SERVER_HOSTNAME:-code.${UI_HOST}}"
+CODE_SERVER_PORT="${CODE_SERVER_PORT:-8082}"
 
 if [[ "$FALLBACK_CACHE_MODE" == "development" ]]; then
     FALLBACK_ASSET_CACHE_HEADERS=$(cat <<'EOF'
@@ -403,6 +405,43 @@ ${HTTP_NAMES} {
 CADDY
 
 chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+
+# ── code-server block — appended when CODE_SERVER is set ─────────────────────
+# code-server itself binds to loopback only. Caddy terminates TLS and keeps the
+# browser IDE private to local, RFC1918, and tailnet source addresses.
+if [[ -n "${CODE_SERVER:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_CODE_SERVER
+
+# code-server — browser IDE for this node.
+# Backend binds to loopback only; Caddy exposes it on the private HTTPS entrypoint.
+https://${CODE_SERVER_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy localhost:${CODE_SERVER_PORT} {
+            transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${CODE_SERVER_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_CODE_SERVER
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended code-server block (https://${CODE_SERVER_HOSTNAME} → localhost:${CODE_SERVER_PORT})"
+else
+    echo "    Skipped code-server block (CODE_SERVER not set in .env)"
+fi
 
 # ── mTLS sync block (:8443) — appended when cert env vars are all set ────────
 if [[ -n "${SYNC_TLS_CA:-}" && -n "${SYNC_TLS_CERT:-}" && -n "${SYNC_TLS_KEY:-}" ]]; then
