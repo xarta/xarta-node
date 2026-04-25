@@ -127,6 +127,12 @@ def _result_snippet(text: str, limit: int = 620) -> str:
     return snippet[: limit - 1].rstrip() + "…"
 
 
+def _docs_search_chunk_limit(document_count: int) -> int:
+    """Fetch a wider chunk set so the UI can group by document."""
+    doc_count = max(1, min(30, int(document_count or 8)))
+    return min(120, max(doc_count * 5, doc_count + 20))
+
+
 def _registered_docs_by_path() -> dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM docs").fetchall()
@@ -242,20 +248,22 @@ async def search_docs(body: DocsSearchBody) -> dict:
     if not base_url:
         raise HTTPException(503, "TURBOVEC_DOCS_URL is not configured")
 
+    chunk_limit = _docs_search_chunk_limit(body.top_k)
     if mode == "vector":
         endpoint = "/query"
         payload: dict[str, Any] = {
             "query": body.query,
-            "top_k": body.top_k,
+            "top_k": chunk_limit,
+            "candidate_k": max(body.vector_k, chunk_limit),
             "rerank": body.rerank,
         }
     else:
         endpoint = "/hybrid-query"
         payload = {
             "query": body.query,
-            "top_k": body.top_k,
-            "vector_k": body.vector_k,
-            "keyword_k": body.keyword_k,
+            "top_k": chunk_limit,
+            "vector_k": max(body.vector_k, chunk_limit),
+            "keyword_k": max(body.keyword_k, chunk_limit),
             "rerank": body.rerank,
             "mode": mode,
         }
@@ -288,11 +296,19 @@ async def search_docs(body: DocsSearchBody) -> dict:
         for r in raw_results
         if isinstance(r, dict)
     ]
+    unique_documents = {
+        str(r.get("doc_id") or r.get("viewer_path") or r.get("register_path") or r.get("doc_path") or "").lower()
+        for r in results
+    }
+    unique_documents.discard("")
     return {
         "ok": bool(data.get("ok", True)) if isinstance(data, dict) else True,
         "mode": mode,
         "query": body.query,
         "rerank": body.rerank,
+        "document_target": body.top_k,
+        "chunk_candidate_limit": chunk_limit,
+        "document_count": len(unique_documents),
         "result_count": len(results),
         "results": results,
         "upstream": {
