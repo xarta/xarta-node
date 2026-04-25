@@ -12,8 +12,11 @@ import logging
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 from starlette.responses import Response
 
 from . import config as cfg
@@ -27,6 +30,15 @@ router = APIRouter(prefix="/docs", tags=["docs"])
 
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _DOCS_SENTINEL = _NODE_LOCAL_ROOT / ".docs-pending-commit"
+
+
+class DocsSearchBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=1000)
+    mode: str = "hybrid"
+    top_k: int = Field(default=8, ge=1, le=30)
+    vector_k: int = Field(default=40, ge=1, le=120)
+    keyword_k: int = Field(default=40, ge=1, le=120)
+    rerank: bool = True
 
 
 def _touch_docs_sentinel() -> None:
@@ -89,6 +101,102 @@ def _row_to_out(row) -> DocOut:
     )
 
 
+def _doc_path_candidates(doc_path: str) -> list[str]:
+    clean = (doc_path or "").strip().lstrip("/")
+    if not clean:
+        return []
+    candidates = [clean]
+    if not clean.startswith("docs/"):
+        candidates.append(f"docs/{clean}")
+    else:
+        candidates.append(clean.removeprefix("docs/"))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        key = item.lower()
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(item)
+    return ordered
+
+
+def _result_snippet(text: str, limit: int = 620) -> str:
+    snippet = " ".join((text or "").split())
+    if len(snippet) <= limit:
+        return snippet
+    return snippet[: limit - 1].rstrip() + "…"
+
+
+def _registered_docs_by_path() -> dict[str, Any]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM docs").fetchall()
+    by_path: dict[str, Any] = {}
+    for row in rows:
+        path = (row["path"] or "").strip()
+        if not path:
+            continue
+        by_path[path.lower()] = row
+        if path.startswith("docs/"):
+            by_path[path.removeprefix("docs/").lower()] = row
+    return by_path
+
+
+def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], root: Path) -> dict[str, Any]:
+    doc_path = str(raw.get("doc_path") or "").strip().lstrip("/")
+    candidates = _doc_path_candidates(doc_path)
+    row = next((docs_by_path.get(p.lower()) for p in candidates if p.lower() in docs_by_path), None)
+    registered_path = row["path"] if row else None
+    file_path = registered_path or (candidates[1] if len(candidates) > 1 else (candidates[0] if candidates else ""))
+
+    file_exists = False
+    if file_path:
+        try:
+            file_exists = _safe_resolve(root, file_path).is_file()
+        except HTTPException:
+            file_exists = False
+
+    doc_registered = row is not None
+    openable = bool(doc_registered and file_exists)
+    if openable:
+        register_hint = "registered"
+    elif file_exists:
+        register_hint = "add_to_docs_viewer"
+    else:
+        register_hint = "stale_index"
+
+    title = raw.get("title") or ""
+    if row:
+        title = row["label"] or title
+    if not title and doc_path:
+        title = Path(doc_path).stem.replace("-", " ").replace("_", " ").title()
+
+    return {
+        "doc_path": doc_path,
+        "viewer_path": registered_path,
+        "register_path": None if doc_registered else file_path,
+        "title": title,
+        "chunk_index": raw.get("chunk_index"),
+        "snippet": _result_snippet(str(raw.get("text") or "")),
+        "score": raw.get("score"),
+        "rerank_score": raw.get("rerank_score"),
+        "doc_registered": doc_registered,
+        "doc_id": row["doc_id"] if row else None,
+        "doc_group_id": row["group_id"] if row and "group_id" in row.keys() else None,
+        "file_exists": file_exists,
+        "openable": openable,
+        "register_hint": register_hint,
+        "match_sources": raw.get("match_sources") or (["vector"] if raw.get("vector_rank") is not None else []),
+        "vector_rank": raw.get("vector_rank"),
+        "vector_score": raw.get("vector_score"),
+        "keyword_rank": raw.get("keyword_rank"),
+        "keyword_score": raw.get("keyword_score"),
+        "rrf_score": raw.get("rrf_score"),
+        "keyword_terms": raw.get("keyword_terms") or [],
+        "updated_at": raw.get("updated_at"),
+        "handle": raw.get("handle"),
+    }
+
+
 # ── List ──────────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[DocOut])
@@ -119,6 +227,80 @@ async def list_unregistered_docs() -> list[str]:
         if rel not in registered:
             unregistered.append(rel)
     return unregistered
+
+
+# ── Search proxy ──────────────────────────────────────────────────────────────
+
+@router.post("/search", response_model=dict)
+async def search_docs(body: DocsSearchBody) -> dict:
+    """Proxy node-local TurboVec Docs search and enrich results for the viewer."""
+    mode = (body.mode or "hybrid").strip().lower()
+    if mode not in {"vector", "hybrid", "keyword"}:
+        raise HTTPException(400, "mode must be one of: vector, hybrid, keyword")
+
+    base_url = cfg.TURBOVEC_DOCS_URL.rstrip("/")
+    if not base_url:
+        raise HTTPException(503, "TURBOVEC_DOCS_URL is not configured")
+
+    if mode == "vector":
+        endpoint = "/query"
+        payload: dict[str, Any] = {
+            "query": body.query,
+            "top_k": body.top_k,
+            "rerank": body.rerank,
+        }
+    else:
+        endpoint = "/hybrid-query"
+        payload = {
+            "query": body.query,
+            "top_k": body.top_k,
+            "vector_k": body.vector_k,
+            "keyword_k": body.keyword_k,
+            "rerank": body.rerank,
+            "mode": mode,
+        }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(cfg.TURBOVEC_DOCS_TIMEOUT)) as client:
+            resp = await client.post(f"{base_url}{endpoint}", json=payload)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "TurboVec Docs search timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, f"TurboVec Docs unavailable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        raise HTTPException(502, f"TurboVec Docs search failed: {detail}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise HTTPException(502, "TurboVec Docs returned invalid JSON") from exc
+
+    docs_by_path = _registered_docs_by_path()
+    root = _docs_root()
+    raw_results = data.get("results") if isinstance(data, dict) else []
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    results = [
+        _enrich_search_result(r, docs_by_path, root)
+        for r in raw_results
+        if isinstance(r, dict)
+    ]
+    return {
+        "ok": bool(data.get("ok", True)) if isinstance(data, dict) else True,
+        "mode": mode,
+        "query": body.query,
+        "rerank": body.rerank,
+        "result_count": len(results),
+        "results": results,
+        "upstream": {
+            "endpoint": endpoint,
+            "url": base_url,
+            "result_count": len(raw_results),
+        },
+    }
 
 
 # ── Get with content ──────────────────────────────────────────────────────────
