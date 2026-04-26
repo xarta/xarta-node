@@ -56,6 +56,12 @@ def require_short_response(path: str, data: dict[str, Any]) -> None:
     require(short.get("tts_ready") is True, f"{path} short_response.tts_ready is not true")
     require(short.get("voice_safe") is True, f"{path} short_response.voice_safe is not true")
     require(short.get("format") == "plain_text", f"{path} short_response.format is not plain_text")
+    require(
+        short.get("playback_transport") == "streaming_tts",
+        f"{path} short_response.playback_transport is not streaming_tts",
+    )
+    require(short.get("length_is_tts_limit") is False, f"{path} short response incorrectly marks length as a TTS limit")
+    require(short.get("length_reason") == "conversational_brevity", f"{path} short response missing length_reason")
     require("```" not in text and "`" not in text, f"{path} short_response contains markdown code")
     require(not re.search(r"\[(?:S|s)\d+\]", text), f"{path} short_response contains citation markup")
     require(not re.search(r"https?://", text), f"{path} short_response contains a URL")
