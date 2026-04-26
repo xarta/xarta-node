@@ -217,6 +217,9 @@ def _normalize_short_response(short_response: Any) -> dict[str, Any]:
         "voice_safe": True,
         "format": "plain_text",
         "max_chars": _SHORT_RESPONSE_MAX_CHARS,
+        "length_reason": "conversational_brevity",
+        "length_is_tts_limit": False,
+        "playback_transport": "streaming_tts",
         "char_count": len(text),
     }
 
