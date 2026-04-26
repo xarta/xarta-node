@@ -17,6 +17,9 @@ class AiObservabilityBackend(Protocol):
     async def test_alias(self, alias: str, db_providers: list[dict[str, Any]]) -> dict[str, Any]:
         ...
 
+    async def propose_db_links(self, db_providers: list[dict[str, Any]]) -> dict[str, Any]:
+        ...
+
 
 @dataclass
 class _UnavailableBackend:
@@ -44,6 +47,14 @@ class _UnavailableBackend:
         return {
             "ok": False,
             "alias": alias,
+            "status": "backend_unavailable",
+            "detail": self.reason,
+            "backend": self.backend_name,
+        }
+
+    async def propose_db_links(self, db_providers: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "ok": False,
             "status": "backend_unavailable",
             "detail": self.reason,
             "backend": self.backend_name,
