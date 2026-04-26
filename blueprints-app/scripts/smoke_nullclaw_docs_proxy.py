@@ -63,6 +63,30 @@ def require_common(path: str, data: dict[str, Any]) -> str:
     return task_id
 
 
+def require_catalog(data: dict[str, Any]) -> None:
+    if data.get("ok") is not True:
+        raise AssertionError(f"/api/v1/help/catalog did not report ok=true: {data}")
+    if data.get("version") != "blueprints-help-catalog-v1":
+        raise AssertionError("/api/v1/help/catalog returned an unexpected version")
+    pages = data.get("pages")
+    modals = data.get("modals")
+    if not isinstance(pages, list):
+        raise AssertionError("/api/v1/help/catalog pages is not a list")
+    if not isinstance(modals, list):
+        raise AssertionError("/api/v1/help/catalog modals is not a list")
+    docs_search = next(
+        (
+            modal for modal in modals
+            if isinstance(modal, dict)
+            and modal.get("route") == "settings.docs"
+            and modal.get("modal") == "docs-search"
+        ),
+        None,
+    )
+    if not docs_search:
+        raise AssertionError("/api/v1/help/catalog missing settings.docs docs-search modal")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.getenv("BLUEPRINTS_API_URL", "http://127.0.0.1:8080"))
@@ -94,10 +118,20 @@ def main() -> int:
     ]
 
     with httpx.Client(base_url=args.base_url.rstrip("/"), headers=headers, timeout=90.0) as client:
+        catalog = get_json(client, "/api/v1/help/catalog")
+        require_catalog(catalog)
+        print("ok /api/v1/help/catalog")
+
         turn_task_id = ""
         for path, payload, expected_keys in checks:
             data = post_json(client, path, payload)
             task_id = require_common(path, data)
+            if path in {"/api/v1/help/turn", "/api/v1/help/action"}:
+                if not isinstance(data.get("action_catalog"), dict):
+                    raise AssertionError(f"{path} missing action_catalog metadata")
+                action = data.get("action")
+                if action is not None and not isinstance(action.get("dispatch"), dict):
+                    raise AssertionError(f"{path} action was not catalog-dispatchable")
             if path == "/api/v1/help/turn":
                 turn_task_id = task_id
             for key in expected_keys:
