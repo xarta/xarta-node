@@ -85,6 +85,19 @@ def require_catalog(data: dict[str, Any]) -> None:
     )
     if not docs_search:
         raise AssertionError("/api/v1/help/catalog missing settings.docs docs-search modal")
+    coverage = data.get("coverage")
+    if not isinstance(coverage, dict):
+        raise AssertionError("/api/v1/help/catalog missing coverage block")
+    for key in ("page_count", "modal_count", "document_count", "function_surface_count"):
+        if not isinstance(coverage.get(key), int) or coverage[key] <= 0:
+            raise AssertionError(f"/api/v1/help/catalog coverage.{key} is empty")
+    contract = data.get("contract")
+    if not isinstance(contract, dict):
+        raise AssertionError("/api/v1/help/catalog missing contract block")
+    if "blueprints_doc" not in (contract.get("action_targets") or []):
+        raise AssertionError("/api/v1/help/catalog does not advertise blueprints_doc targets")
+    if "blueprints_menu_function" not in (contract.get("catalog_only_targets") or []):
+        raise AssertionError("/api/v1/help/catalog does not advertise catalog-only menu functions")
 
 
 def main() -> int:
