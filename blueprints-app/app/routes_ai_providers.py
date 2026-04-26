@@ -10,7 +10,9 @@ infrastructure-internal. Do not expose the DB file publicly.
 
 import asyncio
 import json as _json
+import os
 import uuid
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -45,6 +47,58 @@ def _list_provider_dicts() -> list[dict]:
 
 class _AiObservabilityTestBody(BaseModel):
     alias: str
+
+
+class _AiObservabilityDbLinkBody(BaseModel):
+    dry_run: bool = False
+
+
+_LOCAL_LITELLM_ENV = Path("/xarta-node/.lone-wolf/stacks/litellm/.env")
+_LOCAL_LITELLM_BASE_URL = (
+    os.getenv("LITELLM_BASE_URL") or "http://localhost:4000"
+).rstrip("/")
+_ALLOWED_MODEL_TYPES = {"llm", "embedding", "reranker", "tts", "transcription"}
+
+
+def _load_local_litellm_master_key() -> str:
+    if not _LOCAL_LITELLM_ENV.is_file():
+        return ""
+    for raw_line in _LOCAL_LITELLM_ENV.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "LITELLM_MASTER_KEY":
+            return value.strip()
+    return ""
+
+
+def _safe_json_options(value: object) -> str:
+    options: dict[str, object] = {"verify_tls": False}
+    if isinstance(value, dict):
+        for raw_key, raw_val in value.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            lowered = key.lower()
+            if any(marker in lowered for marker in ("key", "token", "secret", "auth")):
+                continue
+            if isinstance(raw_val, (str, int, float, bool)) or raw_val is None:
+                options[key] = raw_val
+    return _json.dumps(options, separators=(",", ":"), sort_keys=True)
+
+
+def _sanitize_public_provider(row: dict) -> dict:
+    out = dict(row)
+    out.pop("api_key", None)
+    out["enabled"] = bool(out.get("enabled", 1))
+    return out
+
+
+def _clean_text(value: object, *, fallback: str, max_len: int) -> str:
+    text = str(value or "").strip() or fallback
+    text = " ".join(text.split())
+    return text[:max_len].rstrip()
 
 
 @router.get("", response_model=list[AiProviderOut])
@@ -85,6 +139,158 @@ async def test_ai_provider_observability_vision(body: _AiObservabilityTestBody) 
     if result.get("status") == "alias_not_found":
         raise HTTPException(404, result.get("detail") or f"Alias {alias!r} not found")
     return result
+
+
+@router.post("/observability/db-link", response_model=dict)
+async def db_link_ai_provider_observability(
+    body: _AiObservabilityDbLinkBody | None = None,
+) -> dict:
+    """Create DB provider rows for config-only LiteLLM aliases.
+
+    The proposal step is local-only: the active node-local observability backend
+    must expose a local planner alias and return JSON.  The route then validates
+    aliases, types, options, and the local base URL before inserting anything.
+    """
+    body = body or _AiObservabilityDbLinkBody()
+    providers = _list_provider_dicts()
+    backend = get_ai_observability_backend()
+    proposer = getattr(backend, "propose_db_links", None)
+    if not callable(proposer):
+        raise HTTPException(503, "The active local observability backend cannot propose DB links.")
+
+    plan = await proposer(providers)
+    if not plan.get("ok"):
+        raise HTTPException(503, plan.get("detail") or "Local AI DB-link planning failed.")
+
+    proposals = plan.get("proposals") or []
+    if not isinstance(proposals, list):
+        raise HTTPException(502, "Local AI DB-link planning returned an invalid proposal list.")
+
+    observed = await backend.describe(providers)
+    models = observed.get("models") or []
+    unlinked_by_alias = {
+        str(item.get("alias") or ""): item
+        for item in models
+        if item.get("alias") and not item.get("db_bound")
+    }
+    existing_aliases = {str(row.get("model_name") or "") for row in providers}
+    master_key = _load_local_litellm_master_key()
+    if not master_key and any(
+        isinstance(item, dict) and str(item.get("action") or "create").lower() == "create"
+        for item in proposals
+    ):
+        raise HTTPException(503, "LITELLM_MASTER_KEY is not available for new DB provider rows.")
+
+    to_insert: list[dict] = []
+    skipped: list[dict] = []
+    for item in proposals:
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get("alias") or item.get("model_name") or "").strip()
+        if not alias:
+            continue
+        action = str(item.get("action") or "create").strip().lower()
+        observed_item = unlinked_by_alias.get(alias)
+        if action == "skip":
+            skipped.append({"alias": alias, "reason": _clean_text(item.get("reason"), fallback="Planner skipped this alias.", max_len=240)})
+            continue
+        if alias in existing_aliases:
+            skipped.append({"alias": alias, "reason": "A DB provider row already exists for this alias."})
+            continue
+        if not observed_item:
+            skipped.append({"alias": alias, "reason": "Alias is not currently an unlinked local observability alias."})
+            continue
+
+        observed_kind = str(observed_item.get("kind") or "llm").strip()
+        proposed_type = str(item.get("model_type") or observed_kind or "llm").strip()
+        model_type = proposed_type if proposed_type in _ALLOWED_MODEL_TYPES else observed_kind
+        if model_type not in _ALLOWED_MODEL_TYPES:
+            model_type = "llm"
+
+        dimensions = None
+        if model_type == "embedding":
+            try:
+                dimensions = int(item.get("dimensions") or (observed_item.get("limits") or {}).get("dimensions"))
+            except Exception:
+                dimensions = None
+
+        options = item.get("options") if isinstance(item.get("options"), dict) else {}
+        alias_u = alias.upper()
+        if model_type == "reranker":
+            options = {**options, "rerank_endpoint": "/rerank"}
+        if "NO-THINK" in alias_u:
+            options = {**options, "no_think_supported": True}
+
+        default_name = f"{alias} ({observed_item.get('provider_family') or 'Configured'} alias)"
+        default_notes = "Stable alias from the current LiteLLM stack catalog. Created by local-only AI DB linker after deterministic validation."
+        to_insert.append(
+            {
+                "provider_id": str(uuid.uuid4()),
+                "name": _clean_text(item.get("name"), fallback=default_name, max_len=180),
+                "base_url": _LOCAL_LITELLM_BASE_URL,
+                "api_key": master_key,
+                "model_name": alias,
+                "model_type": model_type,
+                "dimensions": dimensions,
+                "enabled": 1 if item.get("enabled", True) else 0,
+                "options": _safe_json_options(options),
+                "notes": _clean_text(item.get("notes"), fallback=default_notes, max_len=1200),
+            }
+        )
+
+    applied: list[dict] = []
+    if to_insert and not body.dry_run:
+        with get_conn() as conn:
+            gen = increment_gen(conn, "human")
+            for row in to_insert:
+                conn.execute(
+                    """
+                    INSERT INTO ai_providers
+                        (provider_id, name, base_url, api_key, model_name, model_type,
+                         dimensions, enabled, options, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["provider_id"],
+                        row["name"],
+                        row["base_url"],
+                        row["api_key"],
+                        row["model_name"],
+                        row["model_type"],
+                        row["dimensions"],
+                        row["enabled"],
+                        row["options"],
+                        row["notes"],
+                    ),
+                )
+                created = conn.execute(
+                    "SELECT * FROM ai_providers WHERE provider_id=?",
+                    (row["provider_id"],),
+                ).fetchone()
+                created_dict = dict(created)
+                enqueue_for_all_peers(
+                    conn,
+                    "INSERT",
+                    "ai_providers",
+                    row["provider_id"],
+                    created_dict,
+                    gen,
+                )
+                applied.append(_sanitize_public_provider(created_dict))
+
+    return {
+        "ok": True,
+        "dry_run": bool(body.dry_run),
+        "planner_alias": plan.get("planner_alias"),
+        "candidate_count": plan.get("candidate_count", len(unlinked_by_alias)),
+        "proposal_count": len(proposals),
+        "validated_count": len(to_insert),
+        "applied_count": len(applied) if not body.dry_run else 0,
+        "would_apply_count": len(to_insert),
+        "applied": applied,
+        "would_apply": [_sanitize_public_provider(row) for row in to_insert] if body.dry_run else [],
+        "skipped": skipped,
+    }
 
 
 @router.post("", response_model=AiProviderOut, status_code=201)
