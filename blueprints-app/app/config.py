@@ -200,6 +200,14 @@ DOCS_ROOT: str = os.environ.get("DOCS_ROOT", "")
 TURBOVEC_DOCS_URL: str = os.environ.get("TURBOVEC_DOCS_URL", "http://127.0.0.1:19080")
 TURBOVEC_DOCS_TIMEOUT: float = float(os.environ.get("TURBOVEC_DOCS_TIMEOUT", "12"))
 
+# Node-local deterministic docs synthesis worker. This is a separate Blueprints
+# proxy surface from the direct TurboVec Docs search route above.
+NULLCLAW_DOCS_SEARCH_URL: str = os.environ.get(
+    "NULLCLAW_DOCS_SEARCH_URL",
+    "http://127.0.0.1:19081",
+)
+NULLCLAW_DOCS_SEARCH_TIMEOUT: float = float(os.environ.get("NULLCLAW_DOCS_SEARCH_TIMEOUT", "45"))
+
 # Shell command to restart the blueprints service after a git pull.
 SERVICE_RESTART_CMD: str = os.environ.get("SERVICE_RESTART_CMD", "")
 

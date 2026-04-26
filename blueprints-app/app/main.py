@@ -50,6 +50,7 @@ from .routes_firewall import router as firewall_router
 from .routes_form_controls import router as form_controls_router
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
+from .routes_help import router as help_router
 from .routes_keys import router as keys_router
 from .routes_litellm import router as litellm_router
 from .routes_litellm_hook import router as litellm_hook_router
@@ -350,6 +351,7 @@ def create_app() -> FastAPI:
     application.include_router(assumptions_router, prefix="/api/v1")
     application.include_router(todo_router, prefix="/api/v1")
     application.include_router(docs_router, prefix="/api/v1")
+    application.include_router(help_router, prefix="/api/v1")
     application.include_router(doc_groups_router, prefix="/api/v1")
     application.include_router(doc_images_router, prefix="/api/v1")
     application.include_router(firewall_router, prefix="/api/v1")
