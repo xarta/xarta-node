@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 import httpx
@@ -18,6 +19,14 @@ _SEARCH_PROFILE_BY_MODE: dict[str, str] = {
     "vector": "turbovec-docs-vector",
     "keyword": "turbovec-docs-keyword",
 }
+
+_SHORT_RESPONSE_MAX_CHARS = 180
+_VOICE_UNSAFE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("ignore_previous", r"\bignore (all )?(previous|prior|above) (instructions|messages)\b"),
+    ("role_override", r"\b(system|developer|assistant) (prompt|message|instructions)\b"),
+    ("credential_request", r"\b(api[_ -]?key|password|secret|token|credential)s?\b"),
+    ("tool_instruction", r"\b(run|execute|call|invoke) (this )?(tool|command|shell|script)\b"),
+)
 
 
 class SynthesisControls(BaseModel):
@@ -61,6 +70,7 @@ async def submit_query_synthesis(body: SynthesisControls, mode: BlueprintsSynthe
     payload = stack_task_payload(body, mode)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(cfg.NULLCLAW_DOCS_SEARCH_TIMEOUT)) as client:
+            await _ensure_worker_ready(client, base_url)
             response = await client.post(f"{base_url}/tasks/query-synthesis", json=payload)
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "nullclaw-docs-search synthesis timed out") from exc
@@ -85,6 +95,37 @@ async def fetch_query_synthesis_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(503, f"nullclaw-docs-search unavailable: {exc}") from exc
 
     return _decode_task_response(response, "task lookup")
+
+
+async def _ensure_worker_ready(client: httpx.AsyncClient, base_url: str) -> None:
+    try:
+        response = await client.get(f"{base_url}/health")
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "nullclaw-docs-search health check timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, f"nullclaw-docs-search unavailable: {exc}") from exc
+
+    detail: Any
+    try:
+        detail = response.json()
+    except ValueError:
+        detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+    body = detail.get("detail") if isinstance(detail, dict) and isinstance(detail.get("detail"), dict) else detail
+    ok = response.status_code < 400
+    if isinstance(body, dict) and body.get("ok") is False:
+        ok = False
+    if ok:
+        return
+    raise HTTPException(
+        503,
+        {
+            "message": "nullclaw-docs-search is not ready",
+            "service": "nullclaw-docs-search",
+            "health_endpoint": "/health",
+            "upstream_status": response.status_code,
+            "health": body,
+        },
+    )
 
 
 def blueprints_synthesis_response(
@@ -123,7 +164,7 @@ def blueprints_synthesis_response(
         response["error"] = task.get("error")
 
     if projection in {"turn", "short"}:
-        response["short_response"] = help_turn.get("short_response")
+        response["short_response"] = _normalize_short_response(help_turn.get("short_response"))
     if projection in {"turn", "modal"}:
         response["modal_response"] = help_turn.get("modal_response")
     if projection in {"turn", "action"}:
@@ -161,6 +202,55 @@ def _decode_task_response(response: httpx.Response, operation: str) -> dict[str,
     return data
 
 
+def _normalize_short_response(short_response: Any) -> dict[str, Any]:
+    source = short_response if isinstance(short_response, dict) else {}
+    raw_text = str(source.get("text") or "").strip()
+    text = _plain_voice_text(raw_text)
+    unsafe = _has_voice_unsafe_text(text)
+    if not text or unsafe:
+        text = "Open the help response for the cited local documentation details."
+    text = _clamp_voice_text(text, _SHORT_RESPONSE_MAX_CHARS)
+    return {
+        **source,
+        "text": text,
+        "tts_ready": True,
+        "voice_safe": True,
+        "format": "plain_text",
+        "max_chars": _SHORT_RESPONSE_MAX_CHARS,
+        "char_count": len(text),
+    }
+
+
+def _plain_voice_text(text: str) -> str:
+    plain = str(text or "")
+    plain = re.sub(r"```.*?```", " ", plain, flags=re.DOTALL)
+    plain = re.sub(r"`([^`]*)`", r"\1", plain)
+    plain = re.sub(r"\[(?:S|s)\d+\]", "", plain)
+    plain = re.sub(r"https?://\S+", "link", plain)
+    plain = re.sub(r"(?m)^#{1,6}\s*", "", plain)
+    plain = re.sub(r"(?m)^[-*]\s+", "", plain)
+    plain = re.sub(r"[*_>#]+", " ", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain
+
+
+def _has_voice_unsafe_text(text: str) -> bool:
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for _code, pattern in _VOICE_UNSAFE_PATTERNS
+    )
+
+
+def _clamp_voice_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    sentence_end = max(text.rfind(".", 0, limit), text.rfind("?", 0, limit), text.rfind("!", 0, limit))
+    if sentence_end >= 60:
+        return text[: sentence_end + 1].strip()
+    clipped = text[:limit].rsplit(" ", 1)[0].strip()
+    return f"{clipped}."
+
+
 def _warnings_from_result(result: dict[str, Any], help_turn: dict[str, Any]) -> list[Any]:
     warnings: list[Any] = []
     for item in result.get("warnings") or []:
@@ -184,4 +274,24 @@ def _evidence_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "documents": [doc for doc in documents if isinstance(doc, dict)],
         "document_count": context.get("document_count", 0),
         "returned_chars": context.get("returned_chars", 0),
+    }
+
+
+def synthesis_display_block(response: dict[str, Any]) -> dict[str, Any]:
+    """Build UI-friendly display metadata without changing the stack-local contract."""
+    answer = str(response.get("answer") or "").strip()
+    sources = response.get("sources") if isinstance(response.get("sources"), list) else []
+    evidence = response.get("evidence") if isinstance(response.get("evidence"), dict) else {}
+    summary = _plain_voice_text(answer)
+    if len(summary) > 260:
+        summary = _clamp_voice_text(summary, 260)
+    if not summary:
+        summary = "No grounded answer could be synthesized from the retrieved local documentation."
+    return {
+        "title": "Docs Search Explanation",
+        "summary": summary,
+        "markdown": answer,
+        "source_count": len(sources),
+        "evidence_document_count": evidence.get("document_count", 0),
+        "content_is_grounded_evidence": True,
     }

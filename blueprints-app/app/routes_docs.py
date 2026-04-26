@@ -27,6 +27,7 @@ from .nullclaw_docs_search import (
     blueprints_synthesis_response,
     ensure_succeeded,
     submit_query_synthesis,
+    synthesis_display_block,
 )
 from .sync.queue import enqueue_for_all_peers
 
@@ -334,11 +335,13 @@ async def explain_docs_search(body: DocsSearchExplainBody) -> dict[str, Any]:
     """Return a grounded synthesis for a docs search query via nullclaw-docs-search."""
     task = await submit_query_synthesis(body, body.explanation_mode)
     ensure_succeeded(task)
-    return blueprints_synthesis_response(
+    response = blueprints_synthesis_response(
         task,
         route="/api/v1/docs/search/explain",
         projection="explain",
     )
+    response["display"] = synthesis_display_block(response)
+    return response
 
 
 # ── Get with content ──────────────────────────────────────────────────────────
