@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +22,12 @@ from starlette.responses import Response
 from . import config as cfg
 from .db import get_conn, increment_gen
 from .models import DocContentBody, DocCreate, DocOut, DocUpdate, DocWithContent
+from .nullclaw_docs_search import (
+    SynthesisControls,
+    blueprints_synthesis_response,
+    ensure_succeeded,
+    submit_query_synthesis,
+)
 from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
@@ -39,6 +45,10 @@ class DocsSearchBody(BaseModel):
     vector_k: int = Field(default=40, ge=1, le=120)
     keyword_k: int = Field(default=40, ge=1, le=120)
     rerank: bool = True
+
+
+class DocsSearchExplainBody(SynthesisControls):
+    explanation_mode: Literal["summary", "answer"] = "answer"
 
 
 def _touch_docs_sentinel() -> None:
@@ -317,6 +327,18 @@ async def search_docs(body: DocsSearchBody) -> dict:
             "result_count": len(raw_results),
         },
     }
+
+
+@router.post("/search/explain", response_model=dict)
+async def explain_docs_search(body: DocsSearchExplainBody) -> dict[str, Any]:
+    """Return a grounded synthesis for a docs search query via nullclaw-docs-search."""
+    task = await submit_query_synthesis(body, body.explanation_mode)
+    ensure_succeeded(task)
+    return blueprints_synthesis_response(
+        task,
+        route="/api/v1/docs/search/explain",
+        projection="explain",
+    )
 
 
 # ── Get with content ──────────────────────────────────────────────────────────
