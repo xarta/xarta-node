@@ -254,6 +254,17 @@ def _clamp_voice_text(text: str, limit: int) -> str:
     return f"{clipped}."
 
 
+def _strip_opening_greeting(text: str) -> str:
+    """Remove fragile time-of-day greetings from synthesized display text."""
+    return re.sub(
+        "^\\s*(?:good\\s+(?:morning|afternoon|evening)|hello|hi)\\b(?:[,\\s.!:;-]|\\u2013|\\u2014)*",
+        "",
+        str(text or ""),
+        count=1,
+        flags=re.IGNORECASE,
+    ).lstrip()
+
+
 def _warnings_from_result(result: dict[str, Any], help_turn: dict[str, Any]) -> list[Any]:
     warnings: list[Any] = []
     for item in result.get("warnings") or []:
@@ -282,7 +293,7 @@ def _evidence_from_result(result: dict[str, Any]) -> dict[str, Any]:
 
 def synthesis_display_block(response: dict[str, Any]) -> dict[str, Any]:
     """Build UI-friendly display metadata without changing the stack-local contract."""
-    answer = str(response.get("answer") or "").strip()
+    answer = _strip_opening_greeting(str(response.get("answer") or "").strip())
     sources = response.get("sources") if isinstance(response.get("sources"), list) else []
     evidence = response.get("evidence") if isinstance(response.get("evidence"), dict) else {}
     summary = _plain_voice_text(answer)
