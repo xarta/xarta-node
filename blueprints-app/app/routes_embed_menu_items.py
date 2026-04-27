@@ -114,6 +114,16 @@ _DEFAULT_SEED = [
         "enabled": 1,
         "menu_context": "embed",
     },
+    {
+        "item_key": "help",
+        "label": "Help",
+        "icon_emoji": "?",
+        "icon_asset": "icons/ui/question-mark-gold.svg",
+        "page_index": 3,
+        "sort_order": 0,
+        "enabled": 1,
+        "menu_context": "embed",
+    },
     # ── context: fallback-ui ─────────────────────────────────────────────────
     # Only fallback-ui-specific items. Items shared with embed context are NOT
     # duplicated here — the /config endpoint automatically appends embed context
