@@ -10,7 +10,11 @@ DELETE /api/v1/docs/{doc_id}            → delete record; ?delete_file=true als
 
 import logging
 import os
+import shlex
+import shutil
+import subprocess
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,6 +54,10 @@ class DocsSearchBody(BaseModel):
 
 class DocsSearchExplainBody(SynthesisControls):
     explanation_mode: Literal["summary", "answer"] = "answer"
+
+
+class DocsGroupFolderOpenBody(BaseModel):
+    group_id: str | None = None
 
 
 def _touch_docs_sentinel() -> None:
@@ -129,6 +137,46 @@ def _doc_path_candidates(doc_path: str) -> list[str]:
             seen.add(key)
             ordered.append(item)
     return ordered
+
+
+def _docs_folder_opener() -> list[str]:
+    configured = os.environ.get("BLUEPRINTS_DOCS_FOLDER_OPEN_CMD", "").strip()
+    if configured:
+        return shlex.split(configured)
+    for candidate in ("xdg-open", "gio", "open"):
+        found = shutil.which(candidate)
+        if not found:
+            continue
+        if candidate == "gio":
+            return [found, "open"]
+        return [found]
+    return []
+
+
+def _open_docs_folder(folder: Path) -> None:
+    cmd = _docs_folder_opener()
+    if not cmd:
+        raise HTTPException(
+            503,
+            "No folder opener is available; set BLUEPRINTS_DOCS_FOLDER_OPEN_CMD",
+        )
+    try:
+        proc = subprocess.Popen(
+            [*cmd, str(folder)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            _, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            return
+        if proc.returncode != 0:
+            detail = (stderr or "").strip() or f"exit code {proc.returncode}"
+            raise HTTPException(500, f"Could not open folder: {detail[:300]}")
+    except OSError as exc:
+        raise HTTPException(500, f"Could not open folder: {exc}") from exc
 
 
 def _result_snippet(text: str, limit: int = 620) -> str:
@@ -342,6 +390,72 @@ async def explain_docs_search(body: DocsSearchExplainBody) -> dict[str, Any]:
     )
     response["display"] = synthesis_display_block(response)
     return response
+
+
+# ── Group folder opener ───────────────────────────────────────────────────────
+
+@router.post("/group-folder/open", response_model=dict)
+async def open_docs_group_folder(body: DocsGroupFolderOpenBody) -> dict[str, Any]:
+    """Open the most common parent folder for the docs currently in a group."""
+    root = _docs_root()
+    group_id = body.group_id or None
+    if group_id:
+        query = """
+            SELECT path
+            FROM docs
+            WHERE group_id=?
+            ORDER BY sort_order, label
+        """
+        params: tuple[Any, ...] = (group_id,)
+    else:
+        query = """
+            SELECT path
+            FROM docs
+            WHERE group_id IS NULL OR group_id=''
+            ORDER BY sort_order, label
+        """
+        params = ()
+
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    if not rows:
+        raise HTTPException(404, "No documents in this group")
+
+    folders: list[Path] = []
+    first_seen: dict[Path, int] = {}
+    for row in rows:
+        doc_path = str(row["path"] or "").strip()
+        if not doc_path:
+            continue
+        resolved = _safe_resolve(root, doc_path)
+        folder = resolved if resolved.is_dir() else resolved.parent
+        if folder not in first_seen:
+            first_seen[folder] = len(folders)
+        folders.append(folder)
+
+    if not folders:
+        raise HTTPException(404, "No document paths in this group")
+
+    counts = Counter(folders)
+    folder = max(counts, key=lambda item: (counts[item], -first_seen[item]))
+    if not folder.exists():
+        raise HTTPException(404, f"Folder does not exist: {folder}")
+    if not folder.is_dir():
+        raise HTTPException(400, f"Not a folder: {folder}")
+
+    _open_docs_folder(folder)
+    try:
+        relative = str(folder.relative_to(root))
+    except ValueError:
+        relative = str(folder)
+    return {
+        "ok": True,
+        "folder": str(folder),
+        "relative_folder": "." if relative == "." else relative,
+        "document_count": len(rows),
+        "folder_document_count": counts[folder],
+    }
 
 
 # ── Get with content ──────────────────────────────────────────────────────────
