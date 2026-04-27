@@ -60,6 +60,11 @@ class DocsGroupFolderOpenBody(BaseModel):
     group_id: str | None = None
 
 
+class DocsGroupFolderTreeBody(BaseModel):
+    group_id: str | None = None
+    path: str | None = Field(default=None, max_length=2000)
+
+
 def _touch_docs_sentinel() -> None:
     """Touch the sentinel file so the lone-wolf commit cron picks up the change."""
     try:
@@ -203,6 +208,97 @@ def _registered_docs_by_path() -> dict[str, Any]:
         by_path[path.lower()] = row
         if path.startswith("docs/"):
             by_path[path.removeprefix("docs/").lower()] = row
+    return by_path
+
+
+def _normalize_docs_rel(path: str) -> str:
+    clean = (path or "").strip().replace("\\", "/").strip("/")
+    return "." if clean in ("", ".") else clean
+
+
+def _docs_rel_path(root: Path, path: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return str(path)
+    rel_text = rel.as_posix()
+    return "." if rel_text in ("", ".") else rel_text
+
+
+def _docs_group_path_rows(group_id: str | None) -> list[Any]:
+    if group_id:
+        query = """
+            SELECT path
+            FROM docs
+            WHERE group_id=?
+            ORDER BY sort_order, label
+        """
+        params: tuple[Any, ...] = (group_id,)
+    else:
+        query = """
+            SELECT path
+            FROM docs
+            WHERE group_id IS NULL OR group_id=''
+            ORDER BY sort_order, label
+        """
+        params = ()
+
+    with get_conn() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+def _most_common_docs_folder(root: Path, rows: list[Any]) -> tuple[Path, Counter[Path]]:
+    if not rows:
+        raise HTTPException(404, "No documents in this group")
+
+    folders: list[Path] = []
+    first_seen: dict[Path, int] = {}
+    for row in rows:
+        doc_path = str(row["path"] or "").strip()
+        if not doc_path:
+            continue
+        resolved = _safe_resolve(root, doc_path)
+        folder = resolved if resolved.is_dir() else resolved.parent
+        if folder not in first_seen:
+            first_seen[folder] = len(folders)
+        folders.append(folder)
+
+    if not folders:
+        raise HTTPException(404, "No document paths in this group")
+
+    counts = Counter(folders)
+    folder = max(counts, key=lambda item: (counts[item], -first_seen[item]))
+    if not folder.exists():
+        raise HTTPException(404, f"Folder does not exist: {folder}")
+    if not folder.is_dir():
+        raise HTTPException(400, f"Not a folder: {folder}")
+    return folder, counts
+
+
+def _registered_docs_tree_lookup() -> dict[str, dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT doc_id, label, description, tags, path, group_id
+            FROM docs
+            ORDER BY sort_order, label
+            """
+        ).fetchall()
+
+    by_path: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = _normalize_docs_rel(row["path"])
+        lower_key = key.lower()
+        if not key or lower_key in by_path:
+            continue
+        by_path[lower_key] = {
+            "doc_id": row["doc_id"],
+            "label": row["label"],
+            "description": row["description"],
+            "tags": row["tags"],
+            "path": row["path"],
+            "group_id": row["group_id"] if "group_id" in row.keys() else None,
+        }
     return by_path
 
 
@@ -399,62 +495,91 @@ async def open_docs_group_folder(body: DocsGroupFolderOpenBody) -> dict[str, Any
     """Open the most common parent folder for the docs currently in a group."""
     root = _docs_root()
     group_id = body.group_id or None
-    if group_id:
-        query = """
-            SELECT path
-            FROM docs
-            WHERE group_id=?
-            ORDER BY sort_order, label
-        """
-        params: tuple[Any, ...] = (group_id,)
-    else:
-        query = """
-            SELECT path
-            FROM docs
-            WHERE group_id IS NULL OR group_id=''
-            ORDER BY sort_order, label
-        """
-        params = ()
-
-    with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-
-    if not rows:
-        raise HTTPException(404, "No documents in this group")
-
-    folders: list[Path] = []
-    first_seen: dict[Path, int] = {}
-    for row in rows:
-        doc_path = str(row["path"] or "").strip()
-        if not doc_path:
-            continue
-        resolved = _safe_resolve(root, doc_path)
-        folder = resolved if resolved.is_dir() else resolved.parent
-        if folder not in first_seen:
-            first_seen[folder] = len(folders)
-        folders.append(folder)
-
-    if not folders:
-        raise HTTPException(404, "No document paths in this group")
-
-    counts = Counter(folders)
-    folder = max(counts, key=lambda item: (counts[item], -first_seen[item]))
-    if not folder.exists():
-        raise HTTPException(404, f"Folder does not exist: {folder}")
-    if not folder.is_dir():
-        raise HTTPException(400, f"Not a folder: {folder}")
+    rows = _docs_group_path_rows(group_id)
+    folder, counts = _most_common_docs_folder(root, rows)
 
     _open_docs_folder(folder)
-    try:
-        relative = str(folder.relative_to(root))
-    except ValueError:
-        relative = str(folder)
     return {
         "ok": True,
         "folder": str(folder),
-        "relative_folder": "." if relative == "." else relative,
+        "relative_folder": _docs_rel_path(root, folder),
         "document_count": len(rows),
         "folder_document_count": counts[folder],
+    }
+
+
+@router.post("/group-folder/tree", response_model=dict)
+async def docs_group_folder_tree(body: DocsGroupFolderTreeBody) -> dict[str, Any]:
+    """Return a browser-renderable tree view for a docs group folder."""
+    root = _docs_root()
+    group_id = body.group_id or None
+    rows = _docs_group_path_rows(group_id)
+
+    requested_path = _normalize_docs_rel(body.path or "")
+    if requested_path != ".":
+        folder = _safe_resolve(root, requested_path)
+        if not folder.exists():
+            raise HTTPException(404, f"Folder does not exist: {requested_path}")
+        if not folder.is_dir():
+            raise HTTPException(400, f"Not a folder: {requested_path}")
+        _, counts = _most_common_docs_folder(root, rows)
+    else:
+        folder, counts = _most_common_docs_folder(root, rows)
+
+    relative_folder = _docs_rel_path(root, folder)
+    docs_by_path = _registered_docs_tree_lookup()
+    current_doc = docs_by_path.get(relative_folder.lower())
+
+    entries: list[dict[str, Any]] = []
+    try:
+        children = list(folder.iterdir())
+    except OSError as exc:
+        raise HTTPException(500, f"Could not list folder: {exc}") from exc
+
+    for child in children:
+        child_rel = _docs_rel_path(root, child)
+        child_doc = docs_by_path.get(child_rel.lower())
+        try:
+            is_dir = child.is_dir()
+            is_file = child.is_file()
+        except OSError:
+            continue
+        if not is_dir and not is_file:
+            continue
+        entries.append(
+            {
+                "name": child.name,
+                "path": child_rel,
+                "type": "folder" if is_dir else "file",
+                "registered_doc": child_doc,
+            }
+        )
+
+    entries.sort(key=lambda item: (0 if item["type"] == "folder" else 1, item["name"].lower()))
+
+    breadcrumbs = [{"label": "docs root", "path": "."}]
+    if relative_folder != ".":
+        running: list[str] = []
+        for part in Path(relative_folder).parts:
+            running.append(part)
+            breadcrumbs.append({"label": part, "path": "/".join(running)})
+
+    parent_path = None
+    if relative_folder != ".":
+        parent = folder.parent
+        if str(parent.resolve()).startswith(str(root.resolve())):
+            parent_path = _docs_rel_path(root, parent)
+
+    return {
+        "ok": True,
+        "folder": str(folder),
+        "relative_folder": relative_folder,
+        "parent_path": parent_path,
+        "breadcrumbs": breadcrumbs,
+        "entries": entries,
+        "current_doc": current_doc,
+        "document_count": len(rows),
+        "folder_document_count": counts.get(folder, 0),
     }
 
 
