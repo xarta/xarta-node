@@ -60,6 +60,11 @@ class DocsGroupFolderOpenBody(BaseModel):
     group_id: str | None = None
 
 
+class DocsSearchSyncBody(BaseModel):
+    force: bool = False
+    paths: list[str] | None = None
+
+
 class DocsGroupFolderTreeBody(BaseModel):
     group_id: str | None = None
     path: str | None = Field(default=None, max_length=2000)
@@ -486,6 +491,42 @@ async def explain_docs_search(body: DocsSearchExplainBody) -> dict[str, Any]:
     )
     response["display"] = synthesis_display_block(response)
     return response
+
+
+@router.post("/search/sync", response_model=dict)
+async def sync_docs_search_index(body: DocsSearchSyncBody | None = None) -> dict[str, Any]:
+    """Proxy TurboVec Docs incremental index sync for updated Markdown files."""
+    body = body or DocsSearchSyncBody()
+    base_url = cfg.TURBOVEC_DOCS_URL.rstrip("/")
+    if not base_url:
+        raise HTTPException(503, "TURBOVEC_DOCS_URL is not configured")
+
+    payload: dict[str, Any] = {"force": body.force}
+    if body.paths:
+        payload["paths"] = body.paths
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, 60.0))) as client:
+            resp = await client.post(f"{base_url}/index/sync", json=payload)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "TurboVec Docs index sync timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, f"TurboVec Docs unavailable: {exc}") from exc
+
+    if resp.status_code >= 400:
+        detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        raise HTTPException(502, f"TurboVec Docs index sync failed: {detail}")
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise HTTPException(502, "TurboVec Docs returned invalid JSON") from exc
+
+    return {
+        "ok": bool(data.get("ok", True)) if isinstance(data, dict) else True,
+        "force": body.force,
+        "upstream": data,
+    }
 
 
 # ── Group folder opener ───────────────────────────────────────────────────────
