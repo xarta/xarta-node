@@ -406,6 +406,47 @@ CADDY
 
 chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
 
+# ── Vikunja work-memory block ────────────────────────────────────────────────
+# Backend binds to loopback only. Caddy exposes it on a private HTTPS hostname
+# for local/RFC1918/tailnet clients.
+if [[ -z "${VIKUNJA_HOSTNAME:-}" ]]; then
+    if [[ "$UI_HOST" == *.* ]]; then
+        VIKUNJA_HOSTNAME="projects.${UI_HOST#*.}"
+    else
+        VIKUNJA_HOSTNAME="projects.${UI_HOST}"
+    fi
+fi
+VIKUNJA_PORT="${VIKUNJA_PORT:-3456}"
+cat >> "$CADDYFILE" <<CADDY_VIKUNJA
+
+# Vikunja - private work-memory UI.
+# Backend binds to loopback only; Caddy exposes it on the private HTTPS entrypoint.
+https://${VIKUNJA_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy localhost:${VIKUNJA_PORT} {
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${VIKUNJA_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_VIKUNJA
+chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+echo "    Appended Vikunja block (https://${VIKUNJA_HOSTNAME} → localhost:${VIKUNJA_PORT})"
+
 # ── code-server block — appended when CODE_SERVER is set ─────────────────────
 # code-server itself binds to loopback only. Caddy terminates TLS and keeps the
 # browser IDE private to local, RFC1918, and tailnet source addresses.
