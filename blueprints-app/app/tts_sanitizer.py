@@ -23,6 +23,12 @@ _SOURCE_REF_RE = re.compile(r"(?:[\s,;]*\[S\d+\])+", re.IGNORECASE)
 _BOLD_HEADING_RE = re.compile(r"^\s*\*\*(?P<title>[^*\n][^*\n]*?)\*\*\s*$")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
 _MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]+\|?\s*$")
+_ENDPOINT_LIST_ITEM_RE = re.compile(
+    r"^\s*[-*]\s+(?:\*\*)?(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)(?:\*\*)?\s+"
+    r"(?P<rest>\S.*)$",
+    re.IGNORECASE,
+)
+_LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 _TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]$")
 _BACKLINK_PREFIXES = ("<-", "←", "&larr;", "[<-", "[←", "[&larr;")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
@@ -117,9 +123,10 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("GIF", "gee eye eff"),
     ("PDF", "pee dee eff"),
     ("CSV", "see ess vee"),
+    ("IIFE", "eye eye eff ee"),
     ("JS", "JavaScript"),
     ("TS", "tee ess"),
-    ("DOM", "dee oh em"),
+    ("DOM", "dom"),
     ("PWA", "pee double you ay"),
     ("UI", "you eye"),
     ("UX", "you ex"),
@@ -368,6 +375,50 @@ def summarize_markdown_tables(text: str) -> str:
     return "\n".join(projected)
 
 
+def _summarize_endpoint_list_block(lines: list[str]) -> str:
+    methods: list[str] = []
+    for line in lines:
+        match = _ENDPOINT_LIST_ITEM_RE.match(line)
+        if not match:
+            continue
+        method = match.group("method").upper()
+        if method not in methods:
+            methods.append(method)
+    methods_text = _join_spoken_list(methods)
+    endpoint_word = "endpoint" if len(lines) == 1 else "endpoints"
+    if methods_text:
+        return (
+            f"There is an A pee eye endpoint list with {len(lines)} {endpoint_word} "
+            f"using {methods_text}. It is summarized here rather than read row by row."
+        )
+    return f"The A pee eye includes {len(lines)} endpoints."
+
+
+def summarize_endpoint_list_blocks(text: str) -> str:
+    lines = _normalize_newlines(text).split("\n")
+    projected: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not _ENDPOINT_LIST_ITEM_RE.match(line):
+            projected.append(line)
+            index += 1
+            continue
+        block: list[str] = []
+        while index < len(lines) and _ENDPOINT_LIST_ITEM_RE.match(lines[index]):
+            block.append(lines[index])
+            index += 1
+        if len(block) >= 4:
+            if projected and projected[-1].strip():
+                projected.append("")
+            projected.append(_summarize_endpoint_list_block(block))
+            if index < len(lines) and lines[index].strip():
+                projected.append("")
+        else:
+            projected.extend(block)
+    return "\n".join(projected)
+
+
 def _speak_inline_code_token(value: str) -> str:
     spoken = _speak_known_attribute_names(value)
     if spoken != value:
@@ -487,6 +538,10 @@ def speak_remaining_pipes(text: str) -> str:
     return re.sub(r"\s*\|\s*", " or ", str(text or ""))
 
 
+def strip_markdown_list_markers(text: str) -> str:
+    return _LIST_MARKER_RE.sub("", str(text or ""))
+
+
 TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("normalize_newlines", _normalize_newlines),
     TtsTextTransform("strip_top_backlink_line", strip_top_backlink_line),
@@ -494,8 +549,10 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
     TtsTextTransform("summarize_fenced_code_blocks", summarize_fenced_code_blocks),
     TtsTextTransform("summarize_markdown_tables", summarize_markdown_tables),
+    TtsTextTransform("summarize_endpoint_list_blocks", summarize_endpoint_list_blocks),
     TtsTextTransform("strip_inline_code_ticks", _strip_inline_code_ticks),
     TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
+    TtsTextTransform("strip_markdown_list_markers", strip_markdown_list_markers),
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
     TtsTextTransform("speak_tts_known_terms", speak_tts_known_terms),
     TtsTextTransform("speak_tts_file_extensions", speak_tts_file_extensions),
