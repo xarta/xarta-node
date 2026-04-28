@@ -51,6 +51,7 @@ class SynthesisControls(BaseModel):
     include_research: bool = True
     include_history: bool = False
     include_unknown: bool = True
+    map_reduce: bool = False
 
 
 def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -> dict[str, Any]:
@@ -76,6 +77,7 @@ def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -
         "include_research": body.include_research,
         "include_history": body.include_history,
         "include_unknown": body.include_unknown,
+        "map_reduce": body.map_reduce,
     }
 
 
