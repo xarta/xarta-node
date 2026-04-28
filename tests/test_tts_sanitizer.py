@@ -23,12 +23,15 @@ Despite the progress, there are a few areas."""
         "strip_source_refs",
         "project_markdown_headings",
         "summarize_fenced_code_blocks",
+        "summarize_markdown_tables",
         "strip_inline_code_ticks",
         "strip_inline_markdown_emphasis",
         "speak_known_attribute_names",
+        "speak_tts_known_terms",
         "speak_tts_file_extensions",
         "speak_tts_identifiers",
         "speak_tts_acronyms",
+        "speak_remaining_pipes",
         "normalize_spacing",
     ]
 
@@ -46,17 +49,15 @@ def test_sanitize_tts_text_speaks_data_fc_key_attribute():
 
     assert (
         result.text
-        == "Blueprints gooey uses a data eff sea key aytch tee em ell attribute, data eff sea event, and stray ticks."
+        == "Blueprints gooey uses a data eff sea key H tee em ell attribute, data eff sea event, and stray ticks."
     )
     assert "`" not in result.text
 
 
 def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
-    result = sanitize_tts_text(
-        "The `form_controls` table maps table_layout_catalog rows for SOUND-MANAGER."
-    )
+    result = sanitize_tts_text("The `form_controls` table maps table_layout_catalog rows for NAV-ITEMS.")
 
-    assert result.text == "The form controls table maps table layout catalog rows for SOUND MANAGER."
+    assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
 
 
 def test_prepare_tts_markdown_for_llm_projects_inline_code_identifiers():
@@ -95,7 +96,7 @@ def test_sanitize_tts_text_summarizes_fenced_code_blocks():
 
 Done."""
 
-    assert sanitize_tts_text(raw).text == "Example:\n\nThere is an aytch tee em ell example here.\n\nDone."
+    assert sanitize_tts_text(raw).text == "Example:\n\nThere is an H tee em ell example here.\n\nDone."
 
 
 def test_sanitize_tts_text_speaks_common_technical_acronyms():
@@ -107,7 +108,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
             "ell ee dee ess vee gee pee enn gee jay peg vee em ell ex sea 805 "
             "ay eye A pee eye gooey dee enn ess aitch tee tee pee ess em tee ell ess "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
-            "JavaScript aytch tee em ell"
+            "JavaScript H tee em ell"
         )
     )
 
@@ -118,10 +119,35 @@ def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
     assert (
         sanitize_tts_text(raw).text
         == (
-            "Open form controls dot jay ess, icons dot ess vee gee, page dot aytch tee em ell, "
+            "Open form controls dot jay ess, icons dot ess vee gee, page dot H tee em ell, "
             "config dot ee enn vee, table layout catalog dot jay son, and dot ess vee gee."
         )
     )
+
+
+def test_sanitize_tts_text_summarizes_markdown_tables_without_pipes():
+    raw = """## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | /api/v1/form-controls | List all |
+| POST | /api/v1/form-controls | Create |
+| DELETE | /api/v1/form-controls/{id} | Delete |
+
+Next."""
+
+    result = sanitize_tts_text(raw).text
+
+    assert result == (
+        "A pee eye Endpoints.\n\n"
+        "There is a table with 3 rows covering Method, Path, and Description.\n\n"
+        "Next."
+    )
+    assert "|" not in result
+
+
+def test_sanitize_tts_text_speaks_textarea_as_text_area():
+    assert sanitize_tts_text("textarea textareas click|change|focus").text == "text area text areas click or change or focus"
 
 
 def test_sanitize_tts_text_removes_only_top_backlink():

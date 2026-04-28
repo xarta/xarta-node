@@ -40,11 +40,14 @@ from .nullclaw_docs_search import (
 from .sync.queue import enqueue_for_all_peers
 from .tts_sanitizer import (
     prepare_tts_markdown_for_llm,
+    speak_remaining_pipes,
     speak_tts_acronyms,
     speak_tts_file_extensions,
     speak_tts_identifiers,
+    speak_tts_known_terms,
     strip_top_backlink_line,
     summarize_fenced_code_blocks,
+    summarize_markdown_tables,
 )
 
 log = logging.getLogger(__name__)
@@ -276,13 +279,16 @@ def _clamp_source_markdown(markdown: str, limit: int = 28000) -> str:
 def _clean_doc_speech_markdown(text: str) -> str:
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     cleaned = summarize_fenced_code_blocks(cleaned)
+    cleaned = summarize_markdown_tables(cleaned)
     cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
     cleaned = cleaned.replace("`", "")
     cleaned = _strip_frontmatter(cleaned)
     cleaned = strip_top_backlink_line(cleaned)
+    cleaned = speak_tts_known_terms(cleaned)
     cleaned = speak_tts_file_extensions(cleaned)
     cleaned = speak_tts_identifiers(cleaned)
     cleaned = speak_tts_acronyms(cleaned)
+    cleaned = speak_remaining_pipes(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -297,7 +303,7 @@ Rules:
 - Do not include YAML front matter.
 - Do not recite raw Markdown syntax, table pipes, link URLs, or every repetitive table cell.
 - For links, say their human meaning, such as "link to the responsive header notes".
-- For tables, briefly state that there is a table, describe what it compares or tracks, and call out the important point.
+- For tables, read every row for understanding, then output only a prose summary. Never output Markdown table pipes or row-by-row table text.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
 - Preserve fenced code blocks as examples; summarize what they illustrate instead of reading raw tags, attributes, or source lines.
 - For inline code identifiers, prefer speech-friendly words: form_controls becomes "form controls"; data-fc-key becomes "data eff sea key".

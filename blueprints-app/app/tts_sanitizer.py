@@ -22,6 +22,7 @@ class TtsSanitizeResult:
 _SOURCE_REF_RE = re.compile(r"(?:[\s,;]*\[S\d+\])+", re.IGNORECASE)
 _BOLD_HEADING_RE = re.compile(r"^\s*\*\*(?P<title>[^*\n][^*\n]*?)\*\*\s*$")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]+\|?\s*$")
 _TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]$")
 _BACKLINK_PREFIXES = ("<-", "←", "&larr;", "[<-", "[←", "[&larr;")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
@@ -33,8 +34,8 @@ _FILE_EXTENSION_SPEECH: tuple[tuple[str, str], ...] = (
     ("csv", "dot see ess vee"),
     ("env", "dot ee enn vee"),
     ("gif", "dot gee eye eff"),
-    ("htm", "dot aytch tee em ell"),
-    ("html", "dot aytch tee em ell"),
+    ("htm", "dot H tee em ell"),
+    ("html", "dot H tee em ell"),
     ("jpeg", "dot jay peg"),
     ("jpg", "dot jay peg"),
     ("js", "dot jay ess"),
@@ -107,7 +108,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("JSON", "jay son"),
     ("YAML", "yammel"),
     ("XML", "ex em ell"),
-    ("HTML", "aytch tee em ell"),
+    ("HTML", "H tee em ell"),
     ("CSS", "see ess ess"),
     ("SVG", "ess vee gee"),
     ("PNG", "pee enn gee"),
@@ -174,6 +175,10 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("GUID", "gee you eye dee"),
     ("ID", "eye dee"),
     ("OK", "okay"),
+)
+_KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
+    (r"\btextareas\b", "text areas"),
+    (r"\btextarea\b", "text area"),
 )
 
 
@@ -282,6 +287,87 @@ def summarize_fenced_code_blocks(text: str) -> str:
     return _FENCED_CODE_BLOCK_RE.sub(replace, text)
 
 
+def _is_table_row_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.count("|") >= 2 and not stripped.startswith("```")
+
+
+def _is_table_separator_line(line: str) -> bool:
+    return bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(line))
+
+
+def _clean_table_cell(value: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", str(value or ""))
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"[*_`]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:")
+    return cleaned
+
+
+def _split_table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [_clean_table_cell(cell) for cell in stripped.split("|")]
+
+
+def _join_spoken_list(items: list[str]) -> str:
+    clean = [item for item in items if item]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return f"{', '.join(clean[:-1])}, and {clean[-1]}"
+
+
+def _summarize_table_block(lines: list[str]) -> str:
+    header_line = next((line for line in lines if _is_table_row_line(line) and not _is_table_separator_line(line)), "")
+    header_cells = _split_table_cells(header_line) if header_line else []
+    row_count = sum(1 for line in lines if _is_table_row_line(line) and not _is_table_separator_line(line))
+    if header_cells and row_count:
+        row_count = max(0, row_count - 1)
+    row_word = "row" if row_count == 1 else "rows"
+    columns = _join_spoken_list(header_cells[:6])
+    extra_columns = len(header_cells) - 6
+    if extra_columns > 0:
+        columns = f"{columns}, plus {extra_columns} more"
+    if columns and row_count:
+        return f"There is a table with {row_count} {row_word} covering {columns}."
+    if columns:
+        return f"There is a table covering {columns}."
+    if row_count:
+        return f"There is a table with {row_count} {row_word}."
+    return "There is a table here."
+
+
+def summarize_markdown_tables(text: str) -> str:
+    lines = _normalize_newlines(text).split("\n")
+    projected: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if _is_table_row_line(line) and _is_table_separator_line(next_line):
+            table_lines = [line, next_line]
+            index += 2
+            while index < len(lines) and _is_table_row_line(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            if projected and projected[-1].strip():
+                projected.append("")
+            projected.append(_summarize_table_block(table_lines))
+            if index < len(lines) and lines[index].strip():
+                projected.append("")
+            continue
+        projected.append(line)
+        index += 1
+    return "\n".join(projected)
+
+
 def _speak_inline_code_token(value: str) -> str:
     spoken = _speak_known_attribute_names(value)
     if spoken != value:
@@ -306,6 +392,13 @@ def _speak_known_attribute_names(text: str) -> str:
     )
     text = re.sub(r"\bdata-fc\b", "data eff sea", text, flags=re.IGNORECASE)
     return text
+
+
+def speak_tts_known_terms(text: str) -> str:
+    spoken = str(text or "")
+    for pattern, replacement in _KNOWN_TERM_SPEECH:
+        spoken = re.sub(pattern, replacement, spoken, flags=re.IGNORECASE)
+    return spoken
 
 
 def _speak_identifier_token(value: str) -> str:
@@ -375,6 +468,7 @@ def prepare_tts_markdown_for_llm(markdown: str) -> str:
     def project(segment: str) -> str:
         segment = _INLINE_CODE_RE.sub(lambda match: _speak_inline_code_token(match.group(1)), segment)
         segment = _speak_known_attribute_names(segment)
+        segment = speak_tts_known_terms(segment)
         segment = speak_tts_file_extensions(segment)
         segment = speak_tts_identifiers(segment)
         return speak_tts_acronyms(segment)
@@ -389,18 +483,25 @@ def _normalize_spacing(text: str) -> str:
     return text.strip()
 
 
+def speak_remaining_pipes(text: str) -> str:
+    return re.sub(r"\s*\|\s*", " or ", str(text or ""))
+
+
 TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("normalize_newlines", _normalize_newlines),
     TtsTextTransform("strip_top_backlink_line", strip_top_backlink_line),
     TtsTextTransform("strip_source_refs", _strip_source_refs),
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
     TtsTextTransform("summarize_fenced_code_blocks", summarize_fenced_code_blocks),
+    TtsTextTransform("summarize_markdown_tables", summarize_markdown_tables),
     TtsTextTransform("strip_inline_code_ticks", _strip_inline_code_ticks),
     TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
+    TtsTextTransform("speak_tts_known_terms", speak_tts_known_terms),
     TtsTextTransform("speak_tts_file_extensions", speak_tts_file_extensions),
     TtsTextTransform("speak_tts_identifiers", speak_tts_identifiers),
     TtsTextTransform("speak_tts_acronyms", speak_tts_acronyms),
+    TtsTextTransform("speak_remaining_pipes", speak_remaining_pipes),
     TtsTextTransform("normalize_spacing", _normalize_spacing),
 )
 
