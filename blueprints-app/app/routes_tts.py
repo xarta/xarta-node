@@ -7,6 +7,7 @@ import mimetypes
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Request
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 
 from . import config as cfg
 from .db import get_conn, get_setting
+from .tts_sanitizer import sanitize_tts_text
 
 router = APIRouter(prefix="/tts", tags=["tts"])
 
@@ -56,10 +58,19 @@ class SpeakRequest(BaseModel):
     event_kind: str | None = None
     fallback_kind: str | None = None
     sentiment: str | None = None
+    sanitize_text: bool | None = None
+    sanitise_text: bool | None = None
+    tts_sanitize: bool | None = None
+    transform_profile: Literal["default", "speech", "none"] | None = None
 
 
 class StopRequest(BaseModel):
     client_id: str | None = None
+
+
+class SanitizeRequest(BaseModel):
+    text: str
+    transform_profile: Literal["default", "speech"] | None = None
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -168,6 +179,15 @@ def _client_key(req: Request, explicit_client_id: str | None = None) -> str:
     return f"host:{host}"
 
 
+def _should_sanitize_text(body: SpeakRequest) -> bool:
+    if body.transform_profile == "none":
+        return False
+    return any(
+        value is True
+        for value in (body.sanitize_text, body.sanitise_text, body.tts_sanitize)
+    ) or body.transform_profile in {"default", "speech"}
+
+
 async def _start_session(client_key: str, interrupt: bool) -> tuple[_ActiveSession, bool]:
     interrupted_previous = False
     async with _active_sessions_lock:
@@ -215,7 +235,9 @@ async def tts_speak(body: SpeakRequest, request: Request):
             },
         )
 
-    text = (body.text or "").strip() or settings.get("tts.default_message", "")
+    raw_text = (body.text or "").strip() or settings.get("tts.default_message", "")
+    sanitized = sanitize_tts_text(raw_text) if _should_sanitize_text(body) else None
+    text = sanitized.text if sanitized else raw_text
     voice = (body.voice or "").strip() or settings.get("tts.default_voice", "")
     req_mode = (body.mode or "").strip().lower() or settings.get("tts.default_mode", "").strip().lower()
     fmt = (body.format or "wav").strip().lower()
@@ -346,7 +368,10 @@ async def tts_speak(body: SpeakRequest, request: Request):
         "X-Blueprints-TTS-Engine": "pockettts_stream" if effective_mode == "stream" else "pockettts_batch",
         "X-Blueprints-TTS-Interrupted-Previous": "true" if interrupted_previous else "false",
         "X-Blueprints-TTS-Voice": voice,
+        "X-Blueprints-TTS-Sanitized": "true" if sanitized else "false",
     }
+    if sanitized:
+        headers["X-Blueprints-TTS-Transforms"] = ",".join(sanitized.transforms)
     upstream_ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
     if upstream_ct.startswith("audio/"):
         media_type = upstream_ct
@@ -357,6 +382,17 @@ async def tts_speak(body: SpeakRequest, request: Request):
     else:
         media_type = "application/octet-stream"
     return StreamingResponse(stream_audio(), media_type=media_type, headers=headers)
+
+
+@router.post("/sanitize")
+async def tts_sanitize(body: SanitizeRequest):
+    result = sanitize_tts_text(body.text)
+    return {
+        "ok": True,
+        "text": result.text,
+        "transforms": list(result.transforms),
+        "profile": body.transform_profile or "speech",
+    }
 
 
 @router.post("/stop")
