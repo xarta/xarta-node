@@ -68,10 +68,17 @@ def check_gui_contract(gui_root: Path) -> None:
     require("display.markdown" in docs_search_js, "Docs Search explain markdown is not rendered from display")
     require('id="docs-search-explain"' in index_html, "Docs Search Explain button missing from modal")
     require('id="docs-search-explain-panel"' in index_html, "Docs Search explain panel missing from modal")
+    require('id="docs-folder-tree-explain-sources-btn"' in index_html, "Docs tree explain sources button missing")
+    require('id="docs-folder-tree-sources-modal"' in index_html, "Docs tree explain sources modal missing")
+    require('id="docs-folder-tree-explain-sources"' in index_html, "Docs tree explain source list missing")
     require('id="docs-folder-tree-status-pill"' in index_html, "Docs tree status pill missing from modal")
     require('id="docs-folder-tree-status-modal"' in index_html, "Docs tree status modal missing")
     require("/api/v1/docs/search/status" in docs_js, "Docs tree status endpoint is not wired")
     require("_docsFolderTreeRequestSeq" in docs_js, "Docs tree modal does not guard stale async requests")
+    require("_docsFolderTreeSearchCache" in docs_js, "Docs tree search query is not cached between modal opens")
+    require("sessionStorage.setItem" in docs_js, "Docs tree search cache is not session-backed")
+    require("data-source-path" in docs_js, "Docs tree source rows are not wired to source paths")
+    require("_docsFolderTreeOpenSourceDoc" in docs_js, "Docs tree source rows do not open viewer docs")
 
 
 def check_api_contract(client: httpx.Client, query: str) -> None:
@@ -115,6 +122,9 @@ def check_api_contract(client: httpx.Client, query: str) -> None:
         isinstance(display.get("evidence_document_count"), int),
         "display.evidence_document_count is not an int",
     )
+    require(isinstance(display.get("sources"), list), "display.sources is not a list")
+    require(display.get("source_count") == len(display["sources"]), "display.source_count does not match display.sources")
+    require(display.get("source_count", 0) > 0, "display.source_count is empty for grounded explain query")
     require(display.get("content_is_grounded_evidence") is True, "display missing grounded evidence flag")
 
     status = get_json(client, "/api/v1/docs/search/status")

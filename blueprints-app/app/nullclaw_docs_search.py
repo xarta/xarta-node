@@ -29,6 +29,32 @@ _VOICE_UNSAFE_PATTERNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _normalize_index_scope_paths(paths: list[str] | None, folder: str | None = None) -> list[str]:
+    """Normalize Blueprints docs viewer paths to TurboVec's indexed docs-root paths."""
+    raw_paths = [*(paths or [])]
+    if folder:
+        raw_paths.append(folder)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        value = str(raw or "").strip().replace("\\", "/").lstrip("/")
+        if not value or value in {".", ".."}:
+            continue
+        if value == "docs" or value.startswith("docs/"):
+            value = value.removeprefix("docs").lstrip("/")
+            if not value:
+                continue
+        parts = value.rstrip("/").split("/")
+        if any(part in {"", ".", ".."} or part.startswith(".") for part in parts):
+            continue
+        if not value.endswith(".md") and not value.endswith("/"):
+            value = f"{value.rstrip('/')}/"
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
+
+
 class SynthesisControls(BaseModel):
     """Blueprints request controls mapped onto the stack-local task contract."""
 
@@ -58,6 +84,8 @@ class SynthesisControls(BaseModel):
 
 
 def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -> dict[str, Any]:
+    allowed_paths = _normalize_index_scope_paths(body.allowed_paths, body.folder)
+    folder = allowed_paths[0] if allowed_paths else None
     return {
         "query": body.query,
         "mode": mode,
@@ -76,8 +104,8 @@ def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -
         "max_graph_hops": body.max_graph_hops,
         "max_graph_docs": body.max_graph_docs,
         "group_id": body.group_id,
-        "folder": body.folder,
-        "allowed_paths": body.allowed_paths,
+        "folder": folder,
+        "allowed_paths": allowed_paths,
         "current_only": body.current_only,
         "include_plans": body.include_plans,
         "include_research": body.include_research,
@@ -323,6 +351,38 @@ def synthesis_display_block(response: dict[str, Any]) -> dict[str, Any]:
     answer = _strip_opening_greeting(str(response.get("answer") or "").strip())
     sources = response.get("sources") if isinstance(response.get("sources"), list) else []
     evidence = response.get("evidence") if isinstance(response.get("evidence"), dict) else {}
+    evidence_document_count = int(evidence.get("document_count") or 0)
+    has_grounded_evidence = bool(sources) and evidence_document_count > 0
+    source_items = [
+        {
+            "label": str(source.get("citation_label") or f"[S{index}]"),
+            "path": str(source.get("path") or ""),
+            "title": str(source.get("title") or source.get("path") or ""),
+            "lifecycle": str(source.get("lifecycle") or "unknown"),
+            "source_type": str(source.get("source_type") or "unknown"),
+            "authority": str(source.get("authority") or "unknown"),
+            "fetched": bool(source.get("fetched")),
+            "retrieval_stage": str(source.get("retrieval_stage") or "search"),
+        }
+        for index, source in enumerate(sources, start=1)
+        if isinstance(source, dict)
+    ]
+    if not has_grounded_evidence:
+        warning_lines = []
+        for item in response.get("warnings") or []:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message") or item.get("code") or "").strip()
+            if message:
+                warning_lines.append(f"- {message}")
+        answer = "\n".join(
+            [
+                "No scoped evidence was returned for this explanation request.",
+                "",
+                "The model response was withheld from the display because it was not grounded in fetched source documents.",
+                *(["", "Retrieval notes:", *warning_lines[:6]] if warning_lines else []),
+            ]
+        )
     summary = _plain_voice_text(answer)
     if len(summary) > 260:
         summary = _clamp_voice_text(summary, 260)
@@ -333,6 +393,7 @@ def synthesis_display_block(response: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "markdown": answer,
         "source_count": len(sources),
-        "evidence_document_count": evidence.get("document_count", 0),
-        "content_is_grounded_evidence": True,
+        "evidence_document_count": evidence_document_count,
+        "sources": source_items,
+        "content_is_grounded_evidence": has_grounded_evidence,
     }
