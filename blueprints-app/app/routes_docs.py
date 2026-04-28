@@ -219,6 +219,10 @@ def _docs_search_allowed_paths(folder: str | None, allowed_paths: list[str] | No
         value = str(raw or "").strip().replace("\\", "/").lstrip("/")
         if not value or value in {".", ".."}:
             continue
+        if value == "docs" or value.startswith("docs/"):
+            value = value.removeprefix("docs").lstrip("/")
+            if not value:
+                continue
         parts = Path(value).parts
         if any(part in {"", ".", ".."} or part.startswith(".") for part in parts):
             continue
@@ -333,6 +337,57 @@ def _registered_docs_tree_lookup() -> dict[str, dict[str, Any]]:
             "group_id": row["group_id"] if "group_id" in row.keys() else None,
         }
     return by_path
+
+
+def _count_docs_files(root: Path) -> int:
+    docs_root = root / "docs" if (root / "docs").is_dir() else root
+    count = 0
+    for path in docs_root.rglob("*.md"):
+        try:
+            rel_parts = path.relative_to(docs_root).parts
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in rel_parts[:-1]):
+            continue
+        count += 1
+    return count
+
+
+async def _docs_status_get_json(client: httpx.AsyncClient, url: str) -> tuple[bool, dict[str, Any] | None, str | None]:
+    try:
+        resp = await client.get(url)
+        if resp.status_code >= 400:
+            return False, None, f"HTTP {resp.status_code}"
+        data = resp.json()
+    except httpx.TimeoutException:
+        return False, None, "timeout"
+    except httpx.RequestError as exc:
+        return False, None, str(exc)
+    except ValueError:
+        return False, None, "invalid JSON"
+    if not isinstance(data, dict):
+        return False, None, "non-object response"
+    return True, data, None
+
+
+def _docs_status_check(
+    name: str,
+    label: str,
+    ok: bool,
+    detail: str,
+    *,
+    critical: bool = False,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "label": label,
+        "ok": bool(ok),
+        "status": "ok" if ok else ("fail" if critical else "warn"),
+        "critical": bool(critical),
+        "detail": detail,
+        "meta": meta or {},
+    }
 
 
 def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -581,6 +636,167 @@ async def sync_docs_search_index(body: DocsSearchSyncBody | None = None) -> dict
         "ok": bool(data.get("ok", True)) if isinstance(data, dict) else True,
         "force": body.force,
         "upstream": data,
+    }
+
+
+@router.get("/search/status", response_model=dict)
+async def docs_search_status() -> dict[str, Any]:
+    """Return compact health and corpus metadata for the docs search dashboard."""
+    root = _docs_root()
+    with get_conn() as conn:
+        registered_docs = conn.execute("SELECT COUNT(*) AS n FROM docs").fetchone()["n"]
+        doc_groups = conn.execute("SELECT COUNT(*) AS n FROM doc_groups").fetchone()["n"]
+
+    on_disk_markdown = _count_docs_files(root)
+    checks: list[dict[str, Any]] = [
+        _docs_status_check(
+            "blueprints_docs",
+            "Blueprints Docs",
+            root.exists() and registered_docs > 0,
+            f"{registered_docs} registered docs; {on_disk_markdown} Markdown files on disk",
+            critical=True,
+            meta={
+                "docs_root": str(root),
+                "registered_docs": registered_docs,
+                "on_disk_markdown": on_disk_markdown,
+                "doc_groups": doc_groups,
+            },
+        )
+    ]
+
+    turbovec_base = cfg.TURBOVEC_DOCS_URL.rstrip("/")
+    nullclaw_base = cfg.NULLCLAW_DOCS_SEARCH_URL.rstrip("/")
+    turbovec_health: dict[str, Any] = {}
+    turbovec_stats: dict[str, Any] = {}
+    nullclaw_health: dict[str, Any] = {}
+
+    timeout = httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, cfg.NULLCLAW_DOCS_SEARCH_TIMEOUT, 12.0))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        tv_ok, tv_data, tv_err = await _docs_status_get_json(client, f"{turbovec_base}/health") if turbovec_base else (False, None, "not configured")
+        if tv_data:
+            turbovec_health = tv_data
+        checks.append(
+            _docs_status_check(
+                "turbovec_docs",
+                "TurboVec Docs",
+                tv_ok and bool((tv_data or {}).get("ok")) and bool((tv_data or {}).get("index_exists")),
+                (
+                    f"{(tv_data or {}).get('documents', 0)} docs; {(tv_data or {}).get('chunks', 0)} chunks"
+                    if tv_data else f"Unavailable: {tv_err}"
+                ),
+                critical=True,
+                meta=tv_data or {"error": tv_err},
+            )
+        )
+
+        stats_ok, stats_data, stats_err = await _docs_status_get_json(client, f"{turbovec_base}/stats") if turbovec_base else (False, None, "not configured")
+        if stats_data:
+            turbovec_stats = stats_data
+        graph = (stats_data or {}).get("graph") if isinstance(stats_data, dict) else {}
+        graph_ok = stats_ok and isinstance(graph, dict) and int(graph.get("nodes") or 0) > 0 and int(graph.get("edges") or 0) > 0
+        checks.append(
+            _docs_status_check(
+                "graph_sidecar",
+                "Docs Graph",
+                graph_ok,
+                (
+                    f"{int((graph or {}).get('nodes') or 0)} nodes; "
+                    f"{int((graph or {}).get('edges') or 0)} edges; "
+                    f"{int((graph or {}).get('headings') or 0)} headings"
+                    if stats_ok else f"Stats unavailable: {stats_err}"
+                ),
+                meta=graph if isinstance(graph, dict) else {"error": stats_err},
+            )
+        )
+
+        nc_ok, nc_data, nc_err = await _docs_status_get_json(client, f"{nullclaw_base}/health") if nullclaw_base else (False, None, "not configured")
+        if nc_data:
+            nullclaw_health = nc_data
+        checks.append(
+            _docs_status_check(
+                "nullclaw_docs_search",
+                "Synthesis Worker",
+                nc_ok and bool((nc_data or {}).get("ok")) and bool((nc_data or {}).get("ready")),
+                (
+                    f"{(nc_data or {}).get('task_count', 0)} stored tasks; worker ready"
+                    if nc_data else f"Unavailable: {nc_err}"
+                ),
+                critical=True,
+                meta=nc_data or {"error": nc_err},
+            )
+        )
+
+    deps = nullclaw_health.get("dependencies") if isinstance(nullclaw_health.get("dependencies"), dict) else {}
+    local_ai = deps.get("local_ai") if isinstance(deps.get("local_ai"), dict) else {}
+    checks.append(
+        _docs_status_check(
+            "local_ai",
+            "Local AI",
+            bool(local_ai.get("ok")),
+            (
+                f"{local_ai.get('model') or 'configured model'} via {local_ai.get('base_url') or 'local endpoint'}"
+                if local_ai else "No local AI health result from synthesis worker"
+            ),
+            critical=True,
+            meta=local_ai or {},
+        )
+    )
+
+    lifecycle_counts = turbovec_stats.get("lifecycle_counts") if isinstance(turbovec_stats.get("lifecycle_counts"), list) else []
+    unknown_lifecycle = sum(
+        int(row.get("n") or 0)
+        for row in lifecycle_counts
+        if isinstance(row, dict)
+        and str(row.get("lifecycle") or "unknown") == "unknown"
+        and str(row.get("source_type") or "unknown") == "unknown"
+    )
+    checks.append(
+        _docs_status_check(
+            "metadata_coverage",
+            "Metadata Coverage",
+            unknown_lifecycle == 0,
+            (
+                "All indexed docs have lifecycle/source metadata"
+                if unknown_lifecycle == 0
+                else f"{unknown_lifecycle} indexed docs still have unknown lifecycle/source metadata"
+            ),
+            meta={"unknown_lifecycle_source_docs": unknown_lifecycle},
+        )
+    )
+
+    has_critical_failure = any(check["critical"] and not check["ok"] for check in checks)
+    has_warning = any(not check["critical"] and not check["ok"] for check in checks)
+    status = "red" if has_critical_failure else ("amber" if has_warning else "green")
+    graph = turbovec_stats.get("graph") if isinstance(turbovec_stats.get("graph"), dict) else {}
+    metrics = {
+        "registered_docs": registered_docs,
+        "on_disk_markdown": on_disk_markdown,
+        "doc_groups": doc_groups,
+        "turbovec_documents": turbovec_health.get("documents"),
+        "turbovec_chunks": turbovec_health.get("chunks"),
+        "graph_nodes": graph.get("nodes"),
+        "graph_edges": graph.get("edges"),
+        "graph_headings": graph.get("headings"),
+        "unknown_lifecycle_source_docs": unknown_lifecycle,
+        "nullclaw_task_count": nullclaw_health.get("task_count"),
+    }
+    return {
+        "ok": status != "red",
+        "status": status,
+        "summary": {
+            "green": "Docs search is healthy.",
+            "amber": "Docs search is usable, with non-critical warnings.",
+            "red": "Docs search has a critical failure.",
+        }[status],
+        "metrics": metrics,
+        "checks": checks,
+        "upstream": {
+            "turbovec_docs": {
+                "health": turbovec_health,
+                "stats": turbovec_stats,
+            },
+            "nullclaw_docs_search": nullclaw_health,
+        },
     }
 
 
