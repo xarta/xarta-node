@@ -38,14 +38,14 @@ _FILE_EXTENSION_SPEECH: tuple[tuple[str, str], ...] = (
     ("cjs", "dot see jay ess"),
     ("css", "dot see ess ess"),
     ("csv", "dot see ess vee"),
-    ("env", "dot ee enn vee"),
-    ("gif", "dot gee eye eff"),
-    ("htm", "dot H tee em ell"),
-    ("html", "dot H tee em ell"),
+    ("env", "dot ee en vee"),
+    ("gif", "dot gif"),
+    ("htm", "dot HTML"),
+    ("html", "dot HTML"),
     ("jpeg", "dot jay peg"),
     ("jpg", "dot jay peg"),
     ("js", "dot jay ess"),
-    ("json", "dot jay son"),
+    ("json", "dot Jason"),
     ("jsx", "dot jay ess ex"),
     ("md", "dot em dee"),
     ("mjs", "dot em jay ess"),
@@ -76,14 +76,45 @@ _BARE_FILE_EXTENSION_RE = re.compile(
     + r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_IP_ADDRESS_RE = re.compile(
+    r"\b(?P<ip>(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?::(?P<port>\d{1,5}))?\b"
+)
+_THINK_PAIR_RE = re.compile(r"<think>\s*</think>", re.IGNORECASE)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+_ETH_PORT_RE = re.compile(r"\beth(?P<number>\d+)\b", re.IGNORECASE)
+_PVE_NODE_RE = re.compile(r"\bpve(?P<number>\d+)\b", re.IGNORECASE)
+_OOM_RE = re.compile(r"\boom(?:\s+error)?\b", re.IGNORECASE)
+_LITELLM_CLIENT_CHAT_RE = re.compile(r"\bLLMClient\.chat\b", re.IGNORECASE)
+_PARENT_DIR_RE = re.compile(r"\.\./")
+_COLON_SPEECH_RE = re.compile(r"(?<![A-Za-z0-9]):|:(?!\s)")
+_SECRET_CONTEXT_LABEL_PATTERN = (
+    r"password|passwd|pwd|secret|token|api[_\s-]?key|private[_\s-]?key|credential|"
+    r"virtual[_\s-]?key|master[_\s-]?key|x-api-key|authorization|bearer"
+)
+_OPENAI_STYLE_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{16,}\b")
+_SPOKEN_OPENAI_STYLE_SECRET_RE = re.compile(r"\bsk\s+[A-Za-z0-9][A-Za-z0-9_-]{16,}\b", re.IGNORECASE)
+_CONTEXTUAL_SECRET_VALUE_RE = re.compile(
+    rf"\b(?P<label>{_SECRET_CONTEXT_LABEL_PATTERN})\b"
+    r"(?P<middle>[^.\n]{0,180}?\b(?:is|=|:|Bearer)\s+[`'\"]?)"
+    r"(?P<value>(?:sk[-\s]+)?[A-Za-z0-9][A-Za-z0-9_+=.-]{15,})",
+    re.IGNORECASE,
+)
+_BEARER_SECRET_RE = re.compile(
+    r"\b(?P<prefix>Bearer\s+)(?P<value>(?:sk[-\s]+)?[A-Za-z0-9][A-Za-z0-9_+=.-]{15,})",
+    re.IGNORECASE,
+)
+_X_API_KEY_SECRET_RE = re.compile(
+    r"\b(?P<prefix>X-API-Key\s*:\s*)(?P<value>[A-Za-z0-9][A-Za-z0-9_+=.-]{15,})",
+    re.IGNORECASE,
+)
 _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("CI/CD", "see eye, see dee"),
     ("SQLite", "sequel lite"),
     ("pfSense", "pee eff sense"),
     ("IPv4", "eye pee vee four"),
     ("IPv6", "eye pee vee six"),
-    ("mTLS", "em tee ell ess"),
-    ("VMID", "vee em eye dee"),
+    ("mTLS", "mTLS"),
+    ("VMID", "Virtual Machine eye dee"),
     ("VLAN", "vee lan"),
     ("VXLAN", "vee ex lan"),
     ("WLAN", "double you lan"),
@@ -105,16 +136,16 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("HTTP", "aitch tee tee pee"),
     ("HTTPS", "aitch tee tee pee ess"),
     ("SSH", "ess ess aitch"),
-    ("SSL", "ess ess ell"),
-    ("TLS", "tee ell ess"),
-    ("URL", "you are ell"),
+    ("SSL", "SSL"),
+    ("TLS", "TLS"),
+    ("URL", "url"),
     ("URI", "you are eye"),
     ("API", "A pee eye"),
     ("REST", "rest"),
-    ("JSON", "jay son"),
+    ("JSON", "Jason"),
     ("YAML", "yammel"),
-    ("XML", "ex em ell"),
-    ("HTML", "H tee em ell"),
+    ("XML", "XML"),
+    ("HTML", "HTML"),
     ("CSS", "see ess ess"),
     ("SVG", "ess vee gee"),
     ("PNG", "pee enn gee"),
@@ -124,28 +155,31 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("PDF", "pee dee eff"),
     ("CSV", "see ess vee"),
     ("IIFE", "eye eye eff ee"),
+    ("RTX", "are tee ex"),
     ("JS", "JavaScript"),
     ("TS", "tee ess"),
     ("DOM", "dom"),
     ("PWA", "pee double you ay"),
     ("UI", "you eye"),
     ("UX", "you ex"),
-    ("GUI", "gooey"),
-    ("CLI", "see ell eye"),
+    ("GUI", "goo ee"),
+    ("CLI", "CLI"),
     ("IDE", "eye dee ee"),
     ("SDK", "ess dee kay"),
+    ("MCP", "em see pee"),
     ("CI", "see eye"),
     ("CD", "see dee"),
     ("DB", "dee bee"),
     ("SQL", "sequel"),
     ("ORM", "oh are em"),
     ("CRUD", "crud"),
-    ("AI", "ay eye"),
-    ("LLM", "ell ell em"),
-    ("ML", "em ell"),
-    ("NLP", "enn ell pee"),
+    ("AI", "A eye"),
+    ("LLM", "L.L.M"),
+    ("ML", "ML"),
+    ("NLP", "NLP"),
     ("RAG", "rag"),
     ("TTS", "tee tee ess"),
+    ("TOTP", "tee oh tee pee"),
     ("STT", "ess tee tee"),
     ("ASR", "ay ess are"),
     ("OCR", "oh see are"),
@@ -154,7 +188,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("RAM", "ram"),
     ("ROM", "rom"),
     ("ECC", "ee see see"),
-    ("LED", "ell ee dee"),
+    ("LED", "LED"),
     ("OLED", "oh led"),
     ("HDMI", "aitch dee em eye"),
     ("USB", "you ess bee"),
@@ -169,12 +203,12 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("NFS", "enn eff ess"),
     ("SMB", "ess em bee"),
     ("ZFS", "zee eff ess"),
-    ("LVM", "ell vee em"),
+    ("LVM", "LVM"),
     ("VM", "vee em"),
     ("KVM", "kay vee em"),
     ("QEMU", "queue em you"),
-    ("LXC", "ell ex sea"),
-    ("PVE", "pee vee ee"),
+    ("LXC", "LXC"),
+    ("PVE", "PVE"),
     ("VPS", "vee pee ess"),
     ("OS", "oh ess"),
     ("UID", "you eye dee"),
@@ -184,8 +218,71 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("OK", "okay"),
 )
 _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
+    (r"\bfleet\s+CA\b", "fleet Certificate Authority"),
+    (r"\bpublic\s+CA\b", "public certificate authority"),
+    (r"\bLiteLLM\b", "light L.L.M"),
+    (r"\bpostgres\b", "post gress"),
+    (r"\bbyok\b", "Bring Your Own Key"),
+    (r"\bz\.ai\b", "zed A eye"),
+    (r"\bzai\b", "zed A eye"),
+    (r"\bseekdb\b", "seek dee bee"),
+    (r"\bcerts\b", "certificates"),
+    (r"\bdockge\b", "Dockage"),
+    (r"\bxmemory\b", "ex memory"),
+    (r"\bpipecat\b", "pipe cat"),
+    (r"\blivecat\b", "live cat"),
+    (r"\bvllm\b", "V L.L.M"),
+    (r"\bmoe\b", "Mixture of Experts"),
+    (r"\bopenclaw\b", "open claw"),
+    (r"\bnullclaw\b", "null claw"),
+    (r"\bpockettts\b", "pocket TTS"),
+    (r"\bplaywright\b", "play wright"),
+    (r"\bwebsocket\b", "web socket"),
+    (r"\bclonedrepos\b", "cloned repos"),
+    (r"\blocalstorage\b", "local storage"),
+    (r"\bsessionstorage\b", "session storage"),
+    (r"\bvscodium\b", "vee ess code ee um"),
+    (r"\bvscode\b", "vee ess code"),
+    (r"\bturbovec\b", "turbo veck"),
+    (r"\btailscale\b", "tail scale"),
+    (r"\btaliscale\b", "tail scale"),
+    (r"\bcrawl4ai\b", "crawl for A eye"),
+    (r"\bchtp01\b", "chat private zero one"),
+    (r"\bliteparse\b", "light parse"),
+    (r"\bmarkitdown\b", "mark it down"),
+    (r"\bscrapling\b", "scrape ling"),
+    (r"\bsearxng\b", "seer ex next generation"),
+    (r"\bvikunja\b", "vee coon ee yah"),
     (r"\btextareas\b", "text areas"),
     (r"\btextarea\b", "text area"),
+    (r"(?<!\.)\benv\b", "dot ee en vee"),
+)
+_LEGACY_LETTER_NAME_SPEECH: tuple[tuple[str, str], ...] = (
+    (r"\blight\s*L\.L\.M\b", "light L.L.M"),
+    (r"\blite\.L\.M\b", "light L.L.M"),
+    (r"\blight\.LM\b", "light L.L.M"),
+    (r"\blight\s+dot\s+l\s+dot\s+m\b", "light L.L.M"),
+    (r"\blight\s+ell\s+ell\s+em\b", "light L.L.M"),
+    (r"\blight\s+LLM\b", "light L.L.M"),
+    (r"\bvee\s+ell\s+ell\s+em\b", "V L.L.M"),
+    (r"\bV\s+LLM\b", "V L.L.M"),
+    (r"\bL\s+dot\s+L\s+dot\s+M\b", "L.L.M"),
+    (r"\bell\s+ell\s+em\b", "L.L.M"),
+    (r"\bLLM\b", "L.L.M"),
+    (r"\bLM\b", "L.L.M"),
+    (r"\bPVee(\d+)\b", r"PVE\1"),
+    (r"\bpee\s+vee\s+ee\s+(\d+)\b", r"PVE\1"),
+    (r"\bH\s+tee\s+em\s+ell\b", "HTML"),
+    (r"\bex\s+em\s+ell\b", "XML"),
+    (r"\bem\s+tee\s+ell\s+ess\b", "mTLS"),
+    (r"\btee\s+ell\s+ess\b", "TLS"),
+    (r"\bess\s+ess\s+ell\b", "SSL"),
+    (r"\bsee\s+ell\s+eye\b", "CLI"),
+    (r"\bem\s+ell\b", "ML"),
+    (r"\benn\s+ell\s+pee\b", "NLP"),
+    (r"\bell\s+ee\s+dee\b", "LED"),
+    (r"\bell\s+vee\s+em\b", "LVM"),
+    (r"\bell\s+ex\s+sea\b", "LXC"),
 )
 
 
@@ -221,10 +318,38 @@ def strip_top_backlink_line(text: str) -> str:
 
 def _strip_source_refs(text: str) -> str:
     text = _SOURCE_REF_RE.sub("", text)
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"\s+([,;!?])", r"\1", text)
     text = re.sub(r"([([])\s+", r"\1", text)
     text = re.sub(r"\s+([])])", r"\1", text)
     return text
+
+
+def redact_tts_secret_material(text: str) -> str:
+    """Remove secret-looking values before narration text can be cached or spoken."""
+
+    def redacted_value(value: str) -> str:
+        trailing = ""
+        clean = str(value or "")
+        while clean and clean[-1] in ".,;:!?":
+            trailing = clean[-1] + trailing
+            clean = clean[:-1]
+        return f"redacted key{trailing}"
+
+    def redact_contextual(match: re.Match[str]) -> str:
+        return f"{match.group('label')}{match.group('middle')}{redacted_value(match.group('value'))}"
+
+    projected = str(text or "")
+    projected = _OPENAI_STYLE_SECRET_RE.sub("redacted key", projected)
+    projected = _X_API_KEY_SECRET_RE.sub(lambda match: f"{match.group('prefix')}{redacted_value(match.group('value'))}", projected)
+    projected = _BEARER_SECRET_RE.sub(lambda match: f"{match.group('prefix')}{redacted_value(match.group('value'))}", projected)
+    projected = _CONTEXTUAL_SECRET_VALUE_RE.sub(redact_contextual, projected)
+
+    lines: list[str] = []
+    for line in projected.split("\n"):
+        if re.search(_SECRET_CONTEXT_LABEL_PATTERN, line, flags=re.IGNORECASE):
+            line = _SPOKEN_OPENAI_STYLE_SECRET_RE.sub("redacted key", line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _clean_heading_text(value: str) -> str:
@@ -445,6 +570,42 @@ def _speak_known_attribute_names(text: str) -> str:
     return text
 
 
+def _speak_ip_address(match: re.Match[str]) -> str:
+    ip = match.group("ip")
+    port = match.group("port")
+    spoken = " dot ".join(ip.split("."))
+    if port:
+        spoken = f"{spoken} colon {port}"
+    return spoken
+
+
+def speak_tts_compound_tokens(text: str) -> str:
+    spoken = str(text or "")
+    spoken = _THINK_PAIR_RE.sub("think tags", spoken)
+    spoken = _THINK_TAG_RE.sub("think tag", spoken)
+    spoken = re.sub(r"\.\.\.", " ellipses ", spoken)
+    spoken = re.sub(r"https?://", " url ", spoken, flags=re.IGNORECASE)
+    spoken = _IP_ADDRESS_RE.sub(_speak_ip_address, spoken)
+    spoken = _LITELLM_CLIENT_CHAT_RE.sub("L.L.M client dot chat", spoken)
+    spoken = re.sub(r"-cli\b", " CLI", spoken, flags=re.IGNORECASE)
+    spoken = _PARENT_DIR_RE.sub("parent of ", spoken)
+    spoken = re.sub(r"(?<![A-Za-z0-9])\.claude\b", "dot claude", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"(?<![A-Za-z0-9])\.env\b", "dot ee en vee", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"(?<![A-Za-z0-9])\.gitignored\b", "dot git ignored", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"\bgitignored\b", "dot git ignored", spoken, flags=re.IGNORECASE)
+    spoken = _ETH_PORT_RE.sub(lambda match: f"network port eff {match.group('number')}", spoken)
+    spoken = _PVE_NODE_RE.sub(lambda match: f"PVE{match.group('number')}", spoken)
+    spoken = _OOM_RE.sub("Out Of Memory Error", spoken)
+    return spoken
+
+
+def speak_legacy_letter_names(text: str) -> str:
+    spoken = str(text or "")
+    for pattern, replacement in _LEGACY_LETTER_NAME_SPEECH:
+        spoken = re.sub(pattern, replacement, spoken, flags=re.IGNORECASE)
+    return spoken
+
+
 def speak_tts_known_terms(text: str) -> str:
     spoken = str(text or "")
     for pattern, replacement in _KNOWN_TERM_SPEECH:
@@ -510,17 +671,20 @@ def speak_tts_acronyms(text: str) -> str:
             spoken,
             flags=re.IGNORECASE,
         )
-    return spoken
+    return re.sub(r"\bPVE\s+(?=\d)", "PVE", spoken)
 
 
 def prepare_tts_markdown_for_llm(markdown: str) -> str:
-    text = _normalize_newlines(markdown)
+    text = redact_tts_secret_material(_normalize_newlines(markdown))
 
     def project(segment: str) -> str:
         segment = _INLINE_CODE_RE.sub(lambda match: _speak_inline_code_token(match.group(1)), segment)
         segment = _speak_known_attribute_names(segment)
+        segment = speak_tts_compound_tokens(segment)
+        segment = speak_legacy_letter_names(segment)
         segment = speak_tts_known_terms(segment)
         segment = speak_tts_file_extensions(segment)
+        segment = speak_legacy_letter_names(segment)
         segment = speak_tts_identifiers(segment)
         return speak_tts_acronyms(segment)
 
@@ -538,6 +702,16 @@ def speak_remaining_pipes(text: str) -> str:
     return re.sub(r"\s*\|\s*", " or ", str(text or ""))
 
 
+def speak_tts_punctuation(text: str) -> str:
+    spoken = str(text or "")
+    spoken = spoken.replace("@", " at ")
+    spoken = spoken.replace("\\", " back slash ")
+    spoken = spoken.replace("//", " slash slash ")
+    spoken = spoken.replace("/", " slash ")
+    spoken = _COLON_SPEECH_RE.sub(" colon ", spoken)
+    return spoken
+
+
 def strip_markdown_list_markers(text: str) -> str:
     return _LIST_MARKER_RE.sub("", str(text or ""))
 
@@ -546,6 +720,7 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("normalize_newlines", _normalize_newlines),
     TtsTextTransform("strip_top_backlink_line", strip_top_backlink_line),
     TtsTextTransform("strip_source_refs", _strip_source_refs),
+    TtsTextTransform("redact_tts_secret_material", redact_tts_secret_material),
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
     TtsTextTransform("summarize_fenced_code_blocks", summarize_fenced_code_blocks),
     TtsTextTransform("summarize_markdown_tables", summarize_markdown_tables),
@@ -554,11 +729,16 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
     TtsTextTransform("strip_markdown_list_markers", strip_markdown_list_markers),
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
+    TtsTextTransform("speak_tts_compound_tokens", speak_tts_compound_tokens),
+    TtsTextTransform("speak_legacy_letter_names", speak_legacy_letter_names),
     TtsTextTransform("speak_tts_known_terms", speak_tts_known_terms),
     TtsTextTransform("speak_tts_file_extensions", speak_tts_file_extensions),
+    TtsTextTransform("speak_legacy_letter_names_after_file_extensions", speak_legacy_letter_names),
     TtsTextTransform("speak_tts_identifiers", speak_tts_identifiers),
     TtsTextTransform("speak_tts_acronyms", speak_tts_acronyms),
+    TtsTextTransform("redact_tts_secret_material", redact_tts_secret_material),
     TtsTextTransform("speak_remaining_pipes", speak_remaining_pipes),
+    TtsTextTransform("speak_tts_punctuation", speak_tts_punctuation),
     TtsTextTransform("normalize_spacing", _normalize_spacing),
 )
 
