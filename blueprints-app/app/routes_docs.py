@@ -8,10 +8,12 @@ PUT    /api/v1/docs/{doc_id}/content     → overwrite file content + touch upda
 DELETE /api/v1/docs/{doc_id}            → delete record; ?delete_file=true also removes the file
 """
 
+import json
 import logging
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import uuid
 from collections import Counter
@@ -41,6 +43,24 @@ router = APIRouter(prefix="/docs", tags=["docs"])
 
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _DOCS_SENTINEL = _NODE_LOCAL_ROOT / ".docs-pending-commit"
+_DEFAULT_TURBOVEC_DB_PATH = (
+    _NODE_LOCAL_ROOT / "stacks" / "turbovec-docs" / "data" / "index" / "chunks.sqlite3"
+)
+_DEFAULT_NULLCLAW_TASKS_DIR = (
+    _NODE_LOCAL_ROOT / "stacks" / "nullclaw-docs-search" / "data" / "tasks"
+)
+_METADATA_BACKLOG_LIMIT = 40
+_PATH_LIKE_KEYS = {
+    "path",
+    "doc_path",
+    "viewer_path",
+    "register_path",
+    "expanded_path",
+    "seed_path",
+    "from_path",
+    "to_path",
+    "graph_from_path",
+}
 
 
 class DocsSearchBody(BaseModel):
@@ -89,7 +109,9 @@ def _touch_docs_sentinel() -> None:
 def _docs_root() -> Path:
     root = cfg.DOCS_ROOT or cfg.REPO_INNER_PATH
     if not root:
-        raise HTTPException(503, "DOCS_ROOT (or REPO_INNER_PATH) not configured — cannot locate docs")
+        raise HTTPException(
+            503, "DOCS_ROOT (or REPO_INNER_PATH) not configured — cannot locate docs"
+        )
     return Path(root)
 
 
@@ -353,7 +375,9 @@ def _count_docs_files(root: Path) -> int:
     return count
 
 
-async def _docs_status_get_json(client: httpx.AsyncClient, url: str) -> tuple[bool, dict[str, Any] | None, str | None]:
+async def _docs_status_get_json(
+    client: httpx.AsyncClient, url: str
+) -> tuple[bool, dict[str, Any] | None, str | None]:
     try:
         resp = await client.get(url)
         if resp.status_code >= 400:
@@ -370,7 +394,9 @@ async def _docs_status_get_json(client: httpx.AsyncClient, url: str) -> tuple[bo
     return True, data, None
 
 
-async def _docs_status_model_ids(client: httpx.AsyncClient, base_url: str | None) -> tuple[bool, set[str], str | None]:
+async def _docs_status_model_ids(
+    client: httpx.AsyncClient, base_url: str | None
+) -> tuple[bool, set[str], str | None]:
     if not base_url:
         return False, set(), "not configured"
     headers: dict[str, str] = {}
@@ -389,11 +415,7 @@ async def _docs_status_model_ids(client: httpx.AsyncClient, base_url: str | None
     except ValueError:
         return False, set(), "invalid JSON"
     models = data.get("data") if isinstance(data, dict) else []
-    ids = {
-        str(item.get("id"))
-        for item in models
-        if isinstance(item, dict) and item.get("id")
-    }
+    ids = {str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")}
     if not ids:
         return False, set(), "empty model list"
     return True, ids, None
@@ -416,6 +438,234 @@ def _docs_status_check(
         "critical": bool(critical),
         "detail": detail,
         "meta": meta or {},
+    }
+
+
+def _traffic_status(has_critical_failure: bool, has_warning: bool) -> str:
+    if has_critical_failure:
+        return "red"
+    if has_warning:
+        return "amber"
+    return "green"
+
+
+def _traffic_summary(status: str, *, subject: str) -> str:
+    summaries = {
+        "health": {
+            "green": "Docs search runtime is healthy.",
+            "amber": "Docs search runtime is usable, with non-critical warnings.",
+            "red": "Docs search runtime has a critical failure.",
+        },
+        "quality": {
+            "green": "Docs corpus quality is healthy.",
+            "amber": "Docs corpus quality has review backlog.",
+            "red": "Docs corpus quality could not be assessed.",
+        },
+    }
+    return summaries.get(subject, summaries["health"]).get(status, "Status unknown.")
+
+
+def _normalize_index_doc_path(path: str | None) -> str:
+    value = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if value == "docs" or value.startswith("docs/"):
+        value = value.removeprefix("docs").lstrip("/")
+    return value.strip("/")
+
+
+def _turbovec_db_path() -> Path:
+    configured = os.environ.get("TURBOVEC_DOCS_DB_PATH", "").strip()
+    return Path(configured) if configured else _DEFAULT_TURBOVEC_DB_PATH
+
+
+def _nullclaw_tasks_dir() -> Path:
+    configured = os.environ.get("NULLCLAW_DOCS_SEARCH_TASKS_DIR", "").strip()
+    return Path(configured) if configured else _DEFAULT_NULLCLAW_TASKS_DIR
+
+
+def _collect_known_doc_paths(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT DISTINCT doc_path FROM doc_lifecycle").fetchall()
+    return {path for row in rows if (path := _normalize_index_doc_path(row["doc_path"]))}
+
+
+def _collect_paths_from_json(value: Any, known_paths: set[str], found: set[str]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in _PATH_LIKE_KEYS and isinstance(child, str):
+                path = _normalize_index_doc_path(child)
+                if path in known_paths:
+                    found.add(path)
+            else:
+                _collect_paths_from_json(child, known_paths, found)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_paths_from_json(child, known_paths, found)
+
+
+def _retrieval_counts_from_tasks(
+    tasks_dir: Path, known_paths: set[str]
+) -> tuple[Counter[str], dict[str, Any]]:
+    counts: Counter[str] = Counter()
+    scanned = 0
+    unreadable = 0
+    if not tasks_dir.is_dir():
+        return counts, {"tasks_dir": str(tasks_dir), "scanned_tasks": 0, "unreadable_tasks": 0}
+    for path in sorted(tasks_dir.glob("task_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            unreadable += 1
+            continue
+        scanned += 1
+        found: set[str] = set()
+        _collect_paths_from_json(
+            data.get("result") if isinstance(data, dict) else data, known_paths, found
+        )
+        for doc_path in found:
+            counts[doc_path] += 1
+    return counts, {
+        "tasks_dir": str(tasks_dir),
+        "scanned_tasks": scanned,
+        "unreadable_tasks": unreadable,
+    }
+
+
+def _metadata_backlog_report(limit: int = _METADATA_BACKLOG_LIMIT) -> dict[str, Any]:
+    db_path = _turbovec_db_path()
+    if not db_path.is_file():
+        return {
+            "ok": False,
+            "status": "red",
+            "summary": "TurboVec metadata database is unavailable.",
+            "metrics": {"unknown_lifecycle_source_docs": None},
+            "items": [],
+            "error": f"not found: {db_path}",
+        }
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        known_paths = _collect_known_doc_paths(conn)
+        retrieval_counts, retrieval_meta = _retrieval_counts_from_tasks(
+            _nullclaw_tasks_dir(), known_paths
+        )
+        folder_rows = conn.execute(
+            """
+            SELECT substr(doc_path, 1, instr(doc_path || '/', '/') - 1) AS folder,
+                   COUNT(DISTINCT doc_path) AS docs,
+                   COUNT(*) AS chunks
+            FROM chunks
+            GROUP BY folder
+            ORDER BY chunks DESC, folder ASC
+            """
+        ).fetchall()
+        folder_count = max(len(folder_rows), 1)
+        folder_importance = {
+            row["folder"]: {
+                "rank": index + 1,
+                "score": folder_count - index,
+                "docs": int(row["docs"] or 0),
+                "chunks": int(row["chunks"] or 0),
+            }
+            for index, row in enumerate(folder_rows)
+        }
+        inbound_rows = conn.execute(
+            """
+            SELECT to_path AS doc_path, COUNT(*) AS inbound
+            FROM doc_edges
+            GROUP BY to_path
+            """
+        ).fetchall()
+        inbound_counts = {
+            _normalize_index_doc_path(row["doc_path"]): int(row["inbound"] or 0)
+            for row in inbound_rows
+        }
+        rows = conn.execute(
+            """
+            SELECT dl.doc_path, dl.lifecycle, dl.source_type, dl.authority,
+                   dl.confidence_band, dl.verified_at, dl.freshness_risk,
+                   COALESCE(node.title, '') AS title,
+                   COALESCE(node.heading_count, 0) AS heading_count,
+                   COUNT(DISTINCT chunks.handle) AS chunks
+            FROM doc_lifecycle AS dl
+            LEFT JOIN doc_nodes AS node ON node.doc_path = dl.doc_path
+            LEFT JOIN chunks ON chunks.doc_path = dl.doc_path
+            WHERE dl.lifecycle = 'unknown' AND dl.source_type = 'unknown'
+            GROUP BY dl.doc_path
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        doc_path = _normalize_index_doc_path(row["doc_path"])
+        folder = doc_path.split("/", 1)[0] if "/" in doc_path else doc_path
+        folder_meta = folder_importance.get(
+            folder,
+            {"rank": folder_count + 1, "score": 0, "docs": 0, "chunks": 0},
+        )
+        retrieval_count = int(retrieval_counts.get(doc_path, 0))
+        inbound = int(inbound_counts.get(doc_path, 0))
+        importance = int(folder_meta["score"])
+        priority_score = retrieval_count * 1000 + inbound * 10 + importance
+        items.append(
+            {
+                "path": doc_path,
+                "title": row["title"]
+                or Path(doc_path).stem.replace("-", " ").replace("_", " ").title(),
+                "folder": folder,
+                "priority_score": priority_score,
+                "retrieval_frequency": retrieval_count,
+                "inbound_graph_links": inbound,
+                "folder_importance": importance,
+                "folder_rank": folder_meta["rank"],
+                "folder_docs": folder_meta["docs"],
+                "folder_chunks": folder_meta["chunks"],
+                "chunk_count": int(row["chunks"] or 0),
+                "heading_count": int(row["heading_count"] or 0),
+                "lifecycle": row["lifecycle"],
+                "source_type": row["source_type"],
+                "authority": row["authority"],
+                "confidence_band": row["confidence_band"],
+                "verified_at": row["verified_at"],
+                "freshness_risk": row["freshness_risk"],
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            -int(item["priority_score"]),
+            -int(item["retrieval_frequency"]),
+            -int(item["inbound_graph_links"]),
+            -int(item["folder_importance"]),
+            item["path"],
+        )
+    )
+    unknown_count = len(items)
+    return {
+        "ok": True,
+        "status": "green" if unknown_count == 0 else "amber",
+        "summary": (
+            "All indexed docs have lifecycle/source metadata."
+            if unknown_count == 0
+            else f"{unknown_count} indexed docs still need lifecycle/source metadata review."
+        ),
+        "ordering": [
+            "retrieval_frequency",
+            "inbound_graph_links",
+            "folder_importance",
+        ],
+        "metrics": {
+            "unknown_lifecycle_source_docs": unknown_count,
+            "backlog_items_returned": min(limit, unknown_count),
+            "retrieval_tasks_scanned": retrieval_meta["scanned_tasks"],
+            "retrieval_task_read_errors": retrieval_meta["unreadable_tasks"],
+            "folders_ranked": len(folder_importance),
+        },
+        "items": items[: max(0, limit)],
+        "sources": {
+            "turbovec_db_path": str(db_path),
+            **retrieval_meta,
+        },
     }
 
 
@@ -453,12 +703,16 @@ def _docs_status_model_check(
     )
 
 
-def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], root: Path) -> dict[str, Any]:
+def _enrich_search_result(
+    raw: dict[str, Any], docs_by_path: dict[str, Any], root: Path
+) -> dict[str, Any]:
     doc_path = str(raw.get("doc_path") or "").strip().lstrip("/")
     candidates = _doc_path_candidates(doc_path)
     row = next((docs_by_path.get(p.lower()) for p in candidates if p.lower() in docs_by_path), None)
     registered_path = row["path"] if row else None
-    file_path = registered_path or (candidates[1] if len(candidates) > 1 else (candidates[0] if candidates else ""))
+    file_path = registered_path or (
+        candidates[1] if len(candidates) > 1 else (candidates[0] if candidates else "")
+    )
 
     file_exists = False
     if file_path:
@@ -497,7 +751,8 @@ def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], roo
         "file_exists": file_exists,
         "openable": openable,
         "register_hint": register_hint,
-        "match_sources": raw.get("match_sources") or (["vector"] if raw.get("vector_rank") is not None else []),
+        "match_sources": raw.get("match_sources")
+        or (["vector"] if raw.get("vector_rank") is not None else []),
         "vector_rank": raw.get("vector_rank"),
         "vector_score": raw.get("vector_score"),
         "keyword_rank": raw.get("keyword_rank"),
@@ -512,22 +767,24 @@ def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], roo
         "confidence_band": raw.get("confidence_band") or "unknown",
         "verified_at": raw.get("verified_at"),
         "freshness_risk": raw.get("freshness_risk") or "unknown",
-        "lifecycle_metadata": raw.get("lifecycle_metadata") if isinstance(raw.get("lifecycle_metadata"), dict) else {},
+        "lifecycle_metadata": raw.get("lifecycle_metadata")
+        if isinstance(raw.get("lifecycle_metadata"), dict)
+        else {},
     }
 
 
 # ── List ──────────────────────────────────────────────────────────────────────
 
+
 @router.get("", response_model=list[DocOut])
 async def list_docs() -> list[DocOut]:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM docs ORDER BY sort_order, label"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM docs ORDER BY sort_order, label").fetchall()
     return [_row_to_out(r) for r in rows]
 
 
 # ── List unregistered files ───────────────────────────────────────────────────
+
 
 @router.get("/unregistered", response_model=list[str])
 async def list_unregistered_docs() -> list[str]:
@@ -549,6 +806,7 @@ async def list_unregistered_docs() -> list[str]:
 
 
 # ── Search proxy ──────────────────────────────────────────────────────────────
+
 
 @router.post("/search", response_model=dict)
 async def search_docs(body: DocsSearchBody) -> dict:
@@ -616,12 +874,16 @@ async def search_docs(body: DocsSearchBody) -> dict:
         raw_results = []
 
     results = [
-        _enrich_search_result(r, docs_by_path, root)
-        for r in raw_results
-        if isinstance(r, dict)
+        _enrich_search_result(r, docs_by_path, root) for r in raw_results if isinstance(r, dict)
     ]
     unique_documents = {
-        str(r.get("doc_id") or r.get("viewer_path") or r.get("register_path") or r.get("doc_path") or "").lower()
+        str(
+            r.get("doc_id")
+            or r.get("viewer_path")
+            or r.get("register_path")
+            or r.get("doc_path")
+            or ""
+        ).lower()
         for r in results
     }
     unique_documents.discard("")
@@ -679,7 +941,9 @@ async def sync_docs_search_index(body: DocsSearchSyncBody | None = None) -> dict
         payload["paths"] = body.paths
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, 60.0))) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, 60.0))
+        ) as client:
             resp = await client.post(f"{base_url}/index/sync", json=payload)
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "TurboVec Docs index sync timed out") from exc
@@ -738,28 +1002,44 @@ async def docs_search_status() -> dict[str, Any]:
 
     timeout = httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, cfg.NULLCLAW_DOCS_SEARCH_TIMEOUT, 12.0))
     async with httpx.AsyncClient(timeout=timeout) as client:
-        tv_ok, tv_data, tv_err = await _docs_status_get_json(client, f"{turbovec_base}/health") if turbovec_base else (False, None, "not configured")
+        tv_ok, tv_data, tv_err = (
+            await _docs_status_get_json(client, f"{turbovec_base}/health")
+            if turbovec_base
+            else (False, None, "not configured")
+        )
         if tv_data:
             turbovec_health = tv_data
         checks.append(
             _docs_status_check(
                 "turbovec_docs",
                 "TurboVec Docs",
-                tv_ok and bool((tv_data or {}).get("ok")) and bool((tv_data or {}).get("index_exists")),
+                tv_ok
+                and bool((tv_data or {}).get("ok"))
+                and bool((tv_data or {}).get("index_exists")),
                 (
                     f"{(tv_data or {}).get('documents', 0)} docs; {(tv_data or {}).get('chunks', 0)} chunks"
-                    if tv_data else f"Unavailable: {tv_err}"
+                    if tv_data
+                    else f"Unavailable: {tv_err}"
                 ),
                 critical=True,
                 meta=tv_data or {"error": tv_err},
             )
         )
 
-        stats_ok, stats_data, stats_err = await _docs_status_get_json(client, f"{turbovec_base}/stats") if turbovec_base else (False, None, "not configured")
+        stats_ok, stats_data, stats_err = (
+            await _docs_status_get_json(client, f"{turbovec_base}/stats")
+            if turbovec_base
+            else (False, None, "not configured")
+        )
         if stats_data:
             turbovec_stats = stats_data
         graph = (stats_data or {}).get("graph") if isinstance(stats_data, dict) else {}
-        graph_ok = stats_ok and isinstance(graph, dict) and int(graph.get("nodes") or 0) > 0 and int(graph.get("edges") or 0) > 0
+        graph_ok = (
+            stats_ok
+            and isinstance(graph, dict)
+            and int(graph.get("nodes") or 0) > 0
+            and int(graph.get("edges") or 0) > 0
+        )
         checks.append(
             _docs_status_check(
                 "graph_sidecar",
@@ -769,13 +1049,18 @@ async def docs_search_status() -> dict[str, Any]:
                     f"{int((graph or {}).get('nodes') or 0)} nodes; "
                     f"{int((graph or {}).get('edges') or 0)} edges; "
                     f"{int((graph or {}).get('headings') or 0)} headings"
-                    if stats_ok else f"Stats unavailable: {stats_err}"
+                    if stats_ok
+                    else f"Stats unavailable: {stats_err}"
                 ),
                 meta=graph if isinstance(graph, dict) else {"error": stats_err},
             )
         )
 
-        nc_ok, nc_data, nc_err = await _docs_status_get_json(client, f"{nullclaw_base}/health") if nullclaw_base else (False, None, "not configured")
+        nc_ok, nc_data, nc_err = (
+            await _docs_status_get_json(client, f"{nullclaw_base}/health")
+            if nullclaw_base
+            else (False, None, "not configured")
+        )
         if nc_data:
             nullclaw_health = nc_data
         checks.append(
@@ -785,18 +1070,33 @@ async def docs_search_status() -> dict[str, Any]:
                 nc_ok and bool((nc_data or {}).get("ok")) and bool((nc_data or {}).get("ready")),
                 (
                     f"{(nc_data or {}).get('task_count', 0)} stored tasks; worker ready"
-                    if nc_data else f"Unavailable: {nc_err}"
+                    if nc_data
+                    else f"Unavailable: {nc_err}"
                 ),
                 critical=True,
                 meta=nc_data or {"error": nc_err},
             )
         )
-        deps_for_models = (nc_data or {}).get("dependencies") if isinstance((nc_data or {}).get("dependencies"), dict) else {}
-        local_ai_for_models = deps_for_models.get("local_ai") if isinstance(deps_for_models.get("local_ai"), dict) else {}
-        model_base_url = local_ai_for_models.get("base_url") or os.environ.get("LITELLM_BASE_URL", "")
+        deps_for_models = (
+            (nc_data or {}).get("dependencies")
+            if isinstance((nc_data or {}).get("dependencies"), dict)
+            else {}
+        )
+        local_ai_for_models = (
+            deps_for_models.get("local_ai")
+            if isinstance(deps_for_models.get("local_ai"), dict)
+            else {}
+        )
+        model_base_url = local_ai_for_models.get("base_url") or os.environ.get(
+            "LITELLM_BASE_URL", ""
+        )
         models_ok, model_ids, models_error = await _docs_status_model_ids(client, model_base_url)
 
-    deps = nullclaw_health.get("dependencies") if isinstance(nullclaw_health.get("dependencies"), dict) else {}
+    deps = (
+        nullclaw_health.get("dependencies")
+        if isinstance(nullclaw_health.get("dependencies"), dict)
+        else {}
+    )
     local_ai = deps.get("local_ai") if isinstance(deps.get("local_ai"), dict) else {}
     checks.append(
         _docs_status_check(
@@ -805,7 +1105,8 @@ async def docs_search_status() -> dict[str, Any]:
             bool(local_ai.get("ok")),
             (
                 f"{local_ai.get('model') or 'configured model'} via {local_ai.get('base_url') or 'local endpoint'}"
-                if local_ai else "No local AI health result from synthesis worker"
+                if local_ai
+                else "No local AI health result from synthesis worker"
             ),
             critical=True,
             meta=local_ai or {},
@@ -850,7 +1151,11 @@ async def docs_search_status() -> dict[str, Any]:
         ]
     )
 
-    lifecycle_counts = turbovec_stats.get("lifecycle_counts") if isinstance(turbovec_stats.get("lifecycle_counts"), list) else []
+    lifecycle_counts = (
+        turbovec_stats.get("lifecycle_counts")
+        if isinstance(turbovec_stats.get("lifecycle_counts"), list)
+        else []
+    )
     unknown_lifecycle = sum(
         int(row.get("n") or 0)
         for row in lifecycle_counts
@@ -858,23 +1163,23 @@ async def docs_search_status() -> dict[str, Any]:
         and str(row.get("lifecycle") or "unknown") == "unknown"
         and str(row.get("source_type") or "unknown") == "unknown"
     )
-    checks.append(
-        _docs_status_check(
-            "metadata_coverage",
-            "Metadata Coverage",
-            unknown_lifecycle == 0,
-            (
-                "All indexed docs have lifecycle/source metadata"
-                if unknown_lifecycle == 0
-                else f"{unknown_lifecycle} indexed docs still have unknown lifecycle/source metadata"
-            ),
-            meta={"unknown_lifecycle_source_docs": unknown_lifecycle},
-        )
+    quality_check = _docs_status_check(
+        "metadata_coverage",
+        "Metadata Coverage",
+        unknown_lifecycle == 0,
+        (
+            "All indexed docs have lifecycle/source metadata"
+            if unknown_lifecycle == 0
+            else f"{unknown_lifecycle} indexed docs still have unknown lifecycle/source metadata"
+        ),
+        meta={"unknown_lifecycle_source_docs": unknown_lifecycle},
     )
+    quality_checks = [quality_check]
 
     has_critical_failure = any(check["critical"] and not check["ok"] for check in checks)
     has_warning = any(not check["critical"] and not check["ok"] for check in checks)
-    status = "red" if has_critical_failure else ("amber" if has_warning else "green")
+    status = _traffic_status(has_critical_failure, has_warning)
+    quality_status = _traffic_status(False, any(not check["ok"] for check in quality_checks))
     graph = turbovec_stats.get("graph") if isinstance(turbovec_stats.get("graph"), dict) else {}
     metrics = {
         "registered_docs": registered_docs,
@@ -889,16 +1194,24 @@ async def docs_search_status() -> dict[str, Any]:
         "nullclaw_task_count": nullclaw_health.get("task_count"),
         "available_local_models": len(model_ids) if models_ok else None,
     }
+    quality = {
+        "status": quality_status,
+        "summary": _traffic_summary(quality_status, subject="quality"),
+        "metrics": {
+            "unknown_lifecycle_source_docs": unknown_lifecycle,
+            "proposed_edges": graph.get("proposed_edges"),
+        },
+        "checks": quality_checks,
+        "backlog_endpoint": "/api/v1/docs/search/quality",
+    }
     return {
         "ok": status != "red",
         "status": status,
-        "summary": {
-            "green": "Docs search is healthy.",
-            "amber": "Docs search is usable, with non-critical warnings.",
-            "red": "Docs search has a critical failure.",
-        }[status],
+        "quality_status": quality_status,
+        "summary": _traffic_summary(status, subject="health"),
         "metrics": metrics,
         "checks": checks,
+        "quality": quality,
         "upstream": {
             "turbovec_docs": {
                 "health": turbovec_health,
@@ -909,7 +1222,16 @@ async def docs_search_status() -> dict[str, Any]:
     }
 
 
+@router.get("/search/quality", response_model=dict)
+async def docs_search_quality(
+    limit: int = Query(_METADATA_BACKLOG_LIMIT, ge=1, le=200),
+) -> dict[str, Any]:
+    """Return metadata backlog ordered by retrieval pressure and graph importance."""
+    return _metadata_backlog_report(limit)
+
+
 # ── Group folder opener ───────────────────────────────────────────────────────
+
 
 @router.post("/group-folder/open", response_model=dict)
 async def open_docs_group_folder(body: DocsGroupFolderOpenBody) -> dict[str, Any]:
@@ -1006,6 +1328,7 @@ async def docs_group_folder_tree(body: DocsGroupFolderTreeBody) -> dict[str, Any
 
 # ── Get with content ──────────────────────────────────────────────────────────
 
+
 @router.get("/{doc_id}", response_model=DocWithContent)
 async def get_doc(doc_id: str) -> DocWithContent:
     with get_conn() as conn:
@@ -1025,6 +1348,7 @@ async def get_doc(doc_id: str) -> DocWithContent:
 
 # ── Create ────────────────────────────────────────────────────────────────────
 
+
 @router.post("", response_model=DocOut, status_code=201)
 async def create_doc(body: DocCreate) -> DocOut:
     doc_id = str(uuid.uuid4())
@@ -1040,7 +1364,15 @@ async def create_doc(body: DocCreate) -> DocOut:
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO docs (doc_id, label, description, tags, path, sort_order, group_id) VALUES (?,?,?,?,?,?,?)",
-            (doc_id, body.label, body.description, body.tags, body.path, body.sort_order, body.group_id),
+            (
+                doc_id,
+                body.label,
+                body.description,
+                body.tags,
+                body.path,
+                body.sort_order,
+                body.group_id,
+            ),
         )
         gen = increment_gen(conn, "human")
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
@@ -1049,6 +1381,7 @@ async def create_doc(body: DocCreate) -> DocOut:
 
 
 # ── Update metadata ───────────────────────────────────────────────────────────
+
 
 @router.put("/{doc_id}", response_model=DocOut)
 async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
@@ -1066,8 +1399,16 @@ async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
                group_id    = CASE WHEN ? IS NOT NULL THEN NULLIF(?, '') ELSE group_id END,
                updated_at  = datetime('now')
                WHERE doc_id = ?""",
-            (body.label, body.description, body.tags, body.path, body.sort_order,
-             body.group_id, body.group_id, doc_id),
+            (
+                body.label,
+                body.description,
+                body.tags,
+                body.path,
+                body.sort_order,
+                body.group_id,
+                body.group_id,
+                doc_id,
+            ),
         )
         gen = increment_gen(conn, "human")
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
@@ -1076,6 +1417,7 @@ async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
 
 
 # ── Update file content ───────────────────────────────────────────────────────
+
 
 @router.put("/{doc_id}/content", status_code=204)
 async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
@@ -1108,6 +1450,7 @@ async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
+
 
 @router.delete("/{doc_id}", status_code=204)
 async def delete_doc(
