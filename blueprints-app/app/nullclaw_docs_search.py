@@ -42,6 +42,14 @@ class SynthesisControls(BaseModel):
     keyword_k: int = Field(default=40, ge=1, le=80)
     rerank: bool = True
     include_headings: bool = True
+    follow_markdown_links: bool = True
+    group_id: str | None = Field(default=None, max_length=200)
+    folder: str | None = Field(default=None, max_length=2000)
+    allowed_paths: list[str] = Field(default_factory=list)
+    current_only: bool = False
+    include_plans: bool = True
+    include_research: bool = True
+    include_unknown: bool = True
 
 
 def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -> dict[str, Any]:
@@ -58,6 +66,14 @@ def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -
         "rerank": body.rerank,
         "citation_style": "path",
         "include_headings": body.include_headings,
+        "follow_markdown_links": body.follow_markdown_links,
+        "group_id": body.group_id,
+        "folder": body.folder,
+        "allowed_paths": body.allowed_paths,
+        "current_only": body.current_only,
+        "include_plans": body.include_plans,
+        "include_research": body.include_research,
+        "include_unknown": body.include_unknown,
     }
 
 
@@ -152,6 +168,7 @@ def blueprints_synthesis_response(
         "sources": result.get("sources") if isinstance(result.get("sources"), list) else [],
         "warnings": warnings,
         "evidence": evidence,
+        "strict_evidence": result.get("strict_evidence") if isinstance(result.get("strict_evidence"), dict) else {},
         "upstream": {
             "service": task.get("service") or "nullclaw-docs-search",
             "task_endpoint": "/tasks/query-synthesis",

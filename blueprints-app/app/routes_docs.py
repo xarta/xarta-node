@@ -360,6 +360,13 @@ def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], roo
         "keyword_terms": raw.get("keyword_terms") or [],
         "updated_at": raw.get("updated_at"),
         "handle": raw.get("handle"),
+        "lifecycle": raw.get("lifecycle") or "unknown",
+        "source_type": raw.get("source_type") or "unknown",
+        "authority": raw.get("authority") or "unknown",
+        "confidence_band": raw.get("confidence_band") or "unknown",
+        "verified_at": raw.get("verified_at"),
+        "freshness_risk": raw.get("freshness_risk") or "unknown",
+        "lifecycle_metadata": raw.get("lifecycle_metadata") if isinstance(raw.get("lifecycle_metadata"), dict) else {},
     }
 
 
