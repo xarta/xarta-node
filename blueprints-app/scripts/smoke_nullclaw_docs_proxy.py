@@ -100,6 +100,34 @@ def require_catalog(data: dict[str, Any]) -> None:
         raise AssertionError("/api/v1/help/catalog does not advertise catalog-only menu functions")
 
 
+def require_map_reduce_explain(data: dict[str, Any]) -> None:
+    require_common("/api/v1/docs/search/explain map_reduce", data)
+    strict = data.get("strict_evidence")
+    if not isinstance(strict, dict):
+        raise AssertionError("map_reduce explain missing strict_evidence")
+    if strict.get("answerable") is not True:
+        raise AssertionError(f"map_reduce explain was not answerable: {strict.get('answerability')}")
+    if strict.get("answerability") not in {"supported", "supported_with_unknown_metadata", "direction_only"}:
+        raise AssertionError(f"map_reduce explain returned unexpected answerability: {strict.get('answerability')}")
+    map_reduce = strict.get("map_reduce")
+    if not isinstance(map_reduce, dict) or map_reduce.get("enabled") is not True:
+        raise AssertionError("map_reduce explain did not enable strict_evidence.map_reduce")
+    if map_reduce.get("final_answer_input") != "strict_evidence_only":
+        raise AssertionError("map_reduce explain does not declare strict_evidence_only final input")
+    counts = strict.get("claim_count_by_category")
+    if not isinstance(counts, dict):
+        raise AssertionError("map_reduce explain missing claim_count_by_category")
+    if sum(int(value or 0) for value in counts.values()) != strict.get("claim_count"):
+        raise AssertionError("map_reduce explain claim count mismatch")
+    if int(counts.get("current") or 0) < 1:
+        raise AssertionError("map_reduce explain has no current claims")
+    claims = strict.get("claims")
+    if not isinstance(claims, dict) or not isinstance(claims.get("current"), list):
+        raise AssertionError("map_reduce explain missing current claim list")
+    if not all((claim or {}).get("source_category") == "current" for claim in claims["current"]):
+        raise AssertionError("map_reduce explain current claims have wrong source category")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=os.getenv("BLUEPRINTS_API_URL", "http://127.0.0.1:8080"))
@@ -155,6 +183,18 @@ def main() -> int:
         fetched = get_json(client, f"/api/v1/help/turns/{turn_task_id}")
         require_common("/api/v1/help/turns/{id}", fetched)
         print(f"ok /api/v1/help/turns/{{id}} task_id={turn_task_id}")
+
+        map_reduce_body = {
+            **body,
+            "query": "How is TurboVec Docs wired into Blueprints Docs Search?",
+            "folder": "turbovec",
+            "allowed_paths": ["turbovec/"],
+            "map_reduce": True,
+            "explanation_mode": "answer",
+        }
+        map_reduce = post_json(client, "/api/v1/docs/search/explain", map_reduce_body)
+        require_map_reduce_explain(map_reduce)
+        print(f"ok /api/v1/docs/search/explain map_reduce task_id={map_reduce.get('task_id')}")
 
     return 0
 
