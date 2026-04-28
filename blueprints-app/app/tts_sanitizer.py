@@ -24,6 +24,114 @@ _BOLD_HEADING_RE = re.compile(r"^\s*\*\*(?P<title>[^*\n][^*\n]*?)\*\*\s*$")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
 _TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]$")
 _BACKLINK_PREFIXES = ("<-", "←", "&larr;", "[<-", "[←", "[&larr;")
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
+_IDENTIFIER_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+\b")
+_ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
+    ("CI/CD", "see eye, see dee"),
+    ("SQLite", "sequel lite"),
+    ("pfSense", "pee eff sense"),
+    ("IPv4", "eye pee vee four"),
+    ("IPv6", "eye pee vee six"),
+    ("mTLS", "em tee ell ess"),
+    ("VMID", "vee em eye dee"),
+    ("VLAN", "vee lan"),
+    ("VXLAN", "vee ex lan"),
+    ("WLAN", "double you lan"),
+    ("LAN", "lan"),
+    ("WAN", "wan"),
+    ("VPN", "vee pee enn"),
+    ("DNS", "dee enn ess"),
+    ("mDNS", "em dee enn ess"),
+    ("DHCP", "dee aitch see pee"),
+    ("NTP", "enn tee pee"),
+    ("TCP", "tee see pee"),
+    ("UDP", "you dee pee"),
+    ("CIDR", "sigh der"),
+    ("NAT", "nat"),
+    ("IP", "eye pee"),
+    ("MAC", "mack"),
+    ("NIC", "enn eye sea"),
+    ("MTU", "em tee you"),
+    ("HTTP", "aitch tee tee pee"),
+    ("HTTPS", "aitch tee tee pee ess"),
+    ("SSH", "ess ess aitch"),
+    ("SSL", "ess ess ell"),
+    ("TLS", "tee ell ess"),
+    ("URL", "you are ell"),
+    ("URI", "you are eye"),
+    ("API", "ay pee eye"),
+    ("REST", "rest"),
+    ("JSON", "jay son"),
+    ("YAML", "yammel"),
+    ("XML", "ex em ell"),
+    ("HTML", "aitch tee em ell"),
+    ("CSS", "see ess ess"),
+    ("SVG", "ess vee gee"),
+    ("PNG", "pee enn gee"),
+    ("JPG", "jay peg"),
+    ("JPEG", "jay peg"),
+    ("GIF", "gee eye eff"),
+    ("PDF", "pee dee eff"),
+    ("CSV", "see ess vee"),
+    ("JS", "jay ess"),
+    ("TS", "tee ess"),
+    ("DOM", "dee oh em"),
+    ("PWA", "pee double you ay"),
+    ("UI", "you eye"),
+    ("UX", "you ex"),
+    ("GUI", "gooey"),
+    ("CLI", "see ell eye"),
+    ("IDE", "eye dee ee"),
+    ("SDK", "ess dee kay"),
+    ("CI", "see eye"),
+    ("CD", "see dee"),
+    ("DB", "dee bee"),
+    ("SQL", "sequel"),
+    ("ORM", "oh are em"),
+    ("CRUD", "crud"),
+    ("AI", "ay eye"),
+    ("LLM", "ell ell em"),
+    ("ML", "em ell"),
+    ("NLP", "enn ell pee"),
+    ("RAG", "rag"),
+    ("TTS", "tee tee ess"),
+    ("STT", "ess tee tee"),
+    ("ASR", "ay ess are"),
+    ("OCR", "oh see are"),
+    ("CPU", "see pee you"),
+    ("GPU", "gee pee you"),
+    ("RAM", "ram"),
+    ("ROM", "rom"),
+    ("ECC", "ee see see"),
+    ("LED", "ell ee dee"),
+    ("OLED", "oh led"),
+    ("HDMI", "aitch dee em eye"),
+    ("USB", "you ess bee"),
+    ("PCIe", "pee see eye ee"),
+    ("PCI", "pee see eye"),
+    ("NVMe", "enn vee em ee"),
+    ("SSD", "ess ess dee"),
+    ("HDD", "aitch dee dee"),
+    ("PSU", "pee ess you"),
+    ("UPS", "you pee ess"),
+    ("NAS", "naz"),
+    ("NFS", "enn eff ess"),
+    ("SMB", "ess em bee"),
+    ("ZFS", "zee eff ess"),
+    ("LVM", "ell vee em"),
+    ("VM", "vee em"),
+    ("KVM", "kay vee em"),
+    ("QEMU", "queue em you"),
+    ("LXC", "ell ex sea"),
+    ("PVE", "pee vee ee"),
+    ("VPS", "vee pee ess"),
+    ("OS", "oh ess"),
+    ("UID", "you eye dee"),
+    ("UUID", "you you eye dee"),
+    ("GUID", "gee you eye dee"),
+    ("ID", "eye dee"),
+    ("OK", "okay"),
+)
 
 
 def _normalize_newlines(text: str) -> str:
@@ -88,19 +196,68 @@ def _strip_inline_markdown_emphasis(text: str) -> str:
     text = re.sub(r"\*\*([^*\n]+?)\*\*", r"\1", text)
     text = re.sub(r"__([^_\n]+?)__", r"\1", text)
     text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!_)_([^_\n]+?)_(?!_)", r"\1", text)
+    text = re.sub(r"(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])", r"\1", text)
     return text
 
 
+def _speak_inline_code_token(value: str) -> str:
+    spoken = _speak_known_attribute_names(value)
+    if spoken != value:
+        return spoken
+    return speak_tts_acronyms(_speak_identifier_token(value))
+
+
 def _strip_inline_code_ticks(text: str) -> str:
-    text = re.sub(r"`([^`\n]+?)`", r"\1", text)
+    text = _INLINE_CODE_RE.sub(lambda match: _speak_inline_code_token(match.group(1)), text)
     return text.replace("`", "")
 
 
 def _speak_known_attribute_names(text: str) -> str:
-    text = re.sub(r"\bdata-fc-key\b", "data eff sea key", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\bdata-fc-([A-Za-z0-9_-]+)\b",
+        lambda match: f"data eff sea {_speak_identifier_token(match.group(1))}",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\bdata-fc\b", "data eff sea", text, flags=re.IGNORECASE)
     return text
+
+
+def _speak_identifier_token(value: str) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return token
+    return re.sub(r"(?<=[A-Za-z0-9])[-_]+(?=[A-Za-z0-9])", " ", token)
+
+
+def speak_tts_identifiers(text: str) -> str:
+    return _IDENTIFIER_WORD_RE.sub(lambda match: _speak_identifier_token(match.group(0)), text)
+
+
+def speak_tts_acronyms(text: str) -> str:
+    spoken = str(text or "")
+    for acronym, replacement in _ACRONYM_SPEECH:
+        spoken = re.sub(
+            rf"\b{re.escape(acronym)}(?=\d)",
+            f"{replacement} ",
+            spoken,
+            flags=re.IGNORECASE,
+        )
+        spoken = re.sub(
+            rf"\b{re.escape(acronym)}\b",
+            replacement,
+            spoken,
+            flags=re.IGNORECASE,
+        )
+    return spoken
+
+
+def prepare_tts_markdown_for_llm(markdown: str) -> str:
+    text = _normalize_newlines(markdown)
+    text = _INLINE_CODE_RE.sub(lambda match: _speak_inline_code_token(match.group(1)), text)
+    text = _speak_known_attribute_names(text)
+    text = speak_tts_identifiers(text)
+    return speak_tts_acronyms(text)
 
 
 def _normalize_spacing(text: str) -> str:
@@ -115,9 +272,11 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("strip_top_backlink_line", strip_top_backlink_line),
     TtsTextTransform("strip_source_refs", _strip_source_refs),
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
-    TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
     TtsTextTransform("strip_inline_code_ticks", _strip_inline_code_ticks),
+    TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
+    TtsTextTransform("speak_tts_identifiers", speak_tts_identifiers),
+    TtsTextTransform("speak_tts_acronyms", speak_tts_acronyms),
     TtsTextTransform("normalize_spacing", _normalize_spacing),
 )
 
