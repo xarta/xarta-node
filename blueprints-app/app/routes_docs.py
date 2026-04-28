@@ -41,8 +41,10 @@ from .sync.queue import enqueue_for_all_peers
 from .tts_sanitizer import (
     prepare_tts_markdown_for_llm,
     speak_tts_acronyms,
+    speak_tts_file_extensions,
     speak_tts_identifiers,
     strip_top_backlink_line,
+    summarize_fenced_code_blocks,
 )
 
 log = logging.getLogger(__name__)
@@ -273,12 +275,12 @@ def _clamp_source_markdown(markdown: str, limit: int = 28000) -> str:
 
 def _clean_doc_speech_markdown(text: str) -> str:
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = re.sub(r"```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("```", "")
+    cleaned = summarize_fenced_code_blocks(cleaned)
     cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
     cleaned = cleaned.replace("`", "")
     cleaned = _strip_frontmatter(cleaned)
     cleaned = strip_top_backlink_line(cleaned)
+    cleaned = speak_tts_file_extensions(cleaned)
     cleaned = speak_tts_identifiers(cleaned)
     cleaned = speak_tts_acronyms(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -297,6 +299,7 @@ Rules:
 - For links, say their human meaning, such as "link to the responsive header notes".
 - For tables, briefly state that there is a table, describe what it compares or tracks, and call out the important point.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
+- Preserve fenced code blocks as examples; summarize what they illustrate instead of reading raw tags, attributes, or source lines.
 - For inline code identifiers, prefer speech-friendly words: form_controls becomes "form controls"; data-fc-key becomes "data eff sea key".
 - Spell important acronyms phonetically where it helps narration: LXC becomes "ell ex sea"; SVG becomes "ess vee gee"; AI becomes "ay eye".
 - Keep headings when they help pacing, but make them sound like spoken section titles.

@@ -12,7 +12,7 @@ Despite the progress, there are a few areas."""
 
     assert result.text == """Progress So Far.
 
-As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints ay pee eye, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the TurboVec Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
+As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints A pee eye, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the TurboVec Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
@@ -22,9 +22,11 @@ Despite the progress, there are a few areas."""
         "strip_top_backlink_line",
         "strip_source_refs",
         "project_markdown_headings",
+        "summarize_fenced_code_blocks",
         "strip_inline_code_ticks",
         "strip_inline_markdown_emphasis",
         "speak_known_attribute_names",
+        "speak_tts_file_extensions",
         "speak_tts_identifiers",
         "speak_tts_acronyms",
         "normalize_spacing",
@@ -44,7 +46,7 @@ def test_sanitize_tts_text_speaks_data_fc_key_attribute():
 
     assert (
         result.text
-        == "Blueprints gooey uses a data eff sea key aitch tee em ell attribute, data eff sea event, and stray ticks."
+        == "Blueprints gooey uses a data eff sea key aytch tee em ell attribute, data eff sea event, and stray ticks."
     )
     assert "`" not in result.text
 
@@ -66,15 +68,58 @@ def test_prepare_tts_markdown_for_llm_projects_inline_code_identifiers():
     )
 
 
+def test_prepare_tts_markdown_for_llm_preserves_fenced_code_blocks():
+    raw = """Use `form_controls` and this example:
+
+```html
+<input type="text" data-fc-key="bookmarks.filter.search" />
+```
+
+Then mention SVG."""
+
+    assert prepare_tts_markdown_for_llm(raw) == """Use form controls and this example:
+
+```html
+<input type="text" data-fc-key="bookmarks.filter.search" />
+```
+
+Then mention ess vee gee."""
+
+
+def test_sanitize_tts_text_summarizes_fenced_code_blocks():
+    raw = """Example:
+
+```html
+<input type="text" data-fc-key="bookmarks.filter.search" />
+```
+
+Done."""
+
+    assert sanitize_tts_text(raw).text == "Example:\n\nThere is an aytch tee em ell example here.\n\nDone."
+
+
 def test_sanitize_tts_text_speaks_common_technical_acronyms():
-    raw = "LED SVG png jpg VM LXC805 AI API GUI DNS HTTPS mTLS IPv6 UUID SQLite pfSense CI/CD"
+    raw = "LED SVG png jpg VM LXC805 AI API GUI DNS HTTPS mTLS IPv6 UUID SQLite pfSense CI/CD js html"
 
     assert (
         sanitize_tts_text(raw).text
         == (
             "ell ee dee ess vee gee pee enn gee jay peg vee em ell ex sea 805 "
-            "ay eye ay pee eye gooey dee enn ess aitch tee tee pee ess em tee ell ess "
-            "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee"
+            "ay eye A pee eye gooey dee enn ess aitch tee tee pee ess em tee ell ess "
+            "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
+            "JavaScript aytch tee em ell"
+        )
+    )
+
+
+def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
+    raw = "Open `form-controls.js`, icons.svg, page.HTML, config.env, table_layout_catalog.json, and .svg."
+
+    assert (
+        sanitize_tts_text(raw).text
+        == (
+            "Open form controls dot jay ess, icons dot ess vee gee, page dot aytch tee em ell, "
+            "config dot ee enn vee, table layout catalog dot jay son, and dot ess vee gee."
         )
     )
 
@@ -90,4 +135,4 @@ The page body remains."""
 
     result = sanitize_tts_text(raw)
 
-    assert result.text == "FORM CONTROLS.\n\n← [README](README.md)\n\nThe page body remains."
+    assert result.text == "FORM CONTROLS.\n\n← [README](README dot em dee)\n\nThe page body remains."
