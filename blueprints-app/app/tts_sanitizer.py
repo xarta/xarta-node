@@ -23,10 +23,37 @@ _SOURCE_REF_RE = re.compile(r"(?:[\s,;]*\[S\d+\])+", re.IGNORECASE)
 _BOLD_HEADING_RE = re.compile(r"^\s*\*\*(?P<title>[^*\n][^*\n]*?)\*\*\s*$")
 _MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
 _TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]$")
+_BACKLINK_PREFIXES = ("<-", "←", "&larr;", "[<-", "[←", "[&larr;")
 
 
 def _normalize_newlines(text: str) -> str:
     return str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _is_top_backlink_line(line: str) -> bool:
+    clean = line.strip()
+    if not clean or len(clean) > 220:
+        return False
+    if not clean.lower().startswith(_BACKLINK_PREFIXES):
+        return False
+    lowered = clean.lower()
+    if "](" in clean or "readme" in lowered:
+        return True
+    return bool(re.match(r"^(?:<-|←|&larr;)\s+[\w ./_-]{1,160}$", clean, flags=re.IGNORECASE))
+
+
+def strip_top_backlink_line(text: str) -> str:
+    lines = _normalize_newlines(text).split("\n")
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if not _is_top_backlink_line(line):
+            return "\n".join(lines)
+        del lines[index]
+        while index < len(lines) and not lines[index].strip():
+            del lines[index]
+        return "\n".join(lines)
+    return "\n".join(lines)
 
 
 def _strip_source_refs(text: str) -> str:
@@ -65,6 +92,17 @@ def _strip_inline_markdown_emphasis(text: str) -> str:
     return text
 
 
+def _strip_inline_code_ticks(text: str) -> str:
+    text = re.sub(r"`([^`\n]+?)`", r"\1", text)
+    return text.replace("`", "")
+
+
+def _speak_known_attribute_names(text: str) -> str:
+    text = re.sub(r"\bdata-fc-key\b", "data eff sea key", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bdata-fc\b", "data eff sea", text, flags=re.IGNORECASE)
+    return text
+
+
 def _normalize_spacing(text: str) -> str:
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
     text = "\n".join(lines)
@@ -74,9 +112,12 @@ def _normalize_spacing(text: str) -> str:
 
 TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("normalize_newlines", _normalize_newlines),
+    TtsTextTransform("strip_top_backlink_line", strip_top_backlink_line),
     TtsTextTransform("strip_source_refs", _strip_source_refs),
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
     TtsTextTransform("strip_inline_markdown_emphasis", _strip_inline_markdown_emphasis),
+    TtsTextTransform("strip_inline_code_ticks", _strip_inline_code_ticks),
+    TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
     TtsTextTransform("normalize_spacing", _normalize_spacing),
 )
 
