@@ -37,9 +37,18 @@ def post_json(client: httpx.Client, path: str, body: dict[str, Any]) -> dict[str
     return data
 
 
+def get_json(client: httpx.Client, path: str) -> dict[str, Any]:
+    response = client.get(path)
+    response.raise_for_status()
+    data = response.json()
+    require(isinstance(data, dict), f"{path} returned non-object JSON")
+    return data
+
+
 def check_gui_contract(gui_root: Path) -> None:
     help_js = (gui_root / "js" / "help-surface.js").read_text(encoding="utf-8")
     docs_search_js = (gui_root / "js" / "settings" / "docs-search.js").read_text(encoding="utf-8")
+    docs_js = (gui_root / "js" / "settings" / "docs.js").read_text(encoding="utf-8")
     index_html = (gui_root / "index.html").read_text(encoding="utf-8")
 
     match = re.search(r"async function executeAction\(.*?\n  function open\(", help_js, flags=re.DOTALL)
@@ -59,6 +68,10 @@ def check_gui_contract(gui_root: Path) -> None:
     require("display.markdown" in docs_search_js, "Docs Search explain markdown is not rendered from display")
     require('id="docs-search-explain"' in index_html, "Docs Search Explain button missing from modal")
     require('id="docs-search-explain-panel"' in index_html, "Docs Search explain panel missing from modal")
+    require('id="docs-folder-tree-status-pill"' in index_html, "Docs tree status pill missing from modal")
+    require('id="docs-folder-tree-status-modal"' in index_html, "Docs tree status modal missing")
+    require("/api/v1/docs/search/status" in docs_js, "Docs tree status endpoint is not wired")
+    require("_docsFolderTreeRequestSeq" in docs_js, "Docs tree modal does not guard stale async requests")
 
 
 def check_api_contract(client: httpx.Client, query: str) -> None:
@@ -103,6 +116,20 @@ def check_api_contract(client: httpx.Client, query: str) -> None:
         "display.evidence_document_count is not an int",
     )
     require(display.get("content_is_grounded_evidence") is True, "display missing grounded evidence flag")
+
+    status = get_json(client, "/api/v1/docs/search/status")
+    require(status.get("status") in {"green", "amber", "red"}, "docs search status missing traffic-light state")
+    metrics = status.get("metrics")
+    checks = status.get("checks")
+    require(isinstance(metrics, dict), "docs search status missing metrics")
+    require(isinstance(checks, list) and checks, "docs search status missing checks")
+    require(isinstance(metrics.get("turbovec_documents"), int), "status missing TurboVec document count")
+    require(isinstance(metrics.get("turbovec_chunks"), int), "status missing TurboVec chunk count")
+    require(isinstance(metrics.get("graph_edges"), int), "status missing graph edge count")
+    require(
+        any(isinstance(check, dict) and check.get("name") == "local_ai" for check in checks),
+        "status missing local_ai check",
+    )
 
 
 def check_tts_stream(client: httpx.Client) -> None:
