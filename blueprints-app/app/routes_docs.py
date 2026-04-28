@@ -370,6 +370,35 @@ async def _docs_status_get_json(client: httpx.AsyncClient, url: str) -> tuple[bo
     return True, data, None
 
 
+async def _docs_status_model_ids(client: httpx.AsyncClient, base_url: str | None) -> tuple[bool, set[str], str | None]:
+    if not base_url:
+        return False, set(), "not configured"
+    headers: dict[str, str] = {}
+    api_key = os.environ.get("LITELLM_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        resp = await client.get(f"{base_url.rstrip('/')}/v1/models", headers=headers)
+        if resp.status_code >= 400:
+            return False, set(), f"HTTP {resp.status_code}"
+        data = resp.json()
+    except httpx.TimeoutException:
+        return False, set(), "timeout"
+    except httpx.RequestError as exc:
+        return False, set(), str(exc)
+    except ValueError:
+        return False, set(), "invalid JSON"
+    models = data.get("data") if isinstance(data, dict) else []
+    ids = {
+        str(item.get("id"))
+        for item in models
+        if isinstance(item, dict) and item.get("id")
+    }
+    if not ids:
+        return False, set(), "empty model list"
+    return True, ids, None
+
+
 def _docs_status_check(
     name: str,
     label: str,
@@ -388,6 +417,40 @@ def _docs_status_check(
         "detail": detail,
         "meta": meta or {},
     }
+
+
+def _docs_status_model_check(
+    name: str,
+    label: str,
+    model: str | None,
+    model_ids: set[str],
+    models_ok: bool,
+    models_error: str | None,
+    *,
+    critical: bool = False,
+) -> dict[str, Any]:
+    model_name = str(model or "").strip()
+    ok = bool(model_name and models_ok and model_name in model_ids)
+    if ok:
+        detail = f"{model_name} listed by LiteLLM"
+    elif not model_name:
+        detail = "No model alias configured"
+    elif not models_ok:
+        detail = f"{model_name}; model list unavailable: {models_error or 'unknown error'}"
+    else:
+        detail = f"{model_name} is not listed by LiteLLM"
+    return _docs_status_check(
+        name,
+        label,
+        ok,
+        detail,
+        critical=critical,
+        meta={
+            "model": model_name or None,
+            "model_list_available": models_ok,
+            "model_list_error": models_error,
+        },
+    )
 
 
 def _enrich_search_result(raw: dict[str, Any], docs_by_path: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -669,6 +732,9 @@ async def docs_search_status() -> dict[str, Any]:
     turbovec_health: dict[str, Any] = {}
     turbovec_stats: dict[str, Any] = {}
     nullclaw_health: dict[str, Any] = {}
+    models_ok = False
+    model_ids: set[str] = set()
+    models_error: str | None = None
 
     timeout = httpx.Timeout(max(cfg.TURBOVEC_DOCS_TIMEOUT, cfg.NULLCLAW_DOCS_SEARCH_TIMEOUT, 12.0))
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -725,6 +791,10 @@ async def docs_search_status() -> dict[str, Any]:
                 meta=nc_data or {"error": nc_err},
             )
         )
+        deps_for_models = (nc_data or {}).get("dependencies") if isinstance((nc_data or {}).get("dependencies"), dict) else {}
+        local_ai_for_models = deps_for_models.get("local_ai") if isinstance(deps_for_models.get("local_ai"), dict) else {}
+        model_base_url = local_ai_for_models.get("base_url") or os.environ.get("LITELLM_BASE_URL", "")
+        models_ok, model_ids, models_error = await _docs_status_model_ids(client, model_base_url)
 
     deps = nullclaw_health.get("dependencies") if isinstance(nullclaw_health.get("dependencies"), dict) else {}
     local_ai = deps.get("local_ai") if isinstance(deps.get("local_ai"), dict) else {}
@@ -740,6 +810,44 @@ async def docs_search_status() -> dict[str, Any]:
             critical=True,
             meta=local_ai or {},
         )
+    )
+    checks.extend(
+        [
+            _docs_status_model_check(
+                "docs_embeddings_model",
+                "Embeddings",
+                turbovec_health.get("embedding_model"),
+                model_ids,
+                models_ok,
+                models_error,
+                critical=True,
+            ),
+            _docs_status_model_check(
+                "docs_reranker_model",
+                "Reranker",
+                turbovec_health.get("reranker_model"),
+                model_ids,
+                models_ok,
+                models_error,
+            ),
+            _docs_status_model_check(
+                "turbovec_llm_model",
+                "TurboVec LLM",
+                turbovec_health.get("llm_model"),
+                model_ids,
+                models_ok,
+                models_error,
+            ),
+            _docs_status_model_check(
+                "synthesis_llm_model",
+                "Synthesis LLM",
+                local_ai.get("model"),
+                model_ids,
+                models_ok,
+                models_error,
+                critical=True,
+            ),
+        ]
     )
 
     lifecycle_counts = turbovec_stats.get("lifecycle_counts") if isinstance(turbovec_stats.get("lifecycle_counts"), list) else []
@@ -779,6 +887,7 @@ async def docs_search_status() -> dict[str, Any]:
         "graph_headings": graph.get("headings"),
         "unknown_lifecycle_source_docs": unknown_lifecycle,
         "nullclaw_task_count": nullclaw_health.get("task_count"),
+        "available_local_models": len(model_ids) if models_ok else None,
     }
     return {
         "ok": status != "red",

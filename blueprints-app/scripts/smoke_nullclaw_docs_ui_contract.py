@@ -130,6 +130,15 @@ def check_api_contract(client: httpx.Client, query: str) -> None:
         any(isinstance(check, dict) and check.get("name") == "local_ai" for check in checks),
         "status missing local_ai check",
     )
+    required_status_checks = {
+        "docs_embeddings_model",
+        "docs_reranker_model",
+        "turbovec_llm_model",
+        "synthesis_llm_model",
+    }
+    present = {check.get("name") for check in checks if isinstance(check, dict)}
+    missing = sorted(required_status_checks - present)
+    require(not missing, f"status missing model checks: {', '.join(missing)}")
 
 
 def check_tts_stream(client: httpx.Client) -> None:
