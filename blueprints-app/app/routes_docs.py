@@ -38,7 +38,12 @@ from .nullclaw_docs_search import (
     synthesis_display_block,
 )
 from .sync.queue import enqueue_for_all_peers
-from .tts_sanitizer import strip_top_backlink_line
+from .tts_sanitizer import (
+    prepare_tts_markdown_for_llm,
+    speak_tts_acronyms,
+    speak_tts_identifiers,
+    strip_top_backlink_line,
+)
 
 log = logging.getLogger(__name__)
 
@@ -274,6 +279,8 @@ def _clean_doc_speech_markdown(text: str) -> str:
     cleaned = cleaned.replace("`", "")
     cleaned = _strip_frontmatter(cleaned)
     cleaned = strip_top_backlink_line(cleaned)
+    cleaned = speak_tts_identifiers(cleaned)
+    cleaned = speak_tts_acronyms(cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -290,6 +297,8 @@ Rules:
 - For links, say their human meaning, such as "link to the responsive header notes".
 - For tables, briefly state that there is a table, describe what it compares or tracks, and call out the important point.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
+- For inline code identifiers, prefer speech-friendly words: form_controls becomes "form controls"; data-fc-key becomes "data eff sea key".
+- Spell important acronyms phonetically where it helps narration: LXC becomes "ell ex sea"; SVG becomes "ess vee gee"; AI becomes "ay eye".
 - Keep headings when they help pacing, but make them sound like spoken section titles.
 - Do not add citations, source labels, or commentary about being an AI.
 - Output only the narration Markdown.
@@ -340,7 +349,9 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> str:
     title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
     description = str(doc["description"] or "").strip()
     doc_path = str(doc["path"] or "").strip()
-    speech_source = _clamp_source_markdown(strip_top_backlink_line(_strip_frontmatter(source_markdown)))
+    speech_source = _clamp_source_markdown(
+        prepare_tts_markdown_for_llm(strip_top_backlink_line(_strip_frontmatter(source_markdown)))
+    )
     user_prompt = (
         "/no-think\n"
         f"Document title: {title}\n"
