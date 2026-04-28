@@ -195,7 +195,7 @@ fi
 echo "    ok"
 
 # ── 2c. Ensure Python dev tools are available ─────────────────────────────
-echo "--- checking Python dev tools (uv, ruff)..."
+echo "--- checking Python dev tools (uv, ruff, system helper libs)..."
 if [[ -x "$SCRIPT_DIR/setup-python-dev-tools.sh" ]]; then
     "$SCRIPT_DIR/setup-python-dev-tools.sh"
 else

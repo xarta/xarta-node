@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# setup-python-dev-tools.sh — install uv and ruff on xarta-node LXCs.
+# setup-python-dev-tools.sh — install Python helper tooling on xarta-node LXCs.
 #
 # What this script does (idempotent):
-#   1. Installs PyYAML for system Python validation scripts.
+#   1. Installs PyYAML and HTTPX for system Python validation/helper scripts.
 #   2. Installs uv  — fast Python package manager / project tool runner.
 #   3. Installs ruff — Python linter and formatter.
 #
@@ -12,7 +12,8 @@
 # Notes:
 #   - Intended for Debian 12 xarta-node LXCs.
 #   - Requires curl and python3-pip (installed as part of setup-blueprints.sh).
-#   - python3-yaml is installed through apt so system Python can import yaml.
+#   - python3-yaml and python3-httpx are installed through apt so system
+#     Python helper scripts can import yaml and httpx.
 #   - uv is installed via the official astral.sh binary installer.
 #   - ruff is installed via pip3 --break-system-packages (Debian 12 externally
 #     managed environment requires this flag for system-wide pip installs).
@@ -31,7 +32,7 @@ fi
 echo "=== Python dev tools setup ==="
 echo ""
 
-# ── PyYAML for system Python ─────────────────────────────────────────────────
+# ── System Python helper libraries ────────────────────────────────────────────
 
 if python3 -c "import yaml" >/dev/null 2>&1; then
     echo -e "${GREEN}already installed:${NC} python3-yaml"
@@ -44,6 +45,19 @@ else
         exit 1
     fi
     echo -e "${GREEN}installed:${NC} python3-yaml"
+fi
+
+if python3 -c "import httpx" >/dev/null 2>&1; then
+    echo -e "${GREEN}already installed:${NC} python3-httpx"
+else
+    echo "--- installing python3-httpx..."
+    apt-get update
+    apt-get install -y --no-install-recommends python3-httpx
+    if ! python3 -c "import httpx" >/dev/null 2>&1; then
+        echo -e "${RED}Error:${NC} python3-httpx installation failed" >&2
+        exit 1
+    fi
+    echo -e "${GREEN}installed:${NC} python3-httpx"
 fi
 
 # ── uv ────────────────────────────────────────────────────────────────────────
