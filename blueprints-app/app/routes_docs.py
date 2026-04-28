@@ -11,12 +11,14 @@ DELETE /api/v1/docs/{doc_id}            → delete record; ?delete_file=true als
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import uuid
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +38,7 @@ from .nullclaw_docs_search import (
     synthesis_display_block,
 )
 from .sync.queue import enqueue_for_all_peers
+from .tts_sanitizer import strip_top_backlink_line
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +52,7 @@ _DEFAULT_TURBOVEC_DB_PATH = (
 _DEFAULT_NULLCLAW_TASKS_DIR = (
     _NODE_LOCAL_ROOT / "stacks" / "nullclaw-docs-search" / "data" / "tasks"
 )
+_DOC_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-cache"
 _METADATA_BACKLOG_LIMIT = 40
 _PATH_LIKE_KEYS = {
     "path",
@@ -81,6 +85,10 @@ class DocsSearchBody(BaseModel):
 
 class DocsSearchExplainBody(SynthesisControls):
     explanation_mode: Literal["summary", "answer"] = "answer"
+
+
+class DocSpeechBody(BaseModel):
+    force: bool = False
 
 
 class DocsGroupFolderOpenBody(BaseModel):
@@ -135,6 +143,10 @@ def _normalize_ownership(root: Path, target: Path) -> None:
         current = current.parent
 
 
+def _normalize_node_local_ownership(target: Path) -> None:
+    _normalize_ownership(_NODE_LOCAL_ROOT, target)
+
+
 def _safe_resolve(root: Path, rel_path: str) -> Path:
     """Resolve rel_path under root, raising 400 on path traversal."""
     resolved = (root / rel_path).resolve()
@@ -142,6 +154,211 @@ def _safe_resolve(root: Path, rel_path: str) -> Path:
     if str(resolved).startswith(root_resolved + "/") or str(resolved) == root_resolved:
         return resolved
     raise HTTPException(400, "Path escapes docs root")
+
+
+def _source_timestamp_slug(path: Path) -> str:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        raise HTTPException(404, "doc file not found") from exc
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _now_timestamp_slug() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _safe_cache_rel_parent(doc_path: str) -> Path:
+    clean = _normalize_docs_rel(doc_path)
+    rel_parent = Path(clean).parent
+    if str(rel_parent) == ".":
+        return Path()
+    if any(part in {"", ".", ".."} or part.startswith(".") for part in rel_parent.parts):
+        raise HTTPException(400, "Invalid document path for speech cache")
+    return rel_parent
+
+
+def _doc_speech_cache_dir_and_name(doc_path: str) -> tuple[Path, str]:
+    name = Path(_normalize_docs_rel(doc_path)).name
+    if not name.endswith(".md"):
+        name = f"{name}.md"
+    return _DOC_SPEECH_CACHE_ROOT / _safe_cache_rel_parent(doc_path), name
+
+
+def _doc_speech_cache_candidates(doc_path: str) -> list[Path]:
+    cache_dir, name = _doc_speech_cache_dir_and_name(doc_path)
+    if not cache_dir.is_dir():
+        return []
+    candidates = [p for p in cache_dir.iterdir() if p.is_file() and p.name.endswith(f"--{name}")]
+    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+
+
+def _valid_doc_speech_cache_path(doc_path: str, source_path: Path) -> Path | None:
+    try:
+        source_mtime = source_path.stat().st_mtime
+    except OSError as exc:
+        raise HTTPException(404, "doc file not found") from exc
+    for candidate in _doc_speech_cache_candidates(doc_path):
+        try:
+            if candidate.stat().st_mtime >= source_mtime:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _new_doc_speech_cache_path(doc_path: str) -> Path:
+    cache_dir, name = _doc_speech_cache_dir_and_name(doc_path)
+    base = cache_dir / f"{_now_timestamp_slug()}--{name}"
+    if not base.exists():
+        return base
+    for index in range(1, 100):
+        candidate = cache_dir / f"{_now_timestamp_slug()}-{index:02d}--{name}"
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(500, "Could not allocate a unique speech cache path")
+
+
+def _invalidate_doc_speech_cache(doc_path: str | None) -> None:
+    if not doc_path:
+        return
+    try:
+        for cached in _doc_speech_cache_candidates(doc_path):
+            try:
+                cached.unlink()
+            except OSError as exc:
+                log.warning("docs: could not remove stale speech cache %s: %s", cached, exc)
+    except Exception as exc:
+        log.warning("docs: speech cache invalidation failed for %s: %s", doc_path, exc)
+
+
+def _strip_frontmatter(markdown: str) -> str:
+    text = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
+    start = 1 if text.startswith("\ufeff") else 0
+    if text[start : start + 3] != "---":
+        return text
+    first_line_end = text.find("\n", start)
+    first_line = text[start : len(text) if first_line_end == -1 else first_line_end].strip()
+    if first_line != "---":
+        return text
+    line_start = len(text) if first_line_end == -1 else first_line_end + 1
+    while line_start < len(text):
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(text)
+        if text[line_start:line_end].strip() == "---":
+            return text[line_end + 1 :].lstrip()
+        line_start = line_end + 1
+    return text
+
+
+def _clamp_source_markdown(markdown: str, limit: int = 28000) -> str:
+    text = str(markdown or "")
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rsplit("\n## ", 1)[0].strip()
+    if len(clipped) < limit * 0.5:
+        clipped = text[:limit].rsplit("\n", 1)[0].strip()
+    return (
+        clipped
+        + "\n\n[Document continues beyond this prompt window. Preserve the visible details, "
+        "then say that the remaining lower sections should be read from the page.]"
+    )
+
+
+def _clean_doc_speech_markdown(text: str) -> str:
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"```(?:markdown|md)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
+    cleaned = cleaned.replace("`", "")
+    cleaned = _strip_frontmatter(cleaned)
+    cleaned = strip_top_backlink_line(cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+_DOC_SPEECH_SYSTEM_PROMPT = """
+You write narration scripts for local documentation pages.
+
+Convert the supplied Markdown document into speech-friendly Markdown for TTS.
+
+Rules:
+- Preserve the document's real details, statuses, warnings, dates, names, paths, commands, and relationships.
+- Do not include YAML front matter.
+- Do not recite raw Markdown syntax, table pipes, link URLs, or every repetitive table cell.
+- For links, say their human meaning, such as "link to the responsive header notes".
+- For tables, briefly state that there is a table, describe what it compares or tracks, and call out the important point.
+- For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
+- Keep headings when they help pacing, but make them sound like spoken section titles.
+- Do not add citations, source labels, or commentary about being an AI.
+- Output only the narration Markdown.
+""".strip()
+
+
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"\s*<think>.*?</think>\s*", "", str(text or ""), flags=re.DOTALL).strip()
+
+
+async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> str:
+    base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
+    api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
+    model = (os.environ.get("DOC_SPEECH_LLM_MODEL") or "").strip()
+    if not base_url:
+        raise HTTPException(503, "LITELLM_BASE_URL is not configured for local doc narration")
+    if not api_key:
+        raise HTTPException(503, "LITELLM_API_KEY is not configured for local doc narration")
+    if not model:
+        raise HTTPException(503, "DOC_SPEECH_LLM_MODEL is not configured for local doc narration")
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 4200,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "75"))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Local LLM narration generation timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, f"Local LLM narration endpoint unavailable: {exc}") from exc
+    if resp.status_code >= 400:
+        detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        raise HTTPException(502, f"Local LLM narration generation failed: {detail}")
+    try:
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise HTTPException(502, "Local LLM returned an invalid narration response") from exc
+    return _strip_think_blocks(str(answer or ""))
+
+
+async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> str:
+    title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
+    description = str(doc["description"] or "").strip()
+    doc_path = str(doc["path"] or "").strip()
+    speech_source = _clamp_source_markdown(strip_top_backlink_line(_strip_frontmatter(source_markdown)))
+    user_prompt = (
+        "/no-think\n"
+        f"Document title: {title}\n"
+        f"Document path: {doc_path}\n"
+        f"Description: {description or 'None'}\n\n"
+        "Rewrite this document as a narrated version for TTS playback:\n\n"
+        f"{speech_source}"
+    )
+    answer = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _DOC_SPEECH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+    speech = _clean_doc_speech_markdown(str(answer or ""))
+    if not speech:
+        raise HTTPException(502, "Local LLM returned an empty narration")
+    return speech
 
 
 def _row_to_out(row) -> DocOut:
@@ -1346,6 +1563,68 @@ async def get_doc(doc_id: str) -> DocWithContent:
     return out
 
 
+@router.post("/{doc_id}/speech", response_model=dict)
+async def doc_speech(doc_id: str, body: DocSpeechBody | None = None) -> dict[str, Any]:
+    """Return cached or freshly generated narration Markdown for a document."""
+    force = bool(body.force) if body else False
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "doc not found")
+
+    root = _docs_root()
+    source_path = _safe_resolve(root, row["path"])
+    if not source_path.is_file():
+        _invalidate_doc_speech_cache(row["path"])
+        raise HTTPException(404, "doc file not found")
+
+    if force:
+        _invalidate_doc_speech_cache(row["path"])
+    elif cache_path := _valid_doc_speech_cache_path(row["path"], source_path):
+        try:
+            speech = cache_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(500, f"Could not read speech cache: {exc}") from exc
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "doc_path": row["path"],
+            "cache": "hit",
+            "speech_path": str(cache_path),
+            "source_version": _source_timestamp_slug(source_path),
+            "generated_at": cache_path.name.split("--", 1)[0],
+            "markdown": speech,
+        }
+    else:
+        _invalidate_doc_speech_cache(row["path"])
+
+    try:
+        source_markdown = source_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(500, f"Could not read document: {exc}") from exc
+
+    speech = await _generate_doc_speech_markdown(row, source_markdown)
+    cache_path = _new_doc_speech_cache_path(row["path"])
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(speech + "\n", encoding="utf-8")
+        _normalize_node_local_ownership(cache_path.parent)
+        _normalize_node_local_ownership(cache_path)
+    except OSError as exc:
+        raise HTTPException(500, f"Could not write speech cache: {exc}") from exc
+
+    return {
+        "ok": True,
+        "doc_id": doc_id,
+        "doc_path": row["path"],
+        "cache": "regenerated" if force else "miss",
+        "speech_path": str(cache_path),
+        "source_version": _source_timestamp_slug(source_path),
+        "generated_at": cache_path.name.split("--", 1)[0],
+        "markdown": speech,
+    }
+
+
 # ── Create ────────────────────────────────────────────────────────────────────
 
 
@@ -1385,10 +1664,12 @@ async def create_doc(body: DocCreate) -> DocOut:
 
 @router.put("/{doc_id}", response_model=DocOut)
 async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
+    old_path: str | None = None
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
         if not row:
             raise HTTPException(404, "doc not found")
+        old_path = row["path"]
         conn.execute(
             """UPDATE docs SET
                label       = COALESCE(?, label),
@@ -1413,6 +1694,9 @@ async def update_doc(doc_id: str, body: DocUpdate) -> DocOut:
         gen = increment_gen(conn, "human")
         row = conn.execute("SELECT * FROM docs WHERE doc_id=?", (doc_id,)).fetchone()
         enqueue_for_all_peers(conn, "UPDATE", "docs", doc_id, dict(row), gen)
+    _invalidate_doc_speech_cache(old_path)
+    if row["path"] != old_path:
+        _invalidate_doc_speech_cache(row["path"])
     return _row_to_out(row)
 
 
@@ -1435,6 +1719,7 @@ async def update_doc_content(doc_id: str, body: DocContentBody) -> Response:
         _normalize_ownership(root, p)
         log.info("docs: wrote %d chars to %s", len(body.content), p)
         _touch_docs_sentinel()
+        _invalidate_doc_speech_cache(path_str)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1474,4 +1759,5 @@ async def delete_doc(
                 log.info("docs: deleted file %s", p)
             except Exception as exc:
                 log.warning("docs: failed to delete file %s: %s", p, exc)
+    _invalidate_doc_speech_cache(path_str)
     return Response(status_code=204)

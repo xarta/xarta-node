@@ -61,6 +61,20 @@ Very basic fallback GUI on /fallback-ui for basic interaction with database.
 SQL Lite for the basic database ... I'll be adding a separate SeekDB database later
 for more agentic capability, connecting to my local LLM, embeedings, reranker endpoints etc.
 
+## Leak scanner policy
+
+Before committing or pushing public repo changes, run:
+
+```bash
+bash check-for-leaks.sh
+```
+
+If the scanner reports a value from private configuration, do not work around it
+by splitting the string, concatenating fragments, encoding it, or reconstructing
+the same private literal in public source. That is a scanner bypass, not a fix.
+Move the value into ignored/private configuration, remove it from public code, or
+change the scanner allowlist only after an intentional review.
+
 **WARNING** - THIS REPO DOES NOT FOLLOW MANY SECURE PRACTICES. IT CURRENTLY ASSUMES ROOT
 ACCESS AND SERVICES WEAKLY MITIGATED BY BEING BASED ON UNPRIVILEDGED LXC'S BUT IT WOULD
 STILL BE WISE TO REFACTOR TO A NON-ROOT INFRASTRUCTURE ESPECIALLY TO PROTECT KEYS ETC.
