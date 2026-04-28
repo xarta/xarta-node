@@ -126,6 +126,14 @@ def require_map_reduce_explain(data: dict[str, Any]) -> None:
         raise AssertionError("map_reduce explain missing current claim list")
     if not all((claim or {}).get("source_category") == "current" for claim in claims["current"]):
         raise AssertionError("map_reduce explain current claims have wrong source category")
+    graph = strict.get("graph_expansion")
+    if not isinstance(graph, dict) or graph.get("enabled") is not True:
+        raise AssertionError("map_reduce explain missing graph_expansion metadata")
+    if graph.get("accepted") and not any(
+        isinstance(source, dict) and source.get("retrieval_stage") == "graph_expansion"
+        for source in strict.get("sources", [])
+    ):
+        raise AssertionError("map_reduce explain accepted graph docs without graph source provenance")
 
 
 def main() -> int:
@@ -189,6 +197,9 @@ def main() -> int:
             "query": "How is TurboVec Docs wired into Blueprints Docs Search?",
             "folder": "turbovec",
             "allowed_paths": ["turbovec/"],
+            "graph_expand": True,
+            "max_graph_hops": 1,
+            "max_graph_docs": 4,
             "map_reduce": True,
             "explanation_mode": "answer",
         }

@@ -43,6 +43,9 @@ class SynthesisControls(BaseModel):
     rerank: bool = True
     include_headings: bool = True
     follow_markdown_links: bool = True
+    graph_expand: bool = True
+    max_graph_hops: int = Field(default=1, ge=1, le=2)
+    max_graph_docs: int = Field(default=4, ge=0, le=12)
     group_id: str | None = Field(default=None, max_length=200)
     folder: str | None = Field(default=None, max_length=2000)
     allowed_paths: list[str] = Field(default_factory=list)
@@ -69,6 +72,9 @@ def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -
         "citation_style": "path",
         "include_headings": body.include_headings,
         "follow_markdown_links": body.follow_markdown_links,
+        "graph_expand": body.graph_expand,
+        "max_graph_hops": body.max_graph_hops,
+        "max_graph_docs": body.max_graph_docs,
         "group_id": body.group_id,
         "folder": body.folder,
         "allowed_paths": body.allowed_paths,
