@@ -49,6 +49,7 @@ class SynthesisControls(BaseModel):
     current_only: bool = False
     include_plans: bool = True
     include_research: bool = True
+    include_history: bool = False
     include_unknown: bool = True
 
 
@@ -73,6 +74,7 @@ def stack_task_payload(body: SynthesisControls, mode: BlueprintsSynthesisMode) -
         "current_only": body.current_only,
         "include_plans": body.include_plans,
         "include_research": body.include_research,
+        "include_history": body.include_history,
         "include_unknown": body.include_unknown,
     }
 

@@ -50,6 +50,13 @@ class DocsSearchBody(BaseModel):
     vector_k: int = Field(default=40, ge=1, le=120)
     keyword_k: int = Field(default=40, ge=1, le=120)
     rerank: bool = True
+    folder: str | None = Field(default=None, max_length=2000)
+    allowed_paths: list[str] = Field(default_factory=list)
+    current_only: bool = False
+    include_plans: bool = True
+    include_research: bool = True
+    include_history: bool = False
+    include_unknown: bool = True
 
 
 class DocsSearchExplainBody(SynthesisControls):
@@ -200,6 +207,27 @@ def _docs_search_chunk_limit(document_count: int) -> int:
     """Fetch a wider chunk set so the UI can group by document."""
     doc_count = max(1, min(30, int(document_count or 8)))
     return min(120, max(doc_count * 5, doc_count + 20))
+
+
+def _docs_search_allowed_paths(folder: str | None, allowed_paths: list[str] | None) -> list[str]:
+    raw_paths = [*(allowed_paths or [])]
+    if folder:
+        raw_paths.append(folder)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        value = str(raw or "").strip().replace("\\", "/").lstrip("/")
+        if not value or value in {".", ".."}:
+            continue
+        parts = Path(value).parts
+        if any(part in {"", ".", ".."} or part.startswith(".") for part in parts):
+            continue
+        if not value.endswith(".md") and not value.endswith("/"):
+            value = f"{value.rstrip('/')}/"
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
 
 
 def _registered_docs_by_path() -> dict[str, Any]:
@@ -416,6 +444,15 @@ async def search_docs(body: DocsSearchBody) -> dict:
         raise HTTPException(503, "TURBOVEC_DOCS_URL is not configured")
 
     chunk_limit = _docs_search_chunk_limit(body.top_k)
+    allowed_paths = _docs_search_allowed_paths(body.folder, body.allowed_paths)
+    scope_payload: dict[str, Any] = {
+        "allowed_paths": allowed_paths,
+        "current_only": body.current_only,
+        "include_plans": body.include_plans,
+        "include_research": body.include_research,
+        "include_history": body.include_history,
+        "include_unknown": body.include_unknown,
+    }
     if mode == "vector":
         endpoint = "/query"
         payload: dict[str, Any] = {
@@ -423,6 +460,7 @@ async def search_docs(body: DocsSearchBody) -> dict:
             "top_k": chunk_limit,
             "candidate_k": max(body.vector_k, chunk_limit),
             "rerank": body.rerank,
+            **scope_payload,
         }
     else:
         endpoint = "/hybrid-query"
@@ -433,6 +471,7 @@ async def search_docs(body: DocsSearchBody) -> dict:
             "keyword_k": max(body.keyword_k, chunk_limit),
             "rerank": body.rerank,
             "mode": mode,
+            **scope_payload,
         }
 
     try:
@@ -475,6 +514,15 @@ async def search_docs(body: DocsSearchBody) -> dict:
         "rerank": body.rerank,
         "document_target": body.top_k,
         "chunk_candidate_limit": chunk_limit,
+        "scope": {
+            "folder": body.folder,
+            "allowed_paths": allowed_paths,
+            "current_only": body.current_only,
+            "include_plans": body.include_plans,
+            "include_research": body.include_research,
+            "include_history": body.include_history,
+            "include_unknown": body.include_unknown,
+        },
         "document_count": len(unique_documents),
         "result_count": len(results),
         "results": results,
