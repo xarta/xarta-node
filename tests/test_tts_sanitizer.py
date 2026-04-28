@@ -24,8 +24,10 @@ Despite the progress, there are a few areas."""
         "project_markdown_headings",
         "summarize_fenced_code_blocks",
         "summarize_markdown_tables",
+        "summarize_endpoint_list_blocks",
         "strip_inline_code_ticks",
         "strip_inline_markdown_emphasis",
+        "strip_markdown_list_markers",
         "speak_known_attribute_names",
         "speak_tts_known_terms",
         "speak_tts_file_extensions",
@@ -146,8 +148,33 @@ Next."""
     assert "|" not in result
 
 
-def test_sanitize_tts_text_speaks_textarea_as_text_area():
-    assert sanitize_tts_text("textarea textareas click|change|focus").text == "text area text areas click or change or focus"
+def test_sanitize_tts_text_speaks_textarea_iife_and_dom_terms():
+    result = sanitize_tts_text("textarea textareas IIFE DOM click|change|focus").text
+
+    assert result == "text area text areas eye eye eff ee dom click or change or focus"
+
+
+def test_sanitize_tts_text_summarizes_endpoint_bullet_blocks():
+    raw = """The system provides the following API methods:
+- **GET** /api/v1/form-controls to list all controls.
+- **GET** /api/v1/form-controls/assets to list asset files.
+- **GET** /api/v1/form-controls/discover-keys to discover literal data-fc-key usages.
+- **POST** /api/v1/form-controls to create a new entry.
+- **PUT** /api/v1/form-controls/{id} to update an entry.
+- **DELETE** /api/v1/form-controls/{id} to remove an entry.
+
+Done."""
+
+    result = sanitize_tts_text(raw).text
+
+    assert result == (
+        "The system provides the following A pee eye methods:\n\n"
+        "There is an A pee eye endpoint list with 6 endpoints using GET, POST, PUT, and DELETE. "
+        "It is summarized here rather than read row by row.\n\n"
+        "Done."
+    )
+    assert "**" not in result
+    assert "/api/" not in result
 
 
 def test_sanitize_tts_text_removes_only_top_backlink():

@@ -18,7 +18,7 @@ import sqlite3
 import subprocess
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -40,14 +40,8 @@ from .nullclaw_docs_search import (
 from .sync.queue import enqueue_for_all_peers
 from .tts_sanitizer import (
     prepare_tts_markdown_for_llm,
-    speak_remaining_pipes,
-    speak_tts_acronyms,
-    speak_tts_file_extensions,
-    speak_tts_identifiers,
-    speak_tts_known_terms,
+    sanitize_tts_text,
     strip_top_backlink_line,
-    summarize_fenced_code_blocks,
-    summarize_markdown_tables,
 )
 
 log = logging.getLogger(__name__)
@@ -171,11 +165,11 @@ def _source_timestamp_slug(path: Path) -> str:
         mtime = path.stat().st_mtime
     except OSError as exc:
         raise HTTPException(404, "doc file not found") from exc
-    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return datetime.fromtimestamp(mtime).strftime("%Y%m%d-%H%M%S")
 
 
 def _now_timestamp_slug() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def _safe_cache_rel_parent(doc_path: str) -> Path:
@@ -278,39 +272,30 @@ def _clamp_source_markdown(markdown: str, limit: int = 28000) -> str:
 
 def _clean_doc_speech_markdown(text: str) -> str:
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = summarize_fenced_code_blocks(cleaned)
-    cleaned = summarize_markdown_tables(cleaned)
-    cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
-    cleaned = cleaned.replace("`", "")
     cleaned = _strip_frontmatter(cleaned)
-    cleaned = strip_top_backlink_line(cleaned)
-    cleaned = speak_tts_known_terms(cleaned)
-    cleaned = speak_tts_file_extensions(cleaned)
-    cleaned = speak_tts_identifiers(cleaned)
-    cleaned = speak_tts_acronyms(cleaned)
-    cleaned = speak_remaining_pipes(cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return sanitize_tts_text(cleaned).text
 
 
 _DOC_SPEECH_SYSTEM_PROMPT = """
 You write narration scripts for local documentation pages.
 
-Convert the supplied Markdown document into speech-friendly Markdown for TTS.
+Convert the supplied Markdown document into a plain text narration script for TTS.
 
 Rules:
 - Preserve the document's real details, statuses, warnings, dates, names, paths, commands, and relationships.
-- Do not include YAML front matter.
+- Output plain text only. Do not use Markdown headings, bullets, numbered lists, bold markers, code fences, tables, YAML front matter, or link syntax.
 - Do not recite raw Markdown syntax, table pipes, link URLs, or every repetitive table cell.
 - For links, say their human meaning, such as "link to the responsive header notes".
 - For tables, read every row for understanding, then output only a prose summary. Never output Markdown table pipes or row-by-row table text.
+- For endpoint tables or method lists, summarize the A pee eye surface in prose. Mention the main capabilities, not every GET, POST, PUT, or DELETE row.
+- For file lists, summarize the implementation areas in prose. Mention important files only when they explain the architecture.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
 - Preserve fenced code blocks as examples; summarize what they illustrate instead of reading raw tags, attributes, or source lines.
 - For inline code identifiers, prefer speech-friendly words: form_controls becomes "form controls"; data-fc-key becomes "data eff sea key".
 - Spell important acronyms phonetically where it helps narration: LXC becomes "ell ex sea"; SVG becomes "ess vee gee"; AI becomes "ay eye".
-- Keep headings when they help pacing, but make them sound like spoken section titles.
+- Use short paragraph breaks for pacing. If a section title helps, write it as a plain sentence with a full stop.
 - Do not add citations, source labels, or commentary about being an AI.
-- Output only the narration Markdown.
+- Output only the narration text.
 """.strip()
 
 
@@ -366,7 +351,7 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> str:
         f"Document title: {title}\n"
         f"Document path: {doc_path}\n"
         f"Description: {description or 'None'}\n\n"
-        "Rewrite this document as a narrated version for TTS playback:\n\n"
+        "Rewrite this document as a plain text narrated version for TTS playback:\n\n"
         f"{speech_source}"
     )
     answer = await _complete_doc_speech_local(
