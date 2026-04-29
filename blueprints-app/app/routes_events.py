@@ -79,6 +79,10 @@ class EventOut(BaseModel):
     created_at: float
     payload: dict[str, Any]
 
+    def to_sse(self) -> str:
+        """Render persisted events in the same SSE format as live AppEvent."""
+        return f"id:{self.event_id}\ndata:{json.dumps(self.model_dump())}\n\n"
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
