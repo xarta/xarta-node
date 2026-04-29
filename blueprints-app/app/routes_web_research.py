@@ -23,6 +23,7 @@ _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "web-research-speech-cache"
 _DEFAULT_ADAPTER_URL = "http://172.31.250.2:18080"
 _DEFAULT_TIMEOUT_SECONDS = 180.0
+_WEB_RESEARCH_SPEECH_VERSION = 2
 _TASK_TERMINAL_STATES = {"succeeded", "partial", "failed", "timed_out", "canceled", "rejected"}
 _DEPTH_POLICIES = {
     "quick": {
@@ -56,6 +57,43 @@ _PRIVATE_TARGET_RE = re.compile(
 _SECRETISH_RE = re.compile(
     r"(?i)\b(api[_ -]?key|authorization|bearer|cookie|password|passwd|secret|token)\b"
 )
+_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
+_EXCLUDED_SPEECH_SECTION_TITLES = {
+    "query plan",
+    "sources",
+    "source",
+    "references",
+    "reference",
+    "citations",
+    "citation",
+    "warnings",
+    "warning",
+    "firewall notes",
+    "firewall note",
+    "boundary notes",
+    "boundary note",
+    "research boundary notes",
+    "research boundary note",
+    "diagnostics",
+    "diagnostic notes",
+}
+
+_WEB_RESEARCH_SPEECH_SYSTEM_PROMPT = """
+You write narration scripts for public web research results.
+
+Convert the supplied Markdown synthesis into a plain text narration script for TTS.
+
+Rules:
+- Preserve the useful answer, caveats, comparisons, dates, names, and practical takeaways.
+- Output plain text only. Do not use Markdown headings, bullets, numbered lists, bold markers, link syntax, tables, or source citations.
+- Do not narrate source lists, references, URLs, query plans, diagnostics, adapter notes, firewall notes, or boundary notes.
+- Do not say source labels such as S one or bracketed citations.
+- Use short paragraph breaks for pacing.
+- If a section title helps the listener, write it as a plain sentence with a full stop.
+- Rewrite visual fragments into natural spoken prose. Avoid reading raw punctuation or Markdown syntax.
+- Do not add commentary about being an AI.
+- Output only the narration text.
+""".strip()
 
 
 Depth = Literal["quick", "standard", "deep"]
@@ -230,40 +268,125 @@ def _speech_safe_text(value: Any) -> str:
     text = re.sub(r"https?://\S+", "source link", text)
     text = re.sub(r"mailto:\S+", "source link", text)
     text = re.sub(r"\[\d+\]", "", text)
+    text = re.sub(r"\[[Ss]\d+\]", "", text)
+    text = re.sub(r"\s+([.,;!?])", r"\1", text)
     return text
 
 
-def _speech_markdown(
-    *,
-    query: str,
-    summary_markdown: str,
-    sources: list[dict[str, Any]],
-    warnings: list[str],
-    firewall_notes: list[str],
-) -> str:
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"\s*<think>.*?</think>\s*", "", str(text or ""), flags=re.DOTALL).strip()
+
+
+def _clean_section_title(title: str) -> str:
+    clean = re.sub(r"[*_`[\]()]+", "", str(title or "")).strip().lower()
+    clean = re.sub(r"[^a-z0-9]+", " ", clean)
+    return " ".join(clean.split())
+
+
+def _strip_non_speech_sections(markdown: str) -> str:
+    out: list[str] = []
+    skip = False
+    for raw_line in str(markdown or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = _MARKDOWN_HEADING_RE.match(raw_line)
+        if heading:
+            title = _clean_section_title(heading.group("title"))
+            skip = title in _EXCLUDED_SPEECH_SECTION_TITLES
+            if skip:
+                continue
+        if not skip:
+            out.append(raw_line)
+    return "\n".join(out).strip()
+
+
+def _clamp_speech_source_markdown(markdown: str, limit: int = 18000) -> str:
+    text = str(markdown or "").strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rsplit("\n## ", 1)[0].strip()
+    if len(clipped) < limit * 0.5:
+        clipped = text[:limit].rsplit("\n", 1)[0].strip()
+    return clipped + "\n\n[Research synthesis continues beyond this prompt window.]"
+
+
+def _clean_web_research_speech_markdown(text: str) -> str:
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\s+([.,;!?])", r"\1", sanitize_tts_text(cleaned).text)
+
+
+def _speech_markdown(*, query: str, summary_markdown: str) -> str:
     lines = [f"Web research for: {_speech_safe_text(query)}", ""]
-    clean_summary = _speech_safe_text(
-        re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", summary_markdown)
-    ).strip()
+    clean_summary = _speech_safe_text(_strip_non_speech_sections(summary_markdown)).strip()
     if clean_summary:
         lines.append(clean_summary)
-    if sources:
-        lines.extend(["", "Sources."])
-        for item in sources[:4]:
-            title = _text(_speech_safe_text(item.get("title")), 180)
-            snippet = _text(_speech_safe_text(item.get("snippet")), 240)
-            if title and snippet:
-                lines.append(f"{item['label']} {title} says: {snippet}")
-            elif title:
-                lines.append(f"{item['label']} {title}.")
-    if warnings:
-        lines.extend(["", "Warnings.", *[_speech_safe_text(item) for item in warnings[:4]]])
-    if firewall_notes:
-        lines.extend(
-            ["", "Research boundary notes.", *[_speech_safe_text(item) for item in firewall_notes[:3]]]
-        )
     prepared = prepare_tts_markdown_for_llm("\n".join(lines))
-    return sanitize_tts_text(prepared).text
+    return re.sub(r"\s+([.,;!?])", r"\1", sanitize_tts_text(prepared).text)
+
+
+async def _complete_web_research_speech_local(messages: list[dict[str, str]]) -> str:
+    base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
+    api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
+    model = (
+        os.environ.get("WEB_RESEARCH_SPEECH_LLM_MODEL")
+        or os.environ.get("DOC_SPEECH_LLM_MODEL")
+        or ""
+    ).strip()
+    if not base_url:
+        raise HTTPException(503, "LITELLM_BASE_URL is not configured for web research narration")
+    if not api_key:
+        raise HTTPException(503, "LITELLM_API_KEY is not configured for web research narration")
+    if not model:
+        raise HTTPException(503, "WEB_RESEARCH_SPEECH_LLM_MODEL or DOC_SPEECH_LLM_MODEL is not configured")
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 2600,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = float(
+        os.environ.get(
+            "WEB_RESEARCH_SPEECH_LLM_TIMEOUT",
+            os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "75"),
+        )
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Local LLM web research narration generation timed out") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, f"Local LLM narration endpoint unavailable: {exc}") from exc
+    if resp.status_code >= 400:
+        detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        raise HTTPException(502, f"Local LLM web research narration generation failed: {detail}")
+    try:
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise HTTPException(502, "Local LLM returned an invalid web research narration response") from exc
+    return _strip_think_blocks(str(answer or ""))
+
+
+async def _generate_web_research_speech_markdown(query: str, summary_markdown: str) -> str:
+    speech_source = _clamp_speech_source_markdown(
+        prepare_tts_markdown_for_llm(_strip_non_speech_sections(summary_markdown))
+    )
+    user_prompt = (
+        "/no-think\n"
+        f"Web research query: {query}\n\n"
+        "Rewrite this web research synthesis as a plain text narrated version for TTS playback:\n\n"
+        f"{speech_source}"
+    )
+    answer = await _complete_web_research_speech_local(
+        [
+            {"role": "system", "content": _WEB_RESEARCH_SPEECH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+    speech = _clean_web_research_speech_markdown(answer)
+    if not speech:
+        raise HTTPException(502, "Local LLM returned an empty web research narration")
+    return speech
 
 
 def _cache_key(
@@ -277,6 +400,7 @@ def _cache_key(
         "query": query.strip(),
         "depth": depth,
         "markdown_digest": markdown_digest,
+        "speech_version": _WEB_RESEARCH_SPEECH_VERSION,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:32]
 
@@ -314,6 +438,9 @@ def _read_speech_cache(cache_key: str) -> dict[str, Any] | None:
         raise HTTPException(500, f"Could not read web research speech cache: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("markdown"), str):
         return None
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    if meta.get("speech_version") != _WEB_RESEARCH_SPEECH_VERSION:
+        return None
     return data
 
 
@@ -324,7 +451,7 @@ def _write_speech_cache(cache_key: str, markdown: str, meta: dict[str, Any]) -> 
         "cache_key": cache_key,
         "generated_at": _now_iso(),
         "markdown": sanitize_tts_text(markdown).text,
-        "meta": meta,
+        "meta": {**meta, "speech_version": _WEB_RESEARCH_SPEECH_VERSION},
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,9 +492,6 @@ def _display_envelope(
     audio = _speech_markdown(
         query=body.query,
         summary_markdown=markdown,
-        sources=sources,
-        warnings=warnings,
-        firewall_notes=firewall_notes,
     )
     return {
         "summary_markdown": markdown,
@@ -480,16 +604,6 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
         depth=body.depth,
         markdown=display["summary_markdown"],
     )
-    _write_speech_cache(
-        cache_key,
-        display["audio_markdown"],
-        {
-            "query": query,
-            "depth": body.depth,
-            "task_id": task_id,
-            "source": "query",
-        },
-    )
     status = str(data.get("state") or "unknown")
     return {
         "ok": status in {"succeeded", "partial"},
@@ -538,16 +652,7 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
 
     query = (body.query or display.get("query") or "web research").strip()
     _validate_public_query(query)
-    source_items = display.get("source_items") if isinstance(display.get("source_items"), list) else []
-    warnings = _list_text(display.get("warnings"), limit=12, item_limit=600)
-    firewall_notes = _list_text(display.get("firewall_notes"), limit=8, item_limit=600)
-    audio = _speech_markdown(
-        query=query,
-        summary_markdown=markdown,
-        sources=[item for item in source_items if isinstance(item, dict)],
-        warnings=warnings,
-        firewall_notes=firewall_notes,
-    )
+    audio = await _generate_web_research_speech_markdown(query=query, summary_markdown=markdown)
     if not cache_key:
         cache_key = _cache_key(
             query=query,
