@@ -127,6 +127,14 @@ async def list_bookmarks(
 
 # ── Static GET routes — MUST come before /{bookmark_id} ──────────────────────
 
+
+@router.get("/dead-link-check-count", response_model=dict)
+async def dead_link_check_count() -> dict:
+    with get_conn() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM bookmarks WHERE archived=0").fetchone()[0]
+    return {"count": int(count)}
+
+
 @router.get("/health", response_model=dict)
 async def bookmarks_health() -> dict:
     with get_conn() as conn:
@@ -917,7 +925,7 @@ async def check_dead_links(
     """
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT bookmark_id, url, title FROM bookmarks WHERE archived=0 LIMIT 5000"
+            "SELECT bookmark_id, url, title FROM bookmarks WHERE archived=0"
         ).fetchall()
     bookmarks = [dict(r) for r in rows]
 
