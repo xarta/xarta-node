@@ -15,6 +15,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from .db import get_conn
 from .tts_sanitizer import prepare_tts_markdown_for_llm, sanitize_tts_text
 
 router = APIRouter(prefix="/web-research", tags=["web-research"])
@@ -22,6 +23,7 @@ router = APIRouter(prefix="/web-research", tags=["web-research"])
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "web-research-speech-cache"
 _PRIVACY_MODE_DOC = _NODE_LOCAL_ROOT / "docs" / "null-claw-web-research" / "PRIVACY-MODE.md"
+_PRIVACY_MODE_DOC_REL = "docs/null-claw-web-research/PRIVACY-MODE.md"
 _DEFAULT_ADAPTER_URL = "http://172.31.250.2:18080"
 _DEFAULT_TIMEOUT_SECONDS = 180.0
 _WEB_RESEARCH_SPEECH_VERSION = 2
@@ -561,10 +563,16 @@ async def web_research_privacy_doc() -> dict[str, Any]:
         markdown = _PRIVACY_MODE_DOC.read_text(encoding="utf-8")
     except OSError as exc:
         raise HTTPException(404, "Web research privacy-mode document is not available") from exc
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT doc_id FROM docs WHERE lower(path)=lower(?) LIMIT 1",
+            (_PRIVACY_MODE_DOC_REL,),
+        ).fetchone()
     return {
         "ok": True,
         "title": "Web Research Privacy Mode",
-        "source": "docs/null-claw-web-research/PRIVACY-MODE.md",
+        "source": _PRIVACY_MODE_DOC_REL,
+        "doc_id": row["doc_id"] if row else None,
         "markdown": markdown,
     }
 
