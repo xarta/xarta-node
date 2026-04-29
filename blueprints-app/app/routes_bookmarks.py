@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -15,8 +16,8 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from .ai_client import embed, rerank, complete
-from .db import get_conn, get_setting, set_setting, increment_gen
+from .ai_client import complete, embed, rerank
+from .db import get_conn, get_setting, increment_gen, set_setting
 from .models import (
     BookmarkCreate,
     BookmarkImportRequest,
@@ -34,15 +35,19 @@ from .seekdb import (
     vector_search_visits,
 )
 from .seekdb_sync import (
-    trigger_seekdb_sync,
-    reindex_all as _do_reindex_all,
-    analyze_domains as _do_analyze_domains,
-    get_reindex_state,
-    SETTING_EXCLUDED_TAGS,
-    SETTING_DOMAIN_THRESHOLD,
-    SETTING_RARE_DOMAINS,
-    DEFAULT_EXCLUDED_TAGS,
     DEFAULT_DOMAIN_THRESHOLD,
+    DEFAULT_EXCLUDED_TAGS,
+    SETTING_DOMAIN_THRESHOLD,
+    SETTING_EXCLUDED_TAGS,
+    SETTING_RARE_DOMAINS,
+    get_reindex_state,
+    trigger_seekdb_sync,
+)
+from .seekdb_sync import (
+    analyze_domains as _do_analyze_domains,
+)
+from .seekdb_sync import (
+    reindex_all as _do_reindex_all,
 )
 from .sync.queue import enqueue_for_all_peers
 
@@ -620,6 +625,26 @@ The user will supply the search query, the top results in final sort order (as a
 Your job: explain clearly and concisely WHY each result is in its current position. Walk through the compound sort key. Identify which tier group(s) are present, point out what's driving the ordering within each group, and flag any interesting cases (e.g. a result with a great reranker_rank that is not at the top because exact_tier or cosine_distance pushed it down). Use markdown with clear sections.
 """.strip()
 
+_SORT_EXPLAIN_MODEL_ENV_KEYS = ("BOOKMARKS_SORT_EXPLAIN_MODEL", "DOC_SPEECH_LLM_MODEL")
+
+
+def _sort_explain_model() -> str | None:
+    for key in _SORT_EXPLAIN_MODEL_ENV_KEYS:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _sort_explain_number(value) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)[:48]
+
+
+def _sort_explain_url_text(value) -> str:
+    return str(value or "")[:500]
+
 
 @router.post("/sort-explain", response_model=dict)
 async def post_sort_explain(body: dict) -> dict:
@@ -632,17 +657,18 @@ async def post_sort_explain(body: dict) -> dict:
     if not results:
         raise HTTPException(400, "No results provided")
 
-    # Strip large fields to keep the prompt tight but keep all scoring fields
+    # Strip large fields to keep the prompt tight, but preserve the fields
+    # that explain ordering: visible URL text, sort tiers, score arms, and scores.
     slim = []
-    for i, r in enumerate(results):
+    for i, r in enumerate(results[:20]):
         slim.append({
             "rank": i + 1,
             "title": (r.get("title") or "")[:120],
-            "url": (r.get("url") or "")[:100],
+            "url_text": _sort_explain_url_text(r.get("url")),
             "score_sources": r.get("score_sources"),
             "kw_tier": r.get("kw_tier"),
-            "cosine_distance": r.get("cosine_distance"),
-            "rrf_score": r.get("rrf_score"),
+            "cosine_distance": _sort_explain_number(r.get("cosine_distance")),
+            "rrf_score": _sort_explain_number(r.get("rrf_score")),
             "reranker_rank": r.get("reranker_rank"),
             "exact_tier": r.get("exact_tier"),
             "item_type": r.get("item_type"),
@@ -673,9 +699,12 @@ async def post_sort_explain(body: dict) -> dict:
             max_tokens=2500,
             strip_think=True,
             no_think=True,
+            model_name=_sort_explain_model(),
         )
+        if not answer:
+            raise RuntimeError("LLM returned an empty sort explanation")
     except Exception as e:
-        raise HTTPException(500, f"LLM error: {e}")
+        raise HTTPException(502, f"LLM error: {e}")
 
     return {"explanation": answer}
 
