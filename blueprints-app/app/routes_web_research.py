@@ -102,6 +102,7 @@ Depth = Literal["quick", "standard", "deep"]
 class WebResearchQueryBody(BaseModel):
     query: str = Field(..., min_length=1, max_length=300)
     depth: Depth = "standard"
+    private_mode: bool = False
 
 
 class WebResearchSpeechBody(BaseModel):
@@ -111,6 +112,7 @@ class WebResearchSpeechBody(BaseModel):
     markdown: str | None = Field(default=None, max_length=60000)
     display: dict[str, Any] | None = None
     force_refresh: bool = False
+    private_mode: bool = False
 
 
 def _adapter_url() -> str:
@@ -552,7 +554,7 @@ async def web_research_egress_ip() -> dict[str, Any]:
     }
 
 
-def _task_payload(query: str, depth: str) -> dict[str, Any]:
+def _task_payload(query: str, depth: str, private_mode: bool = False) -> dict[str, Any]:
     policy = dict(_DEPTH_POLICIES.get(depth, _DEPTH_POLICIES["standard"]))
     policy.update(
         {
@@ -565,6 +567,7 @@ def _task_payload(query: str, depth: str) -> dict[str, Any]:
         "task_type": "web_research",
         "objective": query,
         "research_profile": "public_web",
+        "private_mode": bool(private_mode),
         "inputs": {
             "query": query,
             "urls": [],
@@ -588,6 +591,18 @@ async def _submit_task(base_url: str, payload: dict[str, Any]) -> dict[str, Any]
     except httpx.RequestError as exc:
         raise HTTPException(503, f"nullclaw01 research adapter unavailable: {exc}") from exc
     return _decode_response(response, "task submission")
+
+
+async def _purge_task(base_url: str, task_id: str) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            response = await client.post(f"{base_url}/tasks/{task_id}/purge", json={})
+    except httpx.RequestError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        return _decode_response(response, "task purge")
+    except HTTPException as exc:
+        return {"ok": False, "error": str(exc.detail)}
 
 
 async def _poll_task(base_url: str, task_id: str) -> dict[str, Any]:
@@ -617,22 +632,24 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
-    submitted = await _submit_task(base_url, _task_payload(query, body.depth))
+    submitted = await _submit_task(base_url, _task_payload(query, body.depth, body.private_mode))
     task_id = str(submitted.get("id") or "").strip()
     if not task_id:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
     data = await _poll_task(base_url, task_id)
     display = _display_envelope(body=body, data=data)
-    cache_key = _cache_key(
+    cache_key = None if body.private_mode else _cache_key(
         query=query,
         depth=body.depth,
         markdown=display["summary_markdown"],
     )
+    purge = await _purge_task(base_url, task_id) if body.private_mode else None
     status = str(data.get("state") or "unknown")
     return {
         "ok": status in {"succeeded", "partial"},
         "query": query,
         "depth": body.depth,
+        "private_mode": body.private_mode,
         "status": status,
         "display": display,
         "raw": {
@@ -647,6 +664,7 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
                 ),
                 "source_count": len(display["source_items"]),
                 "warning_count": len(display["warnings"]),
+                "purged": purge if body.private_mode else None,
             }
         },
         "cache_key": cache_key,
@@ -656,7 +674,7 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
 @router.post("/speech", response_model=dict)
 async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
     cache_key = (body.cache_key or "").strip()
-    if cache_key and not body.force_refresh:
+    if cache_key and not body.force_refresh and not body.private_mode:
         cached = _read_speech_cache(cache_key)
         if cached:
             return {
@@ -677,6 +695,13 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
     query = (body.query or display.get("query") or "web research").strip()
     _validate_public_query(query)
     audio = await _generate_web_research_speech_markdown(query=query, summary_markdown=markdown)
+    if body.private_mode:
+        return {
+            "ok": True,
+            "cache": "private",
+            "cache_key": None,
+            "markdown": audio,
+        }
     if not cache_key:
         cache_key = _cache_key(
             query=query,
