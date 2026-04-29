@@ -4,8 +4,9 @@
 # What this script does (idempotent):
 #   1. Installs XFCE, xrdp, and xorgxrdp.
 #   2. Writes ~/.xsession for the xarta user to start XFCE.
-#   3. Enables and starts xrdp.
-#   4. Optionally marks XRDP as enabled in .env so setup-firewall.sh can open 3389.
+#   3. Ensures sesman's Xorg config path exists.
+#   4. Enables and starts xrdp.
+#   5. Optionally marks XRDP as enabled in .env so setup-firewall.sh can open 3389.
 
 set -euo pipefail
 
@@ -111,6 +112,19 @@ if [[ -f /etc/xrdp/sesman.ini ]]; then
     sed -i 's/^ListenAddress=0\.0\.0\.0$/ListenAddress=127.0.0.1/' /etc/xrdp/sesman.ini
     sed -i 's/^ListenAddress=::1$/ListenAddress=127.0.0.1/' /etc/xrdp/sesman.ini
 fi
+
+# Debian's xorgxrdp package ships this under /etc/X11/xrdp, while this
+# sesman.ini uses "-config xrdp/xorg.conf" relative to /etc/xrdp.
+if [[ -f /etc/X11/xrdp/xorg.conf ]]; then
+    install -d -m 755 /etc/xrdp/xrdp
+    install -m 644 /etc/X11/xrdp/xorg.conf /etc/xrdp/xrdp/xorg.conf
+fi
+
+# These nodes use XRDP sessions, not a local graphical greeter. Leaving
+# lightdm enabled in headless/LXC-style environments creates noisy failed
+# boot units when it cannot find a physical screen.
+systemctl disable --now lightdm >/dev/null 2>&1 || true
+systemctl reset-failed lightdm >/dev/null 2>&1 || true
 
 install -d -m 755 /etc/polkit-1/rules.d
 cat > "$POLKIT_RULE_FILE" <<EOF

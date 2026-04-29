@@ -11,6 +11,8 @@
 #        - TCP 80   (Caddy HTTP → HTTPS redirect)
 #        - TCP 443  (Caddy HTTPS)
 #        - TCP 3389 (XRDP) when XARTA_ENABLE_XRDP=true
+#          Uses XARTA_XRDP_ALLOWED_CIDRS plus explicit primary_ip/tailnet_ip
+#          values from .nodes.json for trusted xarta-node fleet peers.
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
 #        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
 #        - TCP+UDP 22000 (Syncthing BEP asset sync)  — per-peer-IP from .nodes.json only
@@ -80,6 +82,24 @@ fi
 echo "=== Firewall setup ==="
 echo ""
 
+NODES_JSON="$SCRIPT_DIR/.nodes.json"
+PEER_IPS=""
+if [[ -f "$NODES_JSON" ]]; then
+    # Extract all primary_ip and tailnet_ip values from every node entry.
+    PEER_IPS=$(python3 -c "
+import json
+data = json.load(open('$NODES_JSON'))
+ips = set()
+for n in data.get('nodes', []):
+    for field in ('primary_ip', 'tailnet_ip'):
+        v = n.get(field, '').strip()
+        if v:
+            ips.add(v)
+for ip in sorted(ips):
+    print(ip)
+")
+fi
+
 # ── Step 1 — Kernel module ────────────────────────────────────────────────────
 echo "Step 1: Loading nf_conntrack kernel module..."
 modprobe nf_conntrack 2>/dev/null || true
@@ -133,6 +153,14 @@ if [[ "$XARTA_ENABLE_XRDP" == "true" ]]; then
         iptables -A XARTA_INPUT -p tcp --dport 3389 -j ACCEPT
         echo "    added: TCP 3389 (XRDP) → ACCEPT"
     fi
+    if [[ -n "$PEER_IPS" ]]; then
+        while IFS= read -r ip; do
+            iptables -A XARTA_INPUT -p tcp --dport 3389 -s "$ip" -j ACCEPT
+            echo "    added: TCP 3389 from $ip (XRDP xarta-node peer) → ACCEPT"
+        done <<< "$PEER_IPS"
+    else
+        echo -e "    ${YELLOW}Warning:${NC} no .nodes.json peer IPs found — XRDP xarta-node peer rules not added."
+    fi
 fi
 
 # Tailscale WireGuard — direct peer connections.
@@ -146,24 +174,10 @@ echo "    added: UDP 41641 (Tailscale/WireGuard) → ACCEPT"
 #   Port 8443 — mTLS sync via Caddy only. Per-peer-IP from .nodes.json.
 # Port 8080 is deliberately excluded: uvicorn on 8080 is loopback-only and all
 # inter-node sync runs over mTLS on 8443. The browser GUI never uses either port.
-NODES_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.nodes.json"
 if [[ ! -f "$NODES_JSON" ]]; then
     echo -e "${YELLOW}Warning:${NC} .nodes.json not found at $NODES_JSON"
     echo "  Port 8443 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
 else
-    # Extract all primary_ip and tailnet_ip values from every node entry.
-    PEER_IPS=$(python3 -c "
-import json, sys
-data = json.load(open('$NODES_JSON'))
-ips = set()
-for n in data.get('nodes', []):
-    for field in ('primary_ip', 'tailnet_ip'):
-        v = n.get(field, '').strip()
-        if v:
-            ips.add(v)
-for ip in sorted(ips):
-    print(ip)
-")
     if [[ -z "$PEER_IPS" ]]; then
         echo -e "${YELLOW}Warning:${NC} No IPs found in .nodes.json — skipping port 8443 rules."
     else
