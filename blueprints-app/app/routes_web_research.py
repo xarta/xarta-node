@@ -21,6 +21,7 @@ router = APIRouter(prefix="/web-research", tags=["web-research"])
 
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "web-research-speech-cache"
+_PRIVACY_MODE_DOC = _NODE_LOCAL_ROOT / "docs" / "null-claw-web-research" / "PRIVACY-MODE.md"
 _DEFAULT_ADAPTER_URL = "http://172.31.250.2:18080"
 _DEFAULT_TIMEOUT_SECONDS = 180.0
 _WEB_RESEARCH_SPEECH_VERSION = 2
@@ -551,6 +552,20 @@ async def web_research_egress_ip() -> dict[str, Any]:
         "reverse_dns": _text(data.get("reverse_dns"), 220) if data.get("reverse_dns") else None,
         "server_domain": _text(data.get("server_domain"), 220) if data.get("server_domain") else None,
         "server_dns_lookup": data.get("server_dns_lookup") if isinstance(data.get("server_dns_lookup"), list) else None,
+    }
+
+
+@router.get("/privacy-doc", response_model=dict)
+async def web_research_privacy_doc() -> dict[str, Any]:
+    try:
+        markdown = _PRIVACY_MODE_DOC.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(404, "Web research privacy-mode document is not available") from exc
+    return {
+        "ok": True,
+        "title": "Web Research Privacy Mode",
+        "source": "docs/null-claw-web-research/PRIVACY-MODE.md",
+        "markdown": markdown,
     }
 
 
