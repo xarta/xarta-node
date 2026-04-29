@@ -528,6 +528,30 @@ async def web_research_health() -> dict[str, Any]:
     }
 
 
+@router.get("/egress-ip", response_model=dict)
+async def web_research_egress_ip() -> dict[str, Any]:
+    ok, data, error = await _adapter_get("/egress-ip", timeout=24.0)
+    if not ok or not isinstance(data, dict):
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "service": "nullclaw01-autonomous-web-research",
+            "error": error or "nullclaw01 research adapter did not return egress IP data",
+        }
+    return {
+        "ok": bool(data.get("ok")),
+        "status": "available" if data.get("ok") else "unavailable",
+        "service": "nullclaw01-autonomous-web-research",
+        "ip": _text(data.get("ip"), 80),
+        "checked_at": data.get("checked_at"),
+        "source": _text(data.get("source"), 120),
+        "tool_path": _text(data.get("tool_path"), 220),
+        "reverse_dns": _text(data.get("reverse_dns"), 220) if data.get("reverse_dns") else None,
+        "server_domain": _text(data.get("server_domain"), 220) if data.get("server_domain") else None,
+        "server_dns_lookup": data.get("server_dns_lookup") if isinstance(data.get("server_dns_lookup"), list) else None,
+    }
+
+
 def _task_payload(query: str, depth: str) -> dict[str, Any]:
     policy = dict(_DEPTH_POLICIES.get(depth, _DEPTH_POLICIES["standard"]))
     policy.update(
