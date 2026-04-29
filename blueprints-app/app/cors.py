@@ -22,7 +22,6 @@ Why not allow_origins=["*"]?
 import json
 import logging
 import time
-from typing import Iterable
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request

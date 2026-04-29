@@ -13,18 +13,17 @@ import json
 import logging
 import os
 import subprocess
-from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from .sync.drain import _make_sync_client
 from starlette.responses import Response
 
 from . import config as cfg
 from .auth import compute_token
 from .db import get_conn
 from .models import NodeOut, RepoVersionsOut
+from .sync.drain import _make_sync_client
 
 log = logging.getLogger(__name__)
 
@@ -311,7 +310,7 @@ async def get_node_pct_status(node_id: str) -> dict:
     pve_host = pve_row["pve_host"]
     vmid     = pve_row["vmid"]
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing, resolve_env_key
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args, resolve_env_key
 
     try:
         ssh_args = make_ssh_args(pve_host, connect_timeout=6)
@@ -371,7 +370,7 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
     pve_host = pve_row["pve_host"]
     vmid     = pve_row["vmid"]
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing, resolve_env_key
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args, resolve_env_key
 
     try:
         ssh_args = make_ssh_args(pve_host, connect_timeout=10)

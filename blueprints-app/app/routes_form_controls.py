@@ -29,8 +29,8 @@ from starlette.responses import Response
 
 from . import config as cfg
 from .db import get_conn, increment_gen
+from .models import FormControlCreate, FormControlOut, FormControlUpdate
 from .sync.queue import enqueue_for_all_peers
-from .models import FormControlCreate, FormControlUpdate, FormControlOut
 
 log = logging.getLogger(__name__)
 

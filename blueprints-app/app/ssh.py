@@ -22,7 +22,6 @@ import os
 
 from .db import get_conn
 
-
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class SshTargetNotFound(RuntimeError):

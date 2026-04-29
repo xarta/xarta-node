@@ -8,8 +8,8 @@ Optional fields default to None so partial updates are expressible.
 from __future__ import annotations
 
 from typing import Any, Optional
-from pydantic import BaseModel, Field
 
+from pydantic import BaseModel, Field
 
 # ── Machine ───────────────────────────────────────────────────────────────────
 

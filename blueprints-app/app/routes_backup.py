@@ -25,8 +25,8 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from starlette.responses import Response
 from pydantic import BaseModel, Field
+from starlette.responses import Response
 
 from . import config as cfg
 from .auth import compute_token

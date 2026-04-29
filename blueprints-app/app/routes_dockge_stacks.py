@@ -8,8 +8,11 @@ from fastapi import APIRouter, HTTPException
 
 from .db import get_conn, increment_gen
 from .models import (
-    DockgeStackCreate, DockgeStackOut, DockgeStackUpdate,
-    DockgeStackServiceCreate, DockgeStackServiceOut, DockgeStackServiceUpdate,
+    DockgeStackCreate,
+    DockgeStackOut,
+    DockgeStackServiceCreate,
+    DockgeStackServiceOut,
+    DockgeStackUpdate,
 )
 from .sync.queue import enqueue_for_all_peers
 
@@ -254,7 +257,7 @@ async def probe_dockge_stacks() -> dict:
     if not os.path.isfile(script):
         raise HTTPException(500, f"Probe script not found: {script}")
 
-    from .ssh import resolve_env_key, SshKeyMissing
+    from .ssh import SshKeyMissing, resolve_env_key
 
     env = {**os.environ}
     for key_var in ("PROXMOX_SSH_KEY", "VM_SSH_KEY", "LXC_SSH_KEY",

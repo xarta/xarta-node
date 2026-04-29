@@ -4,7 +4,6 @@ import json
 
 from fastapi import APIRouter, HTTPException
 
-from . import config as cfg
 from .db import get_conn, increment_gen
 from .models import ServiceCreate, ServiceOut, ServiceUpdate
 from .sync.queue import enqueue_for_all_peers

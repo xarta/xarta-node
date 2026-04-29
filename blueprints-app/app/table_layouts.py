@@ -7,7 +7,6 @@ import json
 import re
 from typing import Any
 
-
 _HEX_RE = re.compile(r"^[0-9A-F]+$")
 _BUCKET_MASK = 0x1F
 _MIN_WIDTH = 56

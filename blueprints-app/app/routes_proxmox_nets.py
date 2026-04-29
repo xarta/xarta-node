@@ -258,10 +258,9 @@ async def enrich_nets_from_pfsense_arp() -> dict:
     """
     import asyncio
     import ipaddress
-    import os
     import re
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args
     ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
     if not ssh_target:
         raise HTTPException(503, "PFSENSE_SSH_TARGET is not set in .env")
@@ -391,9 +390,8 @@ async def find_ips_via_pve() -> dict:
     import asyncio
     import ipaddress
     import json as _json
-    import os
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args
 
     with get_conn() as conn:
         pve_hosts = [
@@ -730,9 +728,8 @@ async def find_ips_via_qemu_agent() -> dict:
     """
     import asyncio
     import json as _json
-    import os
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args
 
     with get_conn() as conn:
         missing = conn.execute(
@@ -842,10 +839,9 @@ async def find_ips_via_pfsense_sweep() -> dict:
     import base64
     import ipaddress
     import json as _json
-    import os
     import re
 
-    from .ssh import make_ssh_args, SshTargetNotFound, SshKeyMissing
+    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args
     ssh_target = os.environ.get("PFSENSE_SSH_TARGET", "")
     if not ssh_target:
         raise HTTPException(503, "PFSENSE_SSH_TARGET is not set in .env")

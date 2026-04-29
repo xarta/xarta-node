@@ -19,11 +19,9 @@ import argparse
 import json
 import re
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from html.parser import HTMLParser
-from urllib.parse import urlparse, urlunparse
-
 
 # ── Parser ─────────────────────────────────────────────────────────────────
 
