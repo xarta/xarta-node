@@ -191,6 +191,7 @@ async def complete(
     strip_think: bool = False,
     return_parts: bool = False,
     no_think: bool = False,
+    model_name: str | None = None,
 ) -> str | dict[str, str]:
     """
     Call the LLM provider assigned to *project_name*.
@@ -218,7 +219,7 @@ async def complete(
                 break
 
     payload = {
-        "model": provider["model_name"],
+        "model": model_name or provider["model_name"],
         "messages": msgs,
         "max_tokens": max_tokens,
     }

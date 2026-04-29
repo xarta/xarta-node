@@ -80,6 +80,7 @@ from .routes_tts import router as tts_router
 from .routes_tts_pool import router as tts_pool_router
 from .routes_ui_cache import router as ui_cache_router
 from .routes_vlans import router as vlans_router
+from .routes_web_research import router as web_research_router
 from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
 from .sync.drain import start_drain_loop, stop_drain_loop
 from .sync.queue import enqueue_for_all_peers
@@ -351,6 +352,7 @@ def create_app() -> FastAPI:
     application.include_router(assumptions_router, prefix="/api/v1")
     application.include_router(todo_router, prefix="/api/v1")
     application.include_router(docs_router, prefix="/api/v1")
+    application.include_router(web_research_router, prefix="/api/v1")
     application.include_router(help_router, prefix="/api/v1")
     application.include_router(doc_groups_router, prefix="/api/v1")
     application.include_router(doc_images_router, prefix="/api/v1")
