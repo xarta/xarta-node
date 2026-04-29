@@ -5,7 +5,6 @@ PUT  /api/v1/assumptions        → body: {"content": "..."} → 204
 """
 
 import logging
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException

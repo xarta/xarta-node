@@ -144,7 +144,7 @@ async def probe_caddy_configs() -> dict:
     if not os.path.isfile(script):
         raise HTTPException(500, f"Probe script not found: {script}")
 
-    from .ssh import probe_status_for_host_type, resolve_env_key, SshKeyMissing
+    from .ssh import SshKeyMissing, probe_status_for_host_type, resolve_env_key
     status = probe_status_for_host_type("pve")
     if not status["configured"]:
         raise HTTPException(503, status["reason"])

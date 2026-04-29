@@ -43,8 +43,8 @@ from starlette.responses import Response
 
 from . import config as cfg
 from .db import get_conn, increment_gen
+from .models import NavItemCreate, NavItemOut, NavItemUpdate
 from .sync.queue import enqueue_for_all_peers
-from .models import NavItemCreate, NavItemUpdate, NavItemOut
 
 log = logging.getLogger(__name__)
 
@@ -635,8 +635,6 @@ async def upload_bulk_assets(
         raise HTTPException(400, "asset_type must be 'icons' or 'sounds'")
 
     original_name = file.filename or "upload"
-    ext = "".join(Path(original_name).suffixes).lower()  # e.g. ".tar.gz"
-    # Also check just the last suffix
     last_ext = Path(original_name).suffix.lower()
 
     allowed = _ICON_ALLOWED_EXTS if asset_type == "icons" else _SOUND_ALLOWED_EXTS

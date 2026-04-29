@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException
 
-from .db import get_conn, get_setting, set_setting, increment_gen
+from .db import get_conn, increment_gen, set_setting
 from .models import SettingOut, SettingUpsert
 from .sync.queue import enqueue_for_all_peers
 

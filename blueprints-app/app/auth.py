@@ -4,8 +4,8 @@ Shared 256-bit secrets live in .env (never transmitted on the wire).
 Token = HMAC-SHA256(secret_bytes, str(unix_time // 5).encode())
 A skew of ±1 window gives ~15-second effective validity.
 """
-import hmac
 import hashlib
+import hmac
 import time
 
 

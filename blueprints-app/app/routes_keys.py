@@ -19,7 +19,6 @@ Security notes:
 import json
 import logging
 import os
-import stat
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException

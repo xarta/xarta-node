@@ -4,16 +4,13 @@ import asyncio
 import ipaddress
 import json
 import os
-import subprocess
-import time as _time
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
 from .db import get_conn, increment_gen
 from .models import ProxmoxConfigCreate, ProxmoxConfigOut, ProxmoxConfigUpdate
-from .sync.queue import enqueue_for_all_peers
 from .routes_proxmox_nets import fill_vlan_tags_from_cidrs
+from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/proxmox-config", tags=["proxmox-config"])
 
@@ -211,7 +208,7 @@ async def probe_proxmox_config() -> dict:
     if not os.path.isfile(script):
         raise HTTPException(500, f"Probe script not found: {script}")
 
-    from .ssh import probe_status_for_host_type, resolve_env_key, SshKeyMissing
+    from .ssh import SshKeyMissing, probe_status_for_host_type, resolve_env_key
     status = probe_status_for_host_type("pve")
     if not status["configured"]:
         raise HTTPException(503, status["reason"])
@@ -490,7 +487,7 @@ if [ "$docker_usable" = "1" ]; then
         2>/dev/null | tr -d '[:space:]')
       if [ -n "$stacks" ]; then
         dockge_json=$(json_append "$dockge_json" \
-          "{\"container\":\"${cname}\",\"stacks_dir\":\"${stacks}\"}") 
+          "{\"container\":\"${cname}\",\"stacks_dir\":\"${stacks}\"}")
       fi
     fi
 
@@ -669,7 +666,10 @@ async def probe_vm_services() -> dict:
                 return
 
             out = stdout.decode(errors="replace")
-            line = next((l for l in out.splitlines() if l.startswith("PROBE_RESULT:")), None)
+            line = next(
+                (probe_line for probe_line in out.splitlines() if probe_line.startswith("PROBE_RESULT:")),
+                None,
+            )
             if not line:
                 results.append({"config_id": config_id, "name": name, "ip": ip,
                                  "ok": False, "error": "no probe result"})

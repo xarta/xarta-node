@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from . import config as cfg
 from .db import get_conn
-from .models import FirewallPortCheck, FirewallProbePort, FirewallProbeOut, FirewallStatusOut
+from .models import FirewallPortCheck, FirewallProbeOut, FirewallProbePort, FirewallStatusOut
 
 router = APIRouter(prefix="/firewall", tags=["firewall"])
 
