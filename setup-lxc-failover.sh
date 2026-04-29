@@ -186,7 +186,8 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     iptables-persistent \
     iproute2 \
     iputils-ping \
-    netfilter-persistent
+    netfilter-persistent \
+    tcpdump
 
 # 2. Enable IP Forwarding (Tailscale requirement)
 echo "Configuring sysctl..."
