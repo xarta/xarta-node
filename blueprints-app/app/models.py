@@ -732,6 +732,7 @@ class TableLayoutBucketBits(BaseModel):
 class TableLayoutColumnSeed(BaseModel):
     column_key: Optional[str] = None
     display_name: str
+    header_label: Optional[str] = None
     sqlite_column: Optional[str] = None
     width_px: Optional[int] = None
     min_width_px: Optional[int] = None
