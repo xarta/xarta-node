@@ -11,7 +11,9 @@ Two protection layers applied in order to every inbound request:
      • /api/v1/sync/* routes  →  BLUEPRINTS_SYNC_SECRET
      • all other routes        →  BLUEPRINTS_API_SECRET
 
-Exempt paths (no token required): /health, and anything under /ui.
+Exempt paths (no token required): /health, anything under /ui, and narrow
+read/search endpoints intended for local AI agents. The IP allowlist still
+applies to token-exempt non-loopback requests.
 
 If the relevant secret is empty (initial deploy before .env is configured),
 the token check is skipped with a debug log so the app still starts.
@@ -40,8 +42,23 @@ for _cidr in cfg.ALLOWED_NETWORKS_RAW.split(","):
     except ValueError:
         log.warning("middleware_auth: ignoring invalid CIDR %r", _cidr)
 
-# Paths that require NO token (IP allowlist still applies)
+# Prefixes that require NO token (IP allowlist still applies)
 _TOKEN_EXEMPT_PREFIXES = ("/health", "/ui", "/favicon.ico", "/api/v1/pwa/manifest")
+# Exact API paths that require NO token (IP allowlist still applies). Keep this
+# intentionally narrow: these are lookup/research surfaces advertised to local
+# AI clients through LiteLLM workspace context.
+_TOKEN_EXEMPT_PATHS = frozenset(
+    {
+        "/api/v1/docs/search",
+        "/api/v1/docs/search/explain",
+        "/api/v1/docs/search/status",
+        "/api/v1/docs/search/quality",
+        "/api/v1/web-research/health",
+        "/api/v1/web-research/egress-ip",
+        "/api/v1/web-research/privacy-doc",
+        "/api/v1/web-research/query",
+    }
+)
 # Routes that use SYNC_SECRET instead of API_SECRET
 _SYNC_PREFIX = "/api/v1/sync/"
 # Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
@@ -67,6 +84,12 @@ def _client_ip(request: Request) -> str:
 _LOOPBACK = frozenset({"127.0.0.1", "::1"})
 
 
+def _is_token_exempt_path(path: str) -> bool:
+    return path in _TOKEN_EXEMPT_PATHS or any(
+        path.startswith(prefix) for prefix in _TOKEN_EXEMPT_PREFIXES
+    )
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         ip_str = _client_ip(request)
@@ -90,7 +113,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if path in _BOOKMARKS_OPEN_PATHS:
             return await call_next(request)
-        if not any(path.startswith(p) for p in _TOKEN_EXEMPT_PREFIXES):
+        if not _is_token_exempt_path(path):
             # Prefer the header; fall back to query param so EventSource (which
             # cannot set custom headers) can pass its TOTP token in the URL.
             token = request.headers.get("x-api-token", "")
