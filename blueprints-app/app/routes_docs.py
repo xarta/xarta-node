@@ -42,6 +42,7 @@ from .tts_sanitizer import (
     prepare_tts_markdown_for_llm,
     sanitize_tts_text,
     strip_top_backlink_line,
+    terminate_tts_line_endings,
 )
 
 log = logging.getLogger(__name__)
@@ -250,30 +251,84 @@ def _strip_frontmatter(markdown: str) -> str:
         line_end = text.find("\n", line_start)
         if line_end == -1:
             line_end = len(text)
-        if text[line_start:line_end].strip() == "---":
+        candidate = text[line_start:line_end].strip()
+        if candidate == "---" or candidate.startswith("--- [<-") or candidate.startswith("--- [←"):
             return text[line_end + 1 :].lstrip()
         line_start = line_end + 1
     return text
 
 
-def _clamp_source_markdown(markdown: str, limit: int = 28000) -> str:
+def _doc_speech_env_int(name: str, default: int, minimum: int = 0, maximum: int = 250000) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("docs: invalid %s=%r; using %s", name, raw, default)
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _doc_speech_source_char_limit() -> int:
+    return _doc_speech_env_int("DOC_SPEECH_SOURCE_CHAR_LIMIT", 0, minimum=0, maximum=1000000)
+
+
+def _doc_speech_max_tokens() -> int:
+    return _doc_speech_env_int("DOC_SPEECH_LLM_MAX_TOKENS", 48000, minimum=1024, maximum=128000)
+
+
+def _doc_speech_cache_meta_path(cache_path: Path) -> Path:
+    return cache_path.with_name(f"{cache_path.name}.meta.json")
+
+
+def _clamp_source_markdown(markdown: str, limit: int | None = None) -> tuple[str, dict[str, Any]]:
     text = str(markdown or "")
-    if len(text) <= limit:
-        return text
-    clipped = text[:limit].rsplit("\n## ", 1)[0].strip()
-    if len(clipped) < limit * 0.5:
-        clipped = text[:limit].rsplit("\n", 1)[0].strip()
-    return (
-        clipped
-        + "\n\n[Document continues beyond this prompt window. Preserve the visible details, "
-        "then say that the remaining lower sections should be read from the page.]"
+    source_limit = _doc_speech_source_char_limit() if limit is None else max(0, int(limit))
+    meta = {
+        "source_chars": len(text),
+        "source_char_limit": source_limit,
+        "source_clipped": False,
+        "prompt_source_chars": len(text),
+    }
+    if source_limit <= 0 or len(text) <= source_limit:
+        return text, meta
+
+    meta["source_clipped"] = True
+    meta["prompt_source_chars"] = source_limit
+    log.warning(
+        "docs: doc speech source exceeded DOC_SPEECH_SOURCE_CHAR_LIMIT=%s (%s chars)",
+        source_limit,
+        len(text),
     )
+    return text[:source_limit], meta
+
+
+def _assert_complete_doc_speech(meta: dict[str, Any]) -> None:
+    if meta.get("source_clipped"):
+        limit = meta.get("source_char_limit")
+        chars = meta.get("source_chars")
+        raise HTTPException(
+            413,
+            (
+                "Document speech source exceeded DOC_SPEECH_SOURCE_CHAR_LIMIT "
+                f"({chars} chars > {limit}). Increase the limit or set it to 0 for no app-level source cap."
+            ),
+        )
+    if meta.get("finish_reason") == "length":
+        raise HTTPException(
+            502,
+            (
+                "Local LLM narration hit DOC_SPEECH_LLM_MAX_TOKENS before completing. "
+                "Increase DOC_SPEECH_LLM_MAX_TOKENS and regenerate."
+            ),
+        )
 
 
 def _clean_doc_speech_markdown(text: str) -> str:
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     cleaned = _strip_frontmatter(cleaned)
-    return sanitize_tts_text(cleaned).text
+    return terminate_tts_line_endings(sanitize_tts_text(cleaned).text)
 
 
 _DOC_SPEECH_SYSTEM_PROMPT = """
@@ -287,12 +342,12 @@ Rules:
 - Do not recite raw Markdown syntax, table pipes, link URLs, or every repetitive table cell.
 - For links, say their human meaning, such as "link to the responsive header notes".
 - For tables, read every row for understanding, then output only a prose summary. Never output Markdown table pipes or row-by-row table text.
-- For endpoint tables or method lists, summarize the A pee eye surface in prose. Mention the main capabilities, not every GET, POST, PUT, or DELETE row.
+- For endpoint tables or method lists, summarize the API surface in prose. Mention the main capabilities, not every GET, POST, PUT, or DELETE row.
 - For file lists, summarize the implementation areas in prose. Mention important files only when they explain the architecture.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
 - Preserve fenced code blocks as examples; summarize what they illustrate instead of reading raw tags, attributes, or source lines.
-- For inline code identifiers, prefer speech-friendly words: form_controls becomes "form controls"; data-fc-key becomes "data eff sea key".
-- Spell important acronyms phonetically where it helps narration: LXC becomes "ell ex sea"; SVG becomes "ess vee gee"; AI becomes "ay eye".
+- Preserve inline code identifiers, acronyms, and product names as normal text. The final speech sanitizer handles pronunciation and difficult tokens.
+- Prefer natural spoken forms for obvious joined technical words, for example "allowlist" as "allow list" and "blocklist" as "block list".
 - Use short paragraph breaks for pacing. If a section title helps, write it as a plain sentence with a full stop.
 - Do not add citations, source labels, or commentary about being an AI.
 - Output only the narration text.
@@ -303,7 +358,7 @@ def _strip_think_blocks(text: str) -> str:
     return re.sub(r"\s*<think>.*?</think>\s*", "", str(text or ""), flags=re.DOTALL).strip()
 
 
-async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> str:
+async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
     base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
     model = (os.environ.get("DOC_SPEECH_LLM_MODEL") or "").strip()
@@ -314,13 +369,14 @@ async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> str:
     if not model:
         raise HTTPException(503, "DOC_SPEECH_LLM_MODEL is not configured for local doc narration")
 
+    max_tokens = _doc_speech_max_tokens()
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 4200,
+        "max_tokens": max_tokens,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
-    timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "75"))
+    timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
@@ -333,19 +389,27 @@ async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> str:
         raise HTTPException(502, f"Local LLM narration generation failed: {detail}")
     try:
         data = resp.json()
-        answer = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        answer = choice["message"]["content"]
     except Exception as exc:
         raise HTTPException(502, "Local LLM returned an invalid narration response") from exc
-    return _strip_think_blocks(str(answer or ""))
+    meta = {
+        "llm_model": data.get("model") or model,
+        "max_tokens": max_tokens,
+        "finish_reason": choice.get("finish_reason"),
+        "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+    }
+    return _strip_think_blocks(str(answer or "")), meta
 
 
-async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> str:
+async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple[str, dict[str, Any]]:
     title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
     description = str(doc["description"] or "").strip()
     doc_path = str(doc["path"] or "").strip()
-    speech_source = _clamp_source_markdown(
+    speech_source, source_meta = _clamp_source_markdown(
         prepare_tts_markdown_for_llm(strip_top_backlink_line(_strip_frontmatter(source_markdown)))
     )
+    _assert_complete_doc_speech(source_meta)
     user_prompt = (
         "/no-think\n"
         f"Document title: {title}\n"
@@ -354,16 +418,27 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> str:
         "Rewrite this document as a plain text narrated version for TTS playback:\n\n"
         f"{speech_source}"
     )
-    answer = await _complete_doc_speech_local(
+    answer, llm_meta = await _complete_doc_speech_local(
         [
             {"role": "system", "content": _DOC_SPEECH_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
     )
+    generation_meta = {
+        **source_meta,
+        **llm_meta,
+    }
+    _assert_complete_doc_speech(generation_meta)
     speech = _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty narration")
-    return speech
+    generation_meta.update(
+        {
+            "speech_chars": len(speech),
+            "speech_words": len(speech.split()),
+        }
+    )
+    return speech, generation_meta
 
 
 def _row_to_out(row) -> DocOut:
@@ -1590,6 +1665,13 @@ async def doc_speech(doc_id: str, body: DocSpeechBody | None = None) -> dict[str
             speech = cache_path.read_text(encoding="utf-8")
         except OSError as exc:
             raise HTTPException(500, f"Could not read speech cache: {exc}") from exc
+        speech_meta = None
+        meta_path = _doc_speech_cache_meta_path(cache_path)
+        if meta_path.is_file():
+            try:
+                speech_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning("docs: could not read speech cache metadata %s: %s", meta_path, exc)
         return {
             "ok": True,
             "doc_id": doc_id,
@@ -1598,6 +1680,7 @@ async def doc_speech(doc_id: str, body: DocSpeechBody | None = None) -> dict[str
             "speech_path": str(cache_path),
             "source_version": _source_timestamp_slug(source_path),
             "generated_at": cache_path.name.split("--", 1)[0],
+            "generation": speech_meta,
             "markdown": speech,
         }
     else:
@@ -1608,13 +1691,25 @@ async def doc_speech(doc_id: str, body: DocSpeechBody | None = None) -> dict[str
     except OSError as exc:
         raise HTTPException(500, f"Could not read document: {exc}") from exc
 
-    speech = await _generate_doc_speech_markdown(row, source_markdown)
+    speech, speech_meta = await _generate_doc_speech_markdown(row, source_markdown)
     cache_path = _new_doc_speech_cache_path(row["path"])
+    speech_meta = {
+        **speech_meta,
+        "doc_id": doc_id,
+        "doc_path": row["path"],
+        "source_version": _source_timestamp_slug(source_path),
+        "generated_at": cache_path.name.split("--", 1)[0],
+    }
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(speech + "\n", encoding="utf-8")
+        _doc_speech_cache_meta_path(cache_path).write_text(
+            json.dumps(speech_meta, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         _normalize_node_local_ownership(cache_path.parent)
         _normalize_node_local_ownership(cache_path)
+        _normalize_node_local_ownership(_doc_speech_cache_meta_path(cache_path))
     except OSError as exc:
         raise HTTPException(500, f"Could not write speech cache: {exc}") from exc
 
@@ -1626,6 +1721,7 @@ async def doc_speech(doc_id: str, body: DocSpeechBody | None = None) -> dict[str
         "speech_path": str(cache_path),
         "source_version": _source_timestamp_slug(source_path),
         "generated_at": cache_path.name.split("--", 1)[0],
+        "generation": speech_meta,
         "markdown": speech,
     }
 

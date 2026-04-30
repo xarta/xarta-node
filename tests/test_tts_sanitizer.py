@@ -1,4 +1,8 @@
-from app.tts_sanitizer import prepare_tts_markdown_for_llm, sanitize_tts_text
+from app.tts_sanitizer import (
+    prepare_tts_markdown_for_llm,
+    sanitize_tts_text,
+    terminate_tts_line_endings,
+)
 
 
 def test_sanitize_tts_text_projects_markdown_headings_and_source_refs():
@@ -68,13 +72,32 @@ def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
     assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
 
 
-def test_prepare_tts_markdown_for_llm_projects_inline_code_identifiers():
+def test_sanitize_tts_text_speaks_known_joined_policy_terms():
+    result = sanitize_tts_text("The allowlist, blocklist, denylist, and safelist are configured.")
+
+    assert result.text == "The allow list, block list, deny list, and safe list are configured."
+
+
+def test_prepare_tts_markdown_for_llm_preserves_markdown_for_model_prompt():
     raw = "Use `form_controls`, `data-fc-key`, and table_layouts in the narration source."
 
     assert (
         prepare_tts_markdown_for_llm(raw)
-        == "Use form controls, data eff sea key, and table layouts in the narration source."
+        == "Use `form_controls`, `data-fc-key`, and table_layouts in the narration source."
     )
+
+
+def test_prepare_tts_markdown_for_llm_does_not_apply_speech_transforms():
+    raw = "LiteLLM Remote-SSH `form_controls.js` SVG API L.L.M."
+
+    prepared = prepare_tts_markdown_for_llm(raw)
+
+    assert prepared == raw
+    assert "light LLM" not in prepared
+    assert "Remote SSH" not in prepared
+    assert "form controls" not in prepared
+    assert "ess vee gee" not in prepared
+    assert "A pee eye" not in prepared
 
 
 def test_prepare_tts_markdown_for_llm_preserves_fenced_code_blocks():
@@ -86,13 +109,13 @@ def test_prepare_tts_markdown_for_llm_preserves_fenced_code_blocks():
 
 Then mention SVG."""
 
-    assert prepare_tts_markdown_for_llm(raw) == """Use form controls and this example:
+    assert prepare_tts_markdown_for_llm(raw) == """Use `form_controls` and this example:
 
 ```html
 <input type="text" data-fc-key="bookmarks.filter.search" />
 ```
 
-Then mention ess vee gee."""
+Then mention SVG."""
 
 
 def test_sanitize_tts_text_summarizes_fenced_code_blocks():
@@ -113,7 +136,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
     assert (
         sanitize_tts_text(raw).text
         == (
-            "LED ess vee gee pee enn gee jay peg vee em LXC 805 "
+            "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
             "A eye A pee eye goo ee dee enn ess aitch tee tee pee ess mTLS "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
             "JavaScript HTML"
@@ -173,11 +196,11 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     )
 
     assert sanitize_tts_text(raw).text == (
-        "light L.L.M post gress fleet Certificate Authority public certificate authority url 127 dot 0 dot 0 dot 1 colon 4000 "
+        "light L-LM post gress fleet Certificate Authority public certificate authority url 127 dot 0 dot 0 dot 1 colon 4000 "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
-        "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L.L.M Mixture of Experts "
-        "L.L.M client dot chat open claw dot claude Bring Your Own Key null claw A eye pocket tee tee ess "
+        "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L-LM Mixture of Experts "
+        "L-LM client dot chat open claw dot claude Bring Your Own Key null claw A eye pocket tee tee ess "
         "play wright web socket cloned repos local storage session storage zed A eye zed A eye vee ess code ee um "
         "vee ess code tee oh tee pee rag turbo veck tail scale tail scale vee pee ess dee enn ess CLI "
         "crawl for A eye chat private zero one light parse mark it down scrape ling seer ex next generation "
@@ -222,8 +245,9 @@ def test_sanitize_tts_text_cleans_legacy_letter_names_and_pve_forms():
     assert (
         sanitize_tts_text(raw).text
         == (
-            "light L.L.M, light L.L.M, light L.L.M, light L.L.M, light L.L.M, "
-            "V L.L.M, L.L.M client, L.L.M, HTML, LXC 805, TLS, PVE999, PVE998"
+            "light L-LM, light L-LM, light L-LM, light L-LM, light L-LM, "
+            "V L-LM, L-LM client, L-LM, HTML, LXC eight zero five, TLS, "
+            "PVE nine nine nine, PVE nine nine eight"
         )
     )
 
@@ -231,7 +255,56 @@ def test_sanitize_tts_text_cleans_legacy_letter_names_and_pve_forms():
 def test_sanitize_tts_text_preserves_llm_pronunciation_in_paths():
     result = sanitize_tts_text("LiteLLM/config.yaml and light L.L.M/config.yaml").text
 
-    assert result == "light L.L.M slash config dot yammel and light L.L.M slash config dot yammel"
+    assert result == "light L-LM slash config dot yammel and light L-LM slash config dot yammel"
+
+
+def test_sanitize_tts_text_speaks_infra_ids_digit_by_digit():
+    result = sanitize_tts_text("PVE987 lxc654 LXC 805 pve-998 paths00 paths10 paths 07 paths00sub2").text
+
+    assert result == (
+        "PVE nine eight seven LXC six five four LXC eight zero five PVE nine nine eight "
+        "paths zero zero paths one zero paths zero seven paths zero zero sub two"
+    )
+
+
+def test_sanitize_tts_text_speaks_partial_ip_patterns():
+    result = sanitize_tts_text("Use 203.0.113.x, 198.x.2.3, and x.x.x.x. Keep 203.0.113.19.").text
+
+    assert result == (
+        "Use 203 dot 0 dot 113 dot X, 198 dot X dot 2 dot 3, and X dot X dot X dot X. "
+        "Keep 203 dot 0 dot 113 dot 19."
+    )
+
+
+def test_sanitize_tts_text_speaks_live_as_lithe_only_in_technical_contexts():
+    technical = sanitize_tts_text(
+        "Validate the corrected cases live on the target nodes. Live local model tests passed. A live run updated it."
+    ).text
+    ordinary = sanitize_tts_text("I live on the target node during tests.").text
+
+    assert technical == (
+        "Validate the corrected cases lithe on the target nodes. "
+        "lithe local model tests passed. A lithe run updated it."
+    )
+    assert ordinary == "I live on the target node during tests."
+
+
+def test_prepare_tts_markdown_for_llm_preserves_ssh_for_model_prompt():
+    result = prepare_tts_markdown_for_llm("Remote-SSH/Roo traffic and SSH target.")
+
+    assert result == "Remote-SSH/Roo traffic and SSH target."
+
+
+def test_terminate_tts_line_endings_adds_pause_punctuation():
+    result = terminate_tts_line_endings("Implementation tracking append\n\nDone in this session:\nAlready done.")
+
+    assert result == "Implementation tracking append.\n\nDone in this session.\nAlready done."
+
+
+def test_sanitize_tts_text_speaks_subagent_with_hyphen():
+    result = sanitize_tts_text("Use a subagent or multiple subagents.").text
+
+    assert result == "Use a sub-agent or multiple sub-agents."
 
 
 def test_prepare_tts_markdown_for_llm_redacts_secret_like_keys():

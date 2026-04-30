@@ -16,7 +16,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .db import get_conn
-from .tts_sanitizer import prepare_tts_markdown_for_llm, sanitize_tts_text
+from .tts_sanitizer import (
+    prepare_tts_markdown_for_llm,
+    sanitize_tts_text,
+    terminate_tts_line_endings,
+)
 
 router = APIRouter(prefix="/web-research", tags=["web-research"])
 
@@ -94,6 +98,7 @@ Rules:
 - Use short paragraph breaks for pacing.
 - If a section title helps the listener, write it as a plain sentence with a full stop.
 - Rewrite visual fragments into natural spoken prose. Avoid reading raw punctuation or Markdown syntax.
+- Prefer natural spoken forms for obvious joined technical words, for example "allowlist" as "allow list" and "blocklist" as "block list".
 - Do not add commentary about being an AI.
 - Output only the narration text.
 """.strip()
@@ -128,6 +133,29 @@ def _timeout_seconds() -> float:
         return max(5.0, min(180.0, float(raw)))
     except ValueError:
         return _DEFAULT_TIMEOUT_SECONDS
+
+
+def _web_research_env_int(name: str, default: int, minimum: int = 0, maximum: int = 250000) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _web_research_summary_char_limit() -> int:
+    return _web_research_env_int("WEB_RESEARCH_SUMMARY_CHAR_LIMIT", 0, minimum=0, maximum=1000000)
+
+
+def _web_research_speech_source_char_limit() -> int:
+    return _web_research_env_int("WEB_RESEARCH_SPEECH_SOURCE_CHAR_LIMIT", 0, minimum=0, maximum=1000000)
+
+
+def _web_research_speech_max_tokens() -> int:
+    return _web_research_env_int("WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS", 48000, minimum=1024, maximum=128000)
 
 
 def _now_iso() -> str:
@@ -248,8 +276,15 @@ def _summary_markdown(data: dict[str, Any], query: str, sources: list[dict[str, 
         markdown = str(result.get("summary_markdown") or "").strip()
     if not markdown:
         markdown = _fallback_markdown(query, sources)
-    if len(markdown) > 24000:
-        markdown = markdown[:24000].rsplit("\n", 1)[0].strip() + "\n\n[Research output truncated.]"
+    limit = _web_research_summary_char_limit()
+    if limit > 0 and len(markdown) > limit:
+        raise HTTPException(
+            413,
+            (
+                "Web research summary exceeded WEB_RESEARCH_SUMMARY_CHAR_LIMIT "
+                f"({len(markdown)} chars > {limit}). Increase the limit or set it to 0 for no app-level cap."
+            ),
+        )
     return markdown
 
 
@@ -303,19 +338,46 @@ def _strip_non_speech_sections(markdown: str) -> str:
     return "\n".join(out).strip()
 
 
-def _clamp_speech_source_markdown(markdown: str, limit: int = 18000) -> str:
+def _clamp_speech_source_markdown(markdown: str, limit: int | None = None) -> tuple[str, dict[str, Any]]:
     text = str(markdown or "").strip()
-    if len(text) <= limit:
-        return text
-    clipped = text[:limit].rsplit("\n## ", 1)[0].strip()
-    if len(clipped) < limit * 0.5:
-        clipped = text[:limit].rsplit("\n", 1)[0].strip()
-    return clipped + "\n\n[Research synthesis continues beyond this prompt window.]"
+    source_limit = _web_research_speech_source_char_limit() if limit is None else max(0, int(limit))
+    meta = {
+        "source_chars": len(text),
+        "source_char_limit": source_limit,
+        "source_clipped": False,
+        "prompt_source_chars": len(text),
+    }
+    if source_limit <= 0 or len(text) <= source_limit:
+        return text, meta
+    meta["source_clipped"] = True
+    meta["prompt_source_chars"] = source_limit
+    return text[:source_limit], meta
+
+
+def _assert_complete_web_research_speech(meta: dict[str, Any]) -> None:
+    if meta.get("source_clipped"):
+        limit = meta.get("source_char_limit")
+        chars = meta.get("source_chars")
+        raise HTTPException(
+            413,
+            (
+                "Web research speech source exceeded WEB_RESEARCH_SPEECH_SOURCE_CHAR_LIMIT "
+                f"({chars} chars > {limit}). Increase the limit or set it to 0 for no app-level source cap."
+            ),
+        )
+    if meta.get("finish_reason") == "length":
+        raise HTTPException(
+            502,
+            (
+                "Local LLM web research narration hit WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS before completing. "
+                "Increase WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS and regenerate."
+            ),
+        )
 
 
 def _clean_web_research_speech_markdown(text: str) -> str:
     cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    return re.sub(r"\s+([.,;!?])", r"\1", sanitize_tts_text(cleaned).text)
+    return re.sub(r"\s+([.,;!?])", r"\1", terminate_tts_line_endings(sanitize_tts_text(cleaned).text))
 
 
 def _speech_markdown(*, query: str, summary_markdown: str) -> str:
@@ -327,7 +389,7 @@ def _speech_markdown(*, query: str, summary_markdown: str) -> str:
     return re.sub(r"\s+([.,;!?])", r"\1", sanitize_tts_text(prepared).text)
 
 
-async def _complete_web_research_speech_local(messages: list[dict[str, str]]) -> str:
+async def _complete_web_research_speech_local(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
     base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
     model = (
@@ -342,18 +404,19 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
     if not model:
         raise HTTPException(503, "WEB_RESEARCH_SPEECH_LLM_MODEL or DOC_SPEECH_LLM_MODEL is not configured")
 
+    max_tokens = _web_research_speech_max_tokens()
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 2600,
+        "max_tokens": max_tokens,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     timeout = float(
-        os.environ.get(
-            "WEB_RESEARCH_SPEECH_LLM_TIMEOUT",
-            os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "75"),
+            os.environ.get(
+                "WEB_RESEARCH_SPEECH_LLM_TIMEOUT",
+                os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"),
+            )
         )
-    )
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
@@ -366,32 +429,43 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
         raise HTTPException(502, f"Local LLM web research narration generation failed: {detail}")
     try:
         data = resp.json()
-        answer = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        answer = choice["message"]["content"]
     except Exception as exc:
         raise HTTPException(502, "Local LLM returned an invalid web research narration response") from exc
-    return _strip_think_blocks(str(answer or ""))
+    meta = {
+        "llm_model": data.get("model") or model,
+        "max_tokens": max_tokens,
+        "finish_reason": choice.get("finish_reason"),
+        "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+    }
+    return _strip_think_blocks(str(answer or "")), meta
 
 
-async def _generate_web_research_speech_markdown(query: str, summary_markdown: str) -> str:
-    speech_source = _clamp_speech_source_markdown(
+async def _generate_web_research_speech_markdown(query: str, summary_markdown: str) -> tuple[str, dict[str, Any]]:
+    speech_source, source_meta = _clamp_speech_source_markdown(
         prepare_tts_markdown_for_llm(_strip_non_speech_sections(summary_markdown))
     )
+    _assert_complete_web_research_speech(source_meta)
     user_prompt = (
         "/no-think\n"
         f"Web research query: {query}\n\n"
         "Rewrite this web research synthesis as a plain text narrated version for TTS playback:\n\n"
         f"{speech_source}"
     )
-    answer = await _complete_web_research_speech_local(
+    answer, llm_meta = await _complete_web_research_speech_local(
         [
             {"role": "system", "content": _WEB_RESEARCH_SPEECH_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
     )
+    generation_meta = {**source_meta, **llm_meta}
+    _assert_complete_web_research_speech(generation_meta)
     speech = _clean_web_research_speech_markdown(answer)
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty web research narration")
-    return speech
+    generation_meta.update({"speech_chars": len(speech), "speech_words": len(speech.split())})
+    return speech, generation_meta
 
 
 def _cache_key(
@@ -705,6 +779,7 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
                 "cache": "hit",
                 "cache_key": cache_key,
                 "generated_at": cached.get("generated_at"),
+                "generation": cached.get("meta", {}).get("generation") if isinstance(cached.get("meta"), dict) else None,
                 "markdown": cached["markdown"],
             }
 
@@ -717,12 +792,13 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
 
     query = (body.query or display.get("query") or "web research").strip()
     _validate_public_query(query)
-    audio = await _generate_web_research_speech_markdown(query=query, summary_markdown=markdown)
+    audio, generation_meta = await _generate_web_research_speech_markdown(query=query, summary_markdown=markdown)
     if body.private_mode:
         return {
             "ok": True,
             "cache": "private",
             "cache_key": None,
+            "generation": generation_meta,
             "markdown": audio,
         }
     if not cache_key:
@@ -744,11 +820,13 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
             "query": query,
             "depth": body.depth,
             "source": "speech",
+            "generation": generation_meta,
         },
     )
     return {
         "ok": True,
         "cache": "regenerated" if body.force_refresh else "miss",
         "cache_key": cache_key,
+        "generation": generation_meta,
         "markdown": audio,
     }

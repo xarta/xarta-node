@@ -30,6 +30,7 @@ _ENDPOINT_LIST_ITEM_RE = re.compile(
 )
 _LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 _TERMINAL_PUNCT_RE = re.compile(r"[.!?:;]$")
+_SPEECH_LINE_TERMINAL_RE = re.compile(r"[.!?]$")
 _BACKLINK_PREFIXES = ("<-", "←", "&larr;", "[<-", "[←", "[&larr;")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _FENCED_CODE_BLOCK_RE = re.compile(r"^```(?P<lang>[^\n`]*)\n(?P<body>.*?)(?:^```\s*$|\Z)", re.MULTILINE | re.DOTALL)
@@ -79,10 +80,28 @@ _BARE_FILE_EXTENSION_RE = re.compile(
 _IP_ADDRESS_RE = re.compile(
     r"\b(?P<ip>(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?::(?P<port>\d{1,5}))?\b"
 )
+_IP_PATTERN_RE = re.compile(
+    r"\b(?P<ip>(?:(?:25[0-5]|2[0-4]\d|1?\d?\d|x)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d|x))\b",
+    re.IGNORECASE,
+)
 _THINK_PAIR_RE = re.compile(r"<think>\s*</think>", re.IGNORECASE)
 _THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
 _ETH_PORT_RE = re.compile(r"\beth(?P<number>\d+)\b", re.IGNORECASE)
 _PVE_NODE_RE = re.compile(r"\bpve(?P<number>\d+)\b", re.IGNORECASE)
+_INFRA_ID_WITH_NUMBER_RE = re.compile(
+    r"\b(?P<prefix>PVE|LXC|paths)(?:[\s-]?)(?P<number>\d{1,5})(?:sub(?P<subnumber>\d{1,5}))?\b",
+    re.IGNORECASE,
+)
+_LIVE_BEFORE_TECH_NOUN_RE = re.compile(
+    r"\blive(?=\s+(?:local|model|response|test|tests|validation|probe|probes|"
+    r"endpoint|route|stack|service|surface|alias|traffic|request|requests|"
+    r"run|runs|full|regeneration)\b)",
+    re.IGNORECASE,
+)
+_LIVE_AFTER_TEST_CONTEXT_RE = re.compile(
+    r"\b(?P<prefix>(?:validat(?:e|es|ed|ing|ion)|verif(?:y|ies|ied|ying)|test(?:s|ed|ing)?|probe(?:s|d|ing)?|smoke(?:s|d|ing)?|check(?:s|ed|ing)?|cases?)\b(?:(?![.!?]\s).){0,120}?)\blive(?=\s+(?:on|against|in|at|with|via|through)\b)",
+    re.IGNORECASE,
+)
 _OOM_RE = re.compile(r"\boom(?:\s+error)?\b", re.IGNORECASE)
 _LITELLM_CLIENT_CHAT_RE = re.compile(r"\bLLMClient\.chat\b", re.IGNORECASE)
 _PARENT_DIR_RE = re.compile(r"\.\./")
@@ -135,7 +154,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("MTU", "em tee you"),
     ("HTTP", "aitch tee tee pee"),
     ("HTTPS", "aitch tee tee pee ess"),
-    ("SSH", "ess ess aitch"),
+    ("SSH", "SSH"),
     ("SSL", "SSL"),
     ("TLS", "TLS"),
     ("URL", "url"),
@@ -174,7 +193,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("ORM", "oh are em"),
     ("CRUD", "crud"),
     ("AI", "A eye"),
-    ("LLM", "L.L.M"),
+    ("LLM", "L-LM"),
     ("ML", "ML"),
     ("NLP", "NLP"),
     ("RAG", "rag"),
@@ -220,7 +239,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
 _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\bfleet\s+CA\b", "fleet Certificate Authority"),
     (r"\bpublic\s+CA\b", "public certificate authority"),
-    (r"\bLiteLLM\b", "light L.L.M"),
+    (r"\bLiteLLM\b", "light LLM"),
     (r"\bpostgres\b", "post gress"),
     (r"\bbyok\b", "Bring Your Own Key"),
     (r"\bz\.ai\b", "zed A eye"),
@@ -231,7 +250,13 @@ _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\bxmemory\b", "ex memory"),
     (r"\bpipecat\b", "pipe cat"),
     (r"\blivecat\b", "live cat"),
-    (r"\bvllm\b", "V L.L.M"),
+    (r"\bvllm\b", "V LLM"),
+    (r"\ballowlist\b", "allow list"),
+    (r"\bblocklist\b", "block list"),
+    (r"\bdenylist\b", "deny list"),
+    (r"\bsafelist\b", "safe list"),
+    (r"\bsubagents\b", "sub-agents"),
+    (r"\bsubagent\b", "sub-agent"),
     (r"\bmoe\b", "Mixture of Experts"),
     (r"\bopenclaw\b", "open claw"),
     (r"\bnullclaw\b", "null claw"),
@@ -258,18 +283,19 @@ _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"(?<!\.)\benv\b", "dot ee en vee"),
 )
 _LEGACY_LETTER_NAME_SPEECH: tuple[tuple[str, str], ...] = (
-    (r"\blight\s*L\.L\.M\b", "light L.L.M"),
-    (r"\blite\.L\.M\b", "light L.L.M"),
-    (r"\blight\.LM\b", "light L.L.M"),
-    (r"\blight\s+dot\s+l\s+dot\s+m\b", "light L.L.M"),
-    (r"\blight\s+ell\s+ell\s+em\b", "light L.L.M"),
-    (r"\blight\s+LLM\b", "light L.L.M"),
-    (r"\bvee\s+ell\s+ell\s+em\b", "V L.L.M"),
-    (r"\bV\s+LLM\b", "V L.L.M"),
-    (r"\bL\s+dot\s+L\s+dot\s+M\b", "L.L.M"),
-    (r"\bell\s+ell\s+em\b", "L.L.M"),
-    (r"\bLLM\b", "L.L.M"),
-    (r"\bLM\b", "L.L.M"),
+    (r"\blight\s*L\.L\.M\b", "light LLM"),
+    (r"\blite\.L\.M\b", "light LLM"),
+    (r"\blight\.LM\b", "light LLM"),
+    (r"\blight\s+dot\s+l\s+dot\s+m\b", "light LLM"),
+    (r"\blight\s+ell\s+ell\s+em\b", "light LLM"),
+    (r"\blight\s+LLM\b", "light LLM"),
+    (r"\bvee\s+ell\s+ell\s+em\b", "V LLM"),
+    (r"\bV\s+LLM\b", "V LLM"),
+    (r"\bL\.L\.M\b", "LLM"),
+    (r"\bL\s+dot\s+L\s+dot\s+M\b", "LLM"),
+    (r"\bell\s+ell\s+em\b", "LLM"),
+    (r"\bLLM\b", "LLM"),
+    (r"(?<!-)\bLM\b", "LLM"),
     (r"\bPVee(\d+)\b", r"PVE\1"),
     (r"\bpee\s+vee\s+ee\s+(\d+)\b", r"PVE\1"),
     (r"\bH\s+tee\s+em\s+ell\b", "HTML"),
@@ -579,6 +605,40 @@ def _speak_ip_address(match: re.Match[str]) -> str:
     return spoken
 
 
+def _speak_ip_pattern(match: re.Match[str]) -> str:
+    return " dot ".join("X" if part.lower() == "x" else part for part in match.group("ip").split("."))
+
+
+_DIGIT_WORDS = {
+    "0": "zero",
+    "1": "one",
+    "2": "two",
+    "3": "three",
+    "4": "four",
+    "5": "five",
+    "6": "six",
+    "7": "seven",
+    "8": "eight",
+    "9": "nine",
+}
+
+
+def _speak_digit_code(match: re.Match[str]) -> str:
+    raw_prefix = match.group("prefix")
+    prefix = "paths" if raw_prefix.lower() == "paths" else raw_prefix.upper()
+    digits = " ".join(_DIGIT_WORDS[digit] for digit in match.group("number"))
+    subnumber = match.group("subnumber")
+    if subnumber:
+        subdigits = " ".join(_DIGIT_WORDS[digit] for digit in subnumber)
+        return f"{prefix} {digits} sub {subdigits}"
+    return f"{prefix} {digits}"
+
+
+def _speak_live_pronunciation(text: str) -> str:
+    spoken = _LIVE_BEFORE_TECH_NOUN_RE.sub("lithe", str(text or ""))
+    return _LIVE_AFTER_TEST_CONTEXT_RE.sub(lambda match: f"{match.group('prefix')}lithe", spoken)
+
+
 def speak_tts_compound_tokens(text: str) -> str:
     spoken = str(text or "")
     spoken = _THINK_PAIR_RE.sub("think tags", spoken)
@@ -586,7 +646,8 @@ def speak_tts_compound_tokens(text: str) -> str:
     spoken = re.sub(r"\.\.\.", " ellipses ", spoken)
     spoken = re.sub(r"https?://", " url ", spoken, flags=re.IGNORECASE)
     spoken = _IP_ADDRESS_RE.sub(_speak_ip_address, spoken)
-    spoken = _LITELLM_CLIENT_CHAT_RE.sub("L.L.M client dot chat", spoken)
+    spoken = _IP_PATTERN_RE.sub(_speak_ip_pattern, spoken)
+    spoken = _LITELLM_CLIENT_CHAT_RE.sub("LLM client dot chat", spoken)
     spoken = re.sub(r"-cli\b", " CLI", spoken, flags=re.IGNORECASE)
     spoken = _PARENT_DIR_RE.sub("parent of ", spoken)
     spoken = re.sub(r"(?<![A-Za-z0-9])\.claude\b", "dot claude", spoken, flags=re.IGNORECASE)
@@ -671,24 +732,41 @@ def speak_tts_acronyms(text: str) -> str:
             spoken,
             flags=re.IGNORECASE,
         )
-    return re.sub(r"\bPVE\s+(?=\d)", "PVE", spoken)
+    spoken = re.sub(r"\bsub\s+agents\b", "sub-agents", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"\bsub\s+agent\b", "sub-agent", spoken, flags=re.IGNORECASE)
+    spoken = _INFRA_ID_WITH_NUMBER_RE.sub(_speak_digit_code, spoken)
+    spoken = _speak_live_pronunciation(spoken)
+    return re.sub(r"\bL\.L\.M\.?", "L-LM", spoken)
 
 
 def prepare_tts_markdown_for_llm(markdown: str) -> str:
-    text = redact_tts_secret_material(_normalize_newlines(markdown))
+    """Prepare source Markdown for the narration model without speech transforms.
 
-    def project(segment: str) -> str:
-        segment = _INLINE_CODE_RE.sub(lambda match: _speak_inline_code_token(match.group(1)), segment)
-        segment = _speak_known_attribute_names(segment)
-        segment = speak_tts_compound_tokens(segment)
-        segment = speak_legacy_letter_names(segment)
-        segment = speak_tts_known_terms(segment)
-        segment = speak_tts_file_extensions(segment)
-        segment = speak_legacy_letter_names(segment)
-        segment = speak_tts_identifiers(segment)
-        return speak_tts_acronyms(segment)
+    Keep this pre-LLM stage boring: normalize newlines and redact secret-like
+    material only. Pronunciation, identifier splitting, acronym handling, and
+    line-ending pauses belong after the model has produced narration text, just
+    before the speech cache is written.
+    """
+    return redact_tts_secret_material(_normalize_newlines(markdown))
 
-    return _transform_outside_fenced_code(text, project)
+
+def terminate_tts_line_endings(text: str) -> str:
+    """Add a spoken pause to plain-text narration lines that lack punctuation."""
+    normalized = _normalize_newlines(text)
+    if "\n" not in normalized:
+        return normalized.strip()
+
+    lines: list[str] = []
+    for raw_line in normalized.split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            lines.append("")
+            continue
+        if _SPEECH_LINE_TERMINAL_RE.search(line):
+            lines.append(line)
+            continue
+        lines.append(re.sub(r"[:;]+$", "", line).rstrip() + ".")
+    return "\n".join(lines).strip()
 
 
 def _normalize_spacing(text: str) -> str:
