@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 # ── Machine ───────────────────────────────────────────────────────────────────
 
+
 class MachineCreate(BaseModel):
     machine_id: str
     name: str
@@ -20,10 +21,12 @@ class MachineCreate(BaseModel):
     parent_machine_id: Optional[str] = None
     ip_addresses: Optional[list[str]] = None
     description: Optional[str] = None
-    machine_kind: Optional[str] = None      # baremetal/proxmox/vm/lxc/docker/switch/router/firewall/pikvm
-    platform: Optional[str] = None           # proxmox/docker/kvm/pfsense/caddy/linux
-    status: str = "active"                  # active/maintenance/offline/decommissioned
-    labels: Optional[list[str]] = None       # freeform tags
+    machine_kind: Optional[str] = (
+        None  # baremetal/proxmox/vm/lxc/docker/switch/router/firewall/pikvm
+    )
+    platform: Optional[str] = None  # proxmox/docker/kvm/pfsense/caddy/linux
+    status: str = "active"  # active/maintenance/offline/decommissioned
+    labels: Optional[list[str]] = None  # freeform tags
     properties_json: Optional[dict] = None  # extensible metadata bag
 
 
@@ -58,6 +61,7 @@ class MachineOut(BaseModel):
 
 # ── Service ───────────────────────────────────────────────────────────────────
 
+
 class ServiceCreate(BaseModel):
     service_id: str
     name: str
@@ -72,12 +76,12 @@ class ServiceCreate(BaseModel):
     project_status: str = "deployed"
     tags: Optional[list[str]] = None
     links: Optional[list[dict[str, str]]] = None
-    host_machine_id: Optional[str] = None       # FK to machines.machine_id
-    service_kind: str = "app"                   # app/api/web/db/proxy/dns/infra-ui
-    exposure_level: str = "internal"             # internal/tailnet/lan/public/restricted
-    health_path: Optional[str] = None            # e.g. /health or /api/v1/health
+    host_machine_id: Optional[str] = None  # FK to machines.machine_id
+    service_kind: str = "app"  # app/api/web/db/proxy/dns/infra-ui
+    exposure_level: str = "internal"  # internal/tailnet/lan/public/restricted
+    health_path: Optional[str] = None  # e.g. /health or /api/v1/health
     health_expected_status: int = 200
-    runtime_notes_json: Optional[dict] = None    # extensible metadata bag
+    runtime_notes_json: Optional[dict] = None  # extensible metadata bag
 
 
 class ServiceUpdate(BaseModel):
@@ -127,41 +131,45 @@ class ServiceOut(BaseModel):
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
+
 class NodeCreate(BaseModel):
     node_id: str
     display_name: str
     host_machine: Optional[str] = None
     tailnet: Optional[str] = None
     addresses: Optional[list[str]] = None
-    ui_url: Optional[str] = None   # browser-facing HTTPS URL for this node
+    ui_url: Optional[str] = None  # browser-facing HTTPS URL for this node
     machine_id: Optional[str] = None  # canonical FK to machines.machine_id
 
 
 class NodeOut(BaseModel):
     node_id: str
     display_name: str
-    display_order: int = 0        # preferred sort position in the node selector
+    display_order: int = 0  # preferred sort position in the node selector
     host_machine: Optional[str] = None
     tailnet: Optional[str] = None
-    primary_hostname: Optional[str] = None   # management VLAN HTTPS hostname
-    tailnet_hostname: Optional[str] = None   # tailnet HTTPS hostname
+    primary_hostname: Optional[str] = None  # management VLAN HTTPS hostname
+    tailnet_hostname: Optional[str] = None  # tailnet HTTPS hostname
     addresses: Optional[list[str]] = None
-    ui_url: Optional[str] = None   # browser-facing HTTPS URL for this node
+    ui_url: Optional[str] = None  # browser-facing HTTPS URL for this node
     machine_id: Optional[str] = None  # canonical FK to machines.machine_id
     last_seen: Optional[str] = None
     created_at: str
-    fleet_peer: bool = True       # False if node is in DB but not a configured sync peer
-    pending_count: int = 0        # unsent sync queue entries targeting this node
+    fleet_peer: bool = True  # False if node is in DB but not a configured sync peer
+    pending_count: int = 0  # unsent sync queue entries targeting this node
 
 
 # ── pfSense DNS ───────────────────────────────────────────────────────────────
 
+
 class PfSenseDnsCreate(BaseModel):
-    dns_entry_id: str               # composite key: "{ip}:{fqdn}"
+    dns_entry_id: str  # composite key: "{ip}:{fqdn}"
     ip_address: str
     fqdn: str
-    record_type: Optional[str] = None   # host_override | host_override_alias | dhcp_lease | domain_override
-    source: Optional[str] = None        # config file name or source identifier
+    record_type: Optional[str] = (
+        None  # host_override | host_override_alias | dhcp_lease | domain_override
+    )
+    source: Optional[str] = None  # config file name or source identifier
     mac_address: Optional[str] = None
     active: int = 1
     last_seen: Optional[str] = None
@@ -199,12 +207,13 @@ class PfSenseDnsOut(BaseModel):
 
 # ── Proxmox Config ────────────────────────────────────────────────────────────
 
+
 class ProxmoxConfigCreate(BaseModel):
-    config_id: str                          # "{pve_name}_{vmid}"
+    config_id: str  # "{pve_name}_{vmid}"
     pve_host: str
     pve_name: Optional[str] = None
     vmid: int
-    vm_type: str                            # 'lxc' | 'qemu'
+    vm_type: str  # 'lxc' | 'qemu'
     name: Optional[str] = None
     status: Optional[str] = None
     cores: Optional[int] = None
@@ -298,12 +307,13 @@ class ProxmoxConfigOut(BaseModel):
 
 # ── Proxmox Nets ──────────────────────────────────────────────────────────────
 
+
 class ProxmoxNetCreate(BaseModel):
-    net_id: str                             # "{config_id}_net{N}"
+    net_id: str  # "{config_id}_net{N}"
     config_id: str
     pve_host: str
     vmid: int
-    net_key: str                            # "net0", "net1" …
+    net_key: str  # "net0", "net1" …
     mac_address: Optional[str] = None
     ip_address: Optional[str] = None
     ip_cidr: Optional[str] = None
@@ -347,6 +357,7 @@ class ProxmoxNetOut(BaseModel):
 
 # ── VLANs ─────────────────────────────────────────────────────────────────────
 
+
 class VlanUpdate(BaseModel):
     cidr: Optional[str] = None
     description: Optional[str] = None
@@ -363,25 +374,28 @@ class VlanOut(BaseModel):
 
 # ── Dockge Stacks ─────────────────────────────────────────────────────────────
 
+
 class DockgeStackCreate(BaseModel):
-    stack_id: str                           # "{source_vmid}_{stacks_dir_slug}_{stack_name}"
+    stack_id: str  # "{source_vmid}_{stacks_dir_slug}_{stack_name}"
     pve_host: str
     source_vmid: int
     source_lxc_name: Optional[str] = None
     stack_name: str
     status: Optional[str] = None
     compose_content: Optional[str] = None
-    services_json: Optional[str] = None    # legacy: JSON array of service names
-    ports_json: Optional[str] = None       # legacy: JSON array of port strings
+    services_json: Optional[str] = None  # legacy: JSON array of service names
+    ports_json: Optional[str] = None  # legacy: JSON array of port strings
     volumes_json: Optional[str] = None
     env_file_exists: int = 0
     stacks_dir: Optional[str] = None
-    vm_type: Optional[str] = None          # lxc | qemu
-    ip_address: Optional[str] = None       # IP we SSH'd into for this probe
-    parent_context: Optional[str] = None   # dockge-stack | docker-compose | docker-run | portainer-stack | native
+    vm_type: Optional[str] = None  # lxc | qemu
+    ip_address: Optional[str] = None  # IP we SSH'd into for this probe
+    parent_context: Optional[str] = (
+        None  # dockge-stack | docker-compose | docker-run | portainer-stack | native
+    )
     parent_stack_name: Optional[str] = None  # if parent_context==dockge-stack
-    obsolete: int = 0                        # 1 = user-marked obsolete; probe never overwrites
-    notes: Optional[str] = None             # free-text user notes
+    obsolete: int = 0  # 1 = user-marked obsolete; probe never overwrites
+    notes: Optional[str] = None  # free-text user notes
     last_probed: Optional[str] = None
 
 
@@ -401,7 +415,7 @@ class DockgeStackUpdate(BaseModel):
     ip_address: Optional[str] = None
     parent_context: Optional[str] = None
     parent_stack_name: Optional[str] = None
-    obsolete: Optional[int] = None          # None = don't update; 0/1 to set
+    obsolete: Optional[int] = None  # None = don't update; 0/1 to set
     notes: Optional[str] = None
     last_probed: Optional[str] = None
 
@@ -432,14 +446,15 @@ class DockgeStackOut(BaseModel):
 
 # ── Dockge Stack Services ──────────────────────────────────────────────────────
 
+
 class DockgeStackServiceCreate(BaseModel):
-    service_id: str                         # "{stack_id}_{service_name}"
+    service_id: str  # "{stack_id}_{service_name}"
     stack_id: str
     service_name: str
     image: Optional[str] = None
-    ports_json: Optional[str] = None        # JSON array of "host:container/proto"
+    ports_json: Optional[str] = None  # JSON array of "host:container/proto"
     volumes_json: Optional[str] = None
-    container_state: Optional[str] = None   # running|stopped|restarting|etc
+    container_state: Optional[str] = None  # running|stopped|restarting|etc
     container_id: Optional[str] = None
     last_probed: Optional[str] = None
 
@@ -469,8 +484,9 @@ class DockgeStackServiceOut(BaseModel):
 
 # ── Caddy Configs ─────────────────────────────────────────────────────────────
 
+
 class CaddyConfigCreate(BaseModel):
-    caddy_id: str                           # "{source_vmid}_{path_slug}"
+    caddy_id: str  # "{source_vmid}_{path_slug}"
     pve_host: Optional[str] = None
     source_vmid: Optional[int] = None
     source_lxc_name: Optional[str] = None
@@ -508,9 +524,11 @@ class CaddyConfigOut(BaseModel):
 
 # ── Settings ─────────────────────────────────────────────────────────────────
 
+
 class SettingUpsert(BaseModel):
     value: str
     description: Optional[str] = None
+
 
 class SettingOut(BaseModel):
     key: str
@@ -521,16 +539,18 @@ class SettingOut(BaseModel):
 
 # ── PVE Hosts ─────────────────────────────────────────────────────────────────
 
+
 class PveHostCreate(BaseModel):
-    pve_id: str          # IP address used as primary key
+    pve_id: str  # IP address used as primary key
     ip_address: str
     hostname: Optional[str] = None
-    pve_name: Optional[str] = None   # short label e.g. "pve1" (user-editable)
+    pve_name: Optional[str] = None  # short label e.g. "pve1" (user-editable)
     version: Optional[str] = None
     port: int = 8006
     ssh_reachable: int = 0
     tailnet_ip: Optional[str] = None
     last_scanned: Optional[str] = None
+
 
 class PveHostUpdate(BaseModel):
     hostname: Optional[str] = None
@@ -540,6 +560,7 @@ class PveHostUpdate(BaseModel):
     ssh_reachable: Optional[int] = None
     tailnet_ip: Optional[str] = None
     last_scanned: Optional[str] = None
+
 
 class PveHostOut(BaseModel):
     pve_id: str
@@ -557,15 +578,18 @@ class PveHostOut(BaseModel):
 
 # ── ARP Manual ───────────────────────────────────────────────────────────────
 
+
 class ArpManualCreate(BaseModel):
     ip_address: str
     mac_address: str
     notes: Optional[str] = None
 
+
 class ArpManualUpdate(BaseModel):
     ip_address: Optional[str] = None
     mac_address: Optional[str] = None
     notes: Optional[str] = None
+
 
 class ArpManualOut(BaseModel):
     entry_id: str
@@ -580,76 +604,81 @@ class ArpManualOut(BaseModel):
 
 # ── Manual Links ─────────────────────────────────────────────────────────────
 
+
 class ManualLinkCreate(BaseModel):
-    vlan_ip:     Optional[str] = None
-    vlan_uri:    Optional[str] = None
-    tailnet_ip:  Optional[str] = None
+    vlan_ip: Optional[str] = None
+    vlan_uri: Optional[str] = None
+    tailnet_ip: Optional[str] = None
     tailnet_uri: Optional[str] = None
-    label:       Optional[str] = None
-    icon:        Optional[str] = None
-    group_name:  Optional[str] = None
-    parent_id:   Optional[str] = None
-    sort_order:  Optional[int] = 0
-    pve_host:    Optional[str] = None
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    group_name: Optional[str] = None
+    parent_id: Optional[str] = None
+    sort_order: Optional[int] = 0
+    pve_host: Optional[str] = None
     is_internet: Optional[int] = 0
-    vm_id:       Optional[str] = None
-    vm_name:     Optional[str] = None
-    lxc_id:      Optional[str] = None
-    lxc_name:    Optional[str] = None
-    location:    Optional[str] = None
-    notes:       Optional[str] = None
+    vm_id: Optional[str] = None
+    vm_name: Optional[str] = None
+    lxc_id: Optional[str] = None
+    lxc_name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
 
 class ManualLinkUpdate(BaseModel):
-    vlan_ip:     Optional[str] = None
-    vlan_uri:    Optional[str] = None
-    tailnet_ip:  Optional[str] = None
+    vlan_ip: Optional[str] = None
+    vlan_uri: Optional[str] = None
+    tailnet_ip: Optional[str] = None
     tailnet_uri: Optional[str] = None
-    label:       Optional[str] = None
-    icon:        Optional[str] = None
-    group_name:  Optional[str] = None
-    parent_id:   Optional[str] = None
-    sort_order:  Optional[int] = None
-    pve_host:    Optional[str] = None
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    group_name: Optional[str] = None
+    parent_id: Optional[str] = None
+    sort_order: Optional[int] = None
+    pve_host: Optional[str] = None
     is_internet: Optional[int] = None
-    vm_id:       Optional[str] = None
-    vm_name:     Optional[str] = None
-    lxc_id:      Optional[str] = None
-    lxc_name:    Optional[str] = None
-    location:    Optional[str] = None
-    notes:       Optional[str] = None
+    vm_id: Optional[str] = None
+    vm_name: Optional[str] = None
+    lxc_id: Optional[str] = None
+    lxc_name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
 
 class ManualLinkOut(BaseModel):
-    link_id:     str
-    vlan_ip:     Optional[str] = None
-    vlan_uri:    Optional[str] = None
-    tailnet_ip:  Optional[str] = None
+    link_id: str
+    vlan_ip: Optional[str] = None
+    vlan_uri: Optional[str] = None
+    tailnet_ip: Optional[str] = None
     tailnet_uri: Optional[str] = None
-    label:       Optional[str] = None
-    icon:        Optional[str] = None
-    group_name:  Optional[str] = None
-    parent_id:   Optional[str] = None
-    sort_order:  int = 0
-    pve_host:    Optional[str] = None
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    group_name: Optional[str] = None
+    parent_id: Optional[str] = None
+    sort_order: int = 0
+    pve_host: Optional[str] = None
     is_internet: int = 0
-    vm_id:       Optional[str] = None
-    vm_name:     Optional[str] = None
-    lxc_id:      Optional[str] = None
-    lxc_name:    Optional[str] = None
-    location:    Optional[str] = None
-    notes:       Optional[str] = None
-    created_at:  str
-    updated_at:  str
+    vm_id: Optional[str] = None
+    vm_name: Optional[str] = None
+    lxc_id: Optional[str] = None
+    lxc_name: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str
+    updated_at: str
 
 
 # ── SSH Targets ───────────────────────────────────────────────────────────────
 
+
 class SshTargetCreate(BaseModel):
     ip_address: str
-    key_env_var: str                 # e.g. VM_SSH_KEY, LXC_SSH_KEY
+    key_env_var: str  # e.g. VM_SSH_KEY, LXC_SSH_KEY
     source_ip: Optional[str] = None  # bind source IP (same VLAN)
     host_name: Optional[str] = None
     host_type: Optional[str] = None  # lxc-fleet | lxc | qemu | citadel | pve | pfsense
     notes: Optional[str] = None
+
 
 class SshTargetUpdate(BaseModel):
     key_env_var: Optional[str] = None
@@ -657,6 +686,7 @@ class SshTargetUpdate(BaseModel):
     host_name: Optional[str] = None
     host_type: Optional[str] = None
     notes: Optional[str] = None
+
 
 class SshTargetOut(BaseModel):
     ip_address: str
@@ -670,6 +700,7 @@ class SshTargetOut(BaseModel):
 
 
 # ── Table Layouts ─────────────────────────────────────────────────────────────
+
 
 class TableLayoutCatalogCreate(BaseModel):
     table_code: str
@@ -723,6 +754,17 @@ class TableLayoutResolveRequest(BaseModel):
     columns: list[TableLayoutColumnSeed] = Field(default_factory=list)
 
 
+class TableLayoutViewport(BaseModel):
+    width_px: Optional[int] = None
+    height_px: Optional[int] = None
+    available_table_width_px: Optional[int] = None
+
+
+class TableLayoutAutoRequest(TableLayoutResolveRequest):
+    viewport: Optional[TableLayoutViewport] = None
+    mode: str = "preview"
+
+
 class TableLayoutUpsert(BaseModel):
     layout_data: dict[str, Any]
 
@@ -739,6 +781,7 @@ class TableLayoutOut(BaseModel):
 
 
 # ── PocketTTS ────────────────────────────────────────────────────────────────
+
 
 class PocketttsTagCreate(BaseModel):
     tag_id: Optional[str] = None
@@ -810,10 +853,11 @@ class PocketttsImportRequest(BaseModel):
 
 # ── Sync ──────────────────────────────────────────────────────────────────────
 
+
 class SyncAction(BaseModel):
-    action_type: str    # INSERT | UPDATE | DELETE | sync_git_outer | sync_git_inner
-    table_name: Optional[str] = ""   # not used for system action types
-    row_id: Optional[str] = ""       # not used for system action types
+    action_type: str  # INSERT | UPDATE | DELETE | sync_git_outer | sync_git_inner
+    table_name: Optional[str] = ""  # not used for system action types
+    row_id: Optional[str] = ""  # not used for system action types
     row_data: Optional[dict[str, Any]] = None
     gen: int
     source_node_id: str
@@ -821,13 +865,13 @@ class SyncAction(BaseModel):
 
 
 class GitPullRequest(BaseModel):
-    scope: str = "outer"   # "outer" | "inner" | "both" | "non_root" | "all"
+    scope: str = "outer"  # "outer" | "inner" | "both" | "non_root" | "all"
 
 
 class SyncActionsPayload(BaseModel):
     actions: list[SyncAction]
     source_node_id: str
-    source_commit_ts: int = 0   # unix epoch of source node's HEAD commit
+    source_commit_ts: int = 0  # unix epoch of source node's HEAD commit
 
 
 class SyncStatus(BaseModel):
@@ -837,33 +881,34 @@ class SyncStatus(BaseModel):
     integrity_ok: bool
     last_write_at: str
     last_write_by: str
-    queue_depths: dict[str, int]      # {peer_node_id: pending_count}
+    queue_depths: dict[str, int]  # {peer_node_id: pending_count}
     peer_count: int
 
 
 # ── Firewall ──────────────────────────────────────────────────────────────────
 
+
 class FirewallPortCheck(BaseModel):
     port: int
-    proto: str           # "tcp" or "udp"
+    proto: str  # "tcp" or "udp"
     label: str
-    expected: str        # "open" or "blocked"
-    in_ruleset: bool     # found in XARTA_INPUT chain
+    expected: str  # "open" or "blocked"
+    in_ruleset: bool  # found in XARTA_INPUT chain
 
 
 class FirewallStatusOut(BaseModel):
     iptables_available: bool
-    input_policy: str    # "DROP", "ACCEPT", or "unknown"
+    input_policy: str  # "DROP", "ACCEPT", or "unknown"
     xarta_input_chain: bool
     ports: list[FirewallPortCheck]
 
 
 class FirewallProbePort(BaseModel):
     port: int
-    proto: str           # "tcp" or "udp"
+    proto: str  # "tcp" or "udp"
     label: str
-    expected: str        # "open" or "blocked"
-    result: str          # "open", "blocked", "timeout", "error", "skipped"
+    expected: str  # "open" or "blocked"
+    result: str  # "open", "blocked", "timeout", "error", "skipped"
     pass_: bool = Field(default=False, alias="pass")
 
     model_config = {"populate_by_name": True}
@@ -879,6 +924,7 @@ class FirewallProbeOut(BaseModel):
 # ── Health ────────────────────────────────────────────────────────────────────
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
+
 
 class DocGroupCreate(BaseModel):
     name: str
@@ -901,10 +947,10 @@ class DocGroupOut(BaseModel):
 class DocCreate(BaseModel):
     label: str
     description: Optional[str] = None
-    tags: Optional[str] = None          # comma-separated, e.g. "menu,ops"
-    path: str                           # relative path from REPO_INNER_PATH
+    tags: Optional[str] = None  # comma-separated, e.g. "menu,ops"
+    path: str  # relative path from REPO_INNER_PATH
     sort_order: int = 0
-    group_id: Optional[str] = None     # NULL = Undefined Group
+    group_id: Optional[str] = None  # NULL = Undefined Group
     initial_content: Optional[str] = None  # written to file on create if provided
 
 
@@ -914,7 +960,7 @@ class DocUpdate(BaseModel):
     tags: Optional[str] = None
     path: Optional[str] = None
     sort_order: Optional[int] = None
-    group_id: Optional[str] = None     # use empty string "" to clear group
+    group_id: Optional[str] = None  # use empty string "" to clear group
 
 
 class DocOut(BaseModel):
@@ -940,6 +986,7 @@ class DocContentBody(BaseModel):
 
 # ── Doc Images ────────────────────────────────────────────────────────────────
 
+
 class DocImageOut(BaseModel):
     image_id: str
     filename: str
@@ -957,15 +1004,16 @@ class DocImageUpdate(BaseModel):
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
+
 class HealthOut(BaseModel):
     status: str
     node_id: str
     node_name: str
     gen: int
     integrity_ok: bool
-    ui_url: Optional[str] = None   # browser-accessible URL; set via BLUEPRINTS_UI_URL
-    commit: Optional[str] = None   # short git hash of the current outer-repo checkout
-    commit_ts: int = 0             # unix epoch of HEAD commit (for commit-guard ordering)
+    ui_url: Optional[str] = None  # browser-accessible URL; set via BLUEPRINTS_UI_URL
+    commit: Optional[str] = None  # short git hash of the current outer-repo checkout
+    commit_ts: int = 0  # unix epoch of HEAD commit (for commit-guard ordering)
 
 
 class RepoVersionOut(BaseModel):
@@ -991,15 +1039,16 @@ class RepoVersionsOut(BaseModel):
 
 # ── AI Providers ─────────────────────────────────────────────────────────────
 
+
 class AiProviderCreate(BaseModel):
     name: str
     base_url: str
     api_key: str = ""
     model_name: str
-    model_type: str                     # 'embedding' | 'reranker' | 'llm'
-    dimensions: Optional[int] = None   # output dims (embedding models only)
+    model_type: str  # 'embedding' | 'reranker' | 'llm'
+    dimensions: Optional[int] = None  # output dims (embedding models only)
     enabled: bool = True
-    options: Optional[str] = None      # JSON blob
+    options: Optional[str] = None  # JSON blob
     notes: Optional[str] = None
 
 
@@ -1032,10 +1081,11 @@ class AiProviderOut(BaseModel):
 
 # ── AI Project Assignments ────────────────────────────────────────────────────
 
+
 class AiProjectAssignmentCreate(BaseModel):
     project_name: str
     provider_id: str
-    role: str                   # 'embedding' | 'reranker' | 'llm'
+    role: str  # 'embedding' | 'reranker' | 'llm'
     priority: int = 0
     enabled: bool = True
 
@@ -1060,6 +1110,7 @@ class AiProjectAssignmentOut(BaseModel):
 
 
 # ── Browser Links (Bookmarks + Visits) ──────────────────────────────────────
+
 
 class BookmarkCreate(BaseModel):
     url: str
@@ -1137,6 +1188,7 @@ class VisitOut(BaseModel):
 
 # ── Form Controls ────────────────────────────────────────────────────────────
 
+
 class FormControlCreate(BaseModel):
     control_key: str
     label: str
@@ -1174,6 +1226,7 @@ class FormControlOut(BaseModel):
 
 # ── Nav Items ─────────────────────────────────────────────────────────────────
 
+
 class NavItemCreate(BaseModel):
     menu_group: str
     item_key: str
@@ -1186,7 +1239,7 @@ class NavItemCreate(BaseModel):
     sort_order: int = 0
     is_fn: int = 0
     fn_key: Optional[str] = None
-    active_on: Optional[str] = None   # JSON string e.g. '["bookmarks-main"]'
+    active_on: Optional[str] = None  # JSON string e.g. '["bookmarks-main"]'
 
 
 class NavItemUpdate(BaseModel):
@@ -1222,6 +1275,7 @@ class NavItemOut(BaseModel):
 
 # ── Embedded Menu Items ──────────────────────────────────────────────────────
 
+
 class EmbedMenuItemCreate(BaseModel):
     item_key: str
     label: str
@@ -1231,7 +1285,7 @@ class EmbedMenuItemCreate(BaseModel):
     page_index: int = 0
     sort_order: int = 0
     enabled: int = 1
-    menu_context: str = 'embed'
+    menu_context: str = "embed"
 
 
 class EmbedMenuItemUpdate(BaseModel):
@@ -1255,6 +1309,6 @@ class EmbedMenuItemOut(BaseModel):
     page_index: int = 0
     sort_order: int = 0
     enabled: int = 1
-    menu_context: str = 'embed'
+    menu_context: str = "embed"
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
