@@ -9,7 +9,7 @@ from typing import Any
 
 _HEX_RE = re.compile(r"^[0-9A-F]+$")
 _BUCKET_MASK = 0x1F
-_MIN_WIDTH = 56
+_MIN_WIDTH = 40
 _MAX_WIDTH = 2400
 
 
