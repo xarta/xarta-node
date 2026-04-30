@@ -130,6 +130,7 @@ def normalize_column_seed(seed: dict[str, Any], fallback_position: int = 0) -> d
     display_name = str(seed.get("display_name") or seed.get("label") or "").strip()
     if not display_name:
         raise TableLayoutError("each layout column requires display_name")
+    header_label = str(seed.get("header_label") or "").strip() or None
 
     sqlite_column = seed.get("sqlite_column")
     column_key = seed.get("column_key") or sqlite_column or display_name
@@ -169,6 +170,7 @@ def normalize_column_seed(seed: dict[str, Any], fallback_position: int = 0) -> d
     return {
         "column_key": _sanitize_column_key(column_key),
         "display_name": display_name,
+        "header_label": header_label,
         "sqlite_column": str(sqlite_column).strip() if sqlite_column else None,
         "width_px": width,
         "min_width_px": min_width,
@@ -205,6 +207,8 @@ def normalize_layout_data(layout_data: dict[str, Any]) -> dict[str, Any]:
             key: bool(layout_data["bucket_flags"].get(key, False))
             for key in ("shade_up", "horizontal_scroll", "mobile", "portrait", "wide")
         }
+    if "measurement" in layout_data and isinstance(layout_data["measurement"], dict):
+        normalized["measurement"] = layout_data["measurement"]
     return normalized
 
 
@@ -325,7 +329,9 @@ def build_fallback_layout(columns: list[dict[str, Any]], bucket_code: str) -> di
     }
 
 
-def seed_from_sibling(sibling_layout: dict[str, Any], requested_columns: list[dict[str, Any]], bucket_code: str) -> dict[str, Any]:
+def seed_from_sibling(
+    sibling_layout: dict[str, Any], requested_columns: list[dict[str, Any]], bucket_code: str
+) -> dict[str, Any]:
     sibling_columns = sibling_layout.get("columns") if isinstance(sibling_layout, dict) else None
     if not isinstance(sibling_columns, list) or not sibling_columns:
         return build_fallback_layout(requested_columns, bucket_code)
@@ -336,7 +342,9 @@ def seed_from_sibling(sibling_layout: dict[str, Any], requested_columns: list[di
         seeded["bucket_flags"] = decode_bucket_code(bucket_code)
         return seeded
 
-    normalized_requested = [normalize_column_seed(column, idx) for idx, column in enumerate(requested_columns)]
+    normalized_requested = [
+        normalize_column_seed(column, idx) for idx, column in enumerate(requested_columns)
+    ]
     sibling_map: dict[str, dict[str, Any]] = {}
     for entry in sibling_columns:
         normalized = normalize_column_seed(entry, entry.get("position", 0))
@@ -348,7 +356,9 @@ def seed_from_sibling(sibling_layout: dict[str, Any], requested_columns: list[di
     fallback = build_fallback_layout(requested_columns, bucket_code)
     fallback_map = {col["column_key"]: col for col in fallback["columns"]}
     for idx, column in enumerate(normalized_requested):
-        match = sibling_map.get(column["column_key"]) or sibling_map.get(column.get("sqlite_column") or "")
+        match = sibling_map.get(column["column_key"]) or sibling_map.get(
+            column.get("sqlite_column") or ""
+        )
         base = copy.deepcopy(match) if match else copy.deepcopy(fallback_map[column["column_key"]])
         base["display_name"] = column["display_name"]
         base["sqlite_column"] = column.get("sqlite_column")
