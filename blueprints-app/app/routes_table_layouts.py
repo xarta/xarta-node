@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from .db import get_conn, increment_gen
 from .models import (
+    TableLayoutAutoRequest,
     TableLayoutCatalogCreate,
     TableLayoutCatalogOut,
     TableLayoutCatalogUpdate,
@@ -16,6 +17,7 @@ from .models import (
     TableLayoutUpsert,
 )
 from .sync.queue import enqueue_for_all_peers
+from .table_auto_layouts import build_auto_layout
 from .table_layouts import (
     TableLayoutError,
     build_fallback_layout,
@@ -88,12 +90,52 @@ def _serialize_json(value: dict) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
 
 
+def _upsert_layout_row(conn, layout_key: str, layout_data: dict, *, source: str = "human"):
+    parts = split_layout_key(layout_key)
+    existing = conn.execute(
+        "SELECT layout_key FROM table_layouts WHERE layout_key=?",
+        (parts["layout_key"],),
+    ).fetchone()
+    gen = increment_gen(conn, source)
+    if existing:
+        conn.execute(
+            """
+            UPDATE table_layouts
+            SET layout_data=?, updated_at=datetime('now')
+            WHERE layout_key=?
+            """,
+            (_serialize_json(layout_data), parts["layout_key"]),
+        )
+        action = "UPDATE"
+    else:
+        conn.execute(
+            """
+            INSERT INTO table_layouts (
+                layout_key, reserved_code, user_code, table_code, bucket_code, layout_data
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                parts["layout_key"],
+                parts["reserved_code"],
+                parts["user_code"],
+                parts["table_code"],
+                parts["bucket_code"],
+                _serialize_json(layout_data),
+            ),
+        )
+        action = "INSERT"
+    row = conn.execute(
+        "SELECT * FROM table_layouts WHERE layout_key=?",
+        (parts["layout_key"],),
+    ).fetchone()
+    enqueue_for_all_peers(conn, action, "table_layouts", parts["layout_key"], dict(row), gen)
+    return row
+
+
 @router.get("/catalog", response_model=list[TableLayoutCatalogOut])
 async def list_table_layout_catalog() -> list[TableLayoutCatalogOut]:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM table_layout_catalog ORDER BY table_code"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM table_layout_catalog ORDER BY table_code").fetchall()
     return [_catalog_row_to_out(row) for row in rows]
 
 
@@ -127,7 +169,9 @@ async def get_table_layout_catalog(table_code: str) -> TableLayoutCatalogOut:
 
 
 @router.post("/catalog", response_model=TableLayoutCatalogOut, status_code=201)
-async def create_table_layout_catalog_entry(body: TableLayoutCatalogCreate) -> TableLayoutCatalogOut:
+async def create_table_layout_catalog_entry(
+    body: TableLayoutCatalogCreate,
+) -> TableLayoutCatalogOut:
     try:
         table_code = normalize_hex_byte(body.table_code, "table_code")
     except TableLayoutError as exc:
@@ -158,7 +202,9 @@ async def create_table_layout_catalog_entry(body: TableLayoutCatalogCreate) -> T
 
 
 @router.put("/catalog/{table_code}", response_model=TableLayoutCatalogOut)
-async def update_table_layout_catalog_entry(table_code: str, body: TableLayoutCatalogUpdate) -> TableLayoutCatalogOut:
+async def update_table_layout_catalog_entry(
+    table_code: str, body: TableLayoutCatalogUpdate
+) -> TableLayoutCatalogOut:
     try:
         code = normalize_hex_byte(table_code, "table_code")
     except TableLayoutError as exc:
@@ -173,7 +219,11 @@ async def update_table_layout_catalog_entry(table_code: str, body: TableLayoutCa
             raise HTTPException(404, f"table layout catalog '{code}' not found")
 
         next_name = body.table_name if body.table_name is not None else existing["table_name"]
-        next_meta = body.table_meta if body.table_meta is not None else parse_json_text(existing["table_meta"], {})
+        next_meta = (
+            body.table_meta
+            if body.table_meta is not None
+            else parse_json_text(existing["table_meta"], {})
+        )
         gen = increment_gen(conn, "human")
         conn.execute(
             """
@@ -240,6 +290,92 @@ async def list_table_layouts(
     return [_layout_row_to_out(row) for row in rows]
 
 
+@router.post("/auto-layout")
+async def auto_layout_table_bucket(body: TableLayoutAutoRequest) -> dict:
+    try:
+        reserved_code = validate_reserved_code(body.reserved_code)
+        user_code = normalize_hex_byte(body.user_code, "user_code")
+        bucket_code = (
+            validate_bucket_code(body.bucket_code)
+            if body.bucket_code
+            else encode_bucket_code(body.bucket_bits.model_dump() if body.bucket_bits else {})
+        )
+        mode = str(body.mode or "preview").strip().lower()
+        if mode not in {"preview", "apply", "replace_generated_only"}:
+            raise TableLayoutError("mode must be preview, apply, or replace_generated_only")
+    except TableLayoutError as exc:
+        raise _http_400(exc) from exc
+
+    with get_conn() as conn:
+        table_code = _resolve_table_code(conn, body.table_code, body.table_name)
+        catalog = conn.execute(
+            "SELECT table_name FROM table_layout_catalog WHERE table_code=?",
+            (table_code,),
+        ).fetchone()
+        table_name = body.table_name or (catalog["table_name"] if catalog else None)
+        layout_key = build_layout_key(reserved_code, user_code, table_code, bucket_code)
+        requested_columns = [column.model_dump() for column in body.columns]
+        viewport = body.viewport.model_dump() if body.viewport else None
+        try:
+            layout_data, planner = build_auto_layout(
+                requested_columns,
+                bucket_code,
+                table_name=table_name,
+                viewport=viewport,
+            )
+            layout_data = normalize_layout_data(layout_data)
+        except TableLayoutError as exc:
+            raise _http_400(exc) from exc
+
+        existing = conn.execute(
+            "SELECT * FROM table_layouts WHERE layout_key=?",
+            (layout_key,),
+        ).fetchone()
+        skipped = False
+        if mode == "replace_generated_only" and existing:
+            existing_layout = parse_json_text(existing["layout_data"], {})
+            existing_origin = str(existing_layout.get("seed_origin") or "").lower()
+            existing_algo = str(existing_layout.get("algorithm_version") or "").lower()
+            generated = existing_origin in {
+                "fallback",
+                "sibling",
+                "sibling-reapply",
+                "auto-layout",
+            } or existing_algo.startswith("auto-")
+            if not generated:
+                skipped = True
+
+        if mode == "preview" or skipped:
+            row_data = {
+                "layout_key": layout_key,
+                "reserved_code": reserved_code,
+                "user_code": user_code,
+                "table_code": table_code,
+                "bucket_code": bucket_code,
+                "layout_data": layout_data
+                if not skipped
+                else parse_json_text(existing["layout_data"], {}),
+                "created_at": existing["created_at"] if existing else None,
+                "updated_at": existing["updated_at"] if existing else None,
+            }
+        else:
+            saved = _upsert_layout_row(
+                conn,
+                layout_key,
+                layout_data,
+                source="table-auto-layout",
+            )
+            row_data = _layout_row_to_out(saved).model_dump()
+
+    row_data["planner"] = planner
+    if skipped:
+        row_data["planner"]["skipped"] = True
+        row_data["planner"]["reason_codes"] = row_data["planner"].get("reason_codes", []) + [
+            "manual_layout_preserved"
+        ]
+    return row_data
+
+
 @router.get("/{layout_key}", response_model=TableLayoutOut)
 async def get_table_layout(layout_key: str) -> TableLayoutOut:
     try:
@@ -262,8 +398,10 @@ async def resolve_table_layout(body: TableLayoutResolveRequest) -> TableLayoutOu
     try:
         reserved_code = validate_reserved_code(body.reserved_code)
         user_code = normalize_hex_byte(body.user_code, "user_code")
-        bucket_code = validate_bucket_code(body.bucket_code) if body.bucket_code else encode_bucket_code(
-            body.bucket_bits.model_dump() if body.bucket_bits else {}
+        bucket_code = (
+            validate_bucket_code(body.bucket_code)
+            if body.bucket_code
+            else encode_bucket_code(body.bucket_bits.model_dump() if body.bucket_bits else {})
         )
     except TableLayoutError as exc:
         raise _http_400(exc) from exc
