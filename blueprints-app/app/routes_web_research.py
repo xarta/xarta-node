@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from .tts_sanitizer import (
 )
 
 router = APIRouter(prefix="/web-research", tags=["web-research"])
+log = logging.getLogger(__name__)
 
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "web-research-speech-cache"
@@ -101,6 +103,25 @@ Rules:
 - Prefer natural spoken forms for obvious joined technical words, for example "allowlist" as "allow list" and "blocklist" as "block list".
 - Do not add commentary about being an AI.
 - Output only the narration text.
+""".strip()
+
+_WEB_RESEARCH_QUERY_NORMALIZER_SYSTEM_PROMPT = """
+You normalize short public web-search queries for display and search quality.
+
+Return strict JSON only, with exactly this shape:
+{"query":"..."}
+
+Rules:
+- Preserve the user's meaning, scope, dates, language, and search intent.
+- Do not answer the query.
+- Do not add new facts, filters, sites, dates, or operators.
+- Do not remove important words.
+- Fix capitalization for proper nouns, titles, brands, place names, people, month names, initialisms, and acronyms.
+- Capitalize the first word of the query.
+- Expand obvious abbreviations when they are part of a widely recognized named entity or title.
+- Do not reinterpret title-like abbreviations as occupational honorifics when the surrounding words imply a known work, franchise, person, place, or brand.
+- Keep the wording natural as a search query, not a sentence.
+- Keep the result under 300 characters.
 """.strip()
 
 
@@ -187,6 +208,95 @@ def _validate_public_query(query: str) -> None:
         raise HTTPException(400, "Query cannot include private, local, or credentialed targets")
     if _SECRETISH_RE.search(query):
         raise HTTPException(400, "Query cannot include credentials or secret-like material")
+
+
+def _fallback_normalize_web_research_query(query: str) -> str:
+    clean = " ".join(str(query or "").strip().split())
+    return clean[:300]
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("normalizer response was not a JSON object")
+    return data
+
+
+def _web_research_query_normalizer_enabled() -> bool:
+    raw = (os.environ.get("WEB_RESEARCH_QUERY_NORMALIZER_ENABLED") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _web_research_query_normalizer_model() -> str:
+    return (
+        os.environ.get("WEB_RESEARCH_QUERY_NORMALIZER_MODEL")
+        or os.environ.get("DOC_SPEECH_LLM_MODEL")
+        or os.environ.get("WEB_RESEARCH_SPEECH_LLM_MODEL")
+        or ""
+    ).strip()
+
+
+async def _complete_web_research_query_normalization_local(query: str) -> str | None:
+    if not _web_research_query_normalizer_enabled():
+        return None
+    base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
+    api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
+    model = _web_research_query_normalizer_model()
+    if not base_url or not api_key or not model:
+        return None
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _WEB_RESEARCH_QUERY_NORMALIZER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({"query": query}, ensure_ascii=False)},
+        ],
+        "temperature": 0,
+        "max_tokens": 120,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = float(os.environ.get("WEB_RESEARCH_QUERY_NORMALIZER_TIMEOUT", "20"))
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        log.warning("web research query normalizer unavailable: %s", exc)
+        return None
+    if resp.status_code >= 400:
+        log.warning("web research query normalizer failed: HTTP %s %s", resp.status_code, resp.text[:240])
+        return None
+    try:
+        data = resp.json()
+        answer = str(data["choices"][0]["message"]["content"] or "")
+        normalized = _extract_json_object(_strip_think_blocks(answer)).get("query")
+    except Exception as exc:
+        log.warning("web research query normalizer returned invalid JSON: %s", exc)
+        return None
+    clean = _fallback_normalize_web_research_query(normalized)
+    if not clean:
+        return None
+    return clean
+
+
+async def _normalize_web_research_query(query: str) -> str:
+    fallback = _fallback_normalize_web_research_query(query)
+    if not fallback:
+        return fallback
+    normalized = await _complete_web_research_query_normalization_local(fallback)
+    if not normalized:
+        return fallback
+    return normalized
 
 
 def _decode_response(response: httpx.Response, operation: str) -> dict[str, Any]:
@@ -723,7 +833,7 @@ async def _poll_task(base_url: str, task_id: str) -> dict[str, Any]:
 
 @router.post("/query", response_model=dict)
 async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
-    query = body.query.strip()
+    query = await _normalize_web_research_query(body.query)
     _validate_public_query(query)
 
     base_url = _adapter_url()
