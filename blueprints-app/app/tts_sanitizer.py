@@ -106,6 +106,17 @@ _OOM_RE = re.compile(r"\boom(?:\s+error)?\b", re.IGNORECASE)
 _LITELLM_CLIENT_CHAT_RE = re.compile(r"\bLLMClient\.chat\b", re.IGNORECASE)
 _PARENT_DIR_RE = re.compile(r"\.\./")
 _COLON_SPEECH_RE = re.compile(r"(?<![A-Za-z0-9]):|:(?!\s)")
+_PCIE_BDF_RE = re.compile(r"\b[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]\b")
+_PCIE_BDF_ROUTE_RE = re.compile(
+    r"\b[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]"
+    r"(?:\s*(?:->|→|,)\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])+"
+    r"\b"
+)
+_BY_ID_DISK_PATH_RE = re.compile(r"/dev/disk/by-id/[^\s,;]+", re.IGNORECASE)
+_SYSFS_PCI_DEVICE_PATH_RE = re.compile(
+    r"/sys/bus/pci/devices/(?:<bdf>|[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])",
+    re.IGNORECASE,
+)
 _SECRET_CONTEXT_LABEL_PATTERN = (
     r"password|passwd|pwd|secret|token|api[_\s-]?key|private[_\s-]?key|credential|"
     r"virtual[_\s-]?key|master[_\s-]?key|x-api-key|authorization|bearer"
@@ -213,6 +224,10 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("USB", "you ess bee"),
     ("PCIe", "pee see eye ee"),
     ("PCI", "pee see eye"),
+    ("BDF", "bee dee eff"),
+    ("DMI", "dee em eye"),
+    ("IOMMU", "eye oh em em you"),
+    ("SATA", "sat ah"),
     ("NVMe", "enn vee em ee"),
     ("SSD", "ess ess dee"),
     ("HDD", "aitch dee dee"),
@@ -261,6 +276,25 @@ _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\bopenclaw\b", "open claw"),
     (r"\bnullclaw\b", "null claw"),
     (r"\bpockettts\b", "pocket TTS"),
+    (r"\blspci\b", "ell ess pee see eye"),
+    (r"\bzpool\b", "zee pool"),
+    (r"\bvdevs\b", "virtual devices"),
+    (r"\bvdev\b", "virtual device"),
+    (r"\bsysfs\b", "sys eff ess"),
+    (r"\broute_bdfs\b", "route BDFs"),
+    (r"\brpool\b", "are pool"),
+    (r"\bipool00\b", "eye pool zero zero"),
+    (r"\bfpool00\b", "eff pool zero zero"),
+    (r"\bX870E\b", "ex eight seventy ee"),
+    (r"\bRyzen\s+9\s+9950X\b", "Ryzen nine ninety nine fifty ex"),
+    (r"\bRTX\s+PRO\s+4000\b", "RTX pro four thousand"),
+    (r"\bRTX\s+5090\b", "RTX fifty ninety"),
+    (r"\bGB202\b", "gee bee two oh two"),
+    (r"\bGB203GL\b", "gee bee two oh three gee ell"),
+    (r"\bT700\b", "tee seven hundred"),
+    (r"\bCrucial\s+P3\b", "Crucial pee three"),
+    (r"\broot\s+complex\b", "root complex"),
+    (r"\broot\s+port\b", "root port"),
     (r"\bplaywright\b", "play wright"),
     (r"\bwebsocket\b", "web socket"),
     (r"\bclonedrepos\b", "cloned repos"),
@@ -660,6 +694,63 @@ def speak_tts_compound_tokens(text: str) -> str:
     return spoken
 
 
+def speak_storage_pcie_terms(text: str) -> str:
+    """Project storage/PCIe command syntax into narration-friendly wording."""
+
+    spoken = str(text or "")
+    spoken = re.sub(
+        r"\bzpool\s+status\s+-vP\s+<pool>",
+        "zee pool status for the selected pool, using verbose full paths",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\bzpool\s+status\s+-vP\s+(?P<pool>[A-Za-z][A-Za-z0-9_-]*)\b",
+        lambda match: (
+            f"zee pool status for pool {match.group('pool')}, using verbose full paths"
+        ),
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\blspci\s+-Dmm\s+-nn\b",
+        "ell ess pee see eye machine readable device list",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\blspci\s+-D\s+-s\s+(?:<bdf>|[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])\s+-vv\b",
+        "ell ess pee see eye verbose details for the selected BDF address",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\blspci\s+-vv\b",
+        "ell ess pee see eye verbose details",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\blspci\s+-tv\b",
+        "ell ess pee see eye tree view",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = re.sub(
+        r"\breadlink\s+-f\s+/sys/bus/pci/devices/(?:<bdf>|[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])\b",
+        "read link of the sysfs PCI device path for the selected BDF address",
+        spoken,
+        flags=re.IGNORECASE,
+    )
+    spoken = _SYSFS_PCI_DEVICE_PATH_RE.sub("the sysfs PCI device path for a BDF address", spoken)
+    spoken = _BY_ID_DISK_PATH_RE.sub("a stable by ID disk path", spoken)
+    spoken = _PCIE_BDF_ROUTE_RE.sub("a PCIe BDF route sequence", spoken)
+    spoken = _PCIE_BDF_RE.sub("a PCIe BDF address", spoken)
+    spoken = spoken.replace("<pool>", "the selected pool")
+    spoken = spoken.replace("<bdf>", "the selected BDF address")
+    return spoken
+
+
 def speak_legacy_letter_names(text: str) -> str:
     spoken = str(text or "")
     for pattern, replacement in _LEGACY_LETTER_NAME_SPEECH:
@@ -800,6 +891,7 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("strip_source_refs", _strip_source_refs),
     TtsTextTransform("redact_tts_secret_material", redact_tts_secret_material),
     TtsTextTransform("project_markdown_headings", _project_markdown_heading_lines),
+    TtsTextTransform("speak_storage_pcie_terms", speak_storage_pcie_terms),
     TtsTextTransform("summarize_fenced_code_blocks", summarize_fenced_code_blocks),
     TtsTextTransform("summarize_markdown_tables", summarize_markdown_tables),
     TtsTextTransform("summarize_endpoint_list_blocks", summarize_endpoint_list_blocks),
