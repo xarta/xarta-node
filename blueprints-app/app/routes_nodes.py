@@ -4,7 +4,7 @@
 /api/v1/nodes         — list nodes registered in the DB
 POST /api/v1/nodes/refresh — re-read .nodes.json and upsert DB (Refresh button)
 DELETE /api/v1/nodes/{id}  — mark node inactive in .nodes.json and update DB
-POST /api/v1/nodes/{id}/pct — start or stop the LXC for a fleet node via pct on its PVE host
+POST /api/v1/nodes/{id}/pct — start/stop/reboot the LXC for a fleet node via pct on its PVE host
 GET  /api/v1/nodes/{id}/pct-status — return current pct status from proxmox_config DB
 """
 
@@ -285,12 +285,11 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
 
 
 class PctAction(BaseModel):
-    action: str  # "start" | "stop"
+    action: str  # "start" | "stop" | "reboot" | "force-cycle"
 
 
-@router.get("/{node_id}/pct-status", status_code=200)
-async def get_node_pct_status(node_id: str) -> dict:
-    """Return the live pct status of the LXC for this node via SSH to its PVE host."""
+def _get_node_lxc_target(node_id: str) -> tuple[str, str, int]:
+    """Return host_machine, pve_host, vmid for a fleet node's LXC."""
     with get_conn() as conn:
         node_row = conn.execute(
             "SELECT host_machine FROM nodes WHERE node_id=?", (node_id,)
@@ -298,36 +297,97 @@ async def get_node_pct_status(node_id: str) -> dict:
     if not node_row:
         raise HTTPException(404, f"node '{node_id}' not found")
 
+    host_machine = node_row["host_machine"]
     with get_conn() as conn:
         pve_row = conn.execute(
             "SELECT pve_host, vmid FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
-            (node_row["host_machine"],),
+            (host_machine,),
         ).fetchone()
-
     if not pve_row:
-        return {"node_id": node_id, "status": "unknown", "vmid": None, "pve_host": None}
+        raise HTTPException(
+            404,
+            f"no proxmox_config entry for '{host_machine}' — run a Proxmox probe first",
+        )
+    return host_machine, pve_row["pve_host"], pve_row["vmid"]
 
-    pve_host = pve_row["pve_host"]
-    vmid     = pve_row["vmid"]
 
+def _make_pve_ssh_args(pve_host: str, connect_timeout: int = 10) -> list[str]:
     from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args, resolve_env_key
 
     try:
-        ssh_args = make_ssh_args(pve_host, connect_timeout=6)
+        return make_ssh_args(pve_host, connect_timeout=connect_timeout)
     except SshTargetNotFound:
+        # Fallback: use PROXMOX_SSH_KEY directly (no source-IP binding)
         try:
             key_path = resolve_env_key("PROXMOX_SSH_KEY")
         except SshKeyMissing as exc:
-            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc)}
-        ssh_args = ["-i", key_path, "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+            raise HTTPException(503, f"SSH key not available: {exc}") from exc
+        return [
+            "-i", key_path,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={connect_timeout}",
+        ]
     except SshKeyMissing as exc:
-        return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc)}
+        raise HTTPException(503, f"SSH key not available: {exc}") from exc
 
-    cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct status {vmid}"]
+
+async def _run_pct_command(
+    pve_host: str,
+    vmid: int,
+    pct_args: str,
+    *,
+    connect_timeout: int = 10,
+    command_timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    ssh_args = _make_pve_ssh_args(pve_host, connect_timeout=connect_timeout)
+    cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct {pct_args} {vmid}"]
     try:
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=8)
-    except subprocess.TimeoutExpired:
-        return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": "SSH timed out"}
+        return await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=command_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "SSH command timed out") from exc
+
+
+@router.get("/{node_id}/pct-status", status_code=200)
+async def get_node_pct_status(node_id: str) -> dict:
+    """Return the live pct status of the LXC for this node via SSH to its PVE host."""
+    try:
+        _, pve_host, vmid = _get_node_lxc_target(node_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        if str(exc.detail).startswith("node "):
+            raise
+        return {"node_id": node_id, "status": "unknown", "vmid": None, "pve_host": None}
+
+    try:
+        result = await _run_pct_command(
+            pve_host,
+            vmid,
+            "status",
+            connect_timeout=6,
+            command_timeout=8,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc.detail)}
+        if exc.status_code == 504:
+            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": "SSH timed out"}
+        raise
+    if result.returncode != 0:
+        return {
+            "node_id": node_id,
+            "status": "unknown",
+            "vmid": vmid,
+            "pve_host": pve_host,
+            "error": result.stderr.strip() or result.stdout.strip() or "pct status failed",
+        }
 
     output = result.stdout.strip().lower()
     if "running" in output:
@@ -342,58 +402,27 @@ async def get_node_pct_status(node_id: str) -> dict:
 
 @router.post("/{node_id}/pct", status_code=200)
 async def node_pct_action(node_id: str, body: PctAction) -> dict:
-    """Start or stop the LXC for the named node via pct on its PVE host."""
+    """Start, stop, reboot, or force stop/start the named node's LXC."""
     action = body.action.strip().lower()
-    if action not in ("start", "stop"):
-        raise HTTPException(400, f"invalid action '{action}'; must be 'start' or 'stop'")
+    if action not in ("start", "stop", "reboot", "force-cycle"):
+        raise HTTPException(400, f"invalid action '{action}'; must be start, stop, reboot, or force-cycle")
 
-    with get_conn() as conn:
-        node_row = conn.execute(
-            "SELECT host_machine FROM nodes WHERE node_id=?", (node_id,)
-        ).fetchone()
-    if not node_row:
-        raise HTTPException(404, f"node '{node_id}' not found")
+    _, pve_host, vmid = _get_node_lxc_target(node_id)
 
-    host_machine = node_row["host_machine"]
-
-    with get_conn() as conn:
-        pve_row = conn.execute(
-            "SELECT pve_host, vmid FROM proxmox_config WHERE name=? AND vm_type='lxc' LIMIT 1",
-            (host_machine,),
-        ).fetchone()
-    if not pve_row:
-        raise HTTPException(
-            404,
-            f"no proxmox_config entry for '{host_machine}' — run a Proxmox probe first",
-        )
-
-    pve_host = pve_row["pve_host"]
-    vmid     = pve_row["vmid"]
-
-    from .ssh import SshKeyMissing, SshTargetNotFound, make_ssh_args, resolve_env_key
-
-    try:
-        ssh_args = make_ssh_args(pve_host, connect_timeout=10)
-    except SshTargetNotFound:
-        # Fallback: use PROXMOX_SSH_KEY directly (no source-IP binding)
-        try:
-            key_path = resolve_env_key("PROXMOX_SSH_KEY")
-        except SshKeyMissing as exc:
-            raise HTTPException(503, f"SSH key not available: {exc}") from exc
-        ssh_args = [
-            "-i", key_path,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-        ]
-    except SshKeyMissing as exc:
-        raise HTTPException(503, f"SSH key not available: {exc}") from exc
-
-    cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct {action} {vmid}"]
-    try:
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired as exc:
-        raise HTTPException(504, "SSH command timed out") from exc
+    outputs: list[str] = []
+    if action == "force-cycle":
+        stop_result = await _run_pct_command(pve_host, vmid, "stop", command_timeout=45)
+        stop_output = stop_result.stderr.strip() or stop_result.stdout.strip()
+        outputs.append(stop_output)
+        if stop_result.returncode != 0 and "not running" not in stop_output.lower() and "already stopped" not in stop_output.lower():
+            raise HTTPException(
+                500,
+                f"pct stop {vmid} on {pve_host} failed: {stop_output or '(no output)'}",
+            )
+        result = await _run_pct_command(pve_host, vmid, "start", command_timeout=45)
+        outputs.append(result.stderr.strip() or result.stdout.strip())
+    else:
+        result = await _run_pct_command(pve_host, vmid, action, command_timeout=45)
 
     if result.returncode != 0:
         raise HTTPException(
@@ -402,12 +431,13 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
         )
 
     log.info("pct %s %s on %s (node %s) succeeded", action, vmid, pve_host, node_id)
+    final_output = "\n".join(line for line in outputs + [result.stdout.strip()] if line)
     return {
         "status":   "ok",
         "action":   action,
         "vmid":     vmid,
         "pve_host": pve_host,
-        "output":   result.stdout.strip(),
+        "output":   final_output,
     }
 
 
@@ -428,4 +458,3 @@ async def register_node_rejected() -> dict:
             "Edit .nodes.json and distribute via bp-nodes-push.sh."
         ),
     )
-

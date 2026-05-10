@@ -200,6 +200,20 @@ DOCS_ROOT: str = os.environ.get("DOCS_ROOT", "")
 TURBOVEC_DOCS_URL: str = os.environ.get("TURBOVEC_DOCS_URL", "http://127.0.0.1:19080")
 TURBOVEC_DOCS_TIMEOUT: float = float(os.environ.get("TURBOVEC_DOCS_TIMEOUT", "12"))
 
+# Node-local Dockge instance and stack directory. The GUI uses the Blueprints
+# API proxy/control surface so Caddy can expose local stack state without
+# opening Dockge's loopback-only port directly.
+LOCAL_DOCKGE_BASE_URL: str = os.environ.get("LOCAL_DOCKGE_BASE_URL", "http://127.0.0.1:5001")
+LOCAL_DOCKGE_STACKS_DIR: str = os.environ.get(
+    "LOCAL_DOCKGE_STACKS_DIR",
+    "/xarta-node/.lone-wolf/stacks",
+)
+LOCAL_DOCKGE_CADDYFILE: str = os.environ.get("LOCAL_DOCKGE_CADDYFILE", "/etc/caddy/Caddyfile")
+LOCAL_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = os.environ.get(
+    "LOCAL_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
+    "",
+)
+
 # Node-local deterministic docs synthesis worker. This is a separate Blueprints
 # proxy surface from the direct TurboVec Docs search route above.
 NULLCLAW_DOCS_SEARCH_URL: str = os.environ.get(
