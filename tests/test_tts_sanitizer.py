@@ -16,7 +16,7 @@ Despite the progress, there are a few areas."""
 
     assert result.text == """Progress So Far.
 
-As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints A pee eye, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
+As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
@@ -37,11 +37,14 @@ Despite the progress, there are a few areas."""
         "speak_known_attribute_names",
         "speak_tts_compound_tokens",
         "speak_http_status_codes",
+        "speak_domain_suffixes",
         "speak_legacy_letter_names",
         "speak_tts_known_terms",
         "speak_tts_file_extensions",
         "speak_legacy_letter_names_after_file_extensions",
+        "speak_env_key_names",
         "speak_tts_identifiers",
+        "speak_tts_known_terms_after_identifiers",
         "speak_tts_acronyms",
         "redact_tts_secret_material",
         "speak_remaining_pipes",
@@ -53,7 +56,7 @@ Despite the progress, there are a few areas."""
 def test_sanitize_tts_text_handles_hash_headings_and_inline_emphasis():
     result = sanitize_tts_text("# Background\nThe **xarta-node** docs are _indexed_ [S12].")
 
-    assert result.text == "Background.\n\nThe xarta node docs are indexed."
+    assert result.text == "Background.\n\nThe zarta node docs are indexed."
 
 
 def test_sanitize_tts_text_speaks_data_fc_key_attribute():
@@ -63,7 +66,7 @@ def test_sanitize_tts_text_speaks_data_fc_key_attribute():
 
     assert (
         result.text
-        == "Blueprints goo ee uses a data eff sea key HTML attribute, data eff sea event, and stray ticks."
+        == "Blueprints gee you eye uses a data eff sea key HTML attribute, data eff sea event, and stray ticks."
     )
     assert "`" not in result.text
 
@@ -72,6 +75,19 @@ def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
     result = sanitize_tts_text("The `form_controls` table maps table_layout_catalog rows for NAV-ITEMS.")
 
     assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
+
+
+def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
+    result = sanitize_tts_text(
+        "CHTP01_AUTH_SECRET POSTGRES_PASSWORD TS_AUTHKEY CHTP01_VLLM_API_KEY "
+        "OPENAI_BASE_URL SYNCTHING_DEVICE_ID pwa_icon_192 tailnet_ip better-auth."
+    ).text
+
+    assert result == (
+        "chat private zero one authorisation secret post gress password tee ess authorisation key "
+        "chat private zero one V L-LM application programming interface key open A eye base you are ell "
+        "sync thing device eye dee pee double you ay icon 192 tail net eye pee better authorisation."
+    )
 
 
 def test_sanitize_tts_text_speaks_known_joined_policy_terms():
@@ -139,7 +155,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
         sanitize_tts_text(raw).text
         == (
             "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
-            "A eye A pee eye goo ee dee enn ess aitch tee tee pee ess mTLS "
+            "artificial intelligence application programming interface gee you eye domain name system aitch tee tee pee ess mTLS "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
             "JavaScript HTML"
         )
@@ -158,6 +174,17 @@ def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
     )
 
 
+def test_sanitize_tts_text_avoids_double_dot_file_pronunciation():
+    result = sanitize_tts_text(
+        "Use dot env, dot .env, .env, env, config.env, dot .json, dot md, dot .claude, and dot gitignored."
+    ).text
+
+    assert result == (
+        "Use dot ee en vee, dot ee en vee, dot ee en vee, dot ee en vee, "
+        "config dot ee en vee, dot Jason, dot em dee, dot claude, and dot git ignored."
+    )
+
+
 def test_sanitize_tts_text_summarizes_markdown_tables_without_pipes():
     raw = """## API Endpoints
 
@@ -172,7 +199,7 @@ Next."""
     result = sanitize_tts_text(raw).text
 
     assert result == (
-        "A pee eye Endpoints.\n\n"
+        "application programming interface Endpoints.\n\n"
         "There is a table with 3 rows covering Method, Path, and Description.\n\n"
         "Next."
     )
@@ -187,7 +214,7 @@ def test_sanitize_tts_text_speaks_textarea_iife_and_dom_terms():
 
 def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     raw = (
-        "LiteLLM postgres fleet CA public CA "
+        "LiteLLM postgres Redis fleet CA public CA "
         "https://127.0.0.1:4000 ../foo/bar C:\\Temp @ eth0 eth1 rtx env .env "
         "gitignored .gitignored <think></think> OOM vmid seekdb certs mcp "
         "dockge xmemory pipecat livecat vllm moe LLMClient.chat openclaw .claude "
@@ -198,13 +225,13 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     )
 
     assert sanitize_tts_text(raw).text == (
-        "light L-LM post gress fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon 4000 "
+        "light L-LM post gress red is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon 4000 "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
         "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L-LM Mixture of Experts "
-        "L-LM client dot chat open claw dot claude Bring Your Own Key null claw A eye pocket tee tee ess "
-        "play wright web socket cloned repos local storage session storage zed A eye zed A eye vee ess code ee um "
-        "vee ess code tee oh tee pee rag turbo veck tail scale tail scale vee pee ess dee enn ess CLI "
+        "L-LM client dot chat open claw dot claude Bring Your Own Key null claw artificial intelligence pocket tee tee ess "
+        "play wright web socket cloned repositories local storage session storage zed A eye zed A eye vee ess code ee um "
+        "vee ess code tee oh tee pee rag turbo veck tail scale tail scale vee pee ess domain name system CLI "
         "crawl for A eye chat private zero one light parse mark it down scrape ling seer ex next generation "
         "vee coon ee yah ellipses path slash to slash file dot Jason"
     )
@@ -219,7 +246,7 @@ def test_sanitize_tts_text_redacts_secret_like_keys_before_caching():
     result = sanitize_tts_text(raw).text
 
     assert result == (
-        "The virtual key for fleet use is redacted key, and Authorization: Bearer redacted key."
+        "The virtual key for fleet use is redacted key, and authorisation: Bearer redacted key."
     )
     assert "EXAMPLEVIRTUALKEY" not in result
     assert "EXAMPLETOKENVALUE" not in result
@@ -302,6 +329,17 @@ def test_sanitize_tts_text_speaks_web_status_codes_and_url_acronym():
     )
 
 
+def test_sanitize_tts_text_speaks_xarta_repos_and_domain_suffixes():
+    result = sanitize_tts_text(
+        "Open repos, repo's, and clonedrepos at https://xarta.local/foo or example.co.uk/xarta-node."
+    ).text
+
+    assert result == (
+        "Open repositories, repositories, and cloned repositories at you are ell zarta dot local slash foo "
+        "or example dot koh dot UK slash zarta node."
+    )
+
+
 def test_prepare_tts_markdown_for_llm_preserves_ssh_for_model_prompt():
     result = prepare_tts_markdown_for_llm("Remote-SSH/Roo traffic and SSH target.")
 
@@ -343,7 +381,7 @@ Done."""
     result = sanitize_tts_text(raw).text
 
     assert result == (
-        "The system provides the following A pee eye methods:\n\n"
+        "The system provides the following application programming interface methods:\n\n"
         "There is an A pee eye endpoint list with 6 endpoints using GET, POST, PUT, and DELETE. "
         "It is summarized here rather than read row by row.\n\n"
         "Done."
