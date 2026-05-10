@@ -92,6 +92,12 @@ _INFRA_ID_WITH_NUMBER_RE = re.compile(
     r"\b(?P<prefix>PVE|LXC|paths)(?:[\s-]?)(?P<number>\d{1,5})(?:sub(?P<subnumber>\d{1,5}))?\b",
     re.IGNORECASE,
 )
+_HTTP_STATUS_CONTEXT_RE = re.compile(
+    r"\b(?P<prefix>HTTP|HTTPS|status(?:\s+code)?|response(?:\s+code)?|"
+    r"returned|returns|returning|error|errors?)\s+(?P<code>[1-5]\d{2})\b",
+    re.IGNORECASE,
+)
+_HTTP_STATUS_BARE_COMMON_RE = re.compile(r"\b(?P<code>400|401|403|404|408|409|422|429|500|501|502|503|504)\b")
 _LIVE_BEFORE_TECH_NOUN_RE = re.compile(
     r"\blive(?=\s+(?:local|model|response|test|tests|validation|probe|probes|"
     r"endpoint|route|stack|service|surface|alias|traffic|request|requests|"
@@ -168,7 +174,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("SSH", "SSH"),
     ("SSL", "SSL"),
     ("TLS", "TLS"),
-    ("URL", "url"),
+    ("URL", "you are ell"),
     ("URI", "you are eye"),
     ("API", "A pee eye"),
     ("REST", "rest"),
@@ -255,6 +261,8 @@ _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\bfleet\s+CA\b", "fleet Certificate Authority"),
     (r"\bpublic\s+CA\b", "public certificate authority"),
     (r"\bLiteLLM\b", "light LLM"),
+    (r"\bOpenAPI\b", "open A pee eye"),
+    (r"\bPostgreSQL\b", "post gress sequel"),
     (r"\bpostgres\b", "post gress"),
     (r"\bbyok\b", "Bring Your Own Key"),
     (r"\bz\.ai\b", "zed A eye"),
@@ -668,6 +676,22 @@ def _speak_digit_code(match: re.Match[str]) -> str:
     return f"{prefix} {digits}"
 
 
+def _speak_http_status_value(code: str) -> str:
+    return " ".join("oh" if digit == "0" else _DIGIT_WORDS[digit] for digit in code)
+
+
+def speak_http_status_codes(text: str) -> str:
+    spoken = str(text or "")
+    spoken = _HTTP_STATUS_CONTEXT_RE.sub(
+        lambda match: f"{match.group('prefix')} {_speak_http_status_value(match.group('code'))}",
+        spoken,
+    )
+    return _HTTP_STATUS_BARE_COMMON_RE.sub(
+        lambda match: _speak_http_status_value(match.group("code")),
+        spoken,
+    )
+
+
 def _speak_live_pronunciation(text: str) -> str:
     spoken = _LIVE_BEFORE_TECH_NOUN_RE.sub("lithe", str(text or ""))
     return _LIVE_AFTER_TEST_CONTEXT_RE.sub(lambda match: f"{match.group('prefix')}lithe", spoken)
@@ -678,7 +702,7 @@ def speak_tts_compound_tokens(text: str) -> str:
     spoken = _THINK_PAIR_RE.sub("think tags", spoken)
     spoken = _THINK_TAG_RE.sub("think tag", spoken)
     spoken = re.sub(r"\.\.\.", " ellipses ", spoken)
-    spoken = re.sub(r"https?://", " url ", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"https?://", " URL ", spoken, flags=re.IGNORECASE)
     spoken = _IP_ADDRESS_RE.sub(_speak_ip_address, spoken)
     spoken = _IP_PATTERN_RE.sub(_speak_ip_pattern, spoken)
     spoken = _LITELLM_CLIENT_CHAT_RE.sub("LLM client dot chat", spoken)
@@ -900,6 +924,7 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("strip_markdown_list_markers", strip_markdown_list_markers),
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
     TtsTextTransform("speak_tts_compound_tokens", speak_tts_compound_tokens),
+    TtsTextTransform("speak_http_status_codes", speak_http_status_codes),
     TtsTextTransform("speak_legacy_letter_names", speak_legacy_letter_names),
     TtsTextTransform("speak_tts_known_terms", speak_tts_known_terms),
     TtsTextTransform("speak_tts_file_extensions", speak_tts_file_extensions),

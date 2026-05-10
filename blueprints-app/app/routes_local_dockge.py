@@ -47,7 +47,7 @@ _OPENAPI_CANDIDATES = ("openapi.json", "swagger.json", "api/openapi.json", "api/
 _DOCS_CANDIDATES = ("docs", "redoc", "swagger", "api/docs")
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _LOCAL_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "local-dockge-speech-cache"
-_LOCAL_DOCKGE_SPEECH_PROMPT_VERSION = "20260510-purpose-context-v1"
+_LOCAL_DOCKGE_SPEECH_PROMPT_VERSION = "20260510-purpose-context-speech-v2"
 _LOCAL_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _LOCAL_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
 _LOCAL_DOCKGE_SOURCE_SUFFIXES = {
@@ -848,6 +848,8 @@ Rules:
 - Be grounded and honest. Distinguish observed facts from likely causes. If the context does not prove why something happened, say that it is not clear from the available evidence.
 - Mention useful next checks only when they follow directly from the supplied docs or status data.
 - Do not reveal secrets or environment values. If a missing environment variable is named in an error, mention only the variable name and the effect.
+- Prefer service names and human descriptions over raw URLs. Mention a hostname, port, path, or status code only when it explains the condition or a useful next check.
+- Preserve acronyms, product names, status codes, and identifiers as ordinary text. The final speech sanitizer handles pronunciation for URL, API, HTTP, OpenAPI, PostgreSQL, IP addresses, status codes, and joined tokens.
 - Keep the existing condition-report style: precise, operational, and useful. Do not replace it with a generic service description.
 - After the condition report, add a concise closing description of what the stack is meant to do. Cover its stand-alone purpose first, then its role in the wider xarta-node or Blueprints local systems. Mention the main web/API/user-facing capability and any important relationship to docs, search, AI, TTS, agents, Caddy, tailnet, or other stacks when the supplied context supports it.
 - If the supplied docs and skills do not explain the stack's purpose or wider role, say that the available local context does not describe its intended role clearly.

@@ -27,6 +27,7 @@ Despite the progress, there are a few areas."""
         "strip_source_refs",
         "redact_tts_secret_material",
         "project_markdown_headings",
+        "speak_storage_pcie_terms",
         "summarize_fenced_code_blocks",
         "summarize_markdown_tables",
         "summarize_endpoint_list_blocks",
@@ -35,6 +36,7 @@ Despite the progress, there are a few areas."""
         "strip_markdown_list_markers",
         "speak_known_attribute_names",
         "speak_tts_compound_tokens",
+        "speak_http_status_codes",
         "speak_legacy_letter_names",
         "speak_tts_known_terms",
         "speak_tts_file_extensions",
@@ -196,7 +198,7 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     )
 
     assert sanitize_tts_text(raw).text == (
-        "light L-LM post gress fleet Certificate Authority public certificate authority url 127 dot 0 dot 0 dot 1 colon 4000 "
+        "light L-LM post gress fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon 4000 "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
         "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L-LM Mixture of Experts "
@@ -287,6 +289,17 @@ def test_sanitize_tts_text_speaks_live_as_lithe_only_in_technical_contexts():
         "lithe local model tests passed. A lithe run updated it."
     )
     assert ordinary == "I live on the target node during tests."
+
+
+def test_sanitize_tts_text_speaks_web_status_codes_and_url_acronym():
+    result = sanitize_tts_text(
+        "The URL returned HTTP 503. Status code 404 and response 500 were seen. PostgreSQL stayed up."
+    ).text
+
+    assert result == (
+        "The you are ell returned aitch tee tee pee five oh three. "
+        "Status code four oh four and response five oh oh were seen. post gress sequel stayed up."
+    )
 
 
 def test_prepare_tts_markdown_for_llm_preserves_ssh_for_model_prompt():
