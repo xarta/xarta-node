@@ -45,6 +45,7 @@ from typing import Any
 import httpx
 
 from .db import get_conn
+from .local_llm_events import publish_local_llm_offline_event
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -223,12 +224,32 @@ async def complete(
         "messages": msgs,
         "max_tokens": max_tokens,
     }
-    async with _http_client(provider) as client:
-        resp = await client.post(
-            f"{provider['base_url'].rstrip('/')}/v1/chat/completions",
-            json=payload,
+    base_url = provider["base_url"].rstrip("/")
+    active_model = model_name or provider["model_name"]
+    try:
+        async with _http_client(provider) as client:
+            resp = await client.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+            )
+    except (httpx.TimeoutException, httpx.RequestError) as exc:
+        await publish_local_llm_offline_event(
+            operation=f"{project_name}:complete",
+            model=active_model,
+            base_url=base_url,
+            detail=str(exc),
         )
-        resp.raise_for_status()
+        raise
+    if resp.status_code >= 400:
+        detail = resp.text[:1000] if resp.text else f"HTTP {resp.status_code}"
+        await publish_local_llm_offline_event(
+            operation=f"{project_name}:complete",
+            model=active_model,
+            base_url=base_url,
+            status_code=resp.status_code,
+            detail=detail,
+        )
+    resp.raise_for_status()
 
     raw = resp.json()["choices"][0]["message"]["content"]
 

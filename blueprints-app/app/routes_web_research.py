@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .db import get_conn
+from .local_llm_events import publish_local_llm_offline_event
 from .tts_sanitizer import (
     prepare_tts_markdown_for_llm,
     sanitize_tts_text,
@@ -531,11 +532,30 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
     except httpx.TimeoutException as exc:
+        await publish_local_llm_offline_event(
+            operation="web-research:narration",
+            model=model,
+            base_url=base_url,
+            detail=str(exc),
+        )
         raise HTTPException(504, "Local LLM web research narration generation timed out") from exc
     except httpx.RequestError as exc:
+        await publish_local_llm_offline_event(
+            operation="web-research:narration",
+            model=model,
+            base_url=base_url,
+            detail=str(exc),
+        )
         raise HTTPException(503, f"Local LLM narration endpoint unavailable: {exc}") from exc
     if resp.status_code >= 400:
         detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        await publish_local_llm_offline_event(
+            operation="web-research:narration",
+            model=model,
+            base_url=base_url,
+            status_code=resp.status_code,
+            detail=detail,
+        )
         raise HTTPException(502, f"Local LLM web research narration generation failed: {detail}")
     try:
         data = resp.json()

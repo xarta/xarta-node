@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .db import get_conn, get_setting
+from .local_llm_events import publish_local_llm_offline_event
 
 router = APIRouter(prefix="/litellm", tags=["litellm"])
 
@@ -243,6 +244,12 @@ async def litellm_chat_proxy(body: _ChatBody) -> dict:
     Master key is added server-side; the frontend never sees it.
     """
     if not await _litellm_reachable():
+        await publish_local_llm_offline_event(
+            operation="litellm:chat-proxy",
+            model=body.model,
+            base_url=_base_url(),
+            detail="LiteLLM stack not reachable",
+        )
         raise HTTPException(503, "LiteLLM stack not reachable")
     url = _base_url()
     master_key = _read_master_key()
@@ -259,11 +266,24 @@ async def litellm_chat_proxy(body: _ChatBody) -> dict:
             r = await client.post(f"{url}/v1/chat/completions", headers=headers, json=payload)
         if r.status_code >= 400:
             detail = r.text[:500] if r.text else f"HTTP {r.status_code}"
+            await publish_local_llm_offline_event(
+                operation="litellm:chat-proxy",
+                model=body.model,
+                base_url=url,
+                status_code=r.status_code,
+                detail=detail,
+            )
             raise HTTPException(r.status_code, detail)
         return r.json()
     except HTTPException:
         raise
     except Exception as exc:
+        await publish_local_llm_offline_event(
+            operation="litellm:chat-proxy",
+            model=body.model,
+            base_url=url,
+            detail=str(exc),
+        )
         raise HTTPException(502, f"LiteLLM chat proxy failed: {exc}") from exc
 
 

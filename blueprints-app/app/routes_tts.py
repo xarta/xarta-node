@@ -55,6 +55,8 @@ class SpeakRequest(BaseModel):
     interrupt: bool | None = None
     mode: str | None = None
     format: str | None = None
+    timeout_ms: int | None = None
+    allow_fallback: bool | None = None
     event_kind: str | None = None
     fallback_kind: str | None = None
     sentiment: str | None = None
@@ -89,6 +91,16 @@ def _parse_int(value: str | None, min_value: int, max_value: int) -> int | None:
         parsed = int(str(value).strip())
     except Exception:
         return None
+    return max(min_value, min(max_value, parsed))
+
+
+def _bounded_int(value: int | None, default: int, min_value: int, max_value: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
     return max(min_value, min(max_value, parsed))
 
 
@@ -222,11 +234,12 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     tts_enabled = _parse_bool(settings.get("tts.enabled"))
     fallback_enabled = _parse_bool(settings.get("tts.fallback.enabled"))
+    fallback_allowed = bool(fallback_enabled) and body.allow_fallback is not False
     interrupt_default = _parse_bool(settings.get("tts.interrupt_default"))
-    timeout_ms = _parse_int(settings.get("tts.timeout_ms"), 1000, 120000)
+    settings_timeout_ms = _parse_int(settings.get("tts.timeout_ms"), 1000, 120000)
     threshold = _parse_int(settings.get("tts.stream_word_threshold"), 1, 2000)
 
-    if None in {tts_enabled, fallback_enabled, interrupt_default, timeout_ms, threshold}:
+    if None in {tts_enabled, fallback_enabled, interrupt_default, settings_timeout_ms, threshold}:
         return JSONResponse(
             status_code=503,
             content={
@@ -257,6 +270,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     client_key = _client_key(request)
     session, interrupted_previous = await _start_session(client_key, interrupt)
+    timeout_ms = _bounded_int(body.timeout_ms, int(settings_timeout_ms), 1000, 600000)
 
     probe_url = settings.get("tts.local_probe_url", "")
     speech_url = settings.get("tts.local_speech_url", "")
@@ -265,7 +279,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     if not tts_available:
         await _clear_session_if_current(client_key, session)
-        if not fallback_enabled:
+        if not fallback_allowed:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -302,10 +316,10 @@ async def tts_speak(body: SpeakRequest, request: Request):
     try:
         req = client.build_request("POST", speech_url, json=payload)
         resp = await client.send(req, stream=True)
-    except Exception:
+    except Exception as exc:
         await _clear_session_if_current(client_key, session)
         await client.aclose()
-        if fallback_enabled:
+        if fallback_allowed:
             return _fallback_response(
                 settings=settings,
                 fallback_kind=fallback_kind,
@@ -320,7 +334,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
                 "ok": False,
                 "engine": "none",
                 "interrupted_previous": interrupted_previous,
-                "detail": "Local PocketTTS request failed",
+                "detail": f"Local PocketTTS request failed: {str(exc)[:240] or exc.__class__.__name__}",
             },
         )
 
@@ -329,7 +343,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
         await resp.aclose()
         await client.aclose()
         await _clear_session_if_current(client_key, session)
-        if fallback_enabled:
+        if fallback_allowed:
             return _fallback_response(
                 settings=settings,
                 fallback_kind=fallback_kind,

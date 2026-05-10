@@ -29,6 +29,7 @@ from starlette.responses import Response
 
 from . import config as cfg
 from .db import get_conn, increment_gen
+from .local_llm_events import publish_local_llm_offline_event
 from .models import DocContentBody, DocCreate, DocOut, DocUpdate, DocWithContent
 from .nullclaw_docs_search import (
     SynthesisControls,
@@ -358,7 +359,11 @@ def _strip_think_blocks(text: str) -> str:
     return re.sub(r"\s*<think>.*?</think>\s*", "", str(text or ""), flags=re.DOTALL).strip()
 
 
-async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
+async def _complete_doc_speech_local(
+    messages: list[dict[str, str]],
+    *,
+    operation: str = "docs:narration",
+) -> tuple[str, dict[str, Any]]:
     base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
     model = (os.environ.get("DOC_SPEECH_LLM_MODEL") or "").strip()
@@ -381,11 +386,30 @@ async def _complete_doc_speech_local(messages: list[dict[str, str]]) -> tuple[st
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
             resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
     except httpx.TimeoutException as exc:
+        await publish_local_llm_offline_event(
+            operation=operation,
+            model=model,
+            base_url=base_url,
+            detail=str(exc),
+        )
         raise HTTPException(504, "Local LLM narration generation timed out") from exc
     except httpx.RequestError as exc:
+        await publish_local_llm_offline_event(
+            operation=operation,
+            model=model,
+            base_url=base_url,
+            detail=str(exc),
+        )
         raise HTTPException(503, f"Local LLM narration endpoint unavailable: {exc}") from exc
     if resp.status_code >= 400:
         detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        await publish_local_llm_offline_event(
+            operation=operation,
+            model=model,
+            base_url=base_url,
+            status_code=resp.status_code,
+            detail=detail,
+        )
         raise HTTPException(502, f"Local LLM narration generation failed: {detail}")
     try:
         data = resp.json()
