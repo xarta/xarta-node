@@ -7,12 +7,15 @@ Caddy-served Blueprints API instead of talking to Dockge's loopback-only port.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -21,6 +24,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from . import config as cfg
+from .routes_docs import (
+    _clamp_source_markdown,
+    _clean_doc_speech_markdown,
+    _complete_doc_speech_local,
+    _normalize_node_local_ownership,
+)
+from .tts_sanitizer import prepare_tts_markdown_for_llm
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +45,32 @@ _EXPOSURE_FILENAMES = (
 _VALID_ACTIONS = {"start", "stop", "restart"}
 _OPENAPI_CANDIDATES = ("openapi.json", "swagger.json", "api/openapi.json", "api/swagger.json")
 _DOCS_CANDIDATES = ("docs", "redoc", "swagger", "api/docs")
+_NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
+_LOCAL_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "local-dockge-speech-cache"
+_LOCAL_DOCKGE_SPEECH_PROMPT_VERSION = "20260510-purpose-context-v1"
+_LOCAL_DOCKGE_SPEECH_FILE_LIMIT = 24000
+_LOCAL_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
+_LOCAL_DOCKGE_SOURCE_SUFFIXES = {
+    ".caddyfile",
+    ".conf",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".md",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+_COMPOSE_ENV_PATTERN = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<op>[^}]*)?\}")
 
 
 class LocalDockgeAction(BaseModel):
     action: str
+
+
+class LocalDockgeSpeechBody(BaseModel):
+    force: bool = False
 
 
 def _stacks_root() -> Path:
@@ -504,6 +536,375 @@ def _inspect_stack(stack_name: str) -> dict:
     return _normalize_stack(stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, _parse_caddy_routes())
 
 
+def _compose_env_references(compose: Path) -> dict:
+    try:
+        text = compose.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"referenced": [], "required": []}
+    referenced = set()
+    required = set()
+    for match in _COMPOSE_ENV_PATTERN.finditer(text):
+        name = match.group("name")
+        op = match.group("op") or ""
+        referenced.add(name)
+        if op.startswith(":?") or op.startswith("?"):
+            required.add(name)
+    return {"referenced": sorted(referenced), "required": sorted(required)}
+
+
+def _env_file_presence(stack_dir: Path) -> dict[str, bool]:
+    env_path = stack_dir / ".env"
+    if not env_path.is_file():
+        return {}
+    presence: dict[str, bool] = {}
+    try:
+        lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return presence
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            presence[key] = bool(value.strip().strip('"').strip("'"))
+    return presence
+
+
+def _stack_env_requirements(stack_dir: Path, compose: Path) -> dict:
+    refs = _compose_env_references(compose)
+    presence = _env_file_presence(stack_dir)
+    required = refs["required"]
+    return {
+        "referenced": refs["referenced"],
+        "required": required,
+        "missing_required": [name for name in required if not presence.get(name, False)],
+    }
+
+
+def _inspect_stack_lenient(stack_name: str) -> tuple[dict, Path, Path]:
+    stack_dir, compose = _safe_stack_dir(stack_name)
+    caddy_routes = _parse_caddy_routes()
+    result = _run_compose(stack_dir, compose, ["ps", "--all", "--format", "json"], timeout=20)
+    compose_config, config_error = _compose_config(stack_dir, compose)
+    if result.returncode == 0:
+        stack = _normalize_stack(stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, caddy_routes)
+        stack["env_requirements"] = _stack_env_requirements(stack_dir, compose)
+        if config_error:
+            stack["compose_config_error"] = config_error
+        return stack, stack_dir, compose
+
+    compose_services = _service_configs(compose_config)
+    services = sorted(compose_services)
+    exposures = _base_exposures(services, [], compose_services, caddy_routes)
+    exposures, manifest_error = _apply_manifest_exposures(exposures, _read_exposure_manifest(stack_dir))
+    stack = {
+        "stack_name": stack_dir.name,
+        "path": str(stack_dir),
+        "compose_file": compose.name,
+        "status": "unknown",
+        "health": "unknown",
+        "running": 0,
+        "total": 0,
+        "services": services,
+        "service_exposures": exposures,
+        "containers": [],
+        "error": result.stderr.strip() or result.stdout.strip() or "docker compose ps failed",
+        "compose_config_error": config_error,
+        "env_requirements": _stack_env_requirements(stack_dir, compose),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if manifest_error:
+        stack["exposure_manifest_error"] = manifest_error
+    return stack, stack_dir, compose
+
+
+def _local_dockge_speech_env_int(name: str, default: int, minimum: int = 0, maximum: int = 1000000) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("local Dockge narration: invalid %s=%r; using %s", name, raw, default)
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _safe_stack_cache_name(stack_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", stack_name.strip()).strip(".-") or "stack"
+
+
+def _local_dockge_speech_cache_dir(stack_name: str) -> Path:
+    return _LOCAL_DOCKGE_SPEECH_CACHE_ROOT / _safe_stack_cache_name(stack_name)
+
+
+def _local_dockge_speech_cache_candidates(stack_name: str) -> list[Path]:
+    cache_dir = _local_dockge_speech_cache_dir(stack_name)
+    if not cache_dir.is_dir():
+        return []
+    candidates = [p for p in cache_dir.iterdir() if p.is_file() and p.name.endswith(".txt")]
+    return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+
+
+def _local_dockge_speech_cache_meta_path(cache_path: Path) -> Path:
+    return cache_path.with_name(f"{cache_path.name}.meta.json")
+
+
+def _new_local_dockge_speech_cache_path(stack_name: str) -> Path:
+    cache_dir = _local_dockge_speech_cache_dir(stack_name)
+    base = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    if not base.exists():
+        return base
+    for index in range(1, 100):
+        candidate = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(500, "Could not allocate a unique local Dockge narration cache path")
+
+
+def _invalidate_local_dockge_speech_cache(stack_name: str) -> None:
+    for cached in _local_dockge_speech_cache_candidates(stack_name):
+        try:
+            cached.unlink()
+        except OSError as exc:
+            log.warning("local Dockge narration: could not remove stale cache %s: %s", cached, exc)
+        meta_path = _local_dockge_speech_cache_meta_path(cached)
+        try:
+            if meta_path.exists():
+                meta_path.unlink()
+        except OSError as exc:
+            log.warning("local Dockge narration: could not remove stale cache metadata %s: %s", meta_path, exc)
+
+
+def _read_local_dockge_source(path: Path, kind: str, source_items: list[dict], seen: set[Path]) -> None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return
+    if resolved in seen or not resolved.is_file():
+        return
+    if resolved.name == ".env":
+        return
+    if resolved.suffix.lower() not in _LOCAL_DOCKGE_SOURCE_SUFFIXES and resolved.name.lower() != "caddyfile":
+        return
+    try:
+        stat = resolved.stat()
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("local Dockge narration: could not read source %s: %s", resolved, exc)
+        return
+    seen.add(resolved)
+    clipped = len(text) > _LOCAL_DOCKGE_SPEECH_FILE_LIMIT
+    source_items.append({
+        "path": str(resolved),
+        "kind": kind,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "clipped": clipped,
+        "text": text[:_LOCAL_DOCKGE_SPEECH_FILE_LIMIT],
+    })
+
+
+def _dockge_skill_roots() -> list[Path]:
+    roots = []
+    for raw_root in (
+        cfg.REPO_OUTER_PATH,
+        cfg.REPO_INNER_PATH,
+        cfg.REPO_NON_ROOT_PATH,
+        str(_NODE_LOCAL_ROOT),
+    ):
+        if not raw_root:
+            continue
+        skill_root = Path(raw_root).expanduser() / ".claude" / "skills"
+        if skill_root.is_dir():
+            roots.append(skill_root)
+    return roots
+
+
+def _gather_local_dockge_speech_sources(stack_name: str, stack_dir: Path, compose: Path) -> list[dict]:
+    source_items: list[dict] = []
+    seen: set[Path] = set()
+    stack_l = stack_name.lower()
+
+    _read_local_dockge_source(compose, "stack-compose", source_items, seen)
+    for name in _EXPOSURE_FILENAMES:
+        _read_local_dockge_source(stack_dir / name, "stack-exposure-manifest", source_items, seen)
+    for name in ("README.md", "NOTES.md", "OPERATIONS.md"):
+        _read_local_dockge_source(stack_dir / name, "stack-note", source_items, seen)
+    docs_dir = stack_dir / "docs"
+    if docs_dir.is_dir():
+        for path in sorted(docs_dir.rglob("*"))[:24]:
+            _read_local_dockge_source(path, "stack-doc", source_items, seen)
+    stack_skill_root = stack_dir / ".claude" / "skills"
+    if stack_skill_root.is_dir():
+        for path in sorted(stack_skill_root.rglob("*"))[:32]:
+            if path.name == "SKILL.md" or path.parent.name == "docs":
+                _read_local_dockge_source(path, "stack-skill", source_items, seen)
+
+    dockge_docs = _NODE_LOCAL_ROOT / "docs" / "dockge"
+    for name in (
+        "LOCAL-DOCKGE-BLUEPRINTS-CONTROL.md",
+        f"{stack_name}.md",
+        f"{stack_name.upper()}.md",
+        f"{stack_name.replace('-', '_')}.md",
+    ):
+        _read_local_dockge_source(dockge_docs / name, "node-local-dockge-doc", source_items, seen)
+    if dockge_docs.is_dir():
+        for path in sorted(dockge_docs.glob("*.md")):
+            if stack_l in path.stem.lower():
+                _read_local_dockge_source(path, "node-local-dockge-doc", source_items, seen)
+
+    for skill_root in _dockge_skill_roots():
+        for skill_dir in sorted((p for p in skill_root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+            name_l = skill_dir.name.lower()
+            if "dockge" not in name_l and stack_l not in name_l:
+                continue
+            _read_local_dockge_source(skill_dir / "SKILL.md", "workspace-skill", source_items, seen)
+            if len(source_items) >= 48:
+                break
+
+    caddyfile = Path(cfg.LOCAL_DOCKGE_CADDYFILE)
+    _read_local_dockge_source(caddyfile, "local-caddy-config", source_items, seen)
+    return source_items
+
+
+def _stack_condition_for_cache(stack: dict) -> dict:
+    clean = json.loads(json.dumps(stack, default=str))
+    clean.pop("updated_at", None)
+    clean.pop("path", None)
+    clean.pop("error", None)
+    clean.pop("compose_config_error", None)
+    for exposure in (clean.get("service_exposures") or {}).values():
+        if isinstance(exposure, dict):
+            route = exposure.get("route")
+            if isinstance(route, dict):
+                route.pop("site", None)
+    return clean
+
+
+def _local_dockge_speech_fingerprint(stack: dict, source_items: list[dict]) -> str:
+    payload = {
+        "prompt_version": _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION,
+        "stack": _stack_condition_for_cache(stack),
+        "sources": [
+            {
+                "path": item.get("path"),
+                "kind": item.get("kind"),
+                "size": item.get("size"),
+                "mtime_ns": item.get("mtime_ns"),
+                "clipped": item.get("clipped"),
+            }
+            for item in source_items
+        ],
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _valid_local_dockge_speech_cache_path(stack_name: str, fingerprint: str) -> Path | None:
+    for candidate in _local_dockge_speech_cache_candidates(stack_name):
+        meta_path = _local_dockge_speech_cache_meta_path(candidate)
+        if not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if meta.get("fingerprint") == fingerprint:
+            return candidate
+    return None
+
+
+def _local_dockge_source_markdown(stack: dict, source_items: list[dict]) -> str:
+    parts = [
+        "# Local Dockge stack condition",
+        "",
+        "Live stack inspection JSON:",
+        "```json",
+        json.dumps(_stack_condition_for_cache(stack), indent=2, sort_keys=True, default=str),
+        "```",
+    ]
+    for item in source_items:
+        parts.extend([
+            "",
+            f"## Source: {item['kind']} — {item['path']}",
+            "",
+            item["text"],
+        ])
+    return "\n".join(parts)
+
+
+_LOCAL_DOCKGE_SPEECH_SYSTEM_PROMPT = """
+You write concise spoken condition reports for a local Dockge stacks page.
+
+Use the supplied live inspection JSON first. Use the docs, skills, compose files, Caddy config, and stack notes only as supporting context.
+
+Rules:
+- Output plain text only. No Markdown headings, bullets, tables, code fences, citations, or source labels.
+- Start with the stack name and its current observed status and health.
+- Explain non-ideal conditions when present: mixed health, unknown health, stopped containers, starting containers, exited containers, compose errors, Caddy exposure issues, or missing runtime information.
+- Be grounded and honest. Distinguish observed facts from likely causes. If the context does not prove why something happened, say that it is not clear from the available evidence.
+- Mention useful next checks only when they follow directly from the supplied docs or status data.
+- Do not reveal secrets or environment values. If a missing environment variable is named in an error, mention only the variable name and the effect.
+- Keep the existing condition-report style: precise, operational, and useful. Do not replace it with a generic service description.
+- After the condition report, add a concise closing description of what the stack is meant to do. Cover its stand-alone purpose first, then its role in the wider xarta-node or Blueprints local systems. Mention the main web/API/user-facing capability and any important relationship to docs, search, AI, TTS, agents, Caddy, tailnet, or other stacks when the supplied context supports it.
+- If the supplied docs and skills do not explain the stack's purpose or wider role, say that the available local context does not describe its intended role clearly.
+- Aim for roughly 180 to 420 spoken words total. It can be longer for complex or unhealthy stacks, but stay concise enough for row-level playback and MP3 generation.
+""".strip()
+
+
+async def _generate_local_dockge_speech_markdown(stack: dict, source_items: list[dict]) -> tuple[str, dict[str, Any]]:
+    source_limit = _local_dockge_speech_env_int(
+        "LOCAL_DOCKGE_SPEECH_SOURCE_CHAR_LIMIT",
+        _LOCAL_DOCKGE_SPEECH_SOURCE_LIMIT,
+        minimum=0,
+        maximum=1000000,
+    )
+    speech_source, source_meta = _clamp_source_markdown(
+        prepare_tts_markdown_for_llm(_local_dockge_source_markdown(stack, source_items)),
+        limit=source_limit,
+    )
+    if source_meta.get("source_clipped"):
+        raise HTTPException(
+            413,
+            (
+                "Local Dockge narration source exceeded LOCAL_DOCKGE_SPEECH_SOURCE_CHAR_LIMIT "
+                f"({source_meta.get('source_chars')} chars > {source_meta.get('source_char_limit')})."
+            ),
+        )
+    user_prompt = (
+        "/no-think\n"
+        f"Stack: {stack.get('stack_name')}\n\n"
+        "Write a spoken condition report from this gathered local context:\n\n"
+        f"{speech_source}"
+    )
+    answer, llm_meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _LOCAL_DOCKGE_SPEECH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        operation="local-dockge:narration",
+    )
+    generation_meta = {**source_meta, **llm_meta}
+    if generation_meta.get("finish_reason") == "length":
+        raise HTTPException(
+            502,
+            "Local Dockge narration hit DOC_SPEECH_LLM_MAX_TOKENS before completing. Increase the limit and regenerate.",
+        )
+    speech = _clean_doc_speech_markdown(str(answer or ""))
+    if not speech:
+        raise HTTPException(502, "Local LLM returned an empty local Dockge narration")
+    generation_meta.update({
+        "speech_chars": len(speech),
+        "speech_words": len(speech.split()),
+        "source_count": len(source_items),
+        "prompt_version": _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION,
+    })
+    return speech, generation_meta
+
+
 def _find_service_exposure(stack_name: str, service_name: str) -> tuple[dict, dict]:
     stack = _inspect_stack(stack_name)
     exposures = stack.get("service_exposures") or {}
@@ -677,6 +1078,81 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
             "detail": "Per-stack smoke tests can be recorded in xarta-service-exposure.yaml and surfaced here later.",
         },
         "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post("/stacks/{stack_name}/speech", status_code=200)
+async def local_dockge_stack_speech(stack_name: str, body: LocalDockgeSpeechBody | None = None) -> dict:
+    force = bool(body.force) if body else False
+    stack, stack_dir, compose = _inspect_stack_lenient(stack_name)
+    source_items = _gather_local_dockge_speech_sources(stack["stack_name"], stack_dir, compose)
+    fingerprint = _local_dockge_speech_fingerprint(stack, source_items)
+
+    if force:
+        _invalidate_local_dockge_speech_cache(stack["stack_name"])
+    elif cache_path := _valid_local_dockge_speech_cache_path(stack["stack_name"], fingerprint):
+        try:
+            speech = cache_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(500, f"Could not read local Dockge narration cache: {exc}") from exc
+        speech_meta = None
+        meta_path = _local_dockge_speech_cache_meta_path(cache_path)
+        if meta_path.is_file():
+            try:
+                speech_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning("local Dockge narration: could not read cache metadata %s: %s", meta_path, exc)
+        return {
+            "ok": True,
+            "stack": stack["stack_name"],
+            "cache": "hit",
+            "speech_path": str(cache_path),
+            "generated_at": cache_path.name.split("--", 1)[0],
+            "generation": speech_meta,
+            "markdown": speech,
+        }
+
+    speech, speech_meta = await _generate_local_dockge_speech_markdown(stack, source_items)
+    cache_path = _new_local_dockge_speech_cache_path(stack["stack_name"])
+    source_summary = [
+        {
+            "path": item.get("path"),
+            "kind": item.get("kind"),
+            "size": item.get("size"),
+            "clipped": item.get("clipped"),
+        }
+        for item in source_items
+    ]
+    speech_meta = {
+        **speech_meta,
+        "stack": stack["stack_name"],
+        "fingerprint": fingerprint,
+        "prompt_version": _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION,
+        "generated_at": cache_path.name.split("--", 1)[0],
+        "sources": source_summary,
+        "condition": _stack_condition_for_cache(stack),
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(speech + "\n", encoding="utf-8")
+        _local_dockge_speech_cache_meta_path(cache_path).write_text(
+            json.dumps(speech_meta, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _normalize_node_local_ownership(cache_path.parent)
+        _normalize_node_local_ownership(cache_path)
+        _normalize_node_local_ownership(_local_dockge_speech_cache_meta_path(cache_path))
+    except OSError as exc:
+        raise HTTPException(500, f"Could not write local Dockge narration cache: {exc}") from exc
+
+    return {
+        "ok": True,
+        "stack": stack["stack_name"],
+        "cache": "regenerated" if force else "miss",
+        "speech_path": str(cache_path),
+        "generated_at": cache_path.name.split("--", 1)[0],
+        "generation": speech_meta,
+        "markdown": speech,
     }
 
 

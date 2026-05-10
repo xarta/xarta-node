@@ -215,6 +215,14 @@ Pill meaning in Local Dockge:
 - `localhost-api` / `localhost-web`: local-only endpoint, modal only
 - `internal`: dependency or non-HTTP service, modal only
 
+## Local Dockge narration support
+
+When adding or maintaining a node-local stack, keep the stack's `README.md`, `docs/`, stack-local `.claude/skills/*/SKILL.md`, and `xarta-service-exposure.yaml` accurate enough for Blueprints Local Dockge narration to explain the stack honestly.
+
+The Local Dockge page has a per-stack speaker action that uses local AI and the same Docs narration/TTS behavior. Its context is the live `docker compose ps --all` / `docker compose config` condition plus node-local Dockge docs, public/private Dockge skills, stack-local skills, stack notes, exposure manifests, and Caddy routes.
+
+Record likely failure modes, required environment variable names, health-check meaning, service purpose, browser/API routes, and safe next checks in docs or skills. Do not place secret values in those files; variable names and operational effects are enough.
+
 ## References
 
 - `/xarta-node/.lone-wolf/docs/dockge/README.md`
