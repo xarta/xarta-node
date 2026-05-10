@@ -77,6 +77,23 @@ _BARE_FILE_EXTENSION_RE = re.compile(
     + r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+_DOT_PREFIX_SPECIAL_SPEECH = {
+    "claude": "dot claude",
+    "gitignored": "dot git ignored",
+}
+_DOT_PREFIX_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])dot\s+\.?(?P<token>"
+    + "|".join(
+        re.escape(token)
+        for token in sorted(
+            set(_FILE_EXTENSION_LOOKUP) | set(_DOT_PREFIX_SPECIAL_SPEECH),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
 _IP_ADDRESS_RE = re.compile(
     r"\b(?P<ip>(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3})(?::(?P<port>\d{1,5}))?\b"
 )
@@ -98,6 +115,28 @@ _HTTP_STATUS_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _HTTP_STATUS_BARE_COMMON_RE = re.compile(r"\b(?P<code>400|401|403|404|408|409|422|429|500|501|502|503|504)\b")
+_ENV_KEY_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+_DOMAIN_SUFFIX_SPEECH: tuple[tuple[str, str], ...] = (
+    (".co.uk", " dot koh dot UK"),
+    (".org.uk", " dot org dot UK"),
+    (".gov.uk", " dot gov dot UK"),
+    (".ac.uk", " dot ay see dot UK"),
+    (".com", " dot com"),
+    (".net", " dot net"),
+    (".org", " dot org"),
+    (".dev", " dot dev"),
+    (".io", " dot eye oh"),
+    (".tech", " dot tech"),
+    (".local", " dot local"),
+    (".localhost", " dot localhost"),
+)
+_DOMAIN_SUFFIX_LOOKUP = dict(_DOMAIN_SUFFIX_SPEECH)
+_DOMAIN_SUFFIX_RE = re.compile(
+    r"(?P<suffix>"
+    + "|".join(re.escape(suffix) for suffix, _spoken in sorted(_DOMAIN_SUFFIX_SPEECH, key=lambda item: len(item[0]), reverse=True))
+    + r")(?=$|[/:?#\s,;)\]}])",
+    re.IGNORECASE,
+)
 _LIVE_BEFORE_TECH_NOUN_RE = re.compile(
     r"\blive(?=\s+(?:local|model|response|test|tests|validation|probe|probes|"
     r"endpoint|route|stack|service|surface|alias|traffic|request|requests|"
@@ -157,7 +196,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("LAN", "lan"),
     ("WAN", "wan"),
     ("VPN", "vee pee enn"),
-    ("DNS", "dee enn ess"),
+    ("DNS", "domain name system"),
     ("mDNS", "em dee enn ess"),
     ("DHCP", "dee aitch see pee"),
     ("NTP", "enn tee pee"),
@@ -176,7 +215,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("TLS", "TLS"),
     ("URL", "you are ell"),
     ("URI", "you are eye"),
-    ("API", "A pee eye"),
+    ("API", "application programming interface"),
     ("REST", "rest"),
     ("JSON", "Jason"),
     ("YAML", "yammel"),
@@ -198,7 +237,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("PWA", "pee double you ay"),
     ("UI", "you eye"),
     ("UX", "you ex"),
-    ("GUI", "goo ee"),
+    ("GUI", "gee you eye"),
     ("CLI", "CLI"),
     ("IDE", "eye dee ee"),
     ("SDK", "ess dee kay"),
@@ -209,7 +248,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("SQL", "sequel"),
     ("ORM", "oh are em"),
     ("CRUD", "crud"),
-    ("AI", "A eye"),
+    ("AI", "artificial intelligence"),
     ("LLM", "L-LM"),
     ("ML", "ML"),
     ("NLP", "NLP"),
@@ -260,10 +299,20 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
 _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\bfleet\s+CA\b", "fleet Certificate Authority"),
     (r"\bpublic\s+CA\b", "public certificate authority"),
+    (r"(?<![A-Za-z0-9])dot\s+\.?env\b", "dot ee en vee"),
     (r"\bLiteLLM\b", "light LLM"),
+    (r"\bauthkey\b", "authorisation key"),
+    (r"\bauthorization\b", "authorisation"),
+    (r"\bauth\b", "authorisation"),
     (r"\bOpenAPI\b", "open A pee eye"),
+    (r"\bOpenAI\b", "open A eye"),
+    (r"\bOpenRouter\b", "open router"),
     (r"\bPostgreSQL\b", "post gress sequel"),
     (r"\bpostgres\b", "post gress"),
+    (r"\bredis\b", "red is"),
+    (r"\bsyncthing\b", "sync thing"),
+    (r"\btailnet\b", "tail net"),
+    (r"\bxarta\b", "zarta"),
     (r"\bbyok\b", "Bring Your Own Key"),
     (r"\bz\.ai\b", "zed A eye"),
     (r"\bzai\b", "zed A eye"),
@@ -305,7 +354,9 @@ _KNOWN_TERM_SPEECH: tuple[tuple[str, str], ...] = (
     (r"\broot\s+port\b", "root port"),
     (r"\bplaywright\b", "play wright"),
     (r"\bwebsocket\b", "web socket"),
-    (r"\bclonedrepos\b", "cloned repos"),
+    (r"\bclonedrepos\b", "cloned repositories"),
+    (r"\brepo's\b", "repositories"),
+    (r"\brepos\b", "repositories"),
     (r"\blocalstorage\b", "local storage"),
     (r"\bsessionstorage\b", "session storage"),
     (r"\bvscodium\b", "vee ess code ee um"),
@@ -692,6 +743,13 @@ def speak_http_status_codes(text: str) -> str:
     )
 
 
+def speak_domain_suffixes(text: str) -> str:
+    return _DOMAIN_SUFFIX_RE.sub(
+        lambda match: _DOMAIN_SUFFIX_LOOKUP.get(match.group("suffix").lower(), match.group(0)),
+        str(text or ""),
+    )
+
+
 def _speak_live_pronunciation(text: str) -> str:
     spoken = _LIVE_BEFORE_TECH_NOUN_RE.sub("lithe", str(text or ""))
     return _LIVE_AFTER_TEST_CONTEXT_RE.sub(lambda match: f"{match.group('prefix')}lithe", spoken)
@@ -702,6 +760,14 @@ def speak_tts_compound_tokens(text: str) -> str:
     spoken = _THINK_PAIR_RE.sub("think tags", spoken)
     spoken = _THINK_TAG_RE.sub("think tag", spoken)
     spoken = re.sub(r"\.\.\.", " ellipses ", spoken)
+    spoken = _DOT_PREFIX_TOKEN_RE.sub(
+        lambda match: _DOT_PREFIX_SPECIAL_SPEECH.get(
+            match.group("token").lower(),
+            _FILE_EXTENSION_LOOKUP.get(match.group("token").lower(), match.group(0)),
+        ),
+        spoken,
+    )
+    spoken = re.sub(r"(?<![A-Za-z0-9])dot\s+\.?env\b", "dot ee en vee", spoken, flags=re.IGNORECASE)
     spoken = re.sub(r"https?://", " URL ", spoken, flags=re.IGNORECASE)
     spoken = _IP_ADDRESS_RE.sub(_speak_ip_address, spoken)
     spoken = _IP_PATTERN_RE.sub(_speak_ip_pattern, spoken)
@@ -854,6 +920,28 @@ def speak_tts_acronyms(text: str) -> str:
     return re.sub(r"\bL\.L\.M\.?", "L-LM", spoken)
 
 
+def speak_env_key_names(text: str) -> str:
+    """Make uppercase environment-style key names speakable.
+
+    This deliberately reuses the existing known-term and acronym vocabulary for
+    each key segment. Segments that still look like all-caps ordinary words are
+    lowered so TTS engines are less tempted to spell them letter by letter.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        pieces: list[str] = []
+        for raw_piece in re.split(r"[_-]+", match.group(0)):
+            if not raw_piece:
+                continue
+            spoken = speak_tts_known_terms(raw_piece)
+            if spoken == raw_piece and raw_piece.isupper():
+                spoken = raw_piece.lower()
+            pieces.append(spoken)
+        return " ".join(pieces) if pieces else match.group(0)
+
+    return _ENV_KEY_TOKEN_RE.sub(replace, str(text or ""))
+
+
 def prepare_tts_markdown_for_llm(markdown: str) -> str:
     """Prepare source Markdown for the narration model without speech transforms.
 
@@ -925,11 +1013,14 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("speak_known_attribute_names", _speak_known_attribute_names),
     TtsTextTransform("speak_tts_compound_tokens", speak_tts_compound_tokens),
     TtsTextTransform("speak_http_status_codes", speak_http_status_codes),
+    TtsTextTransform("speak_domain_suffixes", speak_domain_suffixes),
     TtsTextTransform("speak_legacy_letter_names", speak_legacy_letter_names),
     TtsTextTransform("speak_tts_known_terms", speak_tts_known_terms),
     TtsTextTransform("speak_tts_file_extensions", speak_tts_file_extensions),
     TtsTextTransform("speak_legacy_letter_names_after_file_extensions", speak_legacy_letter_names),
+    TtsTextTransform("speak_env_key_names", speak_env_key_names),
     TtsTextTransform("speak_tts_identifiers", speak_tts_identifiers),
+    TtsTextTransform("speak_tts_known_terms_after_identifiers", speak_tts_known_terms),
     TtsTextTransform("speak_tts_acronyms", speak_tts_acronyms),
     TtsTextTransform("redact_tts_secret_material", redact_tts_secret_material),
     TtsTextTransform("speak_remaining_pipes", speak_remaining_pipes),
