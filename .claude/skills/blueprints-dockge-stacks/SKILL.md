@@ -181,6 +181,40 @@ Portainer is tracked separately via `proxmox_config.portainer_json`. It does
 fundamentally different from Dockge's file-based approach. A dedicated
 `portainer_stacks` table and probe are planned for the future.
 
+## Local Dockge exposure metadata
+
+When adding or maintaining a node-local Dockge stack, add
+`xarta-service-exposure.yaml` at the stack root when any service has a web UI,
+API endpoint, Caddy route, localhost-only API, or useful operator modal content.
+
+The Local Dockge Blueprints page merges this manifest with Caddy route and
+Docker Compose discovery. Use the manifest to correct ambiguous inference and to
+provide human-maintained descriptions.
+
+Minimal shape:
+
+```yaml
+services:
+  app:
+    kind: caddy-web        # caddy-web | caddy-api | tailnet-web | tailnet-api | localhost-api | localhost-web | internal
+    label: Web UI
+    url: https://local-dockge.example.invalid/
+    openapi: /openapi.json # optional
+    docs: /docs            # optional
+    description: Short operator-facing description.
+    notes: Any access policy or routing caveat.
+    tests_todo: Add smoke tests later.
+```
+
+Pill meaning in Local Dockge:
+
+- `caddy-web`: Caddy-routed web frontend, opens in a new browser tab
+- `caddy-api`: Caddy-routed API, opens the full service-info modal
+- `tailnet-web`: Tailscale/Headscale-routed web frontend, opens in a new browser tab
+- `tailnet-api`: Tailscale/Headscale-routed API, opens the full service-info modal
+- `localhost-api` / `localhost-web`: local-only endpoint, modal only
+- `internal`: dependency or non-HTTP service, modal only
+
 ## References
 
 - `/xarta-node/.lone-wolf/docs/dockge/README.md`
