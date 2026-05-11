@@ -28,7 +28,7 @@ Despite the progress, there are a few areas."""
 
     assert result.text == """Progress So Far.
 
-As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
+As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non-root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
@@ -94,10 +94,10 @@ def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
     assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
 
 
-def test_sanitize_tts_text_dehyphenates_unlisted_terms_but_preserves_runtime_terms():
+def test_sanitize_tts_text_preserves_safe_two_word_terms_and_transforms_nav_items():
     result = sanitize_tts_text("Keep purpose-built user-facing copy, but NAV-ITEMS splits.").text
 
-    assert result == "Keep purpose built user facing copy, but NAV ITEMS splits."
+    assert result == "Keep purpose-built user-facing copy, but NAV ITEMS splits."
 
 
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
