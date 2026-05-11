@@ -121,11 +121,14 @@ def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
 
     assert "auth" in tokens
     assert "webauthn" in tokens
+    assert "yubikey" in tokens
     assert "repo" in tokens
     assert "env" in tokens
     assert "auth-exempt" not in runtime_policy["p"]
     assert "auth-token" not in runtime_policy["p"]
     assert "webauthn-backed" not in runtime_policy["p"]
+    assert "yubikey-derived" not in runtime_policy["p"]
+    assert "yubikey-protected" not in runtime_policy["p"]
     assert "a-eye-embeddings" not in runtime_policy["p"]
     assert "a-eye-cheap" not in runtime_policy["p"]
     assert "primary-open" not in runtime_policy["p"]
@@ -157,9 +160,9 @@ def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
 
 
 def test_sanitize_tts_text_speaks_webauthn_compounds_before_auth():
-    result = sanitize_tts_text("WebAuthn-backed auth-token and WebAuthn auth.").text
+    result = sanitize_tts_text("WebAuthn-backed auth-token, yubikey-derived, and WebAuthn auth.").text
 
-    assert result == "web orff en backed authorisation token and web orff en authorisation."
+    assert result == "web orff en backed authorisation token, Yubi-key derived, and web orff en authorisation."
 
 
 def test_sanitize_tts_text_speaks_known_joined_policy_terms():
