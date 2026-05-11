@@ -130,6 +130,16 @@ def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
     assert "non-root" in runtime_policy["p"]
 
 
+def test_tts_hyphen_auto_preserve_has_no_generated_sanitizer_token_conflicts():
+    tokens = _AUTO_MODULE.sanitizer_transform_tokens(_SERVICE_SANITIZER)
+    force_transform_terms = _AUTO_MODULE.load_force_transform_terms(
+        Path("/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_transform_terms.json")
+    )
+    runtime_policy = json.loads(_HYPHEN_RUNTIME_POLICY.read_text(encoding="utf-8"))
+
+    assert _AUTO_MODULE.validate_runtime_policy(runtime_policy, tokens, force_transform_terms) == []
+
+
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
     result = sanitize_tts_text(
         "CHTP01_AUTH_SECRET POSTGRES_PASSWORD TS_AUTHKEY CHTP01_VLLM_API_KEY "
