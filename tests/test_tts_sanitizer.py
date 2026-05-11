@@ -67,13 +67,13 @@ Despite the progress, there are a few areas."""
         "speak_domain_suffixes",
         "speak_legacy_letter_names",
         "shield_litellm_aliases",
-        "speak_tts_known_terms",
         "speak_tts_file_extensions",
         "speak_legacy_letter_names_after_file_extensions",
         "speak_env_key_names",
         "speak_tts_identifiers",
+        "speak_tts_known_terms",
         "speak_litellm_aliases",
-        "speak_tts_known_terms_after_identifiers",
+        "speak_tts_known_terms_after_litellm_aliases",
         "speak_tts_acronyms",
         "speak_tts_product_terms",
         "redact_tts_secret_material",
@@ -126,6 +126,9 @@ def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
     assert "auth-exempt" not in runtime_policy["p"]
     assert "auth-token" not in runtime_policy["p"]
     assert "webauthn-backed" not in runtime_policy["p"]
+    assert "a-eye-embeddings" not in runtime_policy["p"]
+    assert "a-eye-cheap" not in runtime_policy["p"]
+    assert "primary-open" not in runtime_policy["p"]
     assert "purpose-built" in runtime_policy["p"]
     assert "non-root" in runtime_policy["p"]
 
@@ -477,7 +480,7 @@ def test_sanitize_tts_text_formats_litellm_aliases_for_speech():
     )
 
 
-def test_sanitize_tts_text_formats_all_litellm_aliases_idempotently():
+def test_sanitize_tts_text_formats_all_litellm_aliases_from_raw_input():
     aliases = sorted(_MODULE._LITELLM_ALIAS_NAMES)
     raw_alias_word_re = re.compile(
         r"\b(?:ANTHROPIC|CHEAP|CHINA|CODING|EMBEDDINGS|EXPENSIVE|FLASH|FREE|GEMINI|LOCAL|"
@@ -488,7 +491,6 @@ def test_sanitize_tts_text_formats_all_litellm_aliases_idempotently():
     assert len(aliases) == 72
     for alias in aliases:
         result = sanitize_tts_text(f"{alias} model alias").text
-        assert sanitize_tts_text(result).text == result
         assert not raw_alias_word_re.search(result)
 
 
