@@ -28,7 +28,7 @@ Despite the progress, there are a few areas."""
 
     assert result.text == """Progress So Far.
 
-As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
+As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non-root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
@@ -94,6 +94,12 @@ def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
     assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
 
 
+def test_sanitize_tts_text_preserves_unreviewed_hyphenated_terms_by_default():
+    result = sanitize_tts_text("Keep purpose-built user-facing copy, but NAV-ITEMS splits.").text
+
+    assert result == "Keep purpose-built user-facing copy, but NAV ITEMS splits."
+
+
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
     result = sanitize_tts_text(
         "CHTP01_AUTH_SECRET POSTGRES_PASSWORD TS_AUTHKEY CHTP01_VLLM_API_KEY "
@@ -101,8 +107,8 @@ def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
     ).text
 
     assert result == (
-        "chat private zero one authorisation secret post gress password tee ess authorisation key "
-        "chat private zero one V L-LM application programming interface key open a-eye base you are ell "
+        "chat-private zero one authorisation secret post gress password tee ess authorisation key "
+        "chat-private zero one V L-LM application programming interface key open a-eye base you are ell "
         "sync-thing device eye dee pee double you ay icon 192 tail-net eye pee better authorisation."
     )
 
@@ -200,7 +206,7 @@ def test_sanitize_tts_text_avoids_double_dot_file_pronunciation():
 
     assert result == (
         "Use dot ee en vee, dot ee en vee, dot ee en vee, dot ee en vee, "
-        "dot ee en vee, dot ee en vee, config dot ee en vee, dot Jason, dot Jason, "
+        "dot ee en vee, dot ee-en-vee, config dot ee en vee, dot Jason, dot Jason, "
         "dot em dee, dot claude, dot claude, dot SSH, dot SSH, dot SSH, dot config, "
         "dot config, dot config, and dot git ignored."
     )
@@ -230,7 +236,7 @@ Next."""
 def test_sanitize_tts_text_speaks_textarea_iife_and_dom_terms():
     result = sanitize_tts_text("textarea textareas IIFE DOM click|change|focus").text
 
-    assert result == "text area text areas eye eye eff ee dom click or change or focus"
+    assert result == "text-area text-areas eye eye eff ee dom click or change or focus"
 
 
 def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
@@ -247,13 +253,13 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
 
     assert sanitize_tts_text(raw).text == (
         "light L-LM post gress red-is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon four zero zero zero "
-        "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
+        "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee-en-vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
         "seek dee bee certificates em see pee Dockage ex memory pipe-cat lithe-cat V L-LM Mixture of Experts "
         "L-LM client dot chat open-claw dot claude Bring Your Own Key null-claw artificial intelligence pocket-TTS "
-        "play wright web socket cloned repositories local storage session storage zed a-eye zed a-eye vee ess code ee um "
-        "vee ess code tee oh tee pee rag turbo veck tail scale tail scale vee pee ess domain name system CLI "
-        "crawl for a-eye chat private zero one light parse mark it down scrape ling seer ex next generation "
+        "play-wright web-socket cloned repositories local-storage session-storage zed a-eye zed a-eye vee ess code ee um "
+        "vee-ess code tee oh tee pee rag turbo-veck tail scale tail-scale vee pee ess domain name system CLI "
+        "crawl for a-eye chat-private zero one light-parse mark-it-down scrape-ling seer ex next generation "
         "vee coon ee yah ellipses path slash to slash file dot Jason"
     )
 
@@ -361,7 +367,7 @@ def test_sanitize_tts_text_is_idempotent_for_speech_ready_url_terms():
     twice = sanitize_tts_text(once).text
 
     assert once == (
-        "The web you eye is exposed at you are ell chat private zero one dot example dot local slash. "
+        "The web you eye is exposed at you are ell chat-private zero one dot example dot local slash. "
         "For diagnostics use you are ell local-host colon one eight four four three, port five four three two, "
         "or ports one eight zero eight one and one eight four four three. "
         "Yubi-key web orff en authorisation."
