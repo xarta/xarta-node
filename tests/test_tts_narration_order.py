@@ -28,3 +28,9 @@ def test_cached_web_research_narration_is_not_sanitized_again_before_tts():
 
     _assert_pre_sanitized_speak_call(source, "_webResearchPrivacySpeechStart")
     _assert_pre_sanitized_speak_call(source, "_webResearchSpeechStart")
+
+
+def test_cached_local_dockge_narration_is_not_sanitized_again_before_tts():
+    source = (WORKSPACE_ROOT / "gui-fallback/js/settings/local-dockge.js").read_text(encoding="utf-8")
+
+    _assert_pre_sanitized_speak_call(source, "_localDockgeNarrationStart")

@@ -348,6 +348,7 @@ Rules:
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
 - Preserve fenced code blocks as examples; summarize what they illustrate instead of reading raw tags, attributes, or source lines.
 - Preserve inline code identifiers, acronyms, and product names as normal text. The final speech sanitizer handles pronunciation and difficult tokens.
+- Do not pre-pronounce technical punctuation. Write `.env`, `.gitignored`, paths, hostnames, URLs, and `host:port` values as ordinary text when they are important; never write forms like "dot env", "dot dot env", "colon 8080", or hand-spelled URL punctuation.
 - Prefer natural spoken forms for obvious joined technical words, for example "allowlist" as "allow list" and "blocklist" as "block list".
 - Use short paragraph breaks for pacing. If a section title helps, write it as a plain sentence with a full stop.
 - Do not add citations, source labels, or commentary about being an AI.

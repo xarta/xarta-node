@@ -850,6 +850,7 @@ Rules:
 - Do not reveal secrets or environment values. If a missing environment variable is named in an error, mention only the variable name and the effect.
 - Prefer service names and human descriptions over raw URLs. Mention a hostname, port, path, or status code only when it explains the condition or a useful next check.
 - Preserve acronyms, product names, status codes, and identifiers as ordinary text. The final speech sanitizer handles pronunciation for URL, API, HTTP, OpenAPI, PostgreSQL, IP addresses, status codes, and joined tokens.
+- Do not pre-pronounce technical punctuation. Write `.env`, `.gitignored`, paths, hostnames, URLs, and `host:port` values as ordinary text when they are important; never write forms like "dot env", "dot dot env", "colon 8080", or hand-spelled URL punctuation.
 - Keep the existing condition-report style: precise, operational, and useful. Do not replace it with a generic service description.
 - After the condition report, add a concise closing description of what the stack is meant to do. Cover its stand-alone purpose first, then its role in the wider xarta-node or Blueprints local systems. Mention the main web/API/user-facing capability and any important relationship to docs, search, AI, TTS, agents, Caddy, tailnet, or other stacks when the supplied context supports it.
 - If the supplied docs and skills do not explain the stack's purpose or wider role, say that the available local context does not describe its intended role clearly.

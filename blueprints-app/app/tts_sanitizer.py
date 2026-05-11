@@ -81,17 +81,31 @@ _DOT_PREFIX_SPECIAL_SPEECH = {
     "claude": "dot claude",
     "gitignored": "dot git ignored",
 }
+_DOT_PREFIX_TOKENS = tuple(
+    sorted(
+        set(_FILE_EXTENSION_LOOKUP) | set(_DOT_PREFIX_SPECIAL_SPEECH),
+        key=len,
+        reverse=True,
+    )
+)
 _DOT_PREFIX_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9])dot\s+\.?(?P<token>"
-    + "|".join(
-        re.escape(token)
-        for token in sorted(
-            set(_FILE_EXTENSION_LOOKUP) | set(_DOT_PREFIX_SPECIAL_SPEECH),
-            key=len,
-            reverse=True,
-        )
-    )
+    + "|".join(re.escape(token) for token in _DOT_PREFIX_TOKENS)
     + r")\b",
+    re.IGNORECASE,
+)
+_DOUBLE_DOT_PREFIX_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])dot\s+dot\s+\.?(?P<token>"
+    + "|".join(re.escape(token) for token in _DOT_PREFIX_TOKENS)
+    + r")\b",
+    re.IGNORECASE,
+)
+_SPOKEN_DOT_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])dot\s+(?:dot\s+|\.)?(?P<token>[A-Za-z][A-Za-z0-9_-]*)\b",
+    re.IGNORECASE,
+)
+_BARE_DOT_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9])\.(?P<token>[A-Za-z][A-Za-z0-9_-]*)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _IP_ADDRESS_RE = re.compile(
@@ -115,6 +129,16 @@ _HTTP_STATUS_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _HTTP_STATUS_BARE_COMMON_RE = re.compile(r"\b(?P<code>400|401|403|404|408|409|422|429|500|501|502|503|504)\b")
+_PORT_LIST_NUMBER_RE = re.compile(
+    r"\b(?P<label>ports)\s+"
+    r"(?P<numbers>\d{1,5}(?:(?:\s*,\s*(?:(?:and|or)\s+)?|"
+    r"\s+(?:and|or)\s+)\d{1,5})+)(?=\b)",
+    re.IGNORECASE,
+)
+_PORT_OR_COLON_NUMBER_RE = re.compile(
+    r"\b(?P<label>ports?|colon)\s+(?P<number>\d{1,5})(?=\b)",
+    re.IGNORECASE,
+)
 _ENV_KEY_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
 _DOMAIN_SUFFIX_SPEECH: tuple[tuple[str, str], ...] = (
     (".co.uk", " dot koh dot UK"),
@@ -128,7 +152,7 @@ _DOMAIN_SUFFIX_SPEECH: tuple[tuple[str, str], ...] = (
     (".io", " dot eye oh"),
     (".tech", " dot tech"),
     (".local", " dot local"),
-    (".localhost", " dot localhost"),
+    (".localhost", " dot local host"),
 )
 _DOMAIN_SUFFIX_LOOKUP = dict(_DOMAIN_SUFFIX_SPEECH)
 _DOMAIN_SUFFIX_RE = re.compile(
@@ -137,6 +161,24 @@ _DOMAIN_SUFFIX_RE = re.compile(
     + r")(?=$|[/:?#\s,;)\]}])",
     re.IGNORECASE,
 )
+_HOSTNAME_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<host>(?:[A-Za-z0-9-]+\.)+"
+    r"(?:co\.uk|org\.uk|gov\.uk|ac\.uk|com|net|org|dev|io|tech|local|localhost))"
+    r"(?=$|[/:?#\s,;)\]}])",
+    re.IGNORECASE,
+)
+_DOMAIN_LABEL_SPEECH = {
+    "ac": "ay see",
+    "co": "koh",
+    "io": "eye oh",
+    "uk": "UK",
+}
+_SPOKEN_DOMAIN_DOT_RE = re.compile(
+    r"(?<=\w)\.(?=(?:xarta|zarta|localhost|local\s+host)\s+dot\s+"
+    r"(?:tech|com|net|org|dev|io|local|localhost)\b)",
+    re.IGNORECASE,
+)
+_SPACED_SPOKEN_PUNCT_RE = re.compile(r"\b(?P<word>slash|dot)\s+(?P<punct>[.,;!?])")
 _LIVE_BEFORE_TECH_NOUN_RE = re.compile(
     r"\blive(?=\s+(?:local|model|response|test|tests|validation|probe|probes|"
     r"endpoint|route|stack|service|surface|alias|traffic|request|requests|"
@@ -198,7 +240,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("VPN", "vee pee enn"),
     ("DNS", "domain name system"),
     ("mDNS", "em dee enn ess"),
-    ("DHCP", "dee aitch see pee"),
+    ("DHCP", "dee H see pee"),
     ("NTP", "enn tee pee"),
     ("TCP", "tee see pee"),
     ("UDP", "you dee pee"),
@@ -208,8 +250,8 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("MAC", "mack"),
     ("NIC", "enn eye sea"),
     ("MTU", "em tee you"),
-    ("HTTP", "aitch tee tee pee"),
-    ("HTTPS", "aitch tee tee pee ess"),
+    ("HTTP", "H tee tee pee"),
+    ("HTTPS", "H tee tee pee ess"),
     ("SSH", "SSH"),
     ("SSL", "SSL"),
     ("TLS", "TLS"),
@@ -265,7 +307,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("ECC", "ee see see"),
     ("LED", "LED"),
     ("OLED", "oh led"),
-    ("HDMI", "aitch dee em eye"),
+    ("HDMI", "H dee em eye"),
     ("USB", "you ess bee"),
     ("PCIe", "pee see eye ee"),
     ("PCI", "pee see eye"),
@@ -275,7 +317,7 @@ _ACRONYM_SPEECH: tuple[tuple[str, str], ...] = (
     ("SATA", "sat ah"),
     ("NVMe", "enn vee em ee"),
     ("SSD", "ess ess dee"),
-    ("HDD", "aitch dee dee"),
+    ("HDD", "H dee dee"),
     ("PSU", "pee ess you"),
     ("UPS", "you pee ess"),
     ("NAS", "naz"),
@@ -731,6 +773,10 @@ def _speak_http_status_value(code: str) -> str:
     return " ".join("oh" if digit == "0" else _DIGIT_WORDS[digit] for digit in code)
 
 
+def _speak_digits_value(number: str) -> str:
+    return " ".join(_DIGIT_WORDS[digit] for digit in number)
+
+
 def speak_http_status_codes(text: str) -> str:
     spoken = str(text or "")
     spoken = _HTTP_STATUS_CONTEXT_RE.sub(
@@ -743,10 +789,48 @@ def speak_http_status_codes(text: str) -> str:
     )
 
 
+def speak_port_and_colon_numbers(text: str) -> str:
+    def replace_port_list(match: re.Match[str]) -> str:
+        numbers = re.sub(
+            r"\d{1,5}",
+            lambda digit_match: _speak_digits_value(digit_match.group(0)),
+            match.group("numbers"),
+        )
+        return f"{match.group('label')} {numbers}"
+
+    spoken = _PORT_LIST_NUMBER_RE.sub(replace_port_list, str(text or ""))
+    return _PORT_OR_COLON_NUMBER_RE.sub(
+        lambda match: f"{match.group('label')} {_speak_digits_value(match.group('number'))}",
+        spoken,
+    )
+
+
+def _speak_hostname_label(label: str) -> str:
+    pieces: list[str] = []
+    for piece in re.split(r"[-_]+", str(label or "").strip()):
+        if not piece:
+            continue
+        lowered = piece.lower()
+        if piece.isdigit():
+            pieces.append(_speak_digits_value(piece))
+        else:
+            pieces.append(_DOMAIN_LABEL_SPEECH.get(lowered, piece))
+    return " ".join(pieces)
+
+
+def speak_hostnames(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        labels = [_speak_hostname_label(label) for label in match.group("host").split(".")]
+        return " dot ".join(label for label in labels if label)
+
+    return _HOSTNAME_RE.sub(replace, str(text or ""))
+
+
 def speak_domain_suffixes(text: str) -> str:
+    spoken = speak_hostnames(text)
     return _DOMAIN_SUFFIX_RE.sub(
         lambda match: _DOMAIN_SUFFIX_LOOKUP.get(match.group("suffix").lower(), match.group(0)),
-        str(text or ""),
+        spoken,
     )
 
 
@@ -755,18 +839,24 @@ def _speak_live_pronunciation(text: str) -> str:
     return _LIVE_AFTER_TEST_CONTEXT_RE.sub(lambda match: f"{match.group('prefix')}lithe", spoken)
 
 
+def _speak_dot_prefix_token(match: re.Match[str]) -> str:
+    raw_token = match.group("token")
+    token = raw_token.lower()
+    return _DOT_PREFIX_SPECIAL_SPEECH.get(
+        token,
+        _FILE_EXTENSION_LOOKUP.get(token, f"dot {_speak_identifier_token(raw_token)}"),
+    )
+
+
 def speak_tts_compound_tokens(text: str) -> str:
     spoken = str(text or "")
     spoken = _THINK_PAIR_RE.sub("think tags", spoken)
     spoken = _THINK_TAG_RE.sub("think tag", spoken)
     spoken = re.sub(r"\.\.\.", " ellipses ", spoken)
-    spoken = _DOT_PREFIX_TOKEN_RE.sub(
-        lambda match: _DOT_PREFIX_SPECIAL_SPEECH.get(
-            match.group("token").lower(),
-            _FILE_EXTENSION_LOOKUP.get(match.group("token").lower(), match.group(0)),
-        ),
-        spoken,
-    )
+    spoken = _DOUBLE_DOT_PREFIX_TOKEN_RE.sub(_speak_dot_prefix_token, spoken)
+    spoken = _DOT_PREFIX_TOKEN_RE.sub(_speak_dot_prefix_token, spoken)
+    spoken = _SPOKEN_DOT_PREFIX_RE.sub(_speak_dot_prefix_token, spoken)
+    spoken = _BARE_DOT_PREFIX_RE.sub(_speak_dot_prefix_token, spoken)
     spoken = re.sub(r"(?<![A-Za-z0-9])dot\s+\.?env\b", "dot ee en vee", spoken, flags=re.IGNORECASE)
     spoken = re.sub(r"https?://", " URL ", spoken, flags=re.IGNORECASE)
     spoken = _IP_ADDRESS_RE.sub(_speak_ip_address, spoken)
@@ -942,6 +1032,18 @@ def speak_env_key_names(text: str) -> str:
     return _ENV_KEY_TOKEN_RE.sub(replace, str(text or ""))
 
 
+def speak_tts_product_terms(text: str) -> str:
+    spoken = str(text or "")
+    spoken = re.sub(r"\bYubi\s*Key\b", "Yubi-key", spoken, flags=re.IGNORECASE)
+    spoken = re.sub(r"\bWeb\s*Authn\b", "web orff en", spoken, flags=re.IGNORECASE)
+    return spoken
+
+
+def clean_spoken_url_artifacts(text: str) -> str:
+    spoken = _SPOKEN_DOMAIN_DOT_RE.sub(" dot ", str(text or ""))
+    return _SPACED_SPOKEN_PUNCT_RE.sub(lambda match: f"{match.group('word')}{match.group('punct')}", spoken)
+
+
 def prepare_tts_markdown_for_llm(markdown: str) -> str:
     """Prepare source Markdown for the narration model without speech transforms.
 
@@ -1022,9 +1124,12 @@ TTS_TEXT_TRANSFORMS: tuple[TtsTextTransform, ...] = (
     TtsTextTransform("speak_tts_identifiers", speak_tts_identifiers),
     TtsTextTransform("speak_tts_known_terms_after_identifiers", speak_tts_known_terms),
     TtsTextTransform("speak_tts_acronyms", speak_tts_acronyms),
+    TtsTextTransform("speak_tts_product_terms", speak_tts_product_terms),
     TtsTextTransform("redact_tts_secret_material", redact_tts_secret_material),
     TtsTextTransform("speak_remaining_pipes", speak_remaining_pipes),
     TtsTextTransform("speak_tts_punctuation", speak_tts_punctuation),
+    TtsTextTransform("speak_port_and_colon_numbers", speak_port_and_colon_numbers),
+    TtsTextTransform("clean_spoken_url_artifacts", clean_spoken_url_artifacts),
     TtsTextTransform("normalize_spacing", _normalize_spacing),
 )
 
