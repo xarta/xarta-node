@@ -13,6 +13,9 @@ _HYHEN_AUTO_PRESERVE_SCRIPT = Path(
 _HYPHEN_RUNTIME_POLICY = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_policy.runtime.json"
 )
+_HYPHEN_UNKNOWN_COUPLETS = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_unknown_couplets.json"
+)
 _SPEC = importlib.util.spec_from_file_location("pockettts_service_tts_sanitizer", _SERVICE_SANITIZER)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -136,14 +139,66 @@ def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
     assert "non-root" in runtime_policy["p"]
 
 
+def test_tts_hyphen_auto_preserve_requires_dictionary_words():
+    source_policy = {
+        "entries": {
+            "purpose-built": {"source_count": 2},
+            "madeup-widget": {"source_count": 3},
+            "auth-token": {"source_count": 4},
+            "nav-items": {"source_count": 5},
+        }
+    }
+    dictionary_words = {"purpose", "built", "widget", "token", "items"}
+    sanitizer_tokens = {"auth"}
+    force_transform_terms = {"nav-items"}
+
+    policy, _stats = _AUTO_MODULE.classify_policy(
+        source_policy,
+        {},
+        sanitizer_tokens,
+        force_transform_terms,
+        dictionary_words,
+    )
+    unknown = _AUTO_MODULE.build_unknown_couplets_report(
+        source_policy,
+        sanitizer_tokens,
+        force_transform_terms,
+        dictionary_words,
+        Path("/tmp/test-dictionary"),
+    )
+
+    assert policy["entries"]["purpose-built"]["dehyphenate"] is False
+    assert policy["entries"]["madeup-widget"]["dehyphenate"] is True
+    assert policy["entries"]["auth-token"]["dehyphenate"] is True
+    assert policy["entries"]["nav-items"]["dehyphenate"] is True
+    assert unknown["e"] == {
+        "madeup-widget": {
+            "m": ["madeup"],
+            "c": 3,
+        }
+    }
+
+
+def test_tts_hyphen_unknown_couplets_report_excludes_known_transform_terms():
+    unknown = json.loads(_HYPHEN_UNKNOWN_COUPLETS.read_text(encoding="utf-8"))
+
+    assert "purpose-built" not in unknown["e"]
+    assert "auth-token" not in unknown["e"]
+    assert "nav-items" not in unknown["e"]
+    assert "webauthn-backed" not in unknown["e"]
+    assert "yubikey-derived" not in unknown["e"]
+    assert "aes-gcm" in unknown["e"]
+
+
 def test_tts_hyphen_auto_preserve_has_no_generated_sanitizer_token_conflicts():
     tokens = _AUTO_MODULE.sanitizer_transform_tokens(_SERVICE_SANITIZER)
     force_transform_terms = _AUTO_MODULE.load_force_transform_terms(
         Path("/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_transform_terms.json")
     )
+    dictionary_words = _AUTO_MODULE.load_dictionary_words(Path("/usr/share/dict/american-english"))
     runtime_policy = json.loads(_HYPHEN_RUNTIME_POLICY.read_text(encoding="utf-8"))
 
-    assert _AUTO_MODULE.validate_runtime_policy(runtime_policy, tokens, force_transform_terms) == []
+    assert _AUTO_MODULE.validate_runtime_policy(runtime_policy, tokens, force_transform_terms, dictionary_words) == []
 
 
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
