@@ -217,6 +217,14 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["aip type"] == "AIP type"
     assert transforms["c"]["aria haspopup"] == "aria has-popup"
     assert transforms["c"]["endpoint list"] == "endpoint list"
+    assert transforms["c"]["azagent ubuntu"] == "a-zed agent ubuntu"
+    assert transforms["c"]["behaviour reference"] == "behaviour reference"
+    assert transforms["c"]["carnice like"] == "carnice-like"
+    assert transforms["c"]["anthropic first"] == "Anthropic-first"
+    assert transforms["c"]["breakpoint driven"] == "breakpoint-driven"
+    assert transforms["c"]["blueprints keystore"] == "Blueprints key-store"
+    assert transforms["c"]["pkg config"] == "package-config"
+    assert transforms["c"]["bookmarks embeddings"] == "bookmarks embeddings"
     assert "a za" in transforms["u"]
 
 
@@ -238,13 +246,17 @@ def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
 def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
     result = sanitize_tts_text(
         "Use badge-btn, backup-tbody, couchdb-based, apitotp-authentication, "
-        "answerability-threshold, aria-haspopup, and crawlerrunconfig-compatible."
+        "answerability-threshold, aria-haspopup, crawlerrunconfig-compatible, "
+        "azagent-ubuntu, behaviour-reference, carnice-like, blueprints-keystore, "
+        "pkg-config, and bookmarks-embeddings."
     ).text
 
     assert result == (
         "Use badge button, backup tee body, couch dee bee based, "
         "application programming interface tee oh tee pee authentication, "
-        "answer-ability threshold, aria has-popup, and crawler run config compatible."
+        "answer-ability threshold, aria has-popup, crawler run config compatible, "
+        "a-zed agent ubuntu, behaviour reference, carnice-like, Blueprints key-store, "
+        "package-config, and bookmarks embeddings."
     )
 
 
