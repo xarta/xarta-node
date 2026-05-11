@@ -236,11 +236,35 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["non allowlisted"] == "non-allow-listed"
     assert transforms["c"]["non autoregressive"] == "non-auto-regressive"
     assert transforms["c"]["non ipool"] == "non-eye-pool"
+    assert transforms["c"]["a za"] == "a zed a"
+    assert transforms["c"]["agentic chunker"] == "a gent-ick chucker"
+    assert transforms["c"]["anthropic passthrough"] == "Anthropic pass-through"
+    assert transforms["c"]["arping sweep"] == "ar-ping sweep"
+    assert transforms["c"]["ata backed"] == "ATA backed"
+    assert transforms["c"]["back compat"] == "backward compatible"
+    assert transforms["c"]["bare systemd"] == "bare system-dee"
+    assert transforms["c"]["bg ctrl"] == "background control"
+    assert transforms["c"]["blueprints appappaiclientpy"] == "Blueprints app-app a-eye client-pie"
+    assert transforms["c"]["blueprints observability"] == "Blueprints observe-ability"
+    assert transforms["c"]["browser wasm"] == "browser whasm"
+    assert transforms["c"]["build meson"] == "build meezon"
+    assert transforms["c"]["bulk precreate"] == "bulk pre-create"
+    assert transforms["c"]["capabilities dict"] == "capabilities dictionary"
+    assert transforms["c"]["carnace hermes"] == "carnice Hermes"
+    assert transforms["c"]["carnice style"] == "carnice-style"
+    assert transforms["c"]["cgroup based"] == "sea-group based"
+    assert transforms["c"]["chatgpt plan"] == "chat GPT plan"
+    assert transforms["c"]["checkbox list"] == "check-box list"
+    assert transforms["c"]["checksum member"] == "check-sum member"
+    assert transforms["c"]["chipset style"] == "chip-set style"
+    assert transforms["c"]["chromadb replacement"] == "chroma DB replacement"
+    assert transforms["c"]["chu tianxiang"] == "Chu Tianxiang"
+    assert transforms["c"]["ciphertext only"] == "cipher-text only"
     assert "private pki" not in transforms["c"]
     assert "presidio pii" not in transforms["c"]
     assert "nvidia cuda" not in transforms["c"]
     assert "oom killed" not in transforms["c"]
-    assert "a za" in transforms["u"]
+    assert "clockhtml internals" in transforms["u"]
 
 
 def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
@@ -265,7 +289,12 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "azagent-ubuntu, behaviour-reference, carnice-like, blueprints-keystore, "
         "pkg-config, bookmarks-embeddings, private-pki, presidio-pii, nvidia-cuda, nvidia-smi, "
         "oom-killed, pre-signoff, post-indexsync, print-errorlogs, reranker-health, "
-        "non-allowlisted, non-autoregressive, and non-ipool."
+        "non-allowlisted, non-autoregressive, non-ipool, a-za, agentic-chunker, "
+        "anthropic-passthrough, arping-sweep, ata-backed, back-compat, bare-systemd, "
+        "bg-ctrl, blueprints-appappaiclientpy, blueprints-observability, browser-wasm, "
+        "build-meson, bulk-precreate, capabilities-dict, carnice-style, cgroup-based, "
+        "chatgpt-plan, checkbox-list, checksum-member, chipset-style, chromadb-replacement, "
+        "chu-tianxiang, and ciphertext-only."
     ).text
 
     assert result == (
@@ -276,7 +305,12 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "package-config, bookmarks embeddings, private PKI, Presidio P two, "
         "en-vid ee-ah cue-dah, en-vid ee-ah SMI, "
         "Out Of Memory killed, pre-sign-off, post-index-sync, print error-logs, re-ranker health, "
-        "non-allow-listed, non-auto-regressive, and non-eye-pool."
+        "non-allow-listed, non-auto-regressive, non-eye-pool, a zed a, a gent-ick chucker, "
+        "Anthropic pass-through, ar-ping sweep, ATA backed, backward compatible, bare system-dee, "
+        "background control, Blueprints app-app a-eye client-pie, Blueprints observe-ability, browser whasm, "
+        "build meezon, bulk pre-create, capabilities dictionary, carnice-style, sea-group based, "
+        "chat GPT plan, check-box list, check-sum member, chip-set style, chroma dee bee replacement, "
+        "Chu Tianxiang, and cipher-text only."
     )
 
 
