@@ -10,11 +10,17 @@ _SERVICE_SANITIZER = Path(
 _HYHEN_AUTO_PRESERVE_SCRIPT = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/scripts/auto_preserve_hyphenated_terms.py"
 )
+_UNKNOWN_COUPLET_SUGGEST_SCRIPT = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/scripts/suggest_unknown_couplet_transforms.py"
+)
 _HYPHEN_RUNTIME_POLICY = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_policy.runtime.json"
 )
 _HYPHEN_UNKNOWN_COUPLETS = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_unknown_couplets.json"
+)
+_UNKNOWN_COUPLET_TRANSFORMS = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_unknown_couplet_transforms.json"
 )
 _SPEC = importlib.util.spec_from_file_location("pockettts_service_tts_sanitizer", _SERVICE_SANITIZER)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -29,6 +35,13 @@ sys.path.insert(0, str(_HYHEN_AUTO_PRESERVE_SCRIPT.parent))
 _AUTO_MODULE = importlib.util.module_from_spec(_AUTO_SPEC)
 sys.modules[_AUTO_SPEC.name] = _AUTO_MODULE
 _AUTO_SPEC.loader.exec_module(_AUTO_MODULE)
+_SUGGEST_SPEC = importlib.util.spec_from_file_location(
+    "pockettts_suggest_unknown_couplet_transforms", _UNKNOWN_COUPLET_SUGGEST_SCRIPT
+)
+assert _SUGGEST_SPEC is not None and _SUGGEST_SPEC.loader is not None
+_SUGGEST_MODULE = importlib.util.module_from_spec(_SUGGEST_SPEC)
+sys.modules[_SUGGEST_SPEC.name] = _SUGGEST_MODULE
+_SUGGEST_SPEC.loader.exec_module(_SUGGEST_MODULE)
 
 prepare_tts_markdown_for_llm = _MODULE.prepare_tts_markdown_for_llm
 sanitize_tts_text = _MODULE.sanitize_tts_text
@@ -74,6 +87,7 @@ Despite the progress, there are a few areas."""
         "speak_legacy_letter_names_after_file_extensions",
         "speak_env_key_names",
         "speak_tts_identifiers",
+        "speak_unknown_couplet_terms",
         "speak_tts_known_terms",
         "speak_litellm_aliases",
         "speak_tts_known_terms_after_litellm_aliases",
@@ -188,6 +202,50 @@ def test_tts_hyphen_unknown_couplets_report_excludes_known_transform_terms():
     assert "webauthn-backed" not in unknown["e"]
     assert "yubikey-derived" not in unknown["e"]
     assert "aes-gcm" in unknown["e"]
+
+
+def test_unknown_couplet_transform_suggestions_cover_common_patterns():
+    transforms = json.loads(_UNKNOWN_COUPLET_TRANSFORMS.read_text(encoding="utf-8"))
+
+    assert transforms["c"]["costoverhead assessment"] == "cost-overhead assessment"
+    assert transforms["c"]["couchdb based"] == "couch DB based"
+    assert transforms["c"]["crawlerrunconfig compatible"] == "crawler run config compatible"
+    assert transforms["c"]["backup tbody"] == "backup tee body"
+    assert transforms["c"]["badge btn"] == "badge button"
+    assert transforms["c"]["apitotp authentication"] == "API TOTP authentication"
+    assert transforms["c"]["answerability threshold"] == "answer-ability threshold"
+    assert transforms["c"]["aip type"] == "AIP type"
+    assert transforms["c"]["aria haspopup"] == "aria has-popup"
+    assert transforms["c"]["endpoint list"] == "endpoint list"
+    assert "a za" in transforms["u"]
+
+
+def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
+    unknown = {"e": {"badge-btn": {"m": ["btn"], "c": 1}, "custom-token": {"m": ["custom"], "c": 2}}}
+    existing = {"c": {"badge btn": "badge control"}, "u": {"custom token": "custom token"}}
+
+    suggestions = _SUGGEST_MODULE.build_transform_suggestions(
+        unknown,
+        {"badge", "custom", "token"},
+        set(),
+        existing,
+    )
+
+    assert suggestions["c"]["badge btn"] == "badge control"
+    assert suggestions["u"]["custom token"] == "custom token"
+
+
+def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
+    result = sanitize_tts_text(
+        "Use badge-btn, backup-tbody, couchdb-based, apitotp-authentication, "
+        "answerability-threshold, aria-haspopup, and crawlerrunconfig-compatible."
+    ).text
+
+    assert result == (
+        "Use badge button, backup tee body, couch dee bee based, "
+        "application programming interface tee oh tee pee authentication, "
+        "answer-ability threshold, aria has-popup, and crawler run config compatible."
+    )
 
 
 def test_tts_hyphen_auto_preserve_has_no_generated_sanitizer_token_conflicts():
