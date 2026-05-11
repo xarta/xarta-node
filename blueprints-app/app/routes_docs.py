@@ -39,11 +39,10 @@ from .nullclaw_docs_search import (
     synthesis_display_block,
 )
 from .sync.queue import enqueue_for_all_peers
-from .tts_sanitizer import (
-    prepare_tts_markdown_for_llm,
-    sanitize_tts_text,
-    strip_top_backlink_line,
-    terminate_tts_line_endings,
+from .tts_sanitizer_client import (
+    TtsSanitizerUnavailable,
+    clean_tts_markdown_via_service,
+    prepare_tts_markdown_for_llm_via_service,
 )
 
 log = logging.getLogger(__name__)
@@ -326,10 +325,12 @@ def _assert_complete_doc_speech(meta: dict[str, Any]) -> None:
         )
 
 
-def _clean_doc_speech_markdown(text: str) -> str:
-    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    cleaned = _strip_frontmatter(cleaned)
-    return terminate_tts_line_endings(sanitize_tts_text(cleaned).text)
+async def _clean_doc_speech_markdown(text: str) -> str:
+    cleaned = _strip_frontmatter(str(text or ""))
+    try:
+        return (await clean_tts_markdown_via_service(cleaned)).text
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 _DOC_SPEECH_SYSTEM_PROMPT = """
@@ -431,9 +432,14 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
     title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
     description = str(doc["description"] or "").strip()
     doc_path = str(doc["path"] or "").strip()
-    speech_source, source_meta = _clamp_source_markdown(
-        prepare_tts_markdown_for_llm(strip_top_backlink_line(_strip_frontmatter(source_markdown)))
-    )
+    try:
+        prepared_source = await prepare_tts_markdown_for_llm_via_service(
+            _strip_frontmatter(source_markdown),
+            strip_top_backlink=True,
+        )
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    speech_source, source_meta = _clamp_source_markdown(prepared_source)
     _assert_complete_doc_speech(source_meta)
     user_prompt = (
         "/no-think\n"
@@ -454,7 +460,7 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
         **llm_meta,
     }
     _assert_complete_doc_speech(generation_meta)
-    speech = _clean_doc_speech_markdown(str(answer or ""))
+    speech = await _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty narration")
     generation_meta.update(

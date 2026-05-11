@@ -34,3 +34,30 @@ def test_cached_local_dockge_narration_is_not_sanitized_again_before_tts():
     source = (WORKSPACE_ROOT / "gui-fallback/js/settings/local-dockge.js").read_text(encoding="utf-8")
 
     _assert_pre_sanitized_speak_call(source, "_localDockgeNarrationStart")
+
+
+def test_blueprints_wrapper_suppresses_upstream_pockettts_sanitizer():
+    source = Path("/root/xarta-node/blueprints-app/app/routes_tts.py").read_text(encoding="utf-8")
+    model_field = source.find('"model": model_name')
+    assert model_field != -1
+    payload_start = source.rfind("payload = {", 0, model_field)
+    assert payload_start != -1
+    payload_end = source.find("}", model_field)
+    assert payload_end != -1
+    payload = source[payload_start:payload_end]
+    assert '"sanitize_text": False' in payload
+    assert '"transform_profile": "none"' in payload
+
+
+def test_blueprints_does_not_carry_a_second_tts_sanitizer_implementation():
+    assert not Path("/root/xarta-node/blueprints-app/app/tts_sanitizer.py").exists()
+
+
+def test_web_research_speech_cache_write_does_not_resanitize():
+    source = Path("/root/xarta-node/blueprints-app/app/routes_web_research.py").read_text(encoding="utf-8")
+    start = source.find("def _write_speech_cache")
+    assert start != -1
+    end = source.find("def ", start + 1)
+    assert end != -1
+    function_body = source[start:end]
+    assert "sanitize_tts_text(" not in function_body

@@ -18,10 +18,11 @@ from pydantic import BaseModel, Field
 
 from .db import get_conn
 from .local_llm_events import publish_local_llm_offline_event
-from .tts_sanitizer import (
-    prepare_tts_markdown_for_llm,
-    sanitize_tts_text,
-    terminate_tts_line_endings,
+from .tts_sanitizer_client import (
+    TtsSanitizerUnavailable,
+    clean_tts_markdown_via_service,
+    prepare_and_sanitize_tts_markdown_via_service,
+    prepare_tts_markdown_for_llm_via_service,
 )
 
 router = APIRouter(prefix="/web-research", tags=["web-research"])
@@ -486,18 +487,24 @@ def _assert_complete_web_research_speech(meta: dict[str, Any]) -> None:
         )
 
 
-def _clean_web_research_speech_markdown(text: str) -> str:
-    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    return re.sub(r"\s+([.,;!?])", r"\1", terminate_tts_line_endings(sanitize_tts_text(cleaned).text))
+async def _clean_web_research_speech_markdown(text: str) -> str:
+    try:
+        result = await clean_tts_markdown_via_service(str(text or ""))
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return re.sub(r"\s+([.,;!?])", r"\1", result.text)
 
 
-def _speech_markdown(*, query: str, summary_markdown: str) -> str:
+async def _speech_markdown(*, query: str, summary_markdown: str) -> str:
     lines = [f"Web research for: {_speech_safe_text(query)}", ""]
     clean_summary = _speech_safe_text(_strip_non_speech_sections(summary_markdown)).strip()
     if clean_summary:
         lines.append(clean_summary)
-    prepared = prepare_tts_markdown_for_llm("\n".join(lines))
-    return re.sub(r"\s+([.,;!?])", r"\1", sanitize_tts_text(prepared).text)
+    try:
+        result = await prepare_and_sanitize_tts_markdown_via_service("\n".join(lines))
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return re.sub(r"\s+([.,;!?])", r"\1", result.text)
 
 
 async def _complete_web_research_speech_local(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
@@ -573,9 +580,13 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
 
 
 async def _generate_web_research_speech_markdown(query: str, summary_markdown: str) -> tuple[str, dict[str, Any]]:
-    speech_source, source_meta = _clamp_speech_source_markdown(
-        prepare_tts_markdown_for_llm(_strip_non_speech_sections(summary_markdown))
-    )
+    try:
+        prepared_source = await prepare_tts_markdown_for_llm_via_service(
+            _strip_non_speech_sections(summary_markdown)
+        )
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    speech_source, source_meta = _clamp_speech_source_markdown(prepared_source)
     _assert_complete_web_research_speech(source_meta)
     user_prompt = (
         "/no-think\n"
@@ -591,7 +602,7 @@ async def _generate_web_research_speech_markdown(query: str, summary_markdown: s
     )
     generation_meta = {**source_meta, **llm_meta}
     _assert_complete_web_research_speech(generation_meta)
-    speech = _clean_web_research_speech_markdown(answer)
+    speech = await _clean_web_research_speech_markdown(answer)
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty web research narration")
     generation_meta.update({"speech_chars": len(speech), "speech_words": len(speech.split())})
@@ -659,7 +670,7 @@ def _write_speech_cache(cache_key: str, markdown: str, meta: dict[str, Any]) -> 
         "ok": True,
         "cache_key": cache_key,
         "generated_at": _now_iso(),
-        "markdown": sanitize_tts_text(markdown).text,
+        "markdown": markdown,
         "meta": {**meta, "speech_version": _WEB_RESEARCH_SPEECH_VERSION},
     }
     try:
@@ -672,7 +683,7 @@ def _write_speech_cache(cache_key: str, markdown: str, meta: dict[str, Any]) -> 
     return path
 
 
-def _display_envelope(
+async def _display_envelope(
     *,
     body: WebResearchQueryBody,
     data: dict[str, Any],
@@ -698,7 +709,7 @@ def _display_envelope(
                 break
     firewall_notes = adapter_notes or ["Guarded public-web adapter enforced URL and content restrictions."]
     markdown = _summary_markdown(data, body.query, sources)
-    audio = _speech_markdown(
+    audio = await _speech_markdown(
         query=body.query,
         summary_markdown=markdown,
     )
@@ -864,7 +875,7 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
     if not task_id:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
     data = await _poll_task(base_url, task_id)
-    display = _display_envelope(body=body, data=data)
+    display = await _display_envelope(body=body, data=data)
     cache_key = None if body.private_mode else _cache_key(
         query=query,
         depth=body.depth,

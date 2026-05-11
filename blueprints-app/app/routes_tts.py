@@ -16,7 +16,11 @@ from pydantic import BaseModel
 
 from . import config as cfg
 from .db import get_conn, get_setting
-from .tts_sanitizer import sanitize_tts_text
+from .tts_sanitizer_client import (
+    TtsSanitizerUnavailable,
+    resolve_tts_sanitizer_url,
+    sanitize_tts_text_via_service,
+)
 
 router = APIRouter(prefix="/tts", tags=["tts"])
 
@@ -36,6 +40,9 @@ _REQUIRED_SETTINGS: tuple[str, ...] = (
     "tts.fallback.positive_sound_path",
     "tts.fallback.negative_sound_path",
     "tts.fallback.volume",
+)
+_OPTIONAL_SETTINGS: tuple[str, ...] = (
+    "tts.sanitizer_url",
 )
 
 
@@ -114,6 +121,10 @@ def _resolve_settings() -> tuple[dict[str, str], list[str]]:
                 resolved[key] = db_val
             else:
                 missing.append(key)
+        for key in _OPTIONAL_SETTINGS:
+            db_val = get_setting(conn, key)
+            if db_val is not None and str(db_val).strip() != "":
+                resolved[key] = db_val
     return resolved, missing
 
 
@@ -248,13 +259,35 @@ async def tts_speak(body: SpeakRequest, request: Request):
             },
         )
 
-    raw_text = (body.text or "").strip() or settings.get("tts.default_message", "")
-    sanitized = sanitize_tts_text(raw_text) if _should_sanitize_text(body) else None
-    text = sanitized.text if sanitized else raw_text
     voice = (body.voice or "").strip() or settings.get("tts.default_voice", "")
     req_mode = (body.mode or "").strip().lower() or settings.get("tts.default_mode", "").strip().lower()
     fmt = (body.format or "wav").strip().lower()
     interrupt = bool(interrupt_default) if body.interrupt is None else bool(body.interrupt)
+    timeout_ms = _bounded_int(body.timeout_ms, int(settings_timeout_ms), 1000, 600000)
+
+    raw_text = (body.text or "").strip() or settings.get("tts.default_message", "")
+    try:
+        sanitized = (
+            await sanitize_tts_text_via_service(
+                raw_text,
+                settings=settings,
+                timeout_ms=timeout_ms,
+                transform_profile=body.transform_profile or "speech",
+            )
+            if _should_sanitize_text(body)
+            else None
+        )
+    except TtsSanitizerUnavailable as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "engine": "none",
+                "detail": str(exc),
+                "sanitizer_url": resolve_tts_sanitizer_url(settings),
+            },
+        )
+    text = sanitized.text if sanitized else raw_text
 
     if not text or not voice:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing effective text or voice in DB/call payload"})
@@ -270,8 +303,6 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     client_key = _client_key(request)
     session, interrupted_previous = await _start_session(client_key, interrupt)
-    timeout_ms = _bounded_int(body.timeout_ms, int(settings_timeout_ms), 1000, 600000)
-
     probe_url = settings.get("tts.local_probe_url", "")
     speech_url = settings.get("tts.local_speech_url", "")
 
@@ -308,6 +339,8 @@ async def tts_speak(body: SpeakRequest, request: Request):
         "input": text,
         "response_format": fmt,
         "stream": effective_mode == "stream",
+        "sanitize_text": False,
+        "transform_profile": "none",
     }
 
     fallback_kind = _resolve_fallback_kind(body, default_kind="positive")
@@ -400,12 +433,30 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
 @router.post("/sanitize")
 async def tts_sanitize(body: SanitizeRequest):
-    result = sanitize_tts_text(body.text)
+    settings, _missing = _resolve_settings()
+    timeout_ms = _parse_int(settings.get("tts.timeout_ms"), 1000, 120000) or 12000
+    try:
+        result = await sanitize_tts_text_via_service(
+            body.text,
+            settings=settings,
+            timeout_ms=timeout_ms,
+            transform_profile=body.transform_profile or "speech",
+        )
+    except TtsSanitizerUnavailable as exc:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "detail": str(exc),
+                "sanitizer_url": resolve_tts_sanitizer_url(settings),
+            },
+        )
     return {
         "ok": True,
         "text": result.text,
         "transforms": list(result.transforms),
         "profile": body.transform_profile or "speech",
+        "sanitizer_url": resolve_tts_sanitizer_url(settings),
     }
 
 
@@ -427,8 +478,19 @@ async def tts_status(request: Request):
     settings, missing = _resolve_settings()
     timeout_ms = _parse_int(settings.get("tts.timeout_ms"), 1000, 120000)
     available = False
+    sanitizer_available = False
     if timeout_ms is not None and not missing:
         available = await _is_local_tts_available(settings.get("tts.local_probe_url", ""), timeout_ms)
+        try:
+            await sanitize_tts_text_via_service(
+                "status",
+                settings=settings,
+                timeout_ms=timeout_ms,
+                transform_profile="none",
+            )
+            sanitizer_available = True
+        except TtsSanitizerUnavailable:
+            sanitizer_available = False
 
     client_key = _client_key(request)
     active_session = False
@@ -441,6 +503,7 @@ async def tts_status(request: Request):
         "missing_settings": missing,
         "enabled": _parse_bool(settings.get("tts.enabled")),
         "local_pockettts_available": available,
+        "local_sanitizer_available": sanitizer_available,
         "active_session": active_session,
         "active_sessions_total": len(_active_sessions),
         "default_voice": settings.get("tts.default_voice"),
@@ -450,4 +513,5 @@ async def tts_status(request: Request):
         "sfx_volume": settings.get("tts.fallback.volume"),
         "probe_url": settings.get("tts.local_probe_url"),
         "speech_url": settings.get("tts.local_speech_url"),
+        "sanitizer_url": resolve_tts_sanitizer_url(settings),
     }
