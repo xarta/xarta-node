@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -6,11 +7,25 @@ from pathlib import Path
 _SERVICE_SANITIZER = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_sanitizer.py"
 )
+_HYHEN_AUTO_PRESERVE_SCRIPT = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/scripts/auto_preserve_hyphenated_terms.py"
+)
+_HYPHEN_RUNTIME_POLICY = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_policy.runtime.json"
+)
 _SPEC = importlib.util.spec_from_file_location("pockettts_service_tts_sanitizer", _SERVICE_SANITIZER)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
+_AUTO_SPEC = importlib.util.spec_from_file_location(
+    "pockettts_auto_preserve_hyphenated_terms", _HYHEN_AUTO_PRESERVE_SCRIPT
+)
+assert _AUTO_SPEC is not None and _AUTO_SPEC.loader is not None
+sys.path.insert(0, str(_HYHEN_AUTO_PRESERVE_SCRIPT.parent))
+_AUTO_MODULE = importlib.util.module_from_spec(_AUTO_SPEC)
+sys.modules[_AUTO_SPEC.name] = _AUTO_MODULE
+_AUTO_SPEC.loader.exec_module(_AUTO_MODULE)
 
 prepare_tts_markdown_for_llm = _MODULE.prepare_tts_markdown_for_llm
 sanitize_tts_text = _MODULE.sanitize_tts_text
@@ -98,6 +113,19 @@ def test_sanitize_tts_text_preserves_safe_two_word_terms_and_transforms_nav_item
     result = sanitize_tts_text("Keep purpose-built user-facing copy, but NAV-ITEMS splits.").text
 
     assert result == "Keep purpose-built user-facing copy, but NAV ITEMS splits."
+
+
+def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
+    tokens = _AUTO_MODULE.sanitizer_transform_tokens(_SERVICE_SANITIZER)
+    runtime_policy = json.loads(_HYPHEN_RUNTIME_POLICY.read_text(encoding="utf-8"))
+
+    assert "auth" in tokens
+    assert "repo" in tokens
+    assert "env" in tokens
+    assert "auth-exempt" not in runtime_policy["p"]
+    assert "auth-token" not in runtime_policy["p"]
+    assert "purpose-built" in runtime_policy["p"]
+    assert "non-root" in runtime_policy["p"]
 
 
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
