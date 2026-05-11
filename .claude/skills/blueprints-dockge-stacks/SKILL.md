@@ -221,6 +221,8 @@ When adding or maintaining a node-local stack, keep the stack's `README.md`, `do
 
 The Local Dockge page has a per-stack speaker action that uses local AI and the same Docs narration/TTS behavior. Its context is the live `docker compose ps --all` / `docker compose config` condition plus node-local Dockge docs, public/private Dockge skills, stack-local skills, stack notes, exposure manifests, and Caddy routes.
 
+Local Dockge narration cache text is already speech-ready. Do not sanitize it again for playback or MP3 download. Frontend callers must pass `sanitizeText: false` and `transformProfile: 'none'` when sending cached/generated Local Dockge narration to the Blueprints TTS wrapper.
+
 Record likely failure modes, required environment variable names, health-check meaning, service purpose, browser/API routes, and safe next checks in docs or skills. Do not place secret values in those files; variable names and operational effects are enough.
 
 ## References

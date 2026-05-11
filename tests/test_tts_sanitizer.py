@@ -46,9 +46,12 @@ Despite the progress, there are a few areas."""
         "speak_tts_identifiers",
         "speak_tts_known_terms_after_identifiers",
         "speak_tts_acronyms",
+        "speak_tts_product_terms",
         "redact_tts_secret_material",
         "speak_remaining_pipes",
         "speak_tts_punctuation",
+        "speak_port_and_colon_numbers",
+        "clean_spoken_url_artifacts",
         "normalize_spacing",
     ]
 
@@ -155,7 +158,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
         sanitize_tts_text(raw).text
         == (
             "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
-            "artificial intelligence application programming interface gee you eye domain name system aitch tee tee pee ess mTLS "
+            "artificial intelligence application programming interface gee you eye domain name system H tee tee pee ess mTLS "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
             "JavaScript HTML"
         )
@@ -176,12 +179,16 @@ def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
 
 def test_sanitize_tts_text_avoids_double_dot_file_pronunciation():
     result = sanitize_tts_text(
-        "Use dot env, dot .env, .env, env, config.env, dot .json, dot md, dot .claude, and dot gitignored."
+        "Use dot env, dot .env, dot dot env, dot dot .env, .env, env, config.env, "
+        "dot .json, dot dot json, dot md, dot .claude, dot dot claude, dot .ssh, "
+        "dot dot ssh, .ssh, dot .config, dot dot config, .config, and dot dot gitignored."
     ).text
 
     assert result == (
         "Use dot ee en vee, dot ee en vee, dot ee en vee, dot ee en vee, "
-        "config dot ee en vee, dot Jason, dot em dee, dot claude, and dot git ignored."
+        "dot ee en vee, dot ee en vee, config dot ee en vee, dot Jason, dot Jason, "
+        "dot em dee, dot claude, dot claude, dot SSH, dot SSH, dot SSH, dot config, "
+        "dot config, dot config, and dot git ignored."
     )
 
 
@@ -225,7 +232,7 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     )
 
     assert sanitize_tts_text(raw).text == (
-        "light L-LM post gress red is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon 4000 "
+        "light L-LM post gress red is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon four zero zero zero "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
         "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L-LM Mixture of Experts "
@@ -324,8 +331,40 @@ def test_sanitize_tts_text_speaks_web_status_codes_and_url_acronym():
     ).text
 
     assert result == (
-        "The you are ell returned aitch tee tee pee five oh three. "
+        "The you are ell returned H tee tee pee five oh three. "
         "Status code four oh four and response five oh oh were seen. post gress sequel stayed up."
+    )
+
+
+def test_sanitize_tts_text_is_idempotent_for_speech_ready_url_terms():
+    raw = (
+        "The web UI is exposed at URL chat-private-01.example.local/. "
+        "For diagnostics use URL localhost:18443, port 5432, or ports 18081 and 18443. "
+        "YubiKey WebAuthn auth."
+    )
+
+    once = sanitize_tts_text(raw).text
+    twice = sanitize_tts_text(once).text
+
+    assert once == (
+        "The web you eye is exposed at you are ell chat private zero one dot example dot local slash. "
+        "For diagnostics use you are ell localhost colon one eight four four three, port five four three two, "
+        "or ports one eight zero eight one and one eight four four three. "
+        "Yubi-key web orff en authorisation."
+    )
+    assert twice == once
+
+
+def test_sanitize_tts_text_speaks_plural_port_lists_digit_by_digit():
+    result = sanitize_tts_text(
+        "Local diagnostics are available on loopback at ports 18081 and 18443. "
+        "Fallback ports 18884, 19000, and 11235 remain local."
+    ).text
+
+    assert result == (
+        "Local diagnostics are available on loopback at ports one eight zero eight one "
+        "and one eight four four three. Fallback ports one eight eight eight four, "
+        "one nine zero zero zero, and one one two three five remain local."
     )
 
 
