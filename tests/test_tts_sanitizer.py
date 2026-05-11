@@ -1,8 +1,20 @@
-from app.tts_sanitizer import (
-    prepare_tts_markdown_for_llm,
-    sanitize_tts_text,
-    terminate_tts_line_endings,
+import importlib.util
+import re
+import sys
+from pathlib import Path
+
+_SERVICE_SANITIZER = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_sanitizer.py"
 )
+_SPEC = importlib.util.spec_from_file_location("pockettts_service_tts_sanitizer", _SERVICE_SANITIZER)
+assert _SPEC is not None and _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = _MODULE
+_SPEC.loader.exec_module(_MODULE)
+
+prepare_tts_markdown_for_llm = _MODULE.prepare_tts_markdown_for_llm
+sanitize_tts_text = _MODULE.sanitize_tts_text
+terminate_tts_line_endings = _MODULE.terminate_tts_line_endings
 
 
 def test_sanitize_tts_text_projects_markdown_headings_and_source_refs():
@@ -39,11 +51,13 @@ Despite the progress, there are a few areas."""
         "speak_http_status_codes",
         "speak_domain_suffixes",
         "speak_legacy_letter_names",
+        "shield_litellm_aliases",
         "speak_tts_known_terms",
         "speak_tts_file_extensions",
         "speak_legacy_letter_names_after_file_extensions",
         "speak_env_key_names",
         "speak_tts_identifiers",
+        "speak_litellm_aliases",
         "speak_tts_known_terms_after_identifiers",
         "speak_tts_acronyms",
         "speak_tts_product_terms",
@@ -69,7 +83,7 @@ def test_sanitize_tts_text_speaks_data_fc_key_attribute():
 
     assert (
         result.text
-        == "Blueprints gee you eye uses a data eff sea key HTML attribute, data eff sea event, and stray ticks."
+        == "Blueprints GUI uses a data eff sea key HTML attribute, data eff sea event, and stray ticks."
     )
     assert "`" not in result.text
 
@@ -88,8 +102,8 @@ def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
 
     assert result == (
         "chat private zero one authorisation secret post gress password tee ess authorisation key "
-        "chat private zero one V L-LM application programming interface key open A eye base you are ell "
-        "sync thing device eye dee pee double you ay icon 192 tail net eye pee better authorisation."
+        "chat private zero one V L-LM application programming interface key open a-eye base you are ell "
+        "sync-thing device eye dee pee double you ay icon 192 tail-net eye pee better authorisation."
     )
 
 
@@ -158,7 +172,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
         sanitize_tts_text(raw).text
         == (
             "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
-            "artificial intelligence application programming interface gee you eye domain name system H tee tee pee ess mTLS "
+            "artificial intelligence application programming interface GUI domain name system H tee tee pee ess mTLS "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
             "JavaScript HTML"
         )
@@ -232,14 +246,14 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     )
 
     assert sanitize_tts_text(raw).text == (
-        "light L-LM post gress red is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon four zero zero zero "
+        "light L-LM post gress red-is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon four zero zero zero "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee en vee "
         "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
-        "seek dee bee certificates em see pee Dockage ex memory pipe cat live cat V L-LM Mixture of Experts "
-        "L-LM client dot chat open claw dot claude Bring Your Own Key null claw artificial intelligence pocket tee tee ess "
-        "play wright web socket cloned repositories local storage session storage zed A eye zed A eye vee ess code ee um "
+        "seek dee bee certificates em see pee Dockage ex memory pipe-cat lithe-cat V L-LM Mixture of Experts "
+        "L-LM client dot chat open-claw dot claude Bring Your Own Key null-claw artificial intelligence pocket-TTS "
+        "play wright web socket cloned repositories local storage session storage zed a-eye zed a-eye vee ess code ee um "
         "vee ess code tee oh tee pee rag turbo veck tail scale tail scale vee pee ess domain name system CLI "
-        "crawl for A eye chat private zero one light parse mark it down scrape ling seer ex next generation "
+        "crawl for a-eye chat private zero one light parse mark it down scrape ling seer ex next generation "
         "vee coon ee yah ellipses path slash to slash file dot Jason"
     )
 
@@ -348,7 +362,7 @@ def test_sanitize_tts_text_is_idempotent_for_speech_ready_url_terms():
 
     assert once == (
         "The web you eye is exposed at you are ell chat private zero one dot example dot local slash. "
-        "For diagnostics use you are ell localhost colon one eight four four three, port five four three two, "
+        "For diagnostics use you are ell local-host colon one eight four four three, port five four three two, "
         "or ports one eight zero eight one and one eight four four three. "
         "Yubi-key web orff en authorisation."
     )
@@ -368,15 +382,62 @@ def test_sanitize_tts_text_speaks_plural_port_lists_digit_by_digit():
     )
 
 
-def test_sanitize_tts_text_speaks_xarta_repos_and_domain_suffixes():
+def test_sanitize_tts_text_speaks_colon_port_mappings_digit_by_digit():
     result = sanitize_tts_text(
-        "Open repos, repo's, and clonedrepos at https://xarta.local/foo or example.co.uk/xarta-node."
+        "loopback: 18081 maps to the app HTTP port and 18443 maps to the HTTPS port."
     ).text
 
     assert result == (
-        "Open repositories, repositories, and cloned repositories at you are ell zarta dot local slash foo "
+        "loopback colon one eight zero eight one maps to the app H tee tee pee port "
+        "and one eight four four three maps to the H tee tee pee ess port."
+    )
+
+
+def test_sanitize_tts_text_preserves_gui_and_hyphenates_localhost():
+    result = sanitize_tts_text("gui GUI localhost URL localhost:18443").text
+
+    assert result == "GUI GUI local-host you are ell local-host colon one eight four four three"
+
+
+def test_sanitize_tts_text_speaks_xarta_repos_and_domain_suffixes():
+    result = sanitize_tts_text(
+        "Open repo, repos, repo's, and clonedrepos at https://xarta.local/foo or example.co.uk/xarta-node."
+    ).text
+
+    assert result == (
+        "Open repository, repositories, repositories, and cloned repositories at you are ell zarta dot local slash foo "
         "or example dot koh dot UK slash zarta node."
     )
+
+
+def test_sanitize_tts_text_formats_litellm_aliases_for_speech():
+    assert (
+        sanitize_tts_text("PRIMARY-LOCAL-PRIVATE-NO-PROTECTION model").text
+        == "Primary-Local private No-Protection model"
+    )
+    assert (
+        sanitize_tts_text("PRIMARY LOCAL PRIVATE NO PROTECTION model").text
+        == "Primary-Local private No-Protection model"
+    )
+    assert (
+        sanitize_tts_text("OPENROUTER-CHEAP-US-NO-PROTECTION model").text
+        == "Open-Router-Cheap-US No-Protection model"
+    )
+
+
+def test_sanitize_tts_text_formats_all_litellm_aliases_idempotently():
+    aliases = sorted(_MODULE._LITELLM_ALIAS_NAMES)
+    raw_alias_word_re = re.compile(
+        r"\b(?:ANTHROPIC|CHEAP|CHINA|CODING|EMBEDDINGS|EXPENSIVE|FLASH|FREE|GEMINI|LOCAL|"
+        r"MEDIUM|MINIMAX|OPENAI|OPENROUTER|PRESERVE|PRIMARY|PRIVATE|PROTECTION|QWEN36|"
+        r"RERANKER|SECONDARY|THINKING|VISION|WHISPER|ZAI)\b"
+    )
+
+    assert len(aliases) == 72
+    for alias in aliases:
+        result = sanitize_tts_text(f"{alias} model alias").text
+        assert sanitize_tts_text(result).text == result
+        assert not raw_alias_word_re.search(result)
 
 
 def test_prepare_tts_markdown_for_llm_preserves_ssh_for_model_prompt():

@@ -30,7 +30,7 @@ from .routes_docs import (
     _complete_doc_speech_local,
     _normalize_node_local_ownership,
 )
-from .tts_sanitizer import prepare_tts_markdown_for_llm
+from .tts_sanitizer_client import TtsSanitizerUnavailable, prepare_tts_markdown_for_llm_via_service
 
 log = logging.getLogger(__name__)
 
@@ -865,10 +865,13 @@ async def _generate_local_dockge_speech_markdown(stack: dict, source_items: list
         minimum=0,
         maximum=1000000,
     )
-    speech_source, source_meta = _clamp_source_markdown(
-        prepare_tts_markdown_for_llm(_local_dockge_source_markdown(stack, source_items)),
-        limit=source_limit,
-    )
+    try:
+        prepared_source = await prepare_tts_markdown_for_llm_via_service(
+            _local_dockge_source_markdown(stack, source_items)
+        )
+    except TtsSanitizerUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    speech_source, source_meta = _clamp_source_markdown(prepared_source, limit=source_limit)
     if source_meta.get("source_clipped"):
         raise HTTPException(
             413,
@@ -896,7 +899,7 @@ async def _generate_local_dockge_speech_markdown(stack: dict, source_items: list
             502,
             "Local Dockge narration hit DOC_SPEECH_LLM_MAX_TOKENS before completing. Increase the limit and regenerate.",
         )
-    speech = _clean_doc_speech_markdown(str(answer or ""))
+    speech = await _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty local Dockge narration")
     generation_meta.update({
