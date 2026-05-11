@@ -120,10 +120,12 @@ def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
     runtime_policy = json.loads(_HYPHEN_RUNTIME_POLICY.read_text(encoding="utf-8"))
 
     assert "auth" in tokens
+    assert "webauthn" in tokens
     assert "repo" in tokens
     assert "env" in tokens
     assert "auth-exempt" not in runtime_policy["p"]
     assert "auth-token" not in runtime_policy["p"]
+    assert "webauthn-backed" not in runtime_policy["p"]
     assert "purpose-built" in runtime_policy["p"]
     assert "non-root" in runtime_policy["p"]
 
@@ -139,6 +141,12 @@ def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
         "chat-private zero one V L-LM application programming interface key open a-eye base you are ell "
         "sync-thing device eye dee pee double you ay icon 192 tail-net eye pee better authorisation."
     )
+
+
+def test_sanitize_tts_text_speaks_webauthn_compounds_before_auth():
+    result = sanitize_tts_text("WebAuthn-backed auth-token and WebAuthn auth.").text
+
+    assert result == "web orff en backed authorisation token and web orff en authorisation."
 
 
 def test_sanitize_tts_text_speaks_known_joined_policy_terms():
