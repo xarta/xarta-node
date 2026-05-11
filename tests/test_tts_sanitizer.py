@@ -201,6 +201,10 @@ def test_tts_hyphen_unknown_couplets_report_excludes_known_transform_terms():
     assert "nav-items" not in unknown["e"]
     assert "webauthn-backed" not in unknown["e"]
     assert "yubikey-derived" not in unknown["e"]
+    assert "private-pki" not in unknown["e"]
+    assert "presidio-pii" not in unknown["e"]
+    assert "nvidia-cuda" not in unknown["e"]
+    assert "oom-killed" not in unknown["e"]
     assert "aes-gcm" in unknown["e"]
 
 
@@ -225,6 +229,17 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["blueprints keystore"] == "Blueprints key-store"
     assert transforms["c"]["pkg config"] == "package-config"
     assert transforms["c"]["bookmarks embeddings"] == "bookmarks embeddings"
+    assert transforms["c"]["pre signoff"] == "pre-sign-off"
+    assert transforms["c"]["post indexsync"] == "post-index-sync"
+    assert transforms["c"]["print errorlogs"] == "print error-logs"
+    assert transforms["c"]["reranker health"] == "re-ranker health"
+    assert transforms["c"]["non allowlisted"] == "non-allow-listed"
+    assert transforms["c"]["non autoregressive"] == "non-auto-regressive"
+    assert transforms["c"]["non ipool"] == "non-eye-pool"
+    assert "private pki" not in transforms["c"]
+    assert "presidio pii" not in transforms["c"]
+    assert "nvidia cuda" not in transforms["c"]
+    assert "oom killed" not in transforms["c"]
     assert "a za" in transforms["u"]
 
 
@@ -248,7 +263,9 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "Use badge-btn, backup-tbody, couchdb-based, apitotp-authentication, "
         "answerability-threshold, aria-haspopup, crawlerrunconfig-compatible, "
         "azagent-ubuntu, behaviour-reference, carnice-like, blueprints-keystore, "
-        "pkg-config, and bookmarks-embeddings."
+        "pkg-config, bookmarks-embeddings, private-pki, presidio-pii, nvidia-cuda, nvidia-smi, "
+        "oom-killed, pre-signoff, post-indexsync, print-errorlogs, reranker-health, "
+        "non-allowlisted, non-autoregressive, and non-ipool."
     ).text
 
     assert result == (
@@ -256,7 +273,10 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "application programming interface tee oh tee pee authentication, "
         "answer-ability threshold, aria has-popup, crawler run config compatible, "
         "a-zed agent ubuntu, behaviour reference, carnice-like, Blueprints key-store, "
-        "package-config, and bookmarks embeddings."
+        "package-config, bookmarks embeddings, private PKI, Presidio P two, "
+        "en-vid ee-ah cue-dah, en-vid ee-ah SMI, "
+        "Out Of Memory killed, pre-sign-off, post-index-sync, print error-logs, re-ranker health, "
+        "non-allow-listed, non-auto-regressive, and non-eye-pool."
     )
 
 
@@ -431,7 +451,7 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
     assert sanitize_tts_text(raw).text == (
         "light L-LM post gress red-is fleet Certificate Authority public certificate authority you are ell 127 dot 0 dot 0 dot 1 colon four zero zero zero "
         "parent of foo slash bar C: back slash Temp at network port eff 0 network port eff 1 are tee ex dot ee-en-vee "
-        "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Error Virtual Machine eye dee "
+        "dot ee en vee dot git ignored dot git ignored think tags Out Of Memory Virtual Machine eye dee "
         "seek dee bee certificates em see pee Dockage ex memory pipe-cat lithe-cat V L-LM Mixture of Experts "
         "L-LM client dot chat open-claw dot claude Bring Your Own Key null-claw artificial intelligence pocket-TTS "
         "play-wright web-socket cloned repositories local-storage session-storage zed a-eye zed a-eye vee ess code ee um "
