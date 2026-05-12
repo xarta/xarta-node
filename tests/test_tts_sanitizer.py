@@ -468,6 +468,56 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "no cert": "no certificate",
         "no cors": "no cross-origin resource sharing",
         "no fallback": "no fallback",
+        "no trunc": "no truncation",
+        "node themed": "node-themed",
+        "nordvpn backed": "Nord VPN backed",
+        "npm based": "NPM based",
+        "nryd cy": "en RYD CY",
+        "offline uncorrectable": "offline un-correct-able",
+        "oidc based": "Open ID Connect",
+        "ollama compatible": "O'Llama compatible",
+        "omi pu": "uncertain pronounceable words: oh-my poo, maybe poo means pull-up or pop-up,",
+        "on prem": "on-premises",
+        "open webui": "open web UI",
+        "openmoss team": "Open Moss team",
+        "openssh client": "Open SSH client",
+        "operational runbooks": "operational run-books",
+        "operational takeaway": "operational take-away",
+        "operator resized": "operator re-sized",
+        "over permissioning": "over permission-ing",
+        "pa dmrkiui": "uncertain pronounceable words: pa dee mark-ee UI",
+        "paperclip app": "paper-clip application",
+        "paperclip managed": "paper-clip managed",
+        "passphrase source": "pass-phrase source",
+        "passphrase sources": "pass-phrase sources",
+        "per dataset": "per data-set",
+        "pilot runbook": "pilot run-book",
+        "plex config": "Plex configuration",
+        "plex transcode": "Plex trans-code",
+        "pnpm lock": "PNP em lock",
+        "pointerup drag": "pointer-up",
+        "portainer ce": "Portainer CE",
+        "portainer ee": "Portainer E E",
+        "portainer stack": "Portainer stack",
+        "preflight checklist": "pre-flight checklist",
+        "preflight checks": "pre-flight checks",
+        "private runbook": "private run-book",
+        "prod mtime": "production em-time",
+        "proposed hostname": "proposed host-name",
+        "proxmox config": "Proxmox configuration",
+        "proxmox host": "Proxmox host",
+        "proxmox managed": "Proxmox managed",
+        "proxmox nets": "Proxmox nets",
+        "proxmox probe": "Proxmox probe",
+        "proxmox side": "Proxmox side",
+        "proxmox style": "Proxmox style",
+        "ptag accent": "pee-tag accent",
+        "ptag gender": "pee-tag gender",
+        "ptag quality": "pee-tag quality",
+        "ptag source": "pee-tag source",
+        "ptr derived": "pointer-derived",
+        "pydantic models": "pie-dant-ick models",
+        "qwen backed": "Qwen backed",
     }
 
     for source, replacement in expected.items():
@@ -634,7 +684,15 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "maxtravel-calculation measured-footer mega-prompt mega-wrapper meghrfajazdavkwwwdrlur-ojowt "
         "metaslab-note micro-blog minimax-oriented mistral-common mnt-models mtp-preserved multi-toolchain "
         "must-revalidate mutationobserver-sync mysql-compat name-asc name-desc nav-layout nested-virtualization "
-        "netcat-traditional nn-gen nn-integrity nn-keys nn-peers no-cert no-cors no-fallback"
+        "netcat-traditional nn-gen nn-integrity nn-keys nn-peers no-cert no-cors no-fallback "
+        "no-trunc node-themed nordvpn-backed npm-based nryd-cy offline-uncorrectable oidc-based "
+        "ollama-compatible omi-pu on-prem open-webui openmoss-team openssh-client operational-runbooks "
+        "operational-takeaway operator-resized over-permissioning pa-dmrkiui paperclip-app paperclip-managed "
+        "passphrase-source passphrase-sources per-dataset pilot-runbook plex-config plex-transcode pnpm-lock "
+        "pointerup-drag portainer-ce portainer-ee portainer-stack preflight-checklist preflight-checks "
+        "private-runbook prod-mtime proposed-hostname proxmox-config proxmox-host proxmox-managed proxmox-nets "
+        "proxmox-probe proxmox-side proxmox-style ptag-accent ptag-gender ptag-quality ptag-source "
+        "ptr-derived pydantic-models qwen-backed"
     ).text
 
     assert result == (
@@ -660,7 +718,17 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "unpronouncable-words meta-slab note micro-blog Mini-Max oriented Mistral common Mount Models "
         "MTP preserved multi tool-chain must re-validate mutation observer-sync my-sequel compatibility "
         "name ascending name descending Nav lay-out nested virtualization net-cat traditional en en generation "
-        "en en integrity en en keys en en peers no certificate no cross-origin resource sharing no fallback"
+        "en en integrity en en keys en en peers no certificate no cross-origin resource sharing no fallback "
+        "no truncation node-themed Nord vee pee enn backed NPM based en RYD CY offline un-correct-able "
+        "Open eye dee Connect O'Llama compatible uncertain pronounceable words: oh-my poo, maybe poo means "
+        "pull-up or pop-up, on-premises open web you eye Open Moss team Open SSH client operational run-books "
+        "operational take-away operator re-sized over permission-ing uncertain pronounceable words: pa dee "
+        "mark-ee you eye paper-clip application paper-clip managed pass-phrase source pass-phrase sources "
+        "per data-set pilot run-book Plex configuration Plex trans-code PNP em lock pointer-up Portainer CE "
+        "Portainer E E Portainer stack pre-flight checklist pre-flight checks private run-book production "
+        "em-time proposed host-name Proxmox configuration Proxmox host Proxmox managed Proxmox nets Proxmox "
+        "probe Proxmox side Proxmox style pee-tag accent pee-tag gender pee-tag quality pee-tag source "
+        "pointer-derived pie-dant-ick models Qwen backed"
     )
 
 
