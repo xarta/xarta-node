@@ -288,6 +288,24 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["deep agentic"] == "deep a gent-ick"
     assert transforms["c"]["defrag relevant"] == "defragment relevant"
     assert transforms["c"]["descrip tion"] == "description"
+    assert transforms["c"]["diag chip"] == "diagnostic chip"
+    assert transforms["c"]["diag modal"] == "diagnostic modal"
+    assert transforms["c"]["direct loopback"] == "direct loop-back"
+    assert transforms["c"]["distribute nodesjson"] == "distribute nodes dot json"
+    assert transforms["c"]["distributed failover"] == "distributed fail-over"
+    assert transforms["c"]["docker backed"] == "docker-backed"
+    assert transforms["c"]["docker capable"] == "docker-capable"
+    assert transforms["c"]["docker compose"] == "docker-compose"
+    assert transforms["c"]["docker enabled"] == "docker-enabled"
+    assert transforms["c"]["docker enabling"] == "docker enabling"
+    assert transforms["c"]["docker level"] == "docker-level"
+    assert transforms["c"]["docker network"] == "docker-network"
+    assert transforms["c"]["docker oriented"] == "docker-oriented"
+    assert transforms["c"]["docker published"] == "docker-published"
+    assert transforms["c"]["docker registry"] == "docker-registry"
+    assert transforms["c"]["docker related"] == "docker-related"
+    assert transforms["c"]["docker run"] == "docker-run"
+    assert transforms["c"]["docker specific"] == "docker-specific"
     assert "private pki" not in transforms["c"]
     assert "presidio pii" not in transforms["c"]
     assert "nvidia cuda" not in transforms["c"]
@@ -326,7 +344,10 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "configyaml-entry, configyml-reference, connect-timeout, connectivity-testkit, "
         "copypaste-prompt, cors-bypass, crawlerpool-section, csp-safe, current-tailnets, "
         "cyan-gradient, data-dir, data-filename, data-fn, data-gkey, data-idx, dataset-level, "
-        "deep-agentic, defrag-relevant, and descrip-tion."
+        "deep-agentic, defrag-relevant, descrip-tion, diag-chip, diag-modal, direct-loopback, "
+        "distribute-nodesjson, distributed-failover, docker-backed, docker-capable, docker-compose, "
+        "docker-enabled, docker-enabling, docker-level, docker-network, docker-oriented, "
+        "docker-published, docker-registry, docker-related, docker-run, and docker-specific."
     ).text
 
     assert result == (
@@ -347,7 +368,10 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "config-yammel entry, config yammel reference, connect time-out, connectivity test-kit, "
         "copy-paste prompt, caws bypass, crawler-pool section, CSP Safe, current tail-nets, "
         "cyan gradient, data directory, data file-name, data function, data gee-key, data IDX, dataset level, "
-        "deep a gent-ick, defragment relevant, and description."
+        "deep a gent-ick, defragment relevant, description, diagnostic chip, diagnostic modal, direct loop-back, "
+        "distribute nodes dot Jason, distributed fail-over, docker-backed, docker-capable, docker-compose, "
+        "docker-enabled, docker enabling, docker-level, docker-network, docker-oriented, "
+        "docker-published, docker-registry, docker-related, docker-run, and docker-specific."
     )
 
 
