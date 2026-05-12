@@ -13,6 +13,9 @@ _HYHEN_AUTO_PRESERVE_SCRIPT = Path(
 _UNKNOWN_COUPLET_SUGGEST_SCRIPT = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/scripts/suggest_unknown_couplet_transforms.py"
 )
+_HYPHEN_INVENTORY_SCRIPT = Path(
+    "/xarta-node/.lone-wolf/stacks/pockettts-openai/scripts/inventory_hyphenated_terms.py"
+)
 _HYPHEN_RUNTIME_POLICY = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_policy.runtime.json"
 )
@@ -42,6 +45,13 @@ assert _SUGGEST_SPEC is not None and _SUGGEST_SPEC.loader is not None
 _SUGGEST_MODULE = importlib.util.module_from_spec(_SUGGEST_SPEC)
 sys.modules[_SUGGEST_SPEC.name] = _SUGGEST_MODULE
 _SUGGEST_SPEC.loader.exec_module(_SUGGEST_MODULE)
+_INVENTORY_SPEC = importlib.util.spec_from_file_location(
+    "pockettts_inventory_hyphenated_terms", _HYPHEN_INVENTORY_SCRIPT
+)
+assert _INVENTORY_SPEC is not None and _INVENTORY_SPEC.loader is not None
+_INVENTORY_MODULE = importlib.util.module_from_spec(_INVENTORY_SPEC)
+sys.modules[_INVENTORY_SPEC.name] = _INVENTORY_MODULE
+_INVENTORY_SPEC.loader.exec_module(_INVENTORY_MODULE)
 
 prepare_tts_markdown_for_llm = _MODULE.prepare_tts_markdown_for_llm
 sanitize_tts_text = _MODULE.sanitize_tts_text
@@ -345,6 +355,74 @@ def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
 
     assert suggestions["c"]["badge btn"] == "badge control"
     assert suggestions["u"]["custom token"] == "custom token"
+
+
+def test_hyphen_inventory_skips_generated_chunk_boundary_fragments(tmp_path):
+    db_path = tmp_path / "chunks.sqlite3"
+
+    import sqlite3
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("CREATE TABLE chunks (chunk_index INTEGER NOT NULL, text TEXT NOT NULL)")
+        connection.execute("CREATE TABLE chunks_fts_content (c2 TEXT)")
+        connection.execute(
+            "INSERT INTO chunks (chunk_index, text) VALUES (?, ?)",
+            (0, "request-time at the start of a real document"),
+        )
+        connection.execute(
+            "INSERT INTO chunks (chunk_index, text) VALUES (?, ?)",
+            (3, "equest" + "-time chunk boundary fragment"),
+        )
+        connection.execute(
+            "INSERT INTO chunks (chunk_index, text) VALUES (?, ?)",
+            (3, "middle request-time remains a real full token"),
+        )
+        connection.execute(
+            "INSERT INTO chunks_fts_content (c2) VALUES (?)",
+            ("generated" + "-fts" + "-table should not be scanned",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    original_find_sqlite_files = _INVENTORY_MODULE.find_sqlite_files
+    try:
+        _INVENTORY_MODULE.find_sqlite_files = lambda _roots: [db_path]
+        inventory = {}
+        scanned = _INVENTORY_MODULE.scan_sqlite_tables(inventory, (tmp_path,))
+    finally:
+        _INVENTORY_MODULE.find_sqlite_files = original_find_sqlite_files
+
+    assert scanned == 1
+    assert "request-time" in inventory
+    assert "equest" + "-time" not in inventory
+    assert "generated" + "-fts-table" not in inventory
+
+
+def test_hyphen_inventory_drops_stale_unreviewed_policy_entries():
+    policy = _INVENTORY_MODULE.build_policy(
+        {"request-time": _INVENTORY_MODULE._empty_record()},
+        {
+            "entries": {
+                "equest" + "-time": {
+                    "dehyphenate": True,
+                    "reason": "Inventory default: remove the hyphen unless this term is reviewed for preservation.",
+                    "source_count": 3,
+                },
+                "chat-private": {
+                    "dehyphenate": False,
+                    "reviewed": True,
+                    "reason": "Reviewed speech form; preserve the hyphen for clearer TTS.",
+                },
+            }
+        },
+        {},
+    )
+
+    assert "request-time" in policy["entries"]
+    assert "chat-private" in policy["entries"]
+    assert "equest" + "-time" not in policy["entries"]
 
 
 def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
