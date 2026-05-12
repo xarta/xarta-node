@@ -342,7 +342,7 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert "oom killed" not in transforms["c"]
 
 
-def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_h_batch():
+def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
     transforms = json.loads(_UNKNOWN_COUPLET_TRANSFORMS.read_text(encoding="utf-8"))
 
     expected = {
@@ -399,6 +399,25 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_h_batch():
         "harddrive problems": "hard-drive problems",
         "headscale provided": "head-scale provided",
         "heretic abliterated": "heretic Abliterated",
+        "hermes handoff": "Hermes hand-off",
+        "hermes maint": "Hermes Main T",
+        "hmac secret": "Hash-based Message Authentication Code Secret",
+        "hookscript before": "hook-script before",
+        "horiz scroll": "horizontal scroll",
+        "hu xiaobai": "Hu Xiaobai",
+        "huggingface token": "Hugging Face token",
+        "hw address": "Hardware Address",
+        "hw type": "Hardware Type",
+        "iana managed": "Internet Assigned Numbers Authority Managed",
+        "icann operated": "Internet Corporation for Assigned Names and Numbers operated",
+        "ihor sokoliuk": "Ihor Sokoliuk",
+        "im alive": "IM Alive",
+        "image searchable": "Image Searchable",
+        "importapply strategy": "import-apply strategy",
+        "infra internal": "infra-internal",
+        "infra specific": "infra-specific",
+        "integration roadmap": "integration road-map",
+        "intra table": "infra-table",
     }
 
     for source, replacement in expected.items():
@@ -545,7 +564,7 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
     )
 
 
-def test_sanitize_tts_text_speaks_reviewed_e_to_h_unknown_couplets():
+def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
     result = sanitize_tts_text(
         "dotenv-webpack double-scrollbar drag-resize drive-scsin dropdown-arrow dropdown-open "
         "en-us error-exitcode ev-ec export-preflight failover-architecture failover-observed "
@@ -555,7 +574,10 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_h_unknown_couplets():
         "fpool-origin frontmatter-aware full-reindex fusion-mpt fx-kvbaxjgismb get-tasksid "
         "gfm-style gh-copilot git-based git-clones git-credentials git-ignored git-pull "
         "git-relative git-tracked githookspre-commit gytyhvqh-e handoff-template hangwinmcp-chrome "
-        "harddrive-problems headscale-provided heretic-abliterated"
+        "harddrive-problems headscale-provided heretic-abliterated hermes-handoff hermes-maint "
+        "hmac-secret hookscript-before horiz-scroll hu-xiaobai huggingface-token hw-address hw-type "
+        "iana-managed icann-operated ihor-sokoliuk im-alive image-searchable importapply-strategy "
+        "infra-internal infra-specific integration-roadmap intra-table"
     ).text
 
     assert result == (
@@ -568,7 +590,11 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_h_unknown_couplets():
         "front-matter aware full re-index fusion MPT FX KV Bax JGI ess em bee get tasks eye dee "
         "GFM style GH Co-pilot git based git clones git credentials git ignored git pull git relative "
         "git tracked git-hooks pre-commit GYT YH VGH hand-off template hang-win em see pee Chrome "
-        "hard-drive problems head-scale provided heretic Abliterated"
+        "hard-drive problems head-scale provided heretic Abliterated Hermes hand-off Hermes Main T "
+        "Hash-based Message Authentication Code Secret hook-script before horizontal scroll Hu Xiaobai "
+        "Hugging Face token Hardware Address Hardware Type Internet Assigned Numbers Authority Managed "
+        "Internet Corporation for Assigned Names and Numbers operated Ihor Sokoliuk IM Alive Image Searchable "
+        "import-apply strategy infra-internal infra-specific integration road-map infra-table"
     )
 
 
