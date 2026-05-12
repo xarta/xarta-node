@@ -518,6 +518,42 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "ptr derived": "pointer-derived",
         "pydantic models": "pie-dant-ick models",
         "qwen backed": "Qwen backed",
+        "ratelimiting section": "rate-limiting section",
+        "rdp ing": "RDP-ing",
+        "re chowns": "re-change owners",
+        "re enablement": "re-enablement",
+        "re enqueue": "re-enqueue",
+        "re enqueued": "re-enqueued",
+        "re entrancy": "re-entrance E",
+        "re initialises": "re-initialises",
+        "re onboard": "re-onboard",
+        "re upsert": "re-up-sert",
+        "reachability only": "reach-ability only",
+        "reboot check": "reboot check",
+        "reboot prep": "reboot preparation",
+        "rebuff protectairebuff": "protect a-eye rebuff",
+        "recency focused": "recency-focused",
+        "recency weighted": "recency-weighted",
+        "reindex progress": "re-index progress",
+        "related recordsdocs": "related records documents",
+        "remediation plan": "remediation plan",
+        "request metadata": "request meta-data",
+        "restart mcpo": "restart Model Control Protocol to open a-pee eye proxy",
+        "revalidation friendly": "re-validation friendly",
+        "reverse proxied": "reverse proxied",
+        "rollout notes": "roll-out notes",
+        "roo style": "roo-style",
+        "root centric": "root-cent-rick",
+        "roundtrip test": "round-trip test",
+        "rrf style": "Reciprocal Rank Fusion style",
+        "runtime behavior": "run-time behavior",
+        "runtime capable": "run-time capable",
+        "runtime contract": "run-time contract",
+        "runtime directory": "run-time directory",
+        "runtime model": "run-time model",
+        "runtime pinning": "run-time pinning",
+        "runtime provider": "run-time provider",
+        "runtime usage": "run-time usage",
     }
 
     for source, replacement in expected.items():
@@ -692,7 +728,13 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "pointerup-drag portainer-ce portainer-ee portainer-stack preflight-checklist preflight-checks "
         "private-runbook prod-mtime proposed-hostname proxmox-config proxmox-host proxmox-managed proxmox-nets "
         "proxmox-probe proxmox-side proxmox-style ptag-accent ptag-gender ptag-quality ptag-source "
-        "ptr-derived pydantic-models qwen-backed"
+        "ptr-derived pydantic-models qwen-backed ratelimiting-section rdp-ing re-chowns re-enablement "
+        "re-enqueue re-enqueued re-entrancy re-initialises re-onboard re-upsert reachability-only "
+        "reboot-check reboot-prep rebuff-protectairebuff recency-focused recency-weighted reindex-progress "
+        "related-recordsdocs remediation-plan request-metadata restart-mcpo revalidation-friendly "
+        "reverse-proxied rollout-notes roo-style root-centric roundtrip-test rrf-style runtime-behavior "
+        "runtime-capable runtime-contract runtime-directory runtime-model runtime-pinning runtime-provider "
+        "runtime-usage"
     ).text
 
     assert result == (
@@ -728,7 +770,14 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "Portainer E E Portainer stack pre-flight checklist pre-flight checks private run-book production "
         "em-time proposed host-name Proxmox configuration Proxmox host Proxmox managed Proxmox nets Proxmox "
         "probe Proxmox side Proxmox style pee-tag accent pee-tag gender pee-tag quality pee-tag source "
-        "pointer-derived pie-dant-ick models Qwen backed"
+        "pointer-derived pie-dant-ick models Qwen backed rate-limiting section RDP-ing re-change owners "
+        "re-enablement re-enqueue re-enqueued re-entrance E re-initialises re-onboard re-up-sert "
+        "reach-ability only reboot check reboot preparation protect a-eye rebuff recency-focused "
+        "recency-weighted re-index progress related records documents remediation plan request meta-data "
+        "restart Model Control Protocol to open a-pee eye proxy re-validation friendly reverse proxied "
+        "roll-out notes roo-style root-cent-rick round-trip test Reciprocal Rank Fusion style run-time "
+        "behavior run-time capable run-time contract run-time directory run-time model run-time pinning "
+        "run-time provider run-time usage"
     )
 
 
@@ -821,7 +870,7 @@ Done."""
 
 
 def test_sanitize_tts_text_speaks_common_technical_acronyms():
-    raw = "LED SVG png jpg VM LXC805 AI API GUI DNS HTTPS mTLS IPv6 UUID SQLite pfSense CI/CD js html"
+    raw = "LED SVG png jpg VM LXC805 AI API GUI DNS HTTPS mTLS IPv6 UUID SQLite pfSense CI/CD js html MCPO RRF"
 
     assert (
         sanitize_tts_text(raw).text
@@ -829,7 +878,7 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
             "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
             "artificial intelligence application programming interface GUI domain name system H tee tee pee ess mTLS "
             "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
-            "JavaScript HTML"
+            "JavaScript HTML Model Control Protocol to open a-pee eye proxy Reciprocal Rank Fusion"
         )
     )
 
