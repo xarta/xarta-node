@@ -400,7 +400,7 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "headscale provided": "head-scale provided",
         "heretic abliterated": "heretic Abliterated",
         "hermes handoff": "Hermes hand-off",
-        "hermes maint": "Hermes Main T",
+        "hermes maint": "Hermes maintenance",
         "hmac secret": "Hash-based Message Authentication Code Secret",
         "hookscript before": "hook-script before",
         "horiz scroll": "horizontal scroll",
@@ -418,6 +418,24 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "infra specific": "infra-specific",
         "integration roadmap": "integration road-map",
         "intra table": "infra-table",
+        "invalid settingsyml": "invalid settings-yammel",
+        "iptables persistent": "IP tables persistent",
+        "iputils arping": "IP Utilities Ar-ping",
+        "jq based": "JQ based",
+        "kanban style": "Kanban-Style",
+        "kokoro backed": "Kokoro backed",
+        "kv cache": "KV Cache",
+        "lakera guard": "Lak-era Guard",
+        "later todos": "Later To-Doo's",
+        "layout nav": "Layout Nav",
+        "lifecycle metadata": "Lifecycle meta-data",
+        "llmclient constructor": "Large Language Models client constructor",
+        "loopback bound": "loop-back bound",
+        "loopback only": "loop-back only",
+        "loopback trust": "loop-back trust",
+        "low mem": "low-memory",
+        "lower vram": "lower vee-Ram",
+        "maint read": "maintenance read",
     }
 
     for source, replacement in expected.items():
@@ -577,7 +595,10 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "harddrive-problems headscale-provided heretic-abliterated hermes-handoff hermes-maint "
         "hmac-secret hookscript-before horiz-scroll hu-xiaobai huggingface-token hw-address hw-type "
         "iana-managed icann-operated ihor-sokoliuk im-alive image-searchable importapply-strategy "
-        "infra-internal infra-specific integration-roadmap intra-table"
+        "infra-internal infra-specific integration-roadmap intra-table invalid-settingsyml iptables-persistent "
+        "iputils-arping jq-based kanban-style kokoro-backed kv-cache lakera-guard later-todos layout-nav "
+        "lifecycle-metadata llmclient-constructor loopback-bound loopback-only loopback-trust low-mem "
+        "lower-vram maint-read"
     ).text
 
     assert result == (
@@ -590,11 +611,14 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "front-matter aware full re-index fusion MPT FX KV Bax JGI ess em bee get tasks eye dee "
         "GFM style GH Co-pilot git based git clones git credentials git ignored git pull git relative "
         "git tracked git-hooks pre-commit GYT YH VGH hand-off template hang-win em see pee Chrome "
-        "hard-drive problems head-scale provided heretic Abliterated Hermes hand-off Hermes Main T "
+        "hard-drive problems head-scale provided heretic Abliterated Hermes hand-off Hermes maintenance "
         "Hash-based Message Authentication Code Secret hook-script before horizontal scroll Hu Xiaobai "
         "Hugging Face token Hardware Address Hardware Type Internet Assigned Numbers Authority Managed "
         "Internet Corporation for Assigned Names and Numbers operated Ihor Sokoliuk IM Alive Image Searchable "
-        "import-apply strategy infra-internal infra-specific integration road-map infra-table"
+        "import-apply strategy infra-internal infra-specific integration road-map infra-table invalid settings-yammel "
+        "eye pee tables persistent eye pee Utilities Ar-ping JQ based Kanban-Style Kokoro backed KV Cache "
+        "Lak-era Guard Later To-Doo's Layout Nav Lifecycle meta-data Large Language Models client constructor "
+        "loop-back bound loop-back only loop-back trust low-memory lower vee-ram maintenance read"
     )
 
 
