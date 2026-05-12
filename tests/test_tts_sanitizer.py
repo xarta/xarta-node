@@ -623,6 +623,19 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "vram budget": "vee-Ram budget",
         "vram monitor": "vee-Ram monitor",
         "vram summary": "vee-Ram summary",
+        "vz encrypted": "ZFS Proxmox Virtue-ozzo native encrypted",
+        "vz original": "ZFS Proxmox Virtue-ozzo original",
+        "wal mode": "Write Ahead Logging mode",
+        "wdk wbc": "WDK - WBC",
+        "webapk safe": "web Android Package Kit safe",
+        "webhook triggered": "web-hook triggered",
+        "wi fi": "Why-Fy",
+        "workspace bind": "work-space bind",
+        "workspace context": "work-space context",
+        "workspace index": "work-space index",
+        "workspace orientation": "work-space orientation",
+        "workspace relative": "work-space relative",
+        "workspace skill": "work-space skill",
     }
 
     for source, replacement in expected.items():
@@ -813,7 +826,9 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "torch-runtime traefik-config traefik-exposure trivy-action trivy-teampcp ultrawide-gap "
         "ultrawide-short ultrawide-sidecar ultrawide-splitter unmount-time untrusted-content untrusted-input"
         " uw-debug valkey-cache vec-bm vec-v ver-installed ver-remote visualux-constraints vlm-shaped "
-        "vram-budget vram-monitor vram-summary"
+        "vram-budget vram-monitor vram-summary vz-encrypted vz-original wal-mode wdk-wbc webapk-safe "
+        "webhook-triggered wi-fi workspace-bind workspace-context workspace-index workspace-orientation "
+        "workspace-relative workspace-skill"
     ).text
 
     assert result == (
@@ -868,7 +883,11 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "configuration tray-thick exposure triv-ee action triv-ee team PCP ultra-wide gap ultra-wide short "
         "ultra-wide side-car ultra-wide splitter unmount time untrusted-content untrusted input "
         "you double-U debug value-key cache veck BM veck vee version installed version remote Visual User "
-        "Experience constraints Vision Language Model Shaped vee-ram budget vee-ram monitor vee-ram summary"
+        "Experience constraints Vision Language Model Shaped vee-ram budget vee-ram monitor vee-ram summary "
+        "zee eff ess Proxmox Virtue-ozzo native encrypted zee eff ess Proxmox Virtue-ozzo original "
+        "Write Ahead Logging mode WDK - WBC web Android Package Kit safe web-hook triggered Why-Fy "
+        "work-space bind work-space context work-space index work-space orientation work-space relative "
+        "work-space skill"
     )
 
 
