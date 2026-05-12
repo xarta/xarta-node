@@ -554,6 +554,49 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "runtime pinning": "run-time pinning",
         "runtime provider": "run-time provider",
         "runtime usage": "run-time usage",
+        "sans serif": "sans-serif",
+        "self fk": "self FK",
+        "self hostable": "self host-able",
+        "server docker": "server docker",
+        "server filesystem": "server file-system",
+        "server git": "server git",
+        "service centric": "service cent-rick",
+        "session roadmap": "session road-map",
+        "setting desc": "setting description",
+        "setup docker": "set-up docker",
+        "sfmono regular": "SF-mono regular",
+        "shell scriptable": "Shell script-able",
+        "size asc": "size ascending",
+        "size desc": "size description",
+        "sk ant": "Anthropic secret key",
+        "sk copilot": "Co-pilot secret key",
+        "sk master": "Master secret key",
+        "sk or": "secret-key-or",
+        "sni free": "Server Name Indication, SNI, free",
+        "sni only": "Server Name Indication, SNI, only",
+        "solvable blockers": "solvable blockers",
+        "source datasets": "source data-sets",
+        "speedtest speedtest": "speed-test",
+        "split dropdown": "split drop-down",
+        "split dropdowns": "split drop-downs",
+        "startstop mechanism": "start-stop mechanism",
+        "startstop timing": "start-stop timing",
+        "strict sni": "strict Server Name Indication, SNI",
+        "sub submenus": "(sub) sub-menus",
+        "subnet router": "sub-net router",
+        "symlink backed": "symbolic-link backed",
+        "symlink based": "symbolic-link based",
+        "systemd cryptenroll": "system-dee crypt-enrol",
+        "table nav": "table navigation",
+        "tabular nums": "tabular numbers",
+        "tapir gar": "tapir-gar",
+        "tdd style": "Test Driven Design style",
+        "tempr style": "temperature-style",
+        "timeout minutes": "time-out minutes",
+        "todo editor": "to-do editor",
+        "todo error": "to-do error",
+        "todo preview": "to-do preview",
+        "todo status": "to-do status",
     }
 
     for source, replacement in expected.items():
@@ -734,7 +777,13 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "related-recordsdocs remediation-plan request-metadata restart-mcpo revalidation-friendly "
         "reverse-proxied rollout-notes roo-style root-centric roundtrip-test rrf-style runtime-behavior "
         "runtime-capable runtime-contract runtime-directory runtime-model runtime-pinning runtime-provider "
-        "runtime-usage"
+        "runtime-usage sans-serif self-fk self-hostable server-docker server-filesystem server-git "
+        "service-centric session-roadmap setting-desc setup-docker sfmono-regular shell-scriptable "
+        "size-asc size-desc sk-ant sk-copilot sk-master sk-or sni-free sni-only solvable-blockers "
+        "source-datasets speedtest-speedtest split-dropdown split-dropdowns startstop-mechanism "
+        "startstop-timing strict-sni sub-submenus subnet-router symlink-backed symlink-based "
+        "systemd-cryptenroll table-nav tabular-nums tapir-gar tdd-style tempr-style timeout-minutes "
+        "todo-editor todo-error todo-preview todo-status"
     ).text
 
     assert result == (
@@ -777,7 +826,15 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "restart Model Control Protocol to open a-pee eye proxy re-validation friendly reverse proxied "
         "roll-out notes roo-style root-cent-rick round-trip test Reciprocal Rank Fusion style run-time "
         "behavior run-time capable run-time contract run-time directory run-time model run-time pinning "
-        "run-time provider run-time usage"
+        "run-time provider run-time usage sans-serif self FK self host-able server docker server file-system "
+        "server git service cent-rick session road-map setting description set-up docker SF-mono regular "
+        "Shell script-able size ascending size description Anthropic secret key Co-pilot secret key "
+        "Master secret key secret-key-or Server Name Indication, SNI, free Server Name Indication, SNI, "
+        "only solvable blockers source data-sets speed-test split drop-down split drop-downs start-stop "
+        "mechanism start-stop timing strict Server Name Indication, SNI (sub) sub-menus sub-net router "
+        "symbolic-link backed symbolic-link based system-dee crypt-enrol table navigation tabular numbers "
+        "tapir-gar Test Driven Design style temperature-style time-out minutes to-do editor to-do error "
+        "to-do preview to-do status"
     )
 
 
