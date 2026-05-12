@@ -636,6 +636,17 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "workspace orientation": "work-space orientation",
         "workspace relative": "work-space relative",
         "workspace skill": "work-space skill",
+        "x ndjson": "ex en-dee Jason",
+        "x rtf": "ex Real Time Factor",
+        "x ttfa": "ex Time To First Audio",
+        "x vga": "ex VGA",
+        "xdg open": "ex Desktop Group Open",
+        "xrdp capable": "ex Remote Desktop Protocol capable",
+        "xrdp chansrv": "ex Remote Desktop Protocol Chans RV",
+        "xrdp sesman": "ex Remote Desktop Protocol Ses-man",
+        "xxqufmjcg v": "unpronounceable letters",
+        "xxxxxxx xxxxxxx": "two 7-digit ex-masks",
+        "zfsutils linux": "ZFS utilities (Linux)",
     }
 
     for source, replacement in expected.items():
@@ -828,7 +839,8 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         " uw-debug valkey-cache vec-bm vec-v ver-installed ver-remote visualux-constraints vlm-shaped "
         "vram-budget vram-monitor vram-summary vz-encrypted vz-original wal-mode wdk-wbc webapk-safe "
         "webhook-triggered wi-fi workspace-bind workspace-context workspace-index workspace-orientation "
-        "workspace-relative workspace-skill"
+        "workspace-relative workspace-skill x-ndjson x-rtf x-ttfa x-vga xdg-open xrdp-capable "
+        "xrdp-chansrv xrdp-sesman xxqufmjcg-v xxxxxxx-xxxxxxx zfsutils-linux"
     ).text
 
     assert result == (
@@ -887,7 +899,9 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "zee eff ess Proxmox Virtue-ozzo native encrypted zee eff ess Proxmox Virtue-ozzo original "
         "Write Ahead Logging mode WDK - WBC web Android Package Kit safe web-hook triggered Why-Fy "
         "work-space bind work-space context work-space index work-space orientation work-space relative "
-        "work-space skill"
+        "work-space skill ex en-dee Jason ex Real Time Factor ex Time To First Audio ex VGA "
+        "ex Desktop Group Open ex Remote Desktop Protocol capable ex Remote Desktop Protocol Chans RV "
+        "ex Remote Desktop Protocol Ses-man unpronounceable letters two 7-digit ex-masks zee eff ess utilities (Linux)"
     )
 
 
