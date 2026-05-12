@@ -284,7 +284,7 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["connect timeout"] == "connect time-out"
     assert transforms["c"]["connectivity testkit"] == "connectivity test-kit"
     assert transforms["c"]["copypaste prompt"] == "copy-paste prompt"
-    assert transforms["c"]["cors bypass"] == "caws bypass"
+    assert transforms["c"]["cors bypass"] == "cross-origin resource sharing bypass"
     assert transforms["c"]["crawlerpool section"] == "crawler-pool section"
     assert transforms["c"]["csp safe"] == "CSP Safe"
     assert transforms["c"]["current tailnets"] == "current tail-nets"
@@ -436,6 +436,38 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "low mem": "low-memory",
         "lower vram": "lower vee-Ram",
         "maint read": "maintenance read",
+        "majel older": "older Majel",
+        "manage apikey": "Manage Application Programming Interface key",
+        "maskable friendly": "mask-able friendly",
+        "matrix continuwuity": "matrix continuity with a w",
+        "matrix tuwunel": "matrix tunnel thing with a w",
+        "maxtravel calculation": "max-travel calculation",
+        "measured footer": "measured-footer",
+        "mega prompt": "mega-promp",
+        "mega wrapper": "mega-wrapper",
+        "meghrfajazdavkwwwdrlur ojowt": "unpronouncable-words",
+        "metaslab note": "meta-slab note",
+        "micro blog": "micro-blog",
+        "minimax oriented": "Mini-Max oriented",
+        "mistral common": "Mistral common",
+        "mnt models": "Mount Models",
+        "mtp preserved": "MTP preserved",
+        "multi toolchain": "multi tool-chain",
+        "must revalidate": "must re-validate",
+        "mutationobserver sync": "mutation observer-sync",
+        "mysql compat": "my-sequel compatibility",
+        "name asc": "name ascending",
+        "name desc": "name descending",
+        "nav layout": "Nav lay-out",
+        "nested virtualization": "nested virtualization",
+        "netcat traditional": "net-cat traditional",
+        "nn gen": "en en generation",
+        "nn integrity": "en en integrity",
+        "nn keys": "en en keys",
+        "nn peers": "en en peers",
+        "no cert": "no certificate",
+        "no cors": "no cross-origin resource sharing",
+        "no fallback": "no fallback",
     }
 
     for source, replacement in expected.items():
@@ -568,7 +600,7 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "Chu Tianxiang, cipher-text only, clock HTML internals, cloud-fallback, cloud-initialisation, "
         "command-shell, CMS iffy-ing, code work-space, Codium Server, column chooser, compose yammel draft, "
         "config-yammel entry, config yammel reference, connect time-out, connectivity test-kit, "
-        "copy-paste prompt, caws bypass, crawler-pool section, CSP Safe, current tail-nets, "
+        "copy-paste prompt, cross-origin resource sharing bypass, crawler-pool section, CSP Safe, current tail-nets, "
         "cyan gradient, data directory, data file-name, data function, data gee-key, data IDX, dataset level, "
         "deep a gent-ick, defragment relevant, description, diagnostic chip, diagnostic modal, direct loop-back, "
         "distribute nodes dot Jason, distributed fail-over, docker-backed, docker-capable, docker-compose, "
@@ -598,7 +630,11 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "infra-internal infra-specific integration-roadmap intra-table invalid-settingsyml iptables-persistent "
         "iputils-arping jq-based kanban-style kokoro-backed kv-cache lakera-guard later-todos layout-nav "
         "lifecycle-metadata llmclient-constructor loopback-bound loopback-only loopback-trust low-mem "
-        "lower-vram maint-read"
+        "lower-vram maint-read majel-older manage-apikey maskable-friendly matrix-continuwuity matrix-tuwunel "
+        "maxtravel-calculation measured-footer mega-prompt mega-wrapper meghrfajazdavkwwwdrlur-ojowt "
+        "metaslab-note micro-blog minimax-oriented mistral-common mnt-models mtp-preserved multi-toolchain "
+        "must-revalidate mutationobserver-sync mysql-compat name-asc name-desc nav-layout nested-virtualization "
+        "netcat-traditional nn-gen nn-integrity nn-keys nn-peers no-cert no-cors no-fallback"
     ).text
 
     assert result == (
@@ -618,7 +654,13 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "import-apply strategy infra-internal infra-specific integration road-map infra-table invalid settings-yammel "
         "eye pee tables persistent eye pee Utilities Ar-ping JQ based Kanban-Style Kokoro backed KV Cache "
         "Lak-era Guard Later To-Doo's Layout Nav Lifecycle meta-data Large Language Models client constructor "
-        "loop-back bound loop-back only loop-back trust low-memory lower vee-ram maintenance read"
+        "loop-back bound loop-back only loop-back trust low-memory lower vee-ram maintenance read older Majel "
+        "Manage Application Programming Interface key mask-able friendly matrix continuity with a w "
+        "matrix tunnel thing with a w max-travel calculation measured-footer mega-promp mega-wrapper "
+        "unpronouncable-words meta-slab note micro-blog Mini-Max oriented Mistral common Mount Models "
+        "MTP preserved multi tool-chain must re-validate mutation observer-sync my-sequel compatibility "
+        "name ascending name descending Nav lay-out nested virtualization net-cat traditional en en generation "
+        "en en integrity en en keys en en peers no certificate no cross-origin resource sharing no fallback"
     )
 
 
