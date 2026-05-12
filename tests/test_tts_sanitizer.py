@@ -260,11 +260,38 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["chromadb replacement"] == "chroma DB replacement"
     assert transforms["c"]["chu tianxiang"] == "Chu Tianxiang"
     assert transforms["c"]["ciphertext only"] == "cipher-text only"
+    assert transforms["c"]["clockhtml internals"] == "clock HTML internals"
+    assert transforms["c"]["cloud fallback"] == "cloud-fallback"
+    assert transforms["c"]["cloud init"] == "cloud-initialisation"
+    assert transforms["c"]["cmd shell"] == "command-shell"
+    assert transforms["c"]["cms ifying"] == "CMS iffy-ing"
+    assert transforms["c"]["code workspace"] == "code work-space"
+    assert transforms["c"]["codium server"] == "Codium Server"
+    assert transforms["c"]["column chooser"] == "column chooser"
+    assert transforms["c"]["composeyaml draft"] == "compose yammel draft"
+    assert transforms["c"]["configyaml entry"] == "config-yammel entry"
+    assert transforms["c"]["configyml reference"] == "config yammel reference"
+    assert transforms["c"]["connect timeout"] == "connect time-out"
+    assert transforms["c"]["connectivity testkit"] == "connectivity test-kit"
+    assert transforms["c"]["copypaste prompt"] == "copy-paste prompt"
+    assert transforms["c"]["cors bypass"] == "caws bypass"
+    assert transforms["c"]["crawlerpool section"] == "crawler-pool section"
+    assert transforms["c"]["csp safe"] == "CSP Safe"
+    assert transforms["c"]["current tailnets"] == "current tail-nets"
+    assert transforms["c"]["cyan gradient"] == "cyan gradient"
+    assert transforms["c"]["data dir"] == "data directory"
+    assert transforms["c"]["data filename"] == "data file-name"
+    assert transforms["c"]["data fn"] == "data function"
+    assert transforms["c"]["data gkey"] == "data gee-key"
+    assert transforms["c"]["data idx"] == "data IDX"
+    assert transforms["c"]["dataset level"] == "dataset level"
+    assert transforms["c"]["deep agentic"] == "deep a gent-ick"
+    assert transforms["c"]["defrag relevant"] == "defragment relevant"
+    assert transforms["c"]["descrip tion"] == "description"
     assert "private pki" not in transforms["c"]
     assert "presidio pii" not in transforms["c"]
     assert "nvidia cuda" not in transforms["c"]
     assert "oom killed" not in transforms["c"]
-    assert "clockhtml internals" in transforms["u"]
 
 
 def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
@@ -294,7 +321,12 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "bg-ctrl, blueprints-appappaiclientpy, blueprints-observability, browser-wasm, "
         "build-meson, bulk-precreate, capabilities-dict, carnice-style, cgroup-based, "
         "chatgpt-plan, checkbox-list, checksum-member, chipset-style, chromadb-replacement, "
-        "chu-tianxiang, and ciphertext-only."
+        "chu-tianxiang, ciphertext-only, clockhtml-internals, cloud-fallback, cloud-init, "
+        "cmd-shell, cms-ifying, code-workspace, codium-server, column-chooser, composeyaml-draft, "
+        "configyaml-entry, configyml-reference, connect-timeout, connectivity-testkit, "
+        "copypaste-prompt, cors-bypass, crawlerpool-section, csp-safe, current-tailnets, "
+        "cyan-gradient, data-dir, data-filename, data-fn, data-gkey, data-idx, dataset-level, "
+        "deep-agentic, defrag-relevant, and descrip-tion."
     ).text
 
     assert result == (
@@ -310,7 +342,12 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "background control, Blueprints app-app a-eye client-pie, Blueprints observe-ability, browser whasm, "
         "build meezon, bulk pre-create, capabilities dictionary, carnice-style, sea-group based, "
         "chat GPT plan, check-box list, check-sum member, chip-set style, chroma dee bee replacement, "
-        "Chu Tianxiang, and cipher-text only."
+        "Chu Tianxiang, cipher-text only, clock HTML internals, cloud-fallback, cloud-initialisation, "
+        "command-shell, CMS iffy-ing, code work-space, Codium Server, column chooser, compose yammel draft, "
+        "config-yammel entry, config yammel reference, connect time-out, connectivity test-kit, "
+        "copy-paste prompt, caws bypass, crawler-pool section, CSP Safe, current tail-nets, "
+        "cyan gradient, data directory, data file-name, data function, data gee-key, data IDX, dataset level, "
+        "deep a gent-ick, defragment relevant, and description."
     )
 
 
