@@ -593,10 +593,25 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "tdd style": "Test Driven Design style",
         "tempr style": "temperature-style",
         "timeout minutes": "time-out minutes",
+        "tokenizer revision": "tokenizer revision",
+        "tool normalizer": "tool normalizer",
+        "tooling runtime": "tooling run-time",
         "todo editor": "to-do editor",
         "todo error": "to-do error",
         "todo preview": "to-do preview",
         "todo status": "to-do status",
+        "torch runtime": "torch run-time",
+        "traefik config": "tray-thick configuration",
+        "traefik exposure": "tray-thick exposure",
+        "trivy action": "triv-ee action",
+        "trivy teampcp": "triv-ee team PCP",
+        "ultrawide gap": "ultra-wide gap",
+        "ultrawide short": "ultra-wide short",
+        "ultrawide sidecar": "ultra-wide side-car",
+        "ultrawide splitter": "ultra-wide splitter",
+        "unmount time": "unmount time",
+        "untrusted content": "untrusted-content",
+        "untrusted input": "untrusted input",
     }
 
     for source, replacement in expected.items():
@@ -783,7 +798,9 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "source-datasets speedtest-speedtest split-dropdown split-dropdowns startstop-mechanism "
         "startstop-timing strict-sni sub-submenus subnet-router symlink-backed symlink-based "
         "systemd-cryptenroll table-nav tabular-nums tapir-gar tdd-style tempr-style timeout-minutes "
-        "todo-editor todo-error todo-preview todo-status"
+        "tokenizer-revision tool-normalizer tooling-runtime todo-editor todo-error todo-preview todo-status "
+        "torch-runtime traefik-config traefik-exposure trivy-action trivy-teampcp ultrawide-gap "
+        "ultrawide-short ultrawide-sidecar ultrawide-splitter unmount-time untrusted-content untrusted-input"
     ).text
 
     assert result == (
@@ -833,8 +850,10 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "only solvable blockers source data-sets speed-test split drop-down split drop-downs start-stop "
         "mechanism start-stop timing strict Server Name Indication, SNI (sub) sub-menus sub-net router "
         "symbolic-link backed symbolic-link based system-dee crypt-enrol table navigation tabular numbers "
-        "tapir-gar Test Driven Design style temperature-style time-out minutes to-do editor to-do error "
-        "to-do preview to-do status"
+        "tapir-gar Test Driven Design style temperature-style time-out minutes tokenizer revision tool normalizer "
+        "tooling run-time to-do editor to-do error to-do preview to-do status torch run-time tray-thick "
+        "configuration tray-thick exposure triv-ee action triv-ee team PCP ultra-wide gap ultra-wide short "
+        "ultra-wide side-car ultra-wide splitter unmount time untrusted-content untrusted input"
     )
 
 
