@@ -306,6 +306,26 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["docker related"] == "docker-related"
     assert transforms["c"]["docker run"] == "docker-run"
     assert transforms["c"]["docker specific"] == "docker-specific"
+    assert transforms["c"]["docker stacks"] == "docker-stacks"
+    assert transforms["c"]["docs centric"] == "documents-centric"
+    assert transforms["c"]["docs summarizer"] == "documents-summarizer"
+    assert (
+        transforms["c"]["docsdockgeclaude codemd"]
+        == "mark-down document for Dockge Claude Code container"
+    )
+    assert (
+        transforms["c"]["docsdockgenullclaw basicsmd"]
+        == "mark-down document for Dockge Null-Claw Basics container"
+    )
+    assert (
+        transforms["c"]["docsdockgepockettts openaimd"]
+        == "mark-down document for Dockge Pocket-TTS Open a-eye container"
+    )
+    assert (
+        transforms["c"]["docsdockgeturbovec docsmd"]
+        == "mark-down document for Dockge turbo-veck container"
+    )
+    assert transforms["c"]["dot namespaced"] == "dot name-spaced"
     assert "private pki" not in transforms["c"]
     assert "presidio pii" not in transforms["c"]
     assert "nvidia cuda" not in transforms["c"]
@@ -347,7 +367,10 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "deep-agentic, defrag-relevant, descrip-tion, diag-chip, diag-modal, direct-loopback, "
         "distribute-nodesjson, distributed-failover, docker-backed, docker-capable, docker-compose, "
         "docker-enabled, docker-enabling, docker-level, docker-network, docker-oriented, "
-        "docker-published, docker-registry, docker-related, docker-run, and docker-specific."
+        "docker-published, docker-registry, docker-related, docker-run, docker-specific, "
+        "docker-stacks, docs-centric, docs-summarizer, docsdockgeclaude-codemd, "
+        "docsdockgenullclaw-basicsmd, docsdockgepockettts-openaimd, "
+        "docsdockgeturbovec-docsmd, and dot-namespaced."
     ).text
 
     assert result == (
@@ -371,7 +394,12 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "deep a gent-ick, defragment relevant, description, diagnostic chip, diagnostic modal, direct loop-back, "
         "distribute nodes dot Jason, distributed fail-over, docker-backed, docker-capable, docker-compose, "
         "docker-enabled, docker enabling, docker-level, docker-network, docker-oriented, "
-        "docker-published, docker-registry, docker-related, docker-run, and docker-specific."
+        "docker-published, docker-registry, docker-related, docker-run, docker-specific, "
+        "docker-stacks, documents-centric, documents-summarizer, "
+        "mark-down document for Dockage Claude Code container, "
+        "mark-down document for Dockage null-claw Basics container, "
+        "mark-down document for Dockage pocket-TTS open a-eye container, "
+        "mark-down document for Dockage turbo-veck container, and dot name-spaced."
     )
 
 
