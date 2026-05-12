@@ -612,6 +612,17 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "unmount time": "unmount time",
         "untrusted content": "untrusted-content",
         "untrusted input": "untrusted input",
+        "uw debug": "you double-U debug",
+        "valkey cache": "value-key cache",
+        "vec bm": "veck BM",
+        "vec v": "veck vee",
+        "ver installed": "version installed",
+        "ver remote": "version remote",
+        "visualux constraints": "Visual User Experience constraints",
+        "vlm shaped": "Vision Language Model Shaped",
+        "vram budget": "vee-Ram budget",
+        "vram monitor": "vee-Ram monitor",
+        "vram summary": "vee-Ram summary",
     }
 
     for source, replacement in expected.items():
@@ -801,6 +812,8 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "tokenizer-revision tool-normalizer tooling-runtime todo-editor todo-error todo-preview todo-status "
         "torch-runtime traefik-config traefik-exposure trivy-action trivy-teampcp ultrawide-gap "
         "ultrawide-short ultrawide-sidecar ultrawide-splitter unmount-time untrusted-content untrusted-input"
+        " uw-debug valkey-cache vec-bm vec-v ver-installed ver-remote visualux-constraints vlm-shaped "
+        "vram-budget vram-monitor vram-summary"
     ).text
 
     assert result == (
@@ -853,7 +866,9 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "tapir-gar Test Driven Design style temperature-style time-out minutes tokenizer revision tool normalizer "
         "tooling run-time to-do editor to-do error to-do preview to-do status torch run-time tray-thick "
         "configuration tray-thick exposure triv-ee action triv-ee team PCP ultra-wide gap ultra-wide short "
-        "ultra-wide side-car ultra-wide splitter unmount time untrusted-content untrusted input"
+        "ultra-wide side-car ultra-wide splitter unmount time untrusted-content untrusted input "
+        "you double-U debug value-key cache veck BM veck vee version installed version remote Visual User "
+        "Experience constraints Vision Language Model Shaped vee-ram budget vee-ram monitor vee-ram summary"
     )
 
 
