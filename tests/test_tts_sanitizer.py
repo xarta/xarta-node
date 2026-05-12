@@ -342,6 +342,70 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert "oom killed" not in transforms["c"]
 
 
+def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_h_batch():
+    transforms = json.loads(_UNKNOWN_COUPLET_TRANSFORMS.read_text(encoding="utf-8"))
+
+    expected = {
+        "dotenv webpack": "dot ENV webpack",
+        "double scrollbar": "double scroll-bar",
+        "drag resize": "drag resize",
+        "drive scsin": "drive SCS in",
+        "dropdown arrow": "dropdown arrow",
+        "dropdown open": "dropdown open",
+        "en us": "English US",
+        "error exitcode": "error exit-code",
+        "ev ec": "EV EC",
+        "export preflight": "export pre-flight",
+        "failover architecture": "failover-architecture",
+        "failover observed": "failover-observed",
+        "failover probe": "failover-probe",
+        "failover topology": "failover-topology",
+        "fallback capable": "fallback-capable",
+        "fallback only": "fallback-only",
+        "fallback page": "fallback-page",
+        "fallback playback": "fallback play-back",
+        "fast ttfa": "fast Time To First Audio",
+        "fc container": "FC Container",
+        "fc status": "FC Status",
+        "fc table": "FC Table",
+        "fc tbody": "FC Tee Body",
+        "ff only": "FF Only",
+        "ffffffff keyed": "Hex eff eight times, like four Gibi-bytes, keyed",
+        "fgtinn ebiv": "FGT inn E Biv",
+        "filesystem isolation": "file-system isolation",
+        "filesystem layout": "file-system layout",
+        "filesystem level": "file-system level",
+        "fleet replicable": "fleet replicable",
+        "footer pager": "footer pager",
+        "fpool origin": "F-pool origin",
+        "frontmatter aware": "front-matter aware",
+        "full reindex": "full re-index",
+        "fusion mpt": "fusion MPT",
+        "fx kvbaxjgismb": "FX KV Bax JGI SMB",
+        "get tasksid": "get tasks ID",
+        "gfm style": "GFM style",
+        "gh copilot": "GH Co-pilot",
+        "git based": "git based",
+        "git clones": "git clones",
+        "git credentials": "git credentials",
+        "git ignored": "git ignored",
+        "git pull": "git pull",
+        "git relative": "git relative",
+        "git tracked": "git tracked",
+        "githookspre commit": "git-hooks pre-commit",
+        "gytyhvqh e": "GYT YH VGH",
+        "handoff template": "hand-off template",
+        "hangwinmcp chrome": "hang-win MCP Chrome",
+        "harddrive problems": "hard-drive problems",
+        "headscale provided": "head-scale provided",
+        "heretic abliterated": "heretic Abliterated",
+    }
+
+    for source, replacement in expected.items():
+        assert transforms["c"][source] == replacement
+        assert source not in transforms["u"]
+
+
 def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
     unknown = {"e": {"badge-btn": {"m": ["btn"], "c": 1}, "custom-token": {"m": ["custom"], "c": 2}}}
     existing = {"c": {"badge btn": "badge control"}, "u": {"custom token": "custom token"}}
@@ -478,6 +542,33 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "mark-down document for Dockage null-claw Basics container, "
         "mark-down document for Dockage pocket-TTS open a-eye container, "
         "mark-down document for Dockage turbo-veck container, and dot name-spaced."
+    )
+
+
+def test_sanitize_tts_text_speaks_reviewed_e_to_h_unknown_couplets():
+    result = sanitize_tts_text(
+        "dotenv-webpack double-scrollbar drag-resize drive-scsin dropdown-arrow dropdown-open "
+        "en-us error-exitcode ev-ec export-preflight failover-architecture failover-observed "
+        "failover-probe failover-topology fallback-capable fallback-only fallback-page fallback-playback "
+        "fast-ttfa fc-container fc-status fc-table fc-tbody ff-only ffffffff-keyed fgtinn-ebiv "
+        "filesystem-isolation filesystem-layout filesystem-level fleet-replicable footer-pager "
+        "fpool-origin frontmatter-aware full-reindex fusion-mpt fx-kvbaxjgismb get-tasksid "
+        "gfm-style gh-copilot git-based git-clones git-credentials git-ignored git-pull "
+        "git-relative git-tracked githookspre-commit gytyhvqh-e handoff-template hangwinmcp-chrome "
+        "harddrive-problems headscale-provided heretic-abliterated"
+    ).text
+
+    assert result == (
+        "dot ee en vee webpack double scroll-bar drag resize drive SCS in dropdown arrow dropdown open "
+        "English US error exit-code EV EC export pre-flight failover-architecture failover-observed "
+        "failover-probe failover-topology fallback-capable fallback-only fallback-page fallback play-back "
+        "fast Time To First Audio FC Container FC Status FC Table FC Tee Body FF Only "
+        "Hex eff eight times, like four Gibi-bytes, keyed FGT inn E Biv file-system isolation "
+        "file-system layout file-system level fleet replicable footer pager F-pool origin "
+        "front-matter aware full re-index fusion MPT FX KV Bax JGI ess em bee get tasks eye dee "
+        "GFM style GH Co-pilot git based git clones git credentials git ignored git pull git relative "
+        "git tracked git-hooks pre-commit GYT YH VGH hand-off template hang-win em see pee Chrome "
+        "hard-drive problems head-scale provided heretic Abliterated"
     )
 
 
