@@ -16,6 +16,7 @@ import logging
 import os
 import pty
 import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -214,18 +215,77 @@ def _ssh_command_from_spec(spec: dict[str, Any]) -> tuple[str, ...]:
     return tuple(command)
 
 
+def _vps_dockge_hosts() -> list[str]:
+    hosts: list[str] = []
+    for raw in cfg.VPS_DOCKGE_SSH_HOSTS.split(","):
+        host = raw.strip()
+        if host and host not in hosts:
+            hosts.append(host)
+    if not hosts:
+        raise RuntimeError("VPS_DOCKGE_SSH_HOSTS is empty")
+    return hosts
+
+
+def _vps_dockge_ssh_command_from_spec(spec: dict[str, Any]) -> tuple[str, ...]:
+    """Build an interactive VPS SSH command using the Dockge failover settings."""
+
+    remote_command = _require_str(spec, "remote_command")
+    user = cfg.VPS_DOCKGE_SSH_USER.strip()
+    if not user:
+        raise RuntimeError("VPS_DOCKGE_SSH_USER is empty")
+
+    key = cfg.VPS_DOCKGE_SSH_KEY.strip()
+    if not key:
+        raise RuntimeError("VPS_DOCKGE_SSH_KEY is empty")
+    if not os.path.isfile(key):
+        raise RuntimeError(f"VPS_DOCKGE_SSH_KEY not found: {key}")
+
+    connect_timeout = _target_int(spec, "connect_timeout", 8)
+    host_array = " ".join(shlex.quote(host) for host in _vps_dockge_hosts())
+    source_ip = str(spec.get("source_ip", "")).strip()
+    source_bind = f" -b {shlex.quote(source_ip)}" if source_ip else ""
+    script = (
+        "set -u\n"
+        f"hosts=({host_array})\n"
+        "last_rc=255\n"
+        "for host in \"${hosts[@]}\"; do\n"
+        "  ssh -tt"
+        f" -i {shlex.quote(key)}"
+        " -o BatchMode=yes"
+        " -o StrictHostKeyChecking=accept-new"
+        " -o ServerAliveInterval=30"
+        " -o ServerAliveCountMax=3"
+        " -o IdentitiesOnly=yes"
+        f" -o ConnectTimeout={connect_timeout}"
+        f"{source_bind}"
+        f" -a {shlex.quote(user)}@\"$host\" {shlex.quote(remote_command)}\n"
+        "  rc=$?\n"
+        "  if [ \"$rc\" -ne 255 ]; then exit \"$rc\"; fi\n"
+        "  last_rc=$rc\n"
+        "done\n"
+        "exit \"$last_rc\"\n"
+    )
+    return ("bash", "-lc", script)
+
+
 def _target_from_spec(spec: dict[str, Any]) -> TerminalTarget:
     target_id = _safe_target_id(spec)
     kind = str(spec.get("kind", "ssh")).strip().lower()
-    if kind != "ssh":
+    if kind not in {"ssh", "vps-dockge-ssh"}:
         raise RuntimeError(f"unsupported terminal target kind for {target_id!r}: {kind!r}")
     enabled = _target_bool(spec, "enabled", True)
+    command: tuple[str, ...] = ()
+    if enabled:
+        if kind == "vps-dockge-ssh":
+            command = _vps_dockge_ssh_command_from_spec(spec)
+        else:
+            command = _ssh_command_from_spec(spec)
     return TerminalTarget(
         target_id=target_id,
         label=_require_str(spec, "label"),
         kind=kind,
         stack=str(spec.get("stack", "")).strip(),
-        command=_ssh_command_from_spec(spec) if enabled else (),
+        command=command,
         cwd=str(spec.get("cwd", "/root")).strip() or "/root",
         enabled=enabled,
         menu_order=_target_int(spec, "menu_order", 100),
