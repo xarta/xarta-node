@@ -150,24 +150,28 @@ async function testConnection() {
     _logInfo(`API Secret : set — ${rawSecret.length} hex chars (${rawSecret.length * 4} bits)`);
   }
 
-  // 2. Compute TOTP
+  // 2. Compute TOTP using the node clock when available
   _logStep('Computing TOTP token…');
-  const windowNum = Math.floor(Date.now() / 5000);
+  let clockOffsetMs = 0;
+  try {
+    clockOffsetMs = typeof _syncApiTime === 'function' ? await _syncApiTime(url, true) : 0;
+    _logInfo(`Server clock offset: ${clockOffsetMs} ms relative to this browser`);
+  } catch (ex) {
+    _logWarn(`Server clock sync failed; using browser clock (${ex.message})`);
+  }
+  const adjustedNow = Date.now() + clockOffsetMs;
+  const windowNum = Math.floor(adjustedNow / 5000);
   const windowSec = windowNum * 5;
   const windowUtc = new Date(windowSec * 1000).toISOString().replace('T',' ').replace('.000Z',' UTC');
   _logInfo(`TOTP window: ${windowNum}  (epoch second ${windowSec}, ~${windowUtc})`);
-  _logInfo(`Window age : ${(Date.now() - windowSec * 1000).toFixed(0)} ms into current 5 s window`);
+  _logInfo(`Window age : ${(adjustedNow - windowSec * 1000).toFixed(0)} ms into current 5 s window`);
 
   let token = '';
   if (rawSecret) {
     try {
-      const keyBytes = Uint8Array.from(rawSecret.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-      const msgBytes = new TextEncoder().encode(String(windowNum));
-      const key = await crypto.subtle.importKey(
-        'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-      );
-      const sig = await crypto.subtle.sign('HMAC', key, msgBytes);
-      token = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2,'0')).join('');
+      token = typeof _computeToken === 'function'
+        ? await _computeToken(rawSecret, url)
+        : '';
       _logOk(`TOTP token : ${_truncHex(token)} (HMAC-SHA256, full length ${token.length} chars)`);
     } catch (ex) {
       _logErr(`TOTP computation failed: ${ex.message}`);

@@ -35,6 +35,7 @@ from .routes_ai_project_assignments import router as ai_project_assignments_rout
 from .routes_ai_providers import router as ai_providers_router
 from .routes_arp_manual import router as arp_manual_router
 from .routes_assumptions import router as assumptions_router
+from .routes_auth_time import router as auth_time_router
 from .routes_backup import router as backup_router
 from .routes_bookmarks import router as bookmarks_router
 from .routes_caddy_configs import router as caddy_configs_router
@@ -331,6 +332,7 @@ def create_app() -> FastAPI:
 
     # ── Routers ───────────────────────────────────────────────────────────────
     application.include_router(health_router)
+    application.include_router(auth_time_router, prefix="/api/v1")
     application.include_router(services_router, prefix="/api/v1")
     application.include_router(machines_router, prefix="/api/v1")
     application.include_router(nodes_router, prefix="/api/v1")

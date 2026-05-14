@@ -49,6 +49,7 @@ _TOKEN_EXEMPT_PREFIXES = ("/health", "/ui", "/favicon.ico", "/api/v1/pwa/manifes
 # AI clients through LiteLLM workspace context.
 _TOKEN_EXEMPT_PATHS = frozenset(
     {
+        "/api/v1/auth/time",
         "/api/v1/docs/search",
         "/api/v1/docs/search/explain",
         "/api/v1/docs/search/status",
