@@ -72,6 +72,14 @@ _VPS_DOCKGE_SOURCE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+_VPS_DOCKGE_REQUIRED_ENV = (
+    "VPS_DOCKGE_BASE_URL",
+    "VPS_DOCKGE_STACKS_DIR",
+    "VPS_DOCKGE_SSH_USER",
+    "VPS_DOCKGE_SSH_HOSTS",
+    "VPS_DOCKGE_SSH_KEY",
+    "VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
+)
 
 
 class VpsDockgeAction(BaseModel):
@@ -84,6 +92,16 @@ class VpsDockgeSpeechBody(BaseModel):
 
 def _safe_stack_cache_name(stack_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", stack_name.strip()).strip(".-") or "stack"
+
+
+def _ensure_vps_dockge_config() -> None:
+    missing = [name for name in _VPS_DOCKGE_REQUIRED_ENV if not getattr(cfg, name, "").strip()]
+    if missing:
+        raise HTTPException(
+            503,
+            "VPS Dockge is not configured on this node; set required env vars: "
+            + ", ".join(missing),
+        )
 
 
 def _vps_dockge_speech_cache_dir(stack_name: str) -> Path:
@@ -742,6 +760,7 @@ def _find_service_exposure(stack_name: str, service_name: str) -> tuple[dict, di
 
 @router.get("/stacks", status_code=200)
 async def list_vps_dockge_stacks() -> dict:
+    _ensure_vps_dockge_config()
     root = _stacks_root()
     result, host = _run_remote(
         f"root={shlex.quote(root)}; test -d \"$root\" || exit 43; "
@@ -797,6 +816,7 @@ async def list_vps_dockge_stacks() -> dict:
 
 @router.get("/stacks/{stack_name}/services/{service_name}/info", status_code=200)
 async def vps_dockge_service_info(stack_name: str, service_name: str) -> dict:
+    _ensure_vps_dockge_config()
     stack, exposure = _find_service_exposure(stack_name, service_name)
     base_url = exposure.get("url") or ""
     openapi_candidates = []
@@ -857,6 +877,7 @@ async def vps_dockge_service_info(stack_name: str, service_name: str) -> dict:
 
 @router.post("/stacks/{stack_name}/speech", status_code=200)
 async def vps_dockge_stack_speech(stack_name: str, body: VpsDockgeSpeechBody | None = None) -> dict:
+    _ensure_vps_dockge_config()
     force = bool(body.force) if body else False
     stack = _inspect_stack_lenient(stack_name)
     source_items = _gather_vps_dockge_speech_sources(stack["stack_name"], stack["compose_file"])
@@ -932,6 +953,7 @@ async def vps_dockge_stack_speech(stack_name: str, body: VpsDockgeSpeechBody | N
 
 @router.post("/stacks/{stack_name}/action", status_code=200)
 async def vps_dockge_stack_action(stack_name: str, body: VpsDockgeAction) -> dict:
+    _ensure_vps_dockge_config()
     action = body.action.strip().lower()
     if action not in _VALID_ACTIONS:
         raise HTTPException(400, f"invalid action '{action}'; must be start, stop, or restart")

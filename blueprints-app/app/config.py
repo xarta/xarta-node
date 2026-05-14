@@ -225,14 +225,18 @@ LOCAL_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = os.environ.get(
     "",
 )
 
-# VPS Dockge instance. Values are node-local/private and must be provided by
-# the service environment; public code intentionally carries no defaults.
-VPS_DOCKGE_BASE_URL: str = _require_env("VPS_DOCKGE_BASE_URL")
-VPS_DOCKGE_STACKS_DIR: str = _require_env("VPS_DOCKGE_STACKS_DIR")
-VPS_DOCKGE_SSH_USER: str = _require_env("VPS_DOCKGE_SSH_USER")
-VPS_DOCKGE_SSH_HOSTS: str = _require_env("VPS_DOCKGE_SSH_HOSTS")
-VPS_DOCKGE_SSH_KEY: str = _require_env("VPS_DOCKGE_SSH_KEY")
-VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = _require_env("VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES")
+# VPS Dockge instance. Values are node-local/private and public code carries no
+# defaults. Routes that need this feature validate these at call time so nodes
+# that do not host the VPS Dockge integration can still start Blueprints.
+VPS_DOCKGE_BASE_URL: str = os.environ.get("VPS_DOCKGE_BASE_URL", "").strip()
+VPS_DOCKGE_STACKS_DIR: str = os.environ.get("VPS_DOCKGE_STACKS_DIR", "").strip()
+VPS_DOCKGE_SSH_USER: str = os.environ.get("VPS_DOCKGE_SSH_USER", "").strip()
+VPS_DOCKGE_SSH_HOSTS: str = os.environ.get("VPS_DOCKGE_SSH_HOSTS", "").strip()
+VPS_DOCKGE_SSH_KEY: str = os.environ.get("VPS_DOCKGE_SSH_KEY", "").strip()
+VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = os.environ.get(
+    "VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
+    "",
+).strip()
 
 # Node-local deterministic docs synthesis worker. This is a separate Blueprints
 # proxy surface from the direct TurboVec Docs search route above.
