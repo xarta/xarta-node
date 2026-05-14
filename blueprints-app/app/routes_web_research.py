@@ -29,7 +29,7 @@ router = APIRouter(prefix="/web-research", tags=["web-research"])
 log = logging.getLogger(__name__)
 
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
-_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "web-research-speech-cache"
+_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-web-research-cache"
 _PRIVACY_MODE_DOC = _NODE_LOCAL_ROOT / "docs" / "null-claw-web-research" / "PRIVACY-MODE.md"
 _PRIVACY_MODE_DOC_REL = "docs/null-claw-web-research/PRIVACY-MODE.md"
 _DEFAULT_ADAPTER_URL = "http://172.31.250.2:18080"

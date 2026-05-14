@@ -81,6 +81,7 @@ from .routes_tts import router as tts_router
 from .routes_tts_pool import router as tts_pool_router
 from .routes_ui_cache import router as ui_cache_router
 from .routes_vlans import router as vlans_router
+from .routes_vps_dockge import router as vps_dockge_router
 from .routes_web_research import router as web_research_router
 from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
 from .sync.drain import start_drain_loop, stop_drain_loop
@@ -374,6 +375,7 @@ def create_app() -> FastAPI:
     application.include_router(litellm_hook_router, prefix="/api/v1")
     application.include_router(liteparse_router, prefix="/api/v1")
     application.include_router(local_dockge_router, prefix="/api/v1")
+    application.include_router(vps_dockge_router, prefix="/api/v1")
     application.include_router(markitdown_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
     application.include_router(scrapling_router, prefix="/api/v1")
