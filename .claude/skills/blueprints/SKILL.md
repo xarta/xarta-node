@@ -278,7 +278,7 @@ unavailable in standalone/public-only checkouts.
 `app/middleware_auth.py` — `AuthMiddleware` (Starlette `BaseHTTPMiddleware`) sits before CORS. Two protection layers:
 
 1. **IP allowlist** — client IP (read from `X-Forwarded-For` set by Caddy, then raw socket) must fall within `BLUEPRINTS_ALLOWED_NETWORKS` (comma-separated CIDRs in `.env`).
-2. **TOTP token** — `X-API-Token` header must be `HMAC-SHA256(secret_hex, str(unix_time // 5))`. 5-second windows, ±1 skew (~15 s total validity). Implemented in `app/auth.py`.
+2. **TOTP token** — `X-API-Token` header must be `HMAC-SHA256(secret_hex, str(unix_time // 5))`. 5-second windows, ±1 skew (~15 s total validity). Implemented in `app/auth.py`. Browser and extension clients first call `/api/v1/auth/time` and cache a per-origin server-clock offset before deriving the token.
 
 ### Secret routing — two secrets with distinct scopes
 
@@ -293,6 +293,8 @@ unavailable in standalone/public-only checkouts.
 
 `/health`, `/ui/*`, `/favicon.ico` — always pass through, no token needed.
 
+`/api/v1/auth/time` is token-exempt but still IP-allowlisted; it returns server epoch metadata only so browser TOTP can avoid local clock drift.
+
 ### Loopback exemption
 
 `127.0.0.1` and `::1` bypass **all** checks unconditionally — needed for local `curl` calls from shell scripts like `bp-nodes-push.sh`.
@@ -300,7 +302,7 @@ unavailable in standalone/public-only checkouts.
 ### GUI token flow
 
 - Browser stores `BLUEPRINTS_API_SECRET` in `localStorage['blueprints_api_secret']`
-- `apiFetch()` wrapper in `index.html` computes a fresh TOTP via Web Crypto and injects `X-API-Token` on every request
+- `apiFetch()` wrapper in `gui-fallback/js/api.js` syncs against `/api/v1/auth/time`, computes a fresh TOTP via Web Crypto, and injects `X-API-Token` on every request
 - **Only the derived token travels on the wire** — the raw secret never leaves the browser
 - On 401, `apiFetch()` opens the API key modal
 

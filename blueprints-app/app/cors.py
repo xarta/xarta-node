@@ -45,6 +45,7 @@ ALLOWED_HEADERS = "Content-Type, X-API-Token"
 # (with unpredictable chrome-extension:// origins) can call them freely.
 # Only add paths that are already auth-exempt and return non-sensitive data.
 _OPEN_CORS_PATHS = frozenset({
+    "/api/v1/auth/time",
     "/api/v1/bookmarks/health",
     "/api/v1/bookmarks/extension-version",
 })
