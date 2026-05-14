@@ -7,6 +7,7 @@ Caddy-served Blueprints API instead of talking to Dockge's loopback-only port.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -978,6 +979,10 @@ def _summarize_openapi(spec: dict, url: str) -> dict:
 
 @router.get("/stacks", status_code=200)
 async def list_local_dockge_stacks() -> dict:
+    return await asyncio.to_thread(_list_local_dockge_stacks_sync)
+
+
+def _list_local_dockge_stacks_sync() -> dict:
     root = _stacks_root()
     if not root.is_dir():
         raise HTTPException(404, f"local Dockge stacks directory not found: {root}")
@@ -1025,7 +1030,7 @@ async def list_local_dockge_stacks() -> dict:
 
 @router.get("/stacks/{stack_name}/services/{service_name}/info", status_code=200)
 async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
-    stack, exposure = _find_service_exposure(stack_name, service_name)
+    stack, exposure = await asyncio.to_thread(_find_service_exposure, stack_name, service_name)
     base_url = exposure.get("url") or ""
     openapi_candidates = []
     if exposure.get("openapi_url"):
@@ -1167,7 +1172,10 @@ async def local_dockge_stack_action(stack_name: str, body: LocalDockgeAction) ->
     action = body.action.strip().lower()
     if action not in _VALID_ACTIONS:
         raise HTTPException(400, f"invalid action '{action}'; must be start, stop, or restart")
+    return await asyncio.to_thread(_local_dockge_stack_action_sync, stack_name, action)
 
+
+def _local_dockge_stack_action_sync(stack_name: str, action: str) -> dict:
     stack_dir, compose = _safe_stack_dir(stack_name)
     if action == "start":
         args = ["up", "-d"]

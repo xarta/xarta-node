@@ -7,6 +7,7 @@ tailnet address can be preferred with a public address used only as failover.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -760,6 +761,10 @@ def _find_service_exposure(stack_name: str, service_name: str) -> tuple[dict, di
 
 @router.get("/stacks", status_code=200)
 async def list_vps_dockge_stacks() -> dict:
+    return await asyncio.to_thread(_list_vps_dockge_stacks_sync)
+
+
+def _list_vps_dockge_stacks_sync() -> dict:
     _ensure_vps_dockge_config()
     root = _stacks_root()
     result, host = _run_remote(
@@ -817,7 +822,7 @@ async def list_vps_dockge_stacks() -> dict:
 @router.get("/stacks/{stack_name}/services/{service_name}/info", status_code=200)
 async def vps_dockge_service_info(stack_name: str, service_name: str) -> dict:
     _ensure_vps_dockge_config()
-    stack, exposure = _find_service_exposure(stack_name, service_name)
+    stack, exposure = await asyncio.to_thread(_find_service_exposure, stack_name, service_name)
     base_url = exposure.get("url") or ""
     openapi_candidates = []
     if exposure.get("openapi_url"):
@@ -957,6 +962,10 @@ async def vps_dockge_stack_action(stack_name: str, body: VpsDockgeAction) -> dic
     action = body.action.strip().lower()
     if action not in _VALID_ACTIONS:
         raise HTTPException(400, f"invalid action '{action}'; must be start, stop, or restart")
+    return await asyncio.to_thread(_vps_dockge_stack_action_sync, stack_name, action)
+
+
+def _vps_dockge_stack_action_sync(stack_name: str, action: str) -> dict:
     name = _valid_stack_name(stack_name)
     compose_name = _remote_compose_name(name)
     args = ["up", "-d"] if action == "start" else [action]
