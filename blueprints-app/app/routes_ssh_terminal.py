@@ -22,7 +22,7 @@ import termios
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from . import config as cfg
 from .auth import verify_token
@@ -33,6 +33,7 @@ router = APIRouter(prefix="/ssh-terminal", tags=["ssh-terminal"])
 _LOOPBACK = frozenset({"127.0.0.1", "::1"})
 _MAX_COLS = 240
 _MAX_ROWS = 80
+_ACTIVE_PROCESSES: dict[str, set[subprocess.Popen[bytes]]] = {}
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,23 @@ _TARGETS: dict[str, TerminalTarget] = {
             "TERM=xterm-256color",
             "hermes-local",
             "/opt/hermes/.venv/bin/hermes",
+        ),
+        cwd="/root/xarta-node",
+    ),
+    "local-hermes-setup": TerminalTarget(
+        target_id="local-hermes-setup",
+        label="Local Hermes Setup",
+        kind="docker-exec",
+        stack="hermes-local",
+        command=(
+            "docker",
+            "exec",
+            "-it",
+            "-e",
+            "TERM=xterm-256color",
+            "hermes-local",
+            "/opt/hermes/.venv/bin/hermes",
+            "setup",
         ),
         cwd="/root/xarta-node",
     ),
@@ -172,9 +190,42 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=2)
 
 
+def _register_process(target_id: str, process: subprocess.Popen[bytes]) -> None:
+    _ACTIVE_PROCESSES.setdefault(target_id, set()).add(process)
+
+
+def _unregister_process(target_id: str, process: subprocess.Popen[bytes]) -> None:
+    processes = _ACTIVE_PROCESSES.get(target_id)
+    if not processes:
+        return
+    processes.discard(process)
+    if not processes:
+        _ACTIVE_PROCESSES.pop(target_id, None)
+
+
+def _terminate_target_processes(target_id: str) -> int:
+    processes = list(_ACTIVE_PROCESSES.get(target_id, set()))
+    stopped = 0
+    for process in processes:
+        if process.poll() is None:
+            _terminate_process(process)
+            stopped += 1
+        _unregister_process(target_id, process)
+    return stopped
+
+
 @router.get("/targets")
 async def list_terminal_targets() -> list[dict[str, str | bool]]:
     return [_target_payload(target) for target in _TARGETS.values()]
+
+
+@router.post("/targets/{target_id}/disconnect")
+async def disconnect_terminal_target(target_id: str) -> dict[str, int | str | bool]:
+    target = _TARGETS.get(target_id)
+    if not target:
+        raise HTTPException(404, f"Unknown terminal target: {target_id}")
+    stopped = _terminate_target_processes(target_id)
+    return {"ok": True, "target_id": target_id, "stopped": stopped}
 
 
 @router.websocket("/ws")
@@ -224,6 +275,7 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         close_fds=True,
         preexec_fn=_prepare_child,
     )
+    _register_process(target.target_id, process)
     os.close(slave_fd)
 
     output_task = asyncio.create_task(_send_output(websocket, master_fd, process))
@@ -251,3 +303,4 @@ async def terminal_websocket(websocket: WebSocket) -> None:
             with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, OSError):
                 await task
         _terminate_process(process)
+        _unregister_process(target.target_id, process)
