@@ -36,6 +36,12 @@ def test_cached_local_dockge_narration_is_not_sanitized_again_before_tts():
     _assert_pre_sanitized_speak_call(source, "_localDockgeNarrationStart")
 
 
+def test_cached_vps_dockge_narration_is_not_sanitized_again_before_tts():
+    source = (WORKSPACE_ROOT / "gui-fallback/js/settings/vps-dockge.js").read_text(encoding="utf-8")
+
+    _assert_pre_sanitized_speak_call(source, "_vpsDockgeNarrationStart")
+
+
 def test_blueprints_wrapper_suppresses_upstream_pockettts_sanitizer():
     source = Path("/root/xarta-node/blueprints-app/app/routes_tts.py").read_text(encoding="utf-8")
     model_field = source.find('"model": model_name')

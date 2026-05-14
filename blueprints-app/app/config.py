@@ -19,6 +19,17 @@ import subprocess as _sp
 
 log = logging.getLogger(__name__)
 
+
+def _require_env(name: str) -> str:
+    """Return a required environment value or fail application startup."""
+    if name not in os.environ:
+        raise RuntimeError(f"{name} is not set - add it to .env before starting the app")
+    value = os.environ[name].strip()
+    if not value:
+        raise RuntimeError(f"{name} is empty - set it in .env before starting the app")
+    return value
+
+
 # ── Node identity (stays in .env) ─────────────────────────────────────────────
 NODE_ID: str = os.environ.get("BLUEPRINTS_NODE_ID", "")
 if not NODE_ID:
@@ -213,6 +224,15 @@ LOCAL_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = os.environ.get(
     "LOCAL_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
     "",
 )
+
+# VPS Dockge instance. Values are node-local/private and must be provided by
+# the service environment; public code intentionally carries no defaults.
+VPS_DOCKGE_BASE_URL: str = _require_env("VPS_DOCKGE_BASE_URL")
+VPS_DOCKGE_STACKS_DIR: str = _require_env("VPS_DOCKGE_STACKS_DIR")
+VPS_DOCKGE_SSH_USER: str = _require_env("VPS_DOCKGE_SSH_USER")
+VPS_DOCKGE_SSH_HOSTS: str = _require_env("VPS_DOCKGE_SSH_HOSTS")
+VPS_DOCKGE_SSH_KEY: str = _require_env("VPS_DOCKGE_SSH_KEY")
+VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = _require_env("VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES")
 
 # Node-local deterministic docs synthesis worker. This is a separate Blueprints
 # proxy surface from the direct TurboVec Docs search route above.
