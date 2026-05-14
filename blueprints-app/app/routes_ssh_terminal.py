@@ -70,11 +70,12 @@ _STATIC_TARGETS: dict[str, TerminalTarget] = {
             "/opt/hermes/.venv/bin/hermes",
         ),
         cwd="/root/xarta-node",
-        menu_order=0,
+        menu_order=1,
+        show_in_menu=False,
     ),
     "local-hermes-container": TerminalTarget(
         target_id="local-hermes-container",
-        label="Hermes Local Container",
+        label="Hermes Local",
         kind="docker-exec",
         stack="hermes-local",
         command=(
@@ -94,7 +95,7 @@ _STATIC_TARGETS: dict[str, TerminalTarget] = {
             "-i",
         ),
         cwd="/root/xarta-node",
-        menu_order=1,
+        menu_order=0,
     ),
     "local-hermes-setup": TerminalTarget(
         target_id="local-hermes-setup",
