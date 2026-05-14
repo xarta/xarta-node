@@ -75,6 +75,7 @@ from .routes_scrapling import router as scrapling_router
 from .routes_services import router as services_router
 from .routes_settings import router as settings_router
 from .routes_ssh_targets import router as ssh_targets_router
+from .routes_ssh_terminal import router as ssh_terminal_router
 from .routes_sync import router as sync_router
 from .routes_table_layouts import router as table_layouts_router
 from .routes_todo import router as todo_router
@@ -348,6 +349,7 @@ def create_app() -> FastAPI:
     application.include_router(settings_router, prefix="/api/v1")
     application.include_router(pve_hosts_router, prefix="/api/v1")
     application.include_router(arp_manual_router, prefix="/api/v1")
+    application.include_router(ssh_terminal_router, prefix="/api/v1")
     application.include_router(ssh_targets_router, prefix="/api/v1")
     application.include_router(manual_links_router, prefix="/api/v1")
     application.include_router(keys_router, prefix="/api/v1")
