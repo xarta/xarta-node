@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import pty
+import re
 import signal
 import struct
 import subprocess
@@ -45,12 +46,18 @@ class TerminalTarget:
     command: tuple[str, ...]
     cwd: str = "/root"
     enabled: bool = True
+    menu_order: int = 100
+    show_in_menu: bool = True
 
 
-_TARGETS: dict[str, TerminalTarget] = {
+_TARGET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,80}$")
+_PRIVATE_TARGETS_FILE_ENV = "SSH_TERMINAL_TARGETS_FILE"
+
+
+_STATIC_TARGETS: dict[str, TerminalTarget] = {
     "local-hermes": TerminalTarget(
         target_id="local-hermes",
-        label="Local Hermes",
+        label="Hermes Local Agent",
         kind="docker-exec",
         stack="hermes-local",
         command=(
@@ -63,6 +70,24 @@ _TARGETS: dict[str, TerminalTarget] = {
             "/opt/hermes/.venv/bin/hermes",
         ),
         cwd="/root/xarta-node",
+        menu_order=0,
+    ),
+    "local-hermes-container": TerminalTarget(
+        target_id="local-hermes-container",
+        label="Hermes Local Container",
+        kind="docker-exec",
+        stack="hermes-local",
+        command=(
+            "docker",
+            "exec",
+            "-it",
+            "-e",
+            "TERM=xterm-256color",
+            "hermes-local",
+            "/bin/bash",
+        ),
+        cwd="/root/xarta-node",
+        menu_order=1,
     ),
     "local-hermes-setup": TerminalTarget(
         target_id="local-hermes-setup",
@@ -80,8 +105,151 @@ _TARGETS: dict[str, TerminalTarget] = {
             "setup",
         ),
         cwd="/root/xarta-node",
+        menu_order=2,
+        show_in_menu=False,
     ),
 }
+
+
+def _require_str(spec: dict[str, Any], key: str) -> str:
+    value = str(spec.get(key, "")).strip()
+    if not value:
+        raise RuntimeError(f"terminal target {spec.get('target_id')!r} is missing {key!r}")
+    return value
+
+
+def _safe_target_id(spec: dict[str, Any]) -> str:
+    target_id = _require_str(spec, "target_id")
+    if not _TARGET_ID_RE.fullmatch(target_id):
+        raise RuntimeError(f"invalid terminal target id: {target_id!r}")
+    return target_id
+
+
+def _target_bool(spec: dict[str, Any], key: str, default: bool) -> bool:
+    value = spec.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _target_int(spec: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(spec.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _identity_file_from_spec(spec: dict[str, Any]) -> str:
+    identity_file = str(spec.get("identity_file", "")).strip()
+    identity_file_env = str(spec.get("identity_file_env", "")).strip()
+    if identity_file and identity_file_env:
+        raise RuntimeError(
+            f"terminal target {spec.get('target_id')!r} sets both identity_file and identity_file_env"
+        )
+    if identity_file_env:
+        identity_file = os.environ.get(identity_file_env, "").strip()
+        if not identity_file:
+            raise RuntimeError(
+                f"terminal target {spec.get('target_id')!r} requires unset env var {identity_file_env!r}"
+            )
+    if not identity_file:
+        raise RuntimeError(f"terminal target {spec.get('target_id')!r} has no SSH identity")
+    if not os.path.isfile(identity_file):
+        raise RuntimeError(
+            f"terminal target {spec.get('target_id')!r} SSH identity not found: {identity_file}"
+        )
+    return identity_file
+
+
+def _ssh_command_from_spec(spec: dict[str, Any]) -> tuple[str, ...]:
+    host = _require_str(spec, "host")
+    user = _require_str(spec, "user")
+    identity_file = _identity_file_from_spec(spec)
+    connect_timeout = _target_int(spec, "connect_timeout", 10)
+
+    command = [
+        "ssh",
+        "-tt",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        f"ConnectTimeout={connect_timeout}",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        identity_file,
+    ]
+
+    source_ip = str(spec.get("source_ip", "")).strip()
+    if source_ip:
+        command += ["-b", source_ip]
+
+    host_key_alias = str(spec.get("host_key_alias", "")).strip()
+    if host_key_alias:
+        command += ["-o", f"HostKeyAlias={host_key_alias}"]
+
+    command.append("-A" if _target_bool(spec, "forward_agent", False) else "-a")
+    command.append(f"{user}@{host}")
+
+    remote_command = str(spec.get("remote_command", "")).strip()
+    if remote_command:
+        command.append(remote_command)
+
+    return tuple(command)
+
+
+def _target_from_spec(spec: dict[str, Any]) -> TerminalTarget:
+    target_id = _safe_target_id(spec)
+    kind = str(spec.get("kind", "ssh")).strip().lower()
+    if kind != "ssh":
+        raise RuntimeError(f"unsupported terminal target kind for {target_id!r}: {kind!r}")
+    enabled = _target_bool(spec, "enabled", True)
+    return TerminalTarget(
+        target_id=target_id,
+        label=_require_str(spec, "label"),
+        kind=kind,
+        stack=str(spec.get("stack", "")).strip(),
+        command=_ssh_command_from_spec(spec) if enabled else (),
+        cwd=str(spec.get("cwd", "/root")).strip() or "/root",
+        enabled=enabled,
+        menu_order=_target_int(spec, "menu_order", 100),
+        show_in_menu=_target_bool(spec, "show_in_menu", True),
+    )
+
+
+def _load_private_targets() -> dict[str, TerminalTarget]:
+    path = os.environ.get(_PRIVATE_TARGETS_FILE_ENV, "").strip()
+    if not path:
+        return {}
+    if not os.path.isfile(path):
+        raise RuntimeError(f"{_PRIVATE_TARGETS_FILE_ENV} points to missing file: {path}")
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    specs = raw.get("targets") if isinstance(raw, dict) else raw
+    if not isinstance(specs, list):
+        raise RuntimeError(f"{_PRIVATE_TARGETS_FILE_ENV} must contain a list or {{'targets': [...]}}")
+
+    targets: dict[str, TerminalTarget] = {}
+    for spec in specs:
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"{_PRIVATE_TARGETS_FILE_ENV} contains a non-object target")
+        target = _target_from_spec(spec)
+        targets[target.target_id] = target
+    return targets
+
+
+def _targets() -> dict[str, TerminalTarget]:
+    targets = dict(_STATIC_TARGETS)
+    targets.update(_load_private_targets())
+    return targets
 
 
 def _allowed_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -126,13 +294,15 @@ def _token_allowed(token: str) -> bool:
     )
 
 
-def _target_payload(target: TerminalTarget) -> dict[str, str | bool]:
+def _target_payload(target: TerminalTarget) -> dict[str, str | bool | int]:
     return {
         "target_id": target.target_id,
         "label": target.label,
         "kind": target.kind,
         "stack": target.stack,
         "enabled": target.enabled,
+        "menu_order": target.menu_order,
+        "show_in_menu": target.show_in_menu,
     }
 
 
@@ -215,13 +385,25 @@ def _terminate_target_processes(target_id: str) -> int:
 
 
 @router.get("/targets")
-async def list_terminal_targets() -> list[dict[str, str | bool]]:
-    return [_target_payload(target) for target in _TARGETS.values()]
+async def list_terminal_targets() -> list[dict[str, str | bool | int]]:
+    try:
+        targets = _targets()
+    except RuntimeError as exc:
+        log.error("ssh-terminal: unable to load targets: %s", exc)
+        raise HTTPException(500, str(exc)) from exc
+    return [
+        _target_payload(target)
+        for target in sorted(targets.values(), key=lambda item: (item.menu_order, item.label))
+    ]
 
 
 @router.post("/targets/{target_id}/disconnect")
 async def disconnect_terminal_target(target_id: str) -> dict[str, int | str | bool]:
-    target = _TARGETS.get(target_id)
+    try:
+        target = _targets().get(target_id)
+    except RuntimeError as exc:
+        log.error("ssh-terminal: unable to load targets: %s", exc)
+        raise HTTPException(500, str(exc)) from exc
     if not target:
         raise HTTPException(404, f"Unknown terminal target: {target_id}")
     stopped = _terminate_target_processes(target_id)
@@ -243,7 +425,12 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="Unauthorized")
         return
 
-    target = _TARGETS.get(target_id)
+    try:
+        target = _targets().get(target_id)
+    except RuntimeError as exc:
+        log.error("ssh-terminal: unable to load targets: %s", exc)
+        await websocket.close(code=1011, reason="Target config unavailable")
+        return
     if not target or not target.enabled:
         log.warning("ssh-terminal: blocked websocket from %s for unknown target %r", client_ip, target_id)
         await websocket.close(code=1008, reason="Unknown target")
