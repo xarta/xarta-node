@@ -393,6 +393,13 @@ ${FALLBACK_ASSET_CACHE_HEADERS}
         reverse_proxy localhost:18884
     }
 
+    # SearXNG local stack UI/API on a dedicated path.
+    # handle_path strips /searxng before proxying to the stack.
+    redir /searxng /searxng/ permanent
+    handle_path /searxng* {
+        reverse_proxy localhost:18888
+    }
+
     # Reverse proxy all traffic to the local uvicorn process.
     # Includes /health, /api/v1/*, and /ui/* (GUI + embed component).
     reverse_proxy localhost:8080
@@ -482,6 +489,37 @@ CADDY_CODE_SERVER
     echo "    Appended code-server block (https://${CODE_SERVER_HOSTNAME} → localhost:${CODE_SERVER_PORT})"
 else
     echo "    Skipped code-server block (CODE_SERVER not set in .env)"
+fi
+
+# ── Optional remote SearXNG block ────────────────────────────────────────────
+# Site-specific hostnames and bridge-service addresses live in ignored/private
+# config. The public script only appends this block when both values are set.
+if [[ -n "${SEARXNG_VPS_HOSTNAME:-}" && -n "${SEARXNG_VPS_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_SEARXNG_VPS
+
+# Remote SearXNG — private web UI/API routed through a site-local bridge.
+https://${SEARXNG_VPS_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${SEARXNG_VPS_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${SEARXNG_VPS_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_SEARXNG_VPS
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended remote SearXNG block (https://${SEARXNG_VPS_HOSTNAME} -> ${SEARXNG_VPS_UPSTREAM})"
+else
+    echo "    Skipped remote SearXNG block (SEARXNG_VPS_HOSTNAME/SEARXNG_VPS_UPSTREAM not set)"
 fi
 
 # ── mTLS sync block (:8443) — appended when cert env vars are all set ────────
