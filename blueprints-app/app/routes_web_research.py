@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -231,6 +232,31 @@ def _web_research_speech_max_tokens() -> int:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _elapsed_ms(start: float, end: float | None = None) -> float:
+    return round(((end if end is not None else time.monotonic()) - start) * 1000, 1)
+
+
+def _timeline_span(
+    timeline: list[dict[str, Any]],
+    *,
+    origin: float,
+    stage: str,
+    start: float,
+    status: str = "ok",
+    **fields: Any,
+) -> None:
+    span = {
+        "stage": stage,
+        "status": status,
+        "start_offset_ms": _elapsed_ms(origin, start),
+        "duration_ms": _elapsed_ms(start),
+    }
+    for key, value in fields.items():
+        if value is not None:
+            span[key] = value
+    timeline.append(span)
 
 
 def _text(value: Any, limit: int | None = None) -> str:
@@ -922,29 +948,57 @@ async def _poll_task(base_url: str, task_id: str) -> dict[str, Any]:
 
 @router.post("/query", response_model=dict)
 async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
+    timeline_origin = time.monotonic()
+    timeline: list[dict[str, Any]] = []
+    stage_started = time.monotonic()
     query = await _normalize_web_research_query(body.query)
+    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.query_normalization", start=stage_started)
     _validate_public_query(query)
 
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
     searxng_profile = _searxng_profile(body.searxng_profile)
+    stage_started = time.monotonic()
     submitted = await _submit_task(
         base_url,
         _task_payload(query, body.depth, body.private_mode, searxng_profile=searxng_profile),
     )
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.task_submit",
+        start=stage_started,
+        task_id=submitted.get("id"),
+    )
     task_id = str(submitted.get("id") or "").strip()
     if not task_id:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
+    stage_started = time.monotonic()
     data = await _poll_task(base_url, task_id)
+    status = str(data.get("state") or "unknown")
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.task_poll_until_terminal",
+        start=stage_started,
+        task_id=task_id,
+        terminal_state=status,
+    )
+    stage_started = time.monotonic()
     display = await _display_envelope(body=body, data=data)
+    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.display_envelope", start=stage_started)
     cache_key = None if body.private_mode else _cache_key(
         query=query,
         depth=body.depth,
         markdown=display["summary_markdown"],
     )
+    stage_started = time.monotonic()
     purge = await _purge_task(base_url, task_id) if body.private_mode else None
-    status = str(data.get("state") or "unknown")
+    if body.private_mode:
+        _timeline_span(timeline, origin=timeline_origin, stage="blueprints.private_task_purge", start=stage_started)
+    adapter_diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+    total_ms = _elapsed_ms(timeline_origin)
     return {
         "ok": status in {"succeeded", "partial"},
         "query": query,
@@ -967,7 +1021,14 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
                 "warning_count": len(display["warnings"]),
                 "searxng_profile": searxng_profile,
                 "purged": purge if body.private_mode else None,
-            }
+            },
+            "timing": {
+                "total_ms": total_ms,
+                "blueprints_stages": timeline,
+                "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
+                "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
+                "adapter_stages": adapter_diagnostics.get("timeline") if isinstance(adapter_diagnostics.get("timeline"), list) else [],
+            },
         },
         "cache_key": cache_key,
     }
@@ -975,16 +1036,21 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
 
 @router.post("/query-prompt", response_model=dict)
 async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, Any]:
+    timeline_origin = time.monotonic()
+    timeline: list[dict[str, Any]] = []
     prompt = _text(body.prompt, 4000)
     _validate_public_query(prompt)
     query_source = body.query or prompt
+    stage_started = time.monotonic()
     query = await _normalize_web_research_query(query_source)
+    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.query_normalization", start=stage_started)
     _validate_public_query(query)
 
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
     searxng_profile = _searxng_profile(body.searxng_profile)
+    stage_started = time.monotonic()
     submitted = await _submit_task(
         base_url,
         _task_payload(
@@ -996,10 +1062,28 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
             searxng_profile=searxng_profile,
         ),
     )
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.task_submit",
+        start=stage_started,
+        task_id=submitted.get("id"),
+    )
     task_id = str(submitted.get("id") or "").strip()
     if not task_id:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
+    stage_started = time.monotonic()
     data = await _poll_task(base_url, task_id)
+    status = str(data.get("state") or "unknown")
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.task_poll_until_terminal",
+        start=stage_started,
+        task_id=task_id,
+        terminal_state=status,
+    )
+    stage_started = time.monotonic()
     display = await _display_envelope(
         body=WebResearchQueryBody(
             query=query,
@@ -1009,13 +1093,18 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
         ),
         data=data,
     )
+    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.display_envelope", start=stage_started)
     cache_key = None if body.private_mode else _cache_key(
         query=query,
         depth=body.depth,
         markdown=display["summary_markdown"],
     )
+    stage_started = time.monotonic()
     purge = await _purge_task(base_url, task_id) if body.private_mode else None
-    status = str(data.get("state") or "unknown")
+    if body.private_mode:
+        _timeline_span(timeline, origin=timeline_origin, stage="blueprints.private_task_purge", start=stage_started)
+    adapter_diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+    total_ms = _elapsed_ms(timeline_origin)
     return {
         "ok": status in {"succeeded", "partial"},
         "query": query,
@@ -1038,7 +1127,14 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
                 "warning_count": len(display["warnings"]),
                 "searxng_profile": searxng_profile,
                 "purged": purge if body.private_mode else None,
-            }
+            },
+            "timing": {
+                "total_ms": total_ms,
+                "blueprints_stages": timeline,
+                "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
+                "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
+                "adapter_stages": adapter_diagnostics.get("timeline") if isinstance(adapter_diagnostics.get("timeline"), list) else [],
+            },
         },
         "cache_key": cache_key,
     }
