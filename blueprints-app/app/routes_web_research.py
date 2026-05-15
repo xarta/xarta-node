@@ -128,12 +128,14 @@ Rules:
 
 
 Depth = Literal["quick", "standard", "deep"]
+SearxngProfile = Literal["vpn", "bridge"]
 
 
 class WebResearchQueryBody(BaseModel):
     query: str = Field(..., min_length=1, max_length=300)
     depth: Depth = "standard"
     private_mode: bool = False
+    searxng_profile: SearxngProfile | None = None
 
 
 class WebResearchPromptBody(BaseModel):
@@ -141,6 +143,7 @@ class WebResearchPromptBody(BaseModel):
     query: str | None = Field(default=None, max_length=300)
     depth: Depth = "standard"
     private_mode: bool = False
+    searxng_profile: SearxngProfile | None = None
 
 
 class WebResearchSpeechBody(BaseModel):
@@ -163,6 +166,44 @@ def _timeout_seconds() -> float:
         return max(5.0, min(180.0, float(raw)))
     except ValueError:
         return _DEFAULT_TIMEOUT_SECONDS
+
+
+def _default_searxng_profile() -> SearxngProfile:
+    raw = (os.environ.get("WEB_RESEARCH_SEARXNG_PROFILE") or "vpn").strip().lower()
+    aliases = {
+        "default": "vpn",
+        "vlan99": "vpn",
+        "nordvpn": "vpn",
+        "vpn": "vpn",
+        "vps": "bridge",
+        "xarta": "bridge",
+        "xarta-tech": "bridge",
+        "xarta_tech": "bridge",
+        "bridge": "bridge",
+    }
+    value = aliases.get(raw, raw)
+    return "bridge" if value == "bridge" else "vpn"
+
+
+def _searxng_profile(value: str | None) -> SearxngProfile:
+    if value is None:
+        return _default_searxng_profile()
+    raw = value.strip().lower()
+    aliases = {
+        "default": _default_searxng_profile(),
+        "vlan99": "vpn",
+        "nordvpn": "vpn",
+        "vpn": "vpn",
+        "vps": "bridge",
+        "xarta": "bridge",
+        "xarta-tech": "bridge",
+        "xarta_tech": "bridge",
+        "bridge": "bridge",
+    }
+    resolved = aliases.get(raw)
+    if resolved not in {"vpn", "bridge"}:
+        raise HTTPException(400, "searxng_profile must be vpn or bridge")
+    return "bridge" if resolved == "bridge" else "vpn"
 
 
 def _web_research_env_int(name: str, default: int, minimum: int = 0, maximum: int = 250000) -> int:
@@ -806,6 +847,7 @@ def _task_payload(
     *,
     objective: str | None = None,
     seed_terms: list[str] | None = None,
+    searxng_profile: str | None = None,
 ) -> dict[str, Any]:
     policy = dict(_DEPTH_POLICIES.get(depth, _DEPTH_POLICIES["standard"]))
     policy.update(
@@ -813,6 +855,7 @@ def _task_payload(
             "require_citations": True,
             "require_vlan99_diagnostics": True,
             "allowed_schemes": ["https", "http"],
+            "searxng_profile": _searxng_profile(searxng_profile),
         }
     )
     task_objective = _text(objective or query, 4000)
@@ -885,7 +928,11 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
-    submitted = await _submit_task(base_url, _task_payload(query, body.depth, body.private_mode))
+    searxng_profile = _searxng_profile(body.searxng_profile)
+    submitted = await _submit_task(
+        base_url,
+        _task_payload(query, body.depth, body.private_mode, searxng_profile=searxng_profile),
+    )
     task_id = str(submitted.get("id") or "").strip()
     if not task_id:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
@@ -903,6 +950,7 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
         "query": query,
         "depth": body.depth,
         "private_mode": body.private_mode,
+        "searxng_profile": searxng_profile,
         "status": status,
         "display": display,
         "raw": {
@@ -917,6 +965,7 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
                 ),
                 "source_count": len(display["source_items"]),
                 "warning_count": len(display["warnings"]),
+                "searxng_profile": searxng_profile,
                 "purged": purge if body.private_mode else None,
             }
         },
@@ -935,6 +984,7 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
+    searxng_profile = _searxng_profile(body.searxng_profile)
     submitted = await _submit_task(
         base_url,
         _task_payload(
@@ -943,6 +993,7 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
             body.private_mode,
             objective=prompt,
             seed_terms=[],
+            searxng_profile=searxng_profile,
         ),
     )
     task_id = str(submitted.get("id") or "").strip()
@@ -950,7 +1001,12 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
     data = await _poll_task(base_url, task_id)
     display = await _display_envelope(
-        body=WebResearchQueryBody(query=query, depth=body.depth, private_mode=body.private_mode),
+        body=WebResearchQueryBody(
+            query=query,
+            depth=body.depth,
+            private_mode=body.private_mode,
+            searxng_profile=searxng_profile,
+        ),
         data=data,
     )
     cache_key = None if body.private_mode else _cache_key(
@@ -965,6 +1021,7 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
         "query": query,
         "depth": body.depth,
         "private_mode": body.private_mode,
+        "searxng_profile": searxng_profile,
         "status": status,
         "display": display,
         "raw": {
@@ -979,6 +1036,7 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
                 ),
                 "source_count": len(display["source_items"]),
                 "warning_count": len(display["warnings"]),
+                "searxng_profile": searxng_profile,
                 "purged": purge if body.private_mode else None,
             }
         },
