@@ -40,23 +40,23 @@ _DEPTH_POLICIES = {
     "quick": {
         "max_runtime_seconds": 90,
         "max_search_queries": 2,
-        "max_search_results": 3,
+        "max_search_results": 5,
         "max_fetches": 2,
-        "max_source_chars": 6000,
+        "max_source_chars": 9000,
     },
     "standard": {
         "max_runtime_seconds": 120,
-        "max_search_queries": 3,
-        "max_search_results": 5,
-        "max_fetches": 3,
-        "max_source_chars": 9000,
+        "max_search_queries": 4,
+        "max_search_results": 8,
+        "max_fetches": 4,
+        "max_source_chars": 16000,
     },
     "deep": {
         "max_runtime_seconds": 170,
-        "max_search_queries": 5,
-        "max_search_results": 5,
-        "max_fetches": 4,
-        "max_source_chars": 12000,
+        "max_search_queries": 6,
+        "max_search_results": 10,
+        "max_fetches": 6,
+        "max_source_chars": 24000,
     },
 }
 _PRIVATE_TARGET_RE = re.compile(
@@ -132,6 +132,13 @@ Depth = Literal["quick", "standard", "deep"]
 
 class WebResearchQueryBody(BaseModel):
     query: str = Field(..., min_length=1, max_length=300)
+    depth: Depth = "standard"
+    private_mode: bool = False
+
+
+class WebResearchPromptBody(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=4000)
+    query: str | None = Field(default=None, max_length=300)
     depth: Depth = "standard"
     private_mode: bool = False
 
@@ -792,7 +799,14 @@ async def web_research_privacy_doc() -> dict[str, Any]:
     }
 
 
-def _task_payload(query: str, depth: str, private_mode: bool = False) -> dict[str, Any]:
+def _task_payload(
+    query: str,
+    depth: str,
+    private_mode: bool = False,
+    *,
+    objective: str | None = None,
+    seed_terms: list[str] | None = None,
+) -> dict[str, Any]:
     policy = dict(_DEPTH_POLICIES.get(depth, _DEPTH_POLICIES["standard"]))
     policy.update(
         {
@@ -801,15 +815,16 @@ def _task_payload(query: str, depth: str, private_mode: bool = False) -> dict[st
             "allowed_schemes": ["https", "http"],
         }
     )
+    task_objective = _text(objective or query, 4000)
     return {
         "task_type": "web_research",
-        "objective": query,
+        "objective": task_objective,
         "research_profile": "public_web",
         "private_mode": bool(private_mode),
         "inputs": {
             "query": query,
             "urls": [],
-            "seed_terms": [],
+            "seed_terms": seed_terms or [],
         },
         "policy": policy,
         "notification": {
@@ -876,6 +891,68 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
         raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
     data = await _poll_task(base_url, task_id)
     display = await _display_envelope(body=body, data=data)
+    cache_key = None if body.private_mode else _cache_key(
+        query=query,
+        depth=body.depth,
+        markdown=display["summary_markdown"],
+    )
+    purge = await _purge_task(base_url, task_id) if body.private_mode else None
+    status = str(data.get("state") or "unknown")
+    return {
+        "ok": status in {"succeeded", "partial"},
+        "query": query,
+        "depth": body.depth,
+        "private_mode": body.private_mode,
+        "status": status,
+        "display": display,
+        "raw": {
+            "adapter": {
+                "task_id": task_id,
+                "state": status,
+                "progress": data.get("progress") if isinstance(data.get("progress"), dict) else {},
+                "diagnostics_summary": (
+                    data.get("diagnostics", {}).get("summary")
+                    if isinstance(data.get("diagnostics"), dict)
+                    else {}
+                ),
+                "source_count": len(display["source_items"]),
+                "warning_count": len(display["warnings"]),
+                "purged": purge if body.private_mode else None,
+            }
+        },
+        "cache_key": cache_key,
+    }
+
+
+@router.post("/query-prompt", response_model=dict)
+async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, Any]:
+    prompt = _text(body.prompt, 4000)
+    _validate_public_query(prompt)
+    query_source = body.query or prompt
+    query = await _normalize_web_research_query(query_source)
+    _validate_public_query(query)
+
+    base_url = _adapter_url()
+    if not base_url:
+        raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
+    submitted = await _submit_task(
+        base_url,
+        _task_payload(
+            query,
+            body.depth,
+            body.private_mode,
+            objective=prompt,
+            seed_terms=[],
+        ),
+    )
+    task_id = str(submitted.get("id") or "").strip()
+    if not task_id:
+        raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
+    data = await _poll_task(base_url, task_id)
+    display = await _display_envelope(
+        body=WebResearchQueryBody(query=query, depth=body.depth, private_mode=body.private_mode),
+        data=data,
+    )
     cache_key = None if body.private_mode else _cache_key(
         query=query,
         depth=body.depth,
