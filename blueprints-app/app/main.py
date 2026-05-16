@@ -41,6 +41,7 @@ from .routes_bookmarks import router as bookmarks_router
 from .routes_caddy_configs import router as caddy_configs_router
 from .routes_certs import router as certs_router
 from .routes_crawl4ai import router as crawl4ai_router
+from .routes_dashboard_auth import router as dashboard_auth_router
 from .routes_doc_groups import router as doc_groups_router
 from .routes_doc_images import router as doc_images_router
 from .routes_dockge_stacks import router as dockge_stacks_router
@@ -371,6 +372,7 @@ def create_app() -> FastAPI:
     application.include_router(todo_router, prefix="/api/v1")
     application.include_router(docs_router, prefix="/api/v1")
     application.include_router(web_research_router, prefix="/api/v1")
+    application.include_router(dashboard_auth_router, prefix="/api/v1")
     application.include_router(help_router, prefix="/api/v1")
     application.include_router(doc_groups_router, prefix="/api/v1")
     application.include_router(doc_images_router, prefix="/api/v1")
