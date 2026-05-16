@@ -84,6 +84,19 @@ class EventOut(BaseModel):
         return f"id:{self.event_id}\ndata:{json.dumps(self.model_dump())}\n\n"
 
 
+def _event_out(event: AppEvent) -> EventOut:
+    return EventOut(
+        event_id=event.event_id,
+        event_type=event.event_type,
+        severity=event.severity,
+        title=event.title,
+        message=event.message,
+        source=event.source,
+        created_at=event.created_at,
+        payload=event.payload,
+    )
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 
@@ -273,15 +286,16 @@ async def create_event(body: EventIn) -> EventOut:
         payload=body.payload or {},
         event_id=body.event_id,
     )
+    return await publish_event(event)
+
+
+async def publish_event(event: AppEvent) -> EventOut:
+    """Persist and fan out an app event.
+
+    Background monitors use this helper so their events behave exactly like
+    loopback-posted events: they are stored in recent history and delivered to
+    every live SSE subscriber.
+    """
     _persist(event)
     await bus.publish(event)
-    return EventOut(
-        event_id=event.event_id,
-        event_type=event.event_type,
-        severity=event.severity,
-        title=event.title,
-        message=event.message,
-        source=event.source,
-        created_at=event.created_at,
-        payload=event.payload,
-    )
+    return _event_out(event)

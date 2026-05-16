@@ -89,6 +89,7 @@ from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
 from .sync.drain import start_drain_loop, stop_drain_loop
 from .sync.queue import enqueue_for_all_peers
 from .sync.restore import apply_restore
+from .system_memory_monitor import run_memory_monitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +118,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     boot_catchup_task: asyncio.Task | None = None
     seeded_vlans_task: asyncio.Task | None = None
+    memory_monitor_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -152,6 +154,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Enqueue any vlans rows that were seeded locally but not yet distributed
     seeded_vlans_task = asyncio.create_task(_enqueue_seeded_vlans())
 
+    # Low-overhead RAM warnings for any open web/PWA clients listening on SSE.
+    memory_monitor_task = asyncio.create_task(run_memory_monitor())
+
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
@@ -160,6 +165,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await events_bus.close_all()
     await _cancel_background_task(boot_catchup_task, "boot_catchup")
     await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
+    await _cancel_background_task(memory_monitor_task, "memory_monitor")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 
