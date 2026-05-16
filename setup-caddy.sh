@@ -491,6 +491,70 @@ else
     echo "    Skipped code-server block (CODE_SERVER not set in .env)"
 fi
 
+# ── Hermes Local dashboard block ────────────────────────────────────────────
+# The dashboard process binds to loopback only. Caddy exposes it on a private
+# infra hostname for local/RFC1918/tailnet clients and preserves Hermes'
+# localhost host-header expectation.
+HERMES_LOCAL_DASHBOARD_EXPOSE="${HERMES_LOCAL_DASHBOARD_EXPOSE:-0}"
+if [[ "$HERMES_LOCAL_DASHBOARD_EXPOSE" == "1" || "$HERMES_LOCAL_DASHBOARD_EXPOSE" == "true" ]]; then
+    if [[ -z "${HERMES_LOCAL_DASHBOARD_HOSTNAME:-}" || -z "${HERMES_LOCAL_DASHBOARD_UPSTREAM:-}" ]]; then
+        echo "    Skipped Hermes Local dashboard block (hostname/upstream not set)"
+    else
+    cat >> "$CADDYFILE" <<CADDY_HERMES_LOCAL
+
+# Hermes Local dashboard — privileged local agent UI.
+# Backend binds to loopback only; Caddy exposes it on the private HTTPS entrypoint.
+https://${HERMES_LOCAL_DASHBOARD_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${HERMES_LOCAL_DASHBOARD_UPSTREAM} {
+            header_up Host localhost
+            transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${HERMES_LOCAL_DASHBOARD_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_HERMES_LOCAL
+    if [[ -n "${HERMES_LOCAL_DASHBOARD_ALIASES:-}" ]]; then
+        IFS=',' read -ra HERMES_ALIASES <<< "$HERMES_LOCAL_DASHBOARD_ALIASES"
+        for alias in "${HERMES_ALIASES[@]}"; do
+            alias="${alias// /}"
+            [[ -z "$alias" || "$alias" == "$HERMES_LOCAL_DASHBOARD_HOSTNAME" ]] && continue
+            cat >> "$CADDYFILE" <<CADDY_HERMES_ALIAS
+
+# Hermes Local dashboard alias — redirect to preferred per-node hostname.
+https://${alias} {
+    tls ${CERT_FILE} ${CERT_KEY}
+    redir https://${HERMES_LOCAL_DASHBOARD_HOSTNAME}{uri} permanent
+}
+
+http://${alias} {
+    redir https://${HERMES_LOCAL_DASHBOARD_HOSTNAME}{uri} permanent
+}
+CADDY_HERMES_ALIAS
+            echo "    Appended Hermes Local dashboard alias (https://${alias} -> https://${HERMES_LOCAL_DASHBOARD_HOSTNAME})"
+        done
+    fi
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended Hermes Local dashboard block (https://${HERMES_LOCAL_DASHBOARD_HOSTNAME} -> ${HERMES_LOCAL_DASHBOARD_UPSTREAM})"
+    fi
+else
+    echo "    Skipped Hermes Local dashboard block (HERMES_LOCAL_DASHBOARD_EXPOSE not enabled)"
+fi
+
 # ── Optional remote SearXNG block ────────────────────────────────────────────
 # Site-specific hostnames and bridge-service addresses live in ignored/private
 # config. The public script only appends this block when both values are set.
