@@ -156,6 +156,21 @@ SYNC_SECRET: str = os.environ.get("BLUEPRINTS_SYNC_SECRET", "")
 # Set in .env, e.g.: BLUEPRINTS_ALLOWED_NETWORKS=192.168.x.0/24,100.64.0.0/10
 ALLOWED_NETWORKS_RAW: str = os.environ.get("BLUEPRINTS_ALLOWED_NETWORKS", "")
 
+# Browser sessions issued by Blueprints for privileged dashboard hostnames
+# that are protected by Caddy forward_auth.  The cookie domain is node-local
+# configuration so public source does not carry private infrastructure names.
+DASHBOARD_AUTH_COOKIE_DOMAIN: str = os.environ.get(
+    "BLUEPRINTS_DASHBOARD_AUTH_COOKIE_DOMAIN",
+    "",
+).strip()
+DASHBOARD_AUTH_SESSION_SECONDS: int = int(
+    os.environ.get("BLUEPRINTS_DASHBOARD_AUTH_SESSION_SECONDS", "3600")
+)
+DASHBOARD_AUTH_LOGIN_URL: str = os.environ.get(
+    "BLUEPRINTS_DASHBOARD_AUTH_LOGIN_URL",
+    "",
+).strip()
+
 # ── Network ───────────────────────────────────────────────────────────────────
 # Internal container port (always 8080 inside; host mapping is via Caddy)
 APP_PORT: int = 8080

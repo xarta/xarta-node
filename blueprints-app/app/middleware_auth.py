@@ -59,6 +59,7 @@ _TOKEN_EXEMPT_PATHS = frozenset(
         "/api/v1/web-research/privacy-doc",
         "/api/v1/web-research/query",
         "/api/v1/web-research/query-prompt",
+        "/api/v1/dashboard-auth/hermes-local/validate",
     }
 )
 # Routes that use SYNC_SECRET instead of API_SECRET

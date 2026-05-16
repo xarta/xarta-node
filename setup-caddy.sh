@@ -275,6 +275,34 @@ FALLBACK_CACHE_MODE="$(read_fallback_cache_mode "$FALLBACK_CACHE_STATE_FILE")"
 FALLBACK_ASSET_VERSION="$(compute_fallback_asset_version "$FALLBACK_CACHE_MODE" "$BLUEPRINTS_FALLBACK_GUI_DIR")"
 CODE_SERVER_HOSTNAME="${CODE_SERVER_HOSTNAME:-code.${UI_HOST}}"
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-8082}"
+SPLASH_RENDERER_UPSTREAM="${SPLASH_RENDERER_UPSTREAM:-}"
+MODEL_HOOK_UPSTREAM="${MODEL_HOOK_UPSTREAM:-}"
+MODEL_HOOK_HTTP_HOST="${MODEL_HOOK_HTTP_HOST:-}"
+
+MAIN_SITE_EXTRA_HANDLES=""
+if [[ -n "$SPLASH_RENDERER_UPSTREAM" ]]; then
+    MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
+    # Splash renderer - node-local Pretext-powered ASCII splash pages.
+    # handle_path strips /splash-renderer before proxying to the stack.
+    redir /splash-renderer /splash-renderer/ permanent
+    handle_path /splash-renderer* {
+        reverse_proxy ${SPLASH_RENDERER_UPSTREAM}
+    }
+"
+fi
+if [[ -n "$MODEL_HOOK_UPSTREAM" ]]; then
+    MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
+    # LiteLLM model-hook listener for the node-local sync skill.
+    # Exposed on the existing node HTTP entrypoint so the hook host does not
+    # need direct access to the raw listener port.
+    handle /xarta/health* {
+        reverse_proxy ${MODEL_HOOK_UPSTREAM}
+    }
+    handle /xarta/webhook* {
+        reverse_proxy ${MODEL_HOOK_UPSTREAM}
+    }
+"
+fi
 
 if [[ "$FALLBACK_CACHE_MODE" == "development" ]]; then
     FALLBACK_ASSET_CACHE_HEADERS=$(cat <<'EOF'
@@ -399,6 +427,7 @@ ${FALLBACK_ASSET_CACHE_HEADERS}
     handle_path /searxng* {
         reverse_proxy localhost:18888
     }
+${MAIN_SITE_EXTRA_HANDLES}
 
     # Reverse proxy all traffic to the local uvicorn process.
     # Includes /health, /api/v1/*, and /ui/* (GUI + embed component).
@@ -412,6 +441,62 @@ ${HTTP_NAMES} {
 CADDY
 
 chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+
+if [[ -n "$MODEL_HOOK_UPSTREAM" && -n "$MODEL_HOOK_HTTP_HOST" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_MODEL_HOOK_HTTP
+
+# HTTP callback route for the xarta model-hook listener.
+# Some upstream hook callers can reach the node by direct IP even when DNS is unavailable.
+http://${MODEL_HOOK_HTTP_HOST} {
+    handle /xarta/health* {
+        reverse_proxy ${MODEL_HOOK_UPSTREAM}
+    }
+    handle /xarta/webhook* {
+        reverse_proxy ${MODEL_HOOK_UPSTREAM}
+    }
+    reverse_proxy localhost:8080
+}
+CADDY_MODEL_HOOK_HTTP
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended model-hook HTTP callback block (http://${MODEL_HOOK_HTTP_HOST} -> ${MODEL_HOOK_UPSTREAM})"
+fi
+
+if [[ -n "${MATRIX_SYNAPSE_HOSTNAME:-}" && -n "${MATRIX_SYNAPSE_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_MATRIX
+
+# Matrix Synapse client API for phone/agent messaging.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${MATRIX_SYNAPSE_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_client_well_known {
+        path /.well-known/matrix/client
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @matrix_client_well_known {
+        header Access-Control-Allow-Origin "*"
+        respond \`{"m.homeserver":{"base_url":"https://${MATRIX_SYNAPSE_HOSTNAME}"}}\` 200
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${MATRIX_SYNAPSE_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${MATRIX_SYNAPSE_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_MATRIX
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended Matrix Synapse block (https://${MATRIX_SYNAPSE_HOSTNAME} -> ${MATRIX_SYNAPSE_UPSTREAM})"
+fi
 
 # ── Vikunja work-memory block ────────────────────────────────────────────────
 # Backend binds to loopback only. Caddy exposes it on a private HTTPS hostname
@@ -491,6 +576,38 @@ else
     echo "    Skipped code-server block (CODE_SERVER not set in .env)"
 fi
 
+if [[ -n "${PAPERCLIP_HOSTNAME:-}" && -n "${PAPERCLIP_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_PAPERCLIP
+
+# Paperclip — private agent-company orchestration UI.
+# Backend binds to loopback only; Caddy exposes it on the private HTTPS entrypoint.
+https://${PAPERCLIP_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${PAPERCLIP_UPSTREAM} {
+            transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${PAPERCLIP_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_PAPERCLIP
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended Paperclip block (https://${PAPERCLIP_HOSTNAME} -> ${PAPERCLIP_UPSTREAM})"
+fi
+
 # ── Hermes Local dashboard block ────────────────────────────────────────────
 # The dashboard process binds to loopback only. Caddy exposes it on a private
 # infra hostname for local/RFC1918/tailnet clients and preserves Hermes'
@@ -512,6 +629,14 @@ https://${HERMES_LOCAL_DASHBOARD_HOSTNAME} {
     }
 
     handle @xarta_internal {
+        forward_auth 127.0.0.1:8080 {
+            uri /api/v1/dashboard-auth/hermes-local/validate
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Uri {uri}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Method {method}
+        }
+
         reverse_proxy ${HERMES_LOCAL_DASHBOARD_UPSTREAM} {
             header_up Host localhost
             transport http {
