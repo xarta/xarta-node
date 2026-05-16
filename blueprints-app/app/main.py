@@ -76,6 +76,7 @@ from .routes_services import router as services_router
 from .routes_settings import router as settings_router
 from .routes_ssh_targets import router as ssh_targets_router
 from .routes_ssh_terminal import router as ssh_terminal_router
+from .routes_ssh_terminal import run_terminal_process_reaper
 from .routes_sync import router as sync_router
 from .routes_table_layouts import router as table_layouts_router
 from .routes_todo import router as todo_router
@@ -119,6 +120,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     boot_catchup_task: asyncio.Task | None = None
     seeded_vlans_task: asyncio.Task | None = None
     memory_monitor_task: asyncio.Task | None = None
+    terminal_reaper_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -157,6 +159,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Low-overhead RAM warnings for any open web/PWA clients listening on SSE.
     memory_monitor_task = asyncio.create_task(run_memory_monitor())
 
+    # Sweep terminal child processes that survive websocket disconnect paths.
+    terminal_reaper_task = asyncio.create_task(run_terminal_process_reaper())
+
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
@@ -166,6 +171,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(boot_catchup_task, "boot_catchup")
     await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
     await _cancel_background_task(memory_monitor_task, "memory_monitor")
+    await _cancel_background_task(terminal_reaper_task, "terminal_process_reaper")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 

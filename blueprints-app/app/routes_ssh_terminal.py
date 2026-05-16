@@ -21,6 +21,7 @@ import signal
 import struct
 import subprocess
 import termios
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,7 +36,20 @@ router = APIRouter(prefix="/ssh-terminal", tags=["ssh-terminal"])
 _LOOPBACK = frozenset({"127.0.0.1", "::1"})
 _MAX_COLS = 240
 _MAX_ROWS = 80
-_ACTIVE_PROCESSES: dict[str, set[subprocess.Popen[bytes]]] = {}
+_ACTIVE_PROCESSES: dict[str, dict[int, "ActiveTerminalProcess"]] = {}
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default)) or default))
+    except ValueError:
+        log.warning("ssh-terminal: ignoring invalid %s=%r", name, os.getenv(name))
+        return default
+
+
+_REAPER_INTERVAL_SECS = _env_float("SSH_TERMINAL_REAPER_INTERVAL_SECS", 30.0, 5.0)
+_MAX_SESSION_SECS = _env_float("SSH_TERMINAL_MAX_SESSION_SECS", 21600.0, 60.0)
+_IDLE_SESSION_SECS = _env_float("SSH_TERMINAL_IDLE_SESSION_SECS", 7200.0, 60.0)
 
 
 @dataclass(frozen=True)
@@ -49,6 +63,18 @@ class TerminalTarget:
     enabled: bool = True
     menu_order: int = 100
     show_in_menu: bool = True
+
+
+@dataclass
+class ActiveTerminalProcess:
+    target_id: str
+    process: subprocess.Popen[bytes]
+    started_at: float
+    last_seen_at: float
+    client_ip: str
+
+    def mark_seen(self) -> None:
+        self.last_seen_at = time.monotonic()
 
 
 _TARGET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,80}$")
@@ -384,10 +410,10 @@ def _resize_pty(fd: int, cols: Any, rows: Any) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
 
 
-async def _send_output(websocket: WebSocket, fd: int, process: subprocess.Popen[bytes]) -> None:
+async def _send_output(websocket: WebSocket, fd: int, record: ActiveTerminalProcess) -> None:
     loop = asyncio.get_running_loop()
     while True:
-        if process.poll() is not None:
+        if record.process.poll() is not None:
             break
         try:
             data = await loop.run_in_executor(None, os.read, fd, 8192)
@@ -395,12 +421,14 @@ async def _send_output(websocket: WebSocket, fd: int, process: subprocess.Popen[
             break
         if not data:
             break
+        record.mark_seen()
         await websocket.send_text(data.decode("utf-8", errors="replace"))
 
 
-async def _receive_input(websocket: WebSocket, fd: int) -> None:
+async def _receive_input(websocket: WebSocket, fd: int, record: ActiveTerminalProcess) -> None:
     while True:
         message = await websocket.receive_text()
+        record.mark_seen()
         try:
             payload = json.loads(message)
         except json.JSONDecodeError:
@@ -428,28 +456,105 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=2)
 
 
-def _register_process(target_id: str, process: subprocess.Popen[bytes]) -> None:
-    _ACTIVE_PROCESSES.setdefault(target_id, set()).add(process)
+def _register_process(target_id: str, process: subprocess.Popen[bytes], client_ip: str) -> ActiveTerminalProcess:
+    now = time.monotonic()
+    record = ActiveTerminalProcess(
+        target_id=target_id,
+        process=process,
+        started_at=now,
+        last_seen_at=now,
+        client_ip=client_ip,
+    )
+    _ACTIVE_PROCESSES.setdefault(target_id, {})[process.pid] = record
+    return record
 
 
 def _unregister_process(target_id: str, process: subprocess.Popen[bytes]) -> None:
     processes = _ACTIVE_PROCESSES.get(target_id)
     if not processes:
         return
-    processes.discard(process)
+    processes.pop(process.pid, None)
     if not processes:
         _ACTIVE_PROCESSES.pop(target_id, None)
 
 
 def _terminate_target_processes(target_id: str) -> int:
-    processes = list(_ACTIVE_PROCESSES.get(target_id, set()))
+    processes = list(_ACTIVE_PROCESSES.get(target_id, {}).values())
     stopped = 0
-    for process in processes:
+    for record in processes:
+        process = record.process
         if process.poll() is None:
             _terminate_process(process)
             stopped += 1
         _unregister_process(target_id, process)
     return stopped
+
+
+def _active_process_payload(now: float | None = None) -> list[dict[str, int | str | float]]:
+    now = time.monotonic() if now is None else now
+    payload: list[dict[str, int | str | float]] = []
+    for target_id, records in _ACTIVE_PROCESSES.items():
+        for record in records.values():
+            payload.append({
+                "target_id": target_id,
+                "pid": record.process.pid,
+                "client_ip": record.client_ip,
+                "age_secs": round(now - record.started_at, 3),
+                "idle_secs": round(now - record.last_seen_at, 3),
+            })
+    return payload
+
+
+def _reap_terminal_processes() -> int:
+    now = time.monotonic()
+    stopped = 0
+    for target_id, records in list(_ACTIVE_PROCESSES.items()):
+        for record in list(records.values()):
+            process = record.process
+            age = now - record.started_at
+            idle = now - record.last_seen_at
+            reason = ""
+            if process.poll() is not None:
+                reason = "exited"
+            elif age >= _MAX_SESSION_SECS:
+                reason = f"age>{_MAX_SESSION_SECS:.0f}s"
+            elif idle >= _IDLE_SESSION_SECS:
+                reason = f"idle>{_IDLE_SESSION_SECS:.0f}s"
+
+            if not reason:
+                continue
+            if process.poll() is None:
+                log.warning(
+                    "ssh-terminal: reaping %s pid=%s client=%s reason=%s",
+                    target_id,
+                    process.pid,
+                    record.client_ip,
+                    reason,
+                )
+                _terminate_process(process)
+                stopped += 1
+            _unregister_process(target_id, process)
+    return stopped
+
+
+async def run_terminal_process_reaper() -> None:
+    log.info(
+        "ssh-terminal reaper started: interval=%.1fs idle=%.0fs max_age=%.0fs",
+        _REAPER_INTERVAL_SECS,
+        _IDLE_SESSION_SECS,
+        _MAX_SESSION_SECS,
+    )
+    try:
+        while True:
+            await asyncio.sleep(_REAPER_INTERVAL_SECS)
+            _reap_terminal_processes()
+    except asyncio.CancelledError:
+        stopped = 0
+        for target_id in list(_ACTIVE_PROCESSES):
+            stopped += _terminate_target_processes(target_id)
+        if stopped:
+            log.info("ssh-terminal reaper stopped %d active terminal process(es) during shutdown", stopped)
+        raise
 
 
 @router.get("/targets")
@@ -476,6 +581,23 @@ async def disconnect_terminal_target(target_id: str) -> dict[str, int | str | bo
         raise HTTPException(404, f"Unknown terminal target: {target_id}")
     stopped = _terminate_target_processes(target_id)
     return {"ok": True, "target_id": target_id, "stopped": stopped}
+
+
+@router.get("/processes")
+async def list_terminal_processes() -> dict[str, Any]:
+    """Expose a small operational view for detecting leaked terminal children."""
+    now = time.monotonic()
+    processes = _active_process_payload(now)
+    return {
+        "ok": True,
+        "count": len(processes),
+        "processes": processes,
+        "reaper": {
+            "interval_secs": _REAPER_INTERVAL_SECS,
+            "idle_session_secs": _IDLE_SESSION_SECS,
+            "max_session_secs": _MAX_SESSION_SECS,
+        },
+    }
 
 
 @router.websocket("/ws")
@@ -530,11 +652,11 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         close_fds=True,
         preexec_fn=_prepare_child,
     )
-    _register_process(target.target_id, process)
+    record = _register_process(target.target_id, process, client_ip)
     os.close(slave_fd)
 
-    output_task = asyncio.create_task(_send_output(websocket, master_fd, process))
-    input_task = asyncio.create_task(_receive_input(websocket, master_fd))
+    output_task = asyncio.create_task(_send_output(websocket, master_fd, record))
+    input_task = asyncio.create_task(_receive_input(websocket, master_fd, record))
     try:
         done, pending = await asyncio.wait(
             {output_task, input_task},
