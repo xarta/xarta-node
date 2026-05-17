@@ -680,6 +680,79 @@ else
     echo "    Skipped Hermes Local dashboard block (HERMES_LOCAL_DASHBOARD_EXPOSE not enabled)"
 fi
 
+# ── Hermes VPS dashboard block ──────────────────────────────────────────────
+# The VPS dashboard is reached over a private bridge/proxy path. Caddy remains
+# the browser-facing boundary and validates a separate Blueprints dashboard
+# session before proxying any Hermes HTML.
+HERMES_VPS_DASHBOARD_EXPOSE="${HERMES_VPS_DASHBOARD_EXPOSE:-0}"
+if [[ "$HERMES_VPS_DASHBOARD_EXPOSE" == "1" || "$HERMES_VPS_DASHBOARD_EXPOSE" == "true" ]]; then
+    if [[ -z "${HERMES_VPS_DASHBOARD_HOSTNAME:-}" || -z "${HERMES_VPS_DASHBOARD_UPSTREAM:-}" ]]; then
+        echo "    Skipped Hermes VPS dashboard block (hostname/upstream not set)"
+    else
+    HERMES_VPS_DASHBOARD_HOST_HEADER="${HERMES_VPS_DASHBOARD_HOST_HEADER:-${HERMES_VPS_DASHBOARD_UPSTREAM%%:*}}"
+    cat >> "$CADDYFILE" <<CADDY_HERMES_VPS
+
+# Hermes VPS dashboard — private remote agent UI.
+# Browser access is gated by Blueprints dashboard-auth before proxying upstream.
+https://${HERMES_VPS_DASHBOARD_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        forward_auth 127.0.0.1:8080 {
+            uri /api/v1/dashboard-auth/hermes-vps/validate
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Uri {uri}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Method {method}
+        }
+
+        reverse_proxy ${HERMES_VPS_DASHBOARD_UPSTREAM} {
+            header_up Host ${HERMES_VPS_DASHBOARD_HOST_HEADER}
+            transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${HERMES_VPS_DASHBOARD_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_HERMES_VPS
+    if [[ -n "${HERMES_VPS_DASHBOARD_ALIASES:-}" ]]; then
+        IFS=',' read -ra HERMES_VPS_ALIASES <<< "$HERMES_VPS_DASHBOARD_ALIASES"
+        for alias in "${HERMES_VPS_ALIASES[@]}"; do
+            alias="${alias// /}"
+            [[ -z "$alias" || "$alias" == "$HERMES_VPS_DASHBOARD_HOSTNAME" ]] && continue
+            cat >> "$CADDYFILE" <<CADDY_HERMES_VPS_ALIAS
+
+# Hermes VPS dashboard alias — redirect to preferred hostname.
+https://${alias} {
+    tls ${CERT_FILE} ${CERT_KEY}
+    redir https://${HERMES_VPS_DASHBOARD_HOSTNAME}{uri} permanent
+}
+
+http://${alias} {
+    redir https://${HERMES_VPS_DASHBOARD_HOSTNAME}{uri} permanent
+}
+CADDY_HERMES_VPS_ALIAS
+            echo "    Appended Hermes VPS dashboard alias (https://${alias} -> https://${HERMES_VPS_DASHBOARD_HOSTNAME})"
+        done
+    fi
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended Hermes VPS dashboard block (https://${HERMES_VPS_DASHBOARD_HOSTNAME} -> ${HERMES_VPS_DASHBOARD_UPSTREAM})"
+    fi
+else
+    echo "    Skipped Hermes VPS dashboard block (HERMES_VPS_DASHBOARD_EXPOSE not enabled)"
+fi
+
 # ── Optional remote SearXNG block ────────────────────────────────────────────
 # Site-specific hostnames and bridge-service addresses live in ignored/private
 # config. The public script only appends this block when both values are set.
