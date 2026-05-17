@@ -668,6 +668,78 @@ class ManualLinkOut(BaseModel):
     updated_at: str
 
 
+class ManualLinkCategoryCreate(BaseModel):
+    label: str
+    icon: Optional[str] = None
+    parent_category_id: Optional[str] = None
+    sort_order: Optional[int] = 0
+    show_panel: Optional[int] = 0
+    panel_color: Optional[str] = None
+    panel_background: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ManualLinkCategoryUpdate(BaseModel):
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    parent_category_id: Optional[str] = None
+    sort_order: Optional[int] = None
+    show_panel: Optional[int] = None
+    panel_color: Optional[str] = None
+    panel_background: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ManualLinkCategoryOut(BaseModel):
+    category_id: str
+    label: str
+    icon: Optional[str] = None
+    parent_category_id: Optional[str] = None
+    sort_order: int = 0
+    show_panel: int = 0
+    panel_color: Optional[str] = None
+    panel_background: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ManualLinkCategoryItemCreate(BaseModel):
+    category_id: str
+    link_id: str
+    parent_mapping_id: Optional[str] = None
+    sort_order: Optional[int] = 0
+    label_override: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ManualLinkCategoryItemUpdate(BaseModel):
+    category_id: Optional[str] = None
+    link_id: Optional[str] = None
+    parent_mapping_id: Optional[str] = None
+    sort_order: Optional[int] = None
+    label_override: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ManualLinkCategoryItemOut(BaseModel):
+    mapping_id: str
+    category_id: str
+    link_id: str
+    parent_mapping_id: Optional[str] = None
+    sort_order: int = 0
+    label_override: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str
+    updated_at: str
+    link: Optional[ManualLinkOut] = None
+
+
+class ManualLinkCategoryPayload(BaseModel):
+    categories: list[ManualLinkCategoryOut]
+    items: list[ManualLinkCategoryItemOut]
+
+
 # ── SSH Targets ───────────────────────────────────────────────────────────────
 
 

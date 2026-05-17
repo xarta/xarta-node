@@ -306,6 +306,38 @@ CREATE INDEX IF NOT EXISTS idx_manual_links_group  ON manual_links(group_name);
 CREATE INDEX IF NOT EXISTS idx_manual_links_parent ON manual_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_manual_links_sort   ON manual_links(sort_order);
 
+CREATE TABLE IF NOT EXISTS manual_link_categories (
+    category_id        TEXT PRIMARY KEY,
+    label              TEXT NOT NULL,
+    icon               TEXT,
+    parent_category_id TEXT,
+    sort_order         INTEGER DEFAULT 0,
+    show_panel         INTEGER DEFAULT 0,
+    panel_color        TEXT,
+    panel_background   TEXT,
+    notes              TEXT,
+    created_at         TEXT DEFAULT (datetime('now')),
+    updated_at         TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_manual_link_categories_parent
+    ON manual_link_categories(parent_category_id, sort_order, label);
+
+CREATE TABLE IF NOT EXISTS manual_link_category_items (
+    mapping_id  TEXT PRIMARY KEY,
+    category_id TEXT NOT NULL,
+    link_id     TEXT NOT NULL,
+    parent_mapping_id TEXT,
+    sort_order  INTEGER DEFAULT 0,
+    label_override TEXT,
+    notes       TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_manual_link_category_items_category
+    ON manual_link_category_items(category_id, sort_order);
+CREATE INDEX IF NOT EXISTS idx_manual_link_category_items_link
+    ON manual_link_category_items(link_id);
+
 CREATE TABLE IF NOT EXISTS doc_groups (
     group_id    TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -1008,6 +1040,12 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("form_controls", "sound_asset_off", "TEXT"),
         # embed_menu_items: multi-context support — embed / fallback-ui / db (2026-04-07)
         ("embed_menu_items", "menu_context", "TEXT NOT NULL DEFAULT 'embed'"),
+        # manual_link_category_items: mapping-level hierarchy for Page 4 positions (2026-05-17)
+        ("manual_link_category_items", "parent_mapping_id", "TEXT"),
+        # manual_link_categories: optional Interface panel presentation (2026-05-17)
+        ("manual_link_categories", "show_panel", "INTEGER DEFAULT 0"),
+        ("manual_link_categories", "panel_color", "TEXT"),
+        ("manual_link_categories", "panel_background", "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -1017,6 +1055,41 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         if column not in existing_cols[table]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
             log.info("migration: added column %s.%s", table, column)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_manual_link_category_items_parent "
+        "ON manual_link_category_items(parent_mapping_id)"
+    )
+
+
+def _backfill_manual_link_category_item_parents(conn: sqlite3.Connection) -> None:
+    marker = "manual_link_category_item_parent_backfill_2026_05_17"
+    done = conn.execute("SELECT value FROM sync_meta WHERE key=?", (marker,)).fetchone()
+    if done:
+        return
+    rows = conn.execute(
+        """
+        SELECT m.mapping_id, m.category_id, l.parent_id
+        FROM manual_link_category_items m
+        JOIN manual_links l ON l.link_id = m.link_id
+        WHERE m.parent_mapping_id IS NULL AND l.parent_id IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        parent = conn.execute(
+            """
+            SELECT mapping_id FROM manual_link_category_items
+            WHERE category_id=? AND link_id=?
+            ORDER BY sort_order, mapping_id
+            LIMIT 1
+            """,
+            (row[1], row[2]),
+        ).fetchone()
+        if parent:
+            conn.execute(
+                "UPDATE manual_link_category_items SET parent_mapping_id=? WHERE mapping_id=?",
+                (parent[0], row[0]),
+            )
+    conn.execute("INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, datetime('now'))", (marker,))
 
 
 def _backfill_visit_events(conn: sqlite3.Connection) -> None:
@@ -1159,6 +1232,130 @@ def _seed_table_layout_catalog(conn: sqlite3.Connection) -> None:
         )
 
 
+def _seed_manual_links_ai_assignment(conn: sqlite3.Connection) -> None:
+    """Ensure Manual Links URL intake has a DB-backed local LLM assignment.
+
+    This is intentionally insert-only. If the DB already has any enabled
+    manual-links LLM assignment, that database value wins.
+    """
+    existing = conn.execute(
+        """
+        SELECT assignment_id
+        FROM ai_project_assignments
+        WHERE project_name='manual-links'
+          AND role='llm'
+          AND enabled=1
+        LIMIT 1
+        """
+    ).fetchone()
+    if existing:
+        return
+    provider = conn.execute(
+        """
+        SELECT provider_id
+        FROM ai_providers
+        WHERE model_name='PRIMARY-LOCAL-NO-THINK-PRIVATE'
+          AND model_type='llm'
+          AND enabled=1
+        LIMIT 1
+        """
+    ).fetchone()
+    if not provider:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO ai_project_assignments
+            (assignment_id, project_name, provider_id, role, priority, enabled)
+        VALUES ('manual-links-llm-primary-local-no-think-private',
+                'manual-links', ?, 'llm', 0, 1)
+        """,
+        (provider[0],),
+    )
+
+
+def _manual_link_category_id(label: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in label.strip())
+    slug = "-".join(part for part in slug.split("-") if part)
+    return f"group:{slug or 'uncategorized'}"
+
+
+def _manual_link_icon_for_label(label: str) -> str:
+    value = (label or "").lower()
+    if "proxmox" in value:
+        return "icons/proxmox-logo-stacked-color.svg"
+    if "pfsense" in value:
+        return "icons/pfSense.svg"
+    return "icons/hieroglyphs/eye-of-horus-blue.svg"
+
+
+def _seed_manual_link_categories_from_groups(conn: sqlite3.Connection) -> None:
+    """Backfill deterministic Page 4 categories from existing manual link groups."""
+    rows = conn.execute(
+        """
+        SELECT link_id, COALESCE(NULLIF(TRIM(group_name), ''), 'Uncategorized') AS group_label,
+               COALESCE(sort_order, 0) AS sort_order
+        FROM manual_links
+        ORDER BY group_label, sort_order, label
+        """
+    ).fetchall()
+    category_order: dict[str, int] = {}
+    for row in rows:
+        link_id, label, sort_order = row
+        category_id = _manual_link_category_id(label)
+        if category_id not in category_order:
+            category_order[category_id] = len(category_order)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO manual_link_categories
+                (category_id, label, icon, parent_category_id, sort_order, notes)
+            VALUES (?, ?, NULL, NULL, ?, 'Seeded from manual_links.group_name')
+            """,
+            (category_id, label, category_order[category_id]),
+        )
+        conn.execute(
+            """
+            UPDATE manual_link_categories
+            SET icon = COALESCE(icon, ?)
+            WHERE category_id=?
+            """,
+            (_manual_link_icon_for_label(label), category_id),
+        )
+        conn.execute(
+            """
+            UPDATE manual_links
+            SET icon = COALESCE(icon, ?)
+            WHERE link_id=?
+            """,
+            (_manual_link_icon_for_label(label), link_id),
+        )
+        mapping_id = f"{category_id}:{link_id}"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO manual_link_category_items
+                (mapping_id, category_id, link_id, sort_order, label_override, notes)
+            VALUES (?, ?, ?, ?, NULL, 'Seeded from manual_links.group_name')
+            """,
+            (mapping_id, category_id, link_id, sort_order),
+        )
+    for row in rows:
+        link_id, label, _sort_order = row
+        parent = conn.execute("SELECT parent_id FROM manual_links WHERE link_id=?", (link_id,)).fetchone()
+        if not parent or not parent[0]:
+            continue
+        category_id = _manual_link_category_id(label)
+        parent_mapping_id = f"{category_id}:{parent[0]}"
+        mapping_id = f"{category_id}:{link_id}"
+        conn.execute(
+            """
+            UPDATE manual_link_category_items
+            SET parent_mapping_id = COALESCE(parent_mapping_id, ?)
+            WHERE mapping_id=?
+              AND EXISTS (SELECT 1 FROM manual_link_category_items WHERE mapping_id=?)
+            """,
+            (parent_mapping_id, mapping_id, parent_mapping_id),
+        )
+
+
 def init_db() -> None:
     """Create schema, run migrations, and seed sync_meta on first use."""
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -1167,10 +1364,13 @@ def init_db() -> None:
         conn.executescript(_SEED_SQL)
         _run_migrations(conn)
         _migrate_embed_menu_items_composite_unique(conn)
+        _backfill_manual_link_category_item_parents(conn)
         _dedup_visits(conn)
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
         _seed_table_layout_catalog(conn)
+        _seed_manual_links_ai_assignment(conn)
+        _seed_manual_link_categories_from_groups(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 
 

@@ -7,6 +7,7 @@ PUT    /api/v1/nav-items/{item_id}          → NavItemOut
 DELETE /api/v1/nav-items/{item_id}          → 204
 POST   /api/v1/nav-items/seed               → {"inserted": N, "skipped": M}  (idempotent)
 POST   /api/v1/nav-items/upload-asset       → {"path": "icons/foo.svg", "item_id": "..."}
+POST   /api/v1/nav-items/import-asset-url   → {"path": "icons/foo.svg", "source_url": "..."}
 GET    /api/v1/nav-items/assets             → list of asset files  (?type=icons|sounds)
 DELETE /api/v1/nav-items/assets             → delete an uploaded asset file if not referenced
 POST   /api/v1/nav-items/assign-asset       → assign an existing asset to a nav item
@@ -27,12 +28,16 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel
 
 try:
     from PIL import Image as _PILImage
@@ -52,6 +57,21 @@ router = APIRouter(prefix="/nav-items", tags=["nav-items"])
 
 _ICON_ALLOWED_EXTS  = {".svg", ".png", ".ico", ".jpg", ".jpeg", ".webp"}
 _SOUND_ALLOWED_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".webm", ".m4a"}
+_ICON_CONTENT_TYPE_EXTS = {
+    "image/svg+xml": ".svg",
+    "image/png": ".png",
+    "image/x-icon": ".ico",
+    "image/vnd.microsoft.icon": ".ico",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+_MAX_IMPORTED_ASSET_BYTES = 2 * 1024 * 1024
+
+
+class AssetUrlImport(BaseModel):
+    url: str
+    asset_type: Literal["icons", "sounds"] = "icons"
+    filename: str | None = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -97,6 +117,23 @@ def _assets_dir(asset_type: str) -> Path:
     d = _gui_fallback_root() / "assets" / asset_type
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _safe_asset_name(name: str) -> str:
+    safe_name = Path(name or "asset").name.replace(" ", "_")
+    if not safe_name or safe_name.startswith(".") or "/" in safe_name or "\\" in safe_name:
+        raise HTTPException(400, "invalid filename")
+    return safe_name
+
+
+def _unique_asset_path(assets_dir: Path, safe_name: str) -> tuple[str, Path]:
+    dest = assets_dir / safe_name
+    if dest.exists():
+        stem = Path(safe_name).stem
+        suffix = Path(safe_name).suffix
+        safe_name = f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+        dest = assets_dir / safe_name
+    return safe_name, dest
 
 
 def _asset_reference_counts(conn, asset_path: str) -> dict:
@@ -468,6 +505,58 @@ async def upload_nav_asset(
         enqueue_for_all_peers(conn, "UPDATE", "nav_items", item_id, _row_to_dict(row), gen)
 
     return {"path": relative_path, "item_id": item_id}
+
+
+@router.post("/import-asset-url")
+async def import_asset_url(body: AssetUrlImport):
+    """Download a remote asset URL into gui-fallback/assets and return its relative path."""
+    url = (body.url or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "url must be an http(s) URL")
+
+    asset_type = body.asset_type
+    allowed = _ICON_ALLOWED_EXTS if asset_type == "icons" else _SOUND_ALLOWED_EXTS
+    request = urllib.request.Request(url, headers={"User-Agent": "BlueprintsAssetImporter/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as resp:
+            content_type = (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            content = resp.read(_MAX_IMPORTED_ASSET_BYTES + 1)
+    except urllib.error.URLError as exc:
+        raise HTTPException(400, f"failed to fetch URL: {exc}") from exc
+
+    if len(content) > _MAX_IMPORTED_ASSET_BYTES:
+        raise HTTPException(400, "asset is larger than 2 MiB")
+
+    url_name = Path(urllib.parse.unquote(parsed.path or "")).name
+    safe_name = _safe_asset_name(body.filename or url_name or "downloaded-icon")
+    ext = Path(safe_name).suffix.lower()
+    if not ext and content_type in _ICON_CONTENT_TYPE_EXTS:
+        ext = _ICON_CONTENT_TYPE_EXTS[content_type]
+        safe_name = safe_name + ext
+    if ext not in allowed:
+        raise HTTPException(
+            400,
+            f"file type {ext!r} not allowed for {asset_type}; permitted: {', '.join(sorted(allowed))}",
+        )
+
+    if asset_type == "icons" and ext not in (".svg",):
+        normalised, new_ext = _normalize_icon(content)
+        if new_ext:
+            content = normalised
+            safe_name = Path(safe_name).stem + new_ext
+
+    assets_dir = _assets_dir(asset_type)
+    safe_name, dest = _unique_asset_path(assets_dir, safe_name)
+    try:
+        dest.write_bytes(content)
+    except Exception as exc:
+        log.error("nav_items: failed to import asset %s: %s", dest, exc)
+        raise HTTPException(500, f"failed to save imported asset: {exc}") from exc
+
+    relative_path = f"{asset_type}/{safe_name}"
+    log.info("nav_items: imported remote asset %s -> %s", url, relative_path)
+    return {"path": relative_path, "source_url": url}
 
 
 # ── Assign existing asset endpoint ────────────────────────────────────────────
