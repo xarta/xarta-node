@@ -59,6 +59,7 @@ from .routes_litellm_hook import router as litellm_hook_router
 from .routes_liteparse import router as liteparse_router
 from .routes_local_dockge import router as local_dockge_router
 from .routes_machines import router as machines_router
+from .routes_manual_link_categories import router as manual_link_categories_router
 from .routes_manual_links import router as manual_links_router
 from .routes_markitdown import router as markitdown_router
 from .routes_nav_items import router as nav_items_router
@@ -365,6 +366,7 @@ def create_app() -> FastAPI:
     application.include_router(ssh_terminal_router, prefix="/api/v1")
     application.include_router(ssh_targets_router, prefix="/api/v1")
     application.include_router(manual_links_router, prefix="/api/v1")
+    application.include_router(manual_link_categories_router, prefix="/api/v1")
     application.include_router(keys_router, prefix="/api/v1")
     application.include_router(certs_router, prefix="/api/v1")
     application.include_router(gui_sync_router, prefix="/api/v1")
