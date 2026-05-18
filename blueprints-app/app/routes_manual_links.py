@@ -181,7 +181,7 @@ def _row_to_out(row) -> ManualLinkOut:
 async def list_manual_links() -> list[ManualLinkOut]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM manual_links ORDER BY sort_order, group_name, label"
+            "SELECT * FROM manual_links ORDER BY sort_order, label"
         ).fetchall()
     return [_row_to_out(r) for r in rows]
 
@@ -287,14 +287,13 @@ async def intake_manual_link_url(body: ManualLinkUrlIntake) -> dict:
                     link_id, vlan_ip, vlan_uri, tailnet_ip, tailnet_uri,
                     label, icon, group_name, parent_id, sort_order,
                     pve_host, is_internet, vm_id, vm_name, lxc_id, lxc_name, location, notes
-                ) VALUES (?, NULL, ?, NULL, NULL, ?, ?, ?, NULL, ?, NULL, 1, NULL, NULL, NULL, NULL, NULL, ?)
+                ) VALUES (?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL, ?, NULL, 1, NULL, NULL, NULL, NULL, NULL, ?)
                 """,
                 (
                     link_id,
                     url,
                     plan.get("label") or _label_from_url(url),
                     "icons/hieroglyphs/eye-of-horus-blue.svg",
-                    category_paths.get(category_id, "Unsorted").split(" / ")[-1],
                     0,
                     plan.get("notes") or "Added by Manual Links URL drop intake.",
                 ),
