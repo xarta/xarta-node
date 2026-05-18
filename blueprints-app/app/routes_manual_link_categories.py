@@ -22,6 +22,44 @@ router = APIRouter(prefix="/manual-link-categories", tags=["manual-link-categori
 MAX_DEPTH = 12
 
 
+def _repair_orphan_category_parents(conn) -> int:
+    rows = conn.execute(
+        """
+        SELECT child.category_id
+        FROM manual_link_categories child
+        LEFT JOIN manual_link_categories parent
+          ON parent.category_id = child.parent_category_id
+        WHERE child.parent_category_id IS NOT NULL
+          AND parent.category_id IS NULL
+        """
+    ).fetchall()
+    page_rows = conn.execute(
+        """
+        SELECT category_id
+        FROM manual_link_categories
+        WHERE COALESCE(is_page, 0) = 1
+          AND parent_category_id IS NOT NULL
+        """
+    ).fetchall()
+    ids = [row["category_id"] for row in rows]
+    ids.extend(row["category_id"] for row in page_rows if row["category_id"] not in ids)
+    if not ids:
+        return 0
+    gen = increment_gen(conn, "system")
+    for category_id in ids:
+        conn.execute(
+            """
+            UPDATE manual_link_categories
+            SET parent_category_id=NULL, updated_at=datetime('now')
+            WHERE category_id=?
+            """,
+            (category_id,),
+        )
+        raw = conn.execute("SELECT * FROM manual_link_categories WHERE category_id=?", (category_id,)).fetchone()
+        enqueue_for_all_peers(conn, "UPDATE", "manual_link_categories", category_id, dict(raw), gen)
+    return len(ids)
+
+
 def _repair_orphan_mapping_parents(conn) -> int:
     rows = conn.execute(
         """
@@ -50,6 +88,71 @@ def _repair_orphan_mapping_parents(conn) -> int:
         raw = conn.execute("SELECT * FROM manual_link_category_items WHERE mapping_id=?", (mapping_id,)).fetchone()
         enqueue_for_all_peers(conn, "UPDATE", "manual_link_category_items", mapping_id, dict(raw), gen)
     return len(ids)
+
+
+def _repair_promoted_placeholder_categories(conn) -> int:
+    promoted_rows = conn.execute(
+        """
+        SELECT notes
+        FROM manual_link_categories
+        WHERE notes LIKE 'Promoted from Manual Links placement %'
+        """
+    ).fetchall()
+    promoted_mapping_ids: set[str] = set()
+    prefix = "Promoted from Manual Links placement "
+    for row in promoted_rows:
+        notes = (row["notes"] or "").strip()
+        if notes.startswith(prefix):
+            mapping_id = notes[len(prefix) :].strip().split()[0]
+            if mapping_id:
+                promoted_mapping_ids.add(mapping_id)
+    if not promoted_mapping_ids:
+        return 0
+
+    deleted = 0
+    gen = None
+    for mapping_id in sorted(promoted_mapping_ids):
+        row = conn.execute(
+            """
+            SELECT
+                m.mapping_id, m.category_id, m.link_id,
+                c.notes AS category_notes,
+                COALESCE(c.is_page, 0) AS is_page,
+                COALESCE(c.show_panel, 0) AS show_panel,
+                l.vlan_ip, l.vlan_uri, l.tailnet_ip, l.tailnet_uri
+            FROM manual_link_category_items m
+            JOIN manual_link_categories c ON c.category_id = m.category_id
+            LEFT JOIN manual_links l ON l.link_id = m.link_id
+            WHERE m.mapping_id=?
+            """,
+            (mapping_id,),
+        ).fetchone()
+        if not row:
+            continue
+        has_route = any(row[field] for field in ("vlan_ip", "vlan_uri", "tailnet_ip", "tailnet_uri"))
+        if has_route or row["is_page"] or row["show_panel"]:
+            continue
+        if not (row["category_notes"] or "").startswith("Seeded from manual_links.group_name"):
+            continue
+        category_id = row["category_id"]
+        sibling_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM manual_link_category_items WHERE category_id=?",
+            (category_id,),
+        ).fetchone()["n"]
+        child_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM manual_link_categories WHERE parent_category_id=?",
+            (category_id,),
+        ).fetchone()["n"]
+        if sibling_count != 1 or child_count != 0:
+            continue
+        if gen is None:
+            gen = increment_gen(conn, "system")
+        conn.execute("DELETE FROM manual_link_category_items WHERE mapping_id=?", (mapping_id,))
+        conn.execute("DELETE FROM manual_link_categories WHERE category_id=?", (category_id,))
+        enqueue_for_all_peers(conn, "DELETE", "manual_link_category_items", mapping_id, {}, gen)
+        enqueue_for_all_peers(conn, "DELETE", "manual_link_categories", category_id, {}, gen)
+        deleted += 1
+    return deleted
 
 
 def _category_out(row) -> ManualLinkCategoryOut:
@@ -178,7 +281,9 @@ def _fetch_item(conn, mapping_id: str):
 @router.get("", response_model=ManualLinkCategoryPayload)
 async def list_manual_link_categories() -> ManualLinkCategoryPayload:
     with get_conn() as conn:
+        _repair_orphan_category_parents(conn)
         _repair_orphan_mapping_parents(conn)
+        _repair_promoted_placeholder_categories(conn)
         categories = conn.execute(
             "SELECT * FROM manual_link_categories ORDER BY parent_category_id, sort_order, label"
         ).fetchall()
@@ -217,8 +322,9 @@ async def create_manual_link_category(body: ManualLinkCategoryCreate) -> ManualL
             """
             INSERT INTO manual_link_categories
                 (category_id, label, icon, parent_category_id, sort_order,
-                 show_panel, panel_color, panel_background, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_page, page_label, page_sort_order, show_panel, panel_color,
+                 panel_background, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 category_id,
@@ -226,6 +332,9 @@ async def create_manual_link_category(body: ManualLinkCategoryCreate) -> ManualL
                 body.icon,
                 body.parent_category_id,
                 body.sort_order if body.sort_order is not None else 0,
+                int(bool(body.is_page)),
+                body.page_label,
+                body.page_sort_order if body.page_sort_order is not None else 0,
                 int(bool(body.show_panel)),
                 body.panel_color,
                 body.panel_background,
@@ -259,6 +368,9 @@ async def update_manual_link_category(category_id: str, body: ManualLinkCategory
             "icon",
             "parent_category_id",
             "sort_order",
+            "is_page",
+            "page_label",
+            "page_sort_order",
             "show_panel",
             "panel_color",
             "panel_background",
@@ -267,8 +379,10 @@ async def update_manual_link_category(category_id: str, body: ManualLinkCategory
             if field in fields_set:
                 updates.append(f"{field}=?")
                 value = getattr(body, field)
-                if field == "show_panel":
+                if field in ("is_page", "show_panel"):
                     value = int(bool(value))
+                elif field in ("sort_order", "page_sort_order") and value is None:
+                    value = 0
                 params.append(value)
         if updates:
             updates.append("updated_at=datetime('now')")

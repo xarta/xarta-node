@@ -673,6 +673,9 @@ class ManualLinkCategoryCreate(BaseModel):
     icon: Optional[str] = None
     parent_category_id: Optional[str] = None
     sort_order: Optional[int] = 0
+    is_page: Optional[int] = 0
+    page_label: Optional[str] = None
+    page_sort_order: Optional[int] = 0
     show_panel: Optional[int] = 0
     panel_color: Optional[str] = None
     panel_background: Optional[str] = None
@@ -684,6 +687,9 @@ class ManualLinkCategoryUpdate(BaseModel):
     icon: Optional[str] = None
     parent_category_id: Optional[str] = None
     sort_order: Optional[int] = None
+    is_page: Optional[int] = None
+    page_label: Optional[str] = None
+    page_sort_order: Optional[int] = None
     show_panel: Optional[int] = None
     panel_color: Optional[str] = None
     panel_background: Optional[str] = None
@@ -696,6 +702,9 @@ class ManualLinkCategoryOut(BaseModel):
     icon: Optional[str] = None
     parent_category_id: Optional[str] = None
     sort_order: int = 0
+    is_page: int = 0
+    page_label: Optional[str] = None
+    page_sort_order: int = 0
     show_panel: int = 0
     panel_color: Optional[str] = None
     panel_background: Optional[str] = None
