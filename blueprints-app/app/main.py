@@ -62,6 +62,7 @@ from .routes_machines import router as machines_router
 from .routes_manual_link_categories import router as manual_link_categories_router
 from .routes_manual_links import router as manual_links_router
 from .routes_markitdown import router as markitdown_router
+from .routes_matrix_chat import router as matrix_chat_router
 from .routes_nav_items import router as nav_items_router
 from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
@@ -397,6 +398,7 @@ def create_app() -> FastAPI:
     application.include_router(local_dockge_router, prefix="/api/v1")
     application.include_router(vps_dockge_router, prefix="/api/v1")
     application.include_router(markitdown_router, prefix="/api/v1")
+    application.include_router(matrix_chat_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
     application.include_router(scrapling_router, prefix="/api/v1")
     application.include_router(playwright_router, prefix="/api/v1")
