@@ -86,9 +86,39 @@ def test_matrix_chat_room_and_message_mapping_do_not_return_credentials():
     rendered = repr({"joined": joined, "invited": invited, "message": message})
 
     assert joined[0]["name"] == "Hermes Local Smoke"
+    assert joined[0]["display_name"] == "Hermes Local Smoke"
+    assert joined[0]["name_source"] == "m.room.name"
     assert joined[0]["last_preview"] == "brief reply"
     assert invited == []
     assert message["body"] == "brief reply"
     assert "access_token" not in rendered.lower()
     assert "password" not in rendered.lower()
     assert "authorization" not in rendered.lower()
+
+
+def test_matrix_chat_room_mapping_marks_missing_names_as_fallback():
+    sync = {
+        "rooms": {
+            "join": {
+                "!roomwithnoname:test.example": {
+                    "timeline": {
+                        "events": [
+                            {
+                                "type": "m.room.message",
+                                "event_id": "$event2",
+                                "sender": "@hermes:test.example",
+                                "origin_server_ts": 1710000000001,
+                                "content": {"msgtype": "m.text", "body": "hello"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    joined, _ = matrix_chat._rooms_from_sync(sync)
+
+    assert joined[0]["name"] == "!roomwithnoname:test.example"
+    assert joined[0]["display_name"].startswith("Unnamed room (")
+    assert joined[0]["name_source"] == "fallback_room_id"
