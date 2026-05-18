@@ -253,23 +253,55 @@ async def update_manual_link_category(category_id: str, body: ManualLinkCategory
 
 
 @router.delete("/{category_id}", status_code=204)
-async def delete_manual_link_category(category_id: str) -> None:
+async def delete_manual_link_category(category_id: str, force: bool = False) -> None:
     with get_conn() as conn:
-        has_children = conn.execute(
-            "SELECT 1 FROM manual_link_categories WHERE parent_category_id=? LIMIT 1",
+        category_rows = conn.execute(
+            """
+            WITH RECURSIVE category_tree(category_id, depth) AS (
+                SELECT category_id, 0
+                FROM manual_link_categories
+                WHERE category_id=?
+                UNION ALL
+                SELECT child.category_id, parent.depth + 1
+                FROM manual_link_categories child
+                JOIN category_tree parent ON child.parent_category_id = parent.category_id
+            )
+            SELECT category_id, depth FROM category_tree
+            ORDER BY depth DESC
+            """,
             (category_id,),
-        ).fetchone()
-        has_items = conn.execute(
-            "SELECT 1 FROM manual_link_category_items WHERE category_id=? LIMIT 1",
-            (category_id,),
-        ).fetchone()
-        if has_children or has_items:
-            raise HTTPException(400, "category still has child categories or link mappings")
-        result = conn.execute("DELETE FROM manual_link_categories WHERE category_id=?", (category_id,))
-        if result.rowcount == 0:
+        ).fetchall()
+        if not category_rows:
             raise HTTPException(404, f"category {category_id!r} not found")
+
+        category_ids = [row["category_id"] for row in category_rows]
+        placeholders = ", ".join("?" for _ in category_ids)
+        item_rows = conn.execute(
+            f"""
+            SELECT mapping_id
+            FROM manual_link_category_items
+            WHERE category_id IN ({placeholders})
+            """,
+            category_ids,
+        ).fetchall()
+        if (len(category_rows) > 1 or item_rows) and not force:
+            raise HTTPException(400, "category is not empty; pass force=true to delete its child categories and mappings")
+
+        item_ids = [row["mapping_id"] for row in item_rows]
+        if item_ids:
+            conn.executemany(
+                "DELETE FROM manual_link_category_items WHERE mapping_id=?",
+                [(item_id,) for item_id in item_ids],
+            )
+        conn.executemany(
+            "DELETE FROM manual_link_categories WHERE category_id=?",
+            [(cat_id,) for cat_id in category_ids],
+        )
         gen = increment_gen(conn, "human")
-        enqueue_for_all_peers(conn, "DELETE", "manual_link_categories", category_id, {}, gen)
+        for item_id in item_ids:
+            enqueue_for_all_peers(conn, "DELETE", "manual_link_category_items", item_id, {}, gen)
+        for cat_id in category_ids:
+            enqueue_for_all_peers(conn, "DELETE", "manual_link_categories", cat_id, {}, gen)
 
 
 @router.post("/items", response_model=ManualLinkCategoryItemOut, status_code=201)
