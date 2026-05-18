@@ -253,16 +253,41 @@ def _timeline_events(room: dict[str, Any]) -> list[dict[str, Any]]:
     return events if isinstance(events, list) else []
 
 
-def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | None, bool]:
+def _is_room_id(value: str | None) -> bool:
+    return bool(value and value.startswith("!") and ":" in value)
+
+
+def _short_room_id(room_id: str) -> str:
+    if not room_id:
+        return ""
+    if ":" not in room_id:
+        return room_id
+    local, server = room_id.split(":", 1)
+    if len(local) <= 10:
+        return f"{local}:{server}"
+    return f"{local[:6]}...{local[-4:]}:{server}"
+
+
+def _room_display_name(room_id: str, name: str, canonical_alias: str | None) -> str:
+    if name and not _is_room_id(name):
+        return name
+    if canonical_alias:
+        return canonical_alias
+    return f"Unnamed room ({_short_room_id(room_id)})"
+
+
+def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | None, bool, str]:
     name = ""
     canonical_alias: str | None = None
     encrypted = False
     member_names: list[str] = []
+    name_source = "missing"
     for event in events:
         event_type = event.get("type")
         content = _event_content(event)
-        if event_type == "m.room.name" and isinstance(content.get("name"), str):
-            name = content["name"]
+        if event_type == "m.room.name" and isinstance(content.get("name"), str) and content["name"].strip():
+            name = content["name"].strip()
+            name_source = "m.room.name"
         elif event_type == "m.room.canonical_alias" and isinstance(content.get("alias"), str):
             canonical_alias = content["alias"]
         elif event_type == "m.room.encryption":
@@ -273,14 +298,18 @@ def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | Non
                 member_names.append(display)
     if not name and canonical_alias:
         name = canonical_alias
+        name_source = "m.room.canonical_alias"
     if not name and member_names:
         name = ", ".join(member_names[:3])
-    return name, canonical_alias, encrypted
+        name_source = "m.room.member"
+    if name and _is_room_id(name):
+        name_source = "fallback_room_id"
+    return name, canonical_alias, encrypted, name_source
 
 
 def _room_summary(room_id: str, room: dict[str, Any], *, invite: bool = False) -> dict[str, Any]:
     events = _state_events(room, invite=invite) + _timeline_events(room)
-    name, canonical_alias, encrypted = _room_name_from_events(events)
+    name, canonical_alias, encrypted, name_source = _room_name_from_events(events)
     messages = [_message_from_event(event, room_id) for event in _timeline_events(room)]
     messages = [message for message in messages if message]
     last_message = messages[-1] if messages else None
@@ -290,6 +319,8 @@ def _room_summary(room_id: str, room: dict[str, Any], *, invite: bool = False) -
     return {
         "room_id": room_id,
         "name": name or room_id,
+        "display_name": _room_display_name(room_id, name, canonical_alias),
+        "name_source": name_source if name else "fallback_room_id",
         "canonical_alias": canonical_alias,
         "joined_member_count": joined_count if isinstance(joined_count, int) else None,
         "invited_member_count": invited_count if isinstance(invited_count, int) else None,
