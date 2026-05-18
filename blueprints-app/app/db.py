@@ -312,6 +312,9 @@ CREATE TABLE IF NOT EXISTS manual_link_categories (
     icon               TEXT,
     parent_category_id TEXT,
     sort_order         INTEGER DEFAULT 0,
+    is_page            INTEGER DEFAULT 0,
+    page_label         TEXT,
+    page_sort_order    INTEGER DEFAULT 0,
     show_panel         INTEGER DEFAULT 0,
     panel_color        TEXT,
     panel_background   TEXT,
@@ -1046,6 +1049,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("manual_link_categories", "show_panel", "INTEGER DEFAULT 0"),
         ("manual_link_categories", "panel_color", "TEXT"),
         ("manual_link_categories", "panel_background", "TEXT"),
+        # manual_link_categories: optional Manual Links page roots (2026-05-18)
+        ("manual_link_categories", "is_page", "INTEGER DEFAULT 0"),
+        ("manual_link_categories", "page_label", "TEXT"),
+        ("manual_link_categories", "page_sort_order", "INTEGER DEFAULT 0"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -1289,7 +1296,25 @@ def _manual_link_icon_for_label(label: str) -> str:
 
 
 def _seed_manual_link_categories_from_groups(conn: sqlite3.Connection) -> None:
-    """Backfill deterministic Page 4 categories from existing manual link groups."""
+    """One-time backfill of deterministic Interface categories from legacy groups."""
+    marker = "manual_link_categories_group_seed_2026_05_17"
+    if conn.execute("SELECT 1 FROM sync_meta WHERE key=?", (marker,)).fetchone():
+        return
+
+    existing = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM manual_link_categories) AS categories,
+            (SELECT COUNT(*) FROM manual_link_category_items) AS items
+        """
+    ).fetchone()
+    if existing and (existing[0] or existing[1]):
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_meta(key, value) VALUES (?, 'skipped_existing_mappings')",
+            (marker,),
+        )
+        return
+
     rows = conn.execute(
         """
         SELECT link_id, COALESCE(NULLIF(TRIM(group_name), ''), 'Uncategorized') AS group_label,
@@ -1354,6 +1379,10 @@ def _seed_manual_link_categories_from_groups(conn: sqlite3.Connection) -> None:
             """,
             (parent_mapping_id, mapping_id, parent_mapping_id),
         )
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_meta(key, value) VALUES (?, 'seeded')",
+        (marker,),
+    )
 
 
 def init_db() -> None:
