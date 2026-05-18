@@ -22,6 +22,36 @@ router = APIRouter(prefix="/manual-link-categories", tags=["manual-link-categori
 MAX_DEPTH = 12
 
 
+def _repair_orphan_mapping_parents(conn) -> int:
+    rows = conn.execute(
+        """
+        SELECT child.mapping_id
+        FROM manual_link_category_items child
+        LEFT JOIN manual_link_category_items parent
+          ON parent.mapping_id = child.parent_mapping_id
+         AND parent.category_id = child.category_id
+        WHERE child.parent_mapping_id IS NOT NULL
+          AND parent.mapping_id IS NULL
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [row["mapping_id"] for row in rows]
+    gen = increment_gen(conn, "system")
+    for mapping_id in ids:
+        conn.execute(
+            """
+            UPDATE manual_link_category_items
+            SET parent_mapping_id=NULL, updated_at=datetime('now')
+            WHERE mapping_id=?
+            """,
+            (mapping_id,),
+        )
+        raw = conn.execute("SELECT * FROM manual_link_category_items WHERE mapping_id=?", (mapping_id,)).fetchone()
+        enqueue_for_all_peers(conn, "UPDATE", "manual_link_category_items", mapping_id, dict(raw), gen)
+    return len(ids)
+
+
 def _category_out(row) -> ManualLinkCategoryOut:
     return ManualLinkCategoryOut(**dict(row))
 
@@ -148,6 +178,7 @@ def _fetch_item(conn, mapping_id: str):
 @router.get("", response_model=ManualLinkCategoryPayload)
 async def list_manual_link_categories() -> ManualLinkCategoryPayload:
     with get_conn() as conn:
+        _repair_orphan_mapping_parents(conn)
         categories = conn.execute(
             "SELECT * FROM manual_link_categories ORDER BY parent_category_id, sort_order, label"
         ).fetchall()
