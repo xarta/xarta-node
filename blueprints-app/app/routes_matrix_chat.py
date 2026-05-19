@@ -8,6 +8,7 @@ Matrix credentials or generic Matrix API proxy output.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -50,12 +51,16 @@ _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
 _MAX_SYNC_TIMEOUT_MS = 30_000
+_DEFAULT_CRYPTO_STORE_DIR = (
+    "/xarta-node/.lone-wolf/stacks/matrix-synapse/data/blueprints-chat/crypto-store"
+)
 
 
 class _CreateRoomBody(BaseModel):
     name: str = Field(default="Blueprints Chat", min_length=1, max_length=120)
     topic: str | None = Field(default=None, max_length=400)
     invite: list[str] = Field(default_factory=list, max_length=20)
+    encrypted: bool = False
 
 
 class _JoinRoomBody(BaseModel):
@@ -149,6 +154,13 @@ def _settings() -> dict[str, str]:
             "MATRIX_CHAT_ADMIN_ACCESS_TOKEN",
             "MATRIX_ADMIN_ACCESS_TOKEN",
         ),
+        "encryption": pick("MATRIX_CHAT_ENCRYPTION", "BLUEPRINTS_MATRIX_CHAT_ENCRYPTION"),
+        "device_id": pick("MATRIX_CHAT_DEVICE_ID", "BLUEPRINTS_MATRIX_CHAT_DEVICE_ID"),
+        "crypto_store_dir": pick(
+            "MATRIX_CHAT_CRYPTO_STORE_DIR",
+            "BLUEPRINTS_MATRIX_CHAT_CRYPTO_STORE_DIR",
+            default=_DEFAULT_CRYPTO_STORE_DIR,
+        ),
     }
 
 
@@ -168,6 +180,314 @@ def _headers(settings: dict[str, str]) -> dict[str, str]:
 
 def _matrix_path(path: str) -> str:
     return f"/_matrix/client/v3{path}"
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _e2ee_requested(settings: dict[str, str]) -> bool:
+    return _truthy(settings.get("encryption"))
+
+
+def _check_e2ee_deps() -> tuple[bool, str]:
+    try:
+        import aiosqlite  # noqa: F401
+        import asyncpg  # noqa: F401
+        import olm  # noqa: F401
+        from mautrix.crypto import OlmMachine  # noqa: F401
+        from mautrix.crypto.store.asyncpg import PgCryptoStore  # noqa: F401
+        from mautrix.util.async_db import Database  # noqa: F401
+
+        return True, ""
+    except Exception as exc:  # pragma: no cover - depends on optional runtime deps
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _secure_crypto_store(store_dir: Path) -> None:
+    store_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        store_dir.chmod(0o700)
+    except OSError:
+        pass
+    for path in store_dir.glob("crypto.db*"):
+        if path.is_file():
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+
+
+class _MatrixCryptoStateStore:
+    """Minimal mautrix crypto state-store adapter for the Blueprints chat client."""
+
+    def __init__(self, client_state_store: Any, joined_rooms: set[str]):
+        self._state_store = client_state_store
+        self._joined_rooms = joined_rooms
+
+    async def is_encrypted(self, room_id: str) -> bool:
+        return (await self.get_encryption_info(room_id)) is not None
+
+    async def get_encryption_info(self, room_id: str) -> Any:
+        if hasattr(self._state_store, "get_encryption_info"):
+            return await self._state_store.get_encryption_info(room_id)
+        return None
+
+    async def find_shared_rooms(self, user_id: str) -> list[str]:
+        return list(self._joined_rooms)
+
+
+class _MatrixChatE2EEClient:
+    """Small server-side Matrix client with persistent E2EE state.
+
+    The browser still talks only to Blueprints. Matrix access tokens and crypto
+    state remain on the server.
+    """
+
+    def __init__(self, settings: dict[str, str]):
+        self._settings = dict(settings)
+        self._store_dir = Path(settings["crypto_store_dir"])
+        self._crypto_db_path = self._store_dir / "crypto.db"
+        self._client: Any = None
+        self._api: Any = None
+        self._crypto_db: Any = None
+        self._joined_rooms: set[str] = set()
+        self._started = False
+        self._lock = asyncio.Lock()
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (
+            self._settings.get("upstream", ""),
+            self._settings.get("user_id", ""),
+            self._settings.get("access_token", ""),
+            self._settings.get("crypto_store_dir", ""),
+        )
+
+    async def ensure_started(self) -> None:
+        if self._started:
+            return
+        async with self._lock:
+            if self._started:
+                return
+            await self._start()
+
+    async def _start(self) -> None:
+        ok, detail = _check_e2ee_deps()
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Matrix E2EE dependencies are not installed: {detail}",
+            )
+
+        from mautrix.api import HTTPAPI
+        from mautrix.client import Client
+        from mautrix.client.state_store import MemoryStateStore, MemorySyncStore
+        from mautrix.crypto import OlmMachine
+        from mautrix.crypto.store.asyncpg import PgCryptoStore
+        from mautrix.types import TrustState, UserID
+        from mautrix.util.async_db import Database
+
+        _secure_crypto_store(self._store_dir)
+
+        self._api = HTTPAPI(
+            base_url=self._settings["upstream"],
+            token=self._settings["access_token"],
+        )
+        state_store = MemoryStateStore()
+        sync_store = MemorySyncStore()
+        self._client = Client(
+            mxid=UserID(self._settings["user_id"]),
+            device_id=self._settings.get("device_id") or None,
+            api=self._api,
+            state_store=state_store,
+            sync_store=sync_store,
+        )
+
+        whoami = await self._client.whoami()
+        resolved_user_id = getattr(whoami, "user_id", "") or self._settings["user_id"]
+        resolved_device_id = self._settings.get("device_id") or getattr(whoami, "device_id", "")
+        self._settings["user_id"] = str(resolved_user_id)
+        self._client.mxid = UserID(self._settings["user_id"])
+        if resolved_device_id:
+            self._client.device_id = str(resolved_device_id)
+
+        self._crypto_db = Database.create(
+            f"sqlite:///{self._crypto_db_path}",
+            upgrade_table=PgCryptoStore.upgrade_table,
+        )
+        await self._crypto_db.start()
+        _secure_crypto_store(self._store_dir)
+
+        account_id = self._settings["user_id"] or "blueprints-chat"
+        pickle_key = f"{account_id}:{self._client.device_id or 'default'}"
+        crypto_store = PgCryptoStore(account_id=account_id, pickle_key=pickle_key, db=self._crypto_db)
+        await crypto_store.open()
+        if self._client.device_id:
+            await crypto_store.put_device_id(self._client.device_id)
+
+        olm = OlmMachine(
+            self._client,
+            crypto_store,
+            _MatrixCryptoStateStore(state_store, self._joined_rooms),
+        )
+        olm.share_keys_min_trust = TrustState.UNVERIFIED
+        olm.send_keys_min_trust = TrustState.UNVERIFIED
+        await olm.load()
+        await olm.share_keys()
+        self._client.crypto = olm
+
+        data = await self._client.sync(timeout=1000, full_state=True)
+        await self._handle_sync_data(data if isinstance(data, dict) else {})
+        self._started = True
+        _secure_crypto_store(self._store_dir)
+
+    async def _handle_sync_data(self, data: dict[str, Any]) -> None:
+        rooms_join = data.get("rooms", {}).get("join", {})
+        if isinstance(rooms_join, dict):
+            self._joined_rooms.update(str(room_id) for room_id in rooms_join)
+        next_batch = data.get("next_batch")
+        if next_batch:
+            await self._client.sync_store.put_next_batch(next_batch)
+        tasks = self._client.handle_sync(data)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def sync(
+        self,
+        *,
+        since: str | None = None,
+        timeout_ms: int = 0,
+        full_state: bool = False,
+    ) -> dict[str, Any]:
+        await self.ensure_started() if not self._started else None
+        data = await self._client.sync(
+            since=since,
+            timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
+            full_state=full_state,
+        )
+        if isinstance(data, dict):
+            await self._handle_sync_data(data)
+        return data if isinstance(data, dict) else {}
+
+    async def messages(
+        self,
+        room_id: str,
+        *,
+        limit: int,
+        from_token: str | None = None,
+    ) -> dict[str, Any]:
+        from mautrix.types import PaginationDirection, RoomID, SyncToken
+
+        await self.ensure_started()
+        data = await self._client.get_messages(
+            RoomID(room_id),
+            PaginationDirection.BACKWARD,
+            from_token=SyncToken(from_token) if from_token else None,
+            limit=limit,
+        )
+        events = getattr(data, "events", [])
+        messages = [await self.message_from_event(event, room_id) for event in events]
+        messages = [message for message in messages if message]
+        messages.reverse()
+        return {
+            "room_id": room_id,
+            "messages": messages,
+            "start": str(data.start) if data.start else None,
+            "end": str(data.end) if data.end else None,
+        }
+
+    async def send_message(self, room_id: str, body: str) -> dict[str, Any]:
+        from mautrix.types import EventType, RoomID
+
+        await self.ensure_started()
+        event_id = await self._client.send_message_event(
+            RoomID(room_id),
+            EventType.ROOM_MESSAGE,
+            {"msgtype": "m.text", "body": body},
+        )
+        _secure_crypto_store(self._store_dir)
+        return {"room_id": room_id, "event_id": str(event_id)}
+
+    async def message_from_event(self, event: Any, room_id: str) -> dict[str, Any] | None:
+        from mautrix.types import EventType
+
+        encrypted = str(getattr(event, "type", "")) == str(EventType.ROOM_ENCRYPTED)
+        if encrypted:
+            try:
+                event = await self._client.crypto.decrypt_megolm_event(event)
+            except Exception:
+                return _message_from_parts(
+                    event_id=str(getattr(event, "event_id", "") or ""),
+                    room_id=room_id,
+                    sender=str(getattr(event, "sender", "") or ""),
+                    origin_server_ts=getattr(event, "timestamp", None),
+                    msgtype="m.encrypted",
+                    body="[unable to decrypt encrypted event]",
+                    encrypted=True,
+                    decrypted=False,
+                )
+
+        if str(getattr(event, "type", "")) != str(EventType.ROOM_MESSAGE):
+            return None
+        content = getattr(event, "content", None)
+        body = getattr(content, "body", None)
+        msgtype = getattr(content, "msgtype", None) or "m.text"
+        if not isinstance(body, str):
+            return None
+        source_content = content.serialize() if hasattr(content, "serialize") else {}
+        relates_to = source_content.get("m.relates_to") if isinstance(source_content, dict) else None
+        return _message_from_parts(
+            event_id=str(getattr(event, "event_id", "") or ""),
+            room_id=room_id,
+            sender=str(getattr(event, "sender", "") or ""),
+            origin_server_ts=getattr(event, "timestamp", None),
+            msgtype=str(msgtype),
+            body=body,
+            relates_to=relates_to if isinstance(relates_to, dict) else None,
+            encrypted=encrypted,
+            decrypted=encrypted,
+        )
+
+    async def messages_from_raw_events(
+        self,
+        room_id: str,
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        from mautrix.types import Event
+
+        messages: list[dict[str, Any]] = []
+        for raw in events:
+            try:
+                event = Event.deserialize(raw)
+            except Exception:
+                fallback = _message_from_event(raw, room_id)
+                if fallback:
+                    messages.append(fallback)
+                continue
+            message = await self.message_from_event(event, room_id)
+            if message:
+                messages.append(message)
+        return messages
+
+
+_e2ee_client: _MatrixChatE2EEClient | None = None
+_e2ee_client_key: tuple[str, str, str, str] | None = None
+_e2ee_client_lock = asyncio.Lock()
+
+
+async def _get_e2ee_client(settings: dict[str, str] | None = None) -> _MatrixChatE2EEClient | None:
+    global _e2ee_client, _e2ee_client_key
+    settings = settings or _require_credentials()
+    if not _e2ee_requested(settings):
+        return None
+    candidate = _MatrixChatE2EEClient(settings)
+    async with _e2ee_client_lock:
+        if _e2ee_client is None or _e2ee_client_key != candidate.key:
+            _e2ee_client = candidate
+            _e2ee_client_key = candidate.key
+    await _e2ee_client.ensure_started()
+    return _e2ee_client
 
 
 async def _matrix_request_any(
@@ -279,6 +599,31 @@ def _event_ts(event: dict[str, Any]) -> int | None:
     return ts if isinstance(ts, int) else None
 
 
+def _message_from_parts(
+    *,
+    event_id: str,
+    room_id: str,
+    sender: str,
+    origin_server_ts: int | None,
+    msgtype: str,
+    body: str,
+    relates_to: dict[str, Any] | None = None,
+    encrypted: bool = False,
+    decrypted: bool = False,
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "room_id": room_id,
+        "sender": sender,
+        "origin_server_ts": origin_server_ts,
+        "msgtype": msgtype,
+        "body": body,
+        "relates_to": relates_to if isinstance(relates_to, dict) else None,
+        "encrypted": encrypted,
+        "decrypted": decrypted,
+    }
+
+
 def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] | None:
     event_type = event.get("type")
     content = _event_content(event)
@@ -294,15 +639,17 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         return None
 
     relates_to = content.get("m.relates_to")
-    return {
-        "event_id": event.get("event_id") or "",
-        "room_id": room_id,
-        "sender": event.get("sender") or "",
-        "origin_server_ts": _event_ts(event),
-        "msgtype": msgtype,
-        "body": body,
-        "relates_to": relates_to if isinstance(relates_to, dict) else None,
-    }
+    return _message_from_parts(
+        event_id=event.get("event_id") or "",
+        room_id=room_id,
+        sender=event.get("sender") or "",
+        origin_server_ts=_event_ts(event),
+        msgtype=msgtype,
+        body=body,
+        relates_to=relates_to if isinstance(relates_to, dict) else None,
+        encrypted=event_type == "m.room.encrypted",
+        decrypted=False,
+    )
 
 
 def _state_events(room: dict[str, Any], invite: bool = False) -> list[dict[str, Any]]:
@@ -573,11 +920,32 @@ async def _sync(
     return await _matrix_request("GET", "/sync", params=params)
 
 
+async def _sync_for_chat(
+    *,
+    since: str | None = None,
+    timeout_ms: int = 0,
+    full_state: bool = False,
+) -> tuple[dict[str, Any], _MatrixChatE2EEClient | None]:
+    settings = _require_credentials()
+    e2ee_client = await _get_e2ee_client(settings)
+    if e2ee_client:
+        return (
+            await e2ee_client.sync(
+                since=since,
+                timeout_ms=timeout_ms,
+                full_state=full_state,
+            ),
+            e2ee_client,
+        )
+    return await _sync(since=since, timeout_ms=timeout_ms, full_state=full_state), None
+
+
 @router.get("/status")
 async def matrix_chat_status() -> dict[str, Any]:
     settings = _settings()
     reachable = False
     health = ""
+    e2ee_deps_ok, e2ee_deps_error = _check_e2ee_deps()
     try:
         async with httpx.AsyncClient(
             base_url=settings["upstream"],
@@ -598,7 +966,10 @@ async def matrix_chat_status() -> dict[str, Any]:
         "default_room_id": settings["smoke_room_id"],
         "hermes_user_id": settings["hermes_user_id"],
         "features": {
-            "e2ee": False,
+            "e2ee": _e2ee_requested(settings) and e2ee_deps_ok,
+            "e2ee_requested": _e2ee_requested(settings),
+            "e2ee_dependencies": e2ee_deps_ok,
+            "e2ee_dependency_error": e2ee_deps_error if _e2ee_requested(settings) and not e2ee_deps_ok else "",
             "push_notifications": False,
             "generic_matrix_proxy": False,
         },
@@ -607,7 +978,7 @@ async def matrix_chat_status() -> dict[str, Any]:
 
 @router.get("/rooms")
 async def matrix_chat_rooms() -> dict[str, Any]:
-    sync = await _sync(timeout_ms=0, full_state=True)
+    sync, _e2ee_client = await _sync_for_chat(timeout_ms=0, full_state=True)
     joined, invited = _rooms_from_sync(sync)
     return {
         "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
@@ -623,6 +994,14 @@ async def matrix_chat_create_room(body: _CreateRoomBody) -> dict[str, Any]:
         "preset": "private_chat",
         "visibility": "private",
     }
+    if body.encrypted:
+        payload["initial_state"] = [
+            {
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+            }
+        ]
     if body.topic:
         payload["topic"] = body.topic.strip()
     clean_invites = [user.strip() for user in body.invite if user and user.strip()]
@@ -685,6 +1064,10 @@ async def matrix_chat_messages(
     limit: int = Query(default=50, ge=1, le=_MAX_MESSAGE_LIMIT),
     from_token: str | None = Query(default=None, alias="from"),
 ) -> dict[str, Any]:
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        return await e2ee_client.messages(room_id, limit=limit, from_token=from_token)
+
     encoded_room = quote(room_id, safe="")
     params: dict[str, Any] = {"dir": "b", "limit": limit}
     if from_token:
@@ -704,6 +1087,10 @@ async def matrix_chat_messages(
 
 @router.post("/rooms/{room_id}/messages")
 async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict[str, Any]:
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        return await e2ee_client.send_message(room_id, body.body)
+
     encoded_room = quote(room_id, safe="")
     txn_id = f"bp-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
     encoded_txn = quote(txn_id, safe="")
@@ -724,7 +1111,7 @@ async def matrix_chat_sync(
     since: str | None = None,
     timeout_ms: int = Query(default=0, ge=0, le=_MAX_SYNC_TIMEOUT_MS),
 ) -> dict[str, Any]:
-    sync = await _sync(since=since, timeout_ms=timeout_ms, full_state=False)
+    sync, e2ee_client = await _sync_for_chat(since=since, timeout_ms=timeout_ms, full_state=False)
     joined, invited = _rooms_from_sync(sync)
     rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
     joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
@@ -732,11 +1119,11 @@ async def matrix_chat_sync(
     for room_id, room in joined_raw.items():
         if not isinstance(room, dict):
             continue
-        messages = [
-            _message_from_event(event, room_id)
-            for event in _timeline_events(room)
-            if isinstance(event, dict)
-        ]
+        raw_events = [event for event in _timeline_events(room) if isinstance(event, dict)]
+        if e2ee_client:
+            messages = await e2ee_client.messages_from_raw_events(room_id, raw_events)
+        else:
+            messages = [_message_from_event(event, room_id) for event in raw_events]
         room_updates.append(
             {
                 "room_id": room_id,

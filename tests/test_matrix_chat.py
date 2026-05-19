@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 
 from app import routes_matrix_chat as matrix_chat
@@ -195,5 +197,34 @@ def test_matrix_chat_invite_candidate_filter_applies_query():
         {
             "user_id": "@xarta-operator:test.example",
             "display_name": "xarta-operator",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_create_room_can_request_encryption(monkeypatch):
+    captured = {}
+
+    async def fake_matrix_request(method, path, *, json_body=None, **_kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = json_body
+        return {"room_id": "!encrypted:test.example"}
+
+    monkeypatch.setattr(matrix_chat, "_matrix_request", fake_matrix_request)
+
+    result = await matrix_chat.matrix_chat_create_room(
+        matrix_chat._CreateRoomBody(name="Encrypted Ops", encrypted=True)
+    )
+
+    assert result == {"room_id": "!encrypted:test.example"}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/createRoom"
+    assert captured["json_body"]["visibility"] == "private"
+    assert captured["json_body"]["initial_state"] == [
+        {
+            "type": "m.room.encryption",
+            "state_key": "",
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
         }
     ]
