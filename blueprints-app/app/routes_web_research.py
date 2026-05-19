@@ -67,7 +67,10 @@ _PRIVATE_TARGET_RE = re.compile(
     r")"
 )
 _SECRETISH_RE = re.compile(
-    r"(?i)\b(api[_ -]?key|authorization|bearer|cookie|password|passwd|secret|token)\b"
+    r"(?ix)"
+    r"\b(api[_ -]?key|authorization|bearer|cookie|password|passwd|secret|credential)\b|"
+    r"\btoken\s*[:=]\s*\S+|"
+    r"\b(?:access|auth|api|bearer|refresh)\s+token\b"
 )
 _MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
 _EXCLUDED_SPEECH_SECTION_TITLES = {

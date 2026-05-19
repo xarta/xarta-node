@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 TEST_NODES_JSON = Path("/tmp/xarta-node-test-web-research-nodes.json")
 TEST_NODES_JSON.write_text(
@@ -39,6 +40,7 @@ from app import routes_web_research  # noqa: E402
 from app.routes_web_research import (  # noqa: E402
     _fallback_normalize_web_research_query,
     _normalize_web_research_query,
+    _validate_public_query,
     _web_research_query_normalizer_model,
 )
 
@@ -75,6 +77,18 @@ async def test_normalize_web_research_query_falls_back_to_whitespace_only(monkey
 
 def test_fallback_normalize_web_research_query_does_not_guess_names():
     assert _fallback_normalize_web_research_query(" april dr who bbc ai ") == "april dr who bbc ai"
+
+
+def test_validate_public_query_allows_non_secret_token_language():
+    _validate_public_query("Qwen3 RTX 5090 benchmark tokens per second vLLM")
+    _validate_public_query("token budget benchmark for local LLM inference")
+
+
+def test_validate_public_query_rejects_secret_token_material():
+    with pytest.raises(HTTPException):
+        _validate_public_query("Authorization bearer token for example service")
+    with pytest.raises(HTTPException):
+        _validate_public_query("token=abc123456789")
 
 
 def test_query_normalizer_uses_env_configured_model(monkeypatch):
