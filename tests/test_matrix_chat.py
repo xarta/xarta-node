@@ -122,3 +122,78 @@ def test_matrix_chat_room_mapping_marks_missing_names_as_fallback():
     assert joined[0]["name"] == "!roomwithnoname:test.example"
     assert joined[0]["display_name"].startswith("Unnamed room (")
     assert joined[0]["name_source"] == "fallback_room_id"
+
+
+def test_matrix_chat_invite_candidate_filter_excludes_members_self_and_admin():
+    candidates = [
+        {
+            "user_id": "@codex:test.example",
+            "display_name": "codex",
+            "is_admin": False,
+            "deactivated": False,
+        },
+        {
+            "user_id": "@hermes:test.example",
+            "display_name": "hermes",
+            "is_admin": False,
+            "deactivated": False,
+        },
+        {
+            "user_id": "@operator:test.example",
+            "display_name": "operator",
+            "is_admin": False,
+            "deactivated": False,
+        },
+        {
+            "user_id": "@admin:test.example",
+            "display_name": "admin",
+            "is_admin": True,
+            "deactivated": False,
+        },
+        {
+            "user_id": "@old:test.example",
+            "display_name": "old",
+            "is_admin": False,
+            "deactivated": True,
+        },
+    ]
+
+    filtered = matrix_chat._filter_invite_candidates(
+        candidates,
+        excluded_user_ids={"@hermes:test.example"},
+        current_user_id="@codex:test.example",
+        query="@",
+    )
+
+    assert filtered == [{"user_id": "@operator:test.example", "display_name": "operator"}]
+
+
+def test_matrix_chat_invite_candidate_filter_applies_query():
+    candidates = [
+        {
+            "user_id": "@xarta-operator:test.example",
+            "display_name": "xarta-operator",
+            "is_admin": False,
+            "deactivated": False,
+        },
+        {
+            "user_id": "@hermes:test.example",
+            "display_name": "hermes",
+            "is_admin": False,
+            "deactivated": False,
+        },
+    ]
+
+    filtered = matrix_chat._filter_invite_candidates(
+        candidates,
+        excluded_user_ids=set(),
+        current_user_id="@codex:test.example",
+        query="oper",
+    )
+
+    assert filtered == [
+        {
+            "user_id": "@xarta-operator:test.example",
+            "display_name": "xarta-operator",
+        }
+    ]

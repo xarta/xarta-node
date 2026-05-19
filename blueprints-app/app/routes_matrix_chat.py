@@ -143,6 +143,12 @@ def _settings() -> dict[str, str]:
             "MATRIX_HERMES_USER_ID",
             default=_DEFAULT_HERMES_USER_ID,
         ),
+        "operator_user_id": pick("MATRIX_CHAT_OPERATOR_USER_ID", "MATRIX_OPERATOR_USER_ID"),
+        "admin_user_id": pick("MATRIX_CHAT_ADMIN_USER_ID", "MATRIX_ADMIN_USER_ID"),
+        "admin_access_token": pick(
+            "MATRIX_CHAT_ADMIN_ACCESS_TOKEN",
+            "MATRIX_ADMIN_ACCESS_TOKEN",
+        ),
     }
 
 
@@ -164,7 +170,7 @@ def _matrix_path(path: str) -> str:
     return f"/_matrix/client/v3{path}"
 
 
-async def _matrix_request(
+async def _matrix_request_any(
     method: str,
     path: str,
     *,
@@ -191,6 +197,65 @@ async def _matrix_request(
             detail = "Matrix chat credential rejected by homeserver"
         else:
             detail = f"Matrix request failed with HTTP {response.status_code}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    if not response.content:
+        return {}
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+    return data
+
+
+async def _matrix_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    expected: tuple[int, ...] = (200,),
+) -> dict[str, Any]:
+    data = await _matrix_request_any(
+        method,
+        path,
+        params=params,
+        json_body=json_body,
+        expected=expected,
+    )
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Matrix homeserver returned unexpected JSON")
+    return data
+
+
+async def _synapse_admin_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    expected: tuple[int, ...] = (200,),
+) -> dict[str, Any]:
+    settings = _require_credentials()
+    admin_token = settings.get("admin_access_token") or ""
+    if not admin_token:
+        raise HTTPException(status_code=503, detail="Matrix admin token is not configured")
+    timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+    try:
+        async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
+            response = await client.request(
+                method,
+                f"/_synapse/admin/v2{path}",
+                params=params,
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+
+    if response.status_code not in expected:
+        if response.status_code in {401, 403}:
+            detail = "Matrix admin credential rejected by homeserver"
+        else:
+            detail = f"Matrix admin request failed with HTTP {response.status_code}"
         raise HTTPException(status_code=502, detail=detail)
 
     if not response.content:
@@ -331,6 +396,149 @@ def _room_summary(room_id: str, room: dict[str, Any], *, invite: bool = False) -
     }
 
 
+def _matrix_localpart(user_id: str) -> str:
+    if user_id.startswith("@") and ":" in user_id:
+        return user_id[1:].split(":", 1)[0]
+    return user_id
+
+
+def _user_display_name(user_id: str, display_name: str | None = None) -> str:
+    if display_name and display_name.strip():
+        return display_name.strip()
+    return _matrix_localpart(user_id)
+
+
+def _normalize_user_candidate(raw: dict[str, Any], *, source: str) -> dict[str, Any] | None:
+    user_id = raw.get("name") or raw.get("user_id")
+    if not isinstance(user_id, str) or not user_id.startswith("@") or ":" not in user_id:
+        return None
+    deactivated = bool(raw.get("deactivated"))
+    is_admin = bool(raw.get("admin"))
+    display = raw.get("displayname") or raw.get("display_name")
+    return {
+        "user_id": user_id,
+        "display_name": _user_display_name(user_id, display if isinstance(display, str) else None),
+        "is_admin": is_admin,
+        "deactivated": deactivated,
+        "source": source,
+    }
+
+
+def _candidate_matches_query(candidate: dict[str, Any], query: str) -> bool:
+    needle = query.strip().lower()
+    if needle in {"", "@"}:
+        return True
+    return needle.lstrip("@") in (
+        f"{candidate.get('user_id', '')} {candidate.get('display_name', '')}"
+    ).lower()
+
+
+def _filter_invite_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    excluded_user_ids: set[str],
+    current_user_id: str,
+    query: str,
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    filtered: list[dict[str, Any]] = []
+    for candidate in candidates:
+        user_id = str(candidate.get("user_id") or "")
+        if not user_id or user_id in seen:
+            continue
+        seen.add(user_id)
+        if user_id in excluded_user_ids or user_id == current_user_id:
+            continue
+        if candidate.get("deactivated") or candidate.get("is_admin"):
+            continue
+        if not _candidate_matches_query(candidate, query):
+            continue
+        filtered.append(
+            {
+                "user_id": user_id,
+                "display_name": candidate.get("display_name") or _matrix_localpart(user_id),
+            }
+        )
+    filtered.sort(key=lambda item: (str(item.get("display_name") or "").lower(), item["user_id"]))
+    return filtered
+
+
+def _configured_user_candidates(settings: dict[str, str]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for key in ("user_id", "hermes_user_id", "operator_user_id", "admin_user_id"):
+        user_id = settings.get(key) or ""
+        if not user_id:
+            continue
+        candidates.append(
+            {
+                "user_id": user_id,
+                "display_name": _matrix_localpart(user_id),
+                "is_admin": key == "admin_user_id",
+                "deactivated": False,
+                "source": "config",
+            }
+        )
+    return candidates
+
+
+async def _room_member_user_ids(room_id: str) -> set[str]:
+    encoded_room = quote(room_id, safe="")
+    data = await _matrix_request_any("GET", f"/rooms/{encoded_room}/state")
+    events = data if isinstance(data, list) else []
+    members: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "m.room.member":
+            continue
+        content = _event_content(event)
+        if content.get("membership") not in {"join", "invite"}:
+            continue
+        state_key = event.get("state_key")
+        if isinstance(state_key, str) and state_key.startswith("@"):
+            members.add(state_key)
+    return members
+
+
+async def _admin_user_candidates() -> list[dict[str, Any]]:
+    data = await _synapse_admin_request(
+        "GET",
+        "/users",
+        params={"from": 0, "limit": 100, "guests": "false", "deactivated": "false"},
+    )
+    users = data.get("users") if isinstance(data.get("users"), list) else []
+    candidates = [
+        _normalize_user_candidate(user, source="synapse_admin")
+        for user in users
+        if isinstance(user, dict)
+    ]
+    return [candidate for candidate in candidates if candidate]
+
+
+async def _directory_user_candidates(query: str) -> list[dict[str, Any]]:
+    terms = [query.strip()]
+    if query.strip() in {"", "@"}:
+        terms = ["xarta", "operator", "hermes", "codex"]
+    candidates: list[dict[str, Any]] = []
+    for term in terms:
+        if not term:
+            continue
+        data = await _matrix_request(
+            "POST",
+            "/user_directory/search",
+            json_body={"search_term": term, "limit": 50},
+        )
+        results = data.get("results") if isinstance(data.get("results"), list) else []
+        candidates.extend(
+            candidate
+            for candidate in (
+                _normalize_user_candidate(result, source="user_directory")
+                for result in results
+                if isinstance(result, dict)
+            )
+            if candidate
+        )
+    return candidates
+
+
 def _rooms_from_sync(sync: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
     joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
@@ -441,6 +649,34 @@ async def matrix_chat_invite(room_id: str, body: _InviteBody) -> dict[str, Any]:
         expected=(200,),
     )
     return {"ok": True}
+
+
+@router.get("/rooms/{room_id}/invite-candidates")
+async def matrix_chat_invite_candidates(
+    room_id: str,
+    q: str = Query(default="", max_length=80),
+) -> dict[str, Any]:
+    settings = _require_credentials()
+    excluded = await _room_member_user_ids(room_id)
+    source = "synapse_admin"
+    try:
+        candidates = await _admin_user_candidates()
+    except HTTPException:
+        source = "user_directory"
+        candidates = await _directory_user_candidates(q)
+        candidates.extend(_configured_user_candidates(settings))
+    users = _filter_invite_candidates(
+        candidates,
+        excluded_user_ids=excluded,
+        current_user_id=settings["user_id"],
+        query=q,
+    )
+    return {
+        "room_id": room_id,
+        "query": q,
+        "source": source,
+        "users": users[:50],
+    }
 
 
 @router.get("/rooms/{room_id}/messages")
