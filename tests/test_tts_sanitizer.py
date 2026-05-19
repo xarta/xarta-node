@@ -87,6 +87,7 @@ Despite the progress, there are a few areas."""
         "strip_inline_code_ticks",
         "strip_inline_markdown_emphasis",
         "strip_markdown_list_markers",
+        "review_datetime_and_numeric_candidates",
         "speak_known_attribute_names",
         "speak_tts_compound_tokens",
         "speak_http_status_codes",
@@ -140,6 +141,307 @@ def test_sanitize_tts_text_preserves_safe_two_word_terms_and_transforms_nav_item
     result = sanitize_tts_text("Keep purpose-built user-facing copy, but NAV-ITEMS splits.").text
 
     assert result == "Keep purpose-built user-facing copy, but NAV ITEMS splits."
+
+
+def test_sanitize_tts_text_speaks_stdio_family_terms():
+    result = sanitize_tts_text("Wire stdio transforms for stdin, stdout, and stderr.").text
+
+    assert result == (
+        "Wire standard input output transforms for standard input, "
+        "standard output, and standard error."
+    )
+
+
+def test_sanitize_tts_text_can_use_llm_datetime_classification(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "classify")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(_system_prompt, payload, _config):
+        assert payload["candidate"] == "2026.05.19"
+        assert "snapshot" in payload["context"]
+        return {
+            "likely_datetime": True,
+            "speech_text": "May nineteenth twenty twenty six",
+            "keep_in_speech": True,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = sanitize_tts_text("The snapshot was taken on 2026.05.19.").text
+
+    assert result == "The snapshot was taken on May nineteenth twenty twenty six."
+
+
+def test_sanitize_tts_text_can_use_llm_datetime_rewrite(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(system_prompt, payload, _config):
+        if "classifier" in system_prompt:
+            if payload["candidate"] != "2026.05.19":
+                return {
+                    "likely_datetime": False,
+                    "speech_text": "",
+                    "keep_in_speech": False,
+                }
+            return {
+                "likely_datetime": True,
+                "speech_text": "May nineteenth twenty twenty six",
+                "keep_in_speech": False,
+            }
+        assert payload["date_times_to_remove_or_summarize"] == ["2026.05.19"]
+        return {"text": "The run has a dated build marker, summarized for speech."}
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = sanitize_tts_text("Runs: 2026.05.19 build 123456789.").text
+
+    assert result == "The run has a dated build marker, summarized for speech."
+
+
+def test_sanitize_tts_text_can_use_llm_numeric_density_rewrite(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(system_prompt, payload, _config):
+        if "numeric clutter" in system_prompt:
+            assert payload["long_number_candidates"] == [
+                "233000000000",
+                "269000000000",
+                "439000000000",
+            ]
+            return {
+                "should_simplify": True,
+                "speech_text": (
+                    "Several disk transfers completed, with the larger copies taking longer, "
+                    "so the byte counts are summarized for speech."
+                ),
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = sanitize_tts_text(
+        "Transfers: disk 0 estimated 233000000000 bytes elapsed 1145 seconds, "
+        "disk 5 estimated 269000000000 bytes elapsed 1308 seconds, "
+        "disk 7 estimated 439000000000 bytes elapsed 2119 seconds."
+    ).text
+
+    assert result == (
+        "Several disk transfers completed, with the larger copies taking longer, "
+        "so the byte counts are summarized for speech."
+    )
+
+
+def test_sanitize_tts_text_can_use_llm_version_density_rewrite(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(system_prompt, payload, _config):
+        if "numeric clutter" in system_prompt:
+            assert payload["version_candidates"] == [
+                "1.2.3.45678",
+                "1.2.4.98765",
+                "2.0.0.12345",
+            ]
+            return {
+                "should_simplify": True,
+                "speech_text": "The tests compare earlier one point two builds with a later two point zero build.",
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = sanitize_tts_text(
+        "Versions tested: 1.2.3.45678, 1.2.4.98765, and 2.0.0.12345 behaved differently."
+    ).text
+
+    assert result == "The tests compare earlier one point two builds with a later two point zero build."
+
+
+def test_narration_review_chunks_long_numeric_sentences(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MAX_REWRITE_CHARS", "240")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_NUMERIC_MAX_SECTIONS", "1")
+
+    def fake_decision(system_prompt, payload, _config):
+        if "numeric clutter" in system_prompt:
+            assert len(payload["section"]) <= 240
+            assert len(payload["number_candidates"]) >= 6
+            return {
+                "should_simplify": True,
+                "speech_text": "The folder-count leaderboard is summarized for speech.",
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    text = (
+        "Counts: web design had 31 docs and 269 chunks, light LLM had 13 docs and 102 chunks, "
+        "browser links had 7 docs and 79 chunks, null claw had 11 docs and 76 chunks, "
+        "local AI had 6 docs and 70 chunks, TTS had 11 docs and 63 chunks, "
+        "Dockge had 18 docs and 57 chunks."
+    )
+
+    result = _MODULE.review_datetime_and_numeric_candidates(text)
+
+    assert result.startswith("The folder-count leaderboard is summarized for speech.")
+
+
+def test_narration_review_retries_lacklustre_numeric_rewrite(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    calls: list[str] = []
+
+    def fake_decision(system_prompt, _payload, _config):
+        if "still too number-heavy" in system_prompt:
+            calls.append("retry")
+            return {
+                "should_simplify": True,
+                "speech_text": "The version inventory is summarized for speech, with the important point that the runtime set validated cleanly.",
+                "keep_original": False,
+            }
+        if "numeric clutter" in system_prompt:
+            calls.append("first")
+            return {
+                "should_simplify": True,
+                "speech_text": (
+                    "Versions were 24.15.0, 11.12.1, 10.33.2, 4.14.1, "
+                    "3.11.2, 0.11.8, 9.0.3, and 0.15.12."
+                ),
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = _MODULE.review_datetime_and_numeric_candidates(
+        "Validated versions include 24.15.0, 11.12.1, 10.33.2, 4.14.1, "
+        "3.11.2, 0.11.8, 9.0.3, and 0.15.12."
+    )
+
+    assert calls == ["first", "retry"]
+    assert result == (
+        "The version inventory is summarized for speech, with the important point that "
+        "the runtime set validated cleanly."
+    )
+
+
+def test_narration_review_accepts_concise_retry_with_one_version_example(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    calls: list[str] = []
+
+    def fake_decision(system_prompt, _payload, _config):
+        if "still too number-heavy" in system_prompt:
+            calls.append("retry")
+            return {
+                "should_simplify": True,
+                "speech_text": (
+                    "The image is large due to multiple language toolchains like Node.js and Python. "
+                    "Just is missing because Debian lacks a package. Python version 3.11 is included. "
+                    "No HTTP endpoints exist by design."
+                ),
+                "keep_original": False,
+            }
+        if "numeric clutter" in system_prompt:
+            calls.append("first")
+            return {
+                "should_simplify": True,
+                "speech_text": (
+                    "Node.js 24.15.0, NPM 11.12.1, pnpm 10.33.2, Yarn 4.14.1, "
+                    "Python 3.11.2, uv 0.11.8, pytest 9.0.3, ruff 0.15.12."
+                ),
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = _MODULE.review_datetime_and_numeric_candidates(
+        "Known runtime details: Node.js 24.15.0, NPM 11.12.1, pnpm 10.33.2, "
+        "Yarn 4.14.1, Python 3.11.2, uv 0.11.8, pytest 9.0.3, ruff 0.15.12."
+    )
+
+    assert calls == ["first", "retry"]
+    assert result == (
+        "The image is large due to multiple language toolchains like Node.js and Python. "
+        "Just is missing because Debian lacks a package. Python version 3.11 is included. "
+        "No HTTP endpoints exist by design."
+    )
+
+
+def test_narration_review_hard_fails_when_llm_is_required(monkeypatch):
+    monkeypatch.delenv("TTS_NARRATION_REVIEW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+
+    try:
+        _MODULE.review_datetime_and_numeric_candidates("The build marker was 123456789.")
+    except _MODULE.TtsNarrationReviewError as exc:
+        assert "requires" in str(exc)
+    else:
+        raise AssertionError("expected narration review to hard-fail without LLM credentials")
+
+
+def test_narration_review_simplifies_spoken_dotted_version_soup(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(system_prompt, payload, _config):
+        if "still too number-heavy" in system_prompt:
+            return {
+                "should_simplify": True,
+                "speech_text": "The runtime version inventory is summarized; the important point is that the tool set validated cleanly.",
+                "keep_original": False,
+            }
+        if "numeric clutter" in system_prompt:
+            assert payload["spoken_number_candidates"]
+            return {
+                "should_simplify": True,
+                "speech_text": (
+                    "Versions include two four dot one five dot zero, one one dot one two dot one, "
+                    "ten dot thirty three dot two, four dot fourteen dot one, and three dot eleven dot two."
+                ),
+                "keep_original": False,
+            }
+        return {
+            "likely_datetime": False,
+            "speech_text": "",
+            "keep_in_speech": False,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    result = _MODULE.review_datetime_and_numeric_candidates(
+        "Validated versions include Node dot jay ess version two four dot one five dot zero, "
+        "NPM one one dot one two dot one, pnpm one zero dot three three dot two, "
+        "Yarn four dot one four dot one, Python three dot one one dot two, "
+        "uv zero dot one one dot eight, pytest nine dot zero dot three, "
+        "ruff zero dot one five dot one two, and pyright one dot one dot four zero nine."
+    )
+
+    assert result == (
+        "The runtime version inventory is summarized; the important point is that "
+        "the tool set validated cleanly."
+    )
 
 
 def test_tts_hyphen_auto_preserve_blocks_sanitizer_terms():
