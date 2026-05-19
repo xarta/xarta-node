@@ -58,6 +58,7 @@ _DEFAULT_NULLCLAW_TASKS_DIR = (
     _NODE_LOCAL_ROOT / "stacks" / "nullclaw-docs-search" / "data" / "tasks"
 )
 _DOC_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-cache"
+_DOC_SPEECH_PROMPT_VERSION = "20260519-numeric-transcript-review-v2"
 _METADATA_BACKLOG_LIMIT = 40
 _PATH_LIKE_KEYS = {
     "path",
@@ -205,7 +206,17 @@ def _valid_doc_speech_cache_path(doc_path: str, source_path: Path) -> Path | Non
         raise HTTPException(404, "doc file not found") from exc
     for candidate in _doc_speech_cache_candidates(doc_path):
         try:
-            if candidate.stat().st_mtime >= source_mtime:
+            if candidate.stat().st_mtime < source_mtime:
+                continue
+            meta_path = _doc_speech_cache_meta_path(candidate)
+            if not meta_path.is_file():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning("docs: could not inspect speech cache metadata %s: %s", meta_path, exc)
+                continue
+            if meta.get("prompt_version") == _DOC_SPEECH_PROMPT_VERSION:
                 return candidate
         except OSError:
             continue
@@ -344,6 +355,8 @@ Rules:
 - Do not recite raw Markdown syntax, table pipes, link URLs, or every repetitive table cell.
 - For links, say their human meaning, such as "link to the responsive header notes".
 - For tables, read every row for understanding, then output only a prose summary. Never output Markdown table pipes or row-by-row table text.
+- For version tables, tool inventories, timestamps, numeric leaderboards, byte counts, IDs, or build catalogues, do not recite the values one by one. Explain the point of the cluster, the range or pattern if useful, and keep at most two exact examples only when a listener needs them.
+- Never turn a dense numeric table into spoken digit chains. If many values only prove coverage or validation, say that coverage was validated and name the important families.
 - For endpoint tables or method lists, summarize the API surface in prose. Mention the main capabilities, not every GET, POST, PUT, or DELETE row.
 - For file lists, summarize the implementation areas in prose. Mention important files only when they explain the architecture.
 - For code or commands, mention the command or path only when it is important. Keep punctuation speakable.
@@ -354,6 +367,20 @@ Rules:
 - Use short paragraph breaks for pacing. If a section title helps, write it as a plain sentence with a full stop.
 - Do not add citations, source labels, or commentary about being an AI.
 - Output only the narration text.
+""".strip()
+
+
+_DOC_SPEECH_REVIEW_SYSTEM_PROMPT = """
+You review a complete TTS narration script for a local documentation page.
+
+Return only the final narration text, with no Markdown and no commentary.
+
+Keep the meaning, but rewrite any section that has become poor speech:
+- Dense date/time clusters, long numbers, long IDs, version catalogues, byte counts, timings, or inventories must be summarized.
+- Do not read more than two exact numeric or version examples in one paragraph unless the exact values are the point.
+- If a paragraph says many number words joined by "dot", replace it with the conclusion or validation point.
+- Preserve real warnings, statuses, names, and relationships.
+- Keep normal identifiers as normal text. Do not pre-pronounce punctuation; the final sanitizer handles pronunciation.
 """.strip()
 
 
@@ -428,6 +455,32 @@ async def _complete_doc_speech_local(
     return _strip_think_blocks(str(answer or "")), meta
 
 
+async def _review_doc_speech_narration(
+    *,
+    title: str,
+    doc_path: str,
+    draft: str,
+) -> tuple[str, dict[str, Any]]:
+    review_prompt = (
+        "/no-think\n"
+        f"Document title: {title}\n"
+        f"Document path: {doc_path}\n\n"
+        "Review this complete narration script and return the improved final script:\n\n"
+        f"{draft}"
+    )
+    reviewed, review_meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _DOC_SPEECH_REVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": review_prompt},
+        ],
+        operation="docs:narration-review",
+    )
+    _assert_complete_doc_speech(review_meta)
+    if not reviewed:
+        raise HTTPException(502, "Local LLM returned an empty narration review")
+    return reviewed, review_meta
+
+
 async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple[str, dict[str, Any]]:
     title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
     description = str(doc["description"] or "").strip()
@@ -458,13 +511,20 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
     generation_meta = {
         **source_meta,
         **llm_meta,
+        "prompt_version": _DOC_SPEECH_PROMPT_VERSION,
     }
     _assert_complete_doc_speech(generation_meta)
-    speech = await _clean_doc_speech_markdown(str(answer or ""))
+    reviewed_answer, review_meta = await _review_doc_speech_narration(
+        title=title,
+        doc_path=doc_path,
+        draft=str(answer or ""),
+    )
+    speech = await _clean_doc_speech_markdown(reviewed_answer)
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty narration")
     generation_meta.update(
         {
+            "review": review_meta,
             "speech_chars": len(speech),
             "speech_words": len(speech.split()),
         }
