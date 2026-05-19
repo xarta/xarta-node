@@ -201,6 +201,147 @@ def test_matrix_chat_invite_candidate_filter_applies_query():
     ]
 
 
+def test_matrix_chat_admin_status_does_not_expose_token():
+    settings = {
+        "public_homeserver": "https://chat.test.example",
+        "admin_user_id": "@synapse-admin:test.example",
+        "admin_access_token": "admin-token-secret",
+    }
+
+    status = matrix_chat._admin_status_payload(settings, reachable=True, health="ok")
+    rendered = repr(status)
+
+    assert status["configured"] is True
+    assert status["admin_configured"] is True
+    assert status["admin_user_id"] == "@synapse-admin:test.example"
+    assert status["features"] == {
+        "generic_admin_proxy": False,
+        "destructive_actions": False,
+    }
+    assert "admin-token-secret" not in rendered
+    assert "admin_access_token" not in rendered
+    assert "access_token" not in rendered
+
+
+def test_matrix_chat_admin_user_dto_drops_secret_material():
+    user = matrix_chat._normalize_admin_user(
+        {
+            "name": "@operator:test.example",
+            "displayname": "operator",
+            "admin": False,
+            "deactivated": False,
+            "is_guest": False,
+            "creation_ts": 1770000000000,
+            "access_token": "token-secret",
+            "password": "password-secret",
+            "pusher": "pusher-secret",
+            "topic": "topic-secret",
+            "recovery_key": "recovery-secret",
+        }
+    )
+    rendered = repr(user)
+
+    assert user == {
+        "user_id": "@operator:test.example",
+        "display_name": "operator",
+        "is_admin": False,
+        "deactivated": False,
+        "is_guest": False,
+        "creation_ts": 1770000000000,
+    }
+    for forbidden in (
+        "token-secret",
+        "password-secret",
+        "pusher-secret",
+        "topic-secret",
+        "recovery-secret",
+        "access_token",
+        "password",
+        "pusher",
+        "topic",
+        "recovery",
+    ):
+        assert forbidden not in rendered
+
+
+def test_matrix_chat_admin_room_dto_handles_missing_name_and_drops_topic():
+    room = matrix_chat._normalize_admin_room(
+        {
+            "room_id": "!room:test.example",
+            "joined_members": "3",
+            "joined_local_members": 2,
+            "version": 10,
+            "federatable": "false",
+            "public": None,
+            "topic": "secret-topic",
+        }
+    )
+    rendered = repr(room)
+
+    assert room == {
+        "room_id": "!room:test.example",
+        "name": "",
+        "canonical_alias": "",
+        "joined_members": 3,
+        "joined_local_members": 2,
+        "version": "10",
+        "encrypted": False,
+        "public": False,
+        "federatable": False,
+    }
+    assert "secret-topic" not in rendered
+    assert "topic" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_admin_endpoints_fail_when_admin_token_missing(tmp_path, monkeypatch):
+    env_file = tmp_path / "matrix.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "MATRIX_CODEX_USER_ID=@codex:test.example",
+                "MATRIX_CODEX_ACCESS_TOKEN=chat-token",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", str(env_file))
+    monkeypatch.delenv("MATRIX_CHAT_ADMIN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("MATRIX_ADMIN_ACCESS_TOKEN", raising=False)
+
+    with pytest.raises(matrix_chat.HTTPException) as exc:
+        await matrix_chat.matrix_chat_admin_users()
+
+    assert exc.value.status_code == 503
+    assert "admin token" in exc.value.detail.lower()
+
+
+def test_matrix_chat_admin_member_reduction_includes_power_without_raw_state():
+    state_rows = matrix_chat._room_member_rows_from_state(
+        [
+            {
+                "type": "m.room.power_levels",
+                "content": {"users": {"@admin:test.example": 100}},
+            },
+            {
+                "type": "m.room.member",
+                "state_key": "@admin:test.example",
+                "content": {"membership": "join", "displayname": "Synapse Admin"},
+            },
+        ]
+    )
+    member = matrix_chat._normalize_admin_member("@admin:test.example", state_rows)
+
+    assert member == {
+        "user_id": "@admin:test.example",
+        "membership": "join",
+        "display_name": "Synapse Admin",
+        "power_level": 100,
+    }
+    assert "content" not in repr(member)
+    assert "state_key" not in repr(member)
+
+
 @pytest.mark.asyncio
 async def test_matrix_chat_create_room_can_request_encryption(monkeypatch):
     captured = {}

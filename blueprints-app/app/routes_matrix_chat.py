@@ -554,8 +554,11 @@ async def _synapse_admin_request(
     *,
     params: dict[str, Any] | None = None,
     expected: tuple[int, ...] = (200,),
+    admin_api_version: str = "v2",
 ) -> dict[str, Any]:
-    settings = _require_credentials()
+    if admin_api_version not in {"v1", "v2"}:
+        raise HTTPException(status_code=500, detail="Unsupported Matrix admin API version")
+    settings = _settings()
     admin_token = settings.get("admin_access_token") or ""
     if not admin_token:
         raise HTTPException(status_code=503, detail="Matrix admin token is not configured")
@@ -564,7 +567,7 @@ async def _synapse_admin_request(
         async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
             response = await client.request(
                 method,
-                f"/_synapse/admin/v2{path}",
+                f"/_synapse/admin/{admin_api_version}{path}",
                 params=params,
                 headers={"Authorization": f"Bearer {admin_token}"},
             )
@@ -587,6 +590,161 @@ async def _synapse_admin_request(
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Matrix homeserver returned unexpected JSON")
     return data
+
+
+def _safe_str(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _safe_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _safe_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _normalize_admin_user(raw: dict[str, Any]) -> dict[str, Any] | None:
+    user_id = _safe_str(raw.get("name") or raw.get("user_id"))
+    if not user_id.startswith("@") or ":" not in user_id:
+        return None
+    display = _safe_str(raw.get("displayname") or raw.get("display_name"))
+    return {
+        "user_id": user_id,
+        "display_name": _user_display_name(user_id, display),
+        "is_admin": _safe_bool(raw.get("admin") if "admin" in raw else raw.get("is_admin")),
+        "deactivated": _safe_bool(raw.get("deactivated")),
+        "is_guest": _safe_bool(raw.get("is_guest") if "is_guest" in raw else raw.get("guest")),
+        "creation_ts": _safe_int(raw.get("creation_ts")),
+    }
+
+
+def _normalize_admin_room(raw: dict[str, Any]) -> dict[str, Any] | None:
+    room_id = _safe_str(raw.get("room_id"))
+    if not room_id:
+        return None
+    encryption = raw.get("encryption")
+    encrypted = _safe_bool(raw.get("encrypted"), default=bool(encryption))
+    version = raw.get("version") if raw.get("version") is not None else raw.get("room_version")
+    return {
+        "room_id": room_id,
+        "name": _safe_str(raw.get("name")),
+        "canonical_alias": _safe_str(raw.get("canonical_alias")),
+        "joined_members": _safe_int(raw.get("joined_members")),
+        "joined_local_members": _safe_int(raw.get("joined_local_members")),
+        "version": str(version) if version is not None else None,
+        "encrypted": encrypted,
+        "public": _safe_bool(raw.get("public") if "public" in raw else raw.get("is_public")),
+        "federatable": _safe_bool(raw.get("federatable")),
+    }
+
+
+def _state_content_for(events: list[dict[str, Any]], event_type: str) -> dict[str, Any]:
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != event_type:
+            continue
+        content = _event_content(event)
+        if content:
+            return content
+    return {}
+
+
+def _reduced_power_levels(content: dict[str, Any]) -> dict[str, int | None]:
+    fields = ("users_default", "events_default", "state_default", "redact", "ban", "kick")
+    return {field: _safe_int(content.get(field)) for field in fields}
+
+
+async def _synapse_admin_room_state(room_id: str) -> list[dict[str, Any]]:
+    encoded_room = quote(room_id, safe="")
+    data = await _synapse_admin_request(
+        "GET",
+        f"/rooms/{encoded_room}/state",
+        admin_api_version="v1",
+    )
+    events = data.get("state") if isinstance(data.get("state"), list) else []
+    return [event for event in events if isinstance(event, dict)]
+
+
+def _room_member_rows_from_state(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    power_content = _state_content_for(events, "m.room.power_levels")
+    power_users = power_content.get("users") if isinstance(power_content.get("users"), dict) else {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "m.room.member":
+            continue
+        user_id = _safe_str(event.get("state_key"))
+        if not user_id:
+            continue
+        content = _event_content(event)
+        rows[user_id] = {
+            "user_id": user_id,
+            "membership": _safe_str(content.get("membership")) or "join",
+            "display_name": _user_display_name(user_id, _safe_str(content.get("displayname"))),
+            "power_level": _safe_int(power_users.get(user_id)) if isinstance(power_users, dict) else None,
+        }
+    return rows
+
+
+def _normalize_admin_member(raw: Any, state_rows: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if isinstance(raw, str):
+        user_id = raw
+        raw_dict: dict[str, Any] = {}
+    elif isinstance(raw, dict):
+        user_id = _safe_str(raw.get("user_id") or raw.get("name"))
+        raw_dict = raw
+    else:
+        return None
+    if not user_id.startswith("@") or ":" not in user_id:
+        return None
+    state_row = state_rows.get(user_id, {})
+    display = _safe_str(raw_dict.get("displayname") or raw_dict.get("display_name"))
+    return {
+        "user_id": user_id,
+        "membership": _safe_str(raw_dict.get("membership")) or state_row.get("membership") or "join",
+        "display_name": _user_display_name(user_id, display or state_row.get("display_name")),
+        "power_level": _safe_int(state_row.get("power_level")),
+    }
+
+
+def _admin_status_payload(
+    settings: dict[str, str],
+    *,
+    reachable: bool,
+    health: str = "",
+) -> dict[str, Any]:
+    return {
+        "configured": bool(settings.get("admin_access_token")),
+        "reachable": reachable,
+        "health": health,
+        "homeserver_url": settings["public_homeserver"],
+        "admin_configured": bool(settings.get("admin_access_token")),
+        "admin_user_id": settings.get("admin_user_id") or None,
+        "features": {
+            "generic_admin_proxy": False,
+            "destructive_actions": False,
+        },
+    }
 
 
 def _event_content(event: dict[str, Any]) -> dict[str, Any]:
@@ -974,6 +1132,120 @@ async def matrix_chat_status() -> dict[str, Any]:
             "generic_matrix_proxy": False,
         },
     }
+
+
+@router.get("/admin/status")
+async def matrix_chat_admin_status() -> dict[str, Any]:
+    settings = _settings()
+    reachable = False
+    health = ""
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings["upstream"],
+            timeout=httpx.Timeout(_CONNECT_TIMEOUT),
+        ) as client:
+            response = await client.get("/health")
+        reachable = response.status_code < 500
+        health = response.text[:80]
+    except httpx.RequestError:
+        reachable = False
+    return _admin_status_payload(settings, reachable=reachable, health=health)
+
+
+@router.get("/admin/users")
+async def matrix_chat_admin_users() -> dict[str, Any]:
+    data = await _synapse_admin_request(
+        "GET",
+        "/users",
+        params={"from": 0, "limit": 500, "guests": "true", "deactivated": "true"},
+    )
+    raw_users = data.get("users") if isinstance(data.get("users"), list) else []
+    users = [
+        user
+        for user in (_normalize_admin_user(raw) for raw in raw_users if isinstance(raw, dict))
+        if user
+    ]
+    users.sort(key=lambda item: (str(item.get("user_id") or "").lower()))
+    total = _safe_int(data.get("total")) or len(users)
+    return {"users": users, "total": total}
+
+
+@router.get("/admin/rooms")
+async def matrix_chat_admin_rooms() -> dict[str, Any]:
+    data = await _synapse_admin_request(
+        "GET",
+        "/rooms",
+        params={"from": 0, "limit": 500},
+        admin_api_version="v1",
+    )
+    raw_rooms = data.get("rooms") if isinstance(data.get("rooms"), list) else []
+    rooms = [
+        room
+        for room in (_normalize_admin_room(raw) for raw in raw_rooms if isinstance(raw, dict))
+        if room
+    ]
+    rooms.sort(key=lambda item: (str(item.get("name") or item.get("room_id") or "").lower()))
+    total = _safe_int(data.get("total_rooms")) or _safe_int(data.get("total")) or len(rooms)
+    return {"rooms": rooms, "total": total}
+
+
+@router.get("/admin/rooms/{room_id}")
+async def matrix_chat_admin_room_detail(room_id: str) -> dict[str, Any]:
+    encoded_room = quote(room_id, safe="")
+    data = await _synapse_admin_request(
+        "GET",
+        f"/rooms/{encoded_room}",
+        admin_api_version="v1",
+    )
+    room = _normalize_admin_room({**data, "room_id": data.get("room_id") or room_id}) or {
+        "room_id": room_id,
+        "name": "",
+        "canonical_alias": "",
+        "joined_members": None,
+        "joined_local_members": None,
+        "version": None,
+        "encrypted": False,
+        "public": False,
+        "federatable": False,
+    }
+    events: list[dict[str, Any]] = []
+    try:
+        events = await _synapse_admin_room_state(room_id)
+    except HTTPException:
+        events = []
+    encryption = _state_content_for(events, "m.room.encryption")
+    power_levels = _state_content_for(events, "m.room.power_levels")
+    if encryption:
+        room["encrypted"] = True
+    room["encryption_algorithm"] = _safe_str(encryption.get("algorithm")) if encryption else ""
+    room["power_levels"] = _reduced_power_levels(power_levels) if power_levels else {}
+    return room
+
+
+@router.get("/admin/rooms/{room_id}/members")
+async def matrix_chat_admin_room_members(room_id: str) -> dict[str, Any]:
+    encoded_room = quote(room_id, safe="")
+    state_events: list[dict[str, Any]] = []
+    try:
+        state_events = await _synapse_admin_room_state(room_id)
+    except HTTPException:
+        state_events = []
+    state_rows = _room_member_rows_from_state(state_events)
+    data = await _synapse_admin_request(
+        "GET",
+        f"/rooms/{encoded_room}/members",
+        admin_api_version="v1",
+    )
+    raw_members = data.get("members") if isinstance(data.get("members"), list) else []
+    members = [
+        member
+        for member in (_normalize_admin_member(raw, state_rows) for raw in raw_members)
+        if member
+    ]
+    if not members and state_rows:
+        members = list(state_rows.values())
+    members.sort(key=lambda item: (str(item.get("user_id") or "").lower()))
+    return {"room_id": room_id, "members": members}
 
 
 @router.get("/rooms")
