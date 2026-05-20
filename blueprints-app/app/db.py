@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import Generator
 
 from . import config as cfg
+from .url_identity import normalize_url_identity
 
 log = logging.getLogger(__name__)
 
@@ -1125,6 +1126,44 @@ def _backfill_visit_events(conn: sqlite3.Connection) -> None:
         log.info("_backfill_visit_events: seeded %d event row(s)", len(rows))
 
 
+def _canonicalize_visit_history_urls(conn: sqlite3.Connection) -> None:
+    """Apply current URL identity rules to stored visit history rows.
+
+    This is intentionally scoped to history, not the whole bookmarks table:
+    visits are an audit/use-frequency surface where cache-busting parameters
+    should not fragment the logical page.  The follow-up dedup pass keeps the
+    newest visit row if multiple rows collapse to the same identity.
+    """
+    visit_rows = conn.execute("SELECT visit_id, normalized_url FROM visits").fetchall()
+    changed_visits = 0
+    for row in visit_rows:
+        canonical = normalize_url_identity(row[1])
+        if canonical != row[1]:
+            conn.execute(
+                "UPDATE visits SET normalized_url=?, updated_at=datetime('now') WHERE visit_id=?",
+                (canonical, row[0]),
+            )
+            changed_visits += 1
+
+    event_rows = conn.execute("SELECT event_id, normalized_url FROM visit_events").fetchall()
+    changed_events = 0
+    for row in event_rows:
+        canonical = normalize_url_identity(row[1])
+        if canonical != row[1]:
+            conn.execute(
+                "UPDATE visit_events SET normalized_url=? WHERE event_id=?",
+                (canonical, row[0]),
+            )
+            changed_events += 1
+
+    if changed_visits or changed_events:
+        log.info(
+            "_canonicalize_visit_history_urls: updated %d visit row(s), %d event row(s)",
+            changed_visits,
+            changed_events,
+        )
+
+
 def _dedup_visits(conn: sqlite3.Connection) -> None:
     """Collapse existing duplicate visit rows by normalized_url.
 
@@ -1394,6 +1433,7 @@ def init_db() -> None:
         _run_migrations(conn)
         _migrate_embed_menu_items_composite_unique(conn)
         _backfill_manual_link_category_item_parents(conn)
+        _canonicalize_visit_history_urls(conn)
         _dedup_visits(conn)
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)

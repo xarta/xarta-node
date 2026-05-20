@@ -10,7 +10,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -25,7 +25,10 @@ from .models import (
     BookmarkOut,
     BookmarkUpdate,
     VisitCreate,
+    VisitDomainOut,
+    VisitDomainPageOut,
     VisitOut,
+    VisitPageOut,
 )
 from .seekdb import (
     keyword_search_bookmarks,
@@ -50,6 +53,7 @@ from .seekdb_sync import (
     reindex_all as _do_reindex_all,
 )
 from .sync.queue import enqueue_for_all_peers
+from .url_identity import normalize_url_identity
 
 router = APIRouter(prefix="/bookmarks", tags=["bookmarks"])
 
@@ -59,9 +63,7 @@ def _now_iso() -> str:
 
 
 def _normalize_url(url: str) -> str:
-    p = urlparse((url or "").strip())
-    path = p.path.rstrip("/") or "/"
-    return urlunparse((p.scheme.lower(), p.netloc.lower(), path, p.params, p.query, ""))
+    return normalize_url_identity(url)
 
 
 def _domain(url: str) -> str:
@@ -281,13 +283,183 @@ async def get_reindex_progress() -> dict:
 
 
 @router.get("/visits", response_model=list[VisitOut])
-async def list_visits(limit: int = Query(500, ge=1, le=5000)) -> list[VisitOut]:
+async def list_visits(
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+) -> list[VisitOut]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM visits ORDER BY visited_at DESC LIMIT ?",
-            (limit,),
+            "SELECT * FROM visits ORDER BY visited_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
     return [_row_to_visit_out(r) for r in rows]
+
+
+_VISIT_SORT_COLUMNS = {
+    "title": "lower(title)",
+    "url": "lower(url)",
+    "domain": "lower(domain)",
+    "source": "lower(source)",
+    "dwell_seconds": "dwell_seconds",
+    "visit_count": "visit_count",
+    "visited_at": "visited_at",
+}
+
+
+def _visit_filter_sql(q: str, saved: str) -> tuple[str, list[object]]:
+    where_parts: list[str] = []
+    params: list[object] = []
+
+    q_clean = q.strip().lower()
+    if q_clean:
+        like = f"%{q_clean}%"
+        where_parts.append(
+            "(lower(coalesce(title, '')) LIKE ? "
+            "OR lower(coalesce(url, '')) LIKE ? "
+            "OR lower(coalesce(domain, '')) LIKE ?)"
+        )
+        params.extend([like, like, like])
+
+    if saved == "saved":
+        where_parts.append("bookmark_id IS NOT NULL")
+    elif saved == "unsaved":
+        where_parts.append("bookmark_id IS NULL")
+
+    where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    return where_sql, params
+
+
+@router.get("/visits-page", response_model=VisitPageOut)
+async def list_visits_page(
+    q: str = Query(""),
+    saved: str = Query("all", pattern="^(all|saved|unsaved)$"),
+    sort: str = Query("visited_at"),
+    direction: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> VisitPageOut:
+    where_sql, params = _visit_filter_sql(q, saved)
+    sort_sql = _VISIT_SORT_COLUMNS.get(sort, "visited_at")
+    direction_sql = "ASC" if direction == "asc" else "DESC"
+    tie_break = "visit_id ASC" if direction_sql == "ASC" else "visit_id DESC"
+
+    with get_conn() as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS total, COALESCE(SUM(visit_count), 0) AS total_visit_count FROM visits{where_sql}",
+            params,
+        ).fetchone()
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM visits
+            {where_sql}
+            ORDER BY {sort_sql} {direction_sql}, {tie_break}
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+
+    return VisitPageOut(
+        items=[_row_to_visit_out(r) for r in rows],
+        total=int(total_row["total"] if total_row else 0),
+        total_visit_count=int(total_row["total_visit_count"] if total_row else 0),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/visit-domains-page", response_model=VisitDomainPageOut)
+async def list_visit_domains_page(
+    q: str = Query(""),
+    saved: str = Query("all", pattern="^(all|saved|unsaved)$"),
+    sort: str = Query("domain"),
+    direction: str = Query("asc", pattern="^(asc|desc)$"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    expanded_domains: list[str] = Query(default=[]),
+) -> VisitDomainPageOut:
+    where_sql, params = _visit_filter_sql(q, saved)
+    direction_sql = "ASC" if direction == "asc" else "DESC"
+    domain_expr = "COALESCE(NULLIF(domain, ''), '(unknown)')"
+    child_sort_sql = _VISIT_SORT_COLUMNS.get(sort, "lower(url)")
+
+    with get_conn() as conn:
+        totals = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_urls,
+                COALESCE(SUM(visit_count), 0) AS total_visit_count
+            FROM visits
+            {where_sql}
+            """,
+            params,
+        ).fetchone()
+        total_domains_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total_domains
+            FROM (
+                SELECT {domain_expr} AS domain_key
+                FROM visits
+                {where_sql}
+                GROUP BY domain_key
+            )
+            """,
+            params,
+        ).fetchone()
+        group_rows = conn.execute(
+            f"""
+            SELECT
+                {domain_expr} AS domain,
+                COUNT(*) AS url_count,
+                COALESCE(SUM(visit_count), 0) AS total_visit_count
+            FROM visits
+            {where_sql}
+            GROUP BY domain
+            ORDER BY lower(domain) {direction_sql}, domain {direction_sql}
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+
+        groups_by_domain = {
+            row["domain"]: VisitDomainOut(
+                domain=row["domain"],
+                url_count=int(row["url_count"]),
+                total_visit_count=int(row["total_visit_count"]),
+                items=[],
+            )
+            for row in group_rows
+        }
+        expanded_on_page = [
+            domain for domain in expanded_domains if domain in groups_by_domain
+        ]
+        if expanded_on_page:
+            placeholders = ",".join("?" for _ in expanded_on_page)
+            child_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM visits
+                {where_sql}
+                {"AND" if where_sql else "WHERE"} {domain_expr} IN ({placeholders})
+                ORDER BY {domain_expr} {direction_sql},
+                         {child_sort_sql} {direction_sql},
+                         visit_id {direction_sql}
+                """,
+                [*params, *expanded_on_page],
+            ).fetchall()
+            for row in child_rows:
+                domain = row["domain"] or "(unknown)"
+                if domain in groups_by_domain:
+                    groups_by_domain[domain].items.append(_row_to_visit_out(row))
+
+    return VisitDomainPageOut(
+        groups=list(groups_by_domain.values()),
+        total_domains=int(total_domains_row["total_domains"] if total_domains_row else 0),
+        total_urls=int(totals["total_urls"] if totals else 0),
+        total_visit_count=int(totals["total_visit_count"] if totals else 0),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/visit-events", response_model=list[dict])
