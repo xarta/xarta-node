@@ -539,24 +539,30 @@ class _MatrixChatE2EEClient:
         limit: int,
         from_token: str | None = None,
     ) -> dict[str, Any]:
-        from mautrix.types import PaginationDirection, RoomID, SyncToken
+        from mautrix.api import Method, Path
 
         await self.ensure_started()
-        data = await self._client.get_messages(
-            RoomID(room_id),
-            PaginationDirection.BACKWARD,
-            from_token=SyncToken(from_token) if from_token else None,
-            limit=limit,
+        data = await self._client.api.request(
+            Method.GET,
+            Path.v3.rooms[room_id].messages,
+            query_params={
+                "dir": "b",
+                "from": from_token,
+                "limit": str(limit),
+            },
+            metrics_method="getMessages",
         )
-        events = getattr(data, "events", [])
-        messages = [await self.message_from_event(event, room_id) for event in events]
-        messages = [message for message in messages if message]
+        events = data.get("chunk") if isinstance(data, dict) and isinstance(data.get("chunk"), list) else []
+        messages = await self.messages_from_raw_events(room_id, events)
         messages.reverse()
+        end = data.get("end") if isinstance(data, dict) and isinstance(data.get("end"), str) else None
+        start = data.get("start") if isinstance(data, dict) and isinstance(data.get("start"), str) else from_token
         return {
             "room_id": room_id,
             "messages": messages,
-            "start": str(data.start) if data.start else None,
-            "end": str(data.end) if data.end else None,
+            "start": start,
+            "end": end,
+            "at_start": not bool(end),
         }
 
     async def send_message(self, room_id: str, body: str) -> dict[str, Any]:
@@ -1734,6 +1740,7 @@ async def matrix_chat_messages(
         "messages": messages,
         "start": data.get("start") if isinstance(data.get("start"), str) else None,
         "end": data.get("end") if isinstance(data.get("end"), str) else None,
+        "at_start": not isinstance(data.get("end"), str),
     }
 
 

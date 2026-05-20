@@ -547,3 +547,45 @@ async def test_matrix_chat_create_room_can_request_encryption(monkeypatch):
             "content": {"algorithm": "m.megolm.v1.aes-sha2"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_e2ee_messages_treat_missing_end_as_start_of_history(monkeypatch):
+    captured = {}
+
+    class FakeAPI:
+        async def request(self, method, path, *, query_params=None, metrics_method=None):
+            captured["query_params"] = query_params
+            captured["metrics_method"] = metrics_method
+            return {"chunk": [], "start": "t1-start"}
+
+    class FakeClient:
+        api = FakeAPI()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    async def fake_messages_from_raw_events(room_id, events):
+        return []
+
+    monkeypatch.setattr(client, "messages_from_raw_events", fake_messages_from_raw_events)
+
+    result = await client.messages("!room:test", limit=60, from_token="t1-start")
+
+    assert captured["query_params"] == {"dir": "b", "from": "t1-start", "limit": "60"}
+    assert captured["metrics_method"] == "getMessages"
+    assert result == {
+        "room_id": "!room:test",
+        "messages": [],
+        "start": "t1-start",
+        "end": None,
+        "at_start": True,
+    }
