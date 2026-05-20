@@ -402,6 +402,40 @@ def test_narration_review_hard_fails_when_llm_is_required(monkeypatch):
         raise AssertionError("expected narration review to hard-fail without LLM credentials")
 
 
+def test_realtime_transform_profile_skips_llm_narration_review(monkeypatch):
+    monkeypatch.delenv("TTS_NARRATION_REVIEW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+
+    transforms = _MODULE.tts_text_transforms_for_profile("realtime")
+    result = sanitize_tts_text("The build marker was 123456789.", transforms=transforms)
+
+    assert "review_datetime_and_numeric_candidates" not in result.transforms
+    assert result.text == "The build marker was 123456789."
+
+
+def test_realtime_transform_profile_can_explicitly_allow_llm_sanitizer(monkeypatch):
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "classify")
+    monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")
+
+    def fake_decision(_system_prompt, payload, _config):
+        assert payload["candidate"] == "2026.05.19"
+        return {
+            "likely_datetime": True,
+            "speech_text": "May nineteenth twenty twenty six",
+            "keep_in_speech": True,
+        }
+
+    monkeypatch.setattr(_MODULE, "_llm_json_decision", fake_decision)
+    transforms = _MODULE.tts_text_transforms_for_profile(
+        "conversation",
+        allow_llm_sanitizer=True,
+    )
+    result = sanitize_tts_text("The snapshot was taken on 2026.05.19.", transforms=transforms)
+
+    assert "review_datetime_and_numeric_candidates" in result.transforms
+    assert result.text == "The snapshot was taken on May nineteenth twenty twenty six."
+
+
 def test_narration_review_simplifies_spoken_dotted_version_soup(monkeypatch):
     monkeypatch.setenv("TTS_NARRATION_REVIEW_MODE", "rewrite")
     monkeypatch.setenv("TTS_NARRATION_REVIEW_LLM_API_KEY", "test-key")

@@ -55,6 +55,20 @@ def test_blueprints_wrapper_suppresses_upstream_pockettts_sanitizer():
     assert '"transform_profile": "none"' in payload
 
 
+def test_blueprints_wrapper_exposes_realtime_sanitizer_controls():
+    source = Path("/root/xarta-node/blueprints-app/app/routes_tts.py").read_text(encoding="utf-8")
+    assert '"realtime"' in source
+    assert "allow_llm_sanitizer" in source
+    assert "allow_llm_santitizer" in source
+
+
+def test_browser_tts_client_forwards_realtime_sanitizer_controls():
+    source = (WORKSPACE_ROOT / "gui-fallback/js/tts-wrapper-client.js").read_text(encoding="utf-8")
+    assert "transform_profile" in source
+    assert "allow_llm_sanitizer" in source
+    assert "allowLlmSanitizer" in source
+
+
 def test_blueprints_does_not_carry_a_second_tts_sanitizer_implementation():
     assert not Path("/root/xarta-node/blueprints-app/app/tts_sanitizer.py").exists()
 

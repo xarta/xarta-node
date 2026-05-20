@@ -23,6 +23,25 @@ from .tts_sanitizer_client import (
 )
 
 router = APIRouter(prefix="/tts", tags=["tts"])
+TransformProfile = Literal[
+    "default",
+    "speech",
+    "realtime",
+    "real-time",
+    "conversation",
+    "conversational",
+    "live",
+    "none",
+]
+_SANITIZING_TRANSFORM_PROFILES = {
+    "default",
+    "speech",
+    "realtime",
+    "real-time",
+    "conversation",
+    "conversational",
+    "live",
+}
 
 
 _REQUIRED_SETTINGS: tuple[str, ...] = (
@@ -70,7 +89,9 @@ class SpeakRequest(BaseModel):
     sanitize_text: bool | None = None
     sanitise_text: bool | None = None
     tts_sanitize: bool | None = None
-    transform_profile: Literal["default", "speech", "none"] | None = None
+    transform_profile: TransformProfile | None = None
+    allow_llm_sanitizer: bool | None = None
+    allow_llm_santitizer: bool | None = None
 
 
 class StopRequest(BaseModel):
@@ -79,7 +100,9 @@ class StopRequest(BaseModel):
 
 class SanitizeRequest(BaseModel):
     text: str
-    transform_profile: Literal["default", "speech"] | None = None
+    transform_profile: TransformProfile | None = None
+    allow_llm_sanitizer: bool | None = None
+    allow_llm_santitizer: bool | None = None
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -208,7 +231,11 @@ def _should_sanitize_text(body: SpeakRequest) -> bool:
     return any(
         value is True
         for value in (body.sanitize_text, body.sanitise_text, body.tts_sanitize)
-    ) or body.transform_profile in {"default", "speech"}
+    ) or body.transform_profile in _SANITIZING_TRANSFORM_PROFILES
+
+
+def _allow_llm_sanitizer(body: SpeakRequest | SanitizeRequest) -> bool:
+    return bool(body.allow_llm_sanitizer or body.allow_llm_santitizer)
 
 
 async def _start_session(client_key: str, interrupt: bool) -> tuple[_ActiveSession, bool]:
@@ -273,6 +300,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
                 settings=settings,
                 timeout_ms=timeout_ms,
                 transform_profile=body.transform_profile or "speech",
+                allow_llm_sanitizer=_allow_llm_sanitizer(body),
             )
             if _should_sanitize_text(body)
             else None
@@ -419,6 +447,10 @@ async def tts_speak(body: SpeakRequest, request: Request):
     }
     if sanitized:
         headers["X-Blueprints-TTS-Transforms"] = ",".join(sanitized.transforms)
+        headers["X-Blueprints-TTS-Transform-Profile"] = body.transform_profile or "speech"
+        headers["X-Blueprints-TTS-Allow-LLM-Sanitizer"] = (
+            "true" if _allow_llm_sanitizer(body) else "false"
+        )
     upstream_ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
     if upstream_ct.startswith("audio/"):
         media_type = upstream_ct
@@ -441,6 +473,7 @@ async def tts_sanitize(body: SanitizeRequest):
             settings=settings,
             timeout_ms=timeout_ms,
             transform_profile=body.transform_profile or "speech",
+            allow_llm_sanitizer=_allow_llm_sanitizer(body),
         )
     except TtsSanitizerUnavailable as exc:
         return JSONResponse(
@@ -456,6 +489,7 @@ async def tts_sanitize(body: SanitizeRequest):
         "text": result.text,
         "transforms": list(result.transforms),
         "profile": body.transform_profile or "speech",
+        "allow_llm_sanitizer": _allow_llm_sanitizer(body),
         "sanitizer_url": resolve_tts_sanitizer_url(settings),
     }
 
