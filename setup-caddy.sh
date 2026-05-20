@@ -753,6 +753,49 @@ else
     echo "    Skipped Hermes VPS dashboard block (HERMES_VPS_DASHBOARD_EXPOSE not enabled)"
 fi
 
+# ── Optional shared/friends Matrix Synapse block ─────────────────────────────
+# The shared VPS homeserver is reached over the generic VPS service bridge.
+# Thunderbird-1 Caddy remains the browser/client-facing HTTPS boundary and
+# keeps the same internal/private source policy as the local Synapse hostname.
+if [[ -n "${MATRIX_SHARED_HOSTNAME:-}" && -n "${MATRIX_SHARED_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_MATRIX_SHARED
+
+# Matrix Synapse shared/friends server — VPS backend over private bridge.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${MATRIX_SHARED_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_client_well_known {
+        path /.well-known/matrix/client
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @matrix_client_well_known {
+        header Access-Control-Allow-Origin "*"
+        respond \`{"m.homeserver":{"base_url":"https://${MATRIX_SHARED_HOSTNAME}"}}\` 200
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${MATRIX_SHARED_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${MATRIX_SHARED_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_MATRIX_SHARED
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended shared Matrix Synapse block (https://${MATRIX_SHARED_HOSTNAME} -> ${MATRIX_SHARED_UPSTREAM})"
+else
+    echo "    Skipped shared Matrix Synapse block (MATRIX_SHARED_HOSTNAME/MATRIX_SHARED_UPSTREAM not set)"
+fi
+
 # ── Optional remote SearXNG block ────────────────────────────────────────────
 # Site-specific hostnames and bridge-service addresses live in ignored/private
 # config. The public script only appends this block when both values are set.

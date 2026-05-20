@@ -9,6 +9,7 @@ Matrix credentials or generic Matrix API proxy output.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -27,6 +28,20 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 
+_MATRIX_SERVER_LABELS = {
+    "tb1": "TB1",
+    "vps": "VPS",
+}
+_CURRENT_MATRIX_SERVER = contextvars.ContextVar("matrix_chat_server", default="tb1")
+
+
+def _normalize_server_id(value: str | None) -> str:
+    server_id = (value or "tb1").strip().lower()
+    if server_id not in _MATRIX_SERVER_LABELS:
+        raise HTTPException(status_code=400, detail="Unsupported Matrix chat server")
+    return server_id
+
+
 async def _require_matrix_chat_auth(request: Request) -> None:
     """Require Blueprints token auth even on loopback for Matrix chat routes."""
     from . import config as cfg
@@ -42,13 +57,18 @@ async def _require_matrix_chat_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def _select_matrix_server(request: Request) -> None:
+    _CURRENT_MATRIX_SERVER.set(_normalize_server_id(request.query_params.get("server")))
+
+
 router = APIRouter(
     prefix="/matrix-chat",
     tags=["matrix-chat"],
-    dependencies=[Depends(_require_matrix_chat_auth)],
+    dependencies=[Depends(_require_matrix_chat_auth), Depends(_select_matrix_server)],
 )
 
 _DEFAULT_ENV_FILE = "/xarta-node/.lone-wolf/stacks/matrix-synapse/.env"
+_DEFAULT_VPS_ENV_FILE = "/xarta-node/.lone-wolf/stacks/matrix-synapse-vps/.env"
 _DEFAULT_UPSTREAM = "http://127.0.0.1:8008"
 _DEFAULT_PUBLIC_HOMESERVER = "https://matrix.local"
 _DEFAULT_HERMES_USER_ID = ""
@@ -178,11 +198,47 @@ def _read_env_file(path: str) -> dict[str, str]:
     return values
 
 
-def _settings() -> dict[str, str]:
-    env_file = os.getenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", _DEFAULT_ENV_FILE)
+def _server_env_name(name: str, server_id: str) -> str:
+    return f"{name}_{server_id.upper()}"
+
+
+def _server_prefixed_env_name(name: str, server_id: str) -> str:
+    marker = "MATRIX_CHAT_"
+    if name.startswith(f"BLUEPRINTS_{marker}"):
+        return name.replace(f"BLUEPRINTS_{marker}", f"BLUEPRINTS_{marker}{server_id.upper()}_", 1)
+    if name.startswith(marker):
+        return name.replace(marker, f"{marker}{server_id.upper()}_", 1)
+    return _server_env_name(name, server_id)
+
+
+def _settings(server_id: str | None = None) -> dict[str, str]:
+    server_id = _normalize_server_id(server_id or _CURRENT_MATRIX_SERVER.get())
+    env_file = (
+        os.getenv(_server_env_name("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", server_id))
+        or os.getenv(f"BLUEPRINTS_MATRIX_CHAT_{server_id.upper()}_ENV_FILE")
+        or os.getenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE")
+        or (_DEFAULT_VPS_ENV_FILE if server_id == "vps" else _DEFAULT_ENV_FILE)
+    )
     file_values = _read_env_file(env_file)
 
     def pick(*names: str, default: str = "") -> str:
+        for name in names:
+            server_names = (
+                _server_prefixed_env_name(name, server_id),
+                _server_env_name(name, server_id),
+                name,
+            )
+            for candidate in server_names:
+                value = os.getenv(candidate)
+                if value:
+                    return value.strip()
+            for candidate in server_names:
+                value = file_values.get(candidate)
+                if value:
+                    return value.strip()
+        return default
+
+    def pick_global(*names: str, default: str = "") -> str:
         for name in names:
             value = os.getenv(name)
             if value:
@@ -195,7 +251,7 @@ def _settings() -> dict[str, str]:
     upstream = pick(
         "BLUEPRINTS_MATRIX_CHAT_UPSTREAM",
         "MATRIX_CHAT_UPSTREAM",
-        default=os.getenv("MATRIX_SYNAPSE_UPSTREAM", _DEFAULT_UPSTREAM),
+        default=pick_global("MATRIX_SYNAPSE_UPSTREAM", default=_DEFAULT_UPSTREAM),
     )
     if not upstream.startswith(("http://", "https://")):
         upstream = f"http://{upstream}"
@@ -203,7 +259,7 @@ def _settings() -> dict[str, str]:
     public_homeserver = pick(
         "BLUEPRINTS_MATRIX_CHAT_HOMESERVER",
         "MATRIX_CHAT_HOMESERVER",
-        default=os.getenv("MATRIX_SYNAPSE_HOSTNAME", ""),
+        default=pick_global("MATRIX_SYNAPSE_HOSTNAME"),
     )
     if public_homeserver and not public_homeserver.startswith(("http://", "https://")):
         public_homeserver = f"https://{public_homeserver}"
@@ -214,6 +270,8 @@ def _settings() -> dict[str, str]:
     access_token = pick("MATRIX_CHAT_ACCESS_TOKEN", "MATRIX_CODEX_ACCESS_TOKEN")
 
     return {
+        "server_id": server_id,
+        "server_label": _MATRIX_SERVER_LABELS[server_id],
         "env_file": env_file,
         "upstream": upstream.rstrip("/"),
         "public_homeserver": public_homeserver.rstrip("/"),
@@ -246,12 +304,12 @@ def _settings() -> dict[str, str]:
         "hermes_matrix_patch_report": pick(
             "MATRIX_CHAT_HERMES_PATCH_REPORT",
             "BLUEPRINTS_MATRIX_CHAT_HERMES_PATCH_REPORT",
-            default=_DEFAULT_HERMES_MATRIX_PATCH_REPORT,
+            default="" if server_id == "vps" else _DEFAULT_HERMES_MATRIX_PATCH_REPORT,
         ),
         "hermes_command_container": pick(
             "MATRIX_CHAT_HERMES_COMMAND_CONTAINER",
             "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_CONTAINER",
-            default=_DEFAULT_HERMES_COMMAND_CONTAINER,
+            default="" if server_id == "vps" else _DEFAULT_HERMES_COMMAND_CONTAINER,
         ),
         "hermes_command_python": pick(
             "MATRIX_CHAT_HERMES_COMMAND_PYTHON",
@@ -469,9 +527,9 @@ class _MatrixChatE2EEClient:
             try:
                 await olm.verify_with_recovery_key(recovery_key)
                 log.info("Matrix chat E2EE: cross-signing verified via recovery key")
+                return
             except Exception as exc:
                 log.warning("Matrix chat E2EE: recovery key verification failed: %s", exc)
-            return
 
         try:
             own_xsign = await olm.get_own_cross_signing_public_keys()
@@ -479,7 +537,7 @@ class _MatrixChatE2EEClient:
             own_xsign = None
             log.warning("Matrix chat E2EE: cross-signing key lookup failed: %s", exc)
 
-        if own_xsign is not None:
+        if own_xsign:
             return
 
         try:
@@ -902,6 +960,8 @@ def _admin_status_payload(
     health: str = "",
 ) -> dict[str, Any]:
     return {
+        "server_id": settings.get("server_id") or "tb1",
+        "server_label": settings.get("server_label") or "TB1",
         "configured": bool(settings.get("admin_access_token")),
         "reachable": reachable,
         "health": health,
@@ -1020,8 +1080,13 @@ def _filter_hermes_commands(commands: list[dict[str, Any]], query: str) -> list[
 
 
 def _load_hermes_command_catalog(settings: dict[str, str]) -> dict[str, Any]:
-    container = settings.get("hermes_command_container") or _DEFAULT_HERMES_COMMAND_CONTAINER
+    container = settings.get("hermes_command_container") or ""
     python_bin = settings.get("hermes_command_python") or _DEFAULT_HERMES_COMMAND_PYTHON
+    if not container:
+        raise HTTPException(
+            status_code=503,
+            detail="Hermes command catalogue is not configured for this Matrix server",
+        )
     try:
         proc = subprocess.run(
             ["docker", "exec", container, python_bin, "-c", _HERMES_COMMAND_CATALOG_SCRIPT],
@@ -1463,6 +1528,12 @@ async def matrix_chat_status() -> dict[str, Any]:
         reachable = False
 
     return {
+        "server_id": settings["server_id"],
+        "server_label": settings["server_label"],
+        "servers": [
+            {"id": server_id, "label": label}
+            for server_id, label in _MATRIX_SERVER_LABELS.items()
+        ],
         "configured": bool(settings["user_id"] and settings["access_token"]),
         "reachable": reachable,
         "health": health,
@@ -1611,12 +1682,14 @@ async def matrix_chat_rooms() -> dict[str, Any]:
 
 @router.post("/rooms")
 async def matrix_chat_create_room(body: _CreateRoomBody) -> dict[str, Any]:
+    settings = _settings()
+    force_encrypted = settings["server_id"] == "vps" and _e2ee_requested(settings)
     payload: dict[str, Any] = {
         "name": body.name.strip(),
         "preset": "private_chat",
         "visibility": "private",
     }
-    if body.encrypted:
+    if body.encrypted or force_encrypted:
         payload["initial_state"] = [
             {
                 "type": "m.room.encryption",
