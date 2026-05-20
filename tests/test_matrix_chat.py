@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -43,6 +44,50 @@ def test_matrix_chat_reads_private_env_without_exposing_token(tmp_path, monkeypa
         "hermes_user_id": "@hermes:test.example",
     }
     assert "secret-token-value" not in repr(status)
+
+
+def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):
+    report_path = tmp_path / "matrix_platform_patch.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "generated_at_epoch": 1779292232,
+                "checks": [
+                    {"id": "alias_mentions_leading_at_only", "message": "alias guard", "ok": False},
+                    {"id": "env_allowed_rooms_set", "message": "rooms set", "ok": True},
+                ],
+                "env": {"MATRIX_ACCESS_TOKEN": "must-not-leak"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = matrix_chat._hermes_matrix_patch_status(str(report_path))
+    rendered = repr(status)
+
+    assert status == {
+        "available": True,
+        "ok": False,
+        "generated_at_epoch": 1779292232,
+        "failed_checks": [
+            {"id": "alias_mentions_leading_at_only", "message": "alias guard"}
+        ],
+        "error": "",
+    }
+    assert "must-not-leak" not in rendered
+
+
+def test_matrix_chat_hermes_matrix_patch_status_handles_missing_report(tmp_path):
+    status = matrix_chat._hermes_matrix_patch_status(str(tmp_path / "missing.json"))
+
+    assert status == {
+        "available": False,
+        "ok": None,
+        "generated_at_epoch": None,
+        "failed_checks": [],
+        "error": "report not found",
+    }
 
 
 def test_matrix_chat_room_and_message_mapping_do_not_return_credentials():
@@ -124,6 +169,34 @@ def test_matrix_chat_room_mapping_marks_missing_names_as_fallback():
     assert joined[0]["name"] == "!roomwithnoname:test.example"
     assert joined[0]["display_name"].startswith("Unnamed room (")
     assert joined[0]["name_source"] == "fallback_room_id"
+
+
+def test_matrix_chat_room_mapping_infers_encryption_from_encrypted_timeline_event():
+    sync = {
+        "rooms": {
+            "join": {
+                "!bridge:test.example": {
+                    "state": {"events": []},
+                    "timeline": {
+                        "events": [
+                            {
+                                "type": "m.room.encrypted",
+                                "event_id": "$encrypted",
+                                "sender": "@hermes:test.example",
+                                "origin_server_ts": 1710000000002,
+                                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    }
+
+    joined, _ = matrix_chat._rooms_from_sync(sync)
+
+    assert joined[0]["encrypted"] is True
+    assert joined[0]["last_preview"] == "[encrypted event]"
 
 
 def test_matrix_chat_invite_candidate_filter_excludes_members_self_and_admin():
