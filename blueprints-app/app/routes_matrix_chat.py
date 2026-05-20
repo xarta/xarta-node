@@ -9,6 +9,8 @@ Matrix credentials or generic Matrix API proxy output.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import time
 import uuid
@@ -19,6 +21,8 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 
 async def _require_matrix_chat_auth(request: Request) -> None:
@@ -53,6 +57,9 @@ _MAX_MESSAGE_LIMIT = 100
 _MAX_SYNC_TIMEOUT_MS = 30_000
 _DEFAULT_CRYPTO_STORE_DIR = (
     "/xarta-node/.lone-wolf/stacks/matrix-synapse/data/blueprints-chat/crypto-store"
+)
+_DEFAULT_HERMES_MATRIX_PATCH_REPORT = (
+    "/xarta-node/.lone-wolf/stacks/hermes-local/data/health/matrix_platform_patch.json"
 )
 
 
@@ -156,10 +163,16 @@ def _settings() -> dict[str, str]:
         ),
         "encryption": pick("MATRIX_CHAT_ENCRYPTION", "BLUEPRINTS_MATRIX_CHAT_ENCRYPTION"),
         "device_id": pick("MATRIX_CHAT_DEVICE_ID", "BLUEPRINTS_MATRIX_CHAT_DEVICE_ID"),
+        "recovery_key": pick("MATRIX_CHAT_RECOVERY_KEY", "BLUEPRINTS_MATRIX_CHAT_RECOVERY_KEY"),
         "crypto_store_dir": pick(
             "MATRIX_CHAT_CRYPTO_STORE_DIR",
             "BLUEPRINTS_MATRIX_CHAT_CRYPTO_STORE_DIR",
             default=_DEFAULT_CRYPTO_STORE_DIR,
+        ),
+        "hermes_matrix_patch_report": pick(
+            "MATRIX_CHAT_HERMES_PATCH_REPORT",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_PATCH_REPORT",
+            default=_DEFAULT_HERMES_MATRIX_PATCH_REPORT,
         ),
     }
 
@@ -216,6 +229,12 @@ def _secure_crypto_store(store_dir: Path) -> None:
                 path.chmod(0o600)
             except OSError:
                 pass
+    recovery_path = store_dir / "recovery-key.txt"
+    if recovery_path.is_file():
+        try:
+            recovery_path.chmod(0o600)
+        except OSError:
+            pass
 
 
 class _MatrixCryptoStateStore:
@@ -248,6 +267,7 @@ class _MatrixChatE2EEClient:
         self._settings = dict(settings)
         self._store_dir = Path(settings["crypto_store_dir"])
         self._crypto_db_path = self._store_dir / "crypto.db"
+        self._recovery_key_path = self._store_dir / "recovery-key.txt"
         self._client: Any = None
         self._api: Any = None
         self._crypto_db: Any = None
@@ -335,12 +355,70 @@ class _MatrixChatE2EEClient:
         olm.send_keys_min_trust = TrustState.UNVERIFIED
         await olm.load()
         await olm.share_keys()
+        await self._ensure_cross_signing(olm)
         self._client.crypto = olm
 
         data = await self._client.sync(timeout=1000, full_state=True)
         await self._handle_sync_data(data if isinstance(data, dict) else {})
         self._started = True
         _secure_crypto_store(self._store_dir)
+
+    async def _ensure_cross_signing(self, olm: Any) -> None:
+        """Bootstrap or restore cross-signing for the server-side Matrix device."""
+        recovery_key = self._settings.get("recovery_key", "").strip()
+        if not recovery_key and self._recovery_key_path.is_file():
+            try:
+                recovery_key = self._recovery_key_path.read_text(encoding="utf-8").strip()
+                if recovery_key:
+                    log.info(
+                        "Matrix chat E2EE: loaded recovery key from private store file %s",
+                        self._recovery_key_path,
+                    )
+            except OSError as exc:
+                log.warning(
+                    "Matrix chat E2EE: could not read private recovery key file %s: %s",
+                    self._recovery_key_path,
+                    exc,
+                )
+
+        if recovery_key:
+            try:
+                await olm.verify_with_recovery_key(recovery_key)
+                log.info("Matrix chat E2EE: cross-signing verified via recovery key")
+            except Exception as exc:
+                log.warning("Matrix chat E2EE: recovery key verification failed: %s", exc)
+            return
+
+        try:
+            own_xsign = await olm.get_own_cross_signing_public_keys()
+        except Exception as exc:
+            own_xsign = None
+            log.warning("Matrix chat E2EE: cross-signing key lookup failed: %s", exc)
+
+        if own_xsign is not None:
+            return
+
+        try:
+            new_recovery_key = await olm.generate_recovery_key()
+            self._recovery_key_path.parent.mkdir(parents=True, exist_ok=True)
+            self._recovery_key_path.write_text(new_recovery_key + "\n", encoding="utf-8")
+            self._recovery_key_path.chmod(0o600)
+            log.warning(
+                "Matrix chat E2EE: bootstrapped cross-signing for %s. "
+                "Recovery key was written to private store file %s. "
+                "Move it into private secret storage and set MATRIX_CHAT_RECOVERY_KEY "
+                "for future restarts if desired.",
+                self._settings.get("user_id") or "(unknown user)",
+                self._recovery_key_path,
+            )
+        except Exception as exc:
+            log.warning(
+                "Matrix chat E2EE: cross-signing bootstrap failed "
+                "(non-fatal; service device remains unverified): %s",
+                exc,
+            )
+        finally:
+            _secure_crypto_store(self._store_dir)
 
     async def _handle_sync_data(self, data: dict[str, Any]) -> None:
         rooms_join = data.get("rooms", {}).get("join", {})
@@ -747,6 +825,50 @@ def _admin_status_payload(
     }
 
 
+def _hermes_matrix_patch_status(path: str) -> dict[str, Any]:
+    report_path = Path(path)
+    if not report_path.is_file():
+        return {
+            "available": False,
+            "ok": None,
+            "generated_at_epoch": None,
+            "failed_checks": [],
+            "error": "report not found",
+        }
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "available": False,
+            "ok": None,
+            "generated_at_epoch": None,
+            "failed_checks": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    checks = report.get("checks") if isinstance(report, dict) else []
+    failed = []
+    if isinstance(checks, list):
+        for item in checks:
+            if not isinstance(item, dict) or item.get("ok") is True:
+                continue
+            failed.append(
+                {
+                    "id": _safe_str(item.get("id")),
+                    "message": _safe_str(item.get("message")),
+                }
+            )
+    return {
+        "available": True,
+        "ok": bool(report.get("ok")) if isinstance(report, dict) else False,
+        "generated_at_epoch": _safe_int(report.get("generated_at_epoch"))
+        if isinstance(report, dict)
+        else None,
+        "failed_checks": failed[:20],
+        "error": "",
+    }
+
+
 def _event_content(event: dict[str, Any]) -> dict[str, Any]:
     content = event.get("content")
     return content if isinstance(content, dict) else {}
@@ -860,7 +982,7 @@ def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | Non
             name_source = "m.room.name"
         elif event_type == "m.room.canonical_alias" and isinstance(content.get("alias"), str):
             canonical_alias = content["alias"]
-        elif event_type == "m.room.encryption":
+        elif event_type in {"m.room.encryption", "m.room.encrypted"}:
             encrypted = True
         elif event_type == "m.room.member" and content.get("membership") in {"join", "invite"}:
             display = content.get("displayname")
@@ -1123,6 +1245,9 @@ async def matrix_chat_status() -> dict[str, Any]:
         "user_id": settings["user_id"] or None,
         "default_room_id": settings["smoke_room_id"],
         "hermes_user_id": settings["hermes_user_id"],
+        "hermes_matrix_patch": _hermes_matrix_patch_status(
+            settings["hermes_matrix_patch_report"]
+        ),
         "features": {
             "e2ee": _e2ee_requested(settings) and e2ee_deps_ok,
             "e2ee_requested": _e2ee_requested(settings),
