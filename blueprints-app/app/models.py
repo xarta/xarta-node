@@ -1266,6 +1266,30 @@ class VisitOut(BaseModel):
     updated_at: Optional[str] = None
 
 
+class VisitPageOut(BaseModel):
+    items: list[VisitOut]
+    total: int
+    total_visit_count: int
+    limit: int
+    offset: int
+
+
+class VisitDomainOut(BaseModel):
+    domain: str
+    url_count: int
+    total_visit_count: int
+    items: list[VisitOut] = []
+
+
+class VisitDomainPageOut(BaseModel):
+    groups: list[VisitDomainOut]
+    total_domains: int
+    total_urls: int
+    total_visit_count: int
+    limit: int
+    offset: int
+
+
 # ── Nav Items ─────────────────────────────────────────────────────────────────
 
 # ── Form Controls ────────────────────────────────────────────────────────────
