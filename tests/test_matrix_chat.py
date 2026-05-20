@@ -90,6 +90,111 @@ def test_matrix_chat_hermes_matrix_patch_status_handles_missing_report(tmp_path)
     }
 
 
+def test_matrix_chat_message_content_adds_explicit_mxid_mentions():
+    content = matrix_chat._matrix_message_content(
+        "Hello @hermes:test.example and @operator:test.example"
+    )
+
+    assert content == {
+        "msgtype": "m.text",
+        "body": "Hello @hermes:test.example and @operator:test.example",
+        "m.mentions": {
+            "user_ids": ["@hermes:test.example", "@operator:test.example"],
+        },
+    }
+
+
+def test_matrix_chat_room_mention_candidates_from_state_excludes_self():
+    users = matrix_chat._room_mention_candidates_from_state(
+        [
+            {
+                "type": "m.room.member",
+                "state_key": "@codex:test.example",
+                "content": {"membership": "join", "displayname": "AI-Admin"},
+            },
+            {
+                "type": "m.room.member",
+                "state_key": "@hermes:test.example",
+                "content": {"membership": "join", "displayname": "Hermes-TB1"},
+            },
+            {
+                "type": "m.room.member",
+                "state_key": "@operator:test.example",
+                "content": {"membership": "leave", "displayname": "Davros"},
+            },
+        ],
+        current_user_id="@codex:test.example",
+        query="herm",
+    )
+
+    assert users == [{"user_id": "@hermes:test.example", "display_name": "Hermes-TB1"}]
+
+
+def test_matrix_chat_hermes_command_catalog_reduces_subprocess_output(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "commands": [
+                    {
+                        "name": "/help",
+                        "insert": "/help",
+                        "description": "Show help",
+                        "category": "Info",
+                        "source": "core",
+                        "aliases": ["/h"],
+                        "requires_argument": False,
+                    },
+                    {
+                        "name": "not-a-command",
+                        "description": "drop me",
+                    },
+                ]
+            }
+        )
+        stderr = ""
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Result()
+
+    monkeypatch.setattr(matrix_chat.subprocess, "run", fake_run)
+
+    catalogue = matrix_chat._load_hermes_command_catalog(
+        {
+            "hermes_command_container": "hermes-local",
+            "hermes_command_python": "/opt/hermes/.venv/bin/python",
+        }
+    )
+
+    assert captured["args"][:4] == [
+        "docker",
+        "exec",
+        "hermes-local",
+        "/opt/hermes/.venv/bin/python",
+    ]
+    assert captured["kwargs"]["timeout"] == matrix_chat._HERMES_COMMAND_CATALOG_TIMEOUT
+    assert catalogue == {
+        "source": "hermes",
+        "commands": [
+            {
+                "name": "/help",
+                "insert": "/help",
+                "description": "Show help",
+                "category": "Info",
+                "source": "core",
+                "args_hint": "",
+                "aliases": ["/h"],
+                "requires_argument": False,
+            }
+        ],
+        "total": 1,
+    }
+
+
 def test_matrix_chat_room_and_message_mapping_do_not_return_credentials():
     sync = {
         "next_batch": "s123",

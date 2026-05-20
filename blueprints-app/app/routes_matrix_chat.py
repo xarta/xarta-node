@@ -12,6 +12,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -61,6 +63,78 @@ _DEFAULT_CRYPTO_STORE_DIR = (
 _DEFAULT_HERMES_MATRIX_PATCH_REPORT = (
     "/xarta-node/.lone-wolf/stacks/hermes-local/data/health/matrix_platform_patch.json"
 )
+_DEFAULT_HERMES_COMMAND_CONTAINER = "hermes-local"
+_DEFAULT_HERMES_COMMAND_PYTHON = "/opt/hermes/.venv/bin/python"
+_HERMES_COMMAND_CATALOG_TIMEOUT = 8
+_MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
+_HERMES_COMMAND_CATALOG_SCRIPT = r"""
+import json
+
+from hermes_cli.commands import (
+    COMMAND_REGISTRY,
+    _is_gateway_available,
+    _iter_plugin_command_entries,
+    _requires_argument,
+    _resolve_config_gates,
+)
+
+
+def item(name, description, category, source, args_hint="", aliases=None):
+    insert = f"/{name}"
+    if args_hint:
+        insert += " "
+    return {
+        "name": f"/{name}",
+        "insert": insert,
+        "description": description,
+        "category": category,
+        "source": source,
+        "args_hint": args_hint,
+        "aliases": [f"/{alias}" for alias in aliases or []],
+        "requires_argument": _requires_argument(args_hint),
+    }
+
+
+commands = []
+overrides = _resolve_config_gates()
+for cmd in COMMAND_REGISTRY:
+    if not _is_gateway_available(cmd, overrides):
+        continue
+    commands.append(
+        item(
+            cmd.name,
+            cmd.description,
+            cmd.category,
+            "core",
+            cmd.args_hint,
+            cmd.aliases,
+        )
+    )
+
+for name, description, args_hint in _iter_plugin_command_entries():
+    commands.append(item(name, description, "Plugins", "plugin", args_hint))
+
+try:
+    from agent.skill_commands import get_skill_commands
+
+    for cmd_key, info in sorted(get_skill_commands().items()):
+        name = str(cmd_key).lstrip("/")
+        if not name:
+            continue
+        commands.append(
+            item(
+                name,
+                str(info.get("description") or f"Load {name} skill"),
+                "Skills",
+                "skill",
+                "<instruction>",
+            )
+        )
+except Exception:
+    pass
+
+print(json.dumps({"commands": commands}, ensure_ascii=True))
+"""
 
 
 class _CreateRoomBody(BaseModel):
@@ -173,6 +247,16 @@ def _settings() -> dict[str, str]:
             "MATRIX_CHAT_HERMES_PATCH_REPORT",
             "BLUEPRINTS_MATRIX_CHAT_HERMES_PATCH_REPORT",
             default=_DEFAULT_HERMES_MATRIX_PATCH_REPORT,
+        ),
+        "hermes_command_container": pick(
+            "MATRIX_CHAT_HERMES_COMMAND_CONTAINER",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_CONTAINER",
+            default=_DEFAULT_HERMES_COMMAND_CONTAINER,
+        ),
+        "hermes_command_python": pick(
+            "MATRIX_CHAT_HERMES_COMMAND_PYTHON",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_PYTHON",
+            default=_DEFAULT_HERMES_COMMAND_PYTHON,
         ),
     }
 
@@ -482,7 +566,7 @@ class _MatrixChatE2EEClient:
         event_id = await self._client.send_message_event(
             RoomID(room_id),
             EventType.ROOM_MESSAGE,
-            {"msgtype": "m.text", "body": body},
+            _matrix_message_content(body),
         )
         _secure_crypto_store(self._store_dir)
         return {"room_id": room_id, "event_id": str(event_id)}
@@ -869,6 +953,110 @@ def _hermes_matrix_patch_status(path: str) -> dict[str, Any]:
     }
 
 
+def _mentions_from_body(body: str) -> list[str]:
+    seen: set[str] = set()
+    mentions: list[str] = []
+    for match in _MXID_MENTION_RE.finditer(body or ""):
+        user_id = match.group(1)
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        mentions.append(user_id)
+    return mentions[:20]
+
+
+def _matrix_message_content(body: str) -> dict[str, Any]:
+    content: dict[str, Any] = {"msgtype": "m.text", "body": body}
+    mentions = _mentions_from_body(body)
+    if mentions:
+        content["m.mentions"] = {"user_ids": mentions}
+    return content
+
+
+def _normalize_hermes_command(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    name = _safe_str(raw.get("name"))
+    insert = _safe_str(raw.get("insert")) or name
+    if not name.startswith("/") or not insert.startswith("/"):
+        return None
+    aliases_raw = raw.get("aliases") if isinstance(raw.get("aliases"), list) else []
+    aliases = [_safe_str(alias) for alias in aliases_raw if _safe_str(alias).startswith("/")]
+    return {
+        "name": name[:80],
+        "insert": insert[:120],
+        "description": _safe_str(raw.get("description"))[:240],
+        "category": _safe_str(raw.get("category"))[:80] or "Commands",
+        "source": _safe_str(raw.get("source"))[:40] or "core",
+        "args_hint": _safe_str(raw.get("args_hint"))[:120],
+        "aliases": aliases[:12],
+        "requires_argument": bool(raw.get("requires_argument")),
+    }
+
+
+def _filter_hermes_commands(commands: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    needle = query.strip().lower().lstrip("/")
+    if not needle:
+        return commands[:120]
+    filtered = []
+    for command in commands:
+        haystack = " ".join(
+            [
+                str(command.get("name") or ""),
+                str(command.get("description") or ""),
+                str(command.get("category") or ""),
+                " ".join(str(alias) for alias in command.get("aliases") or []),
+            ]
+        ).lower()
+        if needle in haystack.lstrip("/"):
+            filtered.append(command)
+    return filtered[:120]
+
+
+def _load_hermes_command_catalog(settings: dict[str, str]) -> dict[str, Any]:
+    container = settings.get("hermes_command_container") or _DEFAULT_HERMES_COMMAND_CONTAINER
+    python_bin = settings.get("hermes_command_python") or _DEFAULT_HERMES_COMMAND_PYTHON
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", container, python_bin, "-c", _HERMES_COMMAND_CATALOG_SCRIPT],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_HERMES_COMMAND_CATALOG_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Hermes command catalogue unavailable: {type(exc).__name__}",
+        ) from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "Hermes command catalogue command failed").strip()
+        raise HTTPException(status_code=503, detail=detail[:240])
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=503, detail="Hermes command catalogue returned invalid JSON") from exc
+    raw_commands = data.get("commands") if isinstance(data, dict) else []
+    commands = [
+        command
+        for command in (_normalize_hermes_command(raw) for raw in raw_commands if isinstance(raw, dict))
+        if command
+    ]
+    commands.sort(
+        key=lambda item: (
+            {"core": 0, "plugin": 1, "skill": 2}.get(str(item.get("source") or ""), 9),
+            str(item.get("name") or "").lower(),
+        )
+    )
+    return {
+        "source": "hermes",
+        "commands": commands,
+        "total": len(commands),
+    }
+
+
 def _event_content(event: dict[str, Any]) -> dict[str, Any]:
     content = event.get("content")
     return content if isinstance(content, dict) else {}
@@ -1106,6 +1294,37 @@ def _configured_user_candidates(settings: dict[str, str]) -> list[dict[str, Any]
             }
         )
     return candidates
+
+
+def _room_mention_candidates_from_state(
+    events: list[dict[str, Any]],
+    *,
+    current_user_id: str,
+    query: str,
+) -> list[dict[str, Any]]:
+    rows = _room_member_rows_from_state(events)
+    candidates: list[dict[str, Any]] = []
+    for row in rows.values():
+        if row.get("membership") not in {"join", "invite"}:
+            continue
+        user_id = str(row.get("user_id") or "")
+        if not user_id or user_id == current_user_id:
+            continue
+        candidate = {
+            "user_id": user_id,
+            "display_name": row.get("display_name") or _matrix_localpart(user_id),
+            "is_admin": False,
+            "deactivated": False,
+        }
+        if _candidate_matches_query(candidate, query):
+            candidates.append(
+                {
+                    "user_id": user_id,
+                    "display_name": str(candidate["display_name"]),
+                }
+            )
+    candidates.sort(key=lambda item: (item["display_name"].lower(), item["user_id"]))
+    return candidates[:50]
 
 
 async def _room_member_user_ids(room_id: str) -> set[str]:
@@ -1455,6 +1674,42 @@ async def matrix_chat_invite_candidates(
     }
 
 
+@router.get("/rooms/{room_id}/mention-candidates")
+async def matrix_chat_mention_candidates(
+    room_id: str,
+    q: str = Query(default="", max_length=80),
+) -> dict[str, Any]:
+    settings = _require_credentials()
+    encoded_room = quote(room_id, safe="")
+    data = await _matrix_request_any("GET", f"/rooms/{encoded_room}/state")
+    events = data if isinstance(data, list) else []
+    return {
+        "room_id": room_id,
+        "query": q,
+        "users": _room_mention_candidates_from_state(
+            events,
+            current_user_id=settings["user_id"],
+            query=q,
+        ),
+    }
+
+
+@router.get("/hermes/commands")
+async def matrix_chat_hermes_commands(
+    q: str = Query(default="", max_length=80),
+) -> dict[str, Any]:
+    settings = _settings()
+    catalogue = await asyncio.to_thread(_load_hermes_command_catalog, settings)
+    commands = catalogue.get("commands") if isinstance(catalogue.get("commands"), list) else []
+    filtered = _filter_hermes_commands(commands, q)
+    return {
+        "source": catalogue.get("source") or "hermes",
+        "query": q,
+        "total": catalogue.get("total") if isinstance(catalogue.get("total"), int) else len(commands),
+        "commands": filtered,
+    }
+
+
 @router.get("/rooms/{room_id}/messages")
 async def matrix_chat_messages(
     room_id: str,
@@ -1494,7 +1749,7 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
     data = await _matrix_request(
         "PUT",
         f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
-        json_body={"msgtype": "m.text", "body": body.body},
+        json_body=_matrix_message_content(body.body),
         expected=(200,),
     )
     return {
