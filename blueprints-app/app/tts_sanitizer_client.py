@@ -72,6 +72,7 @@ async def sanitize_tts_text_via_service(
     settings: Mapping[str, str] | None = None,
     timeout_ms: int,
     transform_profile: str = "speech",
+    allow_llm_sanitizer: bool = False,
 ) -> TtsSanitizeResult:
     result_text, transforms = await _post_text_service(
         resolve_tts_sanitizer_url(settings),
@@ -79,6 +80,7 @@ async def sanitize_tts_text_via_service(
             "text": text,
             "sanitize_text": transform_profile != "none",
             "transform_profile": transform_profile or "speech",
+            "allow_llm_sanitizer": allow_llm_sanitizer,
         },
         timeout_ms=timeout_ms,
     )
