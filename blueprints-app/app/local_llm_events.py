@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .db import get_conn
 from .events import AppEvent, bus
+from .system_notifier import notifier_primary_enabled, post_notifier_event
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +125,19 @@ async def publish_local_llm_offline_event(
             "dedupe_seconds": _OFFLINE_DEDUPE_SECONDS,
         },
     )
+    notifier_ok = await post_notifier_event(
+        event_type=event.event_type,
+        title=event.title,
+        message=event.message,
+        severity=event.severity,
+        source_component=event.source,
+        tags=["blueprints", "litellm", "local-llm"],
+        data=event.payload,
+        importance="urgent1",
+        dedupe_key=dedupe_key,
+    )
+    if notifier_primary_enabled() and notifier_ok:
+        return
     try:
         _persist(event)
         await bus.publish(event)

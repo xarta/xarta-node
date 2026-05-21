@@ -66,6 +66,7 @@ from .routes_matrix_chat import router as matrix_chat_router
 from .routes_nav_items import router as nav_items_router
 from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
+from .routes_notifier_dnd import router as notifier_dnd_router
 from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_playwright import router as playwright_router
 from .routes_pockettts import router as pockettts_router
@@ -352,6 +353,7 @@ def create_app() -> FastAPI:
     application.include_router(services_router, prefix="/api/v1")
     application.include_router(machines_router, prefix="/api/v1")
     application.include_router(nodes_router, prefix="/api/v1")
+    application.include_router(notifier_dnd_router, prefix="/api/v1")
     application.include_router(schema_router, prefix="/api/v1")
     application.include_router(sync_router, prefix="/api/v1")
     application.include_router(backup_router, prefix="/api/v1")
