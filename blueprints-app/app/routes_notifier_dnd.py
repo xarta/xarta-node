@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -11,6 +12,8 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .events import AppEvent
+from .routes_events import publish_event
 from .system_notifier import post_notifier_event
 
 router = APIRouter(prefix="/notifier-dnd", tags=["notifier-dnd"])
@@ -34,6 +37,7 @@ DndMode = Literal[
 
 _CONFIG_PATH = Path("/xarta-node/.lone-wolf/config/system-bridge-notifier-dnd.json")
 _DANGER2_STATE_PATH = Path("/xarta-node/.lone-wolf/state/notifier-danger2-control.json")
+_NOTIFIER_STACK_DIR = Path("/xarta-node/.lone-wolf/stacks/system-bridge-notifier")
 _LISTENER_TTL_SECONDS = 20.0
 _listener_heartbeats: dict[str, dict[str, str | float]] = {}
 _speech_claims: dict[str, dict[str, str | float]] = {}
@@ -127,6 +131,22 @@ class Danger2State(BaseModel):
 
 class Danger2CancelResponse(Danger2State):
     notification_submitted: bool = False
+
+
+class NotifierFailureDrillRequest(BaseModel):
+    confirmed: bool = False
+
+
+class NotifierFailureDrillResponse(BaseModel):
+    ok: bool
+    status: str
+    test_id: str
+    event_id: str
+    attempted_event_id: str
+    notifier_submission_failed: bool
+    warning_published: bool
+    stop_ok: bool
+    restart_ok: bool
 
 
 _NOTIFIER_TESTS: dict[str, dict[str, Any]] = {
@@ -322,6 +342,61 @@ def _listener_counts() -> tuple[int, int]:
     return phones, desktops
 
 
+async def _run_notifier_stack_command(*args: str, timeout_seconds: float = 60.0) -> tuple[bool, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "docker",
+        "compose",
+        *args,
+        cwd=str(_NOTIFIER_STACK_DIR),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return False, "docker compose command timed out"
+    output = (stdout + stderr).decode("utf-8", "replace").strip()
+    return proc.returncode == 0, output[-2000:]
+
+
+async def _publish_notifier_failure_warning(
+    *,
+    fallback_event_id: str,
+    attempted_event_id: str,
+    restart_ok: bool,
+) -> None:
+    message = (
+        "System Bridge notifier failure drill. The notifier submission failed, "
+        "and the fallback warning path is working."
+    )
+    if not restart_ok:
+        message += " The notifier stack restart reported a problem."
+    event = AppEvent.create(
+        event_id=fallback_event_id,
+        event_type="system_bridge_notifier.failure.drill",
+        title="Notifier failure drill",
+        message=message,
+        severity="error",
+        source="blueprints-notifier-tests",
+        payload={
+            "event_type": "system_bridge_notifier.failure.drill",
+            "blueprints_event_type": "system_bridge_notifier.failure.drill",
+            "importance": "danger1",
+            "speech": f"Warning. {message}",
+            "test_id": "notifier_failure_warning",
+            "source_component": "blueprints-notifier-tests",
+            "frontend_contract": "notification-tests-modal",
+            "test_broadcast_speech": True,
+            "notifier_failure_fallback": True,
+            "attempted_notifier_event_id": attempted_event_id,
+            "restart_ok": restart_ok,
+        },
+    )
+    await publish_event(event)
+
+
 @router.get("/config", response_model=NotifierDndConfig)
 async def get_notifier_dnd_config() -> NotifierDndConfig:
     return _read_config()
@@ -424,6 +499,84 @@ async def submit_notifier_test(body: NotifierTestRequest) -> NotifierTestRespons
         status="submitted_to_notifier",
         test_id=body.test_id,
         event_id=event_id,
+    )
+
+
+@router.post("/tests/notifier-failure-drill", response_model=NotifierFailureDrillResponse)
+async def run_notifier_failure_drill(
+    body: NotifierFailureDrillRequest,
+) -> NotifierFailureDrillResponse:
+    if not body.confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail="The notifier failure drill requires confirmation",
+        )
+
+    attempted_event_id = f"notifier-failure-drill-attempt-{uuid.uuid4().hex[:12]}"
+    fallback_event_id = f"notifier-failure-drill-warning-{uuid.uuid4().hex[:12]}"
+    stop_ok = False
+    restart_ok = False
+    warning_published = False
+    notifier_submission_failed = False
+
+    try:
+        stop_ok, _stop_output = await _run_notifier_stack_command("stop")
+        if not stop_ok:
+            raise HTTPException(
+                status_code=502,
+                detail="failed to stop system-bridge-notifier Dockge stack",
+            )
+
+        submitted = await post_notifier_event(
+            event_id=attempted_event_id,
+            event_type="system_bridge_notifier.failure.drill_attempt",
+            title="Notifier failure drill attempt",
+            message="This notifier event is expected to fail because the notifier stack is stopped.",
+            severity="error",
+            source_component="blueprints-notifier-tests",
+            destinations=["matrix", "blueprints"],
+            tags=["blueprints-notifier-tests", "notifier-failure-drill"],
+            data={
+                "event_type": "system_bridge_notifier.failure.drill_attempt",
+                "blueprints_event_type": "system_bridge_notifier.failure.drill_attempt",
+                "importance": "danger1",
+                "test_id": "notifier_failure_warning",
+                "source_component": "blueprints-notifier-tests",
+            },
+            importance="danger1",
+            dedupe_key=attempted_event_id,
+        )
+        notifier_submission_failed = not submitted
+    finally:
+        restart_ok, _restart_output = await _run_notifier_stack_command(
+            "up",
+            "-d",
+            timeout_seconds=90.0,
+        )
+
+    if not notifier_submission_failed:
+        raise HTTPException(
+            status_code=502,
+            detail="failure drill did not observe notifier submission failure",
+        )
+
+    await _publish_notifier_failure_warning(
+        fallback_event_id=fallback_event_id,
+        attempted_event_id=attempted_event_id,
+        restart_ok=restart_ok,
+    )
+    warning_published = True
+
+    return NotifierFailureDrillResponse(
+        ok=True,
+        status="notifier_failure_warning_published",
+        test_id="notifier_failure_warning",
+        event_id=fallback_event_id,
+        attempted_event_id=attempted_event_id,
+        notifier_submission_failed=notifier_submission_failed,
+        warning_published=warning_published,
+        stop_ok=stop_ok,
+        restart_ok=restart_ok,
     )
 
 
