@@ -4,6 +4,9 @@
 .env.backup*
 .env.*.bak*
 .env.*.backup*
+.env.*_bak
+*_bak
+*.bak
 .nodes.json
 .xarta/
 .lone-wolf/
