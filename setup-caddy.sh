@@ -478,9 +478,17 @@ https://${MATRIX_SYNAPSE_HOSTNAME} {
         remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
     }
 
+    @matrix_federation {
+        path /_matrix/federation/* /_matrix/key/*
+    }
+
     handle @matrix_client_well_known {
         header Access-Control-Allow-Origin "*"
         respond \`{"m.homeserver":{"base_url":"https://${MATRIX_SYNAPSE_HOSTNAME}"}}\` 200
+    }
+
+    handle @matrix_federation {
+        respond 404
     }
 
     handle @xarta_internal {
@@ -809,9 +817,17 @@ https://${MATRIX_SHARED_HOSTNAME} {
         remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
     }
 
+    @matrix_federation {
+        path /_matrix/federation/* /_matrix/key/*
+    }
+
     handle @matrix_client_well_known {
         header Access-Control-Allow-Origin "*"
         respond \`{"m.homeserver":{"base_url":"https://${MATRIX_SHARED_HOSTNAME}"}}\` 200
+    }
+
+    handle @matrix_federation {
+        respond 404
     }
 
     handle @xarta_internal {
