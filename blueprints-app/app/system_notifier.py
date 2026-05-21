@@ -56,7 +56,7 @@ async def post_notifier_event(
     """Submit an operator event to system-bridge-notifier.
 
     Returns ``False`` when notifier config is absent or submission fails. Callers
-    can then use their legacy local SSE path as a migration fallback.
+    can then use an explicitly named notifier-failure fallback path.
     """
     url = _notifier_url()
     token = _notifier_token()
