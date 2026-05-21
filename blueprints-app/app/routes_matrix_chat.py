@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -85,6 +86,7 @@ _DEFAULT_HERMES_MATRIX_PATCH_REPORT = (
 )
 _DEFAULT_HERMES_COMMAND_CONTAINER = "hermes-local"
 _DEFAULT_HERMES_COMMAND_PYTHON = "/opt/hermes/.venv/bin/python"
+_DEFAULT_ROOM_SETTINGS_FILE = "/xarta-node/.lone-wolf/stacks/matrix-chat/data/room-settings.json"
 _HERMES_COMMAND_CATALOG_TIMEOUT = 8
 _MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 _HERMES_COMMAND_CATALOG_SCRIPT = r"""
@@ -174,6 +176,10 @@ class _InviteBody(BaseModel):
 
 class _SendMessageBody(BaseModel):
     body: str = Field(min_length=1, max_length=8000)
+
+
+class _RoomSettingsBody(BaseModel):
+    hermes_command_catalog: bool = False
 
 
 def _read_env_file(path: str) -> dict[str, str]:
@@ -315,6 +321,24 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             "MATRIX_CHAT_HERMES_COMMAND_PYTHON",
             "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_PYTHON",
             default=_DEFAULT_HERMES_COMMAND_PYTHON,
+        ),
+        "hermes_command_ssh_host": pick(
+            "MATRIX_CHAT_HERMES_COMMAND_SSH_HOST",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_SSH_HOST",
+        ),
+        "hermes_command_ssh_key": pick(
+            "MATRIX_CHAT_HERMES_COMMAND_SSH_KEY",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_SSH_KEY",
+        ),
+        "hermes_command_ssh_user": pick(
+            "MATRIX_CHAT_HERMES_COMMAND_SSH_USER",
+            "BLUEPRINTS_MATRIX_CHAT_HERMES_COMMAND_SSH_USER",
+            default="root",
+        ),
+        "room_settings_file": pick(
+            "MATRIX_CHAT_ROOM_SETTINGS_FILE",
+            "BLUEPRINTS_MATRIX_CHAT_ROOM_SETTINGS_FILE",
+            default=_DEFAULT_ROOM_SETTINGS_FILE,
         ),
     }
 
@@ -971,8 +995,98 @@ def _admin_status_payload(
         "features": {
             "generic_admin_proxy": False,
             "destructive_actions": False,
+            "room_settings": bool(settings.get("admin_access_token")),
         },
     }
+
+
+def _room_settings_path(settings: dict[str, str] | None = None) -> Path:
+    raw_path = (settings or {}).get("room_settings_file") or _DEFAULT_ROOM_SETTINGS_FILE
+    return Path(raw_path)
+
+
+def _read_room_settings(settings: dict[str, str] | None = None) -> dict[str, Any]:
+    path = _room_settings_path(settings)
+    if not path.is_file():
+        return {"servers": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"servers": {}}
+    if not isinstance(data, dict):
+        return {"servers": {}}
+    servers = data.get("servers")
+    if not isinstance(servers, dict):
+        data["servers"] = {}
+    return data
+
+
+def _write_room_settings(settings: dict[str, str], data: dict[str, Any]) -> None:
+    path = _room_settings_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
+
+
+def _room_settings_for(data: dict[str, Any], server_id: str, room_id: str) -> dict[str, Any]:
+    servers = data.get("servers") if isinstance(data.get("servers"), dict) else {}
+    server = servers.get(server_id) if isinstance(servers.get(server_id), dict) else {}
+    rooms = server.get("rooms") if isinstance(server.get("rooms"), dict) else {}
+    room = rooms.get(room_id) if isinstance(rooms.get(room_id), dict) else {}
+    return {
+        "hermes_command_catalog": _safe_bool(room.get("hermes_command_catalog")),
+    }
+
+
+def _room_settings_payload(settings: dict[str, str], room_id: str) -> dict[str, Any]:
+    room = _room_settings_for(
+        _read_room_settings(settings),
+        settings.get("server_id") or "tb1",
+        room_id,
+    )
+    return {
+        "server_id": settings.get("server_id") or "tb1",
+        "room_id": room_id,
+        "hermes_command_catalog": bool(room["hermes_command_catalog"]),
+        "admin_available": bool(settings.get("admin_access_token")),
+    }
+
+
+def _set_room_settings(settings: dict[str, str], room_id: str, patch: _RoomSettingsBody) -> dict[str, Any]:
+    if not settings.get("admin_access_token"):
+        raise HTTPException(status_code=503, detail="Matrix admin token is not configured")
+    server_id = settings.get("server_id") or "tb1"
+    data = _read_room_settings(settings)
+    servers = data.setdefault("servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+        data["servers"] = servers
+    server = servers.setdefault(server_id, {})
+    if not isinstance(server, dict):
+        server = {}
+        servers[server_id] = server
+    rooms = server.setdefault("rooms", {})
+    if not isinstance(rooms, dict):
+        rooms = {}
+        server["rooms"] = rooms
+    rooms[room_id] = {
+        "hermes_command_catalog": bool(patch.hermes_command_catalog),
+    }
+    _write_room_settings(settings, data)
+    return _room_settings_payload(settings, room_id)
+
+
+def _annotate_room_settings(settings: dict[str, str], rooms: list[dict[str, Any]]) -> None:
+    data = _read_room_settings(settings)
+    server_id = settings.get("server_id") or "tb1"
+    for room in rooms:
+        room_id = _safe_str(room.get("room_id"))
+        if not room_id:
+            continue
+        room_settings = _room_settings_for(data, server_id, room_id)
+        room["hermes_command_catalog"] = bool(room_settings["hermes_command_catalog"])
 
 
 def _hermes_matrix_patch_status(path: str) -> dict[str, Any]:
@@ -1082,14 +1196,41 @@ def _filter_hermes_commands(commands: list[dict[str, Any]], query: str) -> list[
 def _load_hermes_command_catalog(settings: dict[str, str]) -> dict[str, Any]:
     container = settings.get("hermes_command_container") or ""
     python_bin = settings.get("hermes_command_python") or _DEFAULT_HERMES_COMMAND_PYTHON
+    ssh_host = settings.get("hermes_command_ssh_host") or ""
+    ssh_key = settings.get("hermes_command_ssh_key") or ""
+    ssh_user = settings.get("hermes_command_ssh_user") or "root"
     if not container:
         raise HTTPException(
             status_code=503,
             detail="Hermes command catalogue is not configured for this Matrix server",
         )
+    if ssh_host:
+        target = ssh_host if "@" in ssh_host else f"{ssh_user}@{ssh_host}"
+        remote_command = " ".join(
+            [
+                "docker",
+                "exec",
+                shlex.quote(container),
+                shlex.quote(python_bin),
+                "-c",
+                shlex.quote(_HERMES_COMMAND_CATALOG_SCRIPT),
+            ]
+        )
+        args = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
+        if ssh_key:
+            args.extend(["-i", ssh_key])
+        args.extend([target, remote_command])
+    else:
+        args = ["docker", "exec", container, python_bin, "-c", _HERMES_COMMAND_CATALOG_SCRIPT]
     try:
         proc = subprocess.run(
-            ["docker", "exec", container, python_bin, "-c", _HERMES_COMMAND_CATALOG_SCRIPT],
+            args,
             check=False,
             capture_output=True,
             text=True,
@@ -1551,6 +1692,7 @@ async def matrix_chat_status() -> dict[str, Any]:
             "e2ee_dependency_error": e2ee_deps_error if _e2ee_requested(settings) and not e2ee_deps_ok else "",
             "push_notifications": False,
             "generic_matrix_proxy": False,
+            "room_settings": bool(settings.get("admin_access_token")),
         },
     }
 
@@ -1663,16 +1805,20 @@ async def matrix_chat_admin_room_members(room_id: str) -> dict[str, Any]:
         for member in (_normalize_admin_member(raw, state_rows) for raw in raw_members)
         if member
     ]
-    if not members and state_rows:
-        members = list(state_rows.values())
+    seen_members = {member["user_id"] for member in members}
+    for user_id, member in state_rows.items():
+        if user_id not in seen_members:
+            members.append(member)
     members.sort(key=lambda item: (str(item.get("user_id") or "").lower()))
     return {"room_id": room_id, "members": members}
 
 
 @router.get("/rooms")
 async def matrix_chat_rooms() -> dict[str, Any]:
+    settings = _settings()
     sync, _e2ee_client = await _sync_for_chat(timeout_ms=0, full_state=True)
     joined, invited = _rooms_from_sync(sync)
+    _annotate_room_settings(settings, joined)
     return {
         "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
         "joined": joined,
@@ -1773,11 +1919,32 @@ async def matrix_chat_mention_candidates(
     }
 
 
+@router.get("/rooms/{room_id}/settings")
+async def matrix_chat_room_settings(room_id: str) -> dict[str, Any]:
+    settings = _settings()
+    return _room_settings_payload(settings, room_id)
+
+
+@router.patch("/rooms/{room_id}/settings")
+async def matrix_chat_update_room_settings(
+    room_id: str,
+    body: _RoomSettingsBody,
+) -> dict[str, Any]:
+    settings = _settings()
+    return _set_room_settings(settings, room_id, body)
+
+
 @router.get("/hermes/commands")
 async def matrix_chat_hermes_commands(
     q: str = Query(default="", max_length=80),
+    room_id: str = Query(default="", max_length=255),
 ) -> dict[str, Any]:
     settings = _settings()
+    if not room_id:
+        raise HTTPException(status_code=403, detail="Hermes command catalogue is disabled for this room")
+    room_settings = _room_settings_payload(settings, room_id)
+    if not room_settings["hermes_command_catalog"]:
+        raise HTTPException(status_code=403, detail="Hermes command catalogue is disabled for this room")
     catalogue = await asyncio.to_thread(_load_hermes_command_catalog, settings)
     commands = catalogue.get("commands") if isinstance(catalogue.get("commands"), list) else []
     filtered = _filter_hermes_commands(commands, q)
@@ -1843,8 +2010,10 @@ async def matrix_chat_sync(
     since: str | None = None,
     timeout_ms: int = Query(default=0, ge=0, le=_MAX_SYNC_TIMEOUT_MS),
 ) -> dict[str, Any]:
+    settings = _settings()
     sync, e2ee_client = await _sync_for_chat(since=since, timeout_ms=timeout_ms, full_state=False)
     joined, invited = _rooms_from_sync(sync)
+    _annotate_room_settings(settings, joined)
     rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
     joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
     room_updates = []

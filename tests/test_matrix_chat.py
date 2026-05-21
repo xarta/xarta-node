@@ -195,6 +195,194 @@ def test_matrix_chat_hermes_command_catalog_reduces_subprocess_output(monkeypatc
     }
 
 
+def test_matrix_chat_hermes_command_catalog_can_probe_over_ssh(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "commands": [
+                    {
+                        "name": "/help",
+                        "insert": "/help",
+                        "description": "Show help",
+                        "category": "Info",
+                        "source": "core",
+                    }
+                ]
+            }
+        )
+        stderr = ""
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Result()
+
+    monkeypatch.setattr(matrix_chat.subprocess, "run", fake_run)
+
+    catalogue = matrix_chat._load_hermes_command_catalog(
+        {
+            "hermes_command_container": "hermes",
+            "hermes_command_python": "/opt/hermes/.venv/bin/python",
+            "hermes_command_ssh_host": "203.0.113.10",
+            "hermes_command_ssh_user": "root",
+            "hermes_command_ssh_key": "/tmp/xarta-test-ssh-key",
+        }
+    )
+
+    assert captured["args"][:7] == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-i",
+        "/tmp/xarta-test-ssh-key",
+    ]
+    assert captured["args"][7] == "root@203.0.113.10"
+    assert captured["args"][8].startswith(
+        "docker exec hermes /opt/hermes/.venv/bin/python -c "
+    )
+    assert "from hermes_cli.commands import" in captured["args"][8]
+    assert "COMMAND_REGISTRY" in captured["args"][8]
+    assert captured["kwargs"]["timeout"] == matrix_chat._HERMES_COMMAND_CATALOG_TIMEOUT
+    assert catalogue["commands"][0]["name"] == "/help"
+    assert catalogue["source"] == "hermes"
+
+
+def test_matrix_chat_room_settings_default_off_and_persist(tmp_path):
+    settings = {
+        "server_id": "vps",
+        "room_settings_file": str(tmp_path / "room-settings.json"),
+        "admin_access_token": "admin-token-secret",
+    }
+
+    assert matrix_chat._room_settings_payload(settings, "!shared:test.example") == {
+        "server_id": "vps",
+        "room_id": "!shared:test.example",
+        "hermes_command_catalog": False,
+        "admin_available": True,
+    }
+
+    updated = matrix_chat._set_room_settings(
+        settings,
+        "!shared:test.example",
+        matrix_chat._RoomSettingsBody(hermes_command_catalog=True),
+    )
+
+    assert updated["hermes_command_catalog"] is True
+    assert matrix_chat._room_settings_payload(
+        settings,
+        "!shared:test.example",
+    )["hermes_command_catalog"] is True
+    assert "admin-token-secret" not in (tmp_path / "room-settings.json").read_text(encoding="utf-8")
+
+
+def test_matrix_chat_room_settings_update_requires_admin_token(tmp_path):
+    settings = {
+        "server_id": "tb1",
+        "room_settings_file": str(tmp_path / "room-settings.json"),
+        "admin_access_token": "",
+    }
+
+    with pytest.raises(matrix_chat.HTTPException) as exc:
+        matrix_chat._set_room_settings(
+            settings,
+            "!bridge:test.example",
+            matrix_chat._RoomSettingsBody(hermes_command_catalog=True),
+        )
+
+    assert exc.value.status_code == 503
+    assert not (tmp_path / "room-settings.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_hermes_commands_refuses_disabled_room_before_probe(tmp_path, monkeypatch):
+    env_file = tmp_path / "matrix.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "MATRIX_CODEX_USER_ID=@codex:test.example",
+                "MATRIX_CODEX_ACCESS_TOKEN=chat-token",
+                f"MATRIX_CHAT_ROOM_SETTINGS_FILE={tmp_path / 'room-settings.json'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", str(env_file))
+
+    def fail_probe(_settings):
+        raise AssertionError("Hermes catalogue probe should not run")
+
+    monkeypatch.setattr(matrix_chat, "_load_hermes_command_catalog", fail_probe)
+
+    with pytest.raises(matrix_chat.HTTPException) as exc:
+        await matrix_chat.matrix_chat_hermes_commands(room_id="!plain:test.example")
+
+    assert exc.value.status_code == 403
+    assert "disabled" in exc.value.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_hermes_commands_allows_enabled_room(tmp_path, monkeypatch):
+    env_file = tmp_path / "matrix.env"
+    settings_file = tmp_path / "room-settings.json"
+    env_file.write_text(
+        "\n".join(
+            [
+                "MATRIX_CODEX_USER_ID=@codex:test.example",
+                "MATRIX_CODEX_ACCESS_TOKEN=chat-token",
+                f"MATRIX_CHAT_ROOM_SETTINGS_FILE={settings_file}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings_file.write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "tb1": {
+                        "rooms": {
+                            "!bridge:test.example": {"hermes_command_catalog": True}
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", str(env_file))
+
+    def fake_probe(_settings):
+        return {
+            "source": "hermes",
+            "total": 1,
+            "commands": [
+                {
+                    "name": "/help",
+                    "insert": "/help",
+                    "description": "Show help",
+                    "category": "Info",
+                    "source": "core",
+                    "args_hint": "",
+                    "aliases": [],
+                    "requires_argument": False,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(matrix_chat, "_load_hermes_command_catalog", fake_probe)
+
+    response = await matrix_chat.matrix_chat_hermes_commands(
+        q="/he",
+        room_id="!bridge:test.example",
+    )
+
+    assert response["commands"][0]["name"] == "/help"
+
+
 def test_matrix_chat_room_and_message_mapping_do_not_return_credentials():
     sync = {
         "next_batch": "s123",
@@ -395,6 +583,7 @@ def test_matrix_chat_admin_status_does_not_expose_token():
     assert status["features"] == {
         "generic_admin_proxy": False,
         "destructive_actions": False,
+        "room_settings": True,
     }
     assert "admin-token-secret" not in rendered
     assert "admin_access_token" not in rendered
@@ -518,6 +707,43 @@ def test_matrix_chat_admin_member_reduction_includes_power_without_raw_state():
     }
     assert "content" not in repr(member)
     assert "state_key" not in repr(member)
+
+
+def test_matrix_chat_admin_member_rows_include_invited_state_members():
+    state_rows = matrix_chat._room_member_rows_from_state(
+        [
+            {
+                "type": "m.room.power_levels",
+                "content": {"users": {"@owner:test.example": 100, "@admin:test.example": 50}},
+            },
+            {
+                "type": "m.room.member",
+                "state_key": "@owner:test.example",
+                "content": {"membership": "join", "displayname": "Owner"},
+            },
+            {
+                "type": "m.room.member",
+                "state_key": "@invitee:test.example",
+                "content": {"membership": "invite", "displayname": "Invited User"},
+            },
+        ]
+    )
+
+    joined = matrix_chat._normalize_admin_member("@owner:test.example", state_rows)
+    invited = state_rows["@invitee:test.example"]
+
+    assert joined == {
+        "user_id": "@owner:test.example",
+        "membership": "join",
+        "display_name": "Owner",
+        "power_level": 100,
+    }
+    assert invited == {
+        "user_id": "@invitee:test.example",
+        "membership": "invite",
+        "display_name": "Invited User",
+        "power_level": None,
+    }
 
 
 @pytest.mark.asyncio
