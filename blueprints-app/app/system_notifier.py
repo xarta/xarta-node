@@ -40,6 +40,7 @@ def _notifier_token() -> str:
 
 async def post_notifier_event(
     *,
+    event_id: str | None = None,
     event_type: str,
     title: str,
     message: str,
@@ -48,7 +49,7 @@ async def post_notifier_event(
     destinations: list[str] | None = None,
     tags: list[str] | None = None,
     data: dict[str, Any] | None = None,
-    importance: str = "neutral",
+    importance: str | None = "neutral",
     dedupe_key: str | None = None,
     recovery: bool = False,
 ) -> bool:
@@ -65,7 +66,8 @@ async def post_notifier_event(
     level = _LEVEL_BY_SEVERITY.get(str(severity or "info").lower(), "information")
     payload_data = dict(data or {})
     payload_data["event_type"] = event_type
-    payload_data.setdefault("importance", importance)
+    if importance is not None:
+        payload_data.setdefault("importance", importance)
 
     body = {
         "source_node": socket.gethostname(),
@@ -79,6 +81,8 @@ async def post_notifier_event(
         "data": payload_data,
         "recovery": bool(recovery),
     }
+    if event_id:
+        body["event_id"] = event_id
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.5)) as client:
             response = await client.post(
