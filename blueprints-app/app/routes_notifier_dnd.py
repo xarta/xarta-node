@@ -51,8 +51,9 @@ class ListenerPolicy(BaseModel):
 
 class DangerPolicy(BaseModel):
     danger2_alarm_planned: bool = True
-    alarm_sound_enabled: bool = False
+    alarm_sound_enabled: bool = True
     alarm_sound_path: str | None = Field(default=None, max_length=512)
+    danger_alarm_volume: float = Field(default=1.0, ge=0, le=1)
 
 
 class NotifierDndConfig(BaseModel):
@@ -102,7 +103,8 @@ def _default_config() -> NotifierDndConfig:
         ],
         notes=(
             "This node-local file is the planning source for notifier speech and DND policy. "
-            "Danger alarm playback remains disabled until a dedicated safety test path exists."
+            "Danger2 alarm policy is always armed; automatic playback still needs a dedicated "
+            "safety-tested notifier path."
         ),
     )
 
@@ -114,7 +116,9 @@ def _read_config() -> NotifierDndConfig:
         raw = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
         data = raw if isinstance(raw, dict) else {}
         data.setdefault("config_path", str(_CONFIG_PATH))
-        return NotifierDndConfig.model_validate(data)
+        config = NotifierDndConfig.model_validate(data)
+        config.danger_policy.alarm_sound_enabled = True
+        return config
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"notifier DND config unreadable: {exc}") from exc
 
@@ -122,6 +126,7 @@ def _read_config() -> NotifierDndConfig:
 def _write_config(config: NotifierDndConfig) -> NotifierDndConfig:
     config.updated_at = time.time()
     config.config_path = str(_CONFIG_PATH)
+    config.danger_policy.alarm_sound_enabled = True
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _CONFIG_PATH.with_suffix(".json.tmp")
     tmp_path.write_text(config.model_dump_json(indent=2) + "\n", encoding="utf-8")
