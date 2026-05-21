@@ -502,6 +502,54 @@ http://${MATRIX_SYNAPSE_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_MATRIX
+    if [[ -n "${MATRIX_SYNAPSE_ALIASES:-}" ]]; then
+        IFS=',' read -ra MATRIX_SYNAPSE_ALIAS_LIST <<< "$MATRIX_SYNAPSE_ALIASES"
+        for alias in "${MATRIX_SYNAPSE_ALIAS_LIST[@]}"; do
+            alias="${alias// /}"
+            [[ -z "$alias" || "$alias" == "$MATRIX_SYNAPSE_HOSTNAME" ]] && continue
+            cat >> "$CADDYFILE" <<CADDY_MATRIX_ALIAS
+
+# Matrix Synapse client API alias for private WebPKI/tailnet clients.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${alias} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_client_well_known {
+        path /.well-known/matrix/client
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_federation {
+        path /_matrix/federation/* /_matrix/key/*
+    }
+
+    handle @matrix_client_well_known {
+        header Access-Control-Allow-Origin "*"
+        respond \`{"m.homeserver":{"base_url":"https://${alias}"}}\` 200
+    }
+
+    handle @matrix_federation {
+        respond 404
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${MATRIX_SYNAPSE_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${alias} {
+    redir https://{host}{uri} permanent
+}
+CADDY_MATRIX_ALIAS
+            echo "    Appended Matrix Synapse alias block (https://${alias} -> ${MATRIX_SYNAPSE_UPSTREAM})"
+        done
+    fi
     chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Matrix Synapse block (https://${MATRIX_SYNAPSE_HOSTNAME} -> ${MATRIX_SYNAPSE_UPSTREAM})"
 fi
@@ -537,6 +585,36 @@ http://${NTFY_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_NTFY
+    if [[ -n "${NTFY_ALIASES:-}" ]]; then
+        IFS=',' read -ra NTFY_ALIAS_LIST <<< "$NTFY_ALIASES"
+        for alias in "${NTFY_ALIAS_LIST[@]}"; do
+            alias="${alias// /}"
+            [[ -z "$alias" || "$alias" == "$NTFY_HOSTNAME" ]] && continue
+            cat >> "$CADDYFILE" <<CADDY_NTFY_ALIAS
+
+# ntfy UnifiedPush gateway alias for private WebPKI/tailnet clients.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${alias} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${NTFY_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${alias} {
+    redir https://{host}{uri} permanent
+}
+CADDY_NTFY_ALIAS
+            echo "    Appended ntfy UnifiedPush alias block (https://${alias} -> ${NTFY_UPSTREAM})"
+        done
+    fi
     chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended ntfy UnifiedPush block (https://${NTFY_HOSTNAME} -> ${NTFY_UPSTREAM})"
 fi
@@ -841,6 +919,54 @@ http://${MATRIX_SHARED_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_MATRIX_SHARED
+    if [[ -n "${MATRIX_SHARED_ALIASES:-}" ]]; then
+        IFS=',' read -ra MATRIX_SHARED_ALIAS_LIST <<< "$MATRIX_SHARED_ALIASES"
+        for alias in "${MATRIX_SHARED_ALIAS_LIST[@]}"; do
+            alias="${alias// /}"
+            [[ -z "$alias" || "$alias" == "$MATRIX_SHARED_HOSTNAME" ]] && continue
+            cat >> "$CADDYFILE" <<CADDY_MATRIX_SHARED_ALIAS
+
+# Matrix Synapse shared/friends alias for private WebPKI/tailnet clients.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${alias} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_client_well_known {
+        path /.well-known/matrix/client
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    @matrix_federation {
+        path /_matrix/federation/* /_matrix/key/*
+    }
+
+    handle @matrix_client_well_known {
+        header Access-Control-Allow-Origin "*"
+        respond \`{"m.homeserver":{"base_url":"https://${alias}"}}\` 200
+    }
+
+    handle @matrix_federation {
+        respond 404
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${MATRIX_SHARED_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${alias} {
+    redir https://{host}{uri} permanent
+}
+CADDY_MATRIX_SHARED_ALIAS
+            echo "    Appended shared Matrix Synapse alias block (https://${alias} -> ${MATRIX_SHARED_UPSTREAM})"
+        done
+    fi
     chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended shared Matrix Synapse block (https://${MATRIX_SHARED_HOSTNAME} -> ${MATRIX_SHARED_UPSTREAM})"
 else
