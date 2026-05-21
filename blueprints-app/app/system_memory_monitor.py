@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from . import config as cfg
 from .events import AppEvent
 from .routes_events import publish_event
+from .system_notifier import notifier_primary_enabled, post_notifier_event
 
 log = logging.getLogger(__name__)
 
@@ -98,21 +99,44 @@ async def _publish_memory_warning(level: str, sample: MemorySample) -> None:
         if critical
         else f"Warning: {node_name} RAM usage exceeding safe parameters"
     )
+    event_type = "system.memory.warning"
+    severity = "error" if critical else "warn"
+    payload = {
+        "node_id": cfg.NODE_ID,
+        "node_name": cfg.NODE_NAME,
+        "level": level,
+        "used_gib": round(sample.used_gib, 2),
+        "available_gib": round(sample.available_gib, 2),
+        "total_gib": round(sample.total_gib, 2),
+        "speech": message,
+    }
+    notifier_ok = await post_notifier_event(
+        event_type=event_type,
+        title="RAM Critical" if critical else "RAM Warning",
+        message=message,
+        severity=severity,
+        source_component="blueprints-memory-monitor",
+        tags=["blueprints", "system", "memory"],
+        data=payload,
+        importance="neutral",
+    )
+    if notifier_primary_enabled() and notifier_ok:
+        log.warning(
+            "memory monitor: %s used=%.2fGiB available=%.2fGiB total=%.2fGiB",
+            level,
+            sample.used_gib,
+            sample.available_gib,
+            sample.total_gib,
+        )
+        return
+
     event = AppEvent.create(
         event_type="system.memory.warning",
         title="RAM Critical" if critical else "RAM Warning",
         message=message,
-        severity="error" if critical else "warn",
+        severity=severity,
         source="blueprints-memory-monitor",
-        payload={
-            "node_id": cfg.NODE_ID,
-            "node_name": cfg.NODE_NAME,
-            "level": level,
-            "used_gib": round(sample.used_gib, 2),
-            "available_gib": round(sample.available_gib, 2),
-            "total_gib": round(sample.total_gib, 2),
-            "speech": message,
-        },
+        payload=payload,
     )
     await publish_event(event)
     log.warning(
