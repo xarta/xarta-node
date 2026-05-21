@@ -13,6 +13,14 @@
 #
 # Idempotent — safe to re-run. If Tailscale is already up with the correct
 # config, the `tailscale up` command is effectively a no-op.
+#
+# xarta-node DNS guardrail:
+#   Keep TAILSCALE_ACCEPT_DNS=false on Blueprints/gateway nodes unless there is
+#   a deliberate DNS repair/review. The site tailnet DNS behavior has been
+#   unreliable in node-to-node contexts, especially for tagged/service devices,
+#   and these nodes rely on .env plus .nodes.json/managed /etc/hosts for stable
+#   peer names. Direct Tailscale DNS at 100.100.100.100 remains useful for
+#   diagnostics, but should not be installed into host resolver state casually.
 
 set -euo pipefail
 
@@ -31,6 +39,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
     echo "Error: .env not found at $ENV_FILE" >&2
     exit 1
 fi
+# shellcheck source=/dev/null
 source "$ENV_FILE"
 
 echo "=== Tailscale up ==="

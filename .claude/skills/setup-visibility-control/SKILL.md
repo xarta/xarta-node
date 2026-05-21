@@ -66,11 +66,20 @@ bash /root/xarta-node/.claude/skills/setup-visibility-control/scripts/setup-reme
   --apply
 ```
 
+VPS everyday-ops tools are intentionally explicit:
+
+```bash
+bash /root/xarta-node/.claude/skills/setup-visibility-control/scripts/setup-remediate.sh \
+  --include vps-ops-tools \
+  --apply
+```
+
 ## Profiles
 
 - `baseline`: ssh-and-git, certificates, blueprints, caddy, python-dev-tools
 - `network`: lxc-failover, tailscale-up, firewall
 - `ops`: shellcheck, rsync, github-cli
+- `vps-ops-tools`: explicit include for external VPS hosts; installs `rsync`, `jq`, `ripgrep`, `tcpdump`, DNS tools, Python venv support, and archive utilities without running Blueprints setup
 - `desktop`: user-xarta, ssh-and-git-xarta, xfce-xrdp, desktop-apps
 - `containers`: docker, dockge
 - `sync`: syncthing

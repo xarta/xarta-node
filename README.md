@@ -177,6 +177,28 @@ The script is idempotent — it is safe to run more than once.
    > `TAILSCALE_ACCEPT_DNS=false` is intentional for gateway nodes — the
    > node uses its own resolvers (set via `nameserver` in the Proxmox LXC
    > config), not ones pushed by the control server.
+   >
+   > Do not flip this to `true` just to make site-tailnet MagicDNS names work.
+   > That DNS posture may be unreliable for some node-to-node and tagged-device
+   > contexts. xarta-node uses `.env`, `.nodes.json`, and the managed
+   > `/etc/hosts` block from `bp-nodes-hosts.sh` as the stable peer-name
+   > source. Fix and review the DNS behavior first before enabling Tailscale
+   > DNS acceptance on these nodes.
+
+### VPS operations tools
+
+For external VPS hosts that support xarta-node workflows but are not full
+Blueprints LXCs, use the smaller ops-tool bootstrap instead of the LXC failover
+setup:
+
+```bash
+sudo bash setup-vps-ops-tools.sh
+```
+
+It installs everyday debugging/deployment tools such as `rsync`, `jq`,
+`ripgrep`, `tcpdump`, DNS tools, Python venv support, and archive utilities.
+It deliberately does not configure Blueprints, Caddy, Tailscale, firewall
+policy, or Docker unless `--with-docker` is explicitly supplied.
 
 4. **Approve advertised routes** in your Tailscale/Headscale admin panel.
 
