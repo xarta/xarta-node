@@ -47,6 +47,7 @@ class ScheduleWindow(BaseModel):
 
 
 class ListenerPolicy(BaseModel):
+    # Legacy config key. Enforced true: phones always speak and never suppress desktop/web.
     phone_wins: bool = True
     desktop_one_per_os_ip: bool = True
     android_listener_future: bool = True
@@ -236,6 +237,7 @@ def _read_config() -> NotifierDndConfig:
         data = raw if isinstance(raw, dict) else {}
         data.setdefault("config_path", str(_CONFIG_PATH))
         config = NotifierDndConfig.model_validate(data)
+        config.listener_policy.phone_wins = True
         config.danger_policy.alarm_sound_enabled = True
         return config
     except Exception as exc:  # noqa: BLE001
@@ -245,6 +247,7 @@ def _read_config() -> NotifierDndConfig:
 def _write_config(config: NotifierDndConfig) -> NotifierDndConfig:
     config.updated_at = time.time()
     config.config_path = str(_CONFIG_PATH)
+    config.listener_policy.phone_wins = True
     config.danger_policy.alarm_sound_enabled = True
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _CONFIG_PATH.with_suffix(".json.tmp")
@@ -350,24 +353,13 @@ async def claim_notifier_speech(
 ) -> SpeechClaimResponse:
     config = _read_config()
     _record_heartbeat(body, request)
-    phone_wins = config.listener_policy.phone_wins
     desktop_dedupe = config.listener_policy.desktop_one_per_os_ip
-    if body.kind != "phone" and phone_wins:
-        phone_active = any(
-            item.get("kind") == "phone"
-            and listener_id != body.listener_id
-            for listener_id, item in _listener_heartbeats.items()
-        )
-        if phone_active:
-            return SpeechClaimResponse(
-                allowed=False,
-                reason="phone_listener_active",
-                listener_id=body.listener_id,
-            )
+    if body.kind == "phone":
+        return SpeechClaimResponse(allowed=True, listener_id=body.listener_id)
 
     if body.kind == "desktop" and desktop_dedupe:
         event_key = body.event_id or f"no-event:{int(time.time() / _LISTENER_TTL_SECONDS)}"
-        claim_key = f"{event_key}:{_client_ip(request)}:{body.os_key}"
+        claim_key = f"{event_key}:{_client_ip(request)}"
         existing = _speech_claims.get(claim_key)
         if existing and existing.get("listener_id") != body.listener_id:
             return SpeechClaimResponse(
