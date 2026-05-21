@@ -52,6 +52,7 @@ class ListenerPolicy(BaseModel):
 class DangerPolicy(BaseModel):
     danger2_alarm_planned: bool = True
     alarm_sound_enabled: bool = False
+    alarm_sound_path: str | None = Field(default=None, max_length=512)
 
 
 class NotifierDndConfig(BaseModel):
