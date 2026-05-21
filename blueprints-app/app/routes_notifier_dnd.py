@@ -401,6 +401,7 @@ async def submit_notifier_test(body: NotifierTestRequest) -> NotifierTestRespons
         "speech": str(spec["speech"]),
         "noisy": bool(spec.get("noisy")),
         "frontend_contract": "notification-tests-modal",
+        "test_broadcast_speech": True,
     }
     importance = spec.get("importance")
     if importance is not None:
