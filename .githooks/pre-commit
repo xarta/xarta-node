@@ -50,6 +50,11 @@ fi
 echo "[pre-commit] Running public leak check..."
 bash "$REPO_ROOT/check-for-leaks.sh"
 
+if [[ -x "$REPO_ROOT/check-caddy-route-parity.sh" ]]; then
+  echo "[pre-commit] Running Caddy route parity check..."
+  bash "$REPO_ROOT/check-caddy-route-parity.sh"
+fi
+
 # ── Ruff: lint staged Python files ───────────────────────────────────────────
 mapfile -t STAGED_PY < <(git diff --cached --name-only --diff-filter=ACMR | grep '\.py$' || true)
 

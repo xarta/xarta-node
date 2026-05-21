@@ -498,6 +498,41 @@ CADDY_MATRIX
     echo "    Appended Matrix Synapse block (https://${MATRIX_SYNAPSE_HOSTNAME} -> ${MATRIX_SYNAPSE_UPSTREAM})"
 fi
 
+if [[ -z "${NTFY_HOSTNAME:-}" ]]; then
+    if [[ "$UI_HOST" == *.* ]]; then
+        NTFY_HOSTNAME="notify.${UI_HOST#*.}"
+    else
+        NTFY_HOSTNAME="notify.${UI_HOST}"
+    fi
+fi
+NTFY_UPSTREAM="${NTFY_UPSTREAM:-localhost:18889}"
+if [[ -n "${NTFY_HOSTNAME:-}" && -n "${NTFY_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_NTFY
+
+# ntfy UnifiedPush gateway for private Matrix/mobile notifications and future local pub/sub.
+# Internal-only by source address: RFC1918 LAN/VLAN, Tailscale CGNAT, and local.
+https://${NTFY_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${NTFY_UPSTREAM}
+    }
+
+    respond 403
+}
+
+http://${NTFY_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_NTFY
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended ntfy UnifiedPush block (https://${NTFY_HOSTNAME} -> ${NTFY_UPSTREAM})"
+fi
+
 # ── Vikunja work-memory block ────────────────────────────────────────────────
 # Backend binds to loopback only. Caddy exposes it on a private HTTPS hostname
 # for local/RFC1918/tailnet clients.
