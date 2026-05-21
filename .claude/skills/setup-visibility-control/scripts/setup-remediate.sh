@@ -52,6 +52,7 @@ catalog=(
   "python-dev-tools|setup-python-dev-tools.sh"
   "shellcheck|setup-shellcheck.sh"
   "rsync|setup-rsync.sh"
+  "vps-ops-tools|setup-vps-ops-tools.sh"
   "github-cli|setup-github-cli.sh"
   "docker|setup-docker.sh"
   "dockge|setup-dockge.sh"

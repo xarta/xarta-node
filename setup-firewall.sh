@@ -13,6 +13,11 @@
 #        - TCP 3389 (XRDP) when XARTA_ENABLE_XRDP=true
 #          Uses XARTA_XRDP_ALLOWED_CIDRS plus explicit primary_ip/tailnet_ip
 #          values from .nodes.json for trusted xarta-node fleet peers.
+#        - TCP 18941 (system bridge notifier) when
+#          XARTA_ENABLE_SYSTEM_BRIDGE_NOTIFIER=true; source-restricted by
+#          XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS. For some bridge paths,
+#          remote traffic may be SNATed by a pinned local bridge container, so
+#          keep the actual source CIDR in private .env rather than public code.
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
 #        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
 #        - TCP+UDP 22000 (Syncthing BEP asset sync)  — per-peer-IP from .nodes.json only
@@ -53,6 +58,8 @@ fi
 
 XARTA_ENABLE_XRDP="${XARTA_ENABLE_XRDP:-false}"
 XARTA_XRDP_ALLOWED_CIDRS="${XARTA_XRDP_ALLOWED_CIDRS:-}"
+XARTA_ENABLE_SYSTEM_BRIDGE_NOTIFIER="${XARTA_ENABLE_SYSTEM_BRIDGE_NOTIFIER:-false}"
+XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS="${XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS:-}"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -161,6 +168,24 @@ if [[ "$XARTA_ENABLE_XRDP" == "true" ]]; then
     else
         echo -e "    ${YELLOW}Warning:${NC} no .nodes.json peer IPs found — XRDP xarta-node peer rules not added."
     fi
+fi
+
+# System Bridge Notifier — optional private peer API.
+# This is not a public web route. It is only for the paired private service
+# route used by the node-local notifier peer. Some bridge paths SNAT remote
+# traffic to a pinned local route container; use tcpdump to identify the real
+# source and store the exact CIDR in private .env.
+if [[ "$XARTA_ENABLE_SYSTEM_BRIDGE_NOTIFIER" == "true" ]]; then
+    if [[ -z "$XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS" ]]; then
+        echo -e "    ${YELLOW}Warning:${NC} XARTA_ENABLE_SYSTEM_BRIDGE_NOTIFIER=true but XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS is empty; TCP 18941 rule not added."
+    fi
+    IFS=',' read -r -a notifier_cidrs <<< "$XARTA_SYSTEM_BRIDGE_NOTIFIER_ALLOWED_CIDRS"
+    for cidr in "${notifier_cidrs[@]}"; do
+        cidr="${cidr// /}"
+        [[ -z "$cidr" ]] && continue
+        iptables -A XARTA_INPUT -p tcp --dport 18941 -s "$cidr" -j ACCEPT
+        echo "    added: TCP 18941 from $cidr (system bridge notifier peer API) → ACCEPT"
+    done
 fi
 
 # Tailscale WireGuard — direct peer connections.

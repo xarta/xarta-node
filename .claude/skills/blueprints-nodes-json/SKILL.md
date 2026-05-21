@@ -144,6 +144,12 @@ Idempotent — safe to re-run; replaces the old block cleanly.
 
 Preferred over `setup-hosts.sh` on any node with `.nodes.json`.
 
+This managed hosts block is intentionally part of the fleet's DNS strategy.
+Do not enable Tailscale DNS acceptance on xarta-node just to resolve
+site-tailnet MagicDNS names until the MagicDNS/tagged-device behavior has been
+fixed and reviewed. `.nodes.json` plus `/etc/hosts` is the stable node-to-node
+source of truth.
+
 ---
 
 ## Python app integration

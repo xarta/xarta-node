@@ -22,6 +22,7 @@ catalog=(
   "python-dev-tools|setup-python-dev-tools.sh|command -v uv >/dev/null 2>&1 && command -v ruff >/dev/null 2>&1"
   "shellcheck|setup-shellcheck.sh|command -v shellcheck >/dev/null 2>&1"
   "rsync|setup-rsync.sh|command -v rsync >/dev/null 2>&1"
+  "vps-ops-tools|setup-vps-ops-tools.sh|command -v rsync >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v rg >/dev/null 2>&1 && command -v tcpdump >/dev/null 2>&1"
   "github-cli|setup-github-cli.sh|command -v gh >/dev/null 2>&1"
   "docker|setup-docker.sh|command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker"
   "dockge|setup-dockge.sh|docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dockge"

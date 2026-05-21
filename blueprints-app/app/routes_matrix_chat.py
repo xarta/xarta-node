@@ -180,6 +180,8 @@ class _SendMessageBody(BaseModel):
 
 class _RoomSettingsBody(BaseModel):
     hermes_command_catalog: bool = False
+    hide_system_messages: bool = False
+    system_message_min_level: str = "information"
 
 
 def _read_env_file(path: str) -> dict[str, str]:
@@ -687,6 +689,9 @@ class _MatrixChatE2EEClient:
             return None
         source_content = content.serialize() if hasattr(content, "serialize") else {}
         relates_to = source_content.get("m.relates_to") if isinstance(source_content, dict) else None
+        system_message = (
+            source_content.get("org.xarta.system_message") if isinstance(source_content, dict) else None
+        )
         return _message_from_parts(
             event_id=str(getattr(event, "event_id", "") or ""),
             room_id=room_id,
@@ -695,6 +700,7 @@ class _MatrixChatE2EEClient:
             msgtype=str(msgtype),
             body=body,
             relates_to=relates_to if isinstance(relates_to, dict) else None,
+            system_message=system_message if isinstance(system_message, dict) else None,
             encrypted=encrypted,
             decrypted=encrypted,
         )
@@ -1035,8 +1041,13 @@ def _room_settings_for(data: dict[str, Any], server_id: str, room_id: str) -> di
     server = servers.get(server_id) if isinstance(servers.get(server_id), dict) else {}
     rooms = server.get("rooms") if isinstance(server.get("rooms"), dict) else {}
     room = rooms.get(room_id) if isinstance(rooms.get(room_id), dict) else {}
+    system_level = _safe_str(room.get("system_message_min_level")).lower() or "information"
+    if system_level not in {"debug", "information", "warning", "error"}:
+        system_level = "information"
     return {
         "hermes_command_catalog": _safe_bool(room.get("hermes_command_catalog")),
+        "hide_system_messages": _safe_bool(room.get("hide_system_messages")),
+        "system_message_min_level": system_level,
     }
 
 
@@ -1050,6 +1061,8 @@ def _room_settings_payload(settings: dict[str, str], room_id: str) -> dict[str, 
         "server_id": settings.get("server_id") or "tb1",
         "room_id": room_id,
         "hermes_command_catalog": bool(room["hermes_command_catalog"]),
+        "hide_system_messages": bool(room["hide_system_messages"]),
+        "system_message_min_level": room["system_message_min_level"],
         "admin_available": bool(settings.get("admin_access_token")),
     }
 
@@ -1073,6 +1086,11 @@ def _set_room_settings(settings: dict[str, str], room_id: str, patch: _RoomSetti
         server["rooms"] = rooms
     rooms[room_id] = {
         "hermes_command_catalog": bool(patch.hermes_command_catalog),
+        "hide_system_messages": bool(patch.hide_system_messages),
+        "system_message_min_level": _safe_str(patch.system_message_min_level).lower()
+        if _safe_str(patch.system_message_min_level).lower()
+        in {"debug", "information", "warning", "error"}
+        else "information",
     }
     _write_room_settings(settings, data)
     return _room_settings_payload(settings, room_id)
@@ -1087,6 +1105,8 @@ def _annotate_room_settings(settings: dict[str, str], rooms: list[dict[str, Any]
             continue
         room_settings = _room_settings_for(data, server_id, room_id)
         room["hermes_command_catalog"] = bool(room_settings["hermes_command_catalog"])
+        room["hide_system_messages"] = bool(room_settings["hide_system_messages"])
+        room["system_message_min_level"] = room_settings["system_message_min_level"]
 
 
 def _hermes_matrix_patch_status(path: str) -> dict[str, Any]:
@@ -1288,6 +1308,7 @@ def _message_from_parts(
     msgtype: str,
     body: str,
     relates_to: dict[str, Any] | None = None,
+    system_message: dict[str, Any] | None = None,
     encrypted: bool = False,
     decrypted: bool = False,
 ) -> dict[str, Any]:
@@ -1299,6 +1320,7 @@ def _message_from_parts(
         "msgtype": msgtype,
         "body": body,
         "relates_to": relates_to if isinstance(relates_to, dict) else None,
+        "system_message": system_message if isinstance(system_message, dict) else None,
         "encrypted": encrypted,
         "decrypted": decrypted,
     }
@@ -1319,6 +1341,7 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         return None
 
     relates_to = content.get("m.relates_to")
+    system_message = content.get("org.xarta.system_message")
     return _message_from_parts(
         event_id=event.get("event_id") or "",
         room_id=room_id,
@@ -1327,6 +1350,7 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         msgtype=msgtype,
         body=body,
         relates_to=relates_to if isinstance(relates_to, dict) else None,
+        system_message=system_message if isinstance(system_message, dict) else None,
         encrypted=event_type == "m.room.encrypted",
         decrypted=False,
     )
