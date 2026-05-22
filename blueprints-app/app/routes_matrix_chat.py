@@ -95,6 +95,15 @@ _DEFAULT_HERMES_COMMAND_PYTHON = "/opt/hermes/.venv/bin/python"
 _DEFAULT_ROOM_SETTINGS_FILE = "/xarta-node/.lone-wolf/stacks/matrix-chat/data/room-settings.json"
 _HERMES_COMMAND_CATALOG_TIMEOUT = 8
 _MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
+_HERMES_ALIAS_RE = re.compile(r"^\s*(?:hermes|h|hermes-vps|vps|hv)\s*:", re.IGNORECASE)
+_HERMES_BRIDGE_ROOM_NAMES = {
+    "tb1": {"bridge"},
+    "vps": {"shared bridge"},
+}
+_HERMES_BRIDGE_PREFIXES = {
+    "tb1": "hermes: ",
+    "vps": "hermes-vps: ",
+}
 _HERMES_COMMAND_CATALOG_SCRIPT = r"""
 import json
 
@@ -1478,6 +1487,64 @@ def _matrix_message_content(body: str) -> dict[str, Any]:
     return content
 
 
+def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
+    members: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "m.room.member":
+            continue
+        content = _event_content(event)
+        if content.get("membership") not in {"join", "invite"}:
+            continue
+        state_key = event.get("state_key")
+        if isinstance(state_key, str) and state_key.startswith("@"):
+            members.add(state_key)
+    return members
+
+
+def _room_name_candidates(events: list[dict[str, Any]]) -> set[str]:
+    name, canonical_alias, _, _ = _room_name_from_events(events)
+    candidates = {item.strip().lower() for item in (name, canonical_alias or "") if item and item.strip()}
+    if canonical_alias and canonical_alias.startswith("#") and ":" in canonical_alias:
+        candidates.add(canonical_alias[1:].split(":", 1)[0].strip().lower())
+    return candidates
+
+
+def _auto_hermes_prefix_body_for_state(
+    *,
+    server_id: str,
+    body: str,
+    events: list[dict[str, Any]],
+) -> str:
+    clean = (body or "").strip()
+    if not clean or _HERMES_ALIAS_RE.match(clean):
+        return clean
+
+    bridge_names = _HERMES_BRIDGE_ROOM_NAMES.get(server_id, set())
+    if not (_room_name_candidates(events) & bridge_names):
+        return clean
+
+    member_ids = _room_member_user_ids_from_state(events)
+    if any(user_id in member_ids for user_id in _mentions_from_body(clean)):
+        return clean
+
+    return f"{_HERMES_BRIDGE_PREFIXES.get(server_id, 'hermes: ')}{clean}"
+
+
+async def _matrix_chat_outgoing_body(room_id: str, body: str) -> str:
+    settings = _settings()
+    encoded_room = quote(room_id, safe="")
+    try:
+        data = await _matrix_request_any("GET", f"/rooms/{encoded_room}/state")
+    except HTTPException:
+        return (body or "").strip()
+    events = data if isinstance(data, list) else []
+    return _auto_hermes_prefix_body_for_state(
+        server_id=settings.get("server_id", "tb1"),
+        body=body,
+        events=events,
+    )
+
+
 async def _send_bogus_encrypted_test_event(
     room_id: str,
     *,
@@ -1932,17 +1999,7 @@ async def _room_member_user_ids(room_id: str) -> set[str]:
     encoded_room = quote(room_id, safe="")
     data = await _matrix_request_any("GET", f"/rooms/{encoded_room}/state")
     events = data if isinstance(data, list) else []
-    members: set[str] = set()
-    for event in events:
-        if not isinstance(event, dict) or event.get("type") != "m.room.member":
-            continue
-        content = _event_content(event)
-        if content.get("membership") not in {"join", "invite"}:
-            continue
-        state_key = event.get("state_key")
-        if isinstance(state_key, str) and state_key.startswith("@"):
-            members.add(state_key)
-    return members
+    return _room_member_user_ids_from_state(events)
 
 
 async def _admin_user_candidates() -> list[dict[str, Any]]:
@@ -2452,9 +2509,10 @@ async def matrix_chat_redact_messages(
 
 @router.post("/rooms/{room_id}/messages")
 async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict[str, Any]:
+    outgoing_body = await _matrix_chat_outgoing_body(room_id, body.body)
     e2ee_client = await _get_e2ee_client()
     if e2ee_client:
-        return await e2ee_client.send_message(room_id, body.body)
+        return await e2ee_client.send_message(room_id, outgoing_body)
 
     encoded_room = quote(room_id, safe="")
     txn_id = f"bp-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
@@ -2462,7 +2520,7 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
     data = await _matrix_request(
         "PUT",
         f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
-        json_body=_matrix_message_content(body.body),
+        json_body=_matrix_message_content(outgoing_body),
         expected=(200,),
     )
     return {

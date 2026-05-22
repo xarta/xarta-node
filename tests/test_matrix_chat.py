@@ -104,6 +104,62 @@ def test_matrix_chat_message_content_adds_explicit_mxid_mentions():
     }
 
 
+def test_matrix_chat_auto_prefixes_local_bridge_without_member_mention():
+    body = matrix_chat._auto_hermes_prefix_body_for_state(
+        server_id="tb1",
+        body="status please",
+        events=[
+            {"type": "m.room.name", "content": {"name": "Bridge"}},
+            {"type": "m.room.member", "state_key": "@operator:test.example", "content": {"membership": "join"}},
+        ],
+    )
+
+    assert body == "hermes: status please"
+
+
+def test_matrix_chat_auto_prefix_skips_existing_room_member_mention():
+    body = matrix_chat._auto_hermes_prefix_body_for_state(
+        server_id="tb1",
+        body="hello @operator:test.example",
+        events=[
+            {"type": "m.room.name", "content": {"name": "Bridge"}},
+            {"type": "m.room.member", "state_key": "@operator:test.example", "content": {"membership": "join"}},
+        ],
+    )
+
+    assert body == "hello @operator:test.example"
+
+
+def test_matrix_chat_auto_prefix_skips_non_bridge_rooms():
+    body = matrix_chat._auto_hermes_prefix_body_for_state(
+        server_id="tb1",
+        body="status please",
+        events=[{"type": "m.room.name", "content": {"name": "Ops"}}],
+    )
+
+    assert body == "status please"
+
+
+def test_matrix_chat_auto_prefixes_vps_shared_bridge():
+    body = matrix_chat._auto_hermes_prefix_body_for_state(
+        server_id="vps",
+        body="status please",
+        events=[{"type": "m.room.name", "content": {"name": "Shared Bridge"}}],
+    )
+
+    assert body == "hermes-vps: status please"
+
+
+def test_matrix_chat_auto_prefix_skips_existing_hermes_alias():
+    body = matrix_chat._auto_hermes_prefix_body_for_state(
+        server_id="tb1",
+        body="h: status please",
+        events=[{"type": "m.room.name", "content": {"name": "Bridge"}}],
+    )
+
+    assert body == "h: status please"
+
+
 def test_matrix_chat_room_mention_candidates_from_state_excludes_self():
     users = matrix_chat._room_mention_candidates_from_state(
         [
@@ -263,6 +319,8 @@ def test_matrix_chat_room_settings_default_off_and_persist(tmp_path):
         "server_id": "vps",
         "room_id": "!shared:test.example",
         "hermes_command_catalog": False,
+        "hide_system_messages": False,
+        "system_message_min_level": "information",
         "admin_available": True,
     }
 
