@@ -29,7 +29,7 @@ Usage: setup-vps-ops-tools.sh [--with-docker]
 
 Installs common Debian VPS operations tools:
   ca-certificates curl dnsutils git iproute2 iputils-ping jq less lsof
-  netcat-openbsd python3 python3-pip python3-venv ripgrep rsync tcpdump
+  netcat-openbsd pv python3 python3-pip python3-venv ripgrep rsync tcpdump
   unzip zip
 
 Optional:
@@ -57,6 +57,7 @@ packages=(
     less
     lsof
     netcat-openbsd
+    pv
     python3
     python3-pip
     python3-venv
@@ -94,7 +95,7 @@ if [[ "$WITH_DOCKER" == "true" ]]; then
     fi
 fi
 
-for cmd in curl git jq python3 rg rsync tcpdump; do
+for cmd in curl git jq pv python3 rg rsync tcpdump; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${RED}Error:${NC} missing command after install: $cmd" >&2
         exit 1
@@ -103,5 +104,6 @@ done
 
 echo -e "${GREEN}Done.${NC}"
 echo "rsync: $(rsync --version | head -n 1)"
+echo "pv: $(pv --version | head -n 1)"
 echo "rg: $(rg --version | head -n 1)"
 echo "jq: $(jq --version)"
