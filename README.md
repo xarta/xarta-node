@@ -195,7 +195,7 @@ setup:
 sudo bash setup-vps-ops-tools.sh
 ```
 
-It installs everyday debugging/deployment tools such as `rsync`, `jq`,
+It installs everyday debugging/deployment tools such as `rsync`, `pv`, `jq`,
 `ripgrep`, `tcpdump`, DNS tools, Python venv support, and archive utilities.
 It deliberately does not configure Blueprints, Caddy, Tailscale, firewall
 policy, or Docker unless `--with-docker` is explicitly supplied.
