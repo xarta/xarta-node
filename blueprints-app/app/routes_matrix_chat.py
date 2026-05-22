@@ -77,7 +77,13 @@ _DEFAULT_SMOKE_ROOM_ID = ""
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
+_MAX_REDACTION_SCAN_LIMIT = 20_000
+_REDACTION_MAX_RETRIES = 6
+_REDACTION_RETRY_FLOOR_SECONDS = 5.0
+_REDACTION_PACE_SECONDS = 0.15
 _MAX_SYNC_TIMEOUT_MS = 30_000
+_runtime_access_tokens: dict[tuple[str, str, str, str], str] = {}
+_runtime_access_token_lock = asyncio.Lock()
 _DEFAULT_CRYPTO_STORE_DIR = (
     "/xarta-node/.lone-wolf/stacks/matrix-synapse/data/blueprints-chat/crypto-store"
 )
@@ -184,6 +190,20 @@ class _RoomSettingsBody(BaseModel):
     system_message_min_level: str = "information"
 
 
+class _RedactMessagesBody(BaseModel):
+    mode: str = Field(default="events", pattern="^(events|undecryptable|system_before)$")
+    event_ids: list[str] = Field(default_factory=list, max_length=500)
+    before_ts: int | None = None
+    limit: int = Field(default=500, ge=1, le=_MAX_REDACTION_SCAN_LIMIT)
+    scan_all: bool = False
+    reason: str = Field(default="Blueprints Matrix Chat delete", max_length=240)
+
+
+class _TestDecryptionMessagesBody(BaseModel):
+    decryptable_count: int = Field(default=2, ge=0, le=5)
+    undecryptable_count: int = Field(default=2, ge=0, le=5)
+
+
 def _read_env_file(path: str) -> dict[str, str]:
     values: dict[str, str] = {}
     env_path = Path(path)
@@ -217,6 +237,15 @@ def _server_prefixed_env_name(name: str, server_id: str) -> str:
     if name.startswith(marker):
         return name.replace(marker, f"{marker}{server_id.upper()}_", 1)
     return _server_env_name(name, server_id)
+
+
+def _runtime_token_key(settings: dict[str, str]) -> tuple[str, str, str, str]:
+    return (
+        settings.get("server_id", ""),
+        settings.get("upstream", ""),
+        settings.get("user_id", ""),
+        settings.get("device_id", ""),
+    )
 
 
 def _settings(server_id: str | None = None) -> dict[str, str]:
@@ -274,10 +303,24 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
     if not public_homeserver:
         public_homeserver = _DEFAULT_PUBLIC_HOMESERVER
 
-    user_id = pick("MATRIX_CHAT_USER_ID", "MATRIX_CODEX_USER_ID")
-    access_token = pick("MATRIX_CHAT_ACCESS_TOKEN", "MATRIX_CODEX_ACCESS_TOKEN")
+    user_id = pick(
+        "MATRIX_CHAT_DAVROS_USER_ID",
+        "MATRIX_DAVROS_USER_ID",
+        "MATRIX_CHAT_OPERATOR_USER_ID",
+        "MATRIX_OPERATOR_USER_ID",
+        "MATRIX_CHAT_USER_ID",
+        "MATRIX_CODEX_USER_ID",
+    )
+    access_token = pick(
+        "MATRIX_CHAT_DAVROS_ACCESS_TOKEN",
+        "MATRIX_DAVROS_ACCESS_TOKEN",
+        "MATRIX_CHAT_OPERATOR_ACCESS_TOKEN",
+        "MATRIX_OPERATOR_ACCESS_TOKEN",
+        "MATRIX_CHAT_ACCESS_TOKEN",
+        "MATRIX_CODEX_ACCESS_TOKEN",
+    )
 
-    return {
+    settings = {
         "server_id": server_id,
         "server_label": _MATRIX_SERVER_LABELS[server_id],
         "env_file": env_file,
@@ -285,6 +328,14 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
         "public_homeserver": public_homeserver.rstrip("/"),
         "user_id": user_id,
         "access_token": access_token,
+        "password": pick(
+            "MATRIX_CHAT_DAVROS_PASSWORD",
+            "MATRIX_DAVROS_PASSWORD",
+            "MATRIX_CHAT_OPERATOR_PASSWORD",
+            "MATRIX_OPERATOR_PASSWORD",
+            "MATRIX_CHAT_PASSWORD",
+            "MATRIX_CODEX_PASSWORD",
+        ),
         "smoke_room_id": pick(
             "MATRIX_CHAT_DEFAULT_ROOM_ID",
             "MATRIX_HERMES_SMOKE_ROOM_ID",
@@ -302,9 +353,28 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             "MATRIX_ADMIN_ACCESS_TOKEN",
         ),
         "encryption": pick("MATRIX_CHAT_ENCRYPTION", "BLUEPRINTS_MATRIX_CHAT_ENCRYPTION"),
-        "device_id": pick("MATRIX_CHAT_DEVICE_ID", "BLUEPRINTS_MATRIX_CHAT_DEVICE_ID"),
-        "recovery_key": pick("MATRIX_CHAT_RECOVERY_KEY", "BLUEPRINTS_MATRIX_CHAT_RECOVERY_KEY"),
+        "device_id": pick(
+            "MATRIX_CHAT_DAVROS_DEVICE_ID",
+            "MATRIX_DAVROS_DEVICE_ID",
+            "MATRIX_CHAT_OPERATOR_DEVICE_ID",
+            "MATRIX_OPERATOR_DEVICE_ID",
+            "MATRIX_CHAT_DEVICE_ID",
+            "BLUEPRINTS_MATRIX_CHAT_DEVICE_ID",
+            "MATRIX_CODEX_DEVICE_ID",
+        ),
+        "recovery_key": pick(
+            "MATRIX_CHAT_DAVROS_RECOVERY_KEY",
+            "MATRIX_DAVROS_RECOVERY_KEY",
+            "MATRIX_CHAT_OPERATOR_RECOVERY_KEY",
+            "MATRIX_OPERATOR_RECOVERY_KEY",
+            "MATRIX_CHAT_RECOVERY_KEY",
+            "BLUEPRINTS_MATRIX_CHAT_RECOVERY_KEY",
+        ),
         "crypto_store_dir": pick(
+            "MATRIX_CHAT_DAVROS_CRYPTO_STORE_DIR",
+            "MATRIX_DAVROS_CRYPTO_STORE_DIR",
+            "MATRIX_CHAT_OPERATOR_CRYPTO_STORE_DIR",
+            "MATRIX_OPERATOR_CRYPTO_STORE_DIR",
             "MATRIX_CHAT_CRYPTO_STORE_DIR",
             "BLUEPRINTS_MATRIX_CHAT_CRYPTO_STORE_DIR",
             default=_DEFAULT_CRYPTO_STORE_DIR,
@@ -343,6 +413,10 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             default=_DEFAULT_ROOM_SETTINGS_FILE,
         ),
     }
+    cached_token = _runtime_access_tokens.get(_runtime_token_key(settings))
+    if cached_token:
+        settings["access_token"] = cached_token
+    return settings
 
 
 def _require_credentials() -> dict[str, str]:
@@ -357,6 +431,66 @@ def _require_credentials() -> dict[str, str]:
 
 def _headers(settings: dict[str, str]) -> dict[str, str]:
     return {"Authorization": f"Bearer {settings['access_token']}"}
+
+
+async def _refresh_chat_access_token(settings: dict[str, str]) -> dict[str, str]:
+    if not settings.get("password"):
+        raise HTTPException(
+            status_code=502,
+            detail="Matrix chat credential rejected by homeserver and password fallback is not configured",
+        )
+
+    async with _runtime_access_token_lock:
+        cached_token = _runtime_access_tokens.get(_runtime_token_key(settings))
+        if cached_token and cached_token != settings.get("access_token"):
+            settings["access_token"] = cached_token
+            return settings
+
+        payload: dict[str, Any] = {
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": settings["user_id"]},
+            "password": settings["password"],
+            "initial_device_display_name": "Blueprints Matrix Chat",
+        }
+        if settings.get("device_id"):
+            payload["device_id"] = settings["device_id"]
+
+        timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+        try:
+            async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
+                response = await client.post(_matrix_path("/login"), json=payload)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+
+        if response.status_code not in {200, 201}:
+            raise HTTPException(
+                status_code=502,
+                detail="Matrix chat credential rejected and password fallback login failed",
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+
+        token = str(data.get("access_token") or "")
+        resolved_user_id = str(data.get("user_id") or "")
+        resolved_device_id = str(data.get("device_id") or settings.get("device_id") or "")
+        if not token or resolved_user_id != settings["user_id"]:
+            raise HTTPException(
+                status_code=502,
+                detail="Matrix chat password fallback returned an unexpected identity",
+            )
+
+        settings["access_token"] = token
+        if resolved_device_id:
+            settings["device_id"] = resolved_device_id
+        _runtime_access_tokens[_runtime_token_key(settings)] = token
+        log.warning(
+            "Matrix chat access token refreshed from password fallback for %s on %s",
+            settings["user_id"],
+            settings["server_label"],
+        )
+        return settings
 
 
 def _matrix_path(path: str) -> str:
@@ -492,9 +626,17 @@ class _MatrixChatE2EEClient:
             sync_store=sync_store,
         )
 
-        whoami = await self._client.whoami()
+        try:
+            whoami = await self._client.whoami()
+        except Exception as exc:
+            if exc.__class__.__name__ != "MUnknownToken":
+                raise
+            refreshed = await _refresh_chat_access_token(self._settings)
+            self._settings.update(refreshed)
+            self._api.token = self._settings["access_token"]
+            whoami = await self._client.whoami()
         resolved_user_id = getattr(whoami, "user_id", "") or self._settings["user_id"]
-        resolved_device_id = self._settings.get("device_id") or getattr(whoami, "device_id", "")
+        resolved_device_id = getattr(whoami, "device_id", "") or self._settings.get("device_id") or ""
         self._settings["user_id"] = str(resolved_user_id)
         self._client.mxid = UserID(self._settings["user_id"])
         if resolved_device_id:
@@ -626,14 +768,16 @@ class _MatrixChatE2EEClient:
         from mautrix.api import Method, Path
 
         await self.ensure_started()
+        query_params = {
+            "dir": "b",
+            "limit": str(limit),
+        }
+        if from_token:
+            query_params["from"] = from_token
         data = await self._client.api.request(
             Method.GET,
             Path.v3.rooms[room_id].messages,
-            query_params={
-                "dir": "b",
-                "from": from_token,
-                "limit": str(limit),
-            },
+            query_params=query_params,
             metrics_method="getMessages",
         )
         events = data.get("chunk") if isinstance(data, dict) and isinstance(data.get("chunk"), list) else []
@@ -714,6 +858,8 @@ class _MatrixChatE2EEClient:
 
         messages: list[dict[str, Any]] = []
         for raw in events:
+            if _event_is_redacted(raw):
+                continue
             try:
                 event = Event.deserialize(raw)
             except Exception:
@@ -765,6 +911,15 @@ async def _matrix_request_any(
                 json=json_body,
                 headers=_headers(settings),
             )
+            if response.status_code == 401:
+                settings = await _refresh_chat_access_token(settings)
+                response = await client.request(
+                    method,
+                    _matrix_path(path),
+                    params=params,
+                    json=json_body,
+                    headers=_headers(settings),
+                )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
 
@@ -804,11 +959,113 @@ async def _matrix_request(
     return data
 
 
+def _matrix_retry_after_seconds(response: httpx.Response) -> float:
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    retry_after_ms = data.get("retry_after_ms") if isinstance(data, dict) else None
+    if isinstance(retry_after_ms, int | float) and retry_after_ms > 0:
+        return max(_REDACTION_RETRY_FLOOR_SECONDS, min(float(retry_after_ms) / 1000.0, 30.0))
+    return _REDACTION_RETRY_FLOOR_SECONDS
+
+
+async def _redact_matrix_event(room_id: str, event_id: str, reason: str) -> dict[str, Any]:
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Matrix event id is required")
+    settings = _require_credentials()
+    encoded_room = quote(room_id, safe="")
+    encoded_event = quote(event_id, safe="")
+    txn_id = f"bp-redact-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+    encoded_txn = quote(txn_id, safe="")
+    path = _matrix_path(f"/rooms/{encoded_room}/redact/{encoded_event}/{encoded_txn}")
+    timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+    async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
+        for attempt in range(_REDACTION_MAX_RETRIES + 1):
+            try:
+                response = await client.put(path, json={"reason": reason}, headers=_headers(settings))
+                if response.status_code == 401:
+                    settings = await _refresh_chat_access_token(settings)
+                    response = await client.put(path, json={"reason": reason}, headers=_headers(settings))
+            except httpx.RequestError as exc:
+                raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+
+            if response.status_code == 200:
+                try:
+                    data = response.json() if response.content else {}
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Matrix homeserver returned invalid JSON",
+                    ) from exc
+                break
+            if response.status_code == 429 and attempt < _REDACTION_MAX_RETRIES:
+                await asyncio.sleep(_matrix_retry_after_seconds(response))
+                continue
+            if response.status_code in {401, 403}:
+                detail = "Matrix chat credential rejected by homeserver"
+            elif response.status_code == 429:
+                detail = "Matrix homeserver rate limited redaction; try again in a moment"
+            else:
+                detail = f"Matrix redaction failed with HTTP {response.status_code}"
+            raise HTTPException(status_code=502, detail=detail)
+    return {
+        "event_id": event_id,
+        "redaction_event_id": data.get("event_id"),
+    }
+
+
+async def _load_room_messages_for_redaction(
+    room_id: str,
+    limit: int,
+    *,
+    scan_all: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    messages: list[dict[str, Any]] = []
+    from_token: str | None = None
+    target = _MAX_REDACTION_SCAN_LIMIT if scan_all else max(1, min(limit, _MAX_REDACTION_SCAN_LIMIT))
+    remaining = target
+    at_start = False
+
+    while remaining > 0:
+        batch_size = min(_MAX_MESSAGE_LIMIT, remaining)
+        e2ee_client = await _get_e2ee_client()
+        if e2ee_client:
+            data = await e2ee_client.messages(room_id, limit=batch_size, from_token=from_token)
+        else:
+            encoded_room = quote(room_id, safe="")
+            params: dict[str, Any] = {"dir": "b", "limit": batch_size}
+            if from_token:
+                params["from"] = from_token
+            raw = await _matrix_request("GET", f"/rooms/{encoded_room}/messages", params=params)
+            chunk = raw.get("chunk") if isinstance(raw.get("chunk"), list) else []
+            batch_messages = [
+                _message_from_event(event, room_id) for event in chunk if isinstance(event, dict)
+            ]
+            batch_messages = [message for message in batch_messages if message]
+            batch_messages.reverse()
+            data = {
+                "messages": batch_messages,
+                "end": raw.get("end") if isinstance(raw.get("end"), str) else None,
+            }
+
+        batch = data.get("messages") if isinstance(data.get("messages"), list) else []
+        messages.extend(message for message in batch if isinstance(message, dict))
+        remaining -= batch_size
+        from_token = data.get("end") if isinstance(data.get("end"), str) else None
+        if not from_token or not batch:
+            at_start = True
+            break
+
+    return messages[-target:], at_start
+
+
 async def _synapse_admin_request(
     method: str,
     path: str,
     *,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     expected: tuple[int, ...] = (200,),
     admin_api_version: str = "v2",
 ) -> dict[str, Any]:
@@ -825,6 +1082,7 @@ async def _synapse_admin_request(
                 method,
                 f"/_synapse/admin/{admin_api_version}{path}",
                 params=params,
+                json=json_body,
                 headers={"Authorization": f"Bearer {admin_token}"},
             )
     except httpx.RequestError as exc:
@@ -846,6 +1104,53 @@ async def _synapse_admin_request(
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Matrix homeserver returned unexpected JSON")
     return data
+
+
+async def _set_bulk_redaction_ratelimit_override(
+    settings: dict[str, str],
+) -> tuple[bool, dict[str, Any]]:
+    """Temporarily raise the Matrix chat user's send/redaction rate limit."""
+    if not settings.get("admin_access_token") or not settings.get("user_id"):
+        return False, {}
+    encoded_user = quote(settings["user_id"], safe="")
+    path = f"/users/{encoded_user}/override_ratelimit"
+    try:
+        prior = await _synapse_admin_request("GET", path, admin_api_version="v1")
+        await _synapse_admin_request(
+            "POST",
+            path,
+            json_body={"messages_per_second": 50, "burst_count": 500},
+            admin_api_version="v1",
+        )
+    except HTTPException as exc:
+        log.warning("Matrix bulk redaction: could not set temporary ratelimit override: %s", exc.detail)
+        return False, {}
+    return True, prior
+
+
+async def _restore_bulk_redaction_ratelimit_override(
+    settings: dict[str, str],
+    prior: dict[str, Any],
+) -> None:
+    if not settings.get("admin_access_token") or not settings.get("user_id"):
+        return
+    encoded_user = quote(settings["user_id"], safe="")
+    path = f"/users/{encoded_user}/override_ratelimit"
+    try:
+        if prior:
+            await _synapse_admin_request(
+                "POST",
+                path,
+                json_body={
+                    "messages_per_second": int(prior.get("messages_per_second") or 0),
+                    "burst_count": int(prior.get("burst_count") or 0),
+                },
+                admin_api_version="v1",
+            )
+        else:
+            await _synapse_admin_request("DELETE", path, admin_api_version="v1")
+    except HTTPException as exc:
+        log.warning("Matrix bulk redaction: could not restore ratelimit override: %s", exc.detail)
 
 
 def _safe_str(value: Any) -> str:
@@ -1173,6 +1478,41 @@ def _matrix_message_content(body: str) -> dict[str, Any]:
     return content
 
 
+async def _send_bogus_encrypted_test_event(
+    room_id: str,
+    *,
+    label: str,
+    sequence: int,
+) -> dict[str, Any]:
+    settings = _require_credentials()
+    encoded_room = quote(room_id, safe="")
+    txn_id = f"bp-test-undec-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+    encoded_txn = quote(txn_id, safe="")
+    marker = f"{label}-u{sequence}"
+    data = await _matrix_request(
+        "PUT",
+        f"/rooms/{encoded_room}/send/m.room.encrypted/{encoded_txn}",
+        json_body={
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "sender_key": f"blueprints-test-sender-key-{uuid.uuid4().hex}",
+            "session_id": f"blueprints-test-session-{uuid.uuid4().hex}",
+            "device_id": settings.get("device_id") or "BLUEPRINTS_TEST",
+            "ciphertext": f"not-a-valid-megolm-payload:{marker}",
+            "org.xarta.test_message": {
+                "kind": "deliberately_undecryptable",
+                "label": label,
+                "sequence": sequence,
+            },
+        },
+        expected=(200,),
+    )
+    return {
+        "event_id": data.get("event_id"),
+        "kind": "undecryptable",
+        "label": marker,
+    }
+
+
 def _normalize_hermes_command(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -1299,6 +1639,13 @@ def _event_ts(event: dict[str, Any]) -> int | None:
     return ts if isinstance(ts, int) else None
 
 
+def _event_is_redacted(event: dict[str, Any]) -> bool:
+    unsigned = event.get("unsigned")
+    if isinstance(unsigned, dict) and isinstance(unsigned.get("redacted_because"), dict):
+        return True
+    return bool(event.get("redacted"))
+
+
 def _message_from_parts(
     *,
     event_id: str,
@@ -1327,6 +1674,8 @@ def _message_from_parts(
 
 
 def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] | None:
+    if _event_is_redacted(event):
+        return None
     event_type = event.get("type")
     content = _event_content(event)
     if event_type == "m.room.encrypted":
@@ -1367,6 +1716,22 @@ def _state_events(room: dict[str, Any], invite: bool = False) -> list[dict[str, 
 def _timeline_events(room: dict[str, Any]) -> list[dict[str, Any]]:
     events = room.get("timeline", {}).get("events", [])
     return events if isinstance(events, list) else []
+
+
+def _redacted_event_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
+    redacted: list[str] = []
+    for event in events:
+        if _event_is_redacted(event):
+            event_id = _safe_str(event.get("event_id"))
+            if event_id:
+                redacted.append(event_id)
+        if event.get("type") != "m.room.redaction":
+            continue
+        content = _event_content(event)
+        target = _safe_str(event.get("redacts") or content.get("redacts"))
+        if target:
+            redacted.append(target)
+    return redacted
 
 
 def _is_room_id(value: str | None) -> bool:
@@ -2008,6 +2373,83 @@ async def matrix_chat_messages(
     }
 
 
+@router.post("/rooms/{room_id}/redactions")
+async def matrix_chat_redact_messages(
+    room_id: str,
+    body: _RedactMessagesBody,
+) -> dict[str, Any]:
+    targets: list[str] = []
+    if body.mode == "events":
+        targets = [event_id.strip() for event_id in body.event_ids if event_id.strip()]
+        scanned_count = 0
+        scan_exhausted = True
+    elif body.mode == "undecryptable":
+        targets = [event_id.strip() for event_id in body.event_ids if event_id.strip()]
+        if not targets:
+            raise HTTPException(
+                status_code=400,
+                detail="Undecryptable cleanup requires explicit event ids from the visible client view",
+            )
+        scanned_count = 0
+        scan_exhausted = True
+    else:
+        messages, scan_exhausted = await _load_room_messages_for_redaction(
+            room_id,
+            body.limit,
+            scan_all=body.scan_all,
+        )
+        scanned_count = len(messages)
+        if body.mode == "system_before":
+            if body.before_ts is None:
+                raise HTTPException(status_code=400, detail="before_ts is required")
+            targets = [
+                str(message.get("event_id") or "")
+                for message in messages
+                if isinstance(message.get("system_message"), dict)
+                and isinstance(message.get("origin_server_ts"), int)
+                and int(message["origin_server_ts"]) < body.before_ts
+            ]
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for event_id in targets:
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        deduped.append(event_id)
+
+    redacted: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    settings = _settings()
+    override_applied = False
+    override_prior: dict[str, Any] = {}
+    if body.mode != "events" and deduped:
+        override_applied, override_prior = await _set_bulk_redaction_ratelimit_override(settings)
+    try:
+        for index, event_id in enumerate(deduped):
+            try:
+                redacted.append(await _redact_matrix_event(room_id, event_id, body.reason))
+            except HTTPException as exc:
+                errors.append({"event_id": event_id, "detail": exc.detail})
+            if index < len(deduped) - 1 and _REDACTION_PACE_SECONDS > 0:
+                await asyncio.sleep(_REDACTION_PACE_SECONDS)
+    finally:
+        if override_applied:
+            await _restore_bulk_redaction_ratelimit_override(settings, override_prior)
+
+    return {
+        "room_id": room_id,
+        "mode": body.mode,
+        "matched": len(deduped),
+        "scanned_count": scanned_count,
+        "scan_exhausted": scan_exhausted,
+        "scan_limit": _MAX_REDACTION_SCAN_LIMIT if body.scan_all else body.limit,
+        "redacted": redacted,
+        "redacted_count": len(redacted),
+        "errors": errors,
+    }
+
+
 @router.post("/rooms/{room_id}/messages")
 async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict[str, Any]:
     e2ee_client = await _get_e2ee_client()
@@ -2029,6 +2471,52 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
     }
 
 
+@router.post("/rooms/{room_id}/test/decryption-mix")
+async def matrix_chat_seed_decryption_mix(
+    room_id: str,
+    body: _TestDecryptionMessagesBody,
+) -> dict[str, Any]:
+    label = f"bp-decryption-test-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    events: list[dict[str, Any]] = []
+    e2ee_client = await _get_e2ee_client()
+    for index in range(body.decryptable_count):
+        text = (
+            f"[{label}-d{index + 1}] decryptable Matrix chat cleanup test. "
+            "This one should remain after deleting loaded undecryptable messages."
+        )
+        if e2ee_client:
+            sent = await e2ee_client.send_message(room_id, text)
+            events.append(
+                {
+                    "event_id": sent.get("event_id"),
+                    "kind": "decryptable",
+                    "label": f"{label}-d{index + 1}",
+                }
+            )
+        else:
+            sent = await matrix_chat_send_message(room_id, _SendMessageBody(body=text))
+            events.append(
+                {
+                    "event_id": sent.get("event_id"),
+                    "kind": "decryptable",
+                    "label": f"{label}-d{index + 1}",
+                }
+            )
+    for index in range(body.undecryptable_count):
+        events.append(
+            await _send_bogus_encrypted_test_event(
+                room_id,
+                label=label,
+                sequence=index + 1,
+            )
+        )
+    return {
+        "room_id": room_id,
+        "label": label,
+        "events": events,
+    }
+
+
 @router.get("/sync")
 async def matrix_chat_sync(
     since: str | None = None,
@@ -2045,14 +2533,22 @@ async def matrix_chat_sync(
         if not isinstance(room, dict):
             continue
         raw_events = [event for event in _timeline_events(room) if isinstance(event, dict)]
+        redacted_event_ids = _redacted_event_ids_from_events(raw_events)
+        redacted_event_id_set = set(redacted_event_ids)
         if e2ee_client:
             messages = await e2ee_client.messages_from_raw_events(room_id, raw_events)
         else:
             messages = [_message_from_event(event, room_id) for event in raw_events]
+        messages = [
+            message
+            for message in messages
+            if message and message.get("event_id") not in redacted_event_id_set
+        ]
         room_updates.append(
             {
                 "room_id": room_id,
-                "messages": [message for message in messages if message],
+                "messages": messages,
+                "redacted_event_ids": redacted_event_ids,
                 "limited": bool(room.get("timeline", {}).get("limited"))
                 if isinstance(room.get("timeline"), dict)
                 else False,

@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import config as cfg
 from .db import get_conn, get_setting
+from .events import AppEvent
+from .routes_events import publish_event
 from .tts_sanitizer_client import (
     TtsSanitizerUnavailable,
     resolve_tts_sanitizer_url,
@@ -78,6 +82,7 @@ _active_sessions_lock = asyncio.Lock()
 class SpeakRequest(BaseModel):
     text: str | None = None
     voice: str | None = None
+    client_id: str | None = None
     interrupt: bool | None = None
     mode: str | None = None
     format: str | None = None
@@ -103,6 +108,33 @@ class SanitizeRequest(BaseModel):
     transform_profile: TransformProfile | None = None
     allow_llm_sanitizer: bool | None = None
     allow_llm_santitizer: bool | None = None
+
+
+class UtteranceTarget(BaseModel):
+    kind: str | None = None
+    dedupe: str | None = None
+
+
+class UtteranceRequest(BaseModel):
+    utterance_id: str | None = None
+    source: str | None = None
+    agent_id: str | None = None
+    subagent_id: str | None = None
+    conversation_id: str | None = None
+    text: str
+    voice: str | None = None
+    mode: str | None = None
+    format: str | None = None
+    interrupt: bool | None = None
+    client_id: str | None = None
+    target: UtteranceTarget | None = None
+    sanitize_text: bool | None = None
+    transform_profile: TransformProfile | None = None
+    allow_llm_sanitizer: bool | None = None
+    volume: float | None = None
+    timeout_ms: int | None = None
+    allow_fallback: bool | None = None
+    created_at: float | None = None
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -151,6 +183,33 @@ def _resolve_settings() -> tuple[dict[str, str], list[str]]:
     return resolved, missing
 
 
+def _load_recent_utterance_events(limit: int = 20) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT event_id, event_type, severity, title, message, source, created_at, payload_json
+            FROM events
+            WHERE event_type = 'tts.utterance.requested'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "event_id": row["event_id"],
+            "event_type": row["event_type"],
+            "severity": row["severity"],
+            "title": row["title"],
+            "message": row["message"],
+            "source": row["source"],
+            "created_at": float(row["created_at"]),
+            "payload": json.loads(row["payload_json"] or "{}"),
+        }
+        for row in rows
+    ]
+
+
 def _resolve_fallback_file(path_value: str) -> Path:
     raw = str(path_value or "").strip()
     if raw.startswith("/"):
@@ -166,6 +225,12 @@ def _resolve_fallback_kind(body: SpeakRequest, default_kind: str = "positive") -
     if raw in {"neutral", "info", "acknowledge", "ack"}:
         return "neutral"
     return "positive"
+
+
+def _safe_event_id(prefix: str, value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value.strip())
+    safe = safe.strip("-._") or uuid.uuid4().hex
+    return f"{prefix}{safe}"[:160]
 
 
 def _fallback_response(
@@ -329,7 +394,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
     else:
         effective_mode = req_mode
 
-    client_key = _client_key(request)
+    client_key = _client_key(request, body.client_id)
     session, interrupted_previous = await _start_session(client_key, interrupt)
     probe_url = settings.get("tts.local_probe_url", "")
     speech_url = settings.get("tts.local_speech_url", "")
@@ -461,6 +526,71 @@ async def tts_speak(body: SpeakRequest, request: Request):
     else:
         media_type = "application/octet-stream"
     return StreamingResponse(stream_audio(), media_type=media_type, headers=headers)
+
+
+@router.post("/utterances", status_code=201)
+async def tts_create_utterance(body: UtteranceRequest):
+    """Publish a browser-directed Hermes speech command over the SSE bus.
+
+    This route does not synthesize audio server-side. It records a short
+    control event and active browser listeners call /tts/speak locally, which
+    keeps playback near the operator device and preserves browser autoplay
+    behavior.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing utterance text"})
+
+    source = (body.source or "hermes-local").strip() or "hermes-local"
+    agent_id = (body.agent_id or "hermes").strip() or "hermes"
+    utterance_id = (body.utterance_id or f"utt_{uuid.uuid4().hex}").strip()
+    client_id = (body.client_id or f"{source}:{agent_id}").strip()
+    target = body.target or UtteranceTarget(kind="all_listeners", dedupe="one_webpage_per_client_ip_plus_phone")
+    created_at = body.created_at if body.created_at and body.created_at > 0 else time.time()
+
+    payload: dict[str, Any] = {
+        "utterance_id": utterance_id,
+        "source": source,
+        "agent_id": agent_id,
+        "subagent_id": (body.subagent_id or "").strip(),
+        "conversation_id": (body.conversation_id or "").strip(),
+        "text": text,
+        "voice": (body.voice or "").strip(),
+        "mode": (body.mode or "stream").strip().lower() or "stream",
+        "format": (body.format or "wav").strip().lower() or "wav",
+        "interrupt": bool(body.interrupt) if body.interrupt is not None else False,
+        "client_id": client_id,
+        "sanitize_text": body.sanitize_text is not False,
+        "transform_profile": body.transform_profile or "conversation",
+        "allow_llm_sanitizer": bool(body.allow_llm_sanitizer),
+        "volume": body.volume,
+        "timeout_ms": body.timeout_ms,
+        "allow_fallback": body.allow_fallback,
+        "created_at": created_at,
+        "target": {
+            "kind": target.kind or "all_listeners",
+            "dedupe": target.dedupe or "one_webpage_per_client_ip_plus_phone",
+        },
+    }
+
+    event = AppEvent.create(
+        "tts.utterance.requested",
+        "Hermes speech",
+        "Hermes requested browser speech.",
+        severity="info",
+        source=source,
+        payload=payload,
+        event_id=_safe_event_id("tts-utterance-", utterance_id),
+    )
+    published = await publish_event(event)
+    return {"ok": True, "event": published.model_dump(), "payload": payload}
+
+
+@router.get("/utterances/recent")
+async def tts_recent_utterances(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    return {"ok": True, "events": _load_recent_utterance_events(limit)}
 
 
 @router.post("/sanitize")
