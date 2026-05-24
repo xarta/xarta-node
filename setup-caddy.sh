@@ -801,6 +801,56 @@ else
     echo "    Skipped Hermes Local dashboard block (HERMES_LOCAL_DASHBOARD_EXPOSE not enabled)"
 fi
 
+# ── Hermes Local SMS webhook bridge ─────────────────────────────────────────
+# Public HTTPS terminates at the VPS Traefik edge. The private upstream leg from
+# the VPS bridge reaches this HTTP-only Caddy host block and is constrained to
+# the expected Twilio route before proxying to Hermes' loopback SMS listener.
+HERMES_LOCAL_SMS_WEBHOOK_EXPOSE="${HERMES_LOCAL_SMS_WEBHOOK_EXPOSE:-0}"
+if [[ "$HERMES_LOCAL_SMS_WEBHOOK_EXPOSE" == "1" || "$HERMES_LOCAL_SMS_WEBHOOK_EXPOSE" == "true" ]]; then
+    if [[ -z "${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME:-}" \
+       || -z "${HERMES_LOCAL_SMS_WEBHOOK_UPSTREAM:-}" \
+       || -z "${HERMES_LOCAL_SMS_WEBHOOK_PUBLIC_PATH:-}" \
+       || -z "${HERMES_LOCAL_SMS_WEBHOOK_BACKEND_PATH:-}" \
+       || -z "${HERMES_LOCAL_SMS_WEBHOOK_ALLOWED_REMOTE_IPS:-}" ]]; then
+        echo "    Skipped Hermes Local SMS webhook block (required private env not set)"
+    else
+    HERMES_LOCAL_SMS_WEBHOOK_MAX_BODY="${HERMES_LOCAL_SMS_WEBHOOK_MAX_BODY:-64KB}"
+    cat >> "$CADDYFILE" <<CADDY_HERMES_LOCAL_SMS
+
+# Hermes Local SMS webhook — private upstream leg from the VPS public edge.
+# Public URL: https://${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME}${HERMES_LOCAL_SMS_WEBHOOK_PUBLIC_PATH}
+# Hermes backend path remains ${HERMES_LOCAL_SMS_WEBHOOK_BACKEND_PATH}.
+http://${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME} {
+    @hermes_sms_webhook {
+        remote_ip ${HERMES_LOCAL_SMS_WEBHOOK_ALLOWED_REMOTE_IPS}
+        method POST
+        path ${HERMES_LOCAL_SMS_WEBHOOK_PUBLIC_PATH}
+    }
+
+    handle @hermes_sms_webhook {
+        request_body {
+            max_size ${HERMES_LOCAL_SMS_WEBHOOK_MAX_BODY}
+        }
+        rewrite * ${HERMES_LOCAL_SMS_WEBHOOK_BACKEND_PATH}
+        reverse_proxy ${HERMES_LOCAL_SMS_WEBHOOK_UPSTREAM} {
+            header_up Host localhost
+            transport http {
+                read_timeout 30s
+                write_timeout 30s
+            }
+        }
+    }
+
+    respond 404
+}
+CADDY_HERMES_LOCAL_SMS
+    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
+    echo "    Appended Hermes Local SMS webhook block (http://${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME}${HERMES_LOCAL_SMS_WEBHOOK_PUBLIC_PATH} -> ${HERMES_LOCAL_SMS_WEBHOOK_UPSTREAM}${HERMES_LOCAL_SMS_WEBHOOK_BACKEND_PATH})"
+    fi
+else
+    echo "    Skipped Hermes Local SMS webhook block (HERMES_LOCAL_SMS_WEBHOOK_EXPOSE not enabled)"
+fi
+
 # ── Hermes VPS dashboard block ──────────────────────────────────────────────
 # The VPS dashboard is reached over a private bridge/proxy path. Caddy remains
 # the browser-facing boundary and validates a separate Blueprints dashboard
