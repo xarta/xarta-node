@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -25,6 +26,9 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+
+from .events import AppEvent
+from .events import bus as events_bus
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +86,9 @@ _REDACTION_MAX_RETRIES = 6
 _REDACTION_RETRY_FLOOR_SECONDS = 5.0
 _REDACTION_PACE_SECONDS = 0.15
 _MAX_SYNC_TIMEOUT_MS = 30_000
+_WORKER_SYNC_TIMEOUT_MS = 25_000
+_WORKER_ERROR_SLEEP_SECONDS = 8.0
+_WORKER_MISSING_CREDENTIALS_SLEEP_SECONDS = 60.0
 _runtime_access_tokens: dict[tuple[str, str, str, str], str] = {}
 _runtime_access_token_lock = asyncio.Lock()
 _DEFAULT_CRYPTO_STORE_DIR = (
@@ -882,23 +889,22 @@ class _MatrixChatE2EEClient:
         return messages
 
 
-_e2ee_client: _MatrixChatE2EEClient | None = None
-_e2ee_client_key: tuple[str, str, str, str] | None = None
+_e2ee_clients: dict[tuple[str, str, str, str], _MatrixChatE2EEClient] = {}
 _e2ee_client_lock = asyncio.Lock()
 
 
 async def _get_e2ee_client(settings: dict[str, str] | None = None) -> _MatrixChatE2EEClient | None:
-    global _e2ee_client, _e2ee_client_key
     settings = settings or _require_credentials()
     if not _e2ee_requested(settings):
         return None
     candidate = _MatrixChatE2EEClient(settings)
     async with _e2ee_client_lock:
-        if _e2ee_client is None or _e2ee_client_key != candidate.key:
-            _e2ee_client = candidate
-            _e2ee_client_key = candidate.key
-    await _e2ee_client.ensure_started()
-    return _e2ee_client
+        client = _e2ee_clients.get(candidate.key)
+        if client is None:
+            client = candidate
+            _e2ee_clients[candidate.key] = client
+    await client.ensure_started()
+    return client
 
 
 async def _matrix_request_any(
@@ -2097,6 +2103,188 @@ async def _sync_for_chat(
     return await _sync(since=since, timeout_ms=timeout_ms, full_state=full_state), None
 
 
+async def _matrix_chat_sync_payload(
+    settings: dict[str, str],
+    sync: dict[str, Any],
+    e2ee_client: _MatrixChatE2EEClient | None,
+) -> dict[str, Any]:
+    joined, invited = _rooms_from_sync(sync)
+    _annotate_room_settings(settings, joined)
+    rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
+    joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
+    room_updates = []
+    for room_id, room in joined_raw.items():
+        if not isinstance(room, dict):
+            continue
+        raw_events = [event for event in _timeline_events(room) if isinstance(event, dict)]
+        redacted_event_ids = _redacted_event_ids_from_events(raw_events)
+        redacted_event_id_set = set(redacted_event_ids)
+        if e2ee_client:
+            messages = await e2ee_client.messages_from_raw_events(room_id, raw_events)
+        else:
+            messages = [_message_from_event(event, room_id) for event in raw_events]
+        messages = [
+            message
+            for message in messages
+            if message and message.get("event_id") not in redacted_event_id_set
+        ]
+        room_updates.append(
+            {
+                "room_id": room_id,
+                "messages": messages,
+                "redacted_event_ids": redacted_event_ids,
+                "limited": bool(room.get("timeline", {}).get("limited"))
+                if isinstance(room.get("timeline"), dict)
+                else False,
+            }
+        )
+    return {
+        "server_id": settings["server_id"],
+        "server_label": settings["server_label"],
+        "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
+        "joined": joined,
+        "invites": invited,
+        "room_updates": room_updates,
+    }
+
+
+def _payload_has_visible_updates(payload: dict[str, Any], *, snapshot: bool = False) -> bool:
+    if snapshot:
+        return True
+    if payload.get("joined") or payload.get("invites"):
+        return True
+    for update in payload.get("room_updates") or []:
+        if update.get("messages") or update.get("redacted_event_ids") or update.get("limited"):
+            return True
+    return False
+
+
+_sync_worker_tasks: dict[str, asyncio.Task[None]] = {}
+_sync_worker_lock = asyncio.Lock()
+_sync_worker_status: dict[str, dict[str, Any]] = {}
+
+
+def _set_worker_status(server_id: str, **updates: Any) -> None:
+    state = _sync_worker_status.setdefault(
+        server_id,
+        {
+            "server_id": server_id,
+            "running": False,
+            "last_ok_at": 0.0,
+            "last_error_at": 0.0,
+            "last_error": "",
+            "next_batch": "",
+            "published_count": 0,
+        },
+    )
+    state.update(updates)
+    state["updated_at"] = time.time()
+
+
+async def _publish_worker_payload(payload: dict[str, Any], *, snapshot: bool) -> None:
+    server_id = str(payload.get("server_id") or "")
+    label = str(payload.get("server_label") or server_id.upper())
+    published_count = int((_sync_worker_status.get(server_id) or {}).get("published_count") or 0) + 1
+    _set_worker_status(server_id, published_count=published_count)
+    await events_bus.publish(
+        AppEvent.create(
+            "matrix.chat.sync",
+            f"{label} Matrix Sync",
+            "Matrix chat update received.",
+            source="matrix-chat-worker",
+            payload={
+                **payload,
+                "snapshot": snapshot,
+                "suppress_speech": True,
+            },
+        )
+    )
+
+
+async def _matrix_chat_sync_worker(server_id: str) -> None:
+    token = _CURRENT_MATRIX_SERVER.set(server_id)
+    next_batch: str | None = None
+    snapshot = True
+    _set_worker_status(server_id, running=True, started_at=time.time(), last_error="")
+    try:
+        while True:
+            try:
+                settings = _require_credentials()
+                sync, e2ee_client = await _sync_for_chat(
+                    since=next_batch,
+                    timeout_ms=0 if snapshot else _WORKER_SYNC_TIMEOUT_MS,
+                    full_state=snapshot,
+                )
+                payload = await _matrix_chat_sync_payload(settings, sync, e2ee_client)
+                next_batch = payload.get("next_batch") or next_batch
+                if _payload_has_visible_updates(payload, snapshot=snapshot):
+                    await _publish_worker_payload(payload, snapshot=snapshot)
+                _set_worker_status(
+                    server_id,
+                    running=True,
+                    last_ok_at=time.time(),
+                    last_error="",
+                    next_batch=next_batch or "",
+                )
+                snapshot = False
+            except asyncio.CancelledError:
+                raise
+            except HTTPException as exc:
+                _set_worker_status(
+                    server_id,
+                    running=True,
+                    last_error_at=time.time(),
+                    last_error=str(exc.detail),
+                )
+                sleep_for = (
+                    _WORKER_MISSING_CREDENTIALS_SLEEP_SECONDS
+                    if exc.status_code == 503
+                    else _WORKER_ERROR_SLEEP_SECONDS
+                )
+                await asyncio.sleep(sleep_for)
+            except Exception as exc:
+                log.exception("Matrix chat sync worker failed for %s", server_id)
+                _set_worker_status(
+                    server_id,
+                    running=True,
+                    last_error_at=time.time(),
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+                await asyncio.sleep(_WORKER_ERROR_SLEEP_SECONDS)
+    finally:
+        _CURRENT_MATRIX_SERVER.reset(token)
+        _set_worker_status(server_id, running=False, stopped_at=time.time())
+
+
+async def start_matrix_chat_sync_workers() -> None:
+    async with _sync_worker_lock:
+        for server_id in _MATRIX_SERVER_LABELS:
+            task = _sync_worker_tasks.get(server_id)
+            if task and not task.done():
+                continue
+            _sync_worker_tasks[server_id] = asyncio.create_task(
+                _matrix_chat_sync_worker(server_id),
+                name=f"matrix-chat-sync-{server_id}",
+            )
+            _set_worker_status(server_id, running=True)
+    log.info("Matrix chat sync workers started: %s", ", ".join(_sync_worker_tasks) or "(none)")
+
+
+async def stop_matrix_chat_sync_workers() -> None:
+    async with _sync_worker_lock:
+        tasks = list(_sync_worker_tasks.items())
+        _sync_worker_tasks.clear()
+    for server_id, task in tasks:
+        if task.done():
+            continue
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        _set_worker_status(server_id, running=False, stopped_at=time.time())
+    if tasks:
+        log.info("Matrix chat sync workers stopped")
+
+
 @router.get("/status")
 async def matrix_chat_status() -> dict[str, Any]:
     settings = _settings()
@@ -2582,39 +2770,19 @@ async def matrix_chat_sync(
 ) -> dict[str, Any]:
     settings = _settings()
     sync, e2ee_client = await _sync_for_chat(since=since, timeout_ms=timeout_ms, full_state=False)
-    joined, invited = _rooms_from_sync(sync)
-    _annotate_room_settings(settings, joined)
-    rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
-    joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
-    room_updates = []
-    for room_id, room in joined_raw.items():
-        if not isinstance(room, dict):
-            continue
-        raw_events = [event for event in _timeline_events(room) if isinstance(event, dict)]
-        redacted_event_ids = _redacted_event_ids_from_events(raw_events)
-        redacted_event_id_set = set(redacted_event_ids)
-        if e2ee_client:
-            messages = await e2ee_client.messages_from_raw_events(room_id, raw_events)
-        else:
-            messages = [_message_from_event(event, room_id) for event in raw_events]
-        messages = [
-            message
-            for message in messages
-            if message and message.get("event_id") not in redacted_event_id_set
-        ]
-        room_updates.append(
-            {
-                "room_id": room_id,
-                "messages": messages,
-                "redacted_event_ids": redacted_event_ids,
-                "limited": bool(room.get("timeline", {}).get("limited"))
-                if isinstance(room.get("timeline"), dict)
-                else False,
-            }
-        )
+    return await _matrix_chat_sync_payload(settings, sync, e2ee_client)
+
+
+@router.get("/sync-worker/status")
+async def matrix_chat_sync_worker_status() -> dict[str, Any]:
     return {
-        "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
-        "joined": joined,
-        "invites": invited,
-        "room_updates": room_updates,
+        "workers": [
+            {
+                **_sync_worker_status.get(server_id, {"server_id": server_id}),
+                "task_running": bool(
+                    _sync_worker_tasks.get(server_id) and not _sync_worker_tasks[server_id].done()
+                ),
+            }
+            for server_id in _MATRIX_SERVER_LABELS
+        ]
     }
