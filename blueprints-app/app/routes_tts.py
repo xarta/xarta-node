@@ -135,6 +135,7 @@ class UtteranceRequest(BaseModel):
     timeout_ms: int | None = None
     allow_fallback: bool | None = None
     created_at: float | None = None
+    metadata: dict[str, Any] | None = None
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -567,6 +568,7 @@ async def tts_create_utterance(body: UtteranceRequest):
         "timeout_ms": body.timeout_ms,
         "allow_fallback": body.allow_fallback,
         "created_at": created_at,
+        "metadata": body.metadata or {},
         "target": {
             "kind": target.kind or "all_listeners",
             "dedupe": target.dedupe or "one_webpage_per_client_ip_plus_phone",
