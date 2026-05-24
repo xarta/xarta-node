@@ -28,6 +28,10 @@ class BrowserVoiceState(BaseModel):
     tts_enabled: bool = False
 
 
+class VoiceModePolicy(BaseModel):
+    tts_companion_model_preference: str | None = None
+
+
 def _clean_browser_id(value: str | None) -> str:
     return str(value or "").strip()[:160]
 
@@ -40,8 +44,29 @@ def _clean_label(value: str | None, fallback: str) -> str:
 def _empty_state() -> dict[str, Any]:
     return {
         "active": None,
+        "policy": {
+            "tts_companion_model_preference": "codex_spark",
+        },
         "revision": 0.0,
         "updated_at": 0.0,
+    }
+
+
+def _clean_model_preference(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in {"local", "local_private", "private_local", "no_think", "local_no_think"}:
+        return "local_private"
+    if raw in {"codex", "codex_spark", "spark", "gpt_5_3_codex_spark"}:
+        return "codex_spark"
+    return "codex_spark"
+
+
+def _clean_policy(value: Any) -> dict[str, Any]:
+    policy = value if isinstance(value, dict) else {}
+    return {
+        "tts_companion_model_preference": _clean_model_preference(
+            policy.get("tts_companion_model_preference")
+        ),
     }
 
 
@@ -58,6 +83,7 @@ def _read_state_unlocked() -> dict[str, Any]:
     state.update(raw)
     if not isinstance(state.get("active"), dict):
         state["active"] = None
+    state["policy"] = _clean_policy(state.get("policy"))
     return state
 
 
@@ -73,6 +99,7 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "active": active,
+        "policy": _clean_policy(state.get("policy")),
         "revision": float(state.get("revision") or 0),
         "updated_at": float(state.get("updated_at") or 0),
     }
@@ -89,6 +116,7 @@ async def _publish_changed(state: dict[str, Any], action: str) -> None:
         payload={
             "action": action,
             "active": public["active"],
+            "policy": public["policy"],
             "revision": public["revision"],
             "updated_at": public["updated_at"],
         },
@@ -150,4 +178,22 @@ async def voice_mode_deactivate(body: BrowserVoiceState):
             changed = True
     if changed:
         await _publish_changed(state, "deactivate")
+    return _public_state(state)
+
+
+@router.post("/policy")
+async def voice_mode_policy(body: VoiceModePolicy):
+    async with _state_lock:
+        state = _read_state_unlocked()
+        policy = _clean_policy(state.get("policy"))
+        if body.tts_companion_model_preference is not None:
+            policy["tts_companion_model_preference"] = _clean_model_preference(
+                body.tts_companion_model_preference
+            )
+        now = time.time()
+        state["policy"] = policy
+        state["revision"] = now
+        state["updated_at"] = now
+        _write_state_unlocked(state)
+    await _publish_changed(state, "policy")
     return _public_state(state)
