@@ -88,6 +88,7 @@ from .routes_tts import router as tts_router
 from .routes_tts_pool import router as tts_pool_router
 from .routes_ui_cache import router as ui_cache_router
 from .routes_vlans import router as vlans_router
+from .routes_voice_mode import router as voice_mode_router
 from .routes_vps_dockge import router as vps_dockge_router
 from .routes_web_research import router as web_research_router
 from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
@@ -390,6 +391,7 @@ def create_app() -> FastAPI:
     application.include_router(embed_menu_items_router, prefix="/api/v1")
     application.include_router(pockettts_router, prefix="/api/v1")
     application.include_router(tts_router, prefix="/api/v1")
+    application.include_router(voice_mode_router, prefix="/api/v1")
     application.include_router(tts_pool_router, prefix="/api/v1")
     application.include_router(pwa_router, prefix="/api/v1")
     application.include_router(table_layouts_router, prefix="/api/v1")
