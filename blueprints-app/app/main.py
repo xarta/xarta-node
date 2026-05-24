@@ -63,6 +63,7 @@ from .routes_manual_link_categories import router as manual_link_categories_rout
 from .routes_manual_links import router as manual_links_router
 from .routes_markitdown import router as markitdown_router
 from .routes_matrix_chat import router as matrix_chat_router
+from .routes_matrix_chat import start_matrix_chat_sync_workers, stop_matrix_chat_sync_workers
 from .routes_nav_items import router as nav_items_router
 from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
@@ -167,11 +168,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Sweep terminal child processes that survive websocket disconnect paths.
     terminal_reaper_task = asyncio.create_task(run_terminal_process_reaper())
 
+    # Fan Matrix /sync updates into the existing browser SSE stream.
+    await start_matrix_chat_sync_workers()
+
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
 
-    # Shutdown — close SSE bus so all connected clients receive the sentinel
+    # Shutdown — stop producers, then close SSE bus so clients receive the sentinel
+    await stop_matrix_chat_sync_workers()
     await events_bus.close_all()
     await _cancel_background_task(boot_catchup_task, "boot_catchup")
     await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
