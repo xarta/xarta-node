@@ -325,6 +325,10 @@ async def _clear_session_if_current(client_key: str, session: _ActiveSession) ->
 
 @router.post("/speak")
 async def tts_speak(body: SpeakRequest, request: Request):
+    request_started = time.perf_counter()
+    sanitizer_ms: float | None = None
+    probe_ms: float | None = None
+    upstream_headers_ms: float | None = None
     settings, missing = _resolve_settings()
     if missing:
         return JSONResponse(
@@ -360,6 +364,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     raw_text = (body.text or "").strip() or settings.get("tts.default_message", "")
     try:
+        sanitizer_started = time.perf_counter()
         sanitized = (
             await sanitize_tts_text_via_service(
                 raw_text,
@@ -371,6 +376,7 @@ async def tts_speak(body: SpeakRequest, request: Request):
             if _should_sanitize_text(body)
             else None
         )
+        sanitizer_ms = (time.perf_counter() - sanitizer_started) * 1000
     except TtsSanitizerUnavailable as exc:
         return JSONResponse(
             status_code=503,
@@ -400,7 +406,9 @@ async def tts_speak(body: SpeakRequest, request: Request):
     probe_url = settings.get("tts.local_probe_url", "")
     speech_url = settings.get("tts.local_speech_url", "")
 
+    probe_started = time.perf_counter()
     tts_available = bool(tts_enabled) and await _is_local_tts_available(probe_url, timeout_ms)
+    probe_ms = (time.perf_counter() - probe_started) * 1000
 
     if not tts_available:
         await _clear_session_if_current(client_key, session)
@@ -442,7 +450,9 @@ async def tts_speak(body: SpeakRequest, request: Request):
     resp = None
     try:
         req = client.build_request("POST", speech_url, json=payload)
+        upstream_started = time.perf_counter()
         resp = await client.send(req, stream=True)
+        upstream_headers_ms = (time.perf_counter() - upstream_started) * 1000
     except Exception as exc:
         await _clear_session_if_current(client_key, session)
         await client.aclose()
@@ -510,6 +520,10 @@ async def tts_speak(body: SpeakRequest, request: Request):
         "X-Blueprints-TTS-Interrupted-Previous": "true" if interrupted_previous else "false",
         "X-Blueprints-TTS-Voice": voice,
         "X-Blueprints-TTS-Sanitized": "true" if sanitized else "false",
+        "X-Blueprints-TTS-Timing-Total-Prestream-Ms": str(round((time.perf_counter() - request_started) * 1000)),
+        "X-Blueprints-TTS-Timing-Sanitizer-Ms": str(round(sanitizer_ms or 0)),
+        "X-Blueprints-TTS-Timing-Probe-Ms": str(round(probe_ms or 0)),
+        "X-Blueprints-TTS-Timing-Upstream-Headers-Ms": str(round(upstream_headers_ms or 0)),
     }
     if sanitized:
         headers["X-Blueprints-TTS-Transforms"] = ",".join(sanitized.transforms)
