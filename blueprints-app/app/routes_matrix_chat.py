@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from collections import deque
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -104,10 +105,14 @@ _DEFAULT_HERMES_COMMAND_CONTAINER = "hermes-local"
 _DEFAULT_HERMES_COMMAND_PYTHON = "/opt/hermes/.venv/bin/python"
 _DEFAULT_ROOM_SETTINGS_FILE = "/xarta-node/.lone-wolf/stacks/matrix-chat/data/room-settings.json"
 _DEFAULT_STT_WS_URL = ""
+_DEFAULT_STT_NOISE_REDUCTION_ENABLED = "false"
+_DEFAULT_STT_NOISE_DFN_WS_URL = ""
+_DEFAULT_STT_NOISE_ATTEN_LIM_DB = "6.0"
 _HERMES_COMMAND_CATALOG_TIMEOUT = 8
 _STT_WS_CONNECT_TIMEOUT_SECONDS = 5.0
 _STT_WS_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 _STT_FINAL_TIMEOUT_SECONDS = 8.0
+_STT_FILTER_DRAIN_TIMEOUT_SECONDS = 2.0
 _STT_TRANSCRIPT_PREFIX = "[voice/STT transcript, may contain recognition errors]"
 _MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 _HERMES_ALIAS_RE = re.compile(r"^\s*(?:hermes|h|hermes-vps|vps|hv)\s*:", re.IGNORECASE)
@@ -442,6 +447,24 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             "XARTA_STT_WS_URL",
             default=_DEFAULT_STT_WS_URL,
         ),
+        "stt_noise_reduction_enabled": pick(
+            "MATRIX_CHAT_STT_NOISE_REDUCTION_ENABLED",
+            "BLUEPRINTS_MATRIX_CHAT_STT_NOISE_REDUCTION_ENABLED",
+            "XARTA_STT_NOISE_REDUCTION_ENABLED",
+            default=_DEFAULT_STT_NOISE_REDUCTION_ENABLED,
+        ),
+        "stt_noise_dfn_ws_url": pick(
+            "MATRIX_CHAT_STT_NOISE_DFN_WS_URL",
+            "BLUEPRINTS_MATRIX_CHAT_STT_NOISE_DFN_WS_URL",
+            "XARTA_STT_NOISE_DFN_WS_URL",
+            default=_DEFAULT_STT_NOISE_DFN_WS_URL,
+        ),
+        "stt_noise_atten_lim_db": pick(
+            "MATRIX_CHAT_STT_NOISE_ATTEN_LIM_DB",
+            "BLUEPRINTS_MATRIX_CHAT_STT_NOISE_ATTEN_LIM_DB",
+            "XARTA_STT_NOISE_ATTEN_LIM_DB",
+            default=_DEFAULT_STT_NOISE_ATTEN_LIM_DB,
+        ),
     }
     cached_token = _runtime_access_tokens.get(_runtime_token_key(settings))
     if cached_token:
@@ -529,6 +552,13 @@ def _matrix_path(path: str) -> str:
 
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _float_setting(value: str | None, default: float) -> float:
+    try:
+        return float(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _e2ee_requested(settings: dict[str, str]) -> bool:
@@ -2989,17 +3019,47 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
     token = _CURRENT_MATRIX_SERVER.set(server_id)
     settings = _settings(server_id)
     stt_ws_url = (settings.get("stt_ws_url") or _DEFAULT_STT_WS_URL).strip()
+    noise_override = websocket.query_params.get("noise_reduction")
+    noise_enabled = (
+        _truthy(noise_override)
+        if noise_override is not None
+        else _truthy(settings.get("stt_noise_reduction_enabled"))
+    )
+    noise_ws_url = (settings.get("stt_noise_dfn_ws_url") or _DEFAULT_STT_NOISE_DFN_WS_URL).strip()
+    noise_atten_lim_db = _float_setting(
+        websocket.query_params.get("atten_lim_db") or settings.get("stt_noise_atten_lim_db"),
+        float(_DEFAULT_STT_NOISE_ATTEN_LIM_DB),
+    )
     runtime = stt_ws_url.replace("ws://", "", 1).replace("wss://", "", 1) if stt_ws_url else "unconfigured"
     done = asyncio.Event()
     final_requested = asyncio.Event()
+    stt_end_sent = asyncio.Event()
     relay_stats = {"audio_bytes": 0, "audio_frames": 0}
+    filter_pending_sent_at: deque[float] = deque()
+    filter_stats: dict[str, Any] = {
+        "audio_bytes": 0,
+        "audio_frames": 0,
+        "round_trip_ms": [],
+    }
     best_partial_text = ""
     final_sent = False
 
     await websocket.accept()
-    log.info("Matrix STT session opened room=%s runtime=%s", room_id, runtime)
+    log.info(
+        "Matrix STT session opened room=%s runtime=%s noise_reduction=%s",
+        room_id,
+        runtime,
+        noise_enabled,
+    )
     if not stt_ws_url:
         await websocket.send_json({"type": "error", "detail": "STT websocket URL is not configured"})
+        await websocket.close()
+        _CURRENT_MATRIX_SERVER.reset(token)
+        return
+    if noise_enabled and not noise_ws_url:
+        await websocket.send_json(
+            {"type": "error", "detail": "STT noise reduction is enabled but DeepFilterNet URL is not configured"}
+        )
         await websocket.close()
         _CURRENT_MATRIX_SERVER.reset(token)
         return
@@ -3010,8 +3070,18 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             "channels": 1,
             "format": "float32",
             "runtime": runtime,
+            "noise_reduction": {
+                "enabled": noise_enabled,
+                "atten_lim_db": noise_atten_lim_db if noise_enabled else None,
+            },
         }
     )
+
+    async def send_stt_end(stt_ws: Any) -> None:
+        if stt_end_sent.is_set():
+            return
+        await stt_ws.send(json.dumps({"type": "end"}))
+        stt_end_sent.set()
 
     async def relay_browser_to_stt(stt_ws: Any) -> None:
         while not done.is_set():
@@ -3019,7 +3089,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             message_type = message.get("type")
             if message_type == "websocket.disconnect":
                 with suppress(Exception):
-                    await stt_ws.send(json.dumps({"type": "end"}))
+                    await send_stt_end(stt_ws)
                 final_requested.set()
                 done.set()
                 return
@@ -3059,7 +3129,95 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                         )
                         done.set()
                         return
+                    await send_stt_end(stt_ws)
+                    continue
                 await stt_ws.send(payload_text)
+
+    async def finalize_stt_after_filter_drain(stt_ws: Any) -> None:
+        deadline = time.monotonic() + _STT_FILTER_DRAIN_TIMEOUT_SECONDS
+        while filter_pending_sent_at and time.monotonic() < deadline and not done.is_set():
+            await asyncio.sleep(0.02)
+        if filter_pending_sent_at:
+            log.warning(
+                "Matrix STT noise filter drain timeout room=%s pending_chunks=%s frames=%s bytes=%s",
+                room_id,
+                len(filter_pending_sent_at),
+                relay_stats["audio_frames"],
+                relay_stats["audio_bytes"],
+            )
+        await send_stt_end(stt_ws)
+
+    async def relay_browser_to_filter(filter_ws: Any, stt_ws: Any) -> None:
+        while not done.is_set():
+            message = await websocket.receive()
+            message_type = message.get("type")
+            if message_type == "websocket.disconnect":
+                with suppress(Exception):
+                    await filter_ws.send(json.dumps({"type": "end"}))
+                final_requested.set()
+                done.set()
+                return
+            if message_type != "websocket.receive":
+                continue
+            payload_bytes = message.get("bytes")
+            payload_text = message.get("text")
+            if payload_bytes is not None:
+                relay_stats["audio_bytes"] += len(payload_bytes)
+                relay_stats["audio_frames"] += 1
+                filter_pending_sent_at.append(time.monotonic())
+                await filter_ws.send(payload_bytes)
+            elif payload_text is not None:
+                try:
+                    browser_cmd = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    browser_cmd = {}
+                if browser_cmd.get("type") == "end":
+                    final_requested.set()
+                    log.info(
+                        "Matrix STT noise finalize requested room=%s browser_frames=%s browser_bytes=%s relayed_frames=%s relayed_bytes=%s",
+                        room_id,
+                        browser_cmd.get("audio_frames"),
+                        browser_cmd.get("audio_bytes"),
+                        relay_stats["audio_frames"],
+                        relay_stats["audio_bytes"],
+                    )
+                    if relay_stats["audio_bytes"] <= 0:
+                        await websocket.send_json(
+                            {
+                                "type": "final",
+                                "text": "",
+                                "is_final": True,
+                                "matrix_skipped": "no_audio_frames",
+                                "audio_bytes": 0,
+                                "audio_frames": 0,
+                            }
+                        )
+                        done.set()
+                        return
+                    await filter_ws.send(json.dumps({"type": "end"}))
+                    await finalize_stt_after_filter_drain(stt_ws)
+                    continue
+                await filter_ws.send(payload_text)
+
+    async def relay_filter_to_stt(filter_ws: Any, stt_ws: Any) -> None:
+        async for raw_message in filter_ws:
+            if isinstance(raw_message, bytes):
+                filter_stats["audio_bytes"] += len(raw_message)
+                filter_stats["audio_frames"] += 1
+                if filter_pending_sent_at:
+                    elapsed_ms = (time.monotonic() - filter_pending_sent_at.popleft()) * 1000.0
+                    filter_stats["round_trip_ms"].append(elapsed_ms)
+                await stt_ws.send(raw_message)
+                continue
+
+            try:
+                payload = json.loads(str(raw_message or "{}"))
+            except json.JSONDecodeError:
+                payload = {"type": "filter_message", "raw": str(raw_message or "")[:240]}
+            msg_type = str(payload.get("type") or "")
+            if msg_type in {"config_ack", "settings_ack", "stats", "pong"}:
+                continue
+            await websocket.send_json({"type": "noise_reduction", "payload": payload})
 
     async def relay_stt_to_browser(stt_ws: Any) -> None:
         nonlocal best_partial_text, final_sent
@@ -3116,6 +3274,37 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                 best_partial_text = partial_text
             await websocket.send_json(payload)
 
+        if final_requested.is_set() and not done.is_set():
+            transcript = best_partial_text.strip()
+            payload = {
+                "type": "final",
+                "text": transcript,
+                "is_final": True,
+            }
+            if transcript:
+                payload["xarta_stt_final_from_partial"] = True
+                try:
+                    sent = await _send_stt_transcript_message(
+                        room_id=room_id,
+                        server_id=server_id,
+                        transcript=transcript,
+                        runtime=runtime,
+                    )
+                    payload["matrix"] = {
+                        "room_id": sent.get("room_id"),
+                        "event_id": sent.get("event_id"),
+                        "body": sent.get("body"),
+                    }
+                    final_sent = True
+                except Exception as exc:
+                    log.exception("Matrix STT transcript send failed for room %s", room_id)
+                    payload["matrix_error"] = str(exc)
+            else:
+                payload["matrix_skipped"] = "empty_transcript"
+            with suppress(Exception):
+                await websocket.send_json(payload)
+            done.set()
+
     async def enforce_final_timeout() -> None:
         await final_requested.wait()
         try:
@@ -3149,28 +3338,71 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             ping_interval=30,
             ping_timeout=10,
         ) as stt_ws:
-            browser_task = asyncio.create_task(relay_browser_to_stt(stt_ws), name="matrix-stt-browser-relay")
-            stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
-            timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
-            done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
-            tasks = {browser_task, stt_task, timeout_task, done_task}
-            try:
-                finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                if any(task for task in finished if task is not done_task and task.exception()):
-                    for task in finished:
-                        if task is not done_task:
-                            task.result()
-                done.set()
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with suppress(asyncio.CancelledError):
-                        await task
-            finally:
-                done.set()
-                with suppress(Exception):
-                    if not final_sent:
-                        await stt_ws.send(json.dumps({"type": "end"}))
+            if noise_enabled:
+                async with websockets.connect(
+                    noise_ws_url,
+                    open_timeout=_STT_WS_CONNECT_TIMEOUT_SECONDS,
+                    max_size=_STT_WS_MAX_MESSAGE_BYTES,
+                    ping_interval=30,
+                    ping_timeout=10,
+                ) as filter_ws:
+                    await filter_ws.send(json.dumps({"type": "config", "sample_rate": 16000}))
+                    await filter_ws.send(
+                        json.dumps({"type": "update_settings", "atten_lim_db": noise_atten_lim_db})
+                    )
+                    browser_task = asyncio.create_task(
+                        relay_browser_to_filter(filter_ws, stt_ws),
+                        name="matrix-stt-browser-filter-relay",
+                    )
+                    filter_task = asyncio.create_task(
+                        relay_filter_to_stt(filter_ws, stt_ws),
+                        name="matrix-stt-filter-upstream-relay",
+                    )
+                    stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
+                    timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
+                    done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
+                    tasks = {browser_task, stt_task, timeout_task, done_task}
+                    all_tasks = tasks | {filter_task}
+                    try:
+                        finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        if any(task for task in finished if task is not done_task and task.exception()):
+                            for task in finished:
+                                if task is not done_task:
+                                    task.result()
+                        done.set()
+                        for task in all_tasks - finished:
+                            task.cancel()
+                        for task in all_tasks - finished:
+                            with suppress(asyncio.CancelledError):
+                                await task
+                    finally:
+                        done.set()
+                        with suppress(Exception):
+                            if not final_sent:
+                                await send_stt_end(stt_ws)
+            else:
+                browser_task = asyncio.create_task(relay_browser_to_stt(stt_ws), name="matrix-stt-browser-relay")
+                stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
+                timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
+                done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
+                tasks = {browser_task, stt_task, timeout_task, done_task}
+                try:
+                    finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    if any(task for task in finished if task is not done_task and task.exception()):
+                        for task in finished:
+                            if task is not done_task:
+                                task.result()
+                    done.set()
+                    for task in pending:
+                        task.cancel()
+                    for task in pending:
+                        with suppress(asyncio.CancelledError):
+                            await task
+                finally:
+                    done.set()
+                    with suppress(Exception):
+                        if not final_sent:
+                            await send_stt_end(stt_ws)
     except Exception as exc:
         log.exception("Matrix STT websocket failed for room %s via %s", room_id, stt_ws_url)
         with suppress(Exception):
@@ -3184,6 +3416,17 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             final_requested.is_set(),
             final_sent,
         )
+        if noise_enabled and filter_stats["round_trip_ms"]:
+            filter_latencies = filter_stats["round_trip_ms"]
+            log.info(
+                "Matrix STT noise filter stats room=%s frames=%s bytes=%s min_ms=%.1f max_ms=%.1f avg_ms=%.1f",
+                room_id,
+                filter_stats["audio_frames"],
+                filter_stats["audio_bytes"],
+                min(filter_latencies),
+                max(filter_latencies),
+                sum(filter_latencies) / len(filter_latencies),
+            )
         _CURRENT_MATRIX_SERVER.reset(token)
         with suppress(Exception):
             await websocket.close()

@@ -46,6 +46,29 @@ def test_matrix_chat_reads_private_env_without_exposing_token(tmp_path, monkeypa
     assert "secret-token-value" not in repr(status)
 
 
+def test_matrix_chat_reads_private_stt_noise_reduction_settings(tmp_path, monkeypatch):
+    env_file = tmp_path / "matrix.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "MATRIX_CHAT_STT_WS_URL=ws://stt.example.test:8765",
+                "MATRIX_CHAT_STT_NOISE_REDUCTION_ENABLED=true",
+                "MATRIX_CHAT_STT_NOISE_DFN_WS_URL=ws://filter.example.test:18760",
+                "MATRIX_CHAT_STT_NOISE_ATTEN_LIM_DB=6.5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_MATRIX_CHAT_ENV_FILE", str(env_file))
+
+    settings = matrix_chat._settings()
+
+    assert settings["stt_ws_url"] == "ws://stt.example.test:8765"
+    assert settings["stt_noise_reduction_enabled"] == "true"
+    assert settings["stt_noise_dfn_ws_url"] == "ws://filter.example.test:18760"
+    assert settings["stt_noise_atten_lim_db"] == "6.5"
+
+
 def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):
     report_path = tmp_path / "matrix_platform_patch.json"
     report_path.write_text(
