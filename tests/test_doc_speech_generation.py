@@ -345,6 +345,87 @@ def test_long_doc_split_groups_many_heading_sections(tmp_path):
     assert all(section.token_count <= 1200 for section in sections)
 
 
+def test_hermes_upstream_doc_detection():
+    assert routes_docs._is_hermes_upstream_doc("docs/hermes/upstream/HERMES-UPSTREAM-LLMS-FULL.md")
+    assert routes_docs._is_hermes_upstream_doc(
+        "/xarta-node/.lone-wolf/docs/hermes/upstream/HERMES-UPSTREAM-LLMS-FULL.md"
+    )
+    assert not routes_docs._is_hermes_upstream_doc("docs/hermes/README.md")
+    assert not routes_docs._is_hermes_upstream_doc("docs/dockge/HERMES-LOCAL.md")
+
+
+def test_extract_markdown_section_stops_at_peer_heading():
+    markdown = (
+        "# Title\n\n"
+        "## Narration Injection Notes\n\n"
+        "- Use Hermes Local caveat.\n"
+        "- Use Hermes VPS caveat.\n\n"
+        "### Detail\n\n"
+        "Keep this.\n\n"
+        "## Next\n\n"
+        "Skip this.\n"
+    )
+
+    section = routes_docs._extract_markdown_section(markdown, "Narration Injection Notes")
+
+    assert "Hermes Local caveat" in section
+    assert "Keep this." in section
+    assert "Skip this." not in section
+
+
+@pytest.mark.asyncio
+async def test_hermes_deviation_pass_only_for_upstream_doc(tmp_path, monkeypatch):
+    deviation_doc = tmp_path / "HERMES-XARTA-DEVIATIONS.md"
+    deviation_doc.write_text(
+        "# Hermes Xarta Deviations\n\n"
+        "## Narration Injection Notes\n\n"
+        "- Mention Hermes Local and Hermes VPS update deviations.\n\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOC_SPEECH_HERMES_XARTA_DEVIATIONS_DOC", str(deviation_doc))
+
+    calls = []
+
+    async def fake_complete(messages, **kwargs):
+        calls.append((messages, kwargs))
+        return "Updated narration mentions Hermes Local and Hermes VPS.", {
+            "llm_model": "TEST-DOC-SPEECH",
+            "max_tokens": kwargs.get("max_tokens") or 1000,
+            "finish_reason": "stop",
+            "usage": {},
+        }
+
+    monkeypatch.setattr(routes_docs, "_complete_doc_speech_local", fake_complete)
+    llm_calls = []
+
+    unchanged, skipped = await routes_docs._apply_hermes_xarta_deviation_notes(
+        narration="Original narration.",
+        title="Hermes",
+        doc_path="docs/hermes/README.md",
+        target_words=750,
+        max_words=900,
+        llm_calls=llm_calls,
+    )
+
+    assert unchanged == "Original narration."
+    assert skipped["skip_reason"] == "not_hermes_upstream_doc"
+    assert calls == []
+
+    updated, meta = await routes_docs._apply_hermes_xarta_deviation_notes(
+        narration="Original narration.",
+        title="Hermes",
+        doc_path="docs/hermes/upstream/HERMES-UPSTREAM-LLMS-FULL.md",
+        target_words=750,
+        max_words=900,
+        llm_calls=llm_calls,
+    )
+
+    assert updated == "Updated narration mentions Hermes Local and Hermes VPS."
+    assert meta["applied"] is True
+    assert meta["deviation_notes_chars"] > 0
+    assert llm_calls[-1]["operation"] == "hermes_xarta_deviation"
+
+
 def test_long_doc_word_allocation_respects_floor_and_cap(tmp_path):
     text = "# A\n\nsmall\n\n# B\n\n" + ("large " * 400)
     sections = split_sections(
