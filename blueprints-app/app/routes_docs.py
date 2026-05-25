@@ -16,8 +16,10 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import time
 import uuid
 from collections import Counter
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +31,22 @@ from starlette.responses import Response
 
 from . import config as cfg
 from .db import get_conn, increment_gen
+from .doc_speech_budget import (
+    approx_output_tokens_for_words,
+    count_text_tokens,
+    doc_speech_budget_threshold_ratio,
+    doc_speech_max_source_bytes,
+    doc_speech_max_words,
+    doc_speech_target_words,
+    read_model_budget,
+)
+from .doc_speech_long import (
+    SectionRecord,
+    allocate_word_targets,
+    source_fingerprint,
+    split_sections,
+    split_text_to_records,
+)
 from .local_llm_events import publish_local_llm_offline_event
 from .models import DocContentBody, DocCreate, DocOut, DocUpdate, DocWithContent
 from .nullclaw_docs_search import (
@@ -58,7 +76,8 @@ _DEFAULT_NULLCLAW_TASKS_DIR = (
     _NODE_LOCAL_ROOT / "stacks" / "nullclaw-docs-search" / "data" / "tasks"
 )
 _DOC_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-cache"
-_DOC_SPEECH_PROMPT_VERSION = "20260519-numeric-transcript-review-v2"
+_DOC_SPEECH_WORK_ROOT = _NODE_LOCAL_ROOT / "doc-speech-work"
+_DOC_SPEECH_PROMPT_VERSION = "20260525-budget-aware-long-doc-v1"
 _METADATA_BACKLOG_LIMIT = 40
 _PATH_LIKE_KEYS = {
     "path",
@@ -392,6 +411,7 @@ async def _complete_doc_speech_local(
     messages: list[dict[str, str]],
     *,
     operation: str = "docs:narration",
+    max_tokens: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
@@ -403,11 +423,11 @@ async def _complete_doc_speech_local(
     if not model:
         raise HTTPException(503, "DOC_SPEECH_LLM_MODEL is not configured for local doc narration")
 
-    max_tokens = _doc_speech_max_tokens()
+    requested_max_tokens = _doc_speech_max_tokens() if max_tokens is None else max(256, int(max_tokens))
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": requested_max_tokens,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"))
@@ -448,7 +468,7 @@ async def _complete_doc_speech_local(
         raise HTTPException(502, "Local LLM returned an invalid narration response") from exc
     meta = {
         "llm_model": data.get("model") or model,
-        "max_tokens": max_tokens,
+        "max_tokens": requested_max_tokens,
         "finish_reason": choice.get("finish_reason"),
         "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
     }
@@ -460,6 +480,7 @@ async def _review_doc_speech_narration(
     title: str,
     doc_path: str,
     draft: str,
+    max_tokens: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     review_prompt = (
         "/no-think\n"
@@ -474,6 +495,7 @@ async def _review_doc_speech_narration(
             {"role": "user", "content": review_prompt},
         ],
         operation="docs:narration-review",
+        max_tokens=max_tokens,
     )
     _assert_complete_doc_speech(review_meta)
     if not reviewed:
@@ -481,10 +503,461 @@ async def _review_doc_speech_narration(
     return reviewed, review_meta
 
 
+def _doc_value(doc: Any, key: str, default: Any = None) -> Any:
+    try:
+        value = doc[key]
+    except Exception:
+        value = getattr(doc, key, default)
+    return default if value is None else value
+
+
+def _doc_speech_effective_input_budget(model_budget: Any, requested_output_tokens: int) -> int:
+    by_input = max(1, int(model_budget.max_input_tokens) - max(0, int(model_budget.context_buffer_tokens)))
+    by_total = (
+        max(1, int(model_budget.total_context_tokens))
+        - max(0, int(requested_output_tokens))
+        - max(0, int(model_budget.context_buffer_tokens))
+    )
+    return max(1, min(by_input, by_total))
+
+
+def _doc_speech_call_meta(operation: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "llm_model": meta.get("llm_model"),
+        "max_tokens": meta.get("max_tokens"),
+        "finish_reason": meta.get("finish_reason"),
+        "usage": meta.get("usage"),
+    }
+
+
+def _doc_speech_budget_meta(
+    *,
+    doc: Any,
+    source_bytes: int,
+    prepared_source: str,
+    source_token_count: Any,
+    framing_token_count: Any,
+    model_budget: Any,
+    effective_input_budget: int,
+    threshold_ratio: float,
+    target_words: int,
+    max_words: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "prompt_version": _DOC_SPEECH_PROMPT_VERSION,
+        "doc_id": str(_doc_value(doc, "doc_id", "")),
+        "doc_path": str(_doc_value(doc, "path", "")),
+        "source_bytes": source_bytes,
+        "prepared_source_chars": len(prepared_source),
+        "prepared_source_tokens": int(source_token_count.tokens),
+        "token_count_method": source_token_count.method,
+        "token_count_warning": source_token_count.warning,
+        "llm_model": model_budget.model,
+        "model_budget_source": model_budget.source,
+        "model_budget_warning": model_budget.warning,
+        "model_max_input_tokens": model_budget.max_input_tokens,
+        "model_max_output_tokens": model_budget.max_output_tokens,
+        "model_total_context_tokens": model_budget.total_context_tokens,
+        "model_context_buffer_tokens": model_budget.context_buffer_tokens,
+        "effective_input_budget_tokens": effective_input_budget,
+        "prompt_framing_tokens": int(framing_token_count.tokens),
+        "budget_threshold_ratio": threshold_ratio,
+        "target_spoken_words": target_words,
+        "max_spoken_words": max_words,
+        "source_clipped": False,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+    }
+
+
+def _too_large_doc_speech(doc_path: str, source_bytes: int, max_source_bytes: int) -> str:
+    source_mib = source_bytes / (1024 * 1024)
+    limit_mib = max_source_bytes / (1024 * 1024)
+    return (
+        "This document is too large to process for TTS narration. "
+        f"The source is {source_mib:.2f} MiB, above the configured {limit_mib:.2f} MiB narration limit. "
+        f"No model call was made for {doc_path}."
+    )
+
+
+def _long_summary_system_prompt() -> str:
+    return (
+        "You summarize local documentation sections for a short TTS narration. "
+        "Return plain text only, with no Markdown, no bullets, and no commentary. "
+        "Preserve concrete statuses, warnings, dates, names, paths, and commands when they matter. "
+        "Summarize dense tables, inventories, logs, and code blocks by purpose rather than reading them line by line."
+    )
+
+
+def _cohesive_summary_system_prompt() -> str:
+    return (
+        "You turn section summary notes into one flowing TTS narration. "
+        "Return plain text only, with short natural paragraphs. "
+        "Do not add citations, Markdown, bullets, or commentary about the process."
+    )
+
+
+def _section_summary_prompt(
+    *,
+    title: str,
+    doc_title: str,
+    doc_path: str,
+    target_words: int,
+    section_text: str,
+) -> str:
+    return (
+        "/no-think\n"
+        f"Document title: {doc_title}\n"
+        f"Document path: {doc_path}\n"
+        f"Section: {title}\n"
+        f"Target words for this section: {target_words}\n\n"
+        "Summarize this section for a short spoken document orientation:\n\n"
+        f"{section_text}"
+    )
+
+
+def _rough_text_chunks(text: str, count_tokens: Any, max_tokens: int) -> list[str]:
+    lines = str(text or "").splitlines(keepends=True)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+    for line in lines:
+        line_tokens = count_tokens(line).tokens
+        if current and current_tokens + line_tokens > max_tokens:
+            chunks.append("".join(current).strip())
+            current = []
+            current_tokens = 0
+        if line_tokens > max_tokens:
+            char_budget = max(1000, int(max_tokens * 3.0))
+            for start in range(0, len(line), char_budget):
+                chunks.append(line[start : start + char_budget].strip())
+            continue
+        current.append(line)
+        current_tokens += line_tokens
+    if current:
+        chunks.append("".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+async def _summarize_long_text_piece(
+    *,
+    text: str,
+    title: str,
+    doc_title: str,
+    doc_path: str,
+    target_words: int,
+    work_dir: Path,
+    section_id: str,
+    depth: int,
+    max_input_tokens: int,
+    llm_calls: list[dict[str, Any]],
+) -> str:
+    system_prompt = _long_summary_system_prompt()
+    prompt = _section_summary_prompt(
+        title=title,
+        doc_title=doc_title,
+        doc_path=doc_path,
+        target_words=target_words,
+        section_text=text,
+    )
+    framing_tokens = count_text_tokens(system_prompt + "\n" + prompt.replace(text, "")).tokens
+    text_tokens = count_text_tokens(text).tokens
+    if framing_tokens + text_tokens > max_input_tokens and depth < 5:
+        child_work_dir = work_dir / "recursive" / section_id
+        child_records = split_text_to_records(
+            text,
+            work_dir=child_work_dir,
+            count_tokens=lambda value: count_text_tokens(value).tokens,
+            max_tokens=max(512, max_input_tokens - framing_tokens - 256),
+            parent_id=section_id,
+            title_prefix=f"{title} part",
+        )
+        if len(child_records) <= 1:
+            chunks = _rough_text_chunks(
+                text,
+                count_text_tokens,
+                max(512, max_input_tokens - framing_tokens - 256),
+            )
+            child_summaries = []
+            for index, chunk in enumerate(chunks, start=1):
+                child_summaries.append(
+                    await _summarize_long_text_piece(
+                        text=chunk,
+                        title=f"{title} part {index}",
+                        doc_title=doc_title,
+                        doc_path=doc_path,
+                        target_words=max(35, target_words // max(1, len(chunks))),
+                        work_dir=work_dir,
+                        section_id=f"{section_id}-rough-{index:04d}",
+                        depth=depth + 1,
+                        max_input_tokens=max_input_tokens,
+                        llm_calls=llm_calls,
+                    )
+                )
+        else:
+            child_summaries = []
+            for child in child_records:
+                child_text = Path(child.text_path).read_text(encoding="utf-8")
+                child_summaries.append(
+                    await _summarize_long_text_piece(
+                        text=child_text,
+                        title=child.title,
+                        doc_title=doc_title,
+                        doc_path=doc_path,
+                        target_words=max(35, target_words // max(1, len(child_records))),
+                        work_dir=work_dir,
+                        section_id=child.section_id,
+                        depth=depth + 1,
+                        max_input_tokens=max_input_tokens,
+                        llm_calls=llm_calls,
+                    )
+                )
+        text = "\n\n".join(child_summaries)
+        prompt = _section_summary_prompt(
+            title=title,
+            doc_title=doc_title,
+            doc_path=doc_path,
+            target_words=target_words,
+            section_text=text,
+        )
+
+    summary, meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        operation="docs:narration-section-summary",
+        max_tokens=max(768, approx_output_tokens_for_words(target_words)),
+    )
+    _assert_complete_doc_speech(meta)
+    if not summary:
+        raise HTTPException(502, f"Local LLM returned an empty summary for {section_id}")
+    llm_calls.append(_doc_speech_call_meta("section_summary", meta))
+    return summary.strip()
+
+
+async def _compress_doc_speech_text(
+    *,
+    text: str,
+    target_words: int,
+    operation: str,
+    llm_calls: list[dict[str, Any]],
+) -> str:
+    prompt = (
+        "/no-think\n"
+        f"Rewrite this narration to be no more than {target_words} words. "
+        "Keep it speech-ready, plain text, and preserve the important warnings, statuses, paths, and names:\n\n"
+        f"{text}"
+    )
+    compressed, meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _cohesive_summary_system_prompt()},
+            {"role": "user", "content": prompt},
+        ],
+        operation=operation,
+        max_tokens=approx_output_tokens_for_words(target_words),
+    )
+    _assert_complete_doc_speech(meta)
+    llm_calls.append(_doc_speech_call_meta(operation, meta))
+    if not compressed:
+        raise HTTPException(502, "Local LLM returned an empty compressed narration")
+    return compressed.strip()
+
+
+async def _generate_long_doc_speech(
+    *,
+    doc: Any,
+    prepared_source: str,
+    model_budget: Any,
+    target_words: int,
+    max_words: int,
+) -> tuple[str, dict[str, Any]]:
+    title = str(_doc_value(doc, "label", "") or Path(str(_doc_value(doc, "path", ""))).stem).strip()
+    doc_path = str(_doc_value(doc, "path", "") or "").strip()
+    doc_id = str(_doc_value(doc, "doc_id", "") or "unknown")
+    fingerprint = source_fingerprint(prepared_source)
+    work_dir = _DOC_SPEECH_WORK_ROOT / doc_id / fingerprint
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _normalize_node_local_ownership(work_dir.parent)
+    _normalize_node_local_ownership(work_dir)
+
+    section_output_tokens = approx_output_tokens_for_words(max(120, min(max_words, 900)))
+    max_input_tokens = int(_doc_speech_effective_input_budget(model_budget, section_output_tokens) * 0.82)
+    sections = split_sections(
+        prepared_source,
+        work_dir=work_dir,
+        count_tokens=lambda value: count_text_tokens(value).tokens,
+        fallback_chunk_tokens=max(512, max_input_tokens - 1024),
+    )
+    if not sections:
+        raise HTTPException(502, "Could not identify any sections for long document narration")
+
+    allocations = allocate_word_targets(sections, target_words=target_words)
+    llm_calls: list[dict[str, Any]] = []
+    summary_pieces: list[tuple[SectionRecord, str]] = []
+    resumed_summary_count = 0
+    for section in sections:
+        summary_path = Path(section.summary_path)
+        if summary_path.is_file():
+            existing_summary = summary_path.read_text(encoding="utf-8").strip()
+            if existing_summary:
+                resumed_summary_count += 1
+                summary_pieces.append((section, existing_summary))
+                continue
+        section_text = Path(section.text_path).read_text(encoding="utf-8")
+        summary = await _summarize_long_text_piece(
+            text=section_text,
+            title=section.title,
+            doc_title=title,
+            doc_path=doc_path,
+            target_words=allocations.get(section.section_id, 50),
+            work_dir=work_dir,
+            section_id=section.section_id,
+            depth=0,
+            max_input_tokens=max_input_tokens,
+            llm_calls=llm_calls,
+        )
+        summary_path.write_text(summary + "\n", encoding="utf-8")
+        summary_pieces.append((section, summary))
+
+    combined = "\n\n".join(summary for _section, summary in summary_pieces)
+    cohesive_prompt_prefix = (
+        "/no-think\n"
+        f"Document title: {title}\n"
+        f"Document path: {doc_path}\n"
+        f"Target final words: {target_words}\n\n"
+        "Rewrite these section summaries into one cohesive spoken overview:\n\n"
+    )
+    cohesive_input_budget = _doc_speech_effective_input_budget(
+        model_budget,
+        approx_output_tokens_for_words(max_words),
+    )
+    for _attempt in range(5):
+        if count_text_tokens(_cohesive_summary_system_prompt() + "\n" + cohesive_prompt_prefix + combined).tokens <= cohesive_input_budget:
+            break
+        largest_index = max(range(len(summary_pieces)), key=lambda idx: len(summary_pieces[idx][1].split()))
+        section, piece = summary_pieces[largest_index]
+        compressed_piece = await _compress_doc_speech_text(
+            text=piece,
+            target_words=max(35, len(piece.split()) // 2),
+            operation="docs:narration-summary-compress",
+            llm_calls=llm_calls,
+        )
+        summary_pieces[largest_index] = (section, compressed_piece)
+        Path(section.summary_path).write_text(compressed_piece + "\n", encoding="utf-8")
+        combined = "\n\n".join(summary for _section, summary in summary_pieces)
+    else:
+        raise HTTPException(502, "Long document summaries did not fit the model budget after compression")
+
+    cohesive_prompt = cohesive_prompt_prefix + combined
+    cohesive, cohesive_meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _cohesive_summary_system_prompt()},
+            {"role": "user", "content": cohesive_prompt},
+        ],
+        operation="docs:narration-cohesive-summary",
+        max_tokens=approx_output_tokens_for_words(max_words),
+    )
+    _assert_complete_doc_speech(cohesive_meta)
+    llm_calls.append(_doc_speech_call_meta("cohesive_summary", cohesive_meta))
+    if not cohesive:
+        raise HTTPException(502, "Local LLM returned an empty cohesive long-document summary")
+
+    if len(cohesive.split()) > max_words:
+        cohesive = await _compress_doc_speech_text(
+            text=cohesive,
+            target_words=max_words,
+            operation="docs:narration-final-word-guard",
+            llm_calls=llm_calls,
+        )
+
+    reviewed_answer, review_meta = await _review_doc_speech_narration(
+        title=title,
+        doc_path=doc_path,
+        draft=cohesive,
+        max_tokens=approx_output_tokens_for_words(max_words),
+    )
+    llm_calls.append(_doc_speech_call_meta("review", review_meta))
+    speech = await _clean_doc_speech_markdown(reviewed_answer)
+    if not speech:
+        raise HTTPException(502, "Local LLM returned an empty long-document narration")
+    if len(speech.split()) > max_words:
+        speech = await _compress_doc_speech_text(
+            text=speech,
+            target_words=max_words,
+            operation="docs:narration-post-review-word-guard",
+            llm_calls=llm_calls,
+        )
+        speech = await _clean_doc_speech_markdown(speech)
+    if len(speech.split()) > max_words:
+        raise HTTPException(502, f"Long-document narration exceeded the {max_words}-word guard")
+
+    metadata_path = work_dir / "long-summary-metadata.json"
+    long_meta = {
+        "work_dir": str(work_dir),
+        "source_fingerprint": fingerprint,
+        "section_count": len(sections),
+        "sections": [asdict(section) for section in sections],
+        "section_allocations": allocations,
+        "resumed_summary_count": resumed_summary_count,
+        "llm_calls": llm_calls,
+        "llm_call_count": len(llm_calls),
+        "review": review_meta,
+        "finish_reason": cohesive_meta.get("finish_reason"),
+        "speech_chars": len(speech),
+        "speech_words": len(speech.split()),
+    }
+    metadata_path.write_text(json.dumps(long_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return speech, long_meta
+
+
 async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple[str, dict[str, Any]]:
-    title = str(doc["label"] or Path(doc["path"]).stem.replace("-", " ").replace("_", " ")).strip()
-    description = str(doc["description"] or "").strip()
-    doc_path = str(doc["path"] or "").strip()
+    started = time.monotonic()
+    title = str(_doc_value(doc, "label", "") or Path(str(_doc_value(doc, "path", ""))).stem.replace("-", " ").replace("_", " ")).strip()
+    description = str(_doc_value(doc, "description", "") or "").strip()
+    doc_path = str(_doc_value(doc, "path", "") or "").strip()
+    source_bytes = len(str(source_markdown or "").encode("utf-8", "replace"))
+    max_source_bytes = doc_speech_max_source_bytes()
+    model_name = (os.environ.get("DOC_SPEECH_LLM_MODEL") or "").strip()
+    model_budget = read_model_budget(model_name)
+    target_words = doc_speech_target_words()
+    max_words = doc_speech_max_words()
+    threshold_ratio = doc_speech_budget_threshold_ratio()
+    direct_requested_output_tokens = _doc_speech_max_tokens()
+    effective_input_budget = _doc_speech_effective_input_budget(model_budget, direct_requested_output_tokens)
+
+    if max_source_bytes > 0 and source_bytes > max_source_bytes:
+        speech = _too_large_doc_speech(doc_path, source_bytes, max_source_bytes)
+        empty_count = count_text_tokens("")
+        meta = _doc_speech_budget_meta(
+            doc=doc,
+            source_bytes=source_bytes,
+            prepared_source="",
+            source_token_count=empty_count,
+            framing_token_count=empty_count,
+            model_budget=model_budget,
+            effective_input_budget=effective_input_budget,
+            threshold_ratio=threshold_ratio,
+            target_words=target_words,
+            max_words=max_words,
+            elapsed_seconds=time.monotonic() - started,
+        )
+        meta.update(
+            {
+                "path_taken": "too_large",
+                "refusal_reason": f"source_bytes_exceeded_{max_source_bytes}",
+                "incomplete": False,
+                "finish_reason": None,
+                "llm_calls": [],
+                "llm_call_count": 0,
+                "final_speech_words": len(speech.split()),
+                "speech_chars": len(speech),
+                "speech_words": len(speech.split()),
+            }
+        )
+        return speech, meta
+
     try:
         prepared_source = await prepare_tts_markdown_for_llm_via_service(
             _strip_frontmatter(source_markdown),
@@ -492,26 +965,66 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
         )
     except TtsSanitizerUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
-    speech_source, source_meta = _clamp_source_markdown(prepared_source)
-    _assert_complete_doc_speech(source_meta)
-    user_prompt = (
+    source_token_count = count_text_tokens(prepared_source)
+    user_prompt_prefix = (
         "/no-think\n"
         f"Document title: {title}\n"
         f"Document path: {doc_path}\n"
         f"Description: {description or 'None'}\n\n"
         "Rewrite this document as a plain text narrated version for TTS playback:\n\n"
-        f"{speech_source}"
     )
+    framing_token_count = count_text_tokens(_DOC_SPEECH_SYSTEM_PROMPT + "\n" + user_prompt_prefix)
+    base_meta = _doc_speech_budget_meta(
+        doc=doc,
+        source_bytes=source_bytes,
+        prepared_source=prepared_source,
+        source_token_count=source_token_count,
+        framing_token_count=framing_token_count,
+        model_budget=model_budget,
+        effective_input_budget=effective_input_budget,
+        threshold_ratio=threshold_ratio,
+        target_words=target_words,
+        max_words=max_words,
+        elapsed_seconds=time.monotonic() - started,
+    )
+    total_prompt_tokens = source_token_count.tokens + framing_token_count.tokens
+    direct_threshold_tokens = int(effective_input_budget * threshold_ratio)
+    if total_prompt_tokens > direct_threshold_tokens:
+        speech, long_meta = await _generate_long_doc_speech(
+            doc=doc,
+            prepared_source=prepared_source,
+            model_budget=model_budget,
+            target_words=target_words,
+            max_words=max_words,
+        )
+        base_meta.update(
+            {
+                **long_meta,
+                "path_taken": "long_summary",
+                "total_prompt_tokens": total_prompt_tokens,
+                "direct_threshold_tokens": direct_threshold_tokens,
+                "final_speech_words": len(speech.split()),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "incomplete": False,
+            }
+        )
+        return speech, base_meta
+
+    user_prompt = user_prompt_prefix + prepared_source
+    llm_calls: list[dict[str, Any]] = []
     answer, llm_meta = await _complete_doc_speech_local(
         [
             {"role": "system", "content": _DOC_SPEECH_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
     )
+    llm_calls.append(_doc_speech_call_meta("direct_narration", llm_meta))
     generation_meta = {
-        **source_meta,
+        **base_meta,
         **llm_meta,
-        "prompt_version": _DOC_SPEECH_PROMPT_VERSION,
+        "path_taken": "direct",
+        "total_prompt_tokens": total_prompt_tokens,
+        "direct_threshold_tokens": direct_threshold_tokens,
     }
     _assert_complete_doc_speech(generation_meta)
     reviewed_answer, review_meta = await _review_doc_speech_narration(
@@ -519,14 +1032,20 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
         doc_path=doc_path,
         draft=str(answer or ""),
     )
+    llm_calls.append(_doc_speech_call_meta("review", review_meta))
     speech = await _clean_doc_speech_markdown(reviewed_answer)
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty narration")
     generation_meta.update(
         {
             "review": review_meta,
+            "llm_calls": llm_calls,
+            "llm_call_count": len(llm_calls),
             "speech_chars": len(speech),
             "speech_words": len(speech.split()),
+            "final_speech_words": len(speech.split()),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "incomplete": False,
         }
     )
     return speech, generation_meta
