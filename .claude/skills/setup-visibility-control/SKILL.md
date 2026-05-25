@@ -97,3 +97,5 @@ If available in your context, these can provide deeper operational patterns:
 
 - `/root/xarta-node/.xarta/.claude/skills/fleet-node-harness/SKILL.md`
 - `/root/xarta-node/.xarta/.claude/skills/fleet-audit/SKILL.md`
+
+End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

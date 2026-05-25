@@ -109,3 +109,5 @@ Location: `/root/xarta-node/.claude/skills/blueprints-caddy-configs/scripts/bp-c
 
 These are optional node-local references for deployed nodes and may not exist in
 standalone/public-only environments.
+
+End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.
