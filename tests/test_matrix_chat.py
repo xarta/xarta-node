@@ -104,6 +104,31 @@ def test_matrix_chat_message_content_adds_explicit_mxid_mentions():
     }
 
 
+def test_matrix_chat_stt_transcript_body_marks_voice_source():
+    assert (
+        matrix_chat._stt_transcript_body(server_id="tb1", transcript="hello world")
+        == "hermes: [voice/STT transcript, may contain recognition errors] hello world"
+    )
+
+
+def test_matrix_chat_stt_message_content_adds_visible_and_custom_metadata():
+    content = matrix_chat._matrix_stt_message_content(
+        body="hermes: [voice/STT transcript, may contain recognition errors] hello world",
+        runtime="stt-runtime.example:8765",
+        confidence=0.75,
+    )
+
+    assert content == {
+        "msgtype": "m.text",
+        "body": "hermes: [voice/STT transcript, may contain recognition errors] hello world",
+        "xarta_source": "stt",
+        "xarta_stt_runtime": "stt-runtime.example:8765",
+        "xarta_stt_partial": False,
+        "xarta_capture_mode": "push_to_talk",
+        "xarta_stt_confidence": 0.75,
+    }
+
+
 def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
     content = matrix_chat._audio_message_content(
         content_uri="mxc://example.org/audio123",

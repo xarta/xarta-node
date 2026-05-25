@@ -24,8 +24,10 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+import websockets
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket
 from pydantic import BaseModel, Field
+from starlette.requests import HTTPConnection
 
 from .events import AppEvent
 from .events import bus as events_bus
@@ -47,14 +49,14 @@ def _normalize_server_id(value: str | None) -> str:
     return server_id
 
 
-async def _require_matrix_chat_auth(request: Request) -> None:
+async def _require_matrix_chat_auth(connection: HTTPConnection) -> None:
     """Require Blueprints token auth even on loopback for Matrix chat routes."""
     from . import config as cfg
     from .auth import verify_token
 
     if not (cfg.API_SECRET or cfg.SYNC_SECRET):
         return
-    token = request.headers.get("x-api-token", "") or request.query_params.get("token", "")
+    token = connection.headers.get("x-api-token", "") or connection.query_params.get("token", "")
     valid = (cfg.API_SECRET and verify_token(cfg.API_SECRET, token)) or (
         cfg.SYNC_SECRET and verify_token(cfg.SYNC_SECRET, token)
     )
@@ -62,8 +64,8 @@ async def _require_matrix_chat_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-async def _select_matrix_server(request: Request) -> None:
-    _CURRENT_MATRIX_SERVER.set(_normalize_server_id(request.query_params.get("server")))
+async def _select_matrix_server(connection: HTTPConnection) -> None:
+    _CURRENT_MATRIX_SERVER.set(_normalize_server_id(connection.query_params.get("server")))
 
 
 router = APIRouter(
@@ -101,7 +103,12 @@ _DEFAULT_HERMES_MATRIX_PATCH_REPORT = (
 _DEFAULT_HERMES_COMMAND_CONTAINER = "hermes-local"
 _DEFAULT_HERMES_COMMAND_PYTHON = "/opt/hermes/.venv/bin/python"
 _DEFAULT_ROOM_SETTINGS_FILE = "/xarta-node/.lone-wolf/stacks/matrix-chat/data/room-settings.json"
+_DEFAULT_STT_WS_URL = ""
 _HERMES_COMMAND_CATALOG_TIMEOUT = 8
+_STT_WS_CONNECT_TIMEOUT_SECONDS = 5.0
+_STT_WS_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
+_STT_FINAL_TIMEOUT_SECONDS = 8.0
+_STT_TRANSCRIPT_PREFIX = "[voice/STT transcript, may contain recognition errors]"
 _MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 _HERMES_ALIAS_RE = re.compile(r"^\s*(?:hermes|h|hermes-vps|vps|hv)\s*:", re.IGNORECASE)
 _HERMES_BRIDGE_ROOM_NAMES = {
@@ -428,6 +435,12 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             "MATRIX_CHAT_ROOM_SETTINGS_FILE",
             "BLUEPRINTS_MATRIX_CHAT_ROOM_SETTINGS_FILE",
             default=_DEFAULT_ROOM_SETTINGS_FILE,
+        ),
+        "stt_ws_url": pick(
+            "MATRIX_CHAT_STT_WS_URL",
+            "BLUEPRINTS_MATRIX_CHAT_STT_WS_URL",
+            "XARTA_STT_WS_URL",
+            default=_DEFAULT_STT_WS_URL,
         ),
     }
     cached_token = _runtime_access_tokens.get(_runtime_token_key(settings))
@@ -1562,6 +1575,59 @@ def _matrix_message_content(body: str) -> dict[str, Any]:
     if mentions:
         content["m.mentions"] = {"user_ids": mentions}
     return content
+
+
+def _stt_transcript_body(*, server_id: str, transcript: str) -> str:
+    prefix = _HERMES_BRIDGE_PREFIXES.get(server_id, "hermes: ")
+    return f"{prefix}{_STT_TRANSCRIPT_PREFIX} {(transcript or '').strip()}"
+
+
+def _matrix_stt_message_content(
+    *,
+    body: str,
+    runtime: str,
+    confidence: float | None = None,
+) -> dict[str, Any]:
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "xarta_source": "stt",
+            "xarta_stt_runtime": runtime,
+            "xarta_stt_partial": False,
+            "xarta_capture_mode": "push_to_talk",
+        }
+    )
+    if isinstance(confidence, int | float):
+        content["xarta_stt_confidence"] = float(confidence)
+    return content
+
+
+async def _send_stt_transcript_message(
+    *,
+    room_id: str,
+    server_id: str,
+    transcript: str,
+    runtime: str,
+    confidence: float | None = None,
+) -> dict[str, Any]:
+    body = _stt_transcript_body(server_id=server_id, transcript=transcript)
+    content = _matrix_stt_message_content(body=body, runtime=runtime, confidence=confidence)
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-stt-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update({"body": body, "xarta_source": "stt", "xarta_stt_runtime": runtime})
+    return sent
 
 
 def _safe_media_filename(filename: str | None, default: str = "voice-message.webm") -> str:
@@ -2915,6 +2981,212 @@ async def matrix_chat_send_audio(
         sent = {"room_id": room_id, "event_id": data.get("event_id")}
     sent.update({"content_uri": content_uri, "filename": filename, "mimetype": mimetype, "size": len(content)})
     return sent
+
+
+@router.websocket("/rooms/{room_id}/stt/ws")
+async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
+    server_id = _normalize_server_id(websocket.query_params.get("server"))
+    token = _CURRENT_MATRIX_SERVER.set(server_id)
+    settings = _settings(server_id)
+    stt_ws_url = (settings.get("stt_ws_url") or _DEFAULT_STT_WS_URL).strip()
+    runtime = stt_ws_url.replace("ws://", "", 1).replace("wss://", "", 1) if stt_ws_url else "unconfigured"
+    done = asyncio.Event()
+    final_requested = asyncio.Event()
+    relay_stats = {"audio_bytes": 0, "audio_frames": 0}
+    best_partial_text = ""
+    final_sent = False
+
+    await websocket.accept()
+    log.info("Matrix STT session opened room=%s runtime=%s", room_id, runtime)
+    if not stt_ws_url:
+        await websocket.send_json({"type": "error", "detail": "STT websocket URL is not configured"})
+        await websocket.close()
+        _CURRENT_MATRIX_SERVER.reset(token)
+        return
+    await websocket.send_json(
+        {
+            "type": "config",
+            "sample_rate": 16000,
+            "channels": 1,
+            "format": "float32",
+            "runtime": runtime,
+        }
+    )
+
+    async def relay_browser_to_stt(stt_ws: Any) -> None:
+        while not done.is_set():
+            message = await websocket.receive()
+            message_type = message.get("type")
+            if message_type == "websocket.disconnect":
+                with suppress(Exception):
+                    await stt_ws.send(json.dumps({"type": "end"}))
+                final_requested.set()
+                done.set()
+                return
+            if message_type != "websocket.receive":
+                continue
+            payload_bytes = message.get("bytes")
+            payload_text = message.get("text")
+            if payload_bytes is not None:
+                relay_stats["audio_bytes"] += len(payload_bytes)
+                relay_stats["audio_frames"] += 1
+                await stt_ws.send(payload_bytes)
+            elif payload_text is not None:
+                try:
+                    browser_cmd = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    browser_cmd = {}
+                if browser_cmd.get("type") == "end":
+                    final_requested.set()
+                    log.info(
+                        "Matrix STT finalize requested room=%s browser_frames=%s browser_bytes=%s relayed_frames=%s relayed_bytes=%s",
+                        room_id,
+                        browser_cmd.get("audio_frames"),
+                        browser_cmd.get("audio_bytes"),
+                        relay_stats["audio_frames"],
+                        relay_stats["audio_bytes"],
+                    )
+                    if relay_stats["audio_bytes"] <= 0:
+                        await websocket.send_json(
+                            {
+                                "type": "final",
+                                "text": "",
+                                "is_final": True,
+                                "matrix_skipped": "no_audio_frames",
+                                "audio_bytes": 0,
+                                "audio_frames": 0,
+                            }
+                        )
+                        done.set()
+                        return
+                await stt_ws.send(payload_text)
+
+    async def relay_stt_to_browser(stt_ws: Any) -> None:
+        nonlocal best_partial_text, final_sent
+        async for raw_message in stt_ws:
+            payload: dict[str, Any]
+            if isinstance(raw_message, str):
+                try:
+                    payload = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    payload = {"type": "stt_message", "raw": raw_message}
+            else:
+                payload = {"type": "stt_binary", "bytes": len(raw_message or b"")}
+
+            if payload.get("is_final"):
+                transcript = str(payload.get("text") or "").strip() or best_partial_text
+                payload["type"] = "final"
+                if transcript and not str(payload.get("text") or "").strip():
+                    payload["text"] = transcript
+                    payload["xarta_stt_final_from_partial"] = True
+                log.info(
+                    "Matrix STT final room=%s transcript_chars=%s frames=%s bytes=%s",
+                    room_id,
+                    len(transcript),
+                    relay_stats["audio_frames"],
+                    relay_stats["audio_bytes"],
+                )
+                if transcript:
+                    try:
+                        sent = await _send_stt_transcript_message(
+                            room_id=room_id,
+                            server_id=server_id,
+                            transcript=transcript,
+                            runtime=runtime,
+                        )
+                        payload["matrix"] = {
+                            "room_id": sent.get("room_id"),
+                            "event_id": sent.get("event_id"),
+                            "body": sent.get("body"),
+                        }
+                        final_sent = True
+                    except Exception as exc:
+                        log.exception("Matrix STT transcript send failed for room %s", room_id)
+                        payload["matrix_error"] = str(exc)
+                else:
+                    payload["matrix_skipped"] = "empty_transcript"
+                with suppress(Exception):
+                    await websocket.send_json(payload)
+                done.set()
+                return
+
+            payload.setdefault("type", "partial")
+            partial_text = str(payload.get("text") or "").strip()
+            if partial_text:
+                best_partial_text = partial_text
+            await websocket.send_json(payload)
+
+    async def enforce_final_timeout() -> None:
+        await final_requested.wait()
+        try:
+            await asyncio.wait_for(done.wait(), timeout=_STT_FINAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Matrix STT final timeout for room %s after %s frames / %s bytes",
+                room_id,
+                relay_stats["audio_frames"],
+                relay_stats["audio_bytes"],
+            )
+            with suppress(Exception):
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "detail": (
+                            "STT final response timed out "
+                            f"after {relay_stats['audio_frames']} audio frames"
+                        ),
+                        "audio_bytes": relay_stats["audio_bytes"],
+                        "audio_frames": relay_stats["audio_frames"],
+                    }
+                )
+            done.set()
+
+    try:
+        async with websockets.connect(
+            stt_ws_url,
+            open_timeout=_STT_WS_CONNECT_TIMEOUT_SECONDS,
+            max_size=_STT_WS_MAX_MESSAGE_BYTES,
+            ping_interval=30,
+            ping_timeout=10,
+        ) as stt_ws:
+            browser_task = asyncio.create_task(relay_browser_to_stt(stt_ws), name="matrix-stt-browser-relay")
+            stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
+            timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
+            done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
+            tasks = {browser_task, stt_task, timeout_task, done_task}
+            try:
+                finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if any(task for task in finished if task is not done_task and task.exception()):
+                    for task in finished:
+                        if task is not done_task:
+                            task.result()
+                done.set()
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+            finally:
+                done.set()
+                with suppress(Exception):
+                    if not final_sent:
+                        await stt_ws.send(json.dumps({"type": "end"}))
+    except Exception as exc:
+        log.exception("Matrix STT websocket failed for room %s via %s", room_id, stt_ws_url)
+        with suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+    finally:
+        log.info(
+            "Matrix STT session closed room=%s frames=%s bytes=%s final_requested=%s final_sent=%s",
+            room_id,
+            relay_stats["audio_frames"],
+            relay_stats["audio_bytes"],
+            final_requested.is_set(),
+            final_sent,
+        )
+        _CURRENT_MATRIX_SERVER.reset(token)
+        with suppress(Exception):
+            await websocket.close()
 
 
 @router.post("/rooms/{room_id}/test/decryption-mix")
