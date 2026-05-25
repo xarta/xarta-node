@@ -77,7 +77,7 @@ _DEFAULT_NULLCLAW_TASKS_DIR = (
 )
 _DOC_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-cache"
 _DOC_SPEECH_WORK_ROOT = _NODE_LOCAL_ROOT / "doc-speech-work"
-_DOC_SPEECH_PROMPT_VERSION = "20260525-budget-aware-long-doc-v1"
+_DOC_SPEECH_PROMPT_VERSION = "20260525-budget-aware-long-doc-v2-hermes-xarta"
 _METADATA_BACKLOG_LIMIT = 40
 _PATH_LIKE_KEYS = {
     "path",
@@ -598,6 +598,127 @@ def _cohesive_summary_system_prompt() -> str:
     )
 
 
+def _hermes_xarta_deviation_doc_path() -> Path:
+    configured = os.environ.get("DOC_SPEECH_HERMES_XARTA_DEVIATIONS_DOC")
+    if configured:
+        return Path(configured)
+    return _NODE_LOCAL_ROOT / "docs" / "hermes" / "HERMES-XARTA-DEVIATIONS.md"
+
+
+def _is_hermes_upstream_doc(doc_path: str) -> bool:
+    normalized = str(doc_path or "").replace("\\", "/").lstrip("/")
+    return normalized.startswith("docs/hermes/upstream/") or "/docs/hermes/upstream/" in normalized
+
+
+def _normalize_markdown_heading(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _extract_markdown_section(markdown: str, heading: str) -> str:
+    target = _normalize_markdown_heading(heading)
+    lines = str(markdown or "").splitlines()
+    start: int | None = None
+    level: int | None = None
+    for index, line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line.strip())
+        if not match:
+            continue
+        current_level = len(match.group(1))
+        current_heading = _normalize_markdown_heading(match.group(2))
+        if start is None:
+            if current_heading == target:
+                start = index + 1
+                level = current_level
+            continue
+        if level is not None and current_level <= level:
+            return "\n".join(lines[start:index]).strip()
+    if start is None:
+        return ""
+    return "\n".join(lines[start:]).strip()
+
+
+def _load_hermes_xarta_deviation_notes() -> tuple[str, dict[str, Any]]:
+    path = _hermes_xarta_deviation_doc_path()
+    meta: dict[str, Any] = {
+        "applied": False,
+        "deviation_doc_path": str(path),
+    }
+    if not path.is_file():
+        meta["skip_reason"] = "missing_deviation_doc"
+        return "", meta
+    markdown = path.read_text(encoding="utf-8")
+    notes = _extract_markdown_section(markdown, "Narration Injection Notes")
+    if not notes:
+        meta["skip_reason"] = "missing_narration_injection_notes"
+        meta["deviation_doc_fingerprint"] = source_fingerprint(markdown)
+        return "", meta
+    meta["deviation_doc_fingerprint"] = source_fingerprint(markdown)
+    meta["deviation_notes_chars"] = len(notes)
+    return notes, meta
+
+
+def _hermes_xarta_deviation_system_prompt() -> str:
+    return (
+        "You adapt upstream Hermes Agent documentation narration for Xarta's local deployments. "
+        "Return plain text only, with short natural paragraphs. "
+        "Insert Xarta-specific notes only where they correct or clarify the upstream guidance. "
+        "Do not add Markdown, bullets, citations, or process commentary."
+    )
+
+
+async def _apply_hermes_xarta_deviation_notes(
+    *,
+    narration: str,
+    title: str,
+    doc_path: str,
+    target_words: int,
+    max_words: int,
+    llm_calls: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    if not _is_hermes_upstream_doc(doc_path):
+        return narration, {"applied": False, "skip_reason": "not_hermes_upstream_doc"}
+
+    notes, meta = _load_hermes_xarta_deviation_notes()
+    if not notes:
+        return narration, meta
+
+    prompt = (
+        "/no-think\n"
+        f"Upstream document title: {title}\n"
+        f"Upstream document path: {doc_path}\n"
+        f"Target final words: {target_words}\n"
+        f"Maximum final words: {max_words}\n\n"
+        "Xarta deviation notes to apply:\n"
+        f"{notes}\n\n"
+        "Rewrite this upstream Hermes narration so it stays accurate for Xarta listeners. "
+        "Add inline notes about Hermes Local and Hermes VPS where the upstream guidance could mislead. "
+        "Keep the result speech-ready and under the maximum word count. "
+        "Use only the facts in the Xarta deviation notes; do not invent new deployment details.\n\n"
+        "Current narration:\n"
+        f"{narration}"
+    )
+    revised, llm_meta = await _complete_doc_speech_local(
+        [
+            {"role": "system", "content": _hermes_xarta_deviation_system_prompt()},
+            {"role": "user", "content": prompt},
+        ],
+        operation="docs:narration-hermes-xarta-deviation",
+        max_tokens=approx_output_tokens_for_words(max_words),
+    )
+    _assert_complete_doc_speech(llm_meta)
+    llm_calls.append(_doc_speech_call_meta("hermes_xarta_deviation", llm_meta))
+    if not revised:
+        raise HTTPException(502, "Local LLM returned an empty Hermes Xarta deviation narration")
+    meta.update(
+        {
+            "applied": True,
+            "finish_reason": llm_meta.get("finish_reason"),
+            "speech_words": len(revised.split()),
+        }
+    )
+    return revised.strip(), meta
+
+
 def _section_summary_prompt(
     *,
     title: str,
@@ -872,6 +993,23 @@ async def _generate_long_doc_speech(
             llm_calls=llm_calls,
         )
 
+    cohesive, hermes_xarta_deviations_meta = await _apply_hermes_xarta_deviation_notes(
+        narration=cohesive,
+        title=title,
+        doc_path=doc_path,
+        target_words=target_words,
+        max_words=max_words,
+        llm_calls=llm_calls,
+    )
+    if len(cohesive.split()) > max_words:
+        cohesive = await _compress_doc_speech_text(
+            text=cohesive,
+            target_words=max_words,
+            operation="docs:narration-hermes-xarta-word-guard",
+            llm_calls=llm_calls,
+        )
+        hermes_xarta_deviations_meta["post_deviation_word_guard"] = True
+
     reviewed_answer, review_meta = await _review_doc_speech_narration(
         title=title,
         doc_path=doc_path,
@@ -904,6 +1042,7 @@ async def _generate_long_doc_speech(
         "llm_calls": llm_calls,
         "llm_call_count": len(llm_calls),
         "review": review_meta,
+        "hermes_xarta_deviations": hermes_xarta_deviations_meta,
         "finish_reason": cohesive_meta.get("finish_reason"),
         "speech_chars": len(speech),
         "speech_words": len(speech.split()),
