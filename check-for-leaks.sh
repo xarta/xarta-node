@@ -50,6 +50,7 @@ SKIP_KEYS=(
     "XARTA_USER"                # public branding/user name — intentionally present in docs/scripts
     "XARTA_HOME"                # public target home path — intentionally documented
     "XARTA_ENABLE_XRDP"         # value is typically "false" — too generic to scan for
+    "MATRIX_CHAT_STT_NOISE_REDUCTION_ENABLED" # value is typically "false" — too generic to scan for
     "TAILSCALE_ACCEPT_DNS"      # value is "false" — too generic to scan for
     "TAILSCALE_EXIT_NODE"       # value is "true" — too generic to scan for
     "PROXMOX_SSH_KEY"           # standard path convention, present in onboarding templates
