@@ -104,6 +104,36 @@ def test_matrix_chat_message_content_adds_explicit_mxid_mentions():
     }
 
 
+def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
+    content = matrix_chat._audio_message_content(
+        content_uri="mxc://example.org/audio123",
+        filename="voice-note.webm",
+        mimetype="audio/webm",
+        size=12345,
+        duration_ms=987,
+    )
+
+    assert content == {
+        "msgtype": "m.audio",
+        "body": "voice-note.webm",
+        "filename": "voice-note.webm",
+        "url": "mxc://example.org/audio123",
+        "info": {
+            "mimetype": "audio/webm",
+            "size": 12345,
+            "duration": 987,
+        },
+    }
+
+
+def test_matrix_chat_audio_filename_and_mimetype_are_normalized():
+    assert matrix_chat._safe_media_filename("../../voice?.mp3") == "voice_.mp3"
+    assert matrix_chat._safe_media_filename("") == "voice-message.webm"
+    assert matrix_chat._guess_audio_mimetype("clip.mp3", "") == "audio/mpeg"
+    assert matrix_chat._guess_audio_mimetype("clip.wav", None) == "audio/wav"
+    assert matrix_chat._guess_audio_mimetype("clip.bin", "audio/ogg") == "audio/ogg"
+
+
 def test_matrix_chat_auto_prefixes_local_bridge_without_member_mention():
     body = matrix_chat._auto_hermes_prefix_body_for_state(
         server_id="tb1",
