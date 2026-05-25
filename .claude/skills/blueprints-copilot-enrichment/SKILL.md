@@ -176,3 +176,5 @@ When given network scan output (from `bp-scan.sh`), follow this process:
 - **Check for duplicates** before proposing new entries.
 - **Preserve existing data** — use PUT for updates, don't overwrite fields unnecessarily.
 - **Use the schema endpoint** (`/api/v1/schema`) to verify current table structure.
+
+End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.
