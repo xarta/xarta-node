@@ -41,7 +41,25 @@ def _looks_like_local_primary(model: str | None) -> bool:
     return alias.startswith("PRIMARY-LOCAL")
 
 
+def _looks_like_request_shape_failure(detail: str | None) -> bool:
+    text = str(detail or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "contextwindowexceeded",
+            "context window",
+            "maximum context length",
+            "input_tokens",
+            "output_tokens",
+            "reduce the length",
+            "badrequesterror",
+        )
+    )
+
+
 def _looks_like_offline_failure(status_code: int | None, detail: str | None) -> bool:
+    if _looks_like_request_shape_failure(detail):
+        return False
     if status_code is None:
         return True
     if status_code >= 500:

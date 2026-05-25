@@ -494,6 +494,74 @@ def test_matrix_chat_room_and_message_mapping_do_not_return_credentials():
     assert "authorization" not in rendered.lower()
 
 
+def test_matrix_chat_drops_redacted_target_before_message_mapping():
+    events = [
+        {
+            "type": "m.room.encrypted",
+            "event_id": "$bad",
+            "sender": "@old:test.example",
+            "origin_server_ts": 1710000000000,
+            "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+        },
+        {
+            "type": "m.room.redaction",
+            "event_id": "$redaction",
+            "sender": "@admin:test.example",
+            "origin_server_ts": 1710000000001,
+            "redacts": "$bad",
+            "content": {"reason": "cleanup"},
+        },
+        {
+            "type": "m.room.message",
+            "event_id": "$good",
+            "sender": "@hermes:test.example",
+            "origin_server_ts": 1710000000002,
+            "content": {"msgtype": "m.text", "body": "still here"},
+        },
+    ]
+
+    filtered = matrix_chat._events_without_redacted_targets(events)
+    messages = [
+        matrix_chat._message_from_event(event, "!room:test.example")
+        for event in filtered
+    ]
+    messages = [message for message in messages if message]
+
+    assert [event["event_id"] for event in filtered] == ["$redaction", "$good"]
+    assert [message["event_id"] for message in messages] == ["$good"]
+
+
+def test_matrix_chat_strips_redacted_targets_from_sync_before_crypto_handling():
+    sync = {
+        "rooms": {
+            "join": {
+                "!room:test.example": {
+                    "timeline": {
+                        "events": [
+                            {
+                                "type": "m.room.encrypted",
+                                "event_id": "$bad",
+                                "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                            },
+                            {
+                                "type": "m.room.redaction",
+                                "event_id": "$redaction",
+                                "redacts": "$bad",
+                                "content": {"reason": "cleanup"},
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    stripped = matrix_chat._sync_without_redacted_targets(sync)
+    events = stripped["rooms"]["join"]["!room:test.example"]["timeline"]["events"]
+
+    assert [event["event_id"] for event in events] == ["$redaction"]
+
+
 def test_matrix_chat_room_mapping_marks_missing_names_as_fallback():
     sync = {
         "rooms": {

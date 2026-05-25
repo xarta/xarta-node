@@ -684,7 +684,8 @@ class _MatrixChatE2EEClient:
         await self._ensure_cross_signing(olm)
         self._client.crypto = olm
 
-        data = await self._client.sync(timeout=1000, full_state=True)
+        startup_filter = json.dumps({"room": {"timeline": {"limit": 0}}}, separators=(",", ":"))
+        data = await self._client.sync(timeout=1000, full_state=True, filter_id=startup_filter)
         await self._handle_sync_data(data if isinstance(data, dict) else {})
         self._started = True
         _secure_crypto_store(self._store_dir)
@@ -747,6 +748,7 @@ class _MatrixChatE2EEClient:
             _secure_crypto_store(self._store_dir)
 
     async def _handle_sync_data(self, data: dict[str, Any]) -> None:
+        data = _sync_without_redacted_targets(data)
         rooms_join = data.get("rooms", {}).get("join", {})
         if isinstance(rooms_join, dict):
             self._joined_rooms.update(str(room_id) for room_id in rooms_join)
@@ -765,10 +767,14 @@ class _MatrixChatE2EEClient:
         full_state: bool = False,
     ) -> dict[str, Any]:
         await self.ensure_started() if not self._started else None
+        filter_id = None
+        if full_state and not since:
+            filter_id = json.dumps({"room": {"timeline": {"limit": 0}}}, separators=(",", ":"))
         data = await self._client.sync(
             since=since,
             timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
             full_state=full_state,
+            filter_id=filter_id,
         )
         if isinstance(data, dict):
             await self._handle_sync_data(data)
@@ -873,7 +879,7 @@ class _MatrixChatE2EEClient:
         from mautrix.types import Event
 
         messages: list[dict[str, Any]] = []
-        for raw in events:
+        for raw in _events_without_redacted_targets(events):
             if _event_is_redacted(raw):
                 continue
             try:
@@ -1807,6 +1813,41 @@ def _redacted_event_ids_from_events(events: list[dict[str, Any]]) -> list[str]:
     return redacted
 
 
+def _events_without_redacted_targets(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    redacted_event_id_set = set(_redacted_event_ids_from_events(events))
+    if not redacted_event_id_set:
+        return events
+    return [
+        event
+        for event in events
+        if _safe_str(event.get("event_id")) not in redacted_event_id_set
+    ]
+
+
+def _sync_without_redacted_targets(sync: dict[str, Any]) -> dict[str, Any]:
+    rooms = sync.get("rooms")
+    if not isinstance(rooms, dict):
+        return sync
+    for bucket_name in ("join", "invite", "leave"):
+        bucket = rooms.get(bucket_name)
+        if not isinstance(bucket, dict):
+            continue
+        for room in bucket.values():
+            if not isinstance(room, dict):
+                continue
+            timeline = room.get("timeline")
+            if not isinstance(timeline, dict):
+                continue
+            events = timeline.get("events")
+            if not isinstance(events, list):
+                continue
+            raw_events = [event for event in events if isinstance(event, dict)]
+            filtered = _events_without_redacted_targets(raw_events)
+            if len(filtered) != len(raw_events):
+                timeline["events"] = filtered
+    return sync
+
+
 def _is_room_id(value: str | None) -> bool:
     return bool(value and value.startswith("!") and ":" in value)
 
@@ -1864,7 +1905,10 @@ def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | Non
 def _room_summary(room_id: str, room: dict[str, Any], *, invite: bool = False) -> dict[str, Any]:
     events = _state_events(room, invite=invite) + _timeline_events(room)
     name, canonical_alias, encrypted, name_source = _room_name_from_events(events)
-    messages = [_message_from_event(event, room_id) for event in _timeline_events(room)]
+    messages = [
+        _message_from_event(event, room_id)
+        for event in _events_without_redacted_targets(_timeline_events(room))
+    ]
     messages = [message for message in messages if message]
     last_message = messages[-1] if messages else None
     summary = room.get("summary") if isinstance(room.get("summary"), dict) else {}
@@ -2119,10 +2163,11 @@ async def _matrix_chat_sync_payload(
         raw_events = [event for event in _timeline_events(room) if isinstance(event, dict)]
         redacted_event_ids = _redacted_event_ids_from_events(raw_events)
         redacted_event_id_set = set(redacted_event_ids)
+        unredacted_events = _events_without_redacted_targets(raw_events)
         if e2ee_client:
-            messages = await e2ee_client.messages_from_raw_events(room_id, raw_events)
+            messages = await e2ee_client.messages_from_raw_events(room_id, unredacted_events)
         else:
-            messages = [_message_from_event(event, room_id) for event in raw_events]
+            messages = [_message_from_event(event, room_id) for event in unredacted_events]
         messages = [
             message
             for message in messages
