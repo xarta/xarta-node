@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from .events import AppEvent
@@ -81,6 +81,7 @@ _DEFAULT_SMOKE_ROOM_ID = ""
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
+_MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_REDACTION_SCAN_LIMIT = 20_000
 _REDACTION_MAX_RETRIES = 6
 _REDACTION_RETRY_FLOOR_SECONDS = 5.0
@@ -827,6 +828,18 @@ class _MatrixChatE2EEClient:
         _secure_crypto_store(self._store_dir)
         return {"room_id": room_id, "event_id": str(event_id)}
 
+    async def send_message_content(self, room_id: str, content: dict[str, Any]) -> dict[str, Any]:
+        from mautrix.types import EventType, RoomID
+
+        await self.ensure_started()
+        event_id = await self._client.send_message_event(
+            RoomID(room_id),
+            EventType.ROOM_MESSAGE,
+            content,
+        )
+        _secure_crypto_store(self._store_dir)
+        return {"room_id": room_id, "event_id": str(event_id)}
+
     async def message_from_event(self, event: Any, room_id: str) -> dict[str, Any] | None:
         from mautrix.types import EventType
 
@@ -978,6 +991,58 @@ async def _matrix_request(
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Matrix homeserver returned unexpected JSON")
     return data
+
+
+async def _matrix_upload_media(
+    *,
+    content: bytes,
+    filename: str,
+    mimetype: str,
+) -> str:
+    settings = _require_credentials()
+    timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+    params = {"filename": filename}
+    headers = {
+        **_headers(settings),
+        "Content-Type": mimetype or "application/octet-stream",
+    }
+    try:
+        async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
+            response = await client.post(
+                "/_matrix/media/v3/upload",
+                params=params,
+                content=content,
+                headers=headers,
+            )
+            if response.status_code == 401:
+                settings = await _refresh_chat_access_token(settings)
+                headers["Authorization"] = f"Bearer {settings['access_token']}"
+                response = await client.post(
+                    "/_matrix/media/v3/upload",
+                    params=params,
+                    content=content,
+                    headers=headers,
+                )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+
+    if response.status_code not in {200, 201}:
+        if response.status_code == 413:
+            detail = "Matrix homeserver rejected the audio upload as too large"
+        elif response.status_code in {401, 403}:
+            detail = "Matrix chat credential rejected by homeserver"
+        else:
+            detail = f"Matrix media upload failed with HTTP {response.status_code}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+    content_uri = data.get("content_uri") if isinstance(data, dict) else None
+    if not isinstance(content_uri, str) or not content_uri.startswith("mxc://"):
+        raise HTTPException(status_code=502, detail="Matrix homeserver did not return an MXC URI")
+    return content_uri
 
 
 def _matrix_retry_after_seconds(response: httpx.Response) -> float:
@@ -1497,6 +1562,49 @@ def _matrix_message_content(body: str) -> dict[str, Any]:
     if mentions:
         content["m.mentions"] = {"user_ids": mentions}
     return content
+
+
+def _safe_media_filename(filename: str | None, default: str = "voice-message.webm") -> str:
+    raw = Path(filename or "").name.strip()
+    clean = re.sub(r"[^0-9A-Za-z._ -]+", "_", raw).strip(" .")
+    return clean[:160] or default
+
+
+def _guess_audio_mimetype(filename: str, content_type: str | None) -> str:
+    mimetype = (content_type or "").strip().lower()
+    if mimetype:
+        return mimetype
+    suffix = Path(filename).suffix.lower()
+    return {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+        ".oga": "audio/ogg",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }.get(suffix, "application/octet-stream")
+
+
+def _audio_message_content(
+    *,
+    content_uri: str,
+    filename: str,
+    mimetype: str,
+    size: int,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    info: dict[str, Any] = {"mimetype": mimetype, "size": size}
+    if isinstance(duration_ms, int) and duration_ms >= 0:
+        info["duration"] = duration_ms
+    return {
+        "msgtype": "m.audio",
+        "body": filename,
+        "filename": filename,
+        "url": content_uri,
+        "info": info,
+    }
 
 
 def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
@@ -2760,6 +2868,53 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
         "room_id": room_id,
         "event_id": data.get("event_id"),
     }
+
+
+@router.post("/rooms/{room_id}/audio")
+async def matrix_chat_send_audio(
+    room_id: str,
+    file: UploadFile = File(...),
+    duration_ms: int | None = Form(default=None),
+) -> dict[str, Any]:
+    filename = _safe_media_filename(file.filename)
+    mimetype = _guess_audio_mimetype(filename, file.content_type)
+    if not mimetype.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Only audio uploads are supported")
+
+    content = await file.read(_MAX_AUDIO_UPLOAD_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="Audio upload is empty")
+    if len(content) > _MAX_AUDIO_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Audio upload is too large")
+
+    content_uri = await _matrix_upload_media(
+        content=content,
+        filename=filename,
+        mimetype=mimetype,
+    )
+    message_content = _audio_message_content(
+        content_uri=content_uri,
+        filename=filename,
+        mimetype=mimetype,
+        size=len(content),
+        duration_ms=duration_ms,
+    )
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, message_content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-audio-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=message_content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update({"content_uri": content_uri, "filename": filename, "mimetype": mimetype, "size": len(content)})
+    return sent
 
 
 @router.post("/rooms/{room_id}/test/decryption-mix")
