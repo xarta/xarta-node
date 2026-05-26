@@ -253,6 +253,51 @@ VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = os.environ.get(
     "",
 ).strip()
 
+# Remote LXC 841 Dockge instance. This mirrors the VPS Dockge integration, but
+# reaches the Docker host through a configured Proxmox SSH + pct exec hop. The
+# optional JSON config file keeps node-specific host/IP/path values out of
+# public source and out of the main .env leak scanner input.
+LXC841_DOCKGE_CONFIG_FILE: str = os.environ.get("LXC841_DOCKGE_CONFIG_FILE", "").strip()
+
+
+def _load_lxc841_dockge_file_config() -> dict:
+    if not LXC841_DOCKGE_CONFIG_FILE:
+        return {}
+    try:
+        with open(LXC841_DOCKGE_CONFIG_FILE, encoding="utf-8") as _f:
+            raw = json.load(_f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("could not load LXC841_DOCKGE_CONFIG_FILE=%r: %s", LXC841_DOCKGE_CONFIG_FILE, exc)
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+_LXC841_DOCKGE_FILE_CONFIG = _load_lxc841_dockge_file_config()
+
+
+def _lxc841_dockge_setting(name: str) -> str:
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value.strip()
+    file_value = _LXC841_DOCKGE_FILE_CONFIG.get(name)
+    return str(file_value).strip() if file_value is not None else ""
+
+
+LXC841_DOCKGE_BASE_URL: str = _lxc841_dockge_setting("LXC841_DOCKGE_BASE_URL")
+LXC841_DOCKGE_STACKS_DIR: str = _lxc841_dockge_setting("LXC841_DOCKGE_STACKS_DIR")
+LXC841_DOCKGE_SSH_USER: str = _lxc841_dockge_setting("LXC841_DOCKGE_SSH_USER")
+LXC841_DOCKGE_SSH_HOSTS: str = _lxc841_dockge_setting("LXC841_DOCKGE_SSH_HOSTS")
+LXC841_DOCKGE_SSH_KEY: str = _lxc841_dockge_setting("LXC841_DOCKGE_SSH_KEY")
+LXC841_DOCKGE_PVE_BIND_ADDR: str = _lxc841_dockge_setting("LXC841_DOCKGE_PVE_BIND_ADDR")
+LXC841_DOCKGE_PVE_VMID: str = _lxc841_dockge_setting("LXC841_DOCKGE_PVE_VMID")
+LXC841_DOCKGE_LXC_IP: str = _lxc841_dockge_setting("LXC841_DOCKGE_LXC_IP")
+LXC841_DOCKGE_CADDY_VMID: str = _lxc841_dockge_setting("LXC841_DOCKGE_CADDY_VMID")
+LXC841_DOCKGE_CADDYFILE: str = _lxc841_dockge_setting("LXC841_DOCKGE_CADDYFILE")
+LXC841_DOCKGE_DOCS_REL_ROOT: str = _lxc841_dockge_setting("LXC841_DOCKGE_DOCS_REL_ROOT")
+LXC841_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES: str = _lxc841_dockge_setting(
+    "LXC841_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES"
+)
+
 # Node-local deterministic docs synthesis worker. This is a separate Blueprints
 # proxy surface from the direct TurboVec Docs search route above.
 NULLCLAW_DOCS_SEARCH_URL: str = os.environ.get(
