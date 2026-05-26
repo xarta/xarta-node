@@ -54,6 +54,7 @@ def test_matrix_chat_reads_private_stt_noise_reduction_settings(tmp_path, monkey
                 "MATRIX_CHAT_STT_WS_URL=ws://stt.example.test:8765",
                 "MATRIX_CHAT_STT_NOISE_REDUCTION_ENABLED=true",
                 "MATRIX_CHAT_STT_NOISE_DFN_WS_URL=ws://filter.example.test:18760",
+                "MATRIX_CHAT_STT_NOISE_STREAM_TEST_WS_URL=ws://filter.example.test:18761",
                 "MATRIX_CHAT_STT_NOISE_ATTEN_LIM_DB=6.5",
             ]
         ),
@@ -66,6 +67,7 @@ def test_matrix_chat_reads_private_stt_noise_reduction_settings(tmp_path, monkey
     assert settings["stt_ws_url"] == "ws://stt.example.test:8765"
     assert settings["stt_noise_reduction_enabled"] == "true"
     assert settings["stt_noise_dfn_ws_url"] == "ws://filter.example.test:18760"
+    assert settings["stt_noise_stream_test_ws_url"] == "ws://filter.example.test:18761"
     assert settings["stt_noise_atten_lim_db"] == "6.5"
 
 

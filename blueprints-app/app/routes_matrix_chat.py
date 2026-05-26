@@ -107,6 +107,7 @@ _DEFAULT_ROOM_SETTINGS_FILE = "/xarta-node/.lone-wolf/stacks/matrix-chat/data/ro
 _DEFAULT_STT_WS_URL = ""
 _DEFAULT_STT_NOISE_REDUCTION_ENABLED = "false"
 _DEFAULT_STT_NOISE_DFN_WS_URL = ""
+_DEFAULT_STT_NOISE_STREAM_TEST_WS_URL = ""
 _DEFAULT_STT_NOISE_ATTEN_LIM_DB = "6.0"
 _HERMES_COMMAND_CATALOG_TIMEOUT = 8
 _STT_WS_CONNECT_TIMEOUT_SECONDS = 5.0
@@ -458,6 +459,12 @@ def _settings(server_id: str | None = None) -> dict[str, str]:
             "BLUEPRINTS_MATRIX_CHAT_STT_NOISE_DFN_WS_URL",
             "XARTA_STT_NOISE_DFN_WS_URL",
             default=_DEFAULT_STT_NOISE_DFN_WS_URL,
+        ),
+        "stt_noise_stream_test_ws_url": pick(
+            "MATRIX_CHAT_STT_NOISE_STREAM_TEST_WS_URL",
+            "BLUEPRINTS_MATRIX_CHAT_STT_NOISE_STREAM_TEST_WS_URL",
+            "XARTA_STT_NOISE_STREAM_TEST_WS_URL",
+            default=_DEFAULT_STT_NOISE_STREAM_TEST_WS_URL,
         ),
         "stt_noise_atten_lim_db": pick(
             "MATRIX_CHAT_STT_NOISE_ATTEN_LIM_DB",
@@ -3031,6 +3038,148 @@ async def matrix_chat_stt_noise_test_websocket(websocket: WebSocket) -> None:
         send_matrix_transcript=False,
         return_enhanced_audio=True,
     )
+
+
+@router.websocket("/stt/noise-test/stream-quality/ws")
+async def matrix_chat_stt_noise_stream_quality_websocket(websocket: WebSocket) -> None:
+    server_id = _normalize_server_id(websocket.query_params.get("server"))
+    token = _CURRENT_MATRIX_SERVER.set(server_id)
+    settings = _settings(server_id)
+    mirror_ws_url = (settings.get("stt_noise_stream_test_ws_url") or _DEFAULT_STT_NOISE_STREAM_TEST_WS_URL).strip()
+    done = asyncio.Event()
+    stats = {
+        "browser_bytes": 0,
+        "browser_frames": 0,
+        "returned_bytes": 0,
+        "returned_frames": 0,
+    }
+    started_at = time.monotonic()
+
+    await websocket.accept()
+    if not mirror_ws_url:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "detail": "STT stream quality mirror URL is not configured",
+            }
+        )
+        _CURRENT_MATRIX_SERVER.reset(token)
+        with suppress(Exception):
+            await websocket.close()
+        return
+
+    await websocket.send_json(
+        {
+            "type": "config",
+            "mode": "mirror_ws",
+            "mirror_configured": True,
+            "max_message_bytes": _STT_WS_MAX_MESSAGE_BYTES,
+        }
+    )
+
+    def final_payload(reason: str) -> dict[str, Any]:
+        return {
+            "type": "final",
+            "reason": reason,
+            "elapsed_ms": round((time.monotonic() - started_at) * 1000.0, 1),
+            **stats,
+        }
+
+    async def relay_browser_to_mirror(mirror_ws: Any) -> None:
+        while not done.is_set():
+            message = await websocket.receive()
+            message_type = message.get("type")
+            if message_type == "websocket.disconnect":
+                with suppress(Exception):
+                    await mirror_ws.send(json.dumps({"type": "end"}))
+                done.set()
+                return
+            if message_type != "websocket.receive":
+                continue
+            payload_bytes = message.get("bytes")
+            payload_text = message.get("text")
+            if payload_bytes is not None:
+                stats["browser_bytes"] += len(payload_bytes)
+                stats["browser_frames"] += 1
+                await mirror_ws.send(payload_bytes)
+            elif payload_text is not None:
+                try:
+                    browser_cmd = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    browser_cmd = {}
+                await mirror_ws.send(payload_text)
+                if browser_cmd.get("type") == "end":
+                    continue
+
+    async def relay_mirror_to_browser(mirror_ws: Any) -> None:
+        async for raw_message in mirror_ws:
+            if isinstance(raw_message, bytes):
+                stats["returned_bytes"] += len(raw_message)
+                stats["returned_frames"] += 1
+                await websocket.send_bytes(raw_message)
+                continue
+            try:
+                payload = json.loads(str(raw_message or "{}"))
+            except json.JSONDecodeError:
+                payload = {"type": "mirror_message", "raw": str(raw_message or "")[:240]}
+            if payload.get("type") == "final":
+                payload.setdefault("gateway", final_payload("mirror_final"))
+                await websocket.send_json(payload)
+                done.set()
+                return
+            await websocket.send_json({"type": "mirror", "payload": payload})
+        if not done.is_set():
+            await websocket.send_json(final_payload("mirror_closed"))
+            done.set()
+
+    try:
+        log.info(
+            "Matrix STT stream quality test opened server=%s mode=%s",
+            server_id,
+            "mirror_ws",
+        )
+        async with websockets.connect(
+            mirror_ws_url,
+            open_timeout=_STT_WS_CONNECT_TIMEOUT_SECONDS,
+            max_size=_STT_WS_MAX_MESSAGE_BYTES,
+            ping_interval=None,
+        ) as mirror_ws:
+            browser_task = asyncio.create_task(
+                relay_browser_to_mirror(mirror_ws),
+                name="matrix-stt-stream-quality-browser-mirror",
+            )
+            mirror_task = asyncio.create_task(
+                relay_mirror_to_browser(mirror_ws),
+                name="matrix-stt-stream-quality-mirror-browser",
+            )
+            done_task = asyncio.create_task(done.wait(), name="matrix-stt-stream-quality-done")
+            tasks = {browser_task, mirror_task, done_task}
+            finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if any(task for task in finished if task is not done_task and task.exception()):
+                for task in finished:
+                    if task is not done_task:
+                        task.result()
+            done.set()
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with suppress(asyncio.CancelledError):
+                    await task
+    except Exception as exc:
+        log.exception("Matrix STT stream quality websocket failed via %s", mirror_ws_url)
+        with suppress(Exception):
+            await websocket.send_json({"type": "error", "detail": str(exc), **final_payload("error")})
+    finally:
+        log.info(
+            "Matrix STT stream quality test closed server=%s mode=%s sent_frames=%s returned_frames=%s",
+            server_id,
+            "mirror_ws",
+            stats["browser_frames"],
+            stats["returned_frames"],
+        )
+        _CURRENT_MATRIX_SERVER.reset(token)
+        with suppress(Exception):
+            await websocket.close()
 
 
 async def _matrix_chat_stt_relay(
