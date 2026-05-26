@@ -3015,6 +3015,31 @@ async def matrix_chat_send_audio(
 
 @router.websocket("/rooms/{room_id}/stt/ws")
 async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
+    await _matrix_chat_stt_relay(
+        websocket,
+        room_id=room_id,
+        send_matrix_transcript=True,
+        return_enhanced_audio=False,
+    )
+
+
+@router.websocket("/stt/noise-test/ws")
+async def matrix_chat_stt_noise_test_websocket(websocket: WebSocket) -> None:
+    await _matrix_chat_stt_relay(
+        websocket,
+        room_id=None,
+        send_matrix_transcript=False,
+        return_enhanced_audio=True,
+    )
+
+
+async def _matrix_chat_stt_relay(
+    websocket: WebSocket,
+    *,
+    room_id: str | None,
+    send_matrix_transcript: bool,
+    return_enhanced_audio: bool,
+) -> None:
     server_id = _normalize_server_id(websocket.query_params.get("server"))
     token = _CURRENT_MATRIX_SERVER.set(server_id)
     settings = _settings(server_id)
@@ -3041,13 +3066,15 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
         "audio_frames": 0,
         "round_trip_ms": [],
     }
+    session_started_at = time.monotonic()
     best_partial_text = ""
     final_sent = False
+    log_room = room_id or "noise-test"
 
     await websocket.accept()
     log.info(
         "Matrix STT session opened room=%s runtime=%s noise_reduction=%s",
-        room_id,
+        log_room,
         runtime,
         noise_enabled,
     )
@@ -3076,6 +3103,30 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             },
         }
     )
+
+    def stt_timing_payload() -> dict[str, Any]:
+        latencies = filter_stats["round_trip_ms"]
+        timing: dict[str, Any] = {
+            "elapsed_ms": round((time.monotonic() - session_started_at) * 1000.0, 1),
+            "audio_bytes": relay_stats["audio_bytes"],
+            "audio_frames": relay_stats["audio_frames"],
+            "noise_reduction_enabled": noise_enabled,
+        }
+        if noise_enabled:
+            timing["filter"] = {
+                "audio_bytes": filter_stats["audio_bytes"],
+                "audio_frames": filter_stats["audio_frames"],
+                "latency_count": len(latencies),
+            }
+            if latencies:
+                timing["filter"].update(
+                    {
+                        "min_ms": round(min(latencies), 1),
+                        "max_ms": round(max(latencies), 1),
+                        "avg_ms": round(sum(latencies) / len(latencies), 1),
+                    }
+                )
+        return timing
 
     async def send_stt_end(stt_ws: Any) -> None:
         if stt_end_sent.is_set():
@@ -3110,7 +3161,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                     final_requested.set()
                     log.info(
                         "Matrix STT finalize requested room=%s browser_frames=%s browser_bytes=%s relayed_frames=%s relayed_bytes=%s",
-                        room_id,
+                        log_room,
                         browser_cmd.get("audio_frames"),
                         browser_cmd.get("audio_bytes"),
                         relay_stats["audio_frames"],
@@ -3125,6 +3176,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                                 "matrix_skipped": "no_audio_frames",
                                 "audio_bytes": 0,
                                 "audio_frames": 0,
+                                "timing": stt_timing_payload(),
                             }
                         )
                         done.set()
@@ -3140,7 +3192,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
         if filter_pending_sent_at:
             log.warning(
                 "Matrix STT noise filter drain timeout room=%s pending_chunks=%s frames=%s bytes=%s",
-                room_id,
+                log_room,
                 len(filter_pending_sent_at),
                 relay_stats["audio_frames"],
                 relay_stats["audio_bytes"],
@@ -3175,7 +3227,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                     final_requested.set()
                     log.info(
                         "Matrix STT noise finalize requested room=%s browser_frames=%s browser_bytes=%s relayed_frames=%s relayed_bytes=%s",
-                        room_id,
+                        log_room,
                         browser_cmd.get("audio_frames"),
                         browser_cmd.get("audio_bytes"),
                         relay_stats["audio_frames"],
@@ -3190,6 +3242,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                                 "matrix_skipped": "no_audio_frames",
                                 "audio_bytes": 0,
                                 "audio_frames": 0,
+                                "timing": stt_timing_payload(),
                             }
                         )
                         done.set()
@@ -3208,6 +3261,8 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                     elapsed_ms = (time.monotonic() - filter_pending_sent_at.popleft()) * 1000.0
                     filter_stats["round_trip_ms"].append(elapsed_ms)
                 await stt_ws.send(raw_message)
+                if return_enhanced_audio:
+                    await websocket.send_bytes(raw_message)
                 continue
 
             try:
@@ -3239,12 +3294,13 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                     payload["xarta_stt_final_from_partial"] = True
                 log.info(
                     "Matrix STT final room=%s transcript_chars=%s frames=%s bytes=%s",
-                    room_id,
+                    log_room,
                     len(transcript),
                     relay_stats["audio_frames"],
                     relay_stats["audio_bytes"],
                 )
-                if transcript:
+                payload["timing"] = stt_timing_payload()
+                if transcript and send_matrix_transcript and room_id:
                     try:
                         sent = await _send_stt_transcript_message(
                             room_id=room_id,
@@ -3261,6 +3317,8 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                     except Exception as exc:
                         log.exception("Matrix STT transcript send failed for room %s", room_id)
                         payload["matrix_error"] = str(exc)
+                elif transcript:
+                    payload["matrix_skipped"] = "noise_test"
                 else:
                     payload["matrix_skipped"] = "empty_transcript"
                 with suppress(Exception):
@@ -3280,8 +3338,9 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                 "type": "final",
                 "text": transcript,
                 "is_final": True,
+                "timing": stt_timing_payload(),
             }
-            if transcript:
+            if transcript and send_matrix_transcript and room_id:
                 payload["xarta_stt_final_from_partial"] = True
                 try:
                     sent = await _send_stt_transcript_message(
@@ -3299,6 +3358,9 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                 except Exception as exc:
                     log.exception("Matrix STT transcript send failed for room %s", room_id)
                     payload["matrix_error"] = str(exc)
+            elif transcript:
+                payload["xarta_stt_final_from_partial"] = True
+                payload["matrix_skipped"] = "noise_test"
             else:
                 payload["matrix_skipped"] = "empty_transcript"
             with suppress(Exception):
@@ -3312,7 +3374,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
         except asyncio.TimeoutError:
             log.warning(
                 "Matrix STT final timeout for room %s after %s frames / %s bytes",
-                room_id,
+                log_room,
                 relay_stats["audio_frames"],
                 relay_stats["audio_bytes"],
             )
@@ -3326,6 +3388,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                         ),
                         "audio_bytes": relay_stats["audio_bytes"],
                         "audio_frames": relay_stats["audio_frames"],
+                        "timing": stt_timing_payload(),
                     }
                 )
             done.set()
@@ -3335,16 +3398,14 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             stt_ws_url,
             open_timeout=_STT_WS_CONNECT_TIMEOUT_SECONDS,
             max_size=_STT_WS_MAX_MESSAGE_BYTES,
-            ping_interval=30,
-            ping_timeout=10,
+            ping_interval=None,
         ) as stt_ws:
             if noise_enabled:
                 async with websockets.connect(
                     noise_ws_url,
                     open_timeout=_STT_WS_CONNECT_TIMEOUT_SECONDS,
                     max_size=_STT_WS_MAX_MESSAGE_BYTES,
-                    ping_interval=30,
-                    ping_timeout=10,
+                    ping_interval=None,
                 ) as filter_ws:
                     await filter_ws.send(json.dumps({"type": "config", "sample_rate": 16000}))
                     await filter_ws.send(
@@ -3404,13 +3465,13 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
                         if not final_sent:
                             await send_stt_end(stt_ws)
     except Exception as exc:
-        log.exception("Matrix STT websocket failed for room %s via %s", room_id, stt_ws_url)
+        log.exception("Matrix STT websocket failed for room %s via %s", log_room, stt_ws_url)
         with suppress(Exception):
             await websocket.send_json({"type": "error", "detail": str(exc)})
     finally:
         log.info(
             "Matrix STT session closed room=%s frames=%s bytes=%s final_requested=%s final_sent=%s",
-            room_id,
+            log_room,
             relay_stats["audio_frames"],
             relay_stats["audio_bytes"],
             final_requested.is_set(),
@@ -3420,7 +3481,7 @@ async def matrix_chat_stt_websocket(websocket: WebSocket, room_id: str) -> None:
             filter_latencies = filter_stats["round_trip_ms"]
             log.info(
                 "Matrix STT noise filter stats room=%s frames=%s bytes=%s min_ms=%.1f max_ms=%.1f avg_ms=%.1f",
-                room_id,
+                log_room,
                 filter_stats["audio_frames"],
                 filter_stats["audio_bytes"],
                 min(filter_latencies),
