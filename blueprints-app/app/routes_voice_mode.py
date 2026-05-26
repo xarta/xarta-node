@@ -25,6 +25,7 @@ class BrowserVoiceState(BaseModel):
     browser_id: str
     browser_label: str | None = None
     stt_enabled: bool = False
+    stt_mode: str | None = None
     tts_enabled: bool = False
 
 
@@ -59,6 +60,19 @@ def _clean_model_preference(value: str | None) -> str:
     if raw in {"codex", "codex_spark", "spark", "gpt_5_3_codex_spark"}:
         return "codex_spark"
     return "codex_spark"
+
+
+def _clean_stt_mode(value: str | None, stt_enabled: bool = False) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in {"realtime", "real_time", "conversation", "realtime_conversation"}:
+        return "realtime_conversation"
+    if raw in {"push", "push_to_talk", "ptt", "stt"}:
+        return "push_to_talk"
+    if raw in {"wake", "wake_to_talk", "wake_word"}:
+        return "wake_to_talk"
+    if raw in {"", "off", "none", "disabled"}:
+        return "push_to_talk" if stt_enabled else ""
+    return ""
 
 
 def _clean_policy(value: Any) -> dict[str, Any]:
@@ -96,6 +110,10 @@ def _write_state_unlocked(state: dict[str, Any]) -> None:
 
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
+    if active:
+        active = dict(active)
+        active["stt_mode"] = _clean_stt_mode(active.get("stt_mode"), bool(active.get("stt_enabled")))
+        active["stt_enabled"] = bool(active["stt_mode"])
     return {
         "ok": True,
         "active": active,
@@ -135,7 +153,8 @@ async def voice_mode_activate(body: BrowserVoiceState):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
-    if not body.stt_enabled and not body.tts_enabled:
+    stt_mode = _clean_stt_mode(body.stt_mode, body.stt_enabled)
+    if not stt_mode and not body.tts_enabled:
         return JSONResponse(
             status_code=400,
             content={"ok": False, "detail": "Enable STT or TTS before activating this browser."},
@@ -145,7 +164,8 @@ async def voice_mode_activate(body: BrowserVoiceState):
     active = {
         "browser_id": browser_id,
         "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
-        "stt_enabled": bool(body.stt_enabled),
+        "stt_enabled": bool(stt_mode),
+        "stt_mode": stt_mode,
         "tts_enabled": bool(body.tts_enabled),
         "activated_at": now,
     }
