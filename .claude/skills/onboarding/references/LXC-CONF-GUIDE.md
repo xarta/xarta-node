@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # LXC Config Guide — Extracting Onboarding Values
 
 Given a Proxmox LXC config block, extract these values before writing `.env`.

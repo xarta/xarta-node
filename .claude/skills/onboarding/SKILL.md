@@ -8,7 +8,7 @@ description: Onboard a new xarta-node LXC into the Blueprints fleet. Use when th
 ## What you need first
 
 Ask for (or locate) the **Proxmox LXC config** for the target container. Read
-[references/lxc-conf-guide.md](./references/lxc-conf-guide.md) to extract:
+[references/LXC-CONF-GUIDE.md](./references/LXC-CONF-GUIDE.md) to extract:
 - Admin VLAN IP (the always-reachable local management IP from `eth0`)
 - Tailscale IP (if the node is already on the tailnet)
 - `hostname` → becomes NODE_ID, NODE_NAME, TAILSCALE_HOSTNAME, CADDY_EXTRA_NAMES subdomain
@@ -30,7 +30,7 @@ If that fails, fall back to the admin VLAN IP:
 ssh -i /root/.ssh/<deploy-key> root@<ADMIN-VLAN-IP>
 ```
 If neither works the deploy SSH key may not be installed on the target yet — see
-[references/gotchas.md § SSH key not present](references/gotchas.md).
+[references/GOTCHAS.md § SSH key not present](references/GOTCHAS.md).
 
 ---
 
@@ -81,7 +81,7 @@ scp -r -i /root/.ssh/<deploy-key> \
 ```
 
 ### 5. Write .env
-See [references/env-template.md](references/env-template.md) for the full template with
+See [references/ENV-TEMPLATE.md](references/ENV-TEMPLATE.md) for the full template with
 all values to substitute. Write it with:
 ```bash
 ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
@@ -174,10 +174,10 @@ ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
 
 | File | When to read |
 |------|-------------|
-| [references/lxc-conf-guide.md](references/lxc-conf-guide.md) | Parsing a Proxmox LXC conf → extracting IPs, hostnames, interface names |
-| [references/env-template.md](references/env-template.md) | Full .env template with every value and substitution guide |
-| [references/fleet-registry.md](references/fleet-registry.md) | How to register a new node across all existing nodes |
-| [references/gotchas.md](references/gotchas.md) | Known failure modes and fixes from real onboardings |
+| [references/LXC-CONF-GUIDE.md](references/LXC-CONF-GUIDE.md) | Parsing a Proxmox LXC conf → extracting IPs, hostnames, interface names |
+| [references/ENV-TEMPLATE.md](references/ENV-TEMPLATE.md) | Full .env template with every value and substitution guide |
+| [references/FLEET-REGISTRY.md](references/FLEET-REGISTRY.md) | How to register a new node across all existing nodes |
+| [references/GOTCHAS.md](references/GOTCHAS.md) | Known failure modes and fixes from real onboardings |
 
 When asked to commit and push ALL repos always including the lone wolf repo.  Lone wolf repo is specific to each node and not distributed.  Sometimes you'll be asked to also commit and push each lone wolf repo on each node separately via ssh.  That is a separate concern to commit and push all repos.
 

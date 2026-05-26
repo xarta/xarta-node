@@ -5,7 +5,7 @@ description: Work on the Blueprints distributed service index running on xarta-n
 
 # Blueprints — Distributed Service Index (xarta-node)
 
-See [references/architecture.md](references/architecture.md) for the full system design.
+See [references/ARCHITECTURE.md](references/ARCHITECTURE.md) for the full system design.
 
 ## Quick orientation
 
