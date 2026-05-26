@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # Blueprints Database Schema
 
 *Generated: 2026-03-11 15:44:42*
@@ -77,4 +79,3 @@
 | `gen` | `INTEGER` | ✗ | — | — |
 | `created_at` | `TEXT` | ✓ | `datetime('now')` | — |
 | `sent` | `INTEGER` | ✓ | `0` | — |
-

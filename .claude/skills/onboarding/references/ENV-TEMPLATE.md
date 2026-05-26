@@ -1,7 +1,9 @@
+[<- README](README.md)
+
 # .env Template for a New Blueprints Node
 
 Replace every `<PLACEHOLDER>` with values extracted from the LXC config.
-See `lxc-conf-guide.md` for the extraction rules.
+See `LXC-CONF-GUIDE.md` for the extraction rules.
 
 ```bash
 cat > /root/xarta-node/.env << 'ENVEOF'
@@ -56,7 +58,7 @@ CERT_CA=/root/xarta-node/.xarta/.certs/<your-ca>.crt
 # Tailscale
 # -----------------------------------------------------------------------------
 TAILSCALE_HOSTNAME=<HOSTNAME>
-# All /24 subnets across every net interface — see lxc-conf-guide.md
+# All /24 subnets across every net interface — see LXC-CONF-GUIDE.md
 TAILSCALE_ROUTES=<SUBNET-1>/24,<SUBNET-2>/24,<SUBNET-3>/24
 TAILSCALE_EXIT_NODE=true
 TAILSCALE_ACCEPT_DNS=false

@@ -15,12 +15,12 @@ cd /root/xarta-node/.claude/skills/blueprints-schema-doc
 ```
 
 Output files are created in your current working directory:
-- **`blueprints-schema.md`** — Complete schema with all tables, columns, types, nullability, defaults, and relationships
-- **`blueprints-schema-diagram.md`** — Mermaid ER diagram showing table structure and relationships
+- **`BLUEPRINTS-SCHEMA.md`** — Complete schema with all tables, columns, types, nullability, defaults, and relationships
+- **`BLUEPRINTS-SCHEMA-DIAGRAM.md`** — Mermaid ER diagram showing table structure and relationships
 
 ## What it generates
 
-### blueprints-schema.md
+### BLUEPRINTS-SCHEMA.md
 
 A comprehensive markdown reference with:
 
@@ -44,7 +44,7 @@ Example table excerpt:
 | `created_at` | `TEXT` | ✓ | `datetime('now')` | — |
 ```
 
-### blueprints-schema-diagram.md
+### BLUEPRINTS-SCHEMA-DIAGRAM.md
 
 A Mermaid Entity-Relationship (ER) diagram showing:
 - All tables and their columns with types

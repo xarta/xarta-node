@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # Skill patterns (public)
 
 Use this quick reference when creating or refactoring skills.

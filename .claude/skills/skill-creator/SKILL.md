@@ -79,7 +79,7 @@ The audit checks:
 
 ## References
 
-- `references/skill-patterns.md` for recommended anatomy and migration guidance.
+- `references/SKILL-PATTERNS.md` for recommended anatomy and migration guidance.
 - `../cost-efficient-subagents/SKILL.md` for public-safe fresh-context helper
   fan-out using configured local or lower-cost models.
 

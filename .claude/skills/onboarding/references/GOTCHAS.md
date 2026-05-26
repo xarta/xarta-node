@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # Onboarding Gotchas
 
 Failure modes encountered in real onboardings — check here before assuming something is broken.

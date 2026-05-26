@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # Fleet Registry
 
 This file describes the fleet registration pattern. Actual node IPs and names

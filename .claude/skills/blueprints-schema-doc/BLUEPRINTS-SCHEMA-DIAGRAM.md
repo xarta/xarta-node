@@ -1,3 +1,5 @@
+[<- README](README.md)
+
 # Blueprints Database Relationships
 *Generated: 2026-03-11 15:44:42*
 
