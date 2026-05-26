@@ -58,6 +58,7 @@ from .routes_litellm import router as litellm_router
 from .routes_litellm_hook import router as litellm_hook_router
 from .routes_liteparse import router as liteparse_router
 from .routes_local_dockge import router as local_dockge_router
+from .routes_lxc841_dockge import router as lxc841_dockge_router
 from .routes_machines import router as machines_router
 from .routes_manual_link_categories import router as manual_link_categories_router
 from .routes_manual_links import router as manual_links_router
@@ -406,6 +407,7 @@ def create_app() -> FastAPI:
     application.include_router(liteparse_router, prefix="/api/v1")
     application.include_router(local_dockge_router, prefix="/api/v1")
     application.include_router(vps_dockge_router, prefix="/api/v1")
+    application.include_router(lxc841_dockge_router, prefix="/api/v1")
     application.include_router(markitdown_router, prefix="/api/v1")
     application.include_router(matrix_chat_router, prefix="/api/v1")
     application.include_router(crawl4ai_router, prefix="/api/v1")
