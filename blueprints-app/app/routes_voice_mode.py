@@ -212,9 +212,17 @@ async def _probe_websocket_open(url: str, timeout_seconds: float = _PROBE_TIMEOU
             max_size=1024 * 1024,
             ping_interval=None,
         ) as ws:
+            await ws.send(json.dumps({"type": "config", "sample_rate": 16000}))
+            ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout_seconds))
+            if ack.get("type") != "config_ack":
+                return {"ok": False, "status": "bad_response", "error": "bad config response", "body": ack}
+            await ws.send(json.dumps({"type": "ping"}))
+            pong = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout_seconds))
+            if pong.get("type") != "pong":
+                return {"ok": False, "status": "bad_response", "error": "bad ping response", "body": pong}
             with contextlib.suppress(Exception):
-                await ws.send(json.dumps({"type": "ping"}))
-        return {"ok": True, "status": "open"}
+                await ws.send(json.dumps({"type": "end"}))
+        return {"ok": True, "status": "ready", "body": ack}
     except TimeoutError:
         return {"ok": False, "status": "timeout", "error": "timeout"}
     except Exception as exc:
