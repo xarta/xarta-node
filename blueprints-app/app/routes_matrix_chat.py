@@ -3571,8 +3571,7 @@ async def _matrix_chat_stt_relay(
                     stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
                     timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
                     done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
-                    tasks = {browser_task, stt_task, timeout_task, done_task}
-                    all_tasks = tasks | {filter_task}
+                    tasks = {browser_task, filter_task, stt_task, timeout_task, done_task}
                     try:
                         finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                         if any(task for task in finished if task is not done_task and task.exception()):
@@ -3580,9 +3579,9 @@ async def _matrix_chat_stt_relay(
                                 if task is not done_task:
                                     task.result()
                         done.set()
-                        for task in all_tasks - finished:
+                        for task in pending:
                             task.cancel()
-                        for task in all_tasks - finished:
+                        for task in pending:
                             with suppress(asyncio.CancelledError):
                                 await task
                     finally:
