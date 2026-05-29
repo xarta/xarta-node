@@ -24,7 +24,12 @@ aliases only.
 
 ## File layout
 
-All source lives in **`gui-fallback/`** (public outer repo). This is the primary Blueprints dashboard GUI — all feature work, layout, and CSS changes start here.
+The real GUI fallback worktree for this workspace is **`/xarta-node/gui-fallback/`** (`p300/gui-fallback`).
+Use that path first for Blueprints GUI fallback work. Do not start in
+`/root/xarta-node/gui-fallback/`; that checkout is not the active GUI fallback
+source tree for these files.
+
+All source lives in **`/xarta-node/gui-fallback/`** (public non-root repo). This is the primary Blueprints dashboard GUI — all feature work, layout, and CSS changes start here.
 
 > ⚠️ The private inner repo (`.xarta/gui/`) contains an independent private GUI that diverged from `gui-fallback/` in 2026. **Do NOT copy or sync between `gui-fallback/` and `.xarta/gui/`** — they are maintained independently. The live app serves the private GUI from `BLUEPRINTS_GUI_DIR`; file changes there take effect immediately without a restart.
 

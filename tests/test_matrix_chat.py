@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -69,6 +70,55 @@ def test_matrix_chat_reads_private_stt_noise_reduction_settings(tmp_path, monkey
     assert settings["stt_noise_dfn_ws_url"] == "ws://filter.example.test:18760"
     assert settings["stt_noise_stream_test_ws_url"] == "ws://filter.example.test:18761"
     assert settings["stt_noise_atten_lim_db"] == "6.5"
+
+
+def test_matrix_chat_noise_relay_waits_for_stt_final_after_filter_closes():
+    async def run():
+        done = asyncio.Event()
+        final_requested = asyncio.Event()
+        stt_end_sent = asyncio.Event()
+        final_requested.set()
+        stt_end_sent.set()
+
+        async def wait_for_done():
+            await done.wait()
+
+        async def filter_done():
+            return "filter-drained"
+
+        async def stt_final():
+            await asyncio.sleep(0.01)
+            done.set()
+            return "stt-final"
+
+        browser_task = asyncio.create_task(wait_for_done())
+        filter_task = asyncio.create_task(filter_done())
+        stt_task = asyncio.create_task(stt_final())
+        timeout_task = asyncio.create_task(wait_for_done())
+        done_task = asyncio.create_task(done.wait())
+        tasks = {browser_task, filter_task, stt_task, timeout_task, done_task}
+        try:
+            await matrix_chat._wait_for_matrix_stt_noise_relay_completion(
+                browser_task=browser_task,
+                filter_task=filter_task,
+                stt_task=stt_task,
+                timeout_task=timeout_task,
+                done_task=done_task,
+                done=done,
+                final_requested=final_requested,
+                stt_end_sent=stt_end_sent,
+            )
+
+            assert done.is_set()
+            assert stt_task.done()
+            assert stt_task.result() == "stt-final"
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):

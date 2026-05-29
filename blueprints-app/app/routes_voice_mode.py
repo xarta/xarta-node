@@ -111,6 +111,17 @@ class WakeDebugBody(BaseModel):
     recent_stt_events: list[dict[str, Any]] | None = None
     stream_epoch: int | None = None
     audio_frames_sent: int | None = None
+    audio_frames_captured: int | None = None
+    audio_timing: dict[str, Any] | None = None
+    stt_reset_pending_reason: str | None = None
+    stt_speech_start_reset_pending: bool = False
+    vad_speech_start_reset_armed: bool = False
+    audio_delay_frames: int | None = None
+    audio_candidate_frames: int | None = None
+    stt_delay_frames: int | None = None
+    stt_segment_active: bool = False
+    stt_segment: dict[str, Any] | None = None
+    audio_features: dict[str, Any] | None = None
     vad: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
@@ -1193,9 +1204,20 @@ async def voice_mode_update_wake_debug(body: WakeDebugBody):
         "command_diagnostics": _bounded_json(body.command_diagnostics or {}),
         "last_action": _bounded_json(body.last_action or {}),
         "recent_actions": _bounded_json((body.recent_actions or [])[-40:]),
-        "recent_stt_events": _bounded_json((body.recent_stt_events or [])[-120:]),
+        "recent_stt_events": _bounded_json((body.recent_stt_events or [])[-80:]),
         "stream_epoch": int(body.stream_epoch or 0),
         "audio_frames_sent": int(body.audio_frames_sent or 0),
+        "audio_frames_captured": int(body.audio_frames_captured or 0),
+        "audio_timing": _bounded_json(body.audio_timing or {}),
+        "stt_reset_pending_reason": _clean_string(body.stt_reset_pending_reason, "", 120),
+        "stt_speech_start_reset_pending": bool(body.stt_speech_start_reset_pending),
+        "vad_speech_start_reset_armed": bool(body.vad_speech_start_reset_armed),
+        "audio_delay_frames": int(body.audio_delay_frames or 0),
+        "audio_candidate_frames": int(body.audio_candidate_frames or 0),
+        "stt_delay_frames": int(body.stt_delay_frames or 0),
+        "stt_segment_active": bool(body.stt_segment_active),
+        "stt_segment": _bounded_json(body.stt_segment or {}),
+        "audio_features": _bounded_json(body.audio_features or {}),
         "vad": _bounded_json(body.vad or {}),
         "client_now_ms": float(body.client_now_ms or 0),
         "reported_at": now,
