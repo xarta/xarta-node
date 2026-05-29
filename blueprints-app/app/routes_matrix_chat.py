@@ -3182,6 +3182,45 @@ async def matrix_chat_stt_noise_stream_quality_websocket(websocket: WebSocket) -
             await websocket.close()
 
 
+async def _wait_for_matrix_stt_noise_relay_completion(
+    *,
+    browser_task: asyncio.Task[Any],
+    filter_task: asyncio.Task[Any],
+    stt_task: asyncio.Task[Any],
+    timeout_task: asyncio.Task[Any],
+    done_task: asyncio.Task[Any],
+    done: asyncio.Event,
+    final_requested: asyncio.Event,
+    stt_end_sent: asyncio.Event,
+) -> None:
+    pending = {browser_task, filter_task, stt_task, timeout_task, done_task}
+    while pending and not done.is_set():
+        finished, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in finished:
+            pending.discard(task)
+            if task.cancelled():
+                continue
+            if task is done_task:
+                done.set()
+                continue
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+            if task is stt_task or task is timeout_task:
+                done.set()
+                continue
+            if task is browser_task:
+                if not final_requested.is_set():
+                    done.set()
+                continue
+            if task is filter_task:
+                # After browser end, the noise filter leg may close before the
+                # STT runtime has returned its final transcript. Keep waiting
+                # for the STT/final-timeout leg in that normal drain case.
+                if not final_requested.is_set() and not stt_end_sent.is_set():
+                    done.set()
+
+
 async def _matrix_chat_stt_relay(
     websocket: WebSocket,
     *,
@@ -3573,15 +3612,22 @@ async def _matrix_chat_stt_relay(
                     done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
                     tasks = {browser_task, filter_task, stt_task, timeout_task, done_task}
                     try:
-                        finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                        if any(task for task in finished if task is not done_task and task.exception()):
-                            for task in finished:
-                                if task is not done_task:
-                                    task.result()
+                        await _wait_for_matrix_stt_noise_relay_completion(
+                            browser_task=browser_task,
+                            filter_task=filter_task,
+                            stt_task=stt_task,
+                            timeout_task=timeout_task,
+                            done_task=done_task,
+                            done=done,
+                            final_requested=final_requested,
+                            stt_end_sent=stt_end_sent,
+                        )
                         done.set()
-                        for task in pending:
+                        for task in tasks:
+                            if task.done():
+                                continue
                             task.cancel()
-                        for task in pending:
+                        for task in tasks:
                             with suppress(asyncio.CancelledError):
                                 await task
                     finally:
