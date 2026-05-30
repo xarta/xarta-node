@@ -153,6 +153,16 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         modals=[{"id": "vad-dev-modal", "label": "VAD Dev", "open": True}],
         visibility_state="visible",
         has_focus=True,
+        voice={"stt_enabled": True, "stt_mode": "push_to_talk", "tts_enabled": True},
+        viewport={
+            "innerWidth": 1280,
+            "innerHeight": 720,
+            "devicePixelRatio": 1,
+            "screen": {"width": 1920, "height": 1080},
+            "orientation": {"type": "landscape-primary", "angle": 0},
+            "visualViewport": {"width": 1280, "height": 720, "scale": 1},
+            "pointer": {"primary": "fine", "any": "fine", "coarse": False, "fine": True, "maxTouchPoints": 0},
+        },
         frontend={"app": "fallback-ui", "asset_version": "dev-test"},
     )
     report = voice_mode._clean_browser_view_report(body, 20)
@@ -167,6 +177,15 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert state["active"]["last_view_page"]["api_quiet_for_ms"] == 1200
     assert view["tab_id"] == "tab-1"
     assert view["modals"][0]["id"] == "vad-dev-modal"
+    assert view["frontend"]["asset_version"] == "dev-test"
+    assert view["voice"] == {
+        "stt_enabled": True,
+        "stt_mode": "push_to_talk",
+        "tts_enabled": True,
+    }
+    assert view["viewport"]["innerWidth"] == 1280
+    assert view["viewport_class"] == "landscape_1080p_like"
+    assert view["viewport_flags"]["standard_landscape"] is True
 
 
 def test_active_browser_view_exposes_automation_defaults():
@@ -175,6 +194,187 @@ def test_active_browser_view_exposes_automation_defaults():
     assert public["automation"]["default_step_timeout_seconds"] == 10
     assert public["automation"]["minimum_step_timeout_seconds"] == 1
     assert public["automation"]["maximum_step_timeout_seconds"] == 120
+
+
+def test_active_browser_viewport_classification_flags_are_provisional():
+    mobile = voice_mode._clean_browser_view_report(
+        voice_mode.BrowserViewBody(
+            browser_id="phone",
+            viewport={
+                "innerWidth": 390,
+                "innerHeight": 844,
+                "screen": {"width": 390, "height": 844},
+                "pointer": {"coarse": True, "touch": True, "maxTouchPoints": 5},
+            },
+        ),
+        20,
+    )
+    wide = voice_mode._clean_browser_view_report(
+        voice_mode.BrowserViewBody(
+            browser_id="wide",
+            viewport={
+                "innerWidth": 2560,
+                "innerHeight": 1080,
+                "screen": {"width": 2560, "height": 1080},
+                "pointer": {"fine": True, "maxTouchPoints": 0},
+            },
+        ),
+        20,
+    )
+
+    assert mobile["viewport_class"] == "mobile_portrait"
+    assert mobile["viewport_flags"]["mobile_portrait"] is True
+    assert wide["viewport_class"] == "widescreen"
+    assert wide["viewport_flags"]["widescreen"] is True
+    assert wide["viewport_classification"]["provisional"] is True
+
+
+def test_active_browser_client_inventory_marks_active_fresh_and_stale():
+    state = {
+        "active": {"browser_id": "active-browser", "tab_id": "tab-1", "stt_enabled": False},
+        "browser_views": {
+            "active-browser::tab-1": {
+                "browser_id": "active-browser",
+                "browser_label": "Active",
+                "tab_id": "tab-1",
+                "reported_at": 95,
+                "visibility_state": "visible",
+                "has_focus": True,
+                "frontend": {"asset_version": "v1"},
+            },
+            "other-browser::tab-2": {
+                "browser_id": "other-browser",
+                "browser_label": "Other",
+                "tab_id": "tab-2",
+                "reported_at": 50,
+                "visibility_state": "hidden",
+                "has_focus": False,
+                "frontend": {"asset_version": "v0"},
+            },
+        },
+    }
+
+    clients = voice_mode._browser_client_inventory(state, now=100, max_age_seconds=30)
+
+    assert clients[0]["browser_id"] == "active-browser"
+    assert clients[0]["active_tab"] is True
+    assert clients[0]["fresh"] is True
+    assert clients[0]["age_seconds"] == 5
+    assert clients[1]["browser_id"] == "other-browser"
+    assert clients[1]["stale"] is True
+
+
+def test_active_browser_client_lookup_rejects_missing_and_stale_reports():
+    state = {
+        "active": None,
+        "browser_views": {
+            "stale-browser::tab-1": {
+                "browser_id": "stale-browser",
+                "tab_id": "tab-1",
+                "reported_at": 10,
+            }
+        },
+    }
+
+    stale, stale_reason = voice_mode._find_browser_client_report(
+        state,
+        browser_id="stale-browser",
+        tab_id="tab-1",
+        now=100,
+        max_age_seconds=30,
+    )
+    missing, missing_reason = voice_mode._find_browser_client_report(
+        state,
+        browser_id="missing-browser",
+        now=100,
+        max_age_seconds=30,
+    )
+
+    assert stale["browser_id"] == "stale-browser"
+    assert "stale" in stale_reason
+    assert missing is None
+    assert missing_reason == "Browser client was not found"
+
+
+def test_active_browser_from_client_report_preserves_existing_voice_flags_for_same_browser():
+    report = {
+        "browser_id": "active-browser",
+        "browser_label": "Active",
+        "tab_id": "tab-2",
+    }
+    current_active = {
+        "browser_id": "active-browser",
+        "stt_enabled": True,
+        "stt_mode": "wake_to_talk",
+        "tts_enabled": True,
+    }
+
+    active = voice_mode._active_browser_from_client_report(
+        report,
+        25,
+        current_active=current_active,
+    )
+    fresh = voice_mode._active_browser_from_client_report(
+        {"browser_id": "other-browser", "browser_label": "Other", "tab_id": "tab-3"},
+        30,
+    )
+
+    assert active["browser_id"] == "active-browser"
+    assert active["tab_id"] == "tab-2"
+    assert active["stt_mode"] == "wake_to_talk"
+    assert active["tts_enabled"] is True
+    assert fresh["stt_enabled"] is False
+    assert fresh["tts_enabled"] is False
+
+
+def test_active_browser_from_client_report_uses_reported_voice_state_for_new_browser():
+    active = voice_mode._active_browser_from_client_report(
+        {
+            "browser_id": "phone-browser",
+            "browser_label": "Phone",
+            "tab_id": "phone-tab",
+            "voice": {
+                "stt_enabled": True,
+                "stt_mode": "wake_to_talk",
+                "tts_enabled": True,
+            },
+        },
+        40,
+    )
+
+    assert active["browser_id"] == "phone-browser"
+    assert active["tab_id"] == "phone-tab"
+    assert active["stt_enabled"] is True
+    assert active["stt_mode"] == "wake_to_talk"
+    assert active["tts_enabled"] is True
+
+
+def test_active_browser_from_client_report_allows_explicit_voice_override():
+    body = voice_mode.BrowserClientSelectionBody(
+        browser_id="phone-browser",
+        stt_enabled=False,
+        stt_mode="",
+        tts_enabled=False,
+    )
+
+    active = voice_mode._active_browser_from_client_report(
+        {
+            "browser_id": "phone-browser",
+            "browser_label": "Phone",
+            "tab_id": "phone-tab",
+            "voice": {
+                "stt_enabled": True,
+                "stt_mode": "wake_to_talk",
+                "tts_enabled": True,
+            },
+        },
+        40,
+        body=body,
+    )
+
+    assert active["stt_enabled"] is False
+    assert active["stt_mode"] == ""
+    assert active["tts_enabled"] is False
 
 
 def test_voice_mode_wake_debug_prefers_active_browser_report():

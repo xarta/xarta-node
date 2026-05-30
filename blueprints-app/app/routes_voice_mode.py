@@ -84,6 +84,24 @@ _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_DEFAULT_SECONDS = _bounded_int_env(
     _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS,
     _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MAX_SECONDS,
 )
+_ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS = _bounded_int_env(
+    "ACTIVE_BROWSER_CLIENT_MAX_AGE_SECONDS",
+    30,
+    1,
+    3600,
+)
+_ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
+    # Provisional first-pass thresholds. Keep raw dimensions in reports so these
+    # can be tuned against the actual operator monitors and handheld devices.
+    "mobile_short_side_max_px": 767,
+    "mobile_long_side_max_px": 1180,
+    "touch_mobile_short_side_max_px": 900,
+    "touch_mobile_long_side_max_px": 1400,
+    "desktop_min_landscape_width_px": 900,
+    "standard_landscape_min_aspect": 1.45,
+    "standard_landscape_max_aspect": 1.85,
+    "widescreen_min_aspect": 1.86,
+}
 _wake_debug_stream_lock = asyncio.Lock()
 _wake_debug_subscribers: dict[int, asyncio.Queue[str]] = {}
 _wake_debug_stream_sequence = 0
@@ -226,6 +244,8 @@ class BrowserViewBody(BaseModel):
     tab_id: str | None = None
     page: dict[str, Any] | None = None
     modals: list[dict[str, Any]] | None = None
+    viewport: dict[str, Any] | None = None
+    voice: dict[str, Any] | None = None
     visibility_state: str | None = None
     has_focus: bool = False
     url_path: str | None = None
@@ -233,6 +253,19 @@ class BrowserViewBody(BaseModel):
     url_hash: str | None = None
     frontend: dict[str, Any] | None = None
     client_now_ms: float | None = None
+
+
+class BrowserClientSelectionBody(BaseModel):
+    browser_id: str | None = None
+    tab_id: str | None = None
+    max_age_seconds: int = Field(
+        default=_ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
+        ge=1,
+        le=3600,
+    )
+    tts_enabled: bool | None = None
+    stt_enabled: bool | None = None
+    stt_mode: str | None = None
 
 
 class WakeDevDebugBody(BaseModel):
@@ -1033,9 +1066,161 @@ def _clean_browser_page_int(value: Any, *, maximum: int) -> int:
     return max(0, min(number, maximum))
 
 
+def _clean_viewport_number(value: Any, *, maximum: float = 20000.0, decimals: int = 3) -> float:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        number = 0.0
+    number = max(0.0, min(number, maximum))
+    if decimals <= 0:
+        return float(int(round(number)))
+    return round(number, decimals)
+
+
+def _clean_viewport_int(value: Any, *, maximum: int = 20000) -> int:
+    return int(round(_clean_viewport_number(value, maximum=float(maximum), decimals=0)))
+
+
+def _clean_browser_viewport(raw: Any) -> dict[str, Any]:
+    viewport = raw if isinstance(raw, dict) else {}
+    screen = viewport.get("screen") if isinstance(viewport.get("screen"), dict) else {}
+    visual = viewport.get("visualViewport") if isinstance(viewport.get("visualViewport"), dict) else {}
+    orientation = viewport.get("orientation") if isinstance(viewport.get("orientation"), dict) else {}
+    pointer = viewport.get("pointer") if isinstance(viewport.get("pointer"), dict) else {}
+
+    return {
+        "innerWidth": _clean_viewport_int(viewport.get("innerWidth")),
+        "innerHeight": _clean_viewport_int(viewport.get("innerHeight")),
+        "devicePixelRatio": _clean_viewport_number(viewport.get("devicePixelRatio"), maximum=16.0),
+        "screen": {
+            "width": _clean_viewport_int(screen.get("width")),
+            "height": _clean_viewport_int(screen.get("height")),
+            "availWidth": _clean_viewport_int(screen.get("availWidth")),
+            "availHeight": _clean_viewport_int(screen.get("availHeight")),
+        },
+        "orientation": {
+            "type": _clean_string(orientation.get("type"), "", 80),
+            "angle": _clean_viewport_int(orientation.get("angle"), maximum=360),
+        },
+        "visualViewport": {
+            "width": _clean_viewport_number(visual.get("width")),
+            "height": _clean_viewport_number(visual.get("height")),
+            "scale": _clean_viewport_number(visual.get("scale"), maximum=16.0),
+            "offsetLeft": _clean_viewport_number(visual.get("offsetLeft")),
+            "offsetTop": _clean_viewport_number(visual.get("offsetTop")),
+            "pageLeft": _clean_viewport_number(visual.get("pageLeft")),
+            "pageTop": _clean_viewport_number(visual.get("pageTop")),
+        },
+        "pointer": {
+            "primary": _clean_string(pointer.get("primary"), "", 40),
+            "any": _clean_string(pointer.get("any"), "", 40),
+            "hover": _clean_string(pointer.get("hover"), "", 40),
+            "anyHover": _clean_string(pointer.get("anyHover"), "", 40),
+            "coarse": bool(pointer.get("coarse")),
+            "fine": bool(pointer.get("fine")),
+            "touch": bool(pointer.get("touch")),
+            "maxTouchPoints": _clean_viewport_int(pointer.get("maxTouchPoints"), maximum=64),
+        },
+    }
+
+
+def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
+    width = int(viewport.get("innerWidth") or 0)
+    height = int(viewport.get("innerHeight") or 0)
+    screen = viewport.get("screen") if isinstance(viewport.get("screen"), dict) else {}
+    pointer = viewport.get("pointer") if isinstance(viewport.get("pointer"), dict) else {}
+    if width <= 0 or height <= 0:
+        return {
+            "primary": "unknown",
+            "flags": {
+                "mobile_portrait": False,
+                "mobile_landscape": False,
+                "standard_landscape": False,
+                "landscape_1080p_like": False,
+                "desktop_portrait": False,
+                "widescreen": False,
+            },
+            "provisional": True,
+            "thresholds": dict(_ACTIVE_BROWSER_VIEWPORT_THRESHOLDS),
+        }
+
+    short_side = min(width, height)
+    long_side = max(width, height)
+    portrait = height > width
+    landscape = width >= height
+    aspect = round(width / height, 4) if height else 0.0
+    screen_short = min(int(screen.get("width") or 0), int(screen.get("height") or 0))
+    effective_short = min(value for value in [short_side, screen_short] if value > 0) if screen_short else short_side
+    touch_like = bool(pointer.get("coarse") or pointer.get("touch") or int(pointer.get("maxTouchPoints") or 0) > 0)
+    thresholds = _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS
+    mobile = bool(
+        (
+            effective_short <= thresholds["mobile_short_side_max_px"]
+            and long_side <= thresholds["mobile_long_side_max_px"]
+        )
+        or (
+            touch_like
+            and effective_short <= thresholds["touch_mobile_short_side_max_px"]
+            and long_side <= thresholds["touch_mobile_long_side_max_px"]
+        )
+    )
+    standard_landscape = bool(
+        not mobile
+        and landscape
+        and width >= thresholds["desktop_min_landscape_width_px"]
+        and thresholds["standard_landscape_min_aspect"] <= aspect <= thresholds["standard_landscape_max_aspect"]
+    )
+    widescreen = bool(
+        not mobile
+        and landscape
+        and width >= thresholds["desktop_min_landscape_width_px"]
+        and aspect >= thresholds["widescreen_min_aspect"]
+    )
+    flags = {
+        "mobile_portrait": bool(mobile and portrait),
+        "mobile_landscape": bool(mobile and landscape),
+        "standard_landscape": standard_landscape,
+        "landscape_1080p_like": standard_landscape,
+        "desktop_portrait": bool(not mobile and portrait),
+        "widescreen": widescreen,
+    }
+    primary = "desktop_landscape"
+    for name in [
+        "mobile_portrait",
+        "mobile_landscape",
+        "desktop_portrait",
+        "widescreen",
+        "landscape_1080p_like",
+    ]:
+        if flags.get(name):
+            primary = name
+            break
+
+    return {
+        "primary": primary,
+        "flags": flags,
+        "aspect_ratio": aspect,
+        "provisional": True,
+        "thresholds": dict(thresholds),
+    }
+
+
+def _clean_browser_voice_state(raw: Any) -> dict[str, Any]:
+    voice = raw if isinstance(raw, dict) else {}
+    stt_mode = _clean_stt_mode(voice.get("stt_mode"), bool(voice.get("stt_enabled")))
+    return {
+        "stt_enabled": bool(stt_mode),
+        "stt_mode": stt_mode,
+        "tts_enabled": bool(voice.get("tts_enabled")),
+    }
+
+
 def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, Any]:
     page = body.page if isinstance(body.page, dict) else {}
     frontend = body.frontend if isinstance(body.frontend, dict) else {}
+    viewport = _clean_browser_viewport(body.viewport)
+    viewport_classification = _classify_browser_viewport(viewport)
+    voice = _clean_browser_voice_state(body.voice)
     modals: list[dict[str, Any]] = []
     for modal in body.modals or []:
         if not isinstance(modal, dict):
@@ -1078,6 +1263,11 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
             "api_sequence": _clean_browser_page_int(page.get("api_sequence"), maximum=1000000000),
         },
         "modals": modals,
+        "viewport": viewport,
+        "viewport_classification": viewport_classification,
+        "viewport_class": viewport_classification["primary"],
+        "viewport_flags": viewport_classification["flags"],
+        "voice": voice,
         "visibility_state": visibility,
         "has_focus": bool(body.has_focus),
         "url_path": _clean_string(body.url_path, "", 180),
@@ -1123,6 +1313,120 @@ def _annotate_browser_view(report: dict[str, Any] | None) -> dict[str, Any] | No
     return public
 
 
+def _browser_report_age_seconds(report: dict[str, Any], now: float | None = None) -> float | None:
+    reported_at = float(report.get("reported_at") or 0.0)
+    if not reported_at:
+        return None
+    return round(max(0.0, float(now if now is not None else time.time()) - reported_at), 3)
+
+
+def _annotate_browser_client(
+    report: dict[str, Any],
+    active: dict[str, Any] | None,
+    *,
+    now: float | None = None,
+    max_age_seconds: int | None = None,
+) -> dict[str, Any] | None:
+    public = _annotate_browser_view(report)
+    if not public:
+        return None
+    timestamp = float(now if now is not None else time.time())
+    max_age = max(1, int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS))
+    age = _browser_report_age_seconds(public, timestamp)
+    fresh = bool(age is not None and age <= max_age)
+    report_browser_id = _clean_browser_id(public.get("browser_id"))
+    report_tab_id = _clean_string(public.get("tab_id"), "", 120)
+    active_browser_id = _clean_browser_id(active.get("browser_id") if isinstance(active, dict) else "")
+    active_tab_id = _clean_string(active.get("tab_id") if isinstance(active, dict) else "", "", 120)
+    active_browser = bool(active_browser_id and report_browser_id == active_browser_id)
+    active_tab = bool(active_browser and (not active_tab_id or active_tab_id == report_tab_id))
+    public.update({
+        "client_key": _browser_view_key(public),
+        "server_now": timestamp,
+        "age_seconds": age,
+        "fresh": fresh,
+        "stale": not fresh,
+        "active_browser": active_browser,
+        "active_tab": active_tab,
+        "lease_status": "active_tab" if active_tab else ("active_browser" if active_browser else "inactive"),
+    })
+    return public
+
+
+def _browser_client_inventory(
+    state: dict[str, Any],
+    *,
+    now: float | None = None,
+    max_age_seconds: int | None = None,
+) -> list[dict[str, Any]]:
+    reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
+    active = state.get("active") if isinstance(state.get("active"), dict) else None
+    timestamp = float(now if now is not None else time.time())
+    clients = [
+        _annotate_browser_client(report, active, now=timestamp, max_age_seconds=max_age_seconds)
+        for report in reports.values()
+        if isinstance(report, dict)
+    ]
+    return sorted(
+        (client for client in clients if client),
+        key=lambda client: (
+            1 if client.get("active_tab") else 0,
+            1 if client.get("fresh") else 0,
+            1 if client.get("visibility_state") == "visible" else 0,
+            1 if client.get("has_focus") else 0,
+            float(client.get("reported_at") or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+def _find_browser_client_report(
+    state: dict[str, Any],
+    *,
+    browser_id: str,
+    tab_id: str = "",
+    now: float | None = None,
+    max_age_seconds: int | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    clean_browser_id = _clean_browser_id(browser_id)
+    clean_tab_id = _clean_string(tab_id, "", 120)
+    if not clean_browser_id:
+        return None, "Missing browser_id"
+    clients = [
+        client for client in _browser_client_inventory(state, now=now, max_age_seconds=max_age_seconds)
+        if _clean_browser_id(client.get("browser_id")) == clean_browser_id
+        and (not clean_tab_id or _clean_string(client.get("tab_id"), "", 120) == clean_tab_id)
+    ]
+    if not clients:
+        return None, "Browser client was not found"
+    selected = clients[0]
+    if selected.get("stale"):
+        return selected, f"Browser client is stale ({selected.get('age_seconds')}s old)"
+    return selected, None
+
+
+def _public_browser_clients(
+    state: dict[str, Any],
+    *,
+    max_age_seconds: int | None = None,
+) -> dict[str, Any]:
+    max_age = max(1, int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS))
+    now = time.time()
+    clients = _browser_client_inventory(state, now=now, max_age_seconds=max_age)
+    return {
+        "ok": True,
+        "active": _public_active(state.get("active") if isinstance(state.get("active"), dict) else None),
+        "clients": clients,
+        "count": len(clients),
+        "fresh_count": sum(1 for client in clients if client.get("fresh")),
+        "stale_count": sum(1 for client in clients if client.get("stale")),
+        "max_age_seconds": max_age,
+        "server_now": now,
+        "frontend_expected": _fallback_frontend_expectation(),
+        "viewport_thresholds": dict(_ACTIVE_BROWSER_VIEWPORT_THRESHOLDS),
+    }
+
+
 def _selected_active_browser_view(state: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
@@ -1153,16 +1457,25 @@ def _selected_active_browser_view(state: dict[str, Any]) -> dict[str, Any] | Non
 
 def _public_active_browser_view(state: dict[str, Any]) -> dict[str, Any]:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
+    now = time.time()
     recent = sorted(
         (_annotate_browser_view(report) for report in reports.values() if isinstance(report, dict)),
         key=lambda report: float(report.get("reported_at") or 0.0) if report else 0.0,
         reverse=True,
+    )
+    clients = _browser_client_inventory(
+        state,
+        now=now,
+        max_age_seconds=_ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
     )
     return {
         "ok": True,
         "active": _public_active(state.get("active") if isinstance(state.get("active"), dict) else None),
         "view": _annotate_browser_view(_selected_active_browser_view(state)),
         "reports": [report for report in recent if report][:10],
+        "clients": clients[:10],
+        "client_count": len(clients),
+        "client_max_age_seconds": _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
         "frontend_expected": _fallback_frontend_expectation(),
         "automation": {
             "default_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_DEFAULT_SECONDS,
@@ -1394,6 +1707,48 @@ def _active_browser_from_body(body: BrowserVoiceState, now: float) -> dict[str, 
     }
 
 
+def _active_browser_from_client_report(
+    report: dict[str, Any],
+    now: float,
+    *,
+    body: BrowserClientSelectionBody | None = None,
+    current_active: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current_same_browser = bool(
+        isinstance(current_active, dict)
+        and _clean_browser_id(current_active.get("browser_id")) == _clean_browser_id(report.get("browser_id"))
+    )
+    report_voice = report.get("voice") if isinstance(report.get("voice"), dict) else {}
+    stt_enabled = bool(body.stt_enabled) if body and body.stt_enabled is not None else (
+        bool(report_voice.get("stt_enabled")) if report_voice else (
+            bool(current_active.get("stt_enabled")) if current_same_browser else False
+        )
+    )
+    stt_mode = _clean_stt_mode(
+        body.stt_mode if body and body.stt_mode is not None else (
+            report_voice.get("stt_mode") if report_voice else (
+                current_active.get("stt_mode") if current_same_browser else ""
+            )
+        ),
+        stt_enabled,
+    )
+    tts_enabled = bool(body.tts_enabled) if body and body.tts_enabled is not None else (
+        bool(report_voice.get("tts_enabled")) if report_voice else (
+            bool(current_active.get("tts_enabled")) if current_same_browser else False
+        )
+    )
+    return {
+        "browser_id": _clean_browser_id(report.get("browser_id")),
+        "browser_label": _clean_label(report.get("browser_label"), "Blueprints browser"),
+        "tab_id": _clean_string(report.get("tab_id"), "", 120),
+        "stt_enabled": bool(stt_mode),
+        "stt_mode": stt_mode,
+        "tts_enabled": tts_enabled,
+        "activated_at": now,
+        "activated_via": "browser-client-api",
+    }
+
+
 class _ActiveBrowserActivationFsm:
     STATE_IDLE = "IDLE"
     STATE_ACTIVATED = "ACTIVATED"
@@ -1493,6 +1848,14 @@ async def active_browser_view() -> dict[str, Any]:
         return _public_active_browser_view(state)
 
 
+@router.get("/browser-clients")
+async def active_browser_clients(max_age_seconds: int = _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS) -> dict[str, Any]:
+    max_age = max(1, min(int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS), 3600))
+    async with _state_lock:
+        state = _read_state_unlocked()
+        return _public_browser_clients(state, max_age_seconds=max_age)
+
+
 @router.post("/browser-view")
 async def update_browser_view(body: BrowserViewBody):
     browser_id = _clean_browser_id(body.browser_id)
@@ -1512,6 +1875,101 @@ async def update_browser_view(body: BrowserViewBody):
         "stored": True,
         "active_tab_changed": active_tab_changed,
     }
+
+
+@router.post("/browser-clients/activate")
+async def active_browser_client_activate(body: BrowserClientSelectionBody):
+    browser_id = _clean_browser_id(body.browser_id)
+    tab_id = _clean_string(body.tab_id, "", 120)
+    if not browser_id:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
+
+    async with _state_lock:
+        state = _read_state_unlocked()
+        now = time.time()
+        report, rejection = _find_browser_client_report(
+            state,
+            browser_id=browser_id,
+            tab_id=tab_id,
+            now=now,
+            max_age_seconds=body.max_age_seconds,
+        )
+        if rejection:
+            status_code = 410 if "stale" in rejection.lower() else 404
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "ok": False,
+                    "detail": rejection,
+                    "browser_id": browser_id,
+                    "tab_id": tab_id,
+                    "client": report,
+                },
+            )
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+        activation = _ActiveBrowserActivationFsm(state).dispatch(
+            _ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
+            browser_id=browser_id,
+            active_browser=_active_browser_from_client_report(report or {}, now, body=body, current_active=active),
+            now=now,
+        )
+        changed = bool(activation.get("changed"))
+        if not changed:
+            return JSONResponse(status_code=400, content={"ok": False, "detail": "Activation request was rejected."})
+        _write_state_unlocked(state)
+        public_clients = _public_browser_clients(state, max_age_seconds=body.max_age_seconds)
+
+    await _publish_changed(state, "activate-browser-client")
+    await _broadcast_current_wake_debug()
+    return public_clients
+
+
+@router.post("/browser-clients/deactivate")
+async def active_browser_client_deactivate(body: BrowserClientSelectionBody | None = None):
+    body = body or BrowserClientSelectionBody()
+    async with _state_lock:
+        state = _read_state_unlocked()
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+        browser_id = _clean_browser_id(body.browser_id) or _clean_browser_id(active.get("browser_id") if active else "")
+        tab_id = _clean_string(body.tab_id, "", 120)
+        if not browser_id:
+            return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
+
+        report, rejection = _find_browser_client_report(
+            state,
+            browser_id=browser_id,
+            tab_id=tab_id,
+            now=time.time(),
+            max_age_seconds=body.max_age_seconds,
+        )
+        active_matches = bool(active and _clean_browser_id(active.get("browser_id")) == browser_id)
+        if rejection and not active_matches:
+            status_code = 410 if "stale" in rejection.lower() else 404
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "ok": False,
+                    "detail": rejection,
+                    "browser_id": browser_id,
+                    "tab_id": tab_id,
+                    "client": report,
+                },
+            )
+
+        activation = _ActiveBrowserActivationFsm(state).dispatch(
+            _ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
+            browser_id=browser_id,
+            now=time.time(),
+        )
+        changed = bool(activation.get("changed"))
+        if changed:
+            _write_state_unlocked(state)
+        public_clients = _public_browser_clients(state, max_age_seconds=body.max_age_seconds)
+
+    if changed:
+        await _publish_changed(state, "deactivate-browser-client")
+        await _broadcast_current_wake_debug()
+    return public_clients
 
 
 @router.get("/dependency-health")
