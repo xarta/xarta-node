@@ -101,6 +101,82 @@ def test_voice_mode_aggregation_proxy_payload_uses_seconds_for_pipecat():
     }
 
 
+def test_active_browser_command_action_aliases_are_sanitized():
+    assert voice_mode._clean_active_browser_command_action("refresh") == "hard_refresh"
+    assert voice_mode._clean_active_browser_command_action("hard-refresh") == "hard_refresh"
+    assert voice_mode._clean_active_browser_command_action("app refresh") == "hard_refresh"
+    assert voice_mode._clean_active_browser_command_action("vad-dev") == "open_vad_dev"
+    assert voice_mode._clean_active_browser_command_action("close-vad") == "close_vad_dev"
+    assert voice_mode._clean_active_browser_command_action("modal close") == "close_modal"
+    assert voice_mode._clean_active_browser_command_action("synthesis") == "open_synthesis"
+    assert voice_mode._clean_active_browser_command_action("probes") == "open_probes"
+    assert voice_mode._clean_active_browser_command_action("settings") == "open_settings"
+    assert voice_mode._clean_active_browser_command_action("selector") == "selector_action"
+
+
+def test_active_browser_command_parameters_are_sanitized():
+    assert voice_mode._clean_active_browser_event_kind("tap") == "click"
+    assert voice_mode._clean_active_browser_event_kind("double tap") == "double_click"
+    assert voice_mode._clean_active_browser_event_kind("long-press") == "long_press"
+    assert voice_mode._clean_active_browser_event_kind("something else") == "click"
+    assert voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
+    assert voice_mode._clean_active_browser_selector_action("API Key") == "api-key"
+
+
+def test_active_browser_view_report_updates_active_tab_and_page():
+    state = {
+        "active": {
+            "browser_id": "active-browser",
+            "browser_label": "Browser on Win32",
+            "stt_enabled": False,
+            "stt_mode": "",
+            "tts_enabled": True,
+            "activated_at": 10,
+        },
+        "browser_views": {},
+        "revision": 10,
+        "updated_at": 10,
+    }
+    body = voice_mode.BrowserViewBody(
+        browser_id="active-browser",
+        browser_label="Browser on Win32",
+        tab_id="tab-1",
+        page={
+            "group": "settings",
+            "tab": "matrix-chat",
+            "loading": False,
+            "ready": True,
+            "api_in_flight": "0",
+            "api_quiet_for_ms": 1200,
+            "api_sequence": 42,
+        },
+        modals=[{"id": "vad-dev-modal", "label": "VAD Dev", "open": True}],
+        visibility_state="visible",
+        has_focus=True,
+        frontend={"app": "fallback-ui", "asset_version": "dev-test"},
+    )
+    report = voice_mode._clean_browser_view_report(body, 20)
+
+    changed = voice_mode._store_browser_view_report_unlocked(state, report, 20)
+    view = voice_mode._selected_active_browser_view(state)
+
+    assert changed is True
+    assert state["active"]["tab_id"] == "tab-1"
+    assert state["active"]["last_view_page"]["tab"] == "matrix-chat"
+    assert state["active"]["last_view_page"]["ready"] is True
+    assert state["active"]["last_view_page"]["api_quiet_for_ms"] == 1200
+    assert view["tab_id"] == "tab-1"
+    assert view["modals"][0]["id"] == "vad-dev-modal"
+
+
+def test_active_browser_view_exposes_automation_defaults():
+    public = voice_mode._public_active_browser_view({"active": None, "browser_views": {}})
+
+    assert public["automation"]["default_step_timeout_seconds"] == 10
+    assert public["automation"]["minimum_step_timeout_seconds"] == 1
+    assert public["automation"]["maximum_step_timeout_seconds"] == 120
+
+
 def test_voice_mode_wake_debug_prefers_active_browser_report():
     state = {
         "active": {
@@ -198,7 +274,7 @@ def test_voice_mode_wake_debug_does_not_treat_stt_mode_as_a_separate_activation(
     assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
-def test_voice_mode_wake_debug_masks_report_from_non_activated_browser():
+def test_voice_mode_wake_debug_masks_report_from_non_active_browser():
     state = {
         "active": None
     }
@@ -222,10 +298,10 @@ def test_voice_mode_wake_debug_masks_report_from_non_activated_browser():
     assert wake_debug["debug"]["running"] is False
     assert wake_debug["debug"]["starting"] is False
     assert wake_debug["debug"]["fsm_state"] == "SELECTED_INACTIVE"
-    assert wake_debug["debug"]["reason"] == "This browser is not activated for Voice Mode."
+    assert wake_debug["debug"]["reason"] == "This browser is not the Active Browser."
 
 
-def test_voice_mode_activation_fsm_replaces_existing_activated_browser():
+def test_active_browser_activation_fsm_replaces_existing_active_browser():
     state = {
         "active": {
             "browser_id": "old-browser",
@@ -245,18 +321,18 @@ def test_voice_mode_activation_fsm_replaces_existing_activated_browser():
         stt_mode="wake_to_talk",
         tts_enabled=False,
     )
-    activated = voice_mode._activated_browser_from_body(body, 20)
+    active_browser = voice_mode._active_browser_from_body(body, 20)
 
-    result = voice_mode._VoiceModeActivationFsm(state).dispatch(
-        voice_mode._VoiceModeActivationFsm.INPUT_ACTIVATE_REQUEST,
+    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
+        voice_mode._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
         browser_id="new-browser",
-        activated_browser=activated,
+        active_browser=active_browser,
         now=20,
     )
 
     assert result["changed"] is True
-    assert result["from"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
-    assert result["to"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
+    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "new-browser"
     assert state["active"]["stt_mode"] == "wake_to_talk"
     assert state["active"]["tts_enabled"] is False
@@ -264,32 +340,34 @@ def test_voice_mode_activation_fsm_replaces_existing_activated_browser():
     assert state["updated_at"] == 20
 
 
-def test_voice_mode_activation_fsm_activates_from_idle():
+def test_active_browser_activation_fsm_activates_from_idle():
     state = {"active": None, "revision": 0, "updated_at": 0}
     body = voice_mode.BrowserVoiceState(
         browser_id="new-browser",
         browser_label="New Browser",
+        tab_id="new-tab",
         stt_enabled=False,
         stt_mode="",
         tts_enabled=True,
     )
-    activated = voice_mode._activated_browser_from_body(body, 20)
+    active_browser = voice_mode._active_browser_from_body(body, 20)
 
-    result = voice_mode._VoiceModeActivationFsm(state).dispatch(
-        voice_mode._VoiceModeActivationFsm.INPUT_ACTIVATE_REQUEST,
+    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
+        voice_mode._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
         browser_id="new-browser",
-        activated_browser=activated,
+        active_browser=active_browser,
         now=20,
     )
 
     assert result["changed"] is True
-    assert result["from"] == voice_mode._VoiceModeActivationFsm.STATE_IDLE
-    assert result["to"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
+    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_IDLE
+    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "new-browser"
+    assert state["active"]["tab_id"] == "new-tab"
     assert state["active"]["tts_enabled"] is True
 
 
-def test_voice_mode_activation_fsm_only_deactivates_current_browser():
+def test_active_browser_activation_fsm_only_deactivates_current_browser():
     state = {
         "active": {
             "browser_id": "current-browser",
@@ -303,24 +381,24 @@ def test_voice_mode_activation_fsm_only_deactivates_current_browser():
         "updated_at": 10,
     }
 
-    ignored = voice_mode._VoiceModeActivationFsm(state).dispatch(
-        voice_mode._VoiceModeActivationFsm.INPUT_DEACTIVATE_REQUEST,
+    ignored = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
+        voice_mode._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
         browser_id="other-browser",
         now=20,
     )
     assert ignored["changed"] is False
-    assert ignored["from"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
-    assert ignored["to"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
+    assert ignored["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert ignored["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "current-browser"
     assert state["revision"] == 10
 
-    result = voice_mode._VoiceModeActivationFsm(state).dispatch(
-        voice_mode._VoiceModeActivationFsm.INPUT_DEACTIVATE_REQUEST,
+    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
+        voice_mode._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
         browser_id="current-browser",
         now=30,
     )
     assert result["changed"] is True
-    assert result["from"] == voice_mode._VoiceModeActivationFsm.STATE_ACTIVATED
-    assert result["to"] == voice_mode._VoiceModeActivationFsm.STATE_IDLE
+    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_IDLE
     assert state["active"] is None
     assert state["revision"] == 30

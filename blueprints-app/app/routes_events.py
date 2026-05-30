@@ -190,8 +190,14 @@ async def _sse_generator(
             after_ts = _ts_for_event_id(last_event_id)
             if after_ts is not None:
                 replays = _load_events(_RECENT_MAX, after_ts=after_ts)
-                for ev in reversed(replays):  # chronological order for the client
-                    yield ev.to_sse()
+            else:
+                # Browser localStorage can outlive server-side event retention or
+                # node-local database resets. Replaying a bounded recent window is
+                # safer than opening a gap; clients deduplicate by event_id and
+                # command payloads carry max-age guards.
+                replays = _load_events(_RECENT_MAX)
+            for ev in reversed(replays):  # chronological order for the client
+                yield ev.to_sse()
 
         # ── Live event loop ───────────────────────────────────────────────────
         while True:
