@@ -55,6 +55,31 @@ if [[ -x "$REPO_ROOT/check-caddy-route-parity.sh" ]]; then
   bash "$REPO_ROOT/check-caddy-route-parity.sh"
 fi
 
+run_active_browser_live_checks() {
+  local runner="/root/xarta-node/.xarta/.claude/skills/xarta-blueprints-browser-automation/scripts/active_browser_precommit_test.py"
+  local staged_pattern='^(blueprints-app/app/routes_voice_mode\.py|blueprints-app/app/routes_events\.py|tests/test_voice_mode\.py|setup-caddy\.sh|setup-blueprints.*|\.githooks/pre-commit)$'
+
+  if [[ "${XARTA_PRECOMMIT_ACTIVE_BROWSER:-0}" != "1" ]]; then
+    echo "[pre-commit] Active Browser live checks disabled (set XARTA_PRECOMMIT_ACTIVE_BROWSER=1 to enable)."
+    return 0
+  fi
+
+  if ! git diff --cached --name-only --diff-filter=ACMR | grep -Eq "$staged_pattern"; then
+    echo "[pre-commit] No staged Active Browser API/test files; skipping live browser checks."
+    return 0
+  fi
+
+  if [[ ! -x "$runner" ]]; then
+    echo "[pre-commit] BLOCKED: Active Browser pre-commit runner not found at $runner" >&2
+    exit 1
+  fi
+
+  echo "[pre-commit] Running Active Browser live automation checks..."
+  python3 "$runner"
+}
+
+run_active_browser_live_checks
+
 # ── Ruff: lint staged Python files ───────────────────────────────────────────
 mapfile -t STAGED_PY < <(git diff --cached --name-only --diff-filter=ACMR | grep '\.py$' || true)
 

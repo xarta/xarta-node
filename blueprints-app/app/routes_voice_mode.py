@@ -1,4 +1,4 @@
-"""Node-local browser voice-mode activation endpoints."""
+"""Node-local Active Browser, voice-mode, and Wake/VAD development endpoints."""
 
 from __future__ import annotations
 
@@ -23,8 +23,18 @@ from .events import AppEvent
 from .routes_events import publish_event
 from .routes_matrix_chat import _matrix_chat_stt_relay
 from .routes_matrix_chat import _settings as _matrix_chat_settings
+from .routes_ui_cache import _read_status as _read_fallback_ui_cache_status
 
 router = APIRouter(prefix="/voice-mode", tags=["voice-mode"])
+
+
+def _bounded_int_env(name: str, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(fallback)) or fallback)
+    except (TypeError, ValueError):
+        value = fallback
+    return max(minimum, min(value, maximum))
+
 
 _STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-voice-mode.json")
 _WAKE_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-to-talk-debug.json")
@@ -64,6 +74,16 @@ _SILENCE_RESET_TIMEOUT_STEP_MS = 300
 _SILENCE_RESET_TIMEOUT_DEFAULT_MS = 2100
 _WAKE_DEBUG_STREAM_KEEPALIVE_SECONDS = 15.0
 _VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
+_ACTIVE_BROWSER_COMMAND_EVENT_TYPE = "blueprints.active_browser.command"
+_BROWSER_VIEW_MAX_REPORTS = 32
+_ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS = 1
+_ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MAX_SECONDS = 120
+_ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_DEFAULT_SECONDS = _bounded_int_env(
+    "ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_SECONDS",
+    10,
+    _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS,
+    _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MAX_SECONDS,
+)
 _wake_debug_stream_lock = asyncio.Lock()
 _wake_debug_subscribers: dict[int, asyncio.Queue[str]] = {}
 _wake_debug_stream_sequence = 0
@@ -75,11 +95,51 @@ _DEV_COMMAND_ACTIONS = {
     "stop",
     "clear",
 }
+_ACTIVE_BROWSER_COMMAND_ACTIONS = {
+    "hard_refresh",
+    "open_chat",
+    "open_vad_dev",
+    "close_vad_dev",
+    "close_modal",
+    "open_synthesis",
+    "open_probes",
+    "open_settings",
+    "selector_action",
+}
+_ACTIVE_BROWSER_COMMAND_ALIASES = {
+    "refresh": "hard_refresh",
+    "reload": "hard_refresh",
+    "app_refresh": "hard_refresh",
+    "refresh_app": "hard_refresh",
+    "chat": "open_chat",
+    "vad_dev": "open_vad_dev",
+    "close_vad": "close_vad_dev",
+    "vad_close": "close_vad_dev",
+    "modal_close": "close_modal",
+    "synthesis": "open_synthesis",
+    "probes": "open_probes",
+    "settings": "open_settings",
+    "selector": "selector_action",
+}
+_ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
+    "": "click",
+    "tap": "click",
+    "single": "click",
+    "single_click": "click",
+    "dblclick": "double_click",
+    "double": "double_click",
+    "double_tap": "double_click",
+    "long": "long_press",
+    "hold": "long_press",
+    "long_tap": "long_press",
+}
+_ACTIVE_BROWSER_EVENT_KINDS = {"click", "double_click", "long_press"}
 
 
 class BrowserVoiceState(BaseModel):
     browser_id: str
     browser_label: str | None = None
+    tab_id: str | None = None
     stt_enabled: bool = False
     stt_mode: str | None = None
     tts_enabled: bool = False
@@ -148,6 +208,33 @@ class VoiceDevCommandBody(BaseModel):
     max_age_seconds: int = Field(default=60, ge=5, le=300)
 
 
+class ActiveBrowserCommandBody(BaseModel):
+    action: str = "hard_refresh"
+    browser_id: str | None = None
+    tab_id: str | None = None
+    command_id: str | None = None
+    modal_id: str | None = None
+    selector_action: str | None = None
+    event_kind: str | None = None
+    target_active_browser: bool = True
+    max_age_seconds: int = Field(default=60, ge=5, le=300)
+
+
+class BrowserViewBody(BaseModel):
+    browser_id: str
+    browser_label: str | None = None
+    tab_id: str | None = None
+    page: dict[str, Any] | None = None
+    modals: list[dict[str, Any]] | None = None
+    visibility_state: str | None = None
+    has_focus: bool = False
+    url_path: str | None = None
+    url_search: str | None = None
+    url_hash: str | None = None
+    frontend: dict[str, Any] | None = None
+    client_now_ms: float | None = None
+
+
 class WakeDevDebugBody(BaseModel):
     browser_id: str
     browser_label: str | None = None
@@ -185,6 +272,8 @@ def _empty_state() -> dict[str, Any]:
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
         },
+        "browser_views": {},
+        "browser_view_updated_at": 0.0,
         "revision": 0.0,
         "updated_at": 0.0,
     }
@@ -223,12 +312,41 @@ def _clean_dev_command_id(value: str | None = None) -> str:
     return clean or f"voice-dev-{uuid.uuid4().hex}"
 
 
+def _clean_active_browser_command_id(value: str | None = None) -> str:
+    raw = str(value or "").strip()
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ":", "."})[:100]
+    return clean or f"active-browser-{uuid.uuid4().hex}"
+
+
 def _clean_dev_command_mode(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def _clean_dev_command_action(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _clean_active_browser_command_action(value: str | None) -> str:
+    action = _clean_dev_command_action(value)
+    return _ACTIVE_BROWSER_COMMAND_ALIASES.get(action, action)
+
+
+def _clean_active_browser_event_kind(value: str | None) -> str:
+    event_kind = _clean_dev_command_action(value)
+    event_kind = _ACTIVE_BROWSER_EVENT_KIND_ALIASES.get(event_kind, event_kind)
+    return event_kind if event_kind in _ACTIVE_BROWSER_EVENT_KINDS else "click"
+
+
+def _clean_active_browser_modal_id(value: str | None) -> str:
+    raw = str(value or "").strip()
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ".", ":"})
+    return clean[:120]
+
+
+def _clean_active_browser_selector_action(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", ".", ":"})
+    return clean[:120]
 
 
 def _clean_hermes_prefix(value: Any, fallback: str) -> str:
@@ -838,6 +956,9 @@ def _read_state_unlocked() -> dict[str, Any]:
     if not isinstance(state.get("active"), dict):
         state["active"] = None
     state["policy"] = _clean_policy(state.get("policy"))
+    if not isinstance(state.get("browser_views"), dict):
+        state["browser_views"] = {}
+    state["browser_view_updated_at"] = float(state.get("browser_view_updated_at") or 0.0)
     return state
 
 
@@ -904,6 +1025,191 @@ def _bounded_json(value: Any, max_chars: int = 20000) -> Any:
     return {"truncated": True, "chars": len(encoded)}
 
 
+def _clean_browser_page_int(value: Any, *, maximum: int) -> int:
+    try:
+        number = int(float(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    return max(0, min(number, maximum))
+
+
+def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, Any]:
+    page = body.page if isinstance(body.page, dict) else {}
+    frontend = body.frontend if isinstance(body.frontend, dict) else {}
+    modals: list[dict[str, Any]] = []
+    for modal in body.modals or []:
+        if not isinstance(modal, dict):
+            continue
+        modal_id = _clean_string(modal.get("id"), "", 120)
+        if not modal_id:
+            continue
+        modals.append({
+            "id": modal_id,
+            "label": _clean_string(modal.get("label"), "", 120),
+            "open": bool(modal.get("open")),
+        })
+        if len(modals) >= 24:
+            break
+
+    visibility = _clean_string(body.visibility_state, "unknown", 30).lower()
+    if visibility not in {"visible", "hidden", "prerender", "unloaded", "unknown"}:
+        visibility = "unknown"
+
+    frontend_report = {
+        "app": _clean_string(frontend.get("app"), "", 80),
+        "asset_version": _clean_string(frontend.get("asset_version"), "", 160),
+        "cache_mode": _clean_string(frontend.get("cache_mode"), "", 40),
+        "service_worker_cache_version": _clean_string(frontend.get("service_worker_cache_version"), "", 120),
+        "service_worker_controller": bool(frontend.get("service_worker_controller")),
+        "service_worker_state": _clean_string(frontend.get("service_worker_state"), "", 40),
+    }
+
+    return {
+        "browser_id": _clean_browser_id(body.browser_id),
+        "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
+        "tab_id": _clean_string(body.tab_id, "", 120),
+        "page": {
+            "group": _clean_string(page.get("group"), "", 80),
+            "tab": _clean_string(page.get("tab"), "", 120),
+            "loading": bool(page.get("loading")),
+            "ready": bool(page.get("ready")),
+            "api_in_flight": _clean_browser_page_int(page.get("api_in_flight"), maximum=1000),
+            "api_quiet_for_ms": _clean_browser_page_int(page.get("api_quiet_for_ms"), maximum=600000),
+            "api_sequence": _clean_browser_page_int(page.get("api_sequence"), maximum=1000000000),
+        },
+        "modals": modals,
+        "visibility_state": visibility,
+        "has_focus": bool(body.has_focus),
+        "url_path": _clean_string(body.url_path, "", 180),
+        "url_search": _clean_string(body.url_search, "", 300),
+        "url_hash": _clean_string(body.url_hash, "", 180),
+        "frontend": frontend_report,
+        "client_now_ms": float(body.client_now_ms or 0.0),
+        "reported_at": now,
+    }
+
+
+def _browser_view_key(report: dict[str, Any]) -> str:
+    browser_id = _clean_browser_id(report.get("browser_id"))
+    tab_id = _clean_string(report.get("tab_id"), "", 120)
+    return f"{browser_id}::{tab_id}" if tab_id else browser_id
+
+
+def _fallback_frontend_expectation() -> dict[str, Any]:
+    try:
+        status = _read_fallback_ui_cache_status().model_dump()
+    except Exception:
+        status = {}
+    return {
+        "app": "fallback-ui",
+        "asset_version": _clean_string(status.get("asset_version"), "", 180),
+        "cache_mode": _clean_string(status.get("current_mode"), "", 40),
+        "fallback_root": _clean_string(status.get("fallback_root"), "", 240),
+        "state_file": _clean_string(status.get("state_file"), "", 240),
+    }
+
+
+def _annotate_browser_view(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
+        return None
+    public = dict(report)
+    frontend = dict(public.get("frontend") if isinstance(public.get("frontend"), dict) else {})
+    expected = _fallback_frontend_expectation()
+    reported_asset = _clean_string(frontend.get("asset_version"), "", 180)
+    expected_asset = _clean_string(expected.get("asset_version"), "", 180)
+    public["frontend"] = frontend
+    public["frontend_expected"] = expected
+    public["frontend_asset_version_match"] = bool(reported_asset and expected_asset and reported_asset == expected_asset)
+    return public
+
+
+def _selected_active_browser_view(state: dict[str, Any]) -> dict[str, Any] | None:
+    active = state.get("active") if isinstance(state.get("active"), dict) else None
+    reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
+    if not reports:
+        return None
+
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
+    candidates = [
+        report for report in reports.values()
+        if isinstance(report, dict)
+        and (not active_browser_id or _clean_browser_id(report.get("browser_id")) == active_browser_id)
+    ]
+    if not candidates:
+        return None
+
+    def _score(report: dict[str, Any]) -> tuple[int, int, int, float]:
+        report_tab_id = _clean_string(report.get("tab_id"), "", 120)
+        return (
+            1 if active_tab_id and report_tab_id == active_tab_id else 0,
+            1 if report.get("visibility_state") == "visible" else 0,
+            1 if report.get("has_focus") else 0,
+            float(report.get("reported_at") or 0.0),
+        )
+
+    return max(candidates, key=_score)
+
+
+def _public_active_browser_view(state: dict[str, Any]) -> dict[str, Any]:
+    reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
+    recent = sorted(
+        (_annotate_browser_view(report) for report in reports.values() if isinstance(report, dict)),
+        key=lambda report: float(report.get("reported_at") or 0.0) if report else 0.0,
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "active": _public_active(state.get("active") if isinstance(state.get("active"), dict) else None),
+        "view": _annotate_browser_view(_selected_active_browser_view(state)),
+        "reports": [report for report in recent if report][:10],
+        "frontend_expected": _fallback_frontend_expectation(),
+        "automation": {
+            "default_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_DEFAULT_SECONDS,
+            "minimum_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS,
+            "maximum_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MAX_SECONDS,
+        },
+        "browser_view_updated_at": float(state.get("browser_view_updated_at") or 0.0),
+    }
+
+
+def _store_browser_view_report_unlocked(state: dict[str, Any], report: dict[str, Any], now: float) -> bool:
+    reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
+    reports[_browser_view_key(report)] = report
+    sorted_items = sorted(
+        reports.items(),
+        key=lambda item: float(item[1].get("reported_at") or 0.0) if isinstance(item[1], dict) else 0.0,
+        reverse=True,
+    )
+    state["browser_views"] = dict(sorted_items[:_BROWSER_VIEW_MAX_REPORTS])
+    state["browser_view_updated_at"] = now
+
+    active = state.get("active") if isinstance(state.get("active"), dict) else None
+    if not active:
+        return False
+    if _clean_browser_id(active.get("browser_id")) != _clean_browser_id(report.get("browser_id")):
+        return False
+
+    changed = False
+    report_tab_id = _clean_string(report.get("tab_id"), "", 120)
+    active_tab_id = _clean_string(active.get("tab_id"), "", 120)
+    should_update_tab = bool(
+        report_tab_id
+        and (
+            not active_tab_id
+            or active_tab_id == report_tab_id
+            or (report.get("visibility_state") == "visible" and bool(report.get("has_focus")))
+        )
+    )
+    if should_update_tab and active_tab_id != report_tab_id:
+        active["tab_id"] = report_tab_id
+        changed = True
+    active["last_view_reported_at"] = now
+    active["last_view_page"] = report.get("page")
+    active["last_view_modals"] = report.get("modals")
+    return changed
+
+
 def _selected_wake_debug_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
@@ -959,7 +1265,7 @@ def _mask_wake_debug_for_backend_activation(
     public["running"] = False
     public["starting"] = False
     public["fsm_state"] = "SELECTED_INACTIVE"
-    public["reason"] = "This browser is not activated for Voice Mode."
+    public["reason"] = "This browser is not the Active Browser."
     public["active_instance_id"] = ""
     return public
 
@@ -1075,11 +1381,12 @@ def _public_state(state: dict[str, Any], debug: dict[str, Any] | None = None) ->
     }
 
 
-def _activated_browser_from_body(body: BrowserVoiceState, now: float) -> dict[str, Any]:
+def _active_browser_from_body(body: BrowserVoiceState, now: float) -> dict[str, Any]:
     stt_mode = _clean_stt_mode(body.stt_mode, body.stt_enabled)
     return {
         "browser_id": _clean_browser_id(body.browser_id),
         "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
+        "tab_id": _clean_string(body.tab_id, "", 120),
         "stt_enabled": bool(stt_mode),
         "stt_mode": stt_mode,
         "tts_enabled": bool(body.tts_enabled),
@@ -1087,7 +1394,7 @@ def _activated_browser_from_body(body: BrowserVoiceState, now: float) -> dict[st
     }
 
 
-class _VoiceModeActivationFsm:
+class _ActiveBrowserActivationFsm:
     STATE_IDLE = "IDLE"
     STATE_ACTIVATED = "ACTIVATED"
     INPUT_ACTIVATE_REQUEST = "ACTIVATE_REQUEST"
@@ -1119,7 +1426,7 @@ class _VoiceModeActivationFsm:
         input_name: str,
         *,
         browser_id: str,
-        activated_browser: dict[str, Any] | None = None,
+        active_browser: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = float(now if now is not None else time.time())
@@ -1132,9 +1439,9 @@ class _VoiceModeActivationFsm:
         )
 
         if action == self.ACTION_ACTIVATE_BROWSER:
-            if not activated_browser:
+            if not active_browser:
                 return {"changed": False, "from": before, "to": before, "output": "ignored"}
-            self.state["active"] = activated_browser
+            self.state["active"] = active_browser
         elif action == self.ACTION_DEACTIVATE_IF_OWNER:
             active = self.state.get("active") if isinstance(self.state.get("active"), dict) else None
             if not active or _clean_browser_id(active.get("browser_id")) != browser_id:
@@ -1157,10 +1464,10 @@ async def _publish_changed(state: dict[str, Any], action: str) -> None:
     public = _public_state(state)
     event = AppEvent.create(
         "voice.mode.changed",
-        "Voice Mode Changed",
-        "Blueprints voice-mode active browser changed.",
+        "Active Browser Changed",
+        "Blueprints Active Browser changed.",
         severity="info",
-        source="blueprints-voice-mode",
+        source="blueprints-active-browser",
         payload={
             "action": action,
             "active": public["active"],
@@ -1179,6 +1486,34 @@ async def voice_mode_status() -> dict[str, Any]:
         return _public_state(state)
 
 
+@router.get("/active-browser-view")
+async def active_browser_view() -> dict[str, Any]:
+    async with _state_lock:
+        state = _read_state_unlocked()
+        return _public_active_browser_view(state)
+
+
+@router.post("/browser-view")
+async def update_browser_view(body: BrowserViewBody):
+    browser_id = _clean_browser_id(body.browser_id)
+    if not browser_id:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
+
+    async with _state_lock:
+        state = _read_state_unlocked()
+        now = time.time()
+        report = _clean_browser_view_report(body, now)
+        active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
+        _write_state_unlocked(state)
+        public = _public_active_browser_view(state)
+
+    return {
+        **public,
+        "stored": True,
+        "active_tab_changed": active_tab_changed,
+    }
+
+
 @router.get("/dependency-health")
 async def voice_mode_dependency_health(
     force: bool = False,
@@ -1192,20 +1527,14 @@ async def voice_mode_activate(body: BrowserVoiceState):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
-    stt_mode = _clean_stt_mode(body.stt_mode, body.stt_enabled)
-    if not stt_mode and not body.tts_enabled:
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "detail": "Enable STT or TTS before activating this browser."},
-        )
 
     async with _state_lock:
         state = _read_state_unlocked()
         now = time.time()
-        activation = _VoiceModeActivationFsm(state).dispatch(
-            _VoiceModeActivationFsm.INPUT_ACTIVATE_REQUEST,
+        activation = _ActiveBrowserActivationFsm(state).dispatch(
+            _ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
             browser_id=browser_id,
-            activated_browser=_activated_browser_from_body(body, now),
+            active_browser=_active_browser_from_body(body, now),
             now=now,
         )
         changed = bool(activation.get("changed"))
@@ -1225,8 +1554,8 @@ async def voice_mode_deactivate(body: BrowserVoiceState):
 
     async with _state_lock:
         state = _read_state_unlocked()
-        activation = _VoiceModeActivationFsm(state).dispatch(
-            _VoiceModeActivationFsm.INPUT_DEACTIVATE_REQUEST,
+        activation = _ActiveBrowserActivationFsm(state).dispatch(
+            _ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
             browser_id=browser_id,
             now=time.time(),
         )
@@ -1402,9 +1731,11 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         active = state.get("active") if isinstance(state.get("active"), dict) else None
 
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
     target_browser_id = explicit_browser_id or (active_browser_id if body.target_active_browser else "")
+    target_tab_id = explicit_tab_id or (active_tab_id if body.target_active_browser else "")
     if body.target_active_browser and not target_browser_id:
-        return JSONResponse(status_code=409, content={"ok": False, "detail": "No active browser is available for Voice Mode"})
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
 
     now = time.time()
     payload = {
@@ -1413,20 +1744,82 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "mode": mode,
         "action": action,
         "target_browser_id": target_browser_id,
-        "target_tab_id": explicit_tab_id,
+        "target_tab_id": target_tab_id,
         "active_browser_id": active_browser_id,
+        "active_tab_id": active_tab_id,
         "open_modal": bool(body.open_modal),
         "created_at": now,
         "max_age_seconds": int(body.max_age_seconds),
     }
     event = AppEvent.create(
         _VOICE_DEV_COMMAND_EVENT_TYPE,
-        "Voice Mode Dev Command",
-        f"Voice Mode dev command {mode}:{action}.",
+        "Active Browser Dev Command",
+        f"Active Browser Wake/VAD dev command {mode}:{action}.",
         severity="info",
-        source="blueprints-voice-mode",
+        source="blueprints-active-browser",
         payload=payload,
         event_id=f"voice-dev-command-{command_id}",
+    )
+    published = await publish_event(event)
+    return {
+        "ok": True,
+        "event": published.model_dump(),
+        "payload": payload,
+    }
+
+
+@router.post("/active-browser-command")
+async def active_browser_command(body: ActiveBrowserCommandBody):
+    """Publish a bounded browser automation command to the Active Browser."""
+    action = _clean_active_browser_command_action(body.action)
+    if action not in _ACTIVE_BROWSER_COMMAND_ACTIONS:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": f"Unsupported active browser action: {action or 'blank'}"},
+        )
+    command_id = _clean_active_browser_command_id(body.command_id)
+    explicit_browser_id = _clean_browser_id(body.browser_id)
+    explicit_tab_id = _clean_string(body.tab_id, "", 120)
+    async with _state_lock:
+        state = _read_state_unlocked()
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
+    target_browser_id = explicit_browser_id or (active_browser_id if body.target_active_browser else "")
+    target_tab_id = explicit_tab_id or (active_tab_id if body.target_active_browser else "")
+    if body.target_active_browser and not target_browser_id:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
+
+    now = time.time()
+    modal_id = _clean_active_browser_modal_id(body.modal_id)
+    selector_action = _clean_active_browser_selector_action(body.selector_action)
+    event_kind = _clean_active_browser_event_kind(body.event_kind)
+    payload = {
+        "schema": "xarta.active_browser.command.v1",
+        "command_id": command_id,
+        "action": action,
+        "target_browser_id": target_browser_id,
+        "target_tab_id": target_tab_id,
+        "active_browser_id": active_browser_id,
+        "active_tab_id": active_tab_id,
+        "created_at": now,
+        "max_age_seconds": int(body.max_age_seconds),
+    }
+    if modal_id:
+        payload["modal_id"] = modal_id
+    if selector_action:
+        payload["selector_action"] = selector_action
+    if body.event_kind is not None:
+        payload["event_kind"] = event_kind
+    event = AppEvent.create(
+        _ACTIVE_BROWSER_COMMAND_EVENT_TYPE,
+        "Active Browser Command",
+        f"Active Browser command {action}.",
+        severity="info",
+        source="blueprints-active-browser",
+        payload=payload,
+        event_id=f"active-browser-command-{command_id}",
     )
     published = await publish_event(event)
     return {
