@@ -90,3 +90,67 @@ def test_legacy_phone_wins_config_is_forced_to_phone_always_speaks(tmp_path, mon
 
     assert written.listener_policy.phone_wins is True
     assert saved["listener_policy"]["phone_wins"] is True
+
+
+def test_default_toast_policy_enables_all_known_categories():
+    policy = dnd._default_config().toast_policy.model_dump()
+
+    assert policy == {
+        "model_alias": True,
+        "system_health": True,
+        "security": True,
+        "notification_tests": True,
+        "hermes_speech": True,
+        "active_browser_state": True,
+        "active_browser_commands": True,
+        "matrix_chat": True,
+        "unknown_other": True,
+    }
+
+
+def test_toast_policy_round_trips_through_config_file(tmp_path, monkeypatch):
+    config_path = tmp_path / "system-bridge-notifier-dnd.json"
+    monkeypatch.setattr(dnd, "_CONFIG_PATH", config_path)
+    config = dnd._default_config()
+    config.toast_policy.active_browser_commands = False
+    config.toast_policy.active_browser_state = False
+
+    dnd._write_config(config)
+    loaded = dnd._read_config()
+
+    assert loaded.toast_policy.active_browser_commands is False
+    assert loaded.toast_policy.active_browser_state is False
+    assert loaded.toast_policy.unknown_other is True
+
+
+def test_missing_toast_policy_reads_as_backward_compatible_defaults(tmp_path, monkeypatch):
+    config_path = tmp_path / "system-bridge-notifier-dnd.json"
+    config_path.write_text(json.dumps({"mode": "default"}), encoding="utf-8")
+    monkeypatch.setattr(dnd, "_CONFIG_PATH", config_path)
+
+    config = dnd._read_config()
+
+    assert config.toast_policy.model_alias is True
+    assert config.toast_policy.unknown_other is True
+
+
+def test_unknown_toast_policy_categories_are_normalized_away(tmp_path, monkeypatch):
+    config_path = tmp_path / "system-bridge-notifier-dnd.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "toast_policy": {
+                    "model_alias": False,
+                    "unknown_future_category": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dnd, "_CONFIG_PATH", config_path)
+
+    config = dnd._read_config()
+    dumped = config.toast_policy.model_dump()
+
+    assert config.toast_policy.model_alias is False
+    assert "unknown_future_category" not in dumped

@@ -34,6 +34,17 @@ DndMode = Literal[
     "manual_dnd_1",
     "manual_dnd_2",
 ]
+ToastCategory = Literal[
+    "model_alias",
+    "system_health",
+    "security",
+    "notification_tests",
+    "hermes_speech",
+    "active_browser_state",
+    "active_browser_commands",
+    "matrix_chat",
+    "unknown_other",
+]
 
 _CONFIG_PATH = Path("/xarta-node/.lone-wolf/config/system-bridge-notifier-dnd.json")
 _DANGER2_STATE_PATH = Path("/xarta-node/.lone-wolf/state/notifier-danger2-control.json")
@@ -65,6 +76,18 @@ class DangerPolicy(BaseModel):
     danger_alarm_volume: float = Field(default=1.0, ge=0, le=1)
 
 
+class ToastPolicy(BaseModel):
+    model_alias: bool = True
+    system_health: bool = True
+    security: bool = True
+    notification_tests: bool = True
+    hermes_speech: bool = True
+    active_browser_state: bool = True
+    active_browser_commands: bool = True
+    matrix_chat: bool = True
+    unknown_other: bool = True
+
+
 class NotifierDndConfig(BaseModel):
     version: int = 1
     mode: DndMode = "default"
@@ -77,6 +100,7 @@ class NotifierDndConfig(BaseModel):
     schedules: list[ScheduleWindow] = Field(default_factory=list, max_length=8)
     listener_policy: ListenerPolicy = Field(default_factory=ListenerPolicy)
     danger_policy: DangerPolicy = Field(default_factory=DangerPolicy)
+    toast_policy: ToastPolicy = Field(default_factory=ToastPolicy)
     notes: str = ""
     updated_at: float | None = None
     config_path: str = str(_CONFIG_PATH)
