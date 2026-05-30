@@ -126,6 +126,9 @@ _DEV_COMMAND_ACTIONS = {
     "set_vad_reset_timeout",
     "set_silero_vad",
     "set_vad_detector",
+    "set_auto_pre_roll",
+    "set_noise_threshold",
+    "set_noise_threshold_db",
 }
 _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "hard_refresh",
@@ -250,6 +253,8 @@ class VoiceDevCommandBody(BaseModel):
     enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
+    noise_threshold_db: float | None = None
+    threshold_db: float | None = None
     aggregation_timeout_ms: int | None = None
     speech_aggregation_timeout_ms: int | None = None
     vad_reset_timeout_ms: int | None = None
@@ -2407,7 +2412,7 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
         "source": _clean_string(body.source, "", 120),
         "status": _clean_string(body.status, "", 240),
         "transcript": _clean_string(body.transcript, "", 4000),
-        "snapshot": _bounded_json(body.snapshot or {}, 50000),
+        "snapshot": _bounded_json(body.snapshot or {}, 120000),
         "client_now_ms": float(body.client_now_ms or 0),
         "reported_at": now,
     }
@@ -2462,6 +2467,8 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "enabled": body.enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
+        "noise_threshold_db": body.noise_threshold_db,
+        "threshold_db": body.threshold_db,
         "aggregation_timeout_ms": body.aggregation_timeout_ms,
         "speech_aggregation_timeout_ms": body.speech_aggregation_timeout_ms,
         "vad_reset_timeout_ms": body.vad_reset_timeout_ms,

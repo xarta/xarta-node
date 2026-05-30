@@ -124,8 +124,13 @@ def test_active_browser_command_action_aliases_are_sanitized():
 def test_voice_dev_vad_detector_actions_are_allowed():
     assert voice_mode._clean_dev_command_action("set silero vad") == "set_silero_vad"
     assert voice_mode._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
+    assert voice_mode._clean_dev_command_action("set auto pre roll") == "set_auto_pre_roll"
+    assert voice_mode._clean_dev_command_action("set-noise-threshold-db") == "set_noise_threshold_db"
     assert "set_silero_vad" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_vad_detector" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_auto_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_noise_threshold" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_noise_threshold_db" in voice_mode._DEV_COMMAND_ACTIONS
 
 
 def test_active_browser_command_parameters_are_sanitized():
