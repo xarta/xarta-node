@@ -68,9 +68,14 @@ def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
         "vad_reset_timeout_ms": 150,
         "silence_reset_timeout_ms": 2100,
     }
+    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 400}) == {
+        "speech_aggregation_timeout_ms": 80,
+        "vad_reset_timeout_ms": 400,
+        "silence_reset_timeout_ms": 2100,
+    }
     assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == {
         "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 500,
+        "vad_reset_timeout_ms": 2000,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == {
