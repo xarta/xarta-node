@@ -1,3 +1,5 @@
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -108,6 +110,11 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("vad-dev") == "open_vad_dev"
     assert voice_mode._clean_active_browser_command_action("close-vad") == "close_vad_dev"
     assert voice_mode._clean_active_browser_command_action("modal close") == "close_modal"
+    assert voice_mode._clean_active_browser_command_action("page") == "open_page"
+    assert voice_mode._clean_active_browser_command_action("open tab") == "open_page"
+    assert voice_mode._clean_active_browser_command_action("modal") == "open_modal"
+    assert voice_mode._clean_active_browser_command_action("fn") == "menu_function"
+    assert voice_mode._clean_active_browser_command_action("menu-fn") == "menu_function"
     assert voice_mode._clean_active_browser_command_action("synthesis") == "open_synthesis"
     assert voice_mode._clean_active_browser_command_action("probes") == "open_probes"
     assert voice_mode._clean_active_browser_command_action("settings") == "open_settings"
@@ -121,6 +128,25 @@ def test_active_browser_command_parameters_are_sanitized():
     assert voice_mode._clean_active_browser_event_kind("something else") == "click"
     assert voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
     assert voice_mode._clean_active_browser_selector_action("API Key") == "api-key"
+    assert voice_mode._clean_active_browser_group("Settings Panel!") == "settings-panel"
+    assert voice_mode._clean_active_browser_page_id("manual-links-page:ABC_123<script>") == "manual-links-page:ABC_123script"
+    assert voice_mode._clean_active_browser_menu_item_id("chat-fn-vad-dev<script>") == "chat-fn-vad-devscript"
+    assert voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>") == "nod.backupColumnsscript"
+    assert len(voice_mode._clean_active_browser_group("A" * 200)) == 80
+    assert len(voice_mode._clean_active_browser_page_id("p" * 220)) == 160
+    assert len(voice_mode._clean_active_browser_menu_item_id("m" * 220)) == 160
+    assert len(voice_mode._clean_active_browser_fn_key("f" * 220)) == 160
+
+
+def test_active_browser_command_rejects_unsupported_actions():
+    response = asyncio.run(
+        voice_mode.active_browser_command(
+            voice_mode.ActiveBrowserCommandBody(action="delete everything")
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["detail"] == "Unsupported active browser action: delete_everything"
 
 
 def test_active_browser_view_report_updates_active_tab_and_page():
@@ -164,6 +190,54 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             "pointer": {"primary": "fine", "any": "fine", "coarse": False, "fine": True, "maxTouchPoints": 0},
         },
         frontend={"app": "fallback-ui", "asset_version": "dev-test"},
+        automation={
+            "current_group": "settings",
+            "current_page_id": "matrix-chat",
+            "menus": [
+                {
+                    "group": "settings",
+                    "active_id": "matrix-chat",
+                    "layout_item_id": "settings-layout",
+                    "pages": [
+                        {
+                            "id": "matrix-chat",
+                            "label": "Chat",
+                            "page_label": "Chat",
+                            "parent": "agent-pages",
+                            "target_id": "matrix-chat",
+                            "current": True,
+                            "visible": True,
+                            "invokable": True,
+                        }
+                    ],
+                    "function_items": [
+                        {
+                            "id": "chat-fn-vad-dev",
+                            "label": "VAD Dev",
+                            "fn": "chat.vadDev",
+                            "active_on": ["matrix-chat"],
+                            "current_context": True,
+                            "visible": True,
+                            "registered": True,
+                            "invokable": True,
+                        }
+                    ],
+                    "current_functions": [
+                        {
+                            "id": "chat-fn-vad-dev",
+                            "label": "VAD Dev",
+                            "fn": "chat.vadDev",
+                            "active_on": ["matrix-chat"],
+                            "current_context": True,
+                            "visible": True,
+                            "registered": True,
+                            "invokable": True,
+                        }
+                    ],
+                }
+            ],
+            "selector_actions": [{"action": "settings", "label": "Settings", "bridge_group": "settings"}],
+        },
     )
     report = voice_mode._clean_browser_view_report(body, 20)
 
@@ -186,6 +260,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert view["viewport"]["innerWidth"] == 1280
     assert view["viewport_class"] == "landscape_1080p_like"
     assert view["viewport_flags"]["standard_landscape"] is True
+    assert view["automation"]["current_group"] == "settings"
+    assert view["automation"]["menus"][0]["pages"][0]["id"] == "matrix-chat"
+    assert view["automation"]["menus"][0]["function_items"][0]["fn"] == "chat.vadDev"
+    assert view["automation"]["selector_actions"][0]["action"] == "settings"
 
 
 def test_active_browser_view_exposes_automation_defaults():
