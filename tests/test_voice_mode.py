@@ -121,6 +121,13 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("selector") == "selector_action"
 
 
+def test_voice_dev_vad_detector_actions_are_allowed():
+    assert voice_mode._clean_dev_command_action("set silero vad") == "set_silero_vad"
+    assert voice_mode._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
+    assert "set_silero_vad" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_vad_detector" in voice_mode._DEV_COMMAND_ACTIONS
+
+
 def test_active_browser_command_parameters_are_sanitized():
     assert voice_mode._clean_active_browser_event_kind("tap") == "click"
     assert voice_mode._clean_active_browser_event_kind("double tap") == "double_click"

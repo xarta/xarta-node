@@ -124,6 +124,8 @@ _DEV_COMMAND_ACTIONS = {
     "set_noise_level_db",
     "set_aggregation_timeout",
     "set_vad_reset_timeout",
+    "set_silero_vad",
+    "set_vad_detector",
 }
 _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "hard_refresh",
