@@ -119,6 +119,9 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "open_vad_dev",
     "close_vad_dev",
     "close_modal",
+    "open_page",
+    "open_modal",
+    "menu_function",
     "open_synthesis",
     "open_probes",
     "open_settings",
@@ -134,6 +137,13 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "close_vad": "close_vad_dev",
     "vad_close": "close_vad_dev",
     "modal_close": "close_modal",
+    "page": "open_page",
+    "open_tab": "open_page",
+    "tab": "open_page",
+    "modal": "open_modal",
+    "fn": "menu_function",
+    "function": "menu_function",
+    "menu_fn": "menu_function",
     "synthesis": "open_synthesis",
     "probes": "open_probes",
     "settings": "open_settings",
@@ -231,6 +241,13 @@ class ActiveBrowserCommandBody(BaseModel):
     browser_id: str | None = None
     tab_id: str | None = None
     command_id: str | None = None
+    group: str | None = None
+    menu_group: str | None = None
+    page_id: str | None = None
+    tab: str | None = None
+    menu_id: str | None = None
+    menu_item_id: str | None = None
+    fn: str | None = None
     modal_id: str | None = None
     selector_action: str | None = None
     event_kind: str | None = None
@@ -252,6 +269,7 @@ class BrowserViewBody(BaseModel):
     url_search: str | None = None
     url_hash: str | None = None
     frontend: dict[str, Any] | None = None
+    automation: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
 
@@ -380,6 +398,30 @@ def _clean_active_browser_selector_action(value: str | None) -> str:
     raw = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
     clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", ".", ":"})
     return clean[:120]
+
+
+def _clean_active_browser_group(value: str | None) -> str:
+    raw = str(value or "").strip().lower().replace(" ", "-").replace("_", "-")
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-"})
+    return clean[:80]
+
+
+def _clean_active_browser_token(value: Any, *, max_length: int = 160) -> str:
+    raw = str(value or "").strip()
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ".", ":"})
+    return clean[:max_length]
+
+
+def _clean_active_browser_page_id(value: str | None) -> str:
+    return _clean_active_browser_token(value, max_length=160)
+
+
+def _clean_active_browser_menu_item_id(value: str | None) -> str:
+    return _clean_active_browser_token(value, max_length=160)
+
+
+def _clean_active_browser_fn_key(value: str | None) -> str:
+    return _clean_active_browser_token(value, max_length=160)
 
 
 def _clean_hermes_prefix(value: Any, fallback: str) -> str:
@@ -1215,6 +1257,156 @@ def _clean_browser_voice_state(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_order(value: Any) -> int:
+    try:
+        number = int(float(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    return max(-10000, min(number, 10000))
+
+
+def _clean_active_browser_active_on(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    active_on: list[str] = []
+    for item in value[:32]:
+        clean = _clean_active_browser_page_id(item)
+        if clean:
+            active_on.append(clean)
+    return active_on
+
+
+def _clean_active_browser_page_capability(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    item_id = _clean_active_browser_page_id(item.get("id"))
+    if not item_id:
+        return None
+    return {
+        "id": item_id,
+        "label": _clean_string(item.get("label"), "", 120),
+        "page_label": _clean_string(item.get("page_label") or item.get("pageLabel"), "", 120),
+        "parent": _clean_active_browser_menu_item_id(item.get("parent")),
+        "order": _clean_active_browser_order(item.get("order")),
+        "target_id": _clean_active_browser_page_id(item.get("target_id")),
+        "current": bool(item.get("current")),
+        "visible": bool(item.get("visible", True)),
+        "blocked": bool(item.get("blocked")),
+        "has_panel": bool(item.get("has_panel")),
+        "invokable": bool(item.get("invokable")),
+    }
+
+
+def _clean_active_browser_function_capability(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    item_id = _clean_active_browser_menu_item_id(item.get("id"))
+    fn_key = _clean_active_browser_fn_key(item.get("fn"))
+    if not item_id and not fn_key:
+        return None
+    return {
+        "id": item_id,
+        "label": _clean_string(item.get("label"), "", 120),
+        "parent": _clean_active_browser_menu_item_id(item.get("parent")),
+        "order": _clean_active_browser_order(item.get("order")),
+        "fn": fn_key,
+        "active_on": _clean_active_browser_active_on(item.get("active_on") or item.get("activeOn")),
+        "current_context": bool(item.get("current_context")),
+        "visible": bool(item.get("visible", True)),
+        "blocked": bool(item.get("blocked")),
+        "registered": bool(item.get("registered")),
+        "invokable": bool(item.get("invokable")),
+    }
+
+
+def _clean_active_browser_menu_capability(menu: Any) -> dict[str, Any] | None:
+    if not isinstance(menu, dict):
+        return None
+    group = _clean_active_browser_group(menu.get("group"))
+    if not group:
+        return None
+    pages = [
+        clean for clean in (
+            _clean_active_browser_page_capability(item)
+            for item in (menu.get("pages") if isinstance(menu.get("pages"), list) else [])
+        )
+        if clean
+    ][:120]
+    function_items = [
+        clean for clean in (
+            _clean_active_browser_function_capability(item)
+            for item in (menu.get("function_items") if isinstance(menu.get("function_items"), list) else [])
+        )
+        if clean
+    ][:160]
+    current_functions = [
+        clean for clean in (
+            _clean_active_browser_function_capability(item)
+            for item in (menu.get("current_functions") if isinstance(menu.get("current_functions"), list) else [])
+        )
+        if clean
+    ][:48]
+    page_count = (
+        _clean_browser_page_int(menu.get("page_count"), maximum=10000)
+        if menu.get("page_count") is not None
+        else len(pages)
+    )
+    function_count = (
+        _clean_browser_page_int(menu.get("function_count"), maximum=10000)
+        if menu.get("function_count") is not None
+        else len(function_items)
+    )
+    return {
+        "group": group,
+        "active_id": _clean_active_browser_page_id(menu.get("active_id")),
+        "layout_item_id": _clean_active_browser_menu_item_id(menu.get("layout_item_id")),
+        "pages": pages,
+        "function_items": function_items,
+        "current_functions": current_functions,
+        "page_count": page_count,
+        "function_count": function_count,
+    }
+
+
+def _clean_active_browser_selector_capability(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    action = _clean_active_browser_selector_action(item.get("action") or item.get("id"))
+    if not action:
+        return None
+    return {
+        "action": action,
+        "label": _clean_string(item.get("label"), "", 120),
+        "bridge_group": _clean_active_browser_group(item.get("bridge_group") or item.get("bridgeGroup")),
+    }
+
+
+def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
+    automation = raw if isinstance(raw, dict) else {}
+    menus = [
+        clean for clean in (
+            _clean_active_browser_menu_capability(item)
+            for item in (automation.get("menus") if isinstance(automation.get("menus"), list) else [])
+        )
+        if clean
+    ][:8]
+    current_menu = _clean_active_browser_menu_capability(automation.get("current_menu"))
+    selector_actions = [
+        clean for clean in (
+            _clean_active_browser_selector_capability(item)
+            for item in (automation.get("selector_actions") if isinstance(automation.get("selector_actions"), list) else [])
+        )
+        if clean
+    ][:80]
+    return {
+        "current_group": _clean_active_browser_group(automation.get("current_group")),
+        "current_page_id": _clean_active_browser_page_id(automation.get("current_page_id")),
+        "menus": menus,
+        "current_menu": current_menu,
+        "selector_actions": selector_actions,
+    }
+
+
 def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, Any]:
     page = body.page if isinstance(body.page, dict) else {}
     frontend = body.frontend if isinstance(body.frontend, dict) else {}
@@ -1274,6 +1466,7 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "url_search": _clean_string(body.url_search, "", 300),
         "url_hash": _clean_string(body.url_hash, "", 180),
         "frontend": frontend_report,
+        "automation": _clean_active_browser_automation_report(body.automation),
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,
     }
@@ -2250,6 +2443,10 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
 
     now = time.time()
+    group = _clean_active_browser_group(body.group or body.menu_group)
+    page_id = _clean_active_browser_page_id(body.page_id or body.tab)
+    menu_item_id = _clean_active_browser_menu_item_id(body.menu_item_id or body.menu_id)
+    fn_key = _clean_active_browser_fn_key(body.fn)
     modal_id = _clean_active_browser_modal_id(body.modal_id)
     selector_action = _clean_active_browser_selector_action(body.selector_action)
     event_kind = _clean_active_browser_event_kind(body.event_kind)
@@ -2264,6 +2461,14 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         "created_at": now,
         "max_age_seconds": int(body.max_age_seconds),
     }
+    if group:
+        payload["group"] = group
+    if page_id:
+        payload["page_id"] = page_id
+    if menu_item_id:
+        payload["menu_item_id"] = menu_item_id
+    if fn_key:
+        payload["fn"] = fn_key
     if modal_id:
         payload["modal_id"] = modal_id
     if selector_action:
