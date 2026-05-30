@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/voice-mode", tags=["voice-mode"])
 
 _STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-voice-mode.json")
 _WAKE_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-to-talk-debug.json")
+_WAKE_DEV_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-dev-debug.json")
 _state_lock = asyncio.Lock()
 _dependency_health_lock = asyncio.Lock()
 _dependency_health_cache: dict[str, Any] = {
@@ -61,9 +63,18 @@ _SILENCE_RESET_TIMEOUT_MAX_MS = 3000
 _SILENCE_RESET_TIMEOUT_STEP_MS = 300
 _SILENCE_RESET_TIMEOUT_DEFAULT_MS = 2100
 _WAKE_DEBUG_STREAM_KEEPALIVE_SECONDS = 15.0
+_VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
 _wake_debug_stream_lock = asyncio.Lock()
 _wake_debug_subscribers: dict[int, asyncio.Queue[str]] = {}
 _wake_debug_stream_sequence = 0
+_DEV_COMMAND_MODES = {"manual", "vad", "vad_rearm"}
+_DEV_COMMAND_ACTIONS = {
+    "enable_test",
+    "disable_test",
+    "record",
+    "stop",
+    "clear",
+}
 
 
 class BrowserVoiceState(BaseModel):
@@ -126,6 +137,29 @@ class WakeDebugBody(BaseModel):
     client_now_ms: float | None = None
 
 
+class VoiceDevCommandBody(BaseModel):
+    mode: str = "manual"
+    action: str = "record"
+    browser_id: str | None = None
+    tab_id: str | None = None
+    command_id: str | None = None
+    open_modal: bool = False
+    target_active_browser: bool = True
+    max_age_seconds: int = Field(default=60, ge=5, le=300)
+
+
+class WakeDevDebugBody(BaseModel):
+    browser_id: str
+    browser_label: str | None = None
+    tab_id: str | None = None
+    mode: str | None = None
+    source: str | None = None
+    status: str | None = None
+    transcript: str | None = None
+    snapshot: dict[str, Any] | None = None
+    client_now_ms: float | None = None
+
+
 def _clean_issue(value: str) -> str:
     return " ".join(str(value or "").strip().split())[:80]
 
@@ -181,6 +215,20 @@ def _clean_stt_mode(value: str | None, stt_enabled: bool = False) -> str:
 def _clean_string(value: Any, fallback: str = "", max_length: int = 255) -> str:
     text = " ".join(str(value if value is not None else fallback).strip().split())
     return (text or fallback)[:max_length]
+
+
+def _clean_dev_command_id(value: str | None = None) -> str:
+    raw = str(value or "").strip()
+    clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ":", "."})[:100]
+    return clean or f"voice-dev-{uuid.uuid4().hex}"
+
+
+def _clean_dev_command_mode(value: str | None) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _clean_dev_command_action(value: str | None) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def _clean_hermes_prefix(value: Any, fallback: str) -> str:
@@ -823,6 +871,29 @@ def _write_wake_debug_unlocked(debug: dict[str, Any]) -> None:
     tmp.replace(_WAKE_DEBUG_PATH)
 
 
+def _read_wake_dev_debug_unlocked() -> dict[str, Any]:
+    try:
+        raw = json.loads(_WAKE_DEV_DEBUG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"reports": {}, "updated_at": 0.0}
+    except Exception:
+        return {"reports": {}, "updated_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"reports": {}, "updated_at": 0.0}
+    reports = raw.get("reports") if isinstance(raw.get("reports"), dict) else {}
+    return {
+        "reports": reports,
+        "updated_at": float(raw.get("updated_at") or 0.0),
+    }
+
+
+def _write_wake_dev_debug_unlocked(debug: dict[str, Any]) -> None:
+    _WAKE_DEV_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _WAKE_DEV_DEBUG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(debug, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(_WAKE_DEV_DEBUG_PATH)
+
+
 def _bounded_json(value: Any, max_chars: int = 20000) -> Any:
     try:
         encoded = json.dumps(value)
@@ -834,6 +905,20 @@ def _bounded_json(value: Any, max_chars: int = 20000) -> Any:
 
 
 def _selected_wake_debug_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
+    active = state.get("active") if isinstance(state.get("active"), dict) else None
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    selected = reports.get(active_browser_id) if active_browser_id else None
+    if not isinstance(selected, dict) and reports and not active_browser_id:
+        selected = max(
+            (report for report in reports.values() if isinstance(report, dict)),
+            key=lambda item: float(item.get("reported_at") or 0.0),
+            default=None,
+        )
+    return selected if isinstance(selected, dict) else None
+
+
+def _selected_browser_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
@@ -893,6 +978,29 @@ def _public_wake_debug(state: dict[str, Any], debug: dict[str, Any]) -> dict[str
         "age_seconds": round(max(0.0, time.time() - reported_at), 3) if reported_at else None,
         "reports_count": len(reports),
         "path": str(_WAKE_DEBUG_PATH),
+    }
+
+
+def _public_wake_dev_debug(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any]:
+    selected = _selected_browser_report(state, debug)
+    active = state.get("active") if isinstance(state.get("active"), dict) else None
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    report_browser_id = _clean_browser_id(selected.get("browser_id") if isinstance(selected, dict) else "")
+    public_debug = dict(selected) if isinstance(selected, dict) else None
+    if isinstance(public_debug, dict):
+        public_debug["authoritative_browser_active"] = bool(
+            active_browser_id and report_browser_id == active_browser_id
+        )
+    reported_at = float(public_debug.get("reported_at") or 0.0) if isinstance(public_debug, dict) else 0.0
+    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    return {
+        "ok": True,
+        "active": _public_active(active),
+        "debug": public_debug,
+        "has_debug": isinstance(public_debug, dict),
+        "age_seconds": round(max(0.0, time.time() - reported_at), 3) if reported_at else None,
+        "reports_count": len(reports),
+        "path": str(_WAKE_DEV_DEBUG_PATH),
     }
 
 
@@ -1235,6 +1343,97 @@ async def voice_mode_update_wake_debug(body: WakeDebugBody):
         public = _public_wake_debug(state, debug)
     await _broadcast_wake_debug(public)
     return public
+
+
+@router.get("/dev-status")
+async def voice_mode_dev_status() -> dict[str, Any]:
+    async with _state_lock:
+        state = _read_state_unlocked()
+        debug = _read_wake_dev_debug_unlocked()
+    return _public_wake_dev_debug(state, debug)
+
+
+@router.post("/dev-status")
+async def voice_mode_update_dev_status(body: WakeDevDebugBody):
+    browser_id = _clean_browser_id(body.browser_id)
+    if not browser_id:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
+    now = time.time()
+    report = {
+        "browser_id": browser_id,
+        "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
+        "tab_id": _clean_string(body.tab_id, "", 120),
+        "mode": _clean_dev_command_mode(body.mode),
+        "source": _clean_string(body.source, "", 120),
+        "status": _clean_string(body.status, "", 240),
+        "transcript": _clean_string(body.transcript, "", 4000),
+        "snapshot": _bounded_json(body.snapshot or {}, 50000),
+        "client_now_ms": float(body.client_now_ms or 0),
+        "reported_at": now,
+    }
+    async with _state_lock:
+        state = _read_state_unlocked()
+        debug = _read_wake_dev_debug_unlocked()
+        reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+        reports[browser_id] = report
+        debug = {
+            "reports": reports,
+            "updated_at": now,
+        }
+        _write_wake_dev_debug_unlocked(debug)
+        public = _public_wake_dev_debug(state, debug)
+    return public
+
+
+@router.post("/dev-command")
+async def voice_mode_dev_command(body: VoiceDevCommandBody):
+    """Publish a browser-directed Wake/VAD dev command over the SSE bus."""
+    mode = _clean_dev_command_mode(body.mode)
+    action = _clean_dev_command_action(body.action)
+    if mode not in _DEV_COMMAND_MODES:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported mode: {mode or 'blank'}"})
+    if action not in _DEV_COMMAND_ACTIONS:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported action: {action or 'blank'}"})
+    command_id = _clean_dev_command_id(body.command_id)
+    explicit_browser_id = _clean_browser_id(body.browser_id)
+    explicit_tab_id = _clean_string(body.tab_id, "", 120)
+    async with _state_lock:
+        state = _read_state_unlocked()
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    target_browser_id = explicit_browser_id or (active_browser_id if body.target_active_browser else "")
+    if body.target_active_browser and not target_browser_id:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "No active browser is available for Voice Mode"})
+
+    now = time.time()
+    payload = {
+        "schema": "xarta.voice_mode.dev_command.v1",
+        "command_id": command_id,
+        "mode": mode,
+        "action": action,
+        "target_browser_id": target_browser_id,
+        "target_tab_id": explicit_tab_id,
+        "active_browser_id": active_browser_id,
+        "open_modal": bool(body.open_modal),
+        "created_at": now,
+        "max_age_seconds": int(body.max_age_seconds),
+    }
+    event = AppEvent.create(
+        _VOICE_DEV_COMMAND_EVENT_TYPE,
+        "Voice Mode Dev Command",
+        f"Voice Mode dev command {mode}:{action}.",
+        severity="info",
+        source="blueprints-voice-mode",
+        payload=payload,
+        event_id=f"voice-dev-command-{command_id}",
+    )
+    published = await publish_event(event)
+    return {
+        "ok": True,
+        "event": published.model_dump(),
+        "payload": payload,
+    }
 
 
 @router.post("/wake-settings")
