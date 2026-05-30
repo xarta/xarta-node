@@ -105,6 +105,7 @@ _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
 _wake_debug_stream_lock = asyncio.Lock()
 _wake_debug_subscribers: dict[int, asyncio.Queue[str]] = {}
 _wake_debug_stream_sequence = 0
+_DEV_COMMAND_SURFACES = {"wake_dev", "vad_dev"}
 _DEV_COMMAND_MODES = {"manual", "vad", "vad_rearm"}
 _DEV_COMMAND_ACTIONS = {
     "enable_test",
@@ -112,6 +113,17 @@ _DEV_COMMAND_ACTIONS = {
     "record",
     "stop",
     "clear",
+    "enable_vad_record",
+    "disable_vad_record",
+    "toggle_vad_record",
+    "enable_vad_stop",
+    "disable_vad_stop",
+    "toggle_vad_stop",
+    "set_noise_reduction",
+    "set_noise_level",
+    "set_noise_level_db",
+    "set_aggregation_timeout",
+    "set_vad_reset_timeout",
 }
 _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "hard_refresh",
@@ -226,11 +238,20 @@ class WakeDebugBody(BaseModel):
 
 
 class VoiceDevCommandBody(BaseModel):
+    surface: str = "wake_dev"
     mode: str = "manual"
     action: str = "record"
     browser_id: str | None = None
     tab_id: str | None = None
     command_id: str | None = None
+    value: Any | None = None
+    enabled: bool | None = None
+    level_db: float | None = None
+    noise_level_db: float | None = None
+    aggregation_timeout_ms: int | None = None
+    speech_aggregation_timeout_ms: int | None = None
+    vad_reset_timeout_ms: int | None = None
+    reset_timeout_ms: int | None = None
     open_modal: bool = False
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
@@ -290,6 +311,7 @@ class WakeDevDebugBody(BaseModel):
     browser_id: str
     browser_label: str | None = None
     tab_id: str | None = None
+    surface: str | None = None
     mode: str | None = None
     source: str | None = None
     status: str | None = None
@@ -371,6 +393,11 @@ def _clean_active_browser_command_id(value: str | None = None) -> str:
 
 def _clean_dev_command_mode(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _clean_dev_command_surface(value: str | None) -> str:
+    clean = _clean_dev_command_mode(value)
+    return clean or "wake_dev"
 
 
 def _clean_dev_command_action(value: str | None) -> str:
@@ -1793,8 +1820,38 @@ def _public_wake_debug(state: dict[str, Any], debug: dict[str, Any]) -> dict[str
     }
 
 
-def _public_wake_dev_debug(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any]:
-    selected = _selected_browser_report(state, debug)
+def _select_wake_dev_report(
+    state: dict[str, Any],
+    debug: dict[str, Any],
+    *,
+    surface: str = "",
+    browser_id: str = "",
+) -> dict[str, Any] | None:
+    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    clean_browser_id = _clean_browser_id(browser_id)
+    if clean_browser_id and isinstance(reports.get(clean_browser_id), dict):
+        return reports[clean_browser_id]
+    clean_surface = _clean_dev_command_surface(surface) if surface else ""
+    if clean_surface:
+        return max(
+            (
+                report for report in reports.values()
+                if isinstance(report, dict) and _clean_dev_command_surface(report.get("surface")) == clean_surface
+            ),
+            key=lambda item: float(item.get("reported_at") or 0.0),
+            default=None,
+        )
+    return _selected_browser_report(state, debug)
+
+
+def _public_wake_dev_debug(
+    state: dict[str, Any],
+    debug: dict[str, Any],
+    *,
+    surface: str = "",
+    browser_id: str = "",
+) -> dict[str, Any]:
+    selected = _select_wake_dev_report(state, debug, surface=surface, browser_id=browser_id)
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     report_browser_id = _clean_browser_id(selected.get("browser_id") if isinstance(selected, dict) else "")
@@ -2326,11 +2383,11 @@ async def voice_mode_update_wake_debug(body: WakeDebugBody):
 
 
 @router.get("/dev-status")
-async def voice_mode_dev_status() -> dict[str, Any]:
+async def voice_mode_dev_status(surface: str | None = None, browser_id: str | None = None) -> dict[str, Any]:
     async with _state_lock:
         state = _read_state_unlocked()
         debug = _read_wake_dev_debug_unlocked()
-    return _public_wake_dev_debug(state, debug)
+    return _public_wake_dev_debug(state, debug, surface=surface or "", browser_id=browser_id or "")
 
 
 @router.post("/dev-status")
@@ -2343,6 +2400,7 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
         "browser_id": browser_id,
         "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
         "tab_id": _clean_string(body.tab_id, "", 120),
+        "surface": _clean_dev_command_surface(body.surface),
         "mode": _clean_dev_command_mode(body.mode),
         "source": _clean_string(body.source, "", 120),
         "status": _clean_string(body.status, "", 240),
@@ -2368,8 +2426,11 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
 @router.post("/dev-command")
 async def voice_mode_dev_command(body: VoiceDevCommandBody):
     """Publish a browser-directed Wake/VAD dev command over the SSE bus."""
+    surface = _clean_dev_command_surface(body.surface)
     mode = _clean_dev_command_mode(body.mode)
     action = _clean_dev_command_action(body.action)
+    if surface not in _DEV_COMMAND_SURFACES:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported surface: {surface or 'blank'}"})
     if mode not in _DEV_COMMAND_MODES:
         return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported mode: {mode or 'blank'}"})
     if action not in _DEV_COMMAND_ACTIONS:
@@ -2392,8 +2453,17 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
     payload = {
         "schema": "xarta.voice_mode.dev_command.v1",
         "command_id": command_id,
+        "surface": surface,
         "mode": mode,
         "action": action,
+        "value": body.value,
+        "enabled": body.enabled,
+        "level_db": body.level_db,
+        "noise_level_db": body.noise_level_db,
+        "aggregation_timeout_ms": body.aggregation_timeout_ms,
+        "speech_aggregation_timeout_ms": body.speech_aggregation_timeout_ms,
+        "vad_reset_timeout_ms": body.vad_reset_timeout_ms,
+        "reset_timeout_ms": body.reset_timeout_ms,
         "target_browser_id": target_browser_id,
         "target_tab_id": target_tab_id,
         "active_browser_id": active_browser_id,
@@ -2405,7 +2475,7 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
     event = AppEvent.create(
         _VOICE_DEV_COMMAND_EVENT_TYPE,
         "Active Browser Dev Command",
-        f"Active Browser Wake/VAD dev command {mode}:{action}.",
+        f"Active Browser {surface} dev command {mode}:{action}.",
         severity="info",
         source="blueprints-active-browser",
         payload=payload,
