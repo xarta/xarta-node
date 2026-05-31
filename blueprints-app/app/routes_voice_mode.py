@@ -68,6 +68,10 @@ _VAD_RESET_TIMEOUT_MIN_MS = 0
 _VAD_RESET_TIMEOUT_MAX_MS = 2000
 _VAD_RESET_TIMEOUT_STEP_MS = 50
 _VAD_RESET_TIMEOUT_DEFAULT_MS = 300
+_PRE_ROLL_FRAMES_MIN = 1
+_PRE_ROLL_FRAMES_MAX = 4
+_PRE_ROLL_FRAMES_STEP = 1
+_PRE_ROLL_FRAMES_DEFAULT = 1
 _SILENCE_RESET_TIMEOUT_MIN_MS = 0
 _SILENCE_RESET_TIMEOUT_MAX_MS = 3000
 _SILENCE_RESET_TIMEOUT_STEP_MS = 300
@@ -127,6 +131,9 @@ _DEV_COMMAND_ACTIONS = {
     "set_silero_vad",
     "set_vad_detector",
     "set_auto_pre_roll",
+    "set_pre_roll_frames",
+    "set_num_pre_roll",
+    "set_num_pre_roll_frames",
     "set_noise_threshold",
     "set_noise_threshold_db",
 }
@@ -259,6 +266,9 @@ class VoiceDevCommandBody(BaseModel):
     speech_aggregation_timeout_ms: int | None = None
     vad_reset_timeout_ms: int | None = None
     reset_timeout_ms: int | None = None
+    pre_roll_frames: int | None = None
+    num_pre_roll: int | None = None
+    num_pre_roll_frames: int | None = None
     open_modal: bool = False
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
@@ -349,6 +359,7 @@ def _empty_state() -> dict[str, Any]:
             "stt": {
                 "speech_aggregation_timeout_ms": _AGGREGATION_TIMEOUT_DEFAULT_MS,
                 "vad_reset_timeout_ms": _VAD_RESET_TIMEOUT_DEFAULT_MS,
+                "pre_roll_frames": _PRE_ROLL_FRAMES_DEFAULT,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
         },
@@ -643,6 +654,13 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             minimum=_VAD_RESET_TIMEOUT_MIN_MS,
             maximum=_VAD_RESET_TIMEOUT_MAX_MS,
             step=_VAD_RESET_TIMEOUT_STEP_MS,
+        ),
+        "pre_roll_frames": _clean_int_step(
+            raw.get("pre_roll_frames", raw.get("num_pre_roll_frames", raw.get("num_pre_roll"))),
+            fallback=_PRE_ROLL_FRAMES_DEFAULT,
+            minimum=_PRE_ROLL_FRAMES_MIN,
+            maximum=_PRE_ROLL_FRAMES_MAX,
+            step=_PRE_ROLL_FRAMES_STEP,
         ),
         "silence_reset_timeout_ms": _clean_int_step(
             raw.get("silence_reset_timeout_ms"),
@@ -2473,6 +2491,9 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "speech_aggregation_timeout_ms": body.speech_aggregation_timeout_ms,
         "vad_reset_timeout_ms": body.vad_reset_timeout_ms,
         "reset_timeout_ms": body.reset_timeout_ms,
+        "pre_roll_frames": body.pre_roll_frames,
+        "num_pre_roll": body.num_pre_roll,
+        "num_pre_roll_frames": body.num_pre_roll_frames,
         "target_browser_id": target_browser_id,
         "target_tab_id": target_tab_id,
         "active_browser_id": active_browser_id,
