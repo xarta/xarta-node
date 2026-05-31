@@ -131,11 +131,15 @@ _DEV_COMMAND_ACTIONS = {
     "set_silero_vad",
     "set_vad_detector",
     "set_auto_pre_roll",
+    "set_always_pre_roll",
     "set_pre_roll_frames",
     "set_num_pre_roll",
     "set_num_pre_roll_frames",
     "set_noise_threshold",
     "set_noise_threshold_db",
+    "set_vad_pre_roll",
+    "set_vad_pre_roll_db",
+    "set_vad_pre_roll_threshold",
 }
 _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "hard_refresh",
@@ -258,10 +262,14 @@ class VoiceDevCommandBody(BaseModel):
     command_id: str | None = None
     value: Any | None = None
     enabled: bool | None = None
+    silero_vad_enabled: bool | None = None
+    auto_pre_roll_enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
     noise_threshold_db: float | None = None
     threshold_db: float | None = None
+    vad_pre_roll_db: float | None = None
+    vad_pre_roll_threshold_db: float | None = None
     aggregation_timeout_ms: int | None = None
     speech_aggregation_timeout_ms: int | None = None
     vad_reset_timeout_ms: int | None = None
@@ -269,6 +277,7 @@ class VoiceDevCommandBody(BaseModel):
     pre_roll_frames: int | None = None
     num_pre_roll: int | None = None
     num_pre_roll_frames: int | None = None
+    always_pre_roll_enabled: bool | None = None
     open_modal: bool = False
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
@@ -360,6 +369,8 @@ def _empty_state() -> dict[str, Any]:
                 "speech_aggregation_timeout_ms": _AGGREGATION_TIMEOUT_DEFAULT_MS,
                 "vad_reset_timeout_ms": _VAD_RESET_TIMEOUT_DEFAULT_MS,
                 "pre_roll_frames": _PRE_ROLL_FRAMES_DEFAULT,
+                "silero_vad_enabled": False,
+                "always_pre_roll_enabled": False,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
         },
@@ -662,6 +673,14 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             maximum=_PRE_ROLL_FRAMES_MAX,
             step=_PRE_ROLL_FRAMES_STEP,
         ),
+        "silero_vad_enabled": _clean_bool(
+            raw.get("silero_vad_enabled", raw.get("silero_enabled")),
+            fallback=False,
+        ),
+        "always_pre_roll_enabled": _clean_bool(
+            raw.get("always_pre_roll_enabled", raw.get("always_pre_roll")),
+            fallback=False,
+        ),
         "silence_reset_timeout_ms": _clean_int_step(
             raw.get("silence_reset_timeout_ms"),
             fallback=_SILENCE_RESET_TIMEOUT_DEFAULT_MS,
@@ -670,6 +689,14 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             step=_SILENCE_RESET_TIMEOUT_STEP_MS,
         ),
     }
+
+
+def _clean_bool(value: Any, *, fallback: bool = False) -> bool:
+    if value is None:
+        return bool(fallback)
+    if isinstance(value, bool):
+        return value
+    return _truthy(value)
 
 
 def _truthy(value: Any) -> bool:
@@ -2483,10 +2510,14 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "action": action,
         "value": body.value,
         "enabled": body.enabled,
+        "silero_vad_enabled": body.silero_vad_enabled,
+        "auto_pre_roll_enabled": body.auto_pre_roll_enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
         "noise_threshold_db": body.noise_threshold_db,
         "threshold_db": body.threshold_db,
+        "vad_pre_roll_db": body.vad_pre_roll_db,
+        "vad_pre_roll_threshold_db": body.vad_pre_roll_threshold_db,
         "aggregation_timeout_ms": body.aggregation_timeout_ms,
         "speech_aggregation_timeout_ms": body.speech_aggregation_timeout_ms,
         "vad_reset_timeout_ms": body.vad_reset_timeout_ms,
@@ -2494,6 +2525,7 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "pre_roll_frames": body.pre_roll_frames,
         "num_pre_roll": body.num_pre_roll,
         "num_pre_roll_frames": body.num_pre_roll_frames,
+        "always_pre_roll_enabled": body.always_pre_roll_enabled,
         "target_browser_id": target_browser_id,
         "target_tab_id": target_tab_id,
         "active_browser_id": active_browser_id,
