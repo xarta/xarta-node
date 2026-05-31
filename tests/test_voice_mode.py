@@ -54,68 +54,94 @@ def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 999}) == {
         "speech_aggregation_timeout_ms": 300,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 1}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 0,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 126}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 150,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 400}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 400,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 2000,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"pre_roll_frames": 3}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 3,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"num_pre_roll_frames": 99}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 4,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"num_pre_roll": 0}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 2100,
     }
     assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 1}) == {
         "speech_aggregation_timeout_ms": 80,
         "vad_reset_timeout_ms": 300,
         "pre_roll_frames": 1,
+        "silero_vad_enabled": False,
+        "always_pre_roll_enabled": False,
         "silence_reset_timeout_ms": 0,
     }
+    assert voice_mode._clean_stt_policy({"silero_vad_enabled": True})["silero_vad_enabled"] is True
+    assert voice_mode._clean_stt_policy({"silero_enabled": "yes"})["silero_vad_enabled"] is True
+    assert voice_mode._clean_stt_policy({"always_pre_roll_enabled": True})["always_pre_roll_enabled"] is True
+    assert voice_mode._clean_stt_policy({"always_pre_roll": "1"})["always_pre_roll_enabled"] is True
 
 
 def test_voice_mode_aggregation_proxy_payload_uses_seconds_for_pipecat():
@@ -151,16 +177,22 @@ def test_voice_dev_vad_detector_actions_are_allowed():
     assert voice_mode._clean_dev_command_action("set silero vad") == "set_silero_vad"
     assert voice_mode._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
     assert voice_mode._clean_dev_command_action("set auto pre roll") == "set_auto_pre_roll"
+    assert voice_mode._clean_dev_command_action("set always pre roll") == "set_always_pre_roll"
     assert voice_mode._clean_dev_command_action("set num pre roll") == "set_num_pre_roll"
     assert voice_mode._clean_dev_command_action("set-noise-threshold-db") == "set_noise_threshold_db"
+    assert voice_mode._clean_dev_command_action("set vad pre roll db") == "set_vad_pre_roll_db"
     assert "set_silero_vad" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_vad_detector" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_auto_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_always_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_pre_roll_frames" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_num_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_num_pre_roll_frames" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_noise_threshold" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_noise_threshold_db" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll_db" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll_threshold" in voice_mode._DEV_COMMAND_ACTIONS
 
 
 def test_active_browser_command_parameters_are_sanitized():
