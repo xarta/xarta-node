@@ -135,6 +135,10 @@ _DEV_COMMAND_ACTIONS = {
     "set_pre_roll_frames",
     "set_num_pre_roll",
     "set_num_pre_roll_frames",
+    "set_word_detection_aliases",
+    "set_word_detection_words",
+    "set_sense_word",
+    "set_sense_words",
     "set_noise_threshold",
     "set_noise_threshold_db",
     "set_vad_pre_roll",
@@ -278,6 +282,8 @@ class VoiceDevCommandBody(BaseModel):
     num_pre_roll: int | None = None
     num_pre_roll_frames: int | None = None
     always_pre_roll_enabled: bool | None = None
+    word_detection_aliases: str | None = None
+    sense_words: str | None = None
     open_modal: bool = False
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
@@ -2526,6 +2532,8 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "num_pre_roll": body.num_pre_roll,
         "num_pre_roll_frames": body.num_pre_roll_frames,
         "always_pre_roll_enabled": body.always_pre_roll_enabled,
+        "word_detection_aliases": body.word_detection_aliases,
+        "sense_words": body.sense_words,
         "target_browser_id": target_browser_id,
         "target_tab_id": target_tab_id,
         "active_browser_id": active_browser_id,
