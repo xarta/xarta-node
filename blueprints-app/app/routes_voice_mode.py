@@ -130,6 +130,8 @@ _DEV_COMMAND_ACTIONS = {
     "set_vad_reset_timeout",
     "set_silero_vad",
     "set_vad_detector",
+    "set_vad_interrupt_tts",
+    "set_vad_interrupt_tts_enabled",
     "set_auto_pre_roll",
     "set_always_pre_roll",
     "set_pre_roll_frames",
@@ -267,6 +269,7 @@ class VoiceDevCommandBody(BaseModel):
     value: Any | None = None
     enabled: bool | None = None
     silero_vad_enabled: bool | None = None
+    vad_interrupt_tts_enabled: bool | None = None
     auto_pre_roll_enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
@@ -376,6 +379,7 @@ def _empty_state() -> dict[str, Any]:
                 "vad_reset_timeout_ms": _VAD_RESET_TIMEOUT_DEFAULT_MS,
                 "pre_roll_frames": _PRE_ROLL_FRAMES_DEFAULT,
                 "silero_vad_enabled": False,
+                "vad_interrupt_tts_enabled": False,
                 "always_pre_roll_enabled": False,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
@@ -681,6 +685,10 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
         ),
         "silero_vad_enabled": _clean_bool(
             raw.get("silero_vad_enabled", raw.get("silero_enabled")),
+            fallback=False,
+        ),
+        "vad_interrupt_tts_enabled": _clean_bool(
+            raw.get("vad_interrupt_tts_enabled", raw.get("vad_interrupt_tts")),
             fallback=False,
         ),
         "always_pre_roll_enabled": _clean_bool(
@@ -2517,6 +2525,7 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "value": body.value,
         "enabled": body.enabled,
         "silero_vad_enabled": body.silero_vad_enabled,
+        "vad_interrupt_tts_enabled": body.vad_interrupt_tts_enabled,
         "auto_pre_roll_enabled": body.auto_pre_roll_enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
