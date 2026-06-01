@@ -76,6 +76,10 @@ _SILENCE_RESET_TIMEOUT_MIN_MS = 0
 _SILENCE_RESET_TIMEOUT_MAX_MS = 3000
 _SILENCE_RESET_TIMEOUT_STEP_MS = 300
 _SILENCE_RESET_TIMEOUT_DEFAULT_MS = 2100
+_WORD_DETECTION_PAYLOAD0_TIMEOUT_MIN_MS = 0
+_WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS = 3000
+_WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS = 300
+_WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS = 0
 _WAKE_DEBUG_STREAM_KEEPALIVE_SECONDS = 15.0
 _VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
 _ACTIVE_BROWSER_COMMAND_EVENT_TYPE = "blueprints.active_browser.command"
@@ -138,6 +142,10 @@ _DEV_COMMAND_ACTIONS = {
     "set_word_detection_prefix_partial_interrupt_tts_enabled",
     "set_word_detection_prefix_final_interrupt_tts",
     "set_word_detection_prefix_final_interrupt_tts_enabled",
+    "set_word_detection_payload0_timeout",
+    "set_word_detection_payload0_timeout_ms",
+    "set_vad_payload0_timeout",
+    "set_vad_payload0_timeout_ms",
     "set_auto_pre_roll",
     "set_always_pre_roll",
     "set_pre_roll_frames",
@@ -279,6 +287,8 @@ class VoiceDevCommandBody(BaseModel):
     word_detection_match_interrupt_tts_enabled: bool | None = None
     word_detection_prefix_partial_interrupt_tts_enabled: bool | None = None
     word_detection_prefix_final_interrupt_tts_enabled: bool | None = None
+    word_detection_payload0_timeout_ms: int | None = None
+    vad_payload0_timeout_ms: int | None = None
     auto_pre_roll_enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
@@ -392,6 +402,7 @@ def _empty_state() -> dict[str, Any]:
                 "word_detection_match_interrupt_tts_enabled": False,
                 "word_detection_prefix_partial_interrupt_tts_enabled": False,
                 "word_detection_prefix_final_interrupt_tts_enabled": False,
+                "word_detection_payload0_timeout_ms": _WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS,
                 "always_pre_roll_enabled": False,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
@@ -728,6 +739,16 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
         ),
         "word_detection_prefix_partial_interrupt_tts_enabled": prefix_partial_interrupt_tts,
         "word_detection_prefix_final_interrupt_tts_enabled": prefix_final_interrupt_tts,
+        "word_detection_payload0_timeout_ms": _clean_int_step(
+            raw.get(
+                "word_detection_payload0_timeout_ms",
+                raw.get("vad_payload0_timeout_ms", raw.get("payload0_timeout_ms")),
+            ),
+            fallback=_WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS,
+            minimum=_WORD_DETECTION_PAYLOAD0_TIMEOUT_MIN_MS,
+            maximum=_WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS,
+            step=_WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS,
+        ),
         "always_pre_roll_enabled": _clean_bool(
             raw.get("always_pre_roll_enabled", raw.get("always_pre_roll")),
             fallback=False,
@@ -2566,6 +2587,8 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "word_detection_match_interrupt_tts_enabled": body.word_detection_match_interrupt_tts_enabled,
         "word_detection_prefix_partial_interrupt_tts_enabled": body.word_detection_prefix_partial_interrupt_tts_enabled,
         "word_detection_prefix_final_interrupt_tts_enabled": body.word_detection_prefix_final_interrupt_tts_enabled,
+        "word_detection_payload0_timeout_ms": body.word_detection_payload0_timeout_ms,
+        "vad_payload0_timeout_ms": body.vad_payload0_timeout_ms,
         "auto_pre_roll_enabled": body.auto_pre_roll_enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
