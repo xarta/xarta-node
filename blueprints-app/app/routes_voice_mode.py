@@ -132,6 +132,12 @@ _DEV_COMMAND_ACTIONS = {
     "set_vad_detector",
     "set_vad_interrupt_tts",
     "set_vad_interrupt_tts_enabled",
+    "set_word_detection_match_interrupt_tts",
+    "set_word_detection_match_interrupt_tts_enabled",
+    "set_word_detection_prefix_partial_interrupt_tts",
+    "set_word_detection_prefix_partial_interrupt_tts_enabled",
+    "set_word_detection_prefix_final_interrupt_tts",
+    "set_word_detection_prefix_final_interrupt_tts_enabled",
     "set_auto_pre_roll",
     "set_always_pre_roll",
     "set_pre_roll_frames",
@@ -270,6 +276,9 @@ class VoiceDevCommandBody(BaseModel):
     enabled: bool | None = None
     silero_vad_enabled: bool | None = None
     vad_interrupt_tts_enabled: bool | None = None
+    word_detection_match_interrupt_tts_enabled: bool | None = None
+    word_detection_prefix_partial_interrupt_tts_enabled: bool | None = None
+    word_detection_prefix_final_interrupt_tts_enabled: bool | None = None
     auto_pre_roll_enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
@@ -380,6 +389,9 @@ def _empty_state() -> dict[str, Any]:
                 "pre_roll_frames": _PRE_ROLL_FRAMES_DEFAULT,
                 "silero_vad_enabled": False,
                 "vad_interrupt_tts_enabled": False,
+                "word_detection_match_interrupt_tts_enabled": False,
+                "word_detection_prefix_partial_interrupt_tts_enabled": False,
+                "word_detection_prefix_final_interrupt_tts_enabled": False,
                 "always_pre_roll_enabled": False,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
@@ -661,6 +673,22 @@ def _clean_wake_to_talk_policy(value: Any) -> dict[str, Any]:
 
 def _clean_stt_policy(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
+    prefix_partial_interrupt_tts = _clean_bool(
+        raw.get(
+            "word_detection_prefix_partial_interrupt_tts_enabled",
+            raw.get("match_prefix_partial_interrupt_tts"),
+        ),
+        fallback=False,
+    )
+    prefix_final_interrupt_tts = _clean_bool(
+        raw.get(
+            "word_detection_prefix_final_interrupt_tts_enabled",
+            raw.get("match_prefix_final_interrupt_tts"),
+        ),
+        fallback=False,
+    )
+    if prefix_partial_interrupt_tts and prefix_final_interrupt_tts:
+        prefix_partial_interrupt_tts = False
     return {
         "speech_aggregation_timeout_ms": _clean_int_step(
             raw.get("speech_aggregation_timeout_ms"),
@@ -691,6 +719,15 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             raw.get("vad_interrupt_tts_enabled", raw.get("vad_interrupt_tts")),
             fallback=False,
         ),
+        "word_detection_match_interrupt_tts_enabled": _clean_bool(
+            raw.get(
+                "word_detection_match_interrupt_tts_enabled",
+                raw.get("match_interrupt_tts"),
+            ),
+            fallback=False,
+        ),
+        "word_detection_prefix_partial_interrupt_tts_enabled": prefix_partial_interrupt_tts,
+        "word_detection_prefix_final_interrupt_tts_enabled": prefix_final_interrupt_tts,
         "always_pre_roll_enabled": _clean_bool(
             raw.get("always_pre_roll_enabled", raw.get("always_pre_roll")),
             fallback=False,
@@ -2526,6 +2563,9 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "enabled": body.enabled,
         "silero_vad_enabled": body.silero_vad_enabled,
         "vad_interrupt_tts_enabled": body.vad_interrupt_tts_enabled,
+        "word_detection_match_interrupt_tts_enabled": body.word_detection_match_interrupt_tts_enabled,
+        "word_detection_prefix_partial_interrupt_tts_enabled": body.word_detection_prefix_partial_interrupt_tts_enabled,
+        "word_detection_prefix_final_interrupt_tts_enabled": body.word_detection_prefix_final_interrupt_tts_enabled,
         "auto_pre_roll_enabled": body.auto_pre_roll_enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
