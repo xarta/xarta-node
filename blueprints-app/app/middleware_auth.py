@@ -10,6 +10,8 @@ Two protection layers applied in order to every inbound request:
    HMAC-SHA256 token derived from the appropriate secret:
      • /api/v1/sync/* routes  →  BLUEPRINTS_SYNC_SECRET
      • all other routes        →  BLUEPRINTS_API_SECRET
+     • narrow TTS/Voice routes →  BLUEPRINTS_TTS_SERVICE_SECRET, when sent as
+                                  X-Blueprints-TTS-Token
 
 Exempt paths (no token required): /health, anything under /ui, and narrow
 read/search endpoints intended for local AI agents. The IP allowlist still
@@ -68,6 +70,16 @@ _SYNC_PREFIX = "/api/v1/sync/"
 # Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
 # All other sync routes (status, git-pull, gui/*) are browser-accessible and accept either secret.
 _SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
+# Route-scoped service-auth surface for remote Hermes TTS companions. These
+# tokens cannot access the rest of the Blueprints API.
+_TTS_SERVICE_ROUTES = frozenset(
+    {
+        ("GET", "/api/v1/voice-mode/status"),
+        ("GET", "/api/v1/tts/status"),
+        ("POST", "/api/v1/tts/utterances"),
+        ("POST", "/api/v1/tts/stop"),
+    }
+)
 # Bookmarks endpoints that are auth-exempt (aggregate/non-sensitive data, open CORS for extension).
 _BOOKMARKS_OPEN_PATHS = frozenset(
     {
@@ -92,6 +104,10 @@ def _is_token_exempt_path(path: str) -> bool:
     return path in _TOKEN_EXEMPT_PATHS or any(
         path.startswith(prefix) for prefix in _TOKEN_EXEMPT_PREFIXES
     )
+
+
+def _is_tts_service_route(method: str, path: str) -> bool:
+    return (method.upper(), path) in _TTS_SERVICE_ROUTES
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -123,6 +139,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             token = request.headers.get("x-api-token", "")
             if not token:
                 token = request.query_params.get("token", "")
+
+            if _is_tts_service_route(request.method, path):
+                tts_token = request.headers.get("x-blueprints-tts-token", "")
+                if cfg.TTS_SERVICE_SECRET and verify_token(
+                    cfg.TTS_SERVICE_SECRET,
+                    tts_token,
+                ):
+                    return await call_next(request)
 
             if any(path.startswith(p) for p in _SYNC_WRITE_PATHS):
                 # Node-to-node sync writes: SYNC_SECRET only.
