@@ -14,8 +14,8 @@ from urllib.parse import urlparse
 
 import httpx
 import websockets
-from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, WebSocket
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .db import get_conn, get_setting
@@ -37,7 +37,6 @@ def _bounded_int_env(name: str, fallback: int, minimum: int, maximum: int) -> in
 
 
 _STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-voice-mode.json")
-_WAKE_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-to-talk-debug.json")
 _WAKE_DEV_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-dev-debug.json")
 _state_lock = asyncio.Lock()
 _dependency_health_lock = asyncio.Lock()
@@ -80,7 +79,6 @@ _WORD_DETECTION_PAYLOAD0_TIMEOUT_MIN_MS = 0
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS = 3000
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS = 300
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS = 0
-_WAKE_DEBUG_STREAM_KEEPALIVE_SECONDS = 15.0
 _VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
 _ACTIVE_BROWSER_COMMAND_EVENT_TYPE = "blueprints.active_browser.command"
 _BROWSER_VIEW_MAX_REPORTS = 32
@@ -110,9 +108,6 @@ _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
     "standard_landscape_max_aspect": 1.85,
     "widescreen_min_aspect": 1.86,
 }
-_wake_debug_stream_lock = asyncio.Lock()
-_wake_debug_subscribers: dict[int, asyncio.Queue[str]] = {}
-_wake_debug_stream_sequence = 0
 _DEV_COMMAND_SURFACES = {"wake_dev", "vad_dev"}
 _DEV_COMMAND_MODES = {"manual", "vad", "vad_rearm"}
 _DEV_COMMAND_ACTIONS = {
@@ -236,41 +231,6 @@ class AggregationTimeoutBody(BaseModel):
         ge=_AGGREGATION_TIMEOUT_MIN_MS,
         le=_AGGREGATION_TIMEOUT_MAX_MS,
     )
-
-
-class WakeDebugBody(BaseModel):
-    browser_id: str
-    browser_label: str | None = None
-    tab_id: str | None = None
-    running: bool = False
-    starting: bool = False
-    reason: str | None = None
-    fsm_state: str | None = None
-    session_id: int | None = None
-    active_instance_id: str | None = None
-    active_send: dict[str, Any] | None = None
-    queues: dict[str, Any] | None = None
-    transcript: str | None = None
-    frozen_send_snapshot: dict[str, Any] | None = None
-    command_diagnostics: dict[str, Any] | None = None
-    last_action: dict[str, Any] | None = None
-    recent_actions: list[dict[str, Any]] | None = None
-    recent_stt_events: list[dict[str, Any]] | None = None
-    stream_epoch: int | None = None
-    audio_frames_sent: int | None = None
-    audio_frames_captured: int | None = None
-    audio_timing: dict[str, Any] | None = None
-    stt_reset_pending_reason: str | None = None
-    stt_speech_start_reset_pending: bool = False
-    vad_speech_start_reset_armed: bool = False
-    audio_delay_frames: int | None = None
-    audio_candidate_frames: int | None = None
-    stt_delay_frames: int | None = None
-    stt_segment_active: bool = False
-    stt_segment: dict[str, Any] | None = None
-    audio_features: dict[str, Any] | None = None
-    vad: dict[str, Any] | None = None
-    client_now_ms: float | None = None
 
 
 class VoiceDevCommandBody(BaseModel):
@@ -547,14 +507,26 @@ def _clean_int_step(
 
 def _wake_aliases(wake_word: str, configured: Any = None) -> list[str]:
     aliases: list[str] = []
-    for value in [wake_word, *(configured if isinstance(configured, list) else [])]:
-        normalized = " ".join(str(value or "").strip().lower().replace("-", " ").split())
+    values: list[Any] = []
+    values.extend(str(wake_word or "").split(";"))
+    if isinstance(configured, list):
+        values.extend(configured)
+    for value in values:
+        normalized = " ".join(
+            str(value or "")
+            .strip()
+            .lower()
+            .replace("-", " ")
+            .replace(",", " ")
+            .replace(".", " ")
+            .split()
+        )
         compact = normalized.replace(" ", "")
         hyphenated = normalized.replace(" ", "-")
         for candidate in (normalized, compact, hyphenated):
             if candidate and candidate not in aliases:
                 aliases.append(candidate)
-    return aliases[:8]
+    return aliases[:16]
 
 
 def _default_wake_instance(
@@ -572,14 +544,12 @@ def _default_wake_instance(
         "wake_word": wake_word,
         "wake_aliases": _wake_aliases(wake_word),
         "hermes_prefix": hermes_prefix,
-        "post_wake_pause_ms": 500,
-        "initial_silence_cancel_ms": 1000,
-        "pause_reset_seconds": 30,
         "auto_execute_silence_ms": 0,
+        "execute_cancel_ms": 0,
         "commands": {
             "pause": "pause-dictation",
-            "resume": "resume-dictation",
             "execute": "execute",
+            "resume": "resume-dictation",
             "cancel": "cancel-dictation",
         },
     }
@@ -589,13 +559,13 @@ def _default_wake_to_talk_policy() -> dict[str, Any]:
     return {
         "instances": {
             "local": _default_wake_instance(
-                label="local",
+                label="hermes-local",
                 matrix_server="tb1",
                 wake_word="Computer",
                 hermes_prefix="hermes: ",
             ),
             "vps": _default_wake_instance(
-                label="vps",
+                label="hermes-VPS",
                 matrix_server="vps",
                 wake_word="Mini-Me",
                 hermes_prefix="hermes-vps: ",
@@ -608,13 +578,12 @@ def _clean_wake_command_map(value: Any) -> dict[str, str]:
     commands = value if isinstance(value, dict) else {}
     defaults = {
         "pause": "pause-dictation",
-        "resume": "resume-dictation",
         "execute": "execute",
+        "resume": "resume-dictation",
         "cancel": "cancel-dictation",
     }
     return {
-        key: _clean_string(commands.get(key), fallback, 80)
-        for key, fallback in defaults.items()
+        key: _clean_string(commands.get(key), fallback, 80) for key, fallback in defaults.items()
     }
 
 
@@ -622,16 +591,32 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
     defaults = _default_wake_to_talk_policy()["instances"][instance_id]
     raw = value if isinstance(value, dict) else {}
     matrix_server = _clean_string(raw.get("matrix_server"), defaults["matrix_server"], 16).lower()
-    if matrix_server not in {"tb1", "vps"}:
+    if matrix_server not in {"tb1", "vps"} or matrix_server != defaults["matrix_server"]:
         matrix_server = defaults["matrix_server"]
-    wake_word = _clean_string(raw.get("wake_word"), defaults["wake_word"], 80)
+    wake_word = _clean_string(raw.get("wake_word"), defaults["wake_word"], 160)
     auto_execute_raw = raw.get("auto_execute_silence_ms", defaults["auto_execute_silence_ms"])
-    auto_execute = 0 if str(auto_execute_raw).strip() in {"", "0", "false", "off", "disabled"} else _clean_int_step(
-        auto_execute_raw,
-        fallback=defaults["auto_execute_silence_ms"] or 300,
-        minimum=300,
-        maximum=3000,
-        step=300,
+    auto_execute = (
+        0
+        if str(auto_execute_raw).strip() in {"", "0", "false", "off", "disabled"}
+        else _clean_int_step(
+            auto_execute_raw,
+            fallback=defaults["auto_execute_silence_ms"] or 300,
+            minimum=300,
+            maximum=3000,
+            step=300,
+        )
+    )
+    execute_cancel_raw = raw.get("execute_cancel_ms", defaults["execute_cancel_ms"])
+    execute_cancel = (
+        0
+        if str(execute_cancel_raw).strip() in {"", "0", "false", "off", "disabled"}
+        else _clean_int_step(
+            execute_cancel_raw,
+            fallback=defaults["execute_cancel_ms"] or 300,
+            minimum=300,
+            maximum=3000,
+            step=300,
+        )
     )
     return {
         # Wake instance activation is controlled by the browser's Wake-to-Talk
@@ -639,34 +624,14 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         # compatibility with earlier persisted settings, but do not expose it
         # as a second user-facing enable switch.
         "enabled": True,
-        "label": _clean_string(raw.get("label"), defaults["label"], 40),
+        "label": defaults["label"],
         "matrix_server": matrix_server,
         "matrix_room_id": _clean_string(raw.get("matrix_room_id"), defaults["matrix_room_id"], 255),
         "wake_word": wake_word,
         "wake_aliases": _wake_aliases(wake_word, raw.get("wake_aliases")),
         "hermes_prefix": _clean_hermes_prefix(raw.get("hermes_prefix"), defaults["hermes_prefix"]),
-        "post_wake_pause_ms": _clean_int_step(
-            raw.get("post_wake_pause_ms"),
-            fallback=defaults["post_wake_pause_ms"],
-            minimum=0,
-            maximum=2000,
-            step=50,
-        ),
-        "initial_silence_cancel_ms": _clean_int_step(
-            raw.get("initial_silence_cancel_ms"),
-            fallback=defaults["initial_silence_cancel_ms"],
-            minimum=0,
-            maximum=2000,
-            step=50,
-        ),
-        "pause_reset_seconds": _clean_int_step(
-            raw.get("pause_reset_seconds"),
-            fallback=defaults["pause_reset_seconds"],
-            minimum=5,
-            maximum=120,
-            step=5,
-        ),
         "auto_execute_silence_ms": auto_execute,
+        "execute_cancel_ms": execute_cancel,
         "commands": _clean_wake_command_map(raw.get("commands")),
     }
 
@@ -836,7 +801,9 @@ def _component(
     }
 
 
-async def _probe_http_json(url: str, timeout_seconds: float = _PROBE_TIMEOUT_SECONDS) -> dict[str, Any]:
+async def _probe_http_json(
+    url: str, timeout_seconds: float = _PROBE_TIMEOUT_SECONDS
+) -> dict[str, Any]:
     if not url:
         return {"ok": False, "status": "unconfigured", "error": "unconfigured"}
     try:
@@ -874,7 +841,9 @@ def _health_body_issue(probe: dict[str, Any], label: str) -> str:
     return ""
 
 
-async def _probe_websocket_open(url: str, timeout_seconds: float = _PROBE_TIMEOUT_SECONDS) -> dict[str, Any]:
+async def _probe_websocket_open(
+    url: str, timeout_seconds: float = _PROBE_TIMEOUT_SECONDS
+) -> dict[str, Any]:
     if not url:
         return {"ok": False, "status": "unconfigured", "error": "unconfigured"}
     try:
@@ -888,11 +857,21 @@ async def _probe_websocket_open(url: str, timeout_seconds: float = _PROBE_TIMEOU
             await ws.send(json.dumps({"type": "config", "sample_rate": 16000}))
             ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout_seconds))
             if ack.get("type") != "config_ack":
-                return {"ok": False, "status": "bad_response", "error": "bad config response", "body": ack}
+                return {
+                    "ok": False,
+                    "status": "bad_response",
+                    "error": "bad config response",
+                    "body": ack,
+                }
             await ws.send(json.dumps({"type": "ping"}))
             pong = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout_seconds))
             if pong.get("type") != "pong":
-                return {"ok": False, "status": "bad_response", "error": "bad ping response", "body": pong}
+                return {
+                    "ok": False,
+                    "status": "bad_response",
+                    "error": "bad ping response",
+                    "body": pong,
+                }
             with contextlib.suppress(Exception):
                 await ws.send(json.dumps({"type": "end"}))
         return {"ok": True, "status": "ready", "body": ack}
@@ -952,7 +931,11 @@ async def _pve_lxc_status(machine: dict[str, Any]) -> dict[str, Any]:
             "issue": "lxc api offline",
             "detail": {"lxc": lxc, "lxc_api": pve_health, "gpu_monitor": gpu_health},
         }
-    return {"ok": False, "issue": f"{lxc_label} status unknown", "detail": {"lxc": lxc, "lxc_api": pve_health}}
+    return {
+        "ok": False,
+        "issue": f"{lxc_label} status unknown",
+        "detail": {"lxc": lxc, "lxc_api": pve_health},
+    }
 
 
 async def _active_mode_stack_status(names: set[str], machine: dict[str, Any]) -> dict[str, Any]:
@@ -976,7 +959,11 @@ async def _active_mode_stack_status(names: set[str], machine: dict[str, Any]) ->
                     "issue": "noise reduction stack offline",
                     "detail": {"stack": stack, "modes": {"active_mode": active_mode}},
                 }
-            return {"ok": True, "issue": "", "detail": {"stack": stack, "modes": {"active_mode": active_mode}}}
+            return {
+                "ok": True,
+                "issue": "",
+                "detail": {"stack": stack, "modes": {"active_mode": active_mode}},
+            }
     return {"ok": False, "issue": "", "detail": {"modes": {"active_mode": active_mode}}}
 
 
@@ -1021,7 +1008,9 @@ async def _tts_component() -> dict[str, Any]:
     probe = await _probe_http_json(probe_url, timeout_seconds=2.0)
     if probe.get("ok"):
         if issue := _health_body_issue(probe, "TTS stack"):
-            return _component("tts", "TTS", issue=issue, detail={"probe_url": probe_url, "probe": probe})
+            return _component(
+                "tts", "TTS", issue=issue, detail={"probe_url": probe_url, "probe": probe}
+            )
         return _component("tts", "TTS", ok=True, detail={"probe_url": probe_url, "probe": probe})
 
     host = _url_host(probe_url)
@@ -1046,8 +1035,18 @@ async def _stt_component(settings: dict[str, str]) -> dict[str, Any]:
     probe = await _probe_http_json(health_url)
     if probe.get("ok"):
         if issue := _health_body_issue(probe, "STT"):
-            return _component("stt", "STT", issue=issue, detail={"ws_url": ws_url, "health_url": health_url, "probe": probe})
-        return _component("stt", "STT", ok=True, detail={"ws_url": ws_url, "health_url": health_url, "probe": probe})
+            return _component(
+                "stt",
+                "STT",
+                issue=issue,
+                detail={"ws_url": ws_url, "health_url": health_url, "probe": probe},
+            )
+        return _component(
+            "stt",
+            "STT",
+            ok=True,
+            detail={"ws_url": ws_url, "health_url": health_url, "probe": probe},
+        )
 
     machine = _machine_for_host(_url_host(ws_url))
     diagnostic = {"ws_url": ws_url, "health_url": health_url, "probe": probe, "machine": machine}
@@ -1086,11 +1085,15 @@ async def _noise_component(settings: dict[str, str], *, deep_probe: bool = False
     parent = await _pve_lxc_status(machine) if machine else {"ok": False, "issue": "", "detail": {}}
     diagnostic.update(parent.get("detail") or {})
     if parent.get("issue"):
-        return _component("noise_reduction", "Noise reduction", issue=parent["issue"], detail=diagnostic)
+        return _component(
+            "noise_reduction", "Noise reduction", issue=parent["issue"], detail=diagnostic
+        )
     stack = await _active_mode_stack_status(_NOISE_STACK_NAMES, machine)
     diagnostic.update(stack.get("detail") or {})
     if stack.get("issue"):
-        return _component("noise_reduction", "Noise reduction", issue=stack["issue"], detail=diagnostic)
+        return _component(
+            "noise_reduction", "Noise reduction", issue=stack["issue"], detail=diagnostic
+        )
     if stack.get("ok"):
         return _component(
             "noise_reduction",
@@ -1099,7 +1102,11 @@ async def _noise_component(settings: dict[str, str], *, deep_probe: bool = False
             status="ready",
             detail=diagnostic,
         )
-    issue = "noise reduction websocket probe failed" if deep_probe else "noise reduction stack status unknown"
+    issue = (
+        "noise reduction websocket probe failed"
+        if deep_probe
+        else "noise reduction stack status unknown"
+    )
     return _component("noise_reduction", "Noise reduction", issue=issue, detail=diagnostic)
 
 
@@ -1132,7 +1139,9 @@ async def _build_dependency_health(*, deep_noise_probe: bool = False) -> dict[st
     }
 
 
-async def _dependency_health_payload(force: bool = False, *, deep_noise_probe: bool = False) -> dict[str, Any]:
+async def _dependency_health_payload(
+    force: bool = False, *, deep_noise_probe: bool = False
+) -> dict[str, Any]:
     now = time.time()
     async with _dependency_health_lock:
         cached = _dependency_health_cache.get("payload")
@@ -1145,16 +1154,17 @@ async def _dependency_health_payload(force: bool = False, *, deep_noise_probe: b
             return payload
         payload = await _build_dependency_health(deep_noise_probe=deep_noise_probe)
         if not deep_noise_probe:
-            _dependency_health_cache.update({
-                "payload": payload,
-                "checked_at": payload["checked_at"],
-                "next_check_seconds": payload["next_check_seconds"],
-            })
+            _dependency_health_cache.update(
+                {
+                    "payload": payload,
+                    "checked_at": payload["checked_at"],
+                    "next_check_seconds": payload["next_check_seconds"],
+                }
+            )
         payload = dict(payload)
         payload["cached"] = False
         payload["cache_age_seconds"] = 0
         return payload
-
 
 
 def _clean_policy(value: Any) -> dict[str, Any]:
@@ -1193,29 +1203,6 @@ def _write_state_unlocked(state: dict[str, Any]) -> None:
     tmp = _STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(_STATE_PATH)
-
-
-def _read_wake_debug_unlocked() -> dict[str, Any]:
-    try:
-        raw = json.loads(_WAKE_DEBUG_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"reports": {}, "updated_at": 0.0}
-    except Exception:
-        return {"reports": {}, "updated_at": 0.0}
-    if not isinstance(raw, dict):
-        return {"reports": {}, "updated_at": 0.0}
-    reports = raw.get("reports") if isinstance(raw.get("reports"), dict) else {}
-    return {
-        "reports": reports,
-        "updated_at": float(raw.get("updated_at") or 0.0),
-    }
-
-
-def _write_wake_debug_unlocked(debug: dict[str, Any]) -> None:
-    _WAKE_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _WAKE_DEBUG_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(debug, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(_WAKE_DEBUG_PATH)
 
 
 def _read_wake_dev_debug_unlocked() -> dict[str, Any]:
@@ -1277,8 +1264,12 @@ def _clean_viewport_int(value: Any, *, maximum: int = 20000) -> int:
 def _clean_browser_viewport(raw: Any) -> dict[str, Any]:
     viewport = raw if isinstance(raw, dict) else {}
     screen = viewport.get("screen") if isinstance(viewport.get("screen"), dict) else {}
-    visual = viewport.get("visualViewport") if isinstance(viewport.get("visualViewport"), dict) else {}
-    orientation = viewport.get("orientation") if isinstance(viewport.get("orientation"), dict) else {}
+    visual = (
+        viewport.get("visualViewport") if isinstance(viewport.get("visualViewport"), dict) else {}
+    )
+    orientation = (
+        viewport.get("orientation") if isinstance(viewport.get("orientation"), dict) else {}
+    )
     pointer = viewport.get("pointer") if isinstance(viewport.get("pointer"), dict) else {}
 
     return {
@@ -1343,8 +1334,14 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
     landscape = width >= height
     aspect = round(width / height, 4) if height else 0.0
     screen_short = min(int(screen.get("width") or 0), int(screen.get("height") or 0))
-    effective_short = min(value for value in [short_side, screen_short] if value > 0) if screen_short else short_side
-    touch_like = bool(pointer.get("coarse") or pointer.get("touch") or int(pointer.get("maxTouchPoints") or 0) > 0)
+    effective_short = (
+        min(value for value in [short_side, screen_short] if value > 0)
+        if screen_short
+        else short_side
+    )
+    touch_like = bool(
+        pointer.get("coarse") or pointer.get("touch") or int(pointer.get("maxTouchPoints") or 0) > 0
+    )
     thresholds = _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS
     mobile = bool(
         (
@@ -1361,7 +1358,9 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
         not mobile
         and landscape
         and width >= thresholds["desktop_min_landscape_width_px"]
-        and thresholds["standard_landscape_min_aspect"] <= aspect <= thresholds["standard_landscape_max_aspect"]
+        and thresholds["standard_landscape_min_aspect"]
+        <= aspect
+        <= thresholds["standard_landscape_max_aspect"]
     )
     widescreen = bool(
         not mobile
@@ -1477,23 +1476,32 @@ def _clean_active_browser_menu_capability(menu: Any) -> dict[str, Any] | None:
     if not group:
         return None
     pages = [
-        clean for clean in (
+        clean
+        for clean in (
             _clean_active_browser_page_capability(item)
             for item in (menu.get("pages") if isinstance(menu.get("pages"), list) else [])
         )
         if clean
     ][:120]
     function_items = [
-        clean for clean in (
+        clean
+        for clean in (
             _clean_active_browser_function_capability(item)
-            for item in (menu.get("function_items") if isinstance(menu.get("function_items"), list) else [])
+            for item in (
+                menu.get("function_items") if isinstance(menu.get("function_items"), list) else []
+            )
         )
         if clean
     ][:160]
     current_functions = [
-        clean for clean in (
+        clean
+        for clean in (
             _clean_active_browser_function_capability(item)
-            for item in (menu.get("current_functions") if isinstance(menu.get("current_functions"), list) else [])
+            for item in (
+                menu.get("current_functions")
+                if isinstance(menu.get("current_functions"), list)
+                else []
+            )
         )
         if clean
     ][:48]
@@ -1528,24 +1536,34 @@ def _clean_active_browser_selector_capability(item: Any) -> dict[str, Any] | Non
     return {
         "action": action,
         "label": _clean_string(item.get("label"), "", 120),
-        "bridge_group": _clean_active_browser_group(item.get("bridge_group") or item.get("bridgeGroup")),
+        "bridge_group": _clean_active_browser_group(
+            item.get("bridge_group") or item.get("bridgeGroup")
+        ),
     }
 
 
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     menus = [
-        clean for clean in (
+        clean
+        for clean in (
             _clean_active_browser_menu_capability(item)
-            for item in (automation.get("menus") if isinstance(automation.get("menus"), list) else [])
+            for item in (
+                automation.get("menus") if isinstance(automation.get("menus"), list) else []
+            )
         )
         if clean
     ][:8]
     current_menu = _clean_active_browser_menu_capability(automation.get("current_menu"))
     selector_actions = [
-        clean for clean in (
+        clean
+        for clean in (
             _clean_active_browser_selector_capability(item)
-            for item in (automation.get("selector_actions") if isinstance(automation.get("selector_actions"), list) else [])
+            for item in (
+                automation.get("selector_actions")
+                if isinstance(automation.get("selector_actions"), list)
+                else []
+            )
         )
         if clean
     ][:80]
@@ -1571,11 +1589,13 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         modal_id = _clean_string(modal.get("id"), "", 120)
         if not modal_id:
             continue
-        modals.append({
-            "id": modal_id,
-            "label": _clean_string(modal.get("label"), "", 120),
-            "open": bool(modal.get("open")),
-        })
+        modals.append(
+            {
+                "id": modal_id,
+                "label": _clean_string(modal.get("label"), "", 120),
+                "open": bool(modal.get("open")),
+            }
+        )
         if len(modals) >= 24:
             break
 
@@ -1587,7 +1607,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "app": _clean_string(frontend.get("app"), "", 80),
         "asset_version": _clean_string(frontend.get("asset_version"), "", 160),
         "cache_mode": _clean_string(frontend.get("cache_mode"), "", 40),
-        "service_worker_cache_version": _clean_string(frontend.get("service_worker_cache_version"), "", 120),
+        "service_worker_cache_version": _clean_string(
+            frontend.get("service_worker_cache_version"), "", 120
+        ),
         "service_worker_controller": bool(frontend.get("service_worker_controller")),
         "service_worker_state": _clean_string(frontend.get("service_worker_state"), "", 40),
     }
@@ -1602,7 +1624,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
             "loading": bool(page.get("loading")),
             "ready": bool(page.get("ready")),
             "api_in_flight": _clean_browser_page_int(page.get("api_in_flight"), maximum=1000),
-            "api_quiet_for_ms": _clean_browser_page_int(page.get("api_quiet_for_ms"), maximum=600000),
+            "api_quiet_for_ms": _clean_browser_page_int(
+                page.get("api_quiet_for_ms"), maximum=600000
+            ),
             "api_sequence": _clean_browser_page_int(page.get("api_sequence"), maximum=1000000000),
         },
         "modals": modals,
@@ -1653,7 +1677,9 @@ def _annotate_browser_view(report: dict[str, Any] | None) -> dict[str, Any] | No
     expected_asset = _clean_string(expected.get("asset_version"), "", 180)
     public["frontend"] = frontend
     public["frontend_expected"] = expected
-    public["frontend_asset_version_match"] = bool(reported_asset and expected_asset and reported_asset == expected_asset)
+    public["frontend_asset_version_match"] = bool(
+        reported_asset and expected_asset and reported_asset == expected_asset
+    )
     return public
 
 
@@ -1680,20 +1706,26 @@ def _annotate_browser_client(
     fresh = bool(age is not None and age <= max_age)
     report_browser_id = _clean_browser_id(public.get("browser_id"))
     report_tab_id = _clean_string(public.get("tab_id"), "", 120)
-    active_browser_id = _clean_browser_id(active.get("browser_id") if isinstance(active, dict) else "")
+    active_browser_id = _clean_browser_id(
+        active.get("browser_id") if isinstance(active, dict) else ""
+    )
     active_tab_id = _clean_string(active.get("tab_id") if isinstance(active, dict) else "", "", 120)
     active_browser = bool(active_browser_id and report_browser_id == active_browser_id)
     active_tab = bool(active_browser and (not active_tab_id or active_tab_id == report_tab_id))
-    public.update({
-        "client_key": _browser_view_key(public),
-        "server_now": timestamp,
-        "age_seconds": age,
-        "fresh": fresh,
-        "stale": not fresh,
-        "active_browser": active_browser,
-        "active_tab": active_tab,
-        "lease_status": "active_tab" if active_tab else ("active_browser" if active_browser else "inactive"),
-    })
+    public.update(
+        {
+            "client_key": _browser_view_key(public),
+            "server_now": timestamp,
+            "age_seconds": age,
+            "fresh": fresh,
+            "stale": not fresh,
+            "active_browser": active_browser,
+            "active_tab": active_tab,
+            "lease_status": "active_tab"
+            if active_tab
+            else ("active_browser" if active_browser else "inactive"),
+        }
+    )
     return public
 
 
@@ -1737,7 +1769,8 @@ def _find_browser_client_report(
     if not clean_browser_id:
         return None, "Missing browser_id"
     clients = [
-        client for client in _browser_client_inventory(state, now=now, max_age_seconds=max_age_seconds)
+        client
+        for client in _browser_client_inventory(state, now=now, max_age_seconds=max_age_seconds)
         if _clean_browser_id(client.get("browser_id")) == clean_browser_id
         and (not clean_tab_id or _clean_string(client.get("tab_id"), "", 120) == clean_tab_id)
     ]
@@ -1759,7 +1792,9 @@ def _public_browser_clients(
     clients = _browser_client_inventory(state, now=now, max_age_seconds=max_age)
     return {
         "ok": True,
-        "active": _public_active(state.get("active") if isinstance(state.get("active"), dict) else None),
+        "active": _public_active(
+            state.get("active") if isinstance(state.get("active"), dict) else None
+        ),
         "clients": clients,
         "count": len(clients),
         "fresh_count": sum(1 for client in clients if client.get("fresh")),
@@ -1780,9 +1815,13 @@ def _selected_active_browser_view(state: dict[str, Any]) -> dict[str, Any] | Non
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
     candidates = [
-        report for report in reports.values()
+        report
+        for report in reports.values()
         if isinstance(report, dict)
-        and (not active_browser_id or _clean_browser_id(report.get("browser_id")) == active_browser_id)
+        and (
+            not active_browser_id
+            or _clean_browser_id(report.get("browser_id")) == active_browser_id
+        )
     ]
     if not candidates:
         return None
@@ -1814,7 +1853,9 @@ def _public_active_browser_view(state: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "ok": True,
-        "active": _public_active(state.get("active") if isinstance(state.get("active"), dict) else None),
+        "active": _public_active(
+            state.get("active") if isinstance(state.get("active"), dict) else None
+        ),
         "view": _annotate_browser_view(_selected_active_browser_view(state)),
         "reports": [report for report in recent if report][:10],
         "clients": clients[:10],
@@ -1830,12 +1871,16 @@ def _public_active_browser_view(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _store_browser_view_report_unlocked(state: dict[str, Any], report: dict[str, Any], now: float) -> bool:
+def _store_browser_view_report_unlocked(
+    state: dict[str, Any], report: dict[str, Any], now: float
+) -> bool:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
     reports[_browser_view_key(report)] = report
     sorted_items = sorted(
         reports.items(),
-        key=lambda item: float(item[1].get("reported_at") or 0.0) if isinstance(item[1], dict) else 0.0,
+        key=lambda item: (
+            float(item[1].get("reported_at") or 0.0) if isinstance(item[1], dict) else 0.0
+        ),
         reverse=True,
     )
     state["browser_views"] = dict(sorted_items[:_BROWSER_VIEW_MAX_REPORTS])
@@ -1867,20 +1912,6 @@ def _store_browser_view_report_unlocked(state: dict[str, Any], report: dict[str,
     return changed
 
 
-def _selected_wake_debug_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
-    active = state.get("active") if isinstance(state.get("active"), dict) else None
-    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
-    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-    selected = reports.get(active_browser_id) if active_browser_id else None
-    if not isinstance(selected, dict) and reports and not active_browser_id:
-        selected = max(
-            (report for report in reports.values() if isinstance(report, dict)),
-            key=lambda item: float(item.get("reported_at") or 0.0),
-            default=None,
-        )
-    return selected if isinstance(selected, dict) else None
-
-
 def _selected_browser_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
@@ -1907,43 +1938,6 @@ def _public_active(active: dict[str, Any] | None) -> dict[str, Any] | None:
     return public_active
 
 
-def _mask_wake_debug_for_backend_activation(
-    active: dict[str, Any] | None,
-    report: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    if not isinstance(report, dict):
-        return None
-    public = dict(report)
-    active_browser_id = _clean_browser_id(active.get("browser_id") if isinstance(active, dict) else "")
-    report_browser_id = _clean_browser_id(report.get("browser_id"))
-    public["authoritative_browser_active"] = bool(active_browser_id and report_browser_id == active_browser_id)
-    if public["authoritative_browser_active"]:
-        return public
-    public["running"] = False
-    public["starting"] = False
-    public["fsm_state"] = "SELECTED_INACTIVE"
-    public["reason"] = "This browser is not the Active Browser."
-    public["active_instance_id"] = ""
-    return public
-
-
-def _public_wake_debug(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any]:
-    selected = _selected_wake_debug_report(state, debug)
-    active = state.get("active") if isinstance(state.get("active"), dict) else None
-    public_debug = _mask_wake_debug_for_backend_activation(active, selected)
-    reported_at = float(public_debug.get("reported_at") or 0.0) if isinstance(public_debug, dict) else 0.0
-    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-    return {
-        "ok": True,
-        "active": _public_active(active),
-        "debug": public_debug,
-        "has_debug": isinstance(public_debug, dict),
-        "age_seconds": round(max(0.0, time.time() - reported_at), 3) if reported_at else None,
-        "reports_count": len(reports),
-        "path": str(_WAKE_DEBUG_PATH),
-    }
-
-
 def _select_wake_dev_report(
     state: dict[str, Any],
     debug: dict[str, Any],
@@ -1959,8 +1953,10 @@ def _select_wake_dev_report(
     if clean_surface:
         return max(
             (
-                report for report in reports.values()
-                if isinstance(report, dict) and _clean_dev_command_surface(report.get("surface")) == clean_surface
+                report
+                for report in reports.values()
+                if isinstance(report, dict)
+                and _clean_dev_command_surface(report.get("surface")) == clean_surface
             ),
             key=lambda item: float(item.get("reported_at") or 0.0),
             default=None,
@@ -1978,13 +1974,17 @@ def _public_wake_dev_debug(
     selected = _select_wake_dev_report(state, debug, surface=surface, browser_id=browser_id)
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
-    report_browser_id = _clean_browser_id(selected.get("browser_id") if isinstance(selected, dict) else "")
+    report_browser_id = _clean_browser_id(
+        selected.get("browser_id") if isinstance(selected, dict) else ""
+    )
     public_debug = dict(selected) if isinstance(selected, dict) else None
     if isinstance(public_debug, dict):
         public_debug["authoritative_browser_active"] = bool(
             active_browser_id and report_browser_id == active_browser_id
         )
-    reported_at = float(public_debug.get("reported_at") or 0.0) if isinstance(public_debug, dict) else 0.0
+    reported_at = (
+        float(public_debug.get("reported_at") or 0.0) if isinstance(public_debug, dict) else 0.0
+    )
     reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
     return {
         "ok": True,
@@ -1995,66 +1995,6 @@ def _public_wake_dev_debug(
         "reports_count": len(reports),
         "path": str(_WAKE_DEV_DEBUG_PATH),
     }
-
-
-def _wake_debug_sse(payload: dict[str, Any], sequence: int) -> str:
-    event = {
-        **payload,
-        "stream": {
-            "sequence": sequence,
-            "server_now": time.time(),
-            "source": "wake-debug-stream",
-        },
-    }
-    return f"id:{sequence}\nevent:wake-debug\ndata:{json.dumps(event, separators=(',', ':'))}\n\n"
-
-
-async def _current_public_wake_debug() -> dict[str, Any]:
-    async with _state_lock:
-        state = _read_state_unlocked()
-        debug = _read_wake_debug_unlocked()
-    return _public_wake_debug(state, debug)
-
-
-async def _broadcast_wake_debug(payload: dict[str, Any]) -> None:
-    global _wake_debug_stream_sequence
-    async with _wake_debug_stream_lock:
-        _wake_debug_stream_sequence += 1
-        frame = _wake_debug_sse(payload, _wake_debug_stream_sequence)
-        subscribers = list(_wake_debug_subscribers.values())
-    for queue in subscribers:
-        if queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
-        with contextlib.suppress(asyncio.QueueFull):
-            queue.put_nowait(frame)
-
-
-async def _broadcast_current_wake_debug() -> None:
-    await _broadcast_wake_debug(await _current_public_wake_debug())
-
-
-async def _wake_debug_stream(request: Request):
-    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=8)
-    subscriber_id = id(queue)
-    async with _wake_debug_stream_lock:
-        _wake_debug_subscribers[subscriber_id] = queue
-        sequence = _wake_debug_stream_sequence
-    try:
-        yield _wake_debug_sse(await _current_public_wake_debug(), sequence)
-        while not await request.is_disconnected():
-            try:
-                frame = await asyncio.wait_for(
-                    queue.get(),
-                    timeout=_WAKE_DEBUG_STREAM_KEEPALIVE_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            yield frame
-    finally:
-        async with _wake_debug_stream_lock:
-            _wake_debug_subscribers.pop(subscriber_id, None)
 
 
 def _public_state(state: dict[str, Any], debug: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2090,25 +2030,36 @@ def _active_browser_from_client_report(
 ) -> dict[str, Any]:
     current_same_browser = bool(
         isinstance(current_active, dict)
-        and _clean_browser_id(current_active.get("browser_id")) == _clean_browser_id(report.get("browser_id"))
+        and _clean_browser_id(current_active.get("browser_id"))
+        == _clean_browser_id(report.get("browser_id"))
     )
     report_voice = report.get("voice") if isinstance(report.get("voice"), dict) else {}
-    stt_enabled = bool(body.stt_enabled) if body and body.stt_enabled is not None else (
-        bool(report_voice.get("stt_enabled")) if report_voice else (
-            bool(current_active.get("stt_enabled")) if current_same_browser else False
+    stt_enabled = (
+        bool(body.stt_enabled)
+        if body and body.stt_enabled is not None
+        else (
+            bool(report_voice.get("stt_enabled"))
+            if report_voice
+            else (bool(current_active.get("stt_enabled")) if current_same_browser else False)
         )
     )
     stt_mode = _clean_stt_mode(
-        body.stt_mode if body and body.stt_mode is not None else (
-            report_voice.get("stt_mode") if report_voice else (
-                current_active.get("stt_mode") if current_same_browser else ""
-            )
+        body.stt_mode
+        if body and body.stt_mode is not None
+        else (
+            report_voice.get("stt_mode")
+            if report_voice
+            else (current_active.get("stt_mode") if current_same_browser else "")
         ),
         stt_enabled,
     )
-    tts_enabled = bool(body.tts_enabled) if body and body.tts_enabled is not None else (
-        bool(report_voice.get("tts_enabled")) if report_voice else (
-            bool(current_active.get("tts_enabled")) if current_same_browser else False
+    tts_enabled = (
+        bool(body.tts_enabled)
+        if body and body.tts_enabled is not None
+        else (
+            bool(report_voice.get("tts_enabled"))
+            if report_voice
+            else (bool(current_active.get("tts_enabled")) if current_same_browser else False)
         )
     )
     return {
@@ -2172,7 +2123,9 @@ class _ActiveBrowserActivationFsm:
                 return {"changed": False, "from": before, "to": before, "output": "ignored"}
             self.state["active"] = active_browser
         elif action == self.ACTION_DEACTIVATE_IF_OWNER:
-            active = self.state.get("active") if isinstance(self.state.get("active"), dict) else None
+            active = (
+                self.state.get("active") if isinstance(self.state.get("active"), dict) else None
+            )
             if not active or _clean_browser_id(active.get("browser_id")) != browser_id:
                 return {"changed": False, "from": before, "to": before, "output": "ignored"}
             self.state["active"] = None
@@ -2223,8 +2176,12 @@ async def active_browser_view() -> dict[str, Any]:
 
 
 @router.get("/browser-clients")
-async def active_browser_clients(max_age_seconds: int = _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS) -> dict[str, Any]:
-    max_age = max(1, min(int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS), 3600))
+async def active_browser_clients(
+    max_age_seconds: int = _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
+) -> dict[str, Any]:
+    max_age = max(
+        1, min(int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS), 3600)
+    )
     async with _state_lock:
         state = _read_state_unlocked()
         return _public_browser_clients(state, max_age_seconds=max_age)
@@ -2284,17 +2241,20 @@ async def active_browser_client_activate(body: BrowserClientSelectionBody):
         activation = _ActiveBrowserActivationFsm(state).dispatch(
             _ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
             browser_id=browser_id,
-            active_browser=_active_browser_from_client_report(report or {}, now, body=body, current_active=active),
+            active_browser=_active_browser_from_client_report(
+                report or {}, now, body=body, current_active=active
+            ),
             now=now,
         )
         changed = bool(activation.get("changed"))
         if not changed:
-            return JSONResponse(status_code=400, content={"ok": False, "detail": "Activation request was rejected."})
+            return JSONResponse(
+                status_code=400, content={"ok": False, "detail": "Activation request was rejected."}
+            )
         _write_state_unlocked(state)
         public_clients = _public_browser_clients(state, max_age_seconds=body.max_age_seconds)
 
     await _publish_changed(state, "activate-browser-client")
-    await _broadcast_current_wake_debug()
     return public_clients
 
 
@@ -2304,10 +2264,14 @@ async def active_browser_client_deactivate(body: BrowserClientSelectionBody | No
     async with _state_lock:
         state = _read_state_unlocked()
         active = state.get("active") if isinstance(state.get("active"), dict) else None
-        browser_id = _clean_browser_id(body.browser_id) or _clean_browser_id(active.get("browser_id") if active else "")
+        browser_id = _clean_browser_id(body.browser_id) or _clean_browser_id(
+            active.get("browser_id") if active else ""
+        )
         tab_id = _clean_string(body.tab_id, "", 120)
         if not browser_id:
-            return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
+            return JSONResponse(
+                status_code=409, content={"ok": False, "detail": "No Active Browser is available"}
+            )
 
         report, rejection = _find_browser_client_report(
             state,
@@ -2342,7 +2306,6 @@ async def active_browser_client_deactivate(body: BrowserClientSelectionBody | No
 
     if changed:
         await _publish_changed(state, "deactivate-browser-client")
-        await _broadcast_current_wake_debug()
     return public_clients
 
 
@@ -2371,10 +2334,11 @@ async def voice_mode_activate(body: BrowserVoiceState):
         )
         changed = bool(activation.get("changed"))
         if not changed:
-            return JSONResponse(status_code=400, content={"ok": False, "detail": "Activation request was rejected."})
+            return JSONResponse(
+                status_code=400, content={"ok": False, "detail": "Activation request was rejected."}
+            )
         _write_state_unlocked(state)
     await _publish_changed(state, "activate")
-    await _broadcast_current_wake_debug()
     return _public_state(state)
 
 
@@ -2396,7 +2360,6 @@ async def voice_mode_deactivate(body: BrowserVoiceState):
             _write_state_unlocked(state)
     if changed:
         await _publish_changed(state, "deactivate")
-        await _broadcast_current_wake_debug()
     return _public_state(state)
 
 
@@ -2429,85 +2392,10 @@ async def voice_mode_wake_settings() -> dict[str, Any]:
     }
 
 
-@router.get("/wake-debug")
-async def voice_mode_wake_debug() -> dict[str, Any]:
-    async with _state_lock:
-        state = _read_state_unlocked()
-        debug = _read_wake_debug_unlocked()
-    return _public_wake_debug(state, debug)
-
-
-@router.get("/wake-debug/stream")
-async def voice_mode_wake_debug_stream(request: Request) -> StreamingResponse:
-    return StreamingResponse(
-        _wake_debug_stream(request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-store",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
-@router.post("/wake-debug")
-async def voice_mode_update_wake_debug(body: WakeDebugBody):
-    browser_id = _clean_browser_id(body.browser_id)
-    if not browser_id:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
-    now = time.time()
-    report = {
-        "browser_id": browser_id,
-        "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
-        "tab_id": _clean_string(body.tab_id, "", 120),
-        "running": bool(body.running),
-        "starting": bool(body.starting),
-        "reason": _clean_string(body.reason, "", 240),
-        "fsm_state": _clean_string(body.fsm_state, "", 80),
-        "session_id": int(body.session_id or 0),
-        "active_instance_id": _clean_string(body.active_instance_id, "", 40),
-        "active_send": _bounded_json(body.active_send or {}),
-        "queues": _bounded_json(body.queues or {}),
-        "transcript": _clean_string(body.transcript, "", 4000),
-        "frozen_send_snapshot": _bounded_json(body.frozen_send_snapshot or {}),
-        "command_diagnostics": _bounded_json(body.command_diagnostics or {}),
-        "last_action": _bounded_json(body.last_action or {}),
-        "recent_actions": _bounded_json((body.recent_actions or [])[-40:]),
-        "recent_stt_events": _bounded_json((body.recent_stt_events or [])[-80:]),
-        "stream_epoch": int(body.stream_epoch or 0),
-        "audio_frames_sent": int(body.audio_frames_sent or 0),
-        "audio_frames_captured": int(body.audio_frames_captured or 0),
-        "audio_timing": _bounded_json(body.audio_timing or {}),
-        "stt_reset_pending_reason": _clean_string(body.stt_reset_pending_reason, "", 120),
-        "stt_speech_start_reset_pending": bool(body.stt_speech_start_reset_pending),
-        "vad_speech_start_reset_armed": bool(body.vad_speech_start_reset_armed),
-        "audio_delay_frames": int(body.audio_delay_frames or 0),
-        "audio_candidate_frames": int(body.audio_candidate_frames or 0),
-        "stt_delay_frames": int(body.stt_delay_frames or 0),
-        "stt_segment_active": bool(body.stt_segment_active),
-        "stt_segment": _bounded_json(body.stt_segment or {}),
-        "audio_features": _bounded_json(body.audio_features or {}),
-        "vad": _bounded_json(body.vad or {}),
-        "client_now_ms": float(body.client_now_ms or 0),
-        "reported_at": now,
-    }
-    async with _state_lock:
-        state = _read_state_unlocked()
-        debug = _read_wake_debug_unlocked()
-        reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-        reports[browser_id] = report
-        debug = {
-            "reports": reports,
-            "updated_at": now,
-        }
-        _write_wake_debug_unlocked(debug)
-        public = _public_wake_debug(state, debug)
-    await _broadcast_wake_debug(public)
-    return public
-
-
 @router.get("/dev-status")
-async def voice_mode_dev_status(surface: str | None = None, browser_id: str | None = None) -> dict[str, Any]:
+async def voice_mode_dev_status(
+    surface: str | None = None, browser_id: str | None = None
+) -> dict[str, Any]:
     async with _state_lock:
         state = _read_state_unlocked()
         debug = _read_wake_dev_debug_unlocked()
@@ -2554,11 +2442,19 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
     mode = _clean_dev_command_mode(body.mode)
     action = _clean_dev_command_action(body.action)
     if surface not in _DEV_COMMAND_SURFACES:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported surface: {surface or 'blank'}"})
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": f"Unsupported surface: {surface or 'blank'}"},
+        )
     if mode not in _DEV_COMMAND_MODES:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported mode: {mode or 'blank'}"})
+        return JSONResponse(
+            status_code=400, content={"ok": False, "detail": f"Unsupported mode: {mode or 'blank'}"}
+        )
     if action not in _DEV_COMMAND_ACTIONS:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": f"Unsupported action: {action or 'blank'}"})
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": f"Unsupported action: {action or 'blank'}"},
+        )
     command_id = _clean_dev_command_id(body.command_id)
     explicit_browser_id = _clean_browser_id(body.browser_id)
     explicit_tab_id = _clean_string(body.tab_id, "", 120)
@@ -2568,10 +2464,14 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
 
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
-    target_browser_id = explicit_browser_id or (active_browser_id if body.target_active_browser else "")
+    target_browser_id = explicit_browser_id or (
+        active_browser_id if body.target_active_browser else ""
+    )
     target_tab_id = explicit_tab_id or (active_tab_id if body.target_active_browser else "")
     if body.target_active_browser and not target_browser_id:
-        return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
+        return JSONResponse(
+            status_code=409, content={"ok": False, "detail": "No Active Browser is available"}
+        )
 
     now = time.time()
     payload = {
@@ -2638,7 +2538,10 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
     if action not in _ACTIVE_BROWSER_COMMAND_ACTIONS:
         return JSONResponse(
             status_code=400,
-            content={"ok": False, "detail": f"Unsupported active browser action: {action or 'blank'}"},
+            content={
+                "ok": False,
+                "detail": f"Unsupported active browser action: {action or 'blank'}",
+            },
         )
     command_id = _clean_active_browser_command_id(body.command_id)
     explicit_browser_id = _clean_browser_id(body.browser_id)
@@ -2649,10 +2552,14 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
 
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
-    target_browser_id = explicit_browser_id or (active_browser_id if body.target_active_browser else "")
+    target_browser_id = explicit_browser_id or (
+        active_browser_id if body.target_active_browser else ""
+    )
     target_tab_id = explicit_tab_id or (active_tab_id if body.target_active_browser else "")
     if body.target_active_browser and not target_browser_id:
-        return JSONResponse(status_code=409, content={"ok": False, "detail": "No Active Browser is available"})
+        return JSONResponse(
+            status_code=409, content={"ok": False, "detail": "No Active Browser is available"}
+        )
 
     now = time.time()
     group = _clean_active_browser_group(body.group or body.menu_group)
@@ -2820,12 +2727,19 @@ async def voice_mode_set_aggregation_timeout(body: AggregationTimeoutBody) -> di
         )
     try:
         async with httpx.AsyncClient(timeout=3.0, verify=_PIPECAT_VERIFY_TLS) as client:
-            response = await client.post(url, json={"aggregation_timeout": payload["aggregation_timeout"]})
+            response = await client.post(
+                url, json={"aggregation_timeout": payload["aggregation_timeout"]}
+            )
         response_payload = response.json() if response.content else {}
         if not response.is_success:
             return JSONResponse(
                 status_code=502,
-                content={"ok": False, "supported": False, "detail": f"HTTP {response.status_code}", "url": url},
+                content={
+                    "ok": False,
+                    "supported": False,
+                    "detail": f"HTTP {response.status_code}",
+                    "url": url,
+                },
             )
     except Exception as exc:
         return JSONResponse(
