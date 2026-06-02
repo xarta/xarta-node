@@ -274,6 +274,22 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             },
         },
         frontend={"app": "fallback-ui", "asset_version": "dev-test"},
+        tts={
+            "client_available": True,
+            "client": {
+                "status": "playing",
+                "utterance_id": "utt-live-proof",
+                "audio_context_state": "running",
+            },
+            "announcer_available": True,
+            "announcer": {
+                "state": "ANNOUNCING",
+                "last_speech": {
+                    "status": "speaking",
+                    "event": {"utterance_id": "utt-live-proof"},
+                },
+            },
+        },
         automation={
             "current_group": "settings",
             "current_page_id": "matrix-chat",
@@ -350,6 +366,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert view["automation"]["menus"][0]["pages"][0]["id"] == "matrix-chat"
     assert view["automation"]["menus"][0]["function_items"][0]["fn"] == "chat.vadDev"
     assert view["automation"]["selector_actions"][0]["action"] == "settings"
+    assert view["tts"]["client_available"] is True
+    assert view["tts"]["client"]["status"] == "playing"
+    assert view["tts"]["client"]["utterance_id"] == "utt-live-proof"
+    assert view["tts"]["announcer"]["last_speech"]["event"]["utterance_id"] == "utt-live-proof"
 
 
 def test_active_browser_view_exposes_automation_defaults():
@@ -574,6 +594,88 @@ def test_voice_mode_wake_dev_debug_prefers_active_browser_report():
     assert public["debug"]["browser_id"] == "active-browser"
     assert public["debug"]["fsm_state"] == "CAPTURING"
     assert public["debug"]["queues"]["message_queue"][0]["text"] == "hello"
+
+
+def test_voice_mode_dev_status_surface_prefers_active_browser_matching_surface():
+    state = {
+        "active": {
+            "browser_id": "active-browser",
+            "browser_label": "Browser on Win32",
+            "stt_enabled": True,
+            "stt_mode": "wake_to_talk",
+            "tts_enabled": True,
+        }
+    }
+    debug = {
+        "reports": {
+            "active-browser:vad_dev": {
+                "browser_id": "active-browser",
+                "surface": "vad_dev",
+                "status": "active VAD report",
+                "reported_at": 20,
+            },
+            "active-browser:wake_dev": {
+                "browser_id": "active-browser",
+                "surface": "wake_dev",
+                "status": "active Wake report",
+                "reported_at": 10,
+            },
+            "other-browser:wake_dev": {
+                "browser_id": "other-browser",
+                "surface": "wake_dev",
+                "status": "newer stale Wake report",
+                "reported_at": 30,
+            },
+        }
+    }
+
+    public = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+
+    assert public["ok"] is True
+    assert public["has_debug"] is True
+    assert public["debug"]["browser_id"] == "active-browser"
+    assert public["debug"]["surface"] == "wake_dev"
+    assert public["debug"]["status"] == "active Wake report"
+    assert public["debug"]["authoritative_browser_active"] is True
+
+
+def test_voice_mode_dev_status_surface_can_select_browser_specific_report():
+    state = {
+        "active": {
+            "browser_id": "active-browser",
+            "browser_label": "Browser on Win32",
+            "stt_enabled": True,
+            "stt_mode": "wake_to_talk",
+            "tts_enabled": True,
+        }
+    }
+    debug = {
+        "reports": {
+            "active-browser:wake_dev": {
+                "browser_id": "active-browser",
+                "surface": "wake_dev",
+                "status": "active Wake report",
+                "reported_at": 10,
+            },
+            "other-browser:wake_dev": {
+                "browser_id": "other-browser",
+                "surface": "wake_dev",
+                "status": "requested Wake report",
+                "reported_at": 20,
+            },
+        }
+    }
+
+    public = voice_mode._public_wake_dev_debug(
+        state,
+        debug,
+        surface="wake_dev",
+        browser_id="other-browser",
+    )
+
+    assert public["debug"]["browser_id"] == "other-browser"
+    assert public["debug"]["status"] == "requested Wake report"
+    assert public["debug"]["authoritative_browser_active"] is False
 
 
 def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():
