@@ -580,6 +580,7 @@ def _default_wake_instance(
         "hermes_prefix": hermes_prefix,
         "auto_execute_silence_ms": 0,
         "execute_cancel_ms": 0,
+        "partial_settle_ms": 0,
         "commands": {
             "pause": "pause-dictation",
             "execute": "execute",
@@ -621,6 +622,18 @@ def _clean_wake_command_map(value: Any) -> dict[str, str]:
     }
 
 
+def _clean_wake_step_ms(value: Any, fallback: int = 0) -> int:
+    if str(value).strip().lower() in {"", "0", "false", "off", "disabled"}:
+        return 0
+    return _clean_int_step(
+        value,
+        fallback=fallback or 300,
+        minimum=300,
+        maximum=3000,
+        step=300,
+    )
+
+
 def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
     defaults = _default_wake_to_talk_policy()["instances"][instance_id]
     raw = value if isinstance(value, dict) else {}
@@ -628,29 +641,20 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
     if matrix_server not in {"tb1", "vps"} or matrix_server != defaults["matrix_server"]:
         matrix_server = defaults["matrix_server"]
     wake_word = _clean_string(raw.get("wake_word"), defaults["wake_word"], 160)
-    auto_execute_raw = raw.get("auto_execute_silence_ms", defaults["auto_execute_silence_ms"])
-    auto_execute = (
-        0
-        if str(auto_execute_raw).strip() in {"", "0", "false", "off", "disabled"}
-        else _clean_int_step(
-            auto_execute_raw,
-            fallback=defaults["auto_execute_silence_ms"] or 300,
-            minimum=300,
-            maximum=3000,
-            step=300,
-        )
+    auto_execute = _clean_wake_step_ms(
+        raw.get("auto_execute_silence_ms", defaults["auto_execute_silence_ms"]),
+        defaults["auto_execute_silence_ms"],
     )
-    execute_cancel_raw = raw.get("execute_cancel_ms", defaults["execute_cancel_ms"])
-    execute_cancel = (
-        0
-        if str(execute_cancel_raw).strip() in {"", "0", "false", "off", "disabled"}
-        else _clean_int_step(
-            execute_cancel_raw,
-            fallback=defaults["execute_cancel_ms"] or 300,
-            minimum=300,
-            maximum=3000,
-            step=300,
-        )
+    execute_cancel = _clean_wake_step_ms(
+        raw.get("execute_cancel_ms", defaults["execute_cancel_ms"]),
+        defaults["execute_cancel_ms"],
+    )
+    partial_settle = _clean_wake_step_ms(
+        raw.get(
+            "partial_settle_ms",
+            raw.get("partial_settle_timeout_ms", defaults["partial_settle_ms"]),
+        ),
+        defaults["partial_settle_ms"],
     )
     return {
         # Wake instance activation is controlled by the browser's Wake-to-Talk
@@ -666,6 +670,7 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         "hermes_prefix": _clean_hermes_prefix(raw.get("hermes_prefix"), defaults["hermes_prefix"]),
         "auto_execute_silence_ms": auto_execute,
         "execute_cancel_ms": execute_cancel,
+        "partial_settle_ms": partial_settle,
         "commands": _clean_wake_command_map(raw.get("commands")),
     }
 
@@ -805,6 +810,25 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             step=_SILENCE_RESET_TIMEOUT_STEP_MS,
         ),
     }
+
+
+def _clean_stt_policy_update(current: Any, patch: Any) -> dict[str, Any]:
+    """Clean an STT policy patch while preserving unspecified current values."""
+    merged = {
+        **_clean_stt_policy(current),
+        **(patch if isinstance(patch, dict) else {}),
+    }
+    return _clean_stt_policy(merged)
+
+
+def _is_default_stt_reset_payload(value: Any, current: Any) -> bool:
+    """Detect stale clients submitting a full default STT policy with a wake-only save."""
+    if not isinstance(value, dict) or not value:
+        return False
+    incoming = _clean_stt_policy(value)
+    default = _clean_stt_policy({})
+    current_clean = _clean_stt_policy(current)
+    return incoming == default and current_clean != default
 
 
 def _clean_bool(value: Any, *, fallback: bool = False) -> bool:
@@ -2749,7 +2773,11 @@ async def voice_mode_update_wake_settings(body: WakeSettingsBody):
         if body.wake_to_talk is not None:
             policy["wake_to_talk"] = _clean_wake_to_talk_policy(body.wake_to_talk)
         if body.stt is not None:
-            policy["stt"] = _clean_stt_policy(body.stt)
+            if body.wake_to_talk is None or not _is_default_stt_reset_payload(
+                body.stt,
+                policy.get("stt"),
+            ):
+                policy["stt"] = _clean_stt_policy_update(policy.get("stt"), body.stt)
         now = time.time()
         state["policy"] = policy
         state["revision"] = now

@@ -21,12 +21,14 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
                     "pause_reset_seconds": 33,
                     "auto_execute_silence_ms": 175,
                     "execute_cancel_ms": 999,
+                    "partial_settle_ms": 1,
                     "commands": {"execute": "execute"},
                 },
                 "vps": {
                     "matrix_server": "not-valid",
                     "wake_word": "Mini-Me",
                     "auto_execute_silence_ms": 3601,
+                    "partial_settle_timeout_ms": 1201,
                 },
             }
         }
@@ -39,6 +41,7 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert "pause_reset_seconds" not in local
     assert local["auto_execute_silence_ms"] == 300
     assert local["execute_cancel_ms"] == 900
+    assert local["partial_settle_ms"] == 300
     assert local["commands"]["execute"] == "execute"
     assert local["commands"]["pause"] == "pause-dictation"
     assert local["hermes_prefix"] == "hermes: "
@@ -47,6 +50,7 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert vps["matrix_server"] == "vps"
     assert vps["auto_execute_silence_ms"] == 3000
     assert vps["execute_cancel_ms"] == 0
+    assert vps["partial_settle_ms"] == 1200
     assert vps["hermes_prefix"] == "hermes-vps: "
     assert "mini me" in vps["wake_aliases"]
     assert "minime" in vps["wake_aliases"]
@@ -123,6 +127,49 @@ def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
         is True
     )
     assert voice_mode._clean_stt_policy({"always_pre_roll": "1"})["always_pre_roll_enabled"] is True
+
+
+def test_voice_mode_stt_policy_update_preserves_unspecified_values():
+    current = voice_mode._clean_stt_policy(
+        {
+            "word_detection_payload0_timeout_ms": 2100,
+            "silero_vad_enabled": True,
+            "word_detection_match_cue_enabled": True,
+            "word_detection_match_cue_sound": "sounds/tos_chirp_5.wav",
+        }
+    )
+
+    updated = voice_mode._clean_stt_policy_update(
+        current,
+        {
+            "vad_reset_timeout_ms": 126,
+        },
+    )
+
+    assert updated["vad_reset_timeout_ms"] == 150
+    assert updated["word_detection_payload0_timeout_ms"] == 2100
+    assert updated["silero_vad_enabled"] is True
+    assert updated["word_detection_match_cue_enabled"] is True
+    assert updated["word_detection_match_cue_sound"] == "sounds/tos_chirp_5.wav"
+
+
+def test_voice_mode_default_stt_reset_payload_detects_stale_combined_wake_save():
+    current = voice_mode._clean_stt_policy(
+        {
+            "word_detection_payload0_timeout_ms": 2100,
+            "silero_vad_enabled": True,
+        }
+    )
+
+    assert voice_mode._is_default_stt_reset_payload(voice_mode._clean_stt_policy({}), current)
+    assert not voice_mode._is_default_stt_reset_payload(
+        {"word_detection_payload0_timeout_ms": 0},
+        voice_mode._clean_stt_policy({}),
+    )
+    assert voice_mode._is_default_stt_reset_payload(
+        {"word_detection_payload0_timeout_ms": 0},
+        current,
+    )
 
 
 def test_voice_mode_aggregation_proxy_payload_uses_seconds_for_pipecat():
