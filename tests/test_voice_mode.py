@@ -20,6 +20,7 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
                     "initial_silence_cancel_ms": 999,
                     "pause_reset_seconds": 33,
                     "auto_execute_silence_ms": 175,
+                    "execute_cancel_ms": 999,
                     "commands": {"execute": "execute"},
                 },
                 "vps": {
@@ -33,10 +34,11 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
 
     local = policy["instances"]["local"]
     assert local["enabled"] is True
-    assert local["post_wake_pause_ms"] == 500
-    assert local["initial_silence_cancel_ms"] == 1000
-    assert local["pause_reset_seconds"] == 35
+    assert "post_wake_pause_ms" not in local
+    assert "initial_silence_cancel_ms" not in local
+    assert "pause_reset_seconds" not in local
     assert local["auto_execute_silence_ms"] == 300
+    assert local["execute_cancel_ms"] == 900
     assert local["commands"]["execute"] == "execute"
     assert local["commands"]["pause"] == "pause-dictation"
     assert local["hermes_prefix"] == "hermes: "
@@ -44,103 +46,82 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     vps = policy["instances"]["vps"]
     assert vps["matrix_server"] == "vps"
     assert vps["auto_execute_silence_ms"] == 3000
+    assert vps["execute_cancel_ms"] == 0
     assert vps["hermes_prefix"] == "hermes-vps: "
     assert "mini me" in vps["wake_aliases"]
     assert "minime" in vps["wake_aliases"]
 
 
 def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
-    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 83}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 999}) == {
-        "speech_aggregation_timeout_ms": 300,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 1}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 0,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 126}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 150,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 400}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 400,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 2000,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"pre_roll_frames": 3}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 3,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"num_pre_roll_frames": 99}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 4,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"num_pre_roll": 0}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 2100,
-    }
-    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 1}) == {
-        "speech_aggregation_timeout_ms": 80,
-        "vad_reset_timeout_ms": 300,
-        "pre_roll_frames": 1,
-        "silero_vad_enabled": False,
-        "always_pre_roll_enabled": False,
-        "silence_reset_timeout_ms": 0,
-    }
+    def expected(**overrides):
+        base = {
+            "speech_aggregation_timeout_ms": 80,
+            "vad_reset_timeout_ms": 300,
+            "pre_roll_frames": 1,
+            "silero_vad_enabled": False,
+            "vad_interrupt_tts_enabled": False,
+            "word_detection_match_interrupt_tts_enabled": False,
+            "word_detection_prefix_partial_interrupt_tts_enabled": False,
+            "word_detection_prefix_final_interrupt_tts_enabled": False,
+            "word_detection_payload0_timeout_ms": 0,
+            "word_detection_match_cue_enabled": False,
+            "word_detection_match_cue_sound": "",
+            "word_detection_payload0_timeout_cue_enabled": False,
+            "word_detection_payload0_timeout_cue_sound": "",
+            "word_detection_agent_candidate_cue_enabled": False,
+            "word_detection_agent_candidate_cue_sound": "",
+            "always_pre_roll_enabled": False,
+            "silence_reset_timeout_ms": 2100,
+        }
+        base.update(overrides)
+        return base
+
+    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 83}) == expected()
+    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 999}) == expected(
+        speech_aggregation_timeout_ms=300
+    )
+    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 1}) == expected(
+        vad_reset_timeout_ms=0
+    )
+    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 126}) == expected(
+        vad_reset_timeout_ms=150
+    )
+    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 400}) == expected(
+        vad_reset_timeout_ms=400
+    )
+    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == expected(
+        vad_reset_timeout_ms=2000
+    )
+    assert voice_mode._clean_stt_policy({"pre_roll_frames": 3}) == expected(pre_roll_frames=3)
+    assert voice_mode._clean_stt_policy({"num_pre_roll_frames": 99}) == expected(pre_roll_frames=4)
+    assert voice_mode._clean_stt_policy({"num_pre_roll": 0}) == expected()
+    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == expected()
+    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 1}) == expected(
+        silence_reset_timeout_ms=0
+    )
+    assert voice_mode._clean_stt_policy(
+        {
+            "word_detection_match_cue_enabled": "yes",
+            "word_detection_match_cue_sound": "sounds/high.mp3",
+            "word_detection_payload0_timeout_sound_enabled": "1",
+            "word_detection_payload0_timeout_sound_path": "sounds/low.mp3",
+            "word_detection_agent_candidate_sound_enabled": True,
+            "word_detection_agent_candidate_sound_path": "sounds/candidate.mp3",
+        }
+    ) == expected(
+        word_detection_match_cue_enabled=True,
+        word_detection_match_cue_sound="sounds/high.mp3",
+        word_detection_payload0_timeout_cue_enabled=True,
+        word_detection_payload0_timeout_cue_sound="sounds/low.mp3",
+        word_detection_agent_candidate_cue_enabled=True,
+        word_detection_agent_candidate_cue_sound="sounds/candidate.mp3",
+    )
     assert voice_mode._clean_stt_policy({"silero_vad_enabled": True})["silero_vad_enabled"] is True
     assert voice_mode._clean_stt_policy({"silero_enabled": "yes"})["silero_vad_enabled"] is True
-    assert voice_mode._clean_stt_policy({"always_pre_roll_enabled": True})["always_pre_roll_enabled"] is True
+    assert (
+        voice_mode._clean_stt_policy({"always_pre_roll_enabled": True})["always_pre_roll_enabled"]
+        is True
+    )
     assert voice_mode._clean_stt_policy({"always_pre_roll": "1"})["always_pre_roll_enabled"] is True
 
 
@@ -179,8 +160,14 @@ def test_voice_dev_vad_detector_actions_are_allowed():
     assert voice_mode._clean_dev_command_action("set auto pre roll") == "set_auto_pre_roll"
     assert voice_mode._clean_dev_command_action("set always pre roll") == "set_always_pre_roll"
     assert voice_mode._clean_dev_command_action("set num pre roll") == "set_num_pre_roll"
-    assert voice_mode._clean_dev_command_action("set-noise-threshold-db") == "set_noise_threshold_db"
+    assert (
+        voice_mode._clean_dev_command_action("set-noise-threshold-db") == "set_noise_threshold_db"
+    )
     assert voice_mode._clean_dev_command_action("set vad pre roll db") == "set_vad_pre_roll_db"
+    assert (
+        voice_mode._clean_dev_command_action("set word detection match cue")
+        == "set_word_detection_match_cue"
+    )
     assert "set_silero_vad" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_vad_detector" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_auto_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
@@ -193,6 +180,9 @@ def test_voice_dev_vad_detector_actions_are_allowed():
     assert "set_vad_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_vad_pre_roll_db" in voice_mode._DEV_COMMAND_ACTIONS
     assert "set_vad_pre_roll_threshold" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_match_cue" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_payload0_timeout_cue" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_agent_candidate_cue" in voice_mode._DEV_COMMAND_ACTIONS
 
 
 def test_active_browser_command_parameters_are_sanitized():
@@ -200,12 +190,23 @@ def test_active_browser_command_parameters_are_sanitized():
     assert voice_mode._clean_active_browser_event_kind("double tap") == "double_click"
     assert voice_mode._clean_active_browser_event_kind("long-press") == "long_press"
     assert voice_mode._clean_active_browser_event_kind("something else") == "click"
-    assert voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
+    assert (
+        voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
+    )
     assert voice_mode._clean_active_browser_selector_action("API Key") == "api-key"
     assert voice_mode._clean_active_browser_group("Settings Panel!") == "settings-panel"
-    assert voice_mode._clean_active_browser_page_id("manual-links-page:ABC_123<script>") == "manual-links-page:ABC_123script"
-    assert voice_mode._clean_active_browser_menu_item_id("chat-fn-vad-dev<script>") == "chat-fn-vad-devscript"
-    assert voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>") == "nod.backupColumnsscript"
+    assert (
+        voice_mode._clean_active_browser_page_id("manual-links-page:ABC_123<script>")
+        == "manual-links-page:ABC_123script"
+    )
+    assert (
+        voice_mode._clean_active_browser_menu_item_id("chat-fn-vad-dev<script>")
+        == "chat-fn-vad-devscript"
+    )
+    assert (
+        voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>")
+        == "nod.backupColumnsscript"
+    )
     assert len(voice_mode._clean_active_browser_group("A" * 200)) == 80
     assert len(voice_mode._clean_active_browser_page_id("p" * 220)) == 160
     assert len(voice_mode._clean_active_browser_menu_item_id("m" * 220)) == 160
@@ -220,7 +221,10 @@ def test_active_browser_command_rejects_unsupported_actions():
     )
 
     assert response.status_code == 400
-    assert json.loads(response.body)["detail"] == "Unsupported active browser action: delete_everything"
+    assert (
+        json.loads(response.body)["detail"]
+        == "Unsupported active browser action: delete_everything"
+    )
 
 
 def test_active_browser_view_report_updates_active_tab_and_page():
@@ -261,7 +265,13 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             "screen": {"width": 1920, "height": 1080},
             "orientation": {"type": "landscape-primary", "angle": 0},
             "visualViewport": {"width": 1280, "height": 720, "scale": 1},
-            "pointer": {"primary": "fine", "any": "fine", "coarse": False, "fine": True, "maxTouchPoints": 0},
+            "pointer": {
+                "primary": "fine",
+                "any": "fine",
+                "coarse": False,
+                "fine": True,
+                "maxTouchPoints": 0,
+            },
         },
         frontend={"app": "fallback-ui", "asset_version": "dev-test"},
         automation={
@@ -310,7 +320,9 @@ def test_active_browser_view_report_updates_active_tab_and_page():
                     ],
                 }
             ],
-            "selector_actions": [{"action": "settings", "label": "Settings", "bridge_group": "settings"}],
+            "selector_actions": [
+                {"action": "settings", "label": "Settings", "bridge_group": "settings"}
+            ],
         },
     )
     report = voice_mode._clean_browser_view_report(body, 20)
@@ -529,7 +541,7 @@ def test_active_browser_from_client_report_allows_explicit_voice_override():
     assert active["tts_enabled"] is False
 
 
-def test_voice_mode_wake_debug_prefers_active_browser_report():
+def test_voice_mode_wake_dev_debug_prefers_active_browser_report():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -541,7 +553,11 @@ def test_voice_mode_wake_debug_prefers_active_browser_report():
     }
     debug = {
         "reports": {
-            "other-browser": {"browser_id": "other-browser", "fsm_state": "ARMED_IDLE", "reported_at": 1},
+            "other-browser": {
+                "browser_id": "other-browser",
+                "fsm_state": "ARMED_IDLE",
+                "reported_at": 1,
+            },
             "active-browser": {
                 "browser_id": "active-browser",
                 "fsm_state": "CAPTURING",
@@ -551,7 +567,7 @@ def test_voice_mode_wake_debug_prefers_active_browser_report():
         }
     }
 
-    public = voice_mode._public_wake_debug(state, debug)
+    public = voice_mode._public_wake_dev_debug(state, debug)
 
     assert public["ok"] is True
     assert public["has_debug"] is True
@@ -560,7 +576,7 @@ def test_voice_mode_wake_debug_prefers_active_browser_report():
     assert public["debug"]["queues"]["message_queue"][0]["text"] == "hello"
 
 
-def test_voice_mode_wake_debug_report_cannot_override_authoritative_active_wake_status():
+def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -584,7 +600,7 @@ def test_voice_mode_wake_debug_report_cannot_override_authoritative_active_wake_
     }
 
     status = voice_mode._public_state(state, debug)
-    wake_debug = voice_mode._public_wake_debug(state, debug)
+    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
 
     assert status["active"]["stt_enabled"] is True
     assert status["active"]["stt_mode"] == "wake_to_talk"
@@ -593,7 +609,7 @@ def test_voice_mode_wake_debug_report_cannot_override_authoritative_active_wake_
     assert wake_debug["debug"]["authoritative_browser_active"] is True
 
 
-def test_voice_mode_wake_debug_does_not_treat_stt_mode_as_a_separate_activation():
+def test_voice_mode_wake_dev_debug_does_not_treat_stt_mode_as_a_separate_activation():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -617,7 +633,7 @@ def test_voice_mode_wake_debug_does_not_treat_stt_mode_as_a_separate_activation(
         }
     }
 
-    wake_debug = voice_mode._public_wake_debug(state, debug)
+    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
 
     assert wake_debug["active"]["stt_enabled"] is False
     assert wake_debug["active"]["stt_mode"] == ""
@@ -626,10 +642,8 @@ def test_voice_mode_wake_debug_does_not_treat_stt_mode_as_a_separate_activation(
     assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
-def test_voice_mode_wake_debug_masks_report_from_non_active_browser():
-    state = {
-        "active": None
-    }
+def test_voice_mode_wake_dev_debug_reports_non_active_browser_as_non_authoritative():
+    state = {"active": None}
     debug = {
         "reports": {
             "other-browser": {
@@ -644,13 +658,13 @@ def test_voice_mode_wake_debug_masks_report_from_non_active_browser():
         }
     }
 
-    wake_debug = voice_mode._public_wake_debug(state, debug)
+    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
 
+    assert wake_debug["active"] is None
     assert wake_debug["debug"]["authoritative_browser_active"] is False
-    assert wake_debug["debug"]["running"] is False
+    assert wake_debug["debug"]["running"] is True
     assert wake_debug["debug"]["starting"] is False
-    assert wake_debug["debug"]["fsm_state"] == "SELECTED_INACTIVE"
-    assert wake_debug["debug"]["reason"] == "This browser is not the Active Browser."
+    assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
 def test_active_browser_activation_fsm_replaces_existing_active_browser():
