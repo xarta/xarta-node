@@ -115,6 +115,7 @@ _STT_WS_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
 _STT_FINAL_TIMEOUT_SECONDS = 8.0
 _STT_FILTER_DRAIN_TIMEOUT_SECONDS = 2.0
 _STT_TRANSCRIPT_PREFIX = "[voice/STT transcript, may contain recognition errors]"
+_WAKE_STT_TRANSCRIPT_PREFIX = "[voice/Wake To Talk STT transcript, may contain recognition errors]"
 _MXID_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 _HERMES_ALIAS_RE = re.compile(r"^\s*(?:hermes|h|hermes-vps|vps|hv)\s*:", re.IGNORECASE)
 _HERMES_BRIDGE_ROOM_NAMES = {
@@ -212,6 +213,16 @@ class _InviteBody(BaseModel):
 
 class _SendMessageBody(BaseModel):
     body: str = Field(min_length=1, max_length=8000)
+
+
+class _WakeSttMessageBody(BaseModel):
+    text: str = Field(min_length=1, max_length=8000)
+    instance: str = Field(default="local", pattern="^(local|vps)$")
+    candidate_source: str = Field(default="", max_length=40)
+    command: str = Field(default="execute", max_length=40)
+    wake_word: str = Field(default="", max_length=160)
+    candidate_revision: str = Field(default="", max_length=160)
+    hermes_prefix: str | None = Field(default=None, max_length=80)
 
 
 class _RoomSettingsBody(BaseModel):
@@ -520,7 +531,9 @@ async def _refresh_chat_access_token(settings: dict[str, str]) -> dict[str, str]
             async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
                 response = await client.post(_matrix_path("/login"), json=payload)
         except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+            raise HTTPException(
+                status_code=502, detail="Matrix homeserver is not reachable"
+            ) from exc
 
         if response.status_code not in {200, 201}:
             raise HTTPException(
@@ -530,7 +543,9 @@ async def _refresh_chat_access_token(settings: dict[str, str]) -> dict[str, str]
         try:
             data = response.json()
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+            raise HTTPException(
+                status_code=502, detail="Matrix homeserver returned invalid JSON"
+            ) from exc
 
         token = str(data.get("access_token") or "")
         resolved_user_id = str(data.get("user_id") or "")
@@ -703,7 +718,9 @@ class _MatrixChatE2EEClient:
             self._api.token = self._settings["access_token"]
             whoami = await self._client.whoami()
         resolved_user_id = getattr(whoami, "user_id", "") or self._settings["user_id"]
-        resolved_device_id = getattr(whoami, "device_id", "") or self._settings.get("device_id") or ""
+        resolved_device_id = (
+            getattr(whoami, "device_id", "") or self._settings.get("device_id") or ""
+        )
         self._settings["user_id"] = str(resolved_user_id)
         self._client.mxid = UserID(self._settings["user_id"])
         if resolved_device_id:
@@ -718,7 +735,9 @@ class _MatrixChatE2EEClient:
 
         account_id = self._settings["user_id"] or "blueprints-chat"
         pickle_key = f"{account_id}:{self._client.device_id or 'default'}"
-        crypto_store = PgCryptoStore(account_id=account_id, pickle_key=pickle_key, db=self._crypto_db)
+        crypto_store = PgCryptoStore(
+            account_id=account_id, pickle_key=pickle_key, db=self._crypto_db
+        )
         await crypto_store.open()
         if self._client.device_id:
             await crypto_store.put_device_id(self._client.device_id)
@@ -853,11 +872,21 @@ class _MatrixChatE2EEClient:
             query_params=query_params,
             metrics_method="getMessages",
         )
-        events = data.get("chunk") if isinstance(data, dict) and isinstance(data.get("chunk"), list) else []
+        events = (
+            data.get("chunk")
+            if isinstance(data, dict) and isinstance(data.get("chunk"), list)
+            else []
+        )
         messages = await self.messages_from_raw_events(room_id, events)
         messages.reverse()
-        end = data.get("end") if isinstance(data, dict) and isinstance(data.get("end"), str) else None
-        start = data.get("start") if isinstance(data, dict) and isinstance(data.get("start"), str) else from_token
+        end = (
+            data.get("end") if isinstance(data, dict) and isinstance(data.get("end"), str) else None
+        )
+        start = (
+            data.get("start")
+            if isinstance(data, dict) and isinstance(data.get("start"), str)
+            else from_token
+        )
         return {
             "room_id": room_id,
             "messages": messages,
@@ -917,9 +946,13 @@ class _MatrixChatE2EEClient:
         if not isinstance(body, str):
             return None
         source_content = content.serialize() if hasattr(content, "serialize") else {}
-        relates_to = source_content.get("m.relates_to") if isinstance(source_content, dict) else None
+        relates_to = (
+            source_content.get("m.relates_to") if isinstance(source_content, dict) else None
+        )
         system_message = (
-            source_content.get("org.xarta.system_message") if isinstance(source_content, dict) else None
+            source_content.get("org.xarta.system_message")
+            if isinstance(source_content, dict)
+            else None
         )
         return _message_from_parts(
             event_id=str(getattr(event, "event_id", "") or ""),
@@ -1019,7 +1052,9 @@ async def _matrix_request_any(
     try:
         data = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+        raise HTTPException(
+            status_code=502, detail="Matrix homeserver returned invalid JSON"
+        ) from exc
     return data
 
 
@@ -1088,7 +1123,9 @@ async def _matrix_upload_media(
     try:
         data = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+        raise HTTPException(
+            status_code=502, detail="Matrix homeserver returned invalid JSON"
+        ) from exc
     content_uri = data.get("content_uri") if isinstance(data, dict) else None
     if not isinstance(content_uri, str) or not content_uri.startswith("mxc://"):
         raise HTTPException(status_code=502, detail="Matrix homeserver did not return an MXC URI")
@@ -1119,12 +1156,18 @@ async def _redact_matrix_event(room_id: str, event_id: str, reason: str) -> dict
     async with httpx.AsyncClient(base_url=settings["upstream"], timeout=timeout) as client:
         for attempt in range(_REDACTION_MAX_RETRIES + 1):
             try:
-                response = await client.put(path, json={"reason": reason}, headers=_headers(settings))
+                response = await client.put(
+                    path, json={"reason": reason}, headers=_headers(settings)
+                )
                 if response.status_code == 401:
                     settings = await _refresh_chat_access_token(settings)
-                    response = await client.put(path, json={"reason": reason}, headers=_headers(settings))
+                    response = await client.put(
+                        path, json={"reason": reason}, headers=_headers(settings)
+                    )
             except httpx.RequestError as exc:
-                raise HTTPException(status_code=502, detail="Matrix homeserver is not reachable") from exc
+                raise HTTPException(
+                    status_code=502, detail="Matrix homeserver is not reachable"
+                ) from exc
 
             if response.status_code == 200:
                 try:
@@ -1159,7 +1202,9 @@ async def _load_room_messages_for_redaction(
 ) -> tuple[list[dict[str, Any]], bool]:
     messages: list[dict[str, Any]] = []
     from_token: str | None = None
-    target = _MAX_REDACTION_SCAN_LIMIT if scan_all else max(1, min(limit, _MAX_REDACTION_SCAN_LIMIT))
+    target = (
+        _MAX_REDACTION_SCAN_LIMIT if scan_all else max(1, min(limit, _MAX_REDACTION_SCAN_LIMIT))
+    )
     remaining = target
     at_start = False
 
@@ -1236,7 +1281,9 @@ async def _synapse_admin_request(
     try:
         data = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Matrix homeserver returned invalid JSON") from exc
+        raise HTTPException(
+            status_code=502, detail="Matrix homeserver returned invalid JSON"
+        ) from exc
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Matrix homeserver returned unexpected JSON")
     return data
@@ -1259,7 +1306,9 @@ async def _set_bulk_redaction_ratelimit_override(
             admin_api_version="v1",
         )
     except HTTPException as exc:
-        log.warning("Matrix bulk redaction: could not set temporary ratelimit override: %s", exc.detail)
+        log.warning(
+            "Matrix bulk redaction: could not set temporary ratelimit override: %s", exc.detail
+        )
         return False, {}
     return True, prior
 
@@ -1398,12 +1447,16 @@ def _room_member_rows_from_state(events: list[dict[str, Any]]) -> dict[str, dict
             "user_id": user_id,
             "membership": _safe_str(content.get("membership")) or "join",
             "display_name": _user_display_name(user_id, _safe_str(content.get("displayname"))),
-            "power_level": _safe_int(power_users.get(user_id)) if isinstance(power_users, dict) else None,
+            "power_level": _safe_int(power_users.get(user_id))
+            if isinstance(power_users, dict)
+            else None,
         }
     return rows
 
 
-def _normalize_admin_member(raw: Any, state_rows: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+def _normalize_admin_member(
+    raw: Any, state_rows: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
     if isinstance(raw, str):
         user_id = raw
         raw_dict: dict[str, Any] = {}
@@ -1418,7 +1471,9 @@ def _normalize_admin_member(raw: Any, state_rows: dict[str, dict[str, Any]]) -> 
     display = _safe_str(raw_dict.get("displayname") or raw_dict.get("display_name"))
     return {
         "user_id": user_id,
-        "membership": _safe_str(raw_dict.get("membership")) or state_row.get("membership") or "join",
+        "membership": _safe_str(raw_dict.get("membership"))
+        or state_row.get("membership")
+        or "join",
         "display_name": _user_display_name(user_id, display or state_row.get("display_name")),
         "power_level": _safe_int(state_row.get("power_level")),
     }
@@ -1508,7 +1563,9 @@ def _room_settings_payload(settings: dict[str, str], room_id: str) -> dict[str, 
     }
 
 
-def _set_room_settings(settings: dict[str, str], room_id: str, patch: _RoomSettingsBody) -> dict[str, Any]:
+def _set_room_settings(
+    settings: dict[str, str], room_id: str, patch: _RoomSettingsBody
+) -> dict[str, Any]:
     if not settings.get("admin_access_token"):
         raise HTTPException(status_code=503, detail="Matrix admin token is not configured")
     server_id = settings.get("server_id") or "tb1"
@@ -1619,6 +1676,23 @@ def _stt_transcript_body(*, server_id: str, transcript: str) -> str:
     return f"{prefix}{_STT_TRANSCRIPT_PREFIX} {(transcript or '').strip()}"
 
 
+def _wake_stt_transcript_body(
+    *,
+    server_id: str,
+    transcript: str,
+    hermes_prefix: str | None = None,
+) -> str:
+    prefix = _safe_str(hermes_prefix).replace("\r", " ").replace("\n", " ")
+    if prefix:
+        prefix = " ".join(prefix.split())
+        if not prefix.endswith(":"):
+            prefix = prefix.rstrip(":") + ":"
+        prefix = f"{prefix} "
+    else:
+        prefix = _HERMES_BRIDGE_PREFIXES.get(server_id, "hermes: ")
+    return f"{prefix}{_WAKE_STT_TRANSCRIPT_PREFIX} {(transcript or '').strip()}"
+
+
 def _matrix_stt_message_content(
     *,
     body: str,
@@ -1636,6 +1710,31 @@ def _matrix_stt_message_content(
     )
     if isinstance(confidence, int | float):
         content["xarta_stt_confidence"] = float(confidence)
+    return content
+
+
+def _matrix_wake_stt_message_content(
+    *,
+    body: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str,
+    candidate_revision: str,
+) -> dict[str, Any]:
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "xarta_source": "stt",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_wake_instance": _safe_str(instance) or "local",
+            "xarta_wake_candidate_source": _safe_str(candidate_source),
+            "xarta_wake_command": _safe_str(command) or "execute",
+            "xarta_wake_candidate_revision": _safe_str(candidate_revision),
+            "xarta_wake_word": _safe_str(wake_word),
+            "xarta_stt_partial": False,
+        }
+    )
     return content
 
 
@@ -1664,6 +1763,59 @@ async def _send_stt_transcript_message(
         )
         sent = {"room_id": room_id, "event_id": data.get("event_id")}
     sent.update({"body": body, "xarta_source": "stt", "xarta_stt_runtime": runtime})
+    return sent
+
+
+async def _send_wake_stt_transcript_message(
+    *,
+    room_id: str,
+    server_id: str,
+    transcript: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str = "",
+    candidate_revision: str = "",
+    hermes_prefix: str | None = None,
+) -> dict[str, Any]:
+    body = _wake_stt_transcript_body(
+        server_id=server_id,
+        transcript=transcript,
+        hermes_prefix=hermes_prefix,
+    )
+    content = _matrix_wake_stt_message_content(
+        body=body,
+        instance=instance,
+        candidate_source=candidate_source,
+        command=command,
+        wake_word=wake_word,
+        candidate_revision=candidate_revision,
+    )
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-wake-stt-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update(
+        {
+            "body": body,
+            "xarta_source": "stt",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_wake_instance": instance,
+            "xarta_wake_candidate_source": candidate_source,
+            "xarta_wake_command": command,
+            "xarta_wake_candidate_revision": candidate_revision,
+        }
+    )
     return sent
 
 
@@ -1726,7 +1878,9 @@ def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
 
 def _room_name_candidates(events: list[dict[str, Any]]) -> set[str]:
     name, canonical_alias, _, _ = _room_name_from_events(events)
-    candidates = {item.strip().lower() for item in (name, canonical_alias or "") if item and item.strip()}
+    candidates = {
+        item.strip().lower() for item in (name, canonical_alias or "") if item and item.strip()
+    }
     if canonical_alias and canonical_alias.startswith("#") and ":" in canonical_alias:
         candidates.add(canonical_alias[1:].split(":", 1)[0].strip().lower())
     return candidates
@@ -1899,11 +2053,15 @@ def _load_hermes_command_catalog(settings: dict[str, str]) -> dict[str, Any]:
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=503, detail="Hermes command catalogue returned invalid JSON") from exc
+        raise HTTPException(
+            status_code=503, detail="Hermes command catalogue returned invalid JSON"
+        ) from exc
     raw_commands = data.get("commands") if isinstance(data, dict) else []
     commands = [
         command
-        for command in (_normalize_hermes_command(raw) for raw in raw_commands if isinstance(raw, dict))
+        for command in (
+            _normalize_hermes_command(raw) for raw in raw_commands if isinstance(raw, dict)
+        )
         if command
     ]
     commands.sort(
@@ -2029,9 +2187,7 @@ def _events_without_redacted_targets(events: list[dict[str, Any]]) -> list[dict[
     if not redacted_event_id_set:
         return events
     return [
-        event
-        for event in events
-        if _safe_str(event.get("event_id")) not in redacted_event_id_set
+        event for event in events if _safe_str(event.get("event_id")) not in redacted_event_id_set
     ]
 
 
@@ -2091,7 +2247,11 @@ def _room_name_from_events(events: list[dict[str, Any]]) -> tuple[str, str | Non
     for event in events:
         event_type = event.get("type")
         content = _event_content(event)
-        if event_type == "m.room.name" and isinstance(content.get("name"), str) and content["name"].strip():
+        if (
+            event_type == "m.room.name"
+            and isinstance(content.get("name"), str)
+            and content["name"].strip()
+        ):
             name = content["name"].strip()
             name_source = "m.room.name"
         elif event_type == "m.room.canonical_alias" and isinstance(content.get("alias"), str):
@@ -2172,9 +2332,10 @@ def _candidate_matches_query(candidate: dict[str, Any], query: str) -> bool:
     needle = query.strip().lower()
     if needle in {"", "@"}:
         return True
-    return needle.lstrip("@") in (
-        f"{candidate.get('user_id', '')} {candidate.get('display_name', '')}"
-    ).lower()
+    return (
+        needle.lstrip("@")
+        in (f"{candidate.get('user_id', '')} {candidate.get('display_name', '')}").lower()
+    )
 
 
 def _filter_invite_candidates(
@@ -2440,7 +2601,9 @@ def _set_worker_status(server_id: str, **updates: Any) -> None:
 async def _publish_worker_payload(payload: dict[str, Any], *, snapshot: bool) -> None:
     server_id = str(payload.get("server_id") or "")
     label = str(payload.get("server_label") or server_id.upper())
-    published_count = int((_sync_worker_status.get(server_id) or {}).get("published_count") or 0) + 1
+    published_count = (
+        int((_sync_worker_status.get(server_id) or {}).get("published_count") or 0) + 1
+    )
     _set_worker_status(server_id, published_count=published_count)
     await events_bus.publish(
         AppEvent.create(
@@ -2562,8 +2725,7 @@ async def matrix_chat_status() -> dict[str, Any]:
         "server_id": settings["server_id"],
         "server_label": settings["server_label"],
         "servers": [
-            {"id": server_id, "label": label}
-            for server_id, label in _MATRIX_SERVER_LABELS.items()
+            {"id": server_id, "label": label} for server_id, label in _MATRIX_SERVER_LABELS.items()
         ],
         "configured": bool(settings["user_id"] and settings["access_token"]),
         "reachable": reachable,
@@ -2572,14 +2734,14 @@ async def matrix_chat_status() -> dict[str, Any]:
         "user_id": settings["user_id"] or None,
         "default_room_id": settings["smoke_room_id"],
         "hermes_user_id": settings["hermes_user_id"],
-        "hermes_matrix_patch": _hermes_matrix_patch_status(
-            settings["hermes_matrix_patch_report"]
-        ),
+        "hermes_matrix_patch": _hermes_matrix_patch_status(settings["hermes_matrix_patch_report"]),
         "features": {
             "e2ee": _e2ee_requested(settings) and e2ee_deps_ok,
             "e2ee_requested": _e2ee_requested(settings),
             "e2ee_dependencies": e2ee_deps_ok,
-            "e2ee_dependency_error": e2ee_deps_error if _e2ee_requested(settings) and not e2ee_deps_ok else "",
+            "e2ee_dependency_error": e2ee_deps_error
+            if _e2ee_requested(settings) and not e2ee_deps_ok
+            else "",
             "push_notifications": False,
             "generic_matrix_proxy": False,
             "room_settings": bool(settings.get("admin_access_token")),
@@ -2618,7 +2780,7 @@ async def matrix_chat_admin_users() -> dict[str, Any]:
         for user in (_normalize_admin_user(raw) for raw in raw_users if isinstance(raw, dict))
         if user
     ]
-    users.sort(key=lambda item: (str(item.get("user_id") or "").lower()))
+    users.sort(key=lambda item: str(item.get("user_id") or "").lower())
     total = _safe_int(data.get("total")) or len(users)
     return {"users": users, "total": total}
 
@@ -2637,7 +2799,7 @@ async def matrix_chat_admin_rooms() -> dict[str, Any]:
         for room in (_normalize_admin_room(raw) for raw in raw_rooms if isinstance(raw, dict))
         if room
     ]
-    rooms.sort(key=lambda item: (str(item.get("name") or item.get("room_id") or "").lower()))
+    rooms.sort(key=lambda item: str(item.get("name") or item.get("room_id") or "").lower())
     total = _safe_int(data.get("total_rooms")) or _safe_int(data.get("total")) or len(rooms)
     return {"rooms": rooms, "total": total}
 
@@ -2699,7 +2861,7 @@ async def matrix_chat_admin_room_members(room_id: str) -> dict[str, Any]:
     for user_id, member in state_rows.items():
         if user_id not in seen_members:
             members.append(member)
-    members.sort(key=lambda item: (str(item.get("user_id") or "").lower()))
+    members.sort(key=lambda item: str(item.get("user_id") or "").lower())
     return {"room_id": room_id, "members": members}
 
 
@@ -2831,17 +2993,23 @@ async def matrix_chat_hermes_commands(
 ) -> dict[str, Any]:
     settings = _settings()
     if not room_id:
-        raise HTTPException(status_code=403, detail="Hermes command catalogue is disabled for this room")
+        raise HTTPException(
+            status_code=403, detail="Hermes command catalogue is disabled for this room"
+        )
     room_settings = _room_settings_payload(settings, room_id)
     if not room_settings["hermes_command_catalog"]:
-        raise HTTPException(status_code=403, detail="Hermes command catalogue is disabled for this room")
+        raise HTTPException(
+            status_code=403, detail="Hermes command catalogue is disabled for this room"
+        )
     catalogue = await asyncio.to_thread(_load_hermes_command_catalog, settings)
     commands = catalogue.get("commands") if isinstance(catalogue.get("commands"), list) else []
     filtered = _filter_hermes_commands(commands, q)
     return {
         "source": catalogue.get("source") or "hermes",
         "query": q,
-        "total": catalogue.get("total") if isinstance(catalogue.get("total"), int) else len(commands),
+        "total": catalogue.get("total")
+        if isinstance(catalogue.get("total"), int)
+        else len(commands),
         "commands": filtered,
     }
 
@@ -2973,6 +3141,34 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
     }
 
 
+@router.post("/rooms/{room_id}/wake-stt")
+async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> dict[str, Any]:
+    settings = _settings()
+    sent = await _send_wake_stt_transcript_message(
+        room_id=room_id,
+        server_id=settings["server_id"],
+        transcript=body.text,
+        instance=body.instance,
+        candidate_source=body.candidate_source,
+        command=body.command,
+        wake_word=body.wake_word,
+        candidate_revision=body.candidate_revision,
+        hermes_prefix=body.hermes_prefix,
+    )
+    return {
+        "room_id": sent.get("room_id"),
+        "event_id": sent.get("event_id"),
+        "body": sent.get("body"),
+        "server_id": settings["server_id"],
+        "xarta_source": "stt",
+        "xarta_capture_mode": "wake_to_talk",
+        "xarta_wake_instance": sent.get("xarta_wake_instance"),
+        "xarta_wake_candidate_source": sent.get("xarta_wake_candidate_source"),
+        "xarta_wake_command": sent.get("xarta_wake_command"),
+        "xarta_wake_candidate_revision": sent.get("xarta_wake_candidate_revision"),
+    }
+
+
 @router.post("/rooms/{room_id}/audio")
 async def matrix_chat_send_audio(
     room_id: str,
@@ -3016,7 +3212,14 @@ async def matrix_chat_send_audio(
             expected=(200,),
         )
         sent = {"room_id": room_id, "event_id": data.get("event_id")}
-    sent.update({"content_uri": content_uri, "filename": filename, "mimetype": mimetype, "size": len(content)})
+    sent.update(
+        {
+            "content_uri": content_uri,
+            "filename": filename,
+            "mimetype": mimetype,
+            "size": len(content),
+        }
+    )
     return sent
 
 
@@ -3045,7 +3248,9 @@ async def matrix_chat_stt_noise_stream_quality_websocket(websocket: WebSocket) -
     server_id = _normalize_server_id(websocket.query_params.get("server"))
     token = _CURRENT_MATRIX_SERVER.set(server_id)
     settings = _settings(server_id)
-    mirror_ws_url = (settings.get("stt_noise_stream_test_ws_url") or _DEFAULT_STT_NOISE_STREAM_TEST_WS_URL).strip()
+    mirror_ws_url = (
+        settings.get("stt_noise_stream_test_ws_url") or _DEFAULT_STT_NOISE_STREAM_TEST_WS_URL
+    ).strip()
     done = asyncio.Event()
     stats = {
         "browser_bytes": 0,
@@ -3168,7 +3373,9 @@ async def matrix_chat_stt_noise_stream_quality_websocket(websocket: WebSocket) -
     except Exception as exc:
         log.exception("Matrix STT stream quality websocket failed via %s", mirror_ws_url)
         with suppress(Exception):
-            await websocket.send_json({"type": "error", "detail": str(exc), **final_payload("error")})
+            await websocket.send_json(
+                {"type": "error", "detail": str(exc), **final_payload("error")}
+            )
     finally:
         log.info(
             "Matrix STT stream quality test closed server=%s mode=%s sent_frames=%s returned_frames=%s",
@@ -3243,7 +3450,11 @@ async def _matrix_chat_stt_relay(
         websocket.query_params.get("atten_lim_db") or settings.get("stt_noise_atten_lim_db"),
         float(_DEFAULT_STT_NOISE_ATTEN_LIM_DB),
     )
-    runtime = stt_ws_url.replace("ws://", "", 1).replace("wss://", "", 1) if stt_ws_url else "unconfigured"
+    runtime = (
+        stt_ws_url.replace("ws://", "", 1).replace("wss://", "", 1)
+        if stt_ws_url
+        else "unconfigured"
+    )
     done = asyncio.Event()
     final_requested = asyncio.Event()
     stt_end_sent = asyncio.Event()
@@ -3267,13 +3478,18 @@ async def _matrix_chat_stt_relay(
         noise_enabled,
     )
     if not stt_ws_url:
-        await websocket.send_json({"type": "error", "detail": "STT websocket URL is not configured"})
+        await websocket.send_json(
+            {"type": "error", "detail": "STT websocket URL is not configured"}
+        )
         await websocket.close()
         _CURRENT_MATRIX_SERVER.reset(token)
         return
     if noise_enabled and not noise_ws_url:
         await websocket.send_json(
-            {"type": "error", "detail": "STT noise reduction is enabled but DeepFilterNet URL is not configured"}
+            {
+                "type": "error",
+                "detail": "STT noise reduction is enabled but DeepFilterNet URL is not configured",
+            }
         )
         await websocket.close()
         _CURRENT_MATRIX_SERVER.reset(token)
@@ -3607,8 +3823,12 @@ async def _matrix_chat_stt_relay(
                         relay_filter_to_stt(filter_ws, stt_ws),
                         name="matrix-stt-filter-upstream-relay",
                     )
-                    stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
-                    timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
+                    stt_task = asyncio.create_task(
+                        relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay"
+                    )
+                    timeout_task = asyncio.create_task(
+                        enforce_final_timeout(), name="matrix-stt-final-timeout"
+                    )
                     done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
                     tasks = {browser_task, filter_task, stt_task, timeout_task, done_task}
                     try:
@@ -3636,13 +3856,21 @@ async def _matrix_chat_stt_relay(
                             if not final_sent:
                                 await send_stt_end(stt_ws)
             else:
-                browser_task = asyncio.create_task(relay_browser_to_stt(stt_ws), name="matrix-stt-browser-relay")
-                stt_task = asyncio.create_task(relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay")
-                timeout_task = asyncio.create_task(enforce_final_timeout(), name="matrix-stt-final-timeout")
+                browser_task = asyncio.create_task(
+                    relay_browser_to_stt(stt_ws), name="matrix-stt-browser-relay"
+                )
+                stt_task = asyncio.create_task(
+                    relay_stt_to_browser(stt_ws), name="matrix-stt-upstream-relay"
+                )
+                timeout_task = asyncio.create_task(
+                    enforce_final_timeout(), name="matrix-stt-final-timeout"
+                )
                 done_task = asyncio.create_task(done.wait(), name="matrix-stt-done")
                 tasks = {browser_task, stt_task, timeout_task, done_task}
                 try:
-                    finished, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    finished, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
                     if any(task for task in finished if task is not done_task and task.exception()):
                         for task in finished:
                             if task is not done_task:

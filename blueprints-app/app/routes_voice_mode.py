@@ -9,7 +9,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -326,6 +326,7 @@ class BrowserViewBody(BaseModel):
     url_hash: str | None = None
     frontend: dict[str, Any] | None = None
     automation: dict[str, Any] | None = None
+    tts: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
 
@@ -1657,6 +1658,9 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
 def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, Any]:
     page = body.page if isinstance(body.page, dict) else {}
     frontend = body.frontend if isinstance(body.frontend, dict) else {}
+    tts = _bounded_json(body.tts if isinstance(body.tts, dict) else {}, 8000)
+    if not isinstance(tts, dict):
+        tts = {}
     viewport = _clean_browser_viewport(body.viewport)
     viewport_classification = _classify_browser_viewport(viewport)
     voice = _clean_browser_voice_state(body.voice)
@@ -1720,6 +1724,7 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "url_hash": _clean_string(body.url_hash, "", 180),
         "frontend": frontend_report,
         "automation": _clean_active_browser_automation_report(body.automation),
+        "tts": tts,
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,
     }
@@ -1990,17 +1995,46 @@ def _store_browser_view_report_unlocked(
     return changed
 
 
+def _dev_debug_reports(debug: dict[str, Any]) -> list[dict[str, Any]]:
+    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    return [report for report in reports.values() if isinstance(report, dict)]
+
+
+def _latest_dev_debug_report(reports: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    return max(
+        reports,
+        key=lambda item: float(item.get("reported_at") or 0.0),
+        default=None,
+    )
+
+
+def _report_matches_browser(report: dict[str, Any], browser_id: str) -> bool:
+    return bool(browser_id) and _clean_browser_id(report.get("browser_id")) == browser_id
+
+
+def _report_matches_surface(report: dict[str, Any], surface: str) -> bool:
+    return bool(surface) and _clean_dev_command_surface(report.get("surface")) == surface
+
+
+def _dev_debug_report_key(report: dict[str, Any]) -> str:
+    browser_id = _clean_browser_id(report.get("browser_id"))
+    surface = _clean_dev_command_surface(report.get("surface"))
+    return f"{browser_id}:{surface}" if browser_id and surface else browser_id
+
+
 def _selected_browser_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
-    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-    selected = reports.get(active_browser_id) if active_browser_id else None
-    if not isinstance(selected, dict) and reports and not active_browser_id:
-        selected = max(
-            (report for report in reports.values() if isinstance(report, dict)),
-            key=lambda item: float(item.get("reported_at") or 0.0),
-            default=None,
+    reports = _dev_debug_reports(debug)
+    selected = (
+        _latest_dev_debug_report(
+            report for report in reports if _report_matches_browser(report, active_browser_id)
         )
+        if active_browser_id
+        else None
+    )
+    if not isinstance(selected, dict) and reports and not active_browser_id:
+        selected = _latest_dev_debug_report(reports)
     return selected if isinstance(selected, dict) else None
 
 
@@ -2023,21 +2057,31 @@ def _select_wake_dev_report(
     surface: str = "",
     browser_id: str = "",
 ) -> dict[str, Any] | None:
-    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    reports = _dev_debug_reports(debug)
     clean_browser_id = _clean_browser_id(browser_id)
-    if clean_browser_id and isinstance(reports.get(clean_browser_id), dict):
-        return reports[clean_browser_id]
     clean_surface = _clean_dev_command_surface(surface) if surface else ""
+    if clean_browser_id:
+        selected = _latest_dev_debug_report(
+            report
+            for report in reports
+            if _report_matches_browser(report, clean_browser_id)
+            and (not clean_surface or _report_matches_surface(report, clean_surface))
+        )
+        if isinstance(selected, dict):
+            return selected
     if clean_surface:
-        return max(
-            (
-                report
-                for report in reports.values()
-                if isinstance(report, dict)
-                and _clean_dev_command_surface(report.get("surface")) == clean_surface
-            ),
-            key=lambda item: float(item.get("reported_at") or 0.0),
-            default=None,
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+        active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+        selected = _latest_dev_debug_report(
+            report
+            for report in reports
+            if _report_matches_browser(report, active_browser_id)
+            and _report_matches_surface(report, clean_surface)
+        )
+        if isinstance(selected, dict):
+            return selected
+        return _latest_dev_debug_report(
+            report for report in reports if _report_matches_surface(report, clean_surface)
         )
     return _selected_browser_report(state, debug)
 
@@ -2503,7 +2547,7 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
         state = _read_state_unlocked()
         debug = _read_wake_dev_debug_unlocked()
         reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-        reports[browser_id] = report
+        reports[_dev_debug_report_key(report)] = report
         debug = {
             "reports": reports,
             "updated_at": now,

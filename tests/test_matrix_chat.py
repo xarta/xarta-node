@@ -145,9 +145,7 @@ def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):
         "available": True,
         "ok": False,
         "generated_at_epoch": 1779292232,
-        "failed_checks": [
-            {"id": "alias_mentions_leading_at_only", "message": "alias guard"}
-        ],
+        "failed_checks": [{"id": "alias_mentions_leading_at_only", "message": "alias guard"}],
         "error": "",
     }
     assert "must-not-leak" not in rendered
@@ -204,6 +202,95 @@ def test_matrix_chat_stt_message_content_adds_visible_and_custom_metadata():
     }
 
 
+def test_matrix_chat_wake_stt_transcript_body_marks_voice_source():
+    assert (
+        matrix_chat._wake_stt_transcript_body(server_id="tb1", transcript="hello world")
+        == "hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world"
+    )
+    assert (
+        matrix_chat._wake_stt_transcript_body(server_id="vps", transcript="hello world")
+        == "hermes-vps: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world"
+    )
+
+
+def test_matrix_chat_wake_stt_message_content_adds_visible_and_custom_metadata():
+    content = matrix_chat._matrix_wake_stt_message_content(
+        body="hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world",
+        instance="local",
+        candidate_source="payload0",
+        command="execute",
+        wake_word="Computer",
+        candidate_revision="wake-local-123",
+    )
+
+    assert content == {
+        "msgtype": "m.text",
+        "body": "hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world",
+        "xarta_source": "stt",
+        "xarta_capture_mode": "wake_to_talk",
+        "xarta_wake_instance": "local",
+        "xarta_wake_candidate_source": "payload0",
+        "xarta_wake_command": "execute",
+        "xarta_wake_candidate_revision": "wake-local-123",
+        "xarta_wake_word": "Computer",
+        "xarta_stt_partial": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_wake_stt_route_reuses_e2ee_content_send(monkeypatch):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$wake-stt"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    token = matrix_chat._CURRENT_MATRIX_SERVER.set("vps")
+    try:
+        result = await matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="What is the time?",
+                instance="vps",
+                candidate_source="payload2",
+                command="auto_execute",
+                wake_word="Mini-Me",
+                candidate_revision="wake-vps-123",
+            ),
+        )
+    finally:
+        matrix_chat._CURRENT_MATRIX_SERVER.reset(token)
+
+    assert captured["room_id"] == "!bridge:test.example"
+    assert captured["content"]["body"] == (
+        "hermes-vps: [voice/Wake To Talk STT transcript, may contain recognition errors] "
+        "What is the time?"
+    )
+    assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
+    assert captured["content"]["xarta_wake_instance"] == "vps"
+    assert captured["content"]["xarta_wake_candidate_source"] == "payload2"
+    assert captured["content"]["xarta_wake_command"] == "auto_execute"
+    assert captured["content"]["xarta_wake_candidate_revision"] == "wake-vps-123"
+    assert result == {
+        "room_id": "!bridge:test.example",
+        "event_id": "$wake-stt",
+        "body": captured["content"]["body"],
+        "server_id": "vps",
+        "xarta_source": "stt",
+        "xarta_capture_mode": "wake_to_talk",
+        "xarta_wake_instance": "vps",
+        "xarta_wake_candidate_source": "payload2",
+        "xarta_wake_command": "auto_execute",
+        "xarta_wake_candidate_revision": "wake-vps-123",
+    }
+
+
 def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
     content = matrix_chat._audio_message_content(
         content_uri="mxc://example.org/audio123",
@@ -240,7 +327,11 @@ def test_matrix_chat_auto_prefixes_local_bridge_without_member_mention():
         body="status please",
         events=[
             {"type": "m.room.name", "content": {"name": "Bridge"}},
-            {"type": "m.room.member", "state_key": "@operator:test.example", "content": {"membership": "join"}},
+            {
+                "type": "m.room.member",
+                "state_key": "@operator:test.example",
+                "content": {"membership": "join"},
+            },
         ],
     )
 
@@ -253,7 +344,11 @@ def test_matrix_chat_auto_prefix_skips_existing_room_member_mention():
         body="hello @operator:test.example",
         events=[
             {"type": "m.room.name", "content": {"name": "Bridge"}},
-            {"type": "m.room.member", "state_key": "@operator:test.example", "content": {"membership": "join"}},
+            {
+                "type": "m.room.member",
+                "state_key": "@operator:test.example",
+                "content": {"membership": "join"},
+            },
         ],
     )
 
@@ -428,9 +523,7 @@ def test_matrix_chat_hermes_command_catalog_can_probe_over_ssh(monkeypatch):
         "/tmp/xarta-test-ssh-key",
     ]
     assert captured["args"][7] == "root@203.0.113.10"
-    assert captured["args"][8].startswith(
-        "docker exec hermes /opt/hermes/.venv/bin/python -c "
-    )
+    assert captured["args"][8].startswith("docker exec hermes /opt/hermes/.venv/bin/python -c ")
     assert "from hermes_cli.commands import" in captured["args"][8]
     assert "COMMAND_REGISTRY" in captured["args"][8]
     assert captured["kwargs"]["timeout"] == matrix_chat._HERMES_COMMAND_CATALOG_TIMEOUT
@@ -461,10 +554,13 @@ def test_matrix_chat_room_settings_default_off_and_persist(tmp_path):
     )
 
     assert updated["hermes_command_catalog"] is True
-    assert matrix_chat._room_settings_payload(
-        settings,
-        "!shared:test.example",
-    )["hermes_command_catalog"] is True
+    assert (
+        matrix_chat._room_settings_payload(
+            settings,
+            "!shared:test.example",
+        )["hermes_command_catalog"]
+        is True
+    )
     assert "admin-token-secret" not in (tmp_path / "room-settings.json").read_text(encoding="utf-8")
 
 
@@ -487,7 +583,9 @@ def test_matrix_chat_room_settings_update_requires_admin_token(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_matrix_chat_hermes_commands_refuses_disabled_room_before_probe(tmp_path, monkeypatch):
+async def test_matrix_chat_hermes_commands_refuses_disabled_room_before_probe(
+    tmp_path, monkeypatch
+):
     env_file = tmp_path / "matrix.env"
     env_file.write_text(
         "\n".join(
@@ -531,11 +629,7 @@ async def test_matrix_chat_hermes_commands_allows_enabled_room(tmp_path, monkeyp
         json.dumps(
             {
                 "servers": {
-                    "tb1": {
-                        "rooms": {
-                            "!bridge:test.example": {"hermes_command_catalog": True}
-                        }
-                    }
+                    "tb1": {"rooms": {"!bridge:test.example": {"hermes_command_catalog": True}}}
                 }
             }
         ),
@@ -651,10 +745,7 @@ def test_matrix_chat_drops_redacted_target_before_message_mapping():
     ]
 
     filtered = matrix_chat._events_without_redacted_targets(events)
-    messages = [
-        matrix_chat._message_from_event(event, "!room:test.example")
-        for event in filtered
-    ]
+    messages = [matrix_chat._message_from_event(event, "!room:test.example") for event in filtered]
     messages = [message for message in messages if message]
 
     assert [event["event_id"] for event in filtered] == ["$redaction", "$good"]
