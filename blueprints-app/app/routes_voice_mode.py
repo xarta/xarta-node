@@ -79,6 +79,7 @@ _WORD_DETECTION_PAYLOAD0_TIMEOUT_MIN_MS = 0
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS = 3000
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS = 300
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS = 0
+_WORD_DETECTION_CUE_SOUND_MAX_LENGTH = 255
 _VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
 _ACTIVE_BROWSER_COMMAND_EVENT_TYPE = "blueprints.active_browser.command"
 _BROWSER_VIEW_MAX_REPORTS = 32
@@ -141,6 +142,15 @@ _DEV_COMMAND_ACTIONS = {
     "set_word_detection_payload0_timeout_ms",
     "set_vad_payload0_timeout",
     "set_vad_payload0_timeout_ms",
+    "set_word_detection_match_cue",
+    "set_word_detection_match_cue_enabled",
+    "set_word_detection_match_cue_sound",
+    "set_word_detection_payload0_timeout_cue",
+    "set_word_detection_payload0_timeout_cue_enabled",
+    "set_word_detection_payload0_timeout_cue_sound",
+    "set_word_detection_agent_candidate_cue",
+    "set_word_detection_agent_candidate_cue_enabled",
+    "set_word_detection_agent_candidate_cue_sound",
     "set_auto_pre_roll",
     "set_always_pre_roll",
     "set_pre_roll_frames",
@@ -254,6 +264,12 @@ class VoiceDevCommandBody(BaseModel):
     word_detection_prefix_final_interrupt_tts_enabled: bool | None = None
     word_detection_payload0_timeout_ms: int | None = None
     vad_payload0_timeout_ms: int | None = None
+    word_detection_match_cue_enabled: bool | None = None
+    word_detection_match_cue_sound: str | None = None
+    word_detection_payload0_timeout_cue_enabled: bool | None = None
+    word_detection_payload0_timeout_cue_sound: str | None = None
+    word_detection_agent_candidate_cue_enabled: bool | None = None
+    word_detection_agent_candidate_cue_sound: str | None = None
     auto_pre_roll_enabled: bool | None = None
     level_db: float | None = None
     noise_level_db: float | None = None
@@ -368,6 +384,12 @@ def _empty_state() -> dict[str, Any]:
                 "word_detection_prefix_partial_interrupt_tts_enabled": False,
                 "word_detection_prefix_final_interrupt_tts_enabled": False,
                 "word_detection_payload0_timeout_ms": _WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS,
+                "word_detection_match_cue_enabled": False,
+                "word_detection_match_cue_sound": "",
+                "word_detection_payload0_timeout_cue_enabled": False,
+                "word_detection_payload0_timeout_cue_sound": "",
+                "word_detection_agent_candidate_cue_enabled": False,
+                "word_detection_agent_candidate_cue_sound": "",
                 "always_pre_roll_enabled": False,
                 "silence_reset_timeout_ms": _SILENCE_RESET_TIMEOUT_DEFAULT_MS,
             },
@@ -404,6 +426,12 @@ def _clean_stt_mode(value: str | None, stt_enabled: bool = False) -> str:
 def _clean_string(value: Any, fallback: str = "", max_length: int = 255) -> str:
     text = " ".join(str(value if value is not None else fallback).strip().split())
     return (text or fallback)[:max_length]
+
+
+def _clean_sound_asset_path(value: Any) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    clean = "".join(ch for ch in raw if ch >= " " and ch != "\x7f")
+    return clean[:_WORD_DETECTION_CUE_SOUND_MAX_LENGTH]
 
 
 def _clean_dev_command_id(value: str | None = None) -> str:
@@ -718,6 +746,51 @@ def _clean_stt_policy(value: Any) -> dict[str, Any]:
             minimum=_WORD_DETECTION_PAYLOAD0_TIMEOUT_MIN_MS,
             maximum=_WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS,
             step=_WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS,
+        ),
+        "word_detection_match_cue_enabled": _clean_bool(
+            raw.get(
+                "word_detection_match_cue_enabled",
+                raw.get("word_detection_match_sound_enabled"),
+            ),
+            fallback=False,
+        ),
+        "word_detection_match_cue_sound": _clean_sound_asset_path(
+            raw.get(
+                "word_detection_match_cue_sound",
+                raw.get("word_detection_match_sound_path", raw.get("word_detection_match_sound")),
+            )
+        ),
+        "word_detection_payload0_timeout_cue_enabled": _clean_bool(
+            raw.get(
+                "word_detection_payload0_timeout_cue_enabled",
+                raw.get("word_detection_payload0_timeout_sound_enabled"),
+            ),
+            fallback=False,
+        ),
+        "word_detection_payload0_timeout_cue_sound": _clean_sound_asset_path(
+            raw.get(
+                "word_detection_payload0_timeout_cue_sound",
+                raw.get(
+                    "word_detection_payload0_timeout_sound_path",
+                    raw.get("word_detection_payload0_timeout_sound"),
+                ),
+            )
+        ),
+        "word_detection_agent_candidate_cue_enabled": _clean_bool(
+            raw.get(
+                "word_detection_agent_candidate_cue_enabled",
+                raw.get("word_detection_agent_candidate_sound_enabled"),
+            ),
+            fallback=False,
+        ),
+        "word_detection_agent_candidate_cue_sound": _clean_sound_asset_path(
+            raw.get(
+                "word_detection_agent_candidate_cue_sound",
+                raw.get(
+                    "word_detection_agent_candidate_sound_path",
+                    raw.get("word_detection_agent_candidate_sound"),
+                ),
+            )
         ),
         "always_pre_roll_enabled": _clean_bool(
             raw.get("always_pre_roll_enabled", raw.get("always_pre_roll")),
@@ -2496,6 +2569,12 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "word_detection_prefix_final_interrupt_tts_enabled": body.word_detection_prefix_final_interrupt_tts_enabled,
         "word_detection_payload0_timeout_ms": body.word_detection_payload0_timeout_ms,
         "vad_payload0_timeout_ms": body.vad_payload0_timeout_ms,
+        "word_detection_match_cue_enabled": body.word_detection_match_cue_enabled,
+        "word_detection_match_cue_sound": body.word_detection_match_cue_sound,
+        "word_detection_payload0_timeout_cue_enabled": body.word_detection_payload0_timeout_cue_enabled,
+        "word_detection_payload0_timeout_cue_sound": body.word_detection_payload0_timeout_cue_sound,
+        "word_detection_agent_candidate_cue_enabled": body.word_detection_agent_candidate_cue_enabled,
+        "word_detection_agent_candidate_cue_sound": body.word_detection_agent_candidate_cue_sound,
         "auto_pre_roll_enabled": body.auto_pre_roll_enabled,
         "level_db": body.level_db,
         "noise_level_db": body.noise_level_db,
