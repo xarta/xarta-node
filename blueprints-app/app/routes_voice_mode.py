@@ -150,6 +150,9 @@ _DEV_COMMAND_ACTIONS = {
     "set_word_detection_words",
     "set_sense_word",
     "set_sense_words",
+    "set_wake_to_talk",
+    "set_wake_to_talk_enabled",
+    "set_stt_mode",
     "set_noise_threshold",
     "set_noise_threshold_db",
     "set_vad_pre_roll",
@@ -242,6 +245,8 @@ class VoiceDevCommandBody(BaseModel):
     command_id: str | None = None
     value: Any | None = None
     enabled: bool | None = None
+    wake_to_talk_enabled: bool | None = None
+    stt_mode: str | None = None
     silero_vad_enabled: bool | None = None
     vad_interrupt_tts_enabled: bool | None = None
     word_detection_match_interrupt_tts_enabled: bool | None = None
@@ -2482,6 +2487,8 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "action": action,
         "value": body.value,
         "enabled": body.enabled,
+        "wake_to_talk_enabled": body.wake_to_talk_enabled,
+        "stt_mode": body.stt_mode,
         "silero_vad_enabled": body.silero_vad_enabled,
         "vad_interrupt_tts_enabled": body.vad_interrupt_tts_enabled,
         "word_detection_match_interrupt_tts_enabled": body.word_detection_match_interrupt_tts_enabled,
