@@ -64,9 +64,7 @@ _REQUIRED_SETTINGS: tuple[str, ...] = (
     "tts.fallback.negative_sound_path",
     "tts.fallback.volume",
 )
-_OPTIONAL_SETTINGS: tuple[str, ...] = (
-    "tts.sanitizer_url",
-)
+_OPTIONAL_SETTINGS: tuple[str, ...] = ("tts.sanitizer_url",)
 
 
 @dataclass
@@ -97,6 +95,7 @@ class SpeakRequest(BaseModel):
     transform_profile: TransformProfile | None = None
     allow_llm_sanitizer: bool | None = None
     allow_llm_santitizer: bool | None = None
+    volume_gain: float | None = None
 
 
 class StopRequest(BaseModel):
@@ -132,6 +131,7 @@ class UtteranceRequest(BaseModel):
     transform_profile: TransformProfile | None = None
     allow_llm_sanitizer: bool | None = None
     volume: float | None = None
+    volume_gain: float | None = None
     timeout_ms: int | None = None
     allow_fallback: bool | None = None
     created_at: float | None = None
@@ -157,6 +157,14 @@ def _parse_int(value: str | None, min_value: int, max_value: int) -> int | None:
     return max(min_value, min(max_value, parsed))
 
 
+def _parse_float(value: Any, default: float, min_value: float, max_value: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
 def _bounded_int(value: int | None, default: int, min_value: int, max_value: int) -> int:
     if value is None:
         return default
@@ -165,6 +173,18 @@ def _bounded_int(value: int | None, default: int, min_value: int, max_value: int
     except Exception:
         return default
     return max(min_value, min(max_value, parsed))
+
+
+def _shared_tts_volume(settings: dict[str, str]) -> float:
+    return _parse_float(settings.get("tts.volume"), 0.85, 0.0, 3.0)
+
+
+def _shared_tts_playback_volume(settings: dict[str, str]) -> float:
+    return min(1.0, _shared_tts_volume(settings))
+
+
+def _shared_tts_volume_gain(settings: dict[str, str]) -> float:
+    return max(1.0, _shared_tts_volume(settings))
 
 
 def _resolve_settings() -> tuple[dict[str, str], list[str]]:
@@ -294,10 +314,10 @@ def _client_key(req: Request, explicit_client_id: str | None = None) -> str:
 def _should_sanitize_text(body: SpeakRequest) -> bool:
     if body.transform_profile == "none":
         return False
-    return any(
-        value is True
-        for value in (body.sanitize_text, body.sanitise_text, body.tts_sanitize)
-    ) or body.transform_profile in _SANITIZING_TRANSFORM_PROFILES
+    return (
+        any(value is True for value in (body.sanitize_text, body.sanitise_text, body.tts_sanitize))
+        or body.transform_profile in _SANITIZING_TRANSFORM_PROFILES
+    )
 
 
 def _allow_llm_sanitizer(body: SpeakRequest | SanitizeRequest) -> bool:
@@ -357,7 +377,9 @@ async def tts_speak(body: SpeakRequest, request: Request):
         )
 
     voice = (body.voice or "").strip() or settings.get("tts.default_voice", "")
-    req_mode = (body.mode or "").strip().lower() or settings.get("tts.default_mode", "").strip().lower()
+    req_mode = (body.mode or "").strip().lower() or settings.get(
+        "tts.default_mode", ""
+    ).strip().lower()
     fmt = (body.format or "wav").strip().lower()
     interrupt = bool(interrupt_default) if body.interrupt is None else bool(body.interrupt)
     timeout_ms = _bounded_int(body.timeout_ms, int(settings_timeout_ms), 1000, 600000)
@@ -390,7 +412,10 @@ async def tts_speak(body: SpeakRequest, request: Request):
     text = sanitized.text if sanitized else raw_text
 
     if not text or not voice:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing effective text or voice in DB/call payload"})
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": "Missing effective text or voice in DB/call payload"},
+        )
 
     if req_mode not in {"auto", "stream", "batch"}:
         req_mode = "stream"
@@ -435,6 +460,9 @@ async def tts_speak(body: SpeakRequest, request: Request):
 
     model_name = (settings.get("tts.model") or "pocket-tts").strip() or "pocket-tts"
 
+    volume_gain = (
+        body.volume_gain if body.volume_gain is not None else _shared_tts_volume_gain(settings)
+    )
     payload = {
         "model": model_name,
         "voice": voice,
@@ -444,6 +472,8 @@ async def tts_speak(body: SpeakRequest, request: Request):
         "sanitize_text": False,
         "transform_profile": "none",
     }
+    if volume_gain != 1.0:
+        payload["volume_gain"] = volume_gain
 
     fallback_kind = _resolve_fallback_kind(body, default_kind="positive")
     client = httpx.AsyncClient(timeout=timeout_ms / 1000.0)
@@ -516,11 +546,15 @@ async def tts_speak(body: SpeakRequest, request: Request):
                 await _clear_session_if_current(client_key, session)
 
     headers = {
-        "X-Blueprints-TTS-Engine": "pockettts_stream" if effective_mode == "stream" else "pockettts_batch",
+        "X-Blueprints-TTS-Engine": "pockettts_stream"
+        if effective_mode == "stream"
+        else "pockettts_batch",
         "X-Blueprints-TTS-Interrupted-Previous": "true" if interrupted_previous else "false",
         "X-Blueprints-TTS-Voice": voice,
         "X-Blueprints-TTS-Sanitized": "true" if sanitized else "false",
-        "X-Blueprints-TTS-Timing-Total-Prestream-Ms": str(round((time.perf_counter() - request_started) * 1000)),
+        "X-Blueprints-TTS-Timing-Total-Prestream-Ms": str(
+            round((time.perf_counter() - request_started) * 1000)
+        ),
         "X-Blueprints-TTS-Timing-Sanitizer-Ms": str(round(sanitizer_ms or 0)),
         "X-Blueprints-TTS-Timing-Probe-Ms": str(round(probe_ms or 0)),
         "X-Blueprints-TTS-Timing-Upstream-Headers-Ms": str(round(upstream_headers_ms or 0)),
@@ -554,14 +588,21 @@ async def tts_create_utterance(body: UtteranceRequest):
     """
     text = (body.text or "").strip()
     if not text:
-        return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing utterance text"})
+        return JSONResponse(
+            status_code=400, content={"ok": False, "detail": "Missing utterance text"}
+        )
 
     source = (body.source or "hermes-local").strip() or "hermes-local"
     agent_id = (body.agent_id or "hermes").strip() or "hermes"
     utterance_id = (body.utterance_id or f"utt_{uuid.uuid4().hex}").strip()
     client_id = (body.client_id or f"{source}:{agent_id}").strip()
-    target = body.target or UtteranceTarget(kind="all_listeners", dedupe="one_webpage_per_client_ip_plus_phone")
+    target = body.target or UtteranceTarget(
+        kind="all_listeners", dedupe="one_webpage_per_client_ip_plus_phone"
+    )
     created_at = body.created_at if body.created_at and body.created_at > 0 else time.time()
+    settings, missing = _resolve_settings()
+    shared_playback_volume = None if missing else _shared_tts_playback_volume(settings)
+    shared_volume_gain = None if missing else _shared_tts_volume_gain(settings)
 
     payload: dict[str, Any] = {
         "utterance_id": utterance_id,
@@ -578,7 +619,8 @@ async def tts_create_utterance(body: UtteranceRequest):
         "sanitize_text": body.sanitize_text is not False,
         "transform_profile": body.transform_profile or "conversation",
         "allow_llm_sanitizer": bool(body.allow_llm_sanitizer),
-        "volume": body.volume,
+        "volume": shared_playback_volume if shared_playback_volume is not None else body.volume,
+        "volume_gain": body.volume_gain if body.volume_gain is not None else shared_volume_gain,
         "timeout_ms": body.timeout_ms,
         "allow_fallback": body.allow_fallback,
         "created_at": created_at,
@@ -660,7 +702,9 @@ async def tts_status(request: Request):
     available = False
     sanitizer_available = False
     if timeout_ms is not None and not missing:
-        available = await _is_local_tts_available(settings.get("tts.local_probe_url", ""), timeout_ms)
+        available = await _is_local_tts_available(
+            settings.get("tts.local_probe_url", ""), timeout_ms
+        )
         try:
             await sanitize_tts_text_via_service(
                 "status",
@@ -690,6 +734,8 @@ async def tts_status(request: Request):
         "default_message": settings.get("tts.default_message"),
         "default_mode": settings.get("tts.default_mode"),
         "tts_volume": settings.get("tts.volume"),
+        "tts_playback_volume": _shared_tts_playback_volume(settings) if not missing else None,
+        "tts_volume_gain": _shared_tts_volume_gain(settings) if not missing else None,
         "sfx_volume": settings.get("tts.fallback.volume"),
         "probe_url": settings.get("tts.local_probe_url"),
         "speech_url": settings.get("tts.local_speech_url"),
