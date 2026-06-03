@@ -427,6 +427,53 @@ def test_active_browser_view_exposes_automation_defaults():
     assert public["automation"]["maximum_step_timeout_seconds"] == 120
 
 
+def test_browser_view_post_returns_small_ack_and_coalesces_disk_persistence(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(voice_mode, "_BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+
+    first = asyncio.run(
+        voice_mode.update_browser_view(
+            voice_mode.BrowserViewBody(
+                browser_id="browser-a",
+                tab_id="tab-1",
+                page={"group": "settings", "tab": "matrix-chat", "ready": True},
+            )
+        )
+    )
+
+    assert first["ok"] is True
+    assert first["stored"] is True
+    assert first["persisted"] is True
+    assert "reports" not in first
+
+    second = asyncio.run(
+        voice_mode.update_browser_view(
+            voice_mode.BrowserViewBody(
+                browser_id="browser-a",
+                tab_id="tab-1",
+                page={"group": "settings", "tab": "agents", "ready": True},
+            )
+        )
+    )
+
+    assert second["ok"] is True
+    assert second["persisted"] is False
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted_report = next(iter(persisted["browser_views"].values()))
+    assert persisted_report["page"]["tab"] == "matrix-chat"
+
+    live = asyncio.run(voice_mode.active_browser_view())
+    assert live["view"]["page"]["tab"] == "agents"
+
+
 def test_active_browser_viewport_classification_flags_are_provisional():
     mobile = voice_mode._clean_browser_view_report(
         voice_mode.BrowserViewBody(
@@ -723,6 +770,107 @@ def test_voice_mode_dev_status_surface_can_select_browser_specific_report():
     assert public["debug"]["browser_id"] == "other-browser"
     assert public["debug"]["status"] == "requested Wake report"
     assert public["debug"]["authoritative_browser_active"] is False
+
+
+def test_voice_mode_dev_status_surface_prefers_active_tab_report():
+    state = {
+        "active": {
+            "browser_id": "active-browser",
+            "tab_id": "tab-1",
+            "browser_label": "Browser on Win32",
+            "stt_enabled": True,
+            "stt_mode": "wake_to_talk",
+            "tts_enabled": True,
+        }
+    }
+    debug = {
+        "reports": {
+            "active-browser:tab-2:wake_dev": {
+                "browser_id": "active-browser",
+                "tab_id": "tab-2",
+                "surface": "wake_dev",
+                "status": "newer wrong tab",
+                "reported_at": 30,
+            },
+            "active-browser:tab-1:wake_dev": {
+                "browser_id": "active-browser",
+                "tab_id": "tab-1",
+                "surface": "wake_dev",
+                "status": "active tab",
+                "reported_at": 20,
+            },
+        }
+    }
+
+    public = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+
+    assert public["debug"]["tab_id"] == "tab-1"
+    assert public["debug"]["status"] == "active tab"
+
+
+def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persistence(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(voice_mode, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+
+    first = asyncio.run(
+        voice_mode.voice_mode_update_dev_status(
+            voice_mode.WakeDevDebugBody(
+                browser_id="browser-a",
+                tab_id="tab-1",
+                surface="vad_dev",
+                mode="vad_rearm",
+                status="first",
+                transcript="Computer",
+                snapshot={"fsm_state": "VAD_REARM_STT_ARMED"},
+            )
+        )
+    )
+
+    assert first["ok"] is True
+    assert first["stored"] is True
+    assert first["persisted"] is True
+    assert first["surface"] == "vad_dev"
+    assert "debug" not in first
+    assert (
+        voice_mode._dev_debug_report_key(
+            {"browser_id": "browser-a", "tab_id": "tab-1", "surface": "vad_dev"}
+        )
+        == "browser-a:tab-1:vad_dev"
+    )
+
+    second = asyncio.run(
+        voice_mode.voice_mode_update_dev_status(
+            voice_mode.WakeDevDebugBody(
+                browser_id="browser-a",
+                tab_id="tab-1",
+                surface="vad_dev",
+                mode="vad_rearm",
+                status="second",
+                transcript="Computer again",
+                snapshot={"fsm_state": "VAD_REARM_STT_FINALIZING"},
+            )
+        )
+    )
+
+    assert second["ok"] is True
+    assert second["persisted"] is False
+    persisted = json.loads(debug_path.read_text(encoding="utf-8"))
+    persisted_report = persisted["reports"]["browser-a:tab-1:vad_dev"]
+    assert persisted_report["status"] == "first"
+
+    live = asyncio.run(voice_mode.voice_mode_dev_status(surface="vad_dev", browser_id="browser-a"))
+    assert live["debug"]["status"] == "second"
+    assert live["debug"]["snapshot"]["fsm_state"] == "VAD_REARM_STT_FINALIZING"
 
 
 def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():

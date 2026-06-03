@@ -29,6 +29,7 @@ import websockets
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket
 from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
+from starlette.websockets import WebSocketDisconnect
 
 from .events import AppEvent
 from .events import bus as events_bus
@@ -122,6 +123,24 @@ _HERMES_BRIDGE_ROOM_NAMES = {
     "tb1": {"bridge"},
     "vps": {"shared bridge"},
 }
+_WEBSOCKET_SEND_CLOSED_MARKERS = (
+    "cannot call",
+    "websocket.close",
+    "close message",
+    "not connected",
+    "disconnected",
+)
+
+
+def _is_expected_websocket_client_close(exc: BaseException) -> bool:
+    if isinstance(exc, (WebSocketDisconnect, OSError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        detail = str(exc).lower()
+        return any(marker in detail for marker in _WEBSOCKET_SEND_CLOSED_MARKERS)
+    return False
+
+
 _HERMES_BRIDGE_PREFIXES = {
     "tb1": "hermes: ",
     "vps": "hermes-vps: ",
@@ -3399,6 +3418,8 @@ async def _wait_for_matrix_stt_noise_relay_completion(
     done: asyncio.Event,
     final_requested: asyncio.Event,
     stt_end_sent: asyncio.Event,
+    client_closed_before_final: asyncio.Event | None = None,
+    log_room: str = "",
 ) -> None:
     pending = {browser_task, filter_task, stt_task, timeout_task, done_task}
     while pending and not done.is_set():
@@ -3412,6 +3433,16 @@ async def _wait_for_matrix_stt_noise_relay_completion(
                 continue
             exception = task.exception()
             if exception is not None:
+                if final_requested.is_set() and _is_expected_websocket_client_close(exception):
+                    if client_closed_before_final is not None:
+                        client_closed_before_final.set()
+                    log.info(
+                        "Matrix STT client_closed_before_final room=%s task=%s",
+                        log_room or "unknown",
+                        task.get_name(),
+                    )
+                    done.set()
+                    continue
                 raise exception
             if task is stt_task or task is timeout_task:
                 done.set()
@@ -3458,6 +3489,7 @@ async def _matrix_chat_stt_relay(
     done = asyncio.Event()
     final_requested = asyncio.Event()
     stt_end_sent = asyncio.Event()
+    client_closed_before_final = asyncio.Event()
     relay_stats = {"audio_bytes": 0, "audio_frames": 0}
     filter_pending_sent_at: deque[float] = deque()
     filter_stats: dict[str, Any] = {
@@ -3841,6 +3873,8 @@ async def _matrix_chat_stt_relay(
                             done=done,
                             final_requested=final_requested,
                             stt_end_sent=stt_end_sent,
+                            client_closed_before_final=client_closed_before_final,
+                            log_room=log_room,
                         )
                         done.set()
                         for task in tasks:
@@ -3871,10 +3905,23 @@ async def _matrix_chat_stt_relay(
                     finished, pending = await asyncio.wait(
                         tasks, return_when=asyncio.FIRST_COMPLETED
                     )
-                    if any(task for task in finished if task is not done_task and task.exception()):
-                        for task in finished:
-                            if task is not done_task:
-                                task.result()
+                    for task in finished:
+                        if task is done_task or task.cancelled():
+                            continue
+                        exception = task.exception()
+                        if exception is None:
+                            continue
+                        if final_requested.is_set() and _is_expected_websocket_client_close(
+                            exception
+                        ):
+                            client_closed_before_final.set()
+                            log.info(
+                                "Matrix STT client_closed_before_final room=%s task=%s",
+                                log_room,
+                                task.get_name(),
+                            )
+                            continue
+                        raise exception
                     done.set()
                     for task in pending:
                         task.cancel()
@@ -3892,12 +3939,13 @@ async def _matrix_chat_stt_relay(
             await websocket.send_json({"type": "error", "detail": str(exc)})
     finally:
         log.info(
-            "Matrix STT session closed room=%s frames=%s bytes=%s final_requested=%s final_sent=%s",
+            "Matrix STT session closed room=%s frames=%s bytes=%s final_requested=%s final_sent=%s client_closed_before_final=%s",
             log_room,
             relay_stats["audio_frames"],
             relay_stats["audio_bytes"],
             final_requested.is_set(),
             final_sent,
+            client_closed_before_final.is_set(),
         )
         if noise_enabled and filter_stats["round_trip_ms"]:
             filter_latencies = filter_stats["round_trip_ms"]

@@ -36,9 +36,28 @@ def _bounded_int_env(name: str, fallback: int, minimum: int, maximum: int) -> in
     return max(minimum, min(value, maximum))
 
 
+def _bounded_float_env(name: str, fallback: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(fallback)) or fallback)
+    except (TypeError, ValueError):
+        value = fallback
+    return max(minimum, min(value, maximum))
+
+
+def _truthy_env(name: str, fallback: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return fallback
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 _STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-voice-mode.json")
 _WAKE_DEV_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-dev-debug.json")
 _state_lock = asyncio.Lock()
+_STATE_CACHE: dict[str, Any] | None = None
+_WAKE_DEV_DEBUG_CACHE: dict[str, Any] | None = None
+_STATE_LAST_PERSISTED_AT = 0.0
+_WAKE_DEV_DEBUG_LAST_PERSISTED_AT = 0.0
 _dependency_health_lock = asyncio.Lock()
 _dependency_health_cache: dict[str, Any] = {
     "payload": None,
@@ -97,6 +116,19 @@ _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS = _bounded_int_env(
     1,
     3600,
 )
+_BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS = _bounded_float_env(
+    "VOICE_MODE_BROWSER_VIEW_PERSIST_INTERVAL_SECONDS",
+    2.0,
+    0.0,
+    60.0,
+)
+_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS = _bounded_float_env(
+    "VOICE_MODE_DEV_STATUS_PERSIST_INTERVAL_SECONDS",
+    2.0,
+    0.0,
+    60.0,
+)
+_VOICE_MODE_HOT_POST_FULL_RESPONSE = _truthy_env("VOICE_MODE_HOT_POST_FULL_RESPONSE")
 _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
     # Provisional first-pass thresholds. Keep raw dimensions in reports so these
     # can be tuned against the actual operator monitors and handheld devices.
@@ -1282,14 +1314,20 @@ def _clean_policy(value: Any) -> dict[str, Any]:
 
 
 def _read_state_unlocked() -> dict[str, Any]:
+    global _STATE_CACHE
+    if isinstance(_STATE_CACHE, dict):
+        return _STATE_CACHE
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return _empty_state()
+        _STATE_CACHE = _empty_state()
+        return _STATE_CACHE
     except Exception:
-        return _empty_state()
+        _STATE_CACHE = _empty_state()
+        return _STATE_CACHE
     if not isinstance(raw, dict):
-        return _empty_state()
+        _STATE_CACHE = _empty_state()
+        return _STATE_CACHE
     state = _empty_state()
     state.update(raw)
     if not isinstance(state.get("active"), dict):
@@ -1298,37 +1336,81 @@ def _read_state_unlocked() -> dict[str, Any]:
     if not isinstance(state.get("browser_views"), dict):
         state["browser_views"] = {}
     state["browser_view_updated_at"] = float(state.get("browser_view_updated_at") or 0.0)
+    _STATE_CACHE = state
     return state
 
 
 def _write_state_unlocked(state: dict[str, Any]) -> None:
+    global _STATE_CACHE, _STATE_LAST_PERSISTED_AT
+    _STATE_CACHE = state
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(_STATE_PATH)
+    _STATE_LAST_PERSISTED_AT = time.monotonic()
+
+
+def _maybe_write_state_telemetry_unlocked(state: dict[str, Any]) -> bool:
+    global _STATE_CACHE
+    _STATE_CACHE = state
+    interval = _BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS
+    now = time.monotonic()
+    if (
+        interval <= 0.0
+        or not _STATE_LAST_PERSISTED_AT
+        or now - _STATE_LAST_PERSISTED_AT >= interval
+    ):
+        _write_state_unlocked(state)
+        return True
+    return False
 
 
 def _read_wake_dev_debug_unlocked() -> dict[str, Any]:
+    global _WAKE_DEV_DEBUG_CACHE
+    if isinstance(_WAKE_DEV_DEBUG_CACHE, dict):
+        return _WAKE_DEV_DEBUG_CACHE
     try:
         raw = json.loads(_WAKE_DEV_DEBUG_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"reports": {}, "updated_at": 0.0}
+        _WAKE_DEV_DEBUG_CACHE = {"reports": {}, "updated_at": 0.0}
+        return _WAKE_DEV_DEBUG_CACHE
     except Exception:
-        return {"reports": {}, "updated_at": 0.0}
+        _WAKE_DEV_DEBUG_CACHE = {"reports": {}, "updated_at": 0.0}
+        return _WAKE_DEV_DEBUG_CACHE
     if not isinstance(raw, dict):
-        return {"reports": {}, "updated_at": 0.0}
+        _WAKE_DEV_DEBUG_CACHE = {"reports": {}, "updated_at": 0.0}
+        return _WAKE_DEV_DEBUG_CACHE
     reports = raw.get("reports") if isinstance(raw.get("reports"), dict) else {}
-    return {
+    _WAKE_DEV_DEBUG_CACHE = {
         "reports": reports,
         "updated_at": float(raw.get("updated_at") or 0.0),
     }
+    return _WAKE_DEV_DEBUG_CACHE
 
 
 def _write_wake_dev_debug_unlocked(debug: dict[str, Any]) -> None:
+    global _WAKE_DEV_DEBUG_CACHE, _WAKE_DEV_DEBUG_LAST_PERSISTED_AT
+    _WAKE_DEV_DEBUG_CACHE = debug
     _WAKE_DEV_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _WAKE_DEV_DEBUG_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(debug, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(_WAKE_DEV_DEBUG_PATH)
+    _WAKE_DEV_DEBUG_LAST_PERSISTED_AT = time.monotonic()
+
+
+def _maybe_write_wake_dev_debug_telemetry_unlocked(debug: dict[str, Any]) -> bool:
+    global _WAKE_DEV_DEBUG_CACHE
+    _WAKE_DEV_DEBUG_CACHE = debug
+    interval = _DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS
+    now = time.monotonic()
+    if (
+        interval <= 0.0
+        or not _WAKE_DEV_DEBUG_LAST_PERSISTED_AT
+        or now - _WAKE_DEV_DEBUG_LAST_PERSISTED_AT >= interval
+    ):
+        _write_wake_dev_debug_unlocked(debug)
+        return True
+    return False
 
 
 def _bounded_json(value: Any, max_chars: int = 20000) -> Any:
@@ -2040,23 +2122,35 @@ def _report_matches_surface(report: dict[str, Any], surface: str) -> bool:
     return bool(surface) and _clean_dev_command_surface(report.get("surface")) == surface
 
 
+def _report_matches_tab(report: dict[str, Any], tab_id: str) -> bool:
+    return bool(tab_id) and _clean_string(report.get("tab_id"), "", 120) == tab_id
+
+
 def _dev_debug_report_key(report: dict[str, Any]) -> str:
     browser_id = _clean_browser_id(report.get("browser_id"))
     surface = _clean_dev_command_surface(report.get("surface"))
-    return f"{browser_id}:{surface}" if browser_id and surface else browser_id
+    tab_id = _clean_string(report.get("tab_id"), "", 120)
+    parts = [part for part in (browser_id, tab_id, surface) if part]
+    return ":".join(parts)
 
 
 def _selected_browser_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
     reports = _dev_debug_reports(debug)
-    selected = (
-        _latest_dev_debug_report(
+    selected = None
+    if active_browser_id and active_tab_id:
+        selected = _latest_dev_debug_report(
+            report
+            for report in reports
+            if _report_matches_browser(report, active_browser_id)
+            and _report_matches_tab(report, active_tab_id)
+        )
+    if not isinstance(selected, dict) and active_browser_id:
+        selected = _latest_dev_debug_report(
             report for report in reports if _report_matches_browser(report, active_browser_id)
         )
-        if active_browser_id
-        else None
-    )
     if not isinstance(selected, dict) and reports and not active_browser_id:
         selected = _latest_dev_debug_report(reports)
     return selected if isinstance(selected, dict) else None
@@ -2096,6 +2190,17 @@ def _select_wake_dev_report(
     if clean_surface:
         active = state.get("active") if isinstance(state.get("active"), dict) else None
         active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+        active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
+        if active_browser_id and active_tab_id:
+            selected = _latest_dev_debug_report(
+                report
+                for report in reports
+                if _report_matches_browser(report, active_browser_id)
+                and _report_matches_tab(report, active_tab_id)
+                and _report_matches_surface(report, clean_surface)
+            )
+            if isinstance(selected, dict):
+                return selected
         selected = _latest_dev_debug_report(
             report
             for report in reports
@@ -2344,14 +2449,19 @@ async def update_browser_view(body: BrowserViewBody):
         now = time.time()
         report = _clean_browser_view_report(body, now)
         active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
-        _write_state_unlocked(state)
-        public = _public_active_browser_view(state)
+        persisted = _maybe_write_state_telemetry_unlocked(state)
+        public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
 
-    return {
-        **public,
+    ack = {
+        "ok": True,
         "stored": True,
+        "persisted": persisted,
+        "updated_at": now,
         "active_tab_changed": active_tab_changed,
     }
+    if public:
+        return {**public, **ack}
+    return ack
 
 
 @router.post("/browser-clients/activate")
@@ -2576,9 +2686,21 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
             "reports": reports,
             "updated_at": now,
         }
-        _write_wake_dev_debug_unlocked(debug)
-        public = _public_wake_dev_debug(state, debug)
-    return public
+        persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(debug)
+        public = (
+            _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+        )
+    ack = {
+        "ok": True,
+        "stored": True,
+        "persisted": persisted,
+        "updated_at": now,
+        "surface": report["surface"],
+        "reports_count": len(reports),
+    }
+    if public:
+        return {**public, **ack}
+    return ack
 
 
 @router.post("/dev-command")
