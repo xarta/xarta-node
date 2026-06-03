@@ -121,6 +121,53 @@ def test_matrix_chat_noise_relay_waits_for_stt_final_after_filter_closes():
     asyncio.run(run())
 
 
+def test_matrix_chat_noise_relay_treats_late_client_close_after_final_request_as_expected():
+    async def run():
+        done = asyncio.Event()
+        final_requested = asyncio.Event()
+        stt_end_sent = asyncio.Event()
+        client_closed_before_final = asyncio.Event()
+        final_requested.set()
+        stt_end_sent.set()
+
+        async def wait_for_done():
+            await done.wait()
+
+        async def late_partial_send_failure():
+            await asyncio.sleep(0.01)
+            raise matrix_chat.WebSocketDisconnect(code=1000)
+
+        browser_task = asyncio.create_task(wait_for_done(), name="browser")
+        filter_task = asyncio.create_task(wait_for_done(), name="filter")
+        stt_task = asyncio.create_task(late_partial_send_failure(), name="stt")
+        timeout_task = asyncio.create_task(wait_for_done(), name="timeout")
+        done_task = asyncio.create_task(done.wait(), name="done")
+        tasks = {browser_task, filter_task, stt_task, timeout_task, done_task}
+        try:
+            await matrix_chat._wait_for_matrix_stt_noise_relay_completion(
+                browser_task=browser_task,
+                filter_task=filter_task,
+                stt_task=stt_task,
+                timeout_task=timeout_task,
+                done_task=done_task,
+                done=done,
+                final_requested=final_requested,
+                stt_end_sent=stt_end_sent,
+                client_closed_before_final=client_closed_before_final,
+                log_room="!room:test",
+            )
+
+            assert done.is_set()
+            assert client_closed_before_final.is_set()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):
     report_path = tmp_path / "matrix_platform_patch.json"
     report_path.write_text(
