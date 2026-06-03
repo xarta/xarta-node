@@ -5,10 +5,13 @@ Config values are read from DB settings (not hardcoded here).
 No DB writes; no enqueue_for_all_peers — these are local-node-only operations.
 """
 
+from typing import Any
+
 import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from . import config as cfg
 from .db import get_conn, get_setting
 
 router = APIRouter(prefix="/playwright", tags=["playwright"])
@@ -18,8 +21,18 @@ _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 90.0
 
 
-class _UrlBody(BaseModel):
+class _BrowserBody(BaseModel):
     url: str
+    viewport: dict[str, Any] | None = None
+    wait_until: str | None = None
+    wait_for_selector: str | None = None
+    wait_for_timeout_ms: int | None = None
+    open_modal_id: str | None = None
+    measure_selectors: list[str] | None = None
+    full_page: bool | None = None
+    ignore_https_errors: bool | None = None
+    local_storage: dict[str, str] | None = None
+    blueprints_auth: bool = False
 
 
 def _base_url() -> str:
@@ -40,6 +53,18 @@ async def _playwright_reachable() -> bool:
             return body.get("reachable") is True
     except Exception:
         return False
+
+
+def _stack_browser_payload(body: _BrowserBody) -> dict[str, Any]:
+    payload = body.model_dump(exclude_none=True)
+    if body.blueprints_auth:
+        if not cfg.API_SECRET:
+            raise HTTPException(500, "BLUEPRINTS_API_SECRET is not configured")
+        local_storage = dict(payload.get("local_storage") or {})
+        local_storage["blueprints_api_secret"] = cfg.API_SECRET
+        payload["local_storage"] = local_storage
+        payload.pop("blueprints_auth", None)
+    return payload
 
 
 @router.get("/health")
@@ -91,7 +116,7 @@ async def playwright_tools() -> dict:
 
 
 @router.post("/probe")
-async def playwright_probe(body: _UrlBody) -> dict:
+async def playwright_probe(body: _BrowserBody) -> dict:
     """Run a bounded browser navigation probe through the local Playwright stack."""
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
@@ -100,9 +125,10 @@ async def playwright_probe(body: _UrlBody) -> dict:
         raise HTTPException(503, "Playwright stack not reachable")
 
     base = _base_url()
+    payload = _stack_browser_payload(body)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
-            r = await client.post(f"{base}/probe", json={"url": body.url})
+            r = await client.post(f"{base}/probe", json=payload)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text[:500])
         data = r.json()
@@ -115,7 +141,7 @@ async def playwright_probe(body: _UrlBody) -> dict:
 
 
 @router.post("/screenshot")
-async def playwright_screenshot(body: _UrlBody) -> dict:
+async def playwright_screenshot(body: _BrowserBody) -> dict:
     """Capture a full-page screenshot through the local Playwright stack."""
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
@@ -124,9 +150,10 @@ async def playwright_screenshot(body: _UrlBody) -> dict:
         raise HTTPException(503, "Playwright stack not reachable")
 
     base = _base_url()
+    payload = _stack_browser_payload(body)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(_READ_TIMEOUT)) as client:
-            r = await client.post(f"{base}/screenshot", json={"url": body.url})
+            r = await client.post(f"{base}/screenshot", json=payload)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text[:500])
         data = r.json()
