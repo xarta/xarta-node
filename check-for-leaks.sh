@@ -62,6 +62,7 @@ SKIP_KEYS=(
     "BLUEPRINTS_GUI_DIR"        # derived from REPO_INNER_PATH — documented public structure
     "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
     "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure
+    "BLUEPRINTS_DASHBOARD_AUTH_SESSION_SECONDS" # numeric session TTL — too generic to scan for
     "DOCS_ROOT"                 # lone-wolf docs root is intentionally referenced in skills/docs
     "THIS_NODE_DOCS_BACKUP"     # value is typically true/false — too generic to scan for
     "SEEKDB_DB"                 # value is "blueprints" — the project name, present everywhere
