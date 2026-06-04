@@ -17,6 +17,7 @@ dependencies = [
     "httpx>=0.28.0",
     "python-multipart>=0.0.9",
     "pyseekdb==1.1.0.post3",
+    "ruamel.yaml>=0.18.0",
     "Pillow>=10.0.0",
     "mautrix[encryption]==0.21.0",
     "aiosqlite>=0.22.0",
