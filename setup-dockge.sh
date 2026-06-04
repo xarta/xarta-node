@@ -25,6 +25,7 @@ DOCKGE_STACK_DIR="${DOCKGE_STACK_DIR:-$DOCKGE_STACKS_DIR/dockge}"
 DOCKGE_PORT="${DOCKGE_PORT:-5001}"
 DOCKGE_BIND_IP="${DOCKGE_BIND_IP:-127.0.0.1}"
 XARTA_USER="${XARTA_USER:-xarta}"
+STACK_RUNTIME_OWNER_FIX_SCRIPT="${STACK_RUNTIME_OWNER_FIX_SCRIPT:-$SCRIPT_DIR/blueprints-app/scripts/lone-wolf-stack-runtime-fix-owner.sh}"
 
 echo "=== Dockge setup ==="
 echo "Stacks dir : $DOCKGE_STACKS_DIR"
@@ -62,9 +63,20 @@ services:
       - DOCKGE_STACKS_DIR=${DOCKGE_STACKS_DIR}
 EOF
 
-chown -R "$XARTA_USER:$XARTA_USER" \
-    "$(dirname "$DOCKGE_STACKS_DIR")" \
-    "$DOCKGE_STACKS_DIR"
+# Keep source-owned paths owned by xarta, but never recursively normalize
+# node-local stack runtime data. Container data directories often need service
+# UIDs such as postgres:70 and a broad chown breaks live stacks.
+chown "$XARTA_USER:$XARTA_USER" \
+    "$NODE_LOCAL_REPO_DIR" \
+    "$DOCKGE_STACKS_DIR" \
+    "$DOCKGE_STACK_DIR" \
+    "$DOCKGE_STACK_DIR/compose.yaml"
+
+chown -R "$XARTA_USER:$XARTA_USER" "$DOCKGE_DATA_DIR"
+
+if [[ -x "$STACK_RUNTIME_OWNER_FIX_SCRIPT" ]]; then
+    "$STACK_RUNTIME_OWNER_FIX_SCRIPT"
+fi
 
 docker compose -f "$DOCKGE_STACK_DIR/compose.yaml" up -d
 

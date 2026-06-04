@@ -31,11 +31,15 @@ fi
 # --- .gitignore ---
 COMMIT_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-commit.sh"
 OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-fix-owner.sh"
+STACK_RUNTIME_OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-stack-runtime-fix-owner.sh"
 CRON_MARKER="lone-wolf-docs-commit"
 CRON_LINE="* * * * * root bash $COMMIT_SCRIPT"
 OWNER_CRON_FILE="/etc/cron.d/lone-wolf-docs-owner"
 OWNER_CRON_MARKER="lone-wolf-docs-fix-owner"
 OWNER_CRON_LINE="* * * * * root bash $OWNER_FIX_SCRIPT"
+STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
+STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
+STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT"
 
 if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
     echo "# $OWNER_CRON_MARKER" > "$OWNER_CRON_FILE"
@@ -44,6 +48,15 @@ if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
     echo "  docs-owner-cron: installed — ownership normalization runs every minute"
 else
     echo "  docs-owner-cron: already installed — OK"
+fi
+
+if ! grep -q "$STACK_RUNTIME_OWNER_CRON_MARKER" "$STACK_RUNTIME_OWNER_CRON_FILE" 2>/dev/null; then
+    echo "# $STACK_RUNTIME_OWNER_CRON_MARKER" > "$STACK_RUNTIME_OWNER_CRON_FILE"
+    echo "$STACK_RUNTIME_OWNER_CRON_LINE" >> "$STACK_RUNTIME_OWNER_CRON_FILE"
+    chmod 644 "$STACK_RUNTIME_OWNER_CRON_FILE"
+    echo "  stack-runtime-owner-cron: installed — runtime ownership guard runs every minute"
+else
+    echo "  stack-runtime-owner-cron: already installed — OK"
 fi
 
 if [[ "$DOCS_BACKUP" == "true" ]]; then
