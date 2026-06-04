@@ -31,11 +31,12 @@ from .models import (
     VisitPageOut,
 )
 from .seekdb import (
-    keyword_search_bookmarks,
-    keyword_search_visits,
-    seekdb_counts,
-    vector_search_bookmarks,
-    vector_search_visits,
+    keyword_search_bookmarks_async,
+    keyword_search_visits_async,
+    seekdb_counts_async,
+    short_seekdb_error,
+    vector_search_bookmarks_async,
+    vector_search_visits_async,
 )
 from .seekdb_sync import (
     DEFAULT_DOMAIN_THRESHOLD,
@@ -143,9 +144,18 @@ async def bookmarks_health() -> dict:
         bookmark_count = int(conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0])
         visit_count = int(conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0])
 
-    counts = seekdb_counts()
-    seekdb_indexed = counts["bookmarks_indexed"]
-    visits_indexed = counts["visits_indexed"]
+    seekdb_ok = "ok"
+    seekdb_err = ""
+    try:
+        counts = await seekdb_counts_async(timeout=2.0)
+        seekdb_indexed = counts["bookmarks_indexed"]
+        visits_indexed = counts["visits_indexed"]
+    except Exception as exc:
+        seekdb_ok = "error"
+        seekdb_err = short_seekdb_error(exc)
+        seekdb_indexed = 0
+        visits_indexed = 0
+
     # Stale = entries present in SQLite but absent from SeekDB.
     # Fast: two COUNTs already fetched above — just arithmetic.
     seekdb_stale = max(0, bookmark_count - seekdb_indexed)
@@ -160,13 +170,14 @@ async def bookmarks_health() -> dict:
             emb_err = "unexpected embedding dimensions"
     except Exception as exc:
         emb_ok = "error"
-        emb_err = str(exc)
+        emb_err = short_seekdb_error(exc)
 
-    status = "ok" if emb_ok == "ok" else "degraded"
+    status = "ok" if seekdb_ok == "ok" and emb_ok == "ok" else "degraded"
     return {
         "status": status,
         "sqlite": "ok",
-        "seekdb": "ok",
+        "seekdb": seekdb_ok,
+        "seekdb_error": seekdb_err,
         "embedding": emb_ok,
         "embedding_error": emb_err,
         "bookmark_count": bookmark_count,
@@ -209,11 +220,17 @@ async def list_tags_with_counts() -> list[dict]:
 
 # ── Embedding config & reindex ────────────────────────────────────────────────
 
+
 @router.get("/embedding-config", response_model=dict)
 async def get_embedding_config() -> dict:
     with get_conn() as conn:
-        excluded_raw = get_setting(conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS) or DEFAULT_EXCLUDED_TAGS
-        threshold = int(get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD) or DEFAULT_DOMAIN_THRESHOLD)
+        excluded_raw = (
+            get_setting(conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS) or DEFAULT_EXCLUDED_TAGS
+        )
+        threshold = int(
+            get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD)
+            or DEFAULT_DOMAIN_THRESHOLD
+        )
         rare_raw = get_setting(conn, SETTING_RARE_DOMAINS, "[]") or "[]"
     excluded_tags = [t.strip() for t in excluded_raw.split(",") if t.strip()]
     try:
@@ -237,22 +254,36 @@ async def put_embedding_config(body: dict) -> dict:
                 val = ",".join(str(t).strip().lower() for t in tags if str(t).strip())
             else:
                 val = str(tags)
-            set_setting(conn, SETTING_EXCLUDED_TAGS, val,
-                        description="Comma-separated tags to exclude from embeddings")
+            set_setting(
+                conn,
+                SETTING_EXCLUDED_TAGS,
+                val,
+                description="Comma-separated tags to exclude from embeddings",
+            )
             gen = increment_gen(conn)
-            row = {"key": SETTING_EXCLUDED_TAGS, "value": val,
-                   "description": "Comma-separated tags to exclude from embeddings",
-                   "updated_at": None}
+            row = {
+                "key": SETTING_EXCLUDED_TAGS,
+                "value": val,
+                "description": "Comma-separated tags to exclude from embeddings",
+                "updated_at": None,
+            }
             enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_EXCLUDED_TAGS, row, gen)
         if "domain_threshold" in body:
             threshold = max(0, int(body["domain_threshold"]))
             val_t = str(threshold)
-            set_setting(conn, SETTING_DOMAIN_THRESHOLD, val_t,
-                        description="Max occurrences for a domain to be treated as rare (included in embeddings)")
+            set_setting(
+                conn,
+                SETTING_DOMAIN_THRESHOLD,
+                val_t,
+                description="Max occurrences for a domain to be treated as rare (included in embeddings)",
+            )
             gen = increment_gen(conn)
-            row = {"key": SETTING_DOMAIN_THRESHOLD, "value": val_t,
-                   "description": "Max occurrences for a domain to be treated as rare (included in embeddings)",
-                   "updated_at": None}
+            row = {
+                "key": SETTING_DOMAIN_THRESHOLD,
+                "value": val_t,
+                "description": "Max occurrences for a domain to be treated as rare (included in embeddings)",
+                "updated_at": None,
+            }
             enqueue_for_all_peers(conn, "INSERT", "settings", SETTING_DOMAIN_THRESHOLD, row, gen)
     return {"ok": True}
 
@@ -264,7 +295,10 @@ async def post_analyze_domains(body: dict | None = None) -> dict:
         threshold = max(0, int(body["domain_threshold"]))
     rare = _do_analyze_domains(threshold)
     with get_conn() as conn:
-        used_threshold = int(get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD) or DEFAULT_DOMAIN_THRESHOLD)
+        used_threshold = int(
+            get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD)
+            or DEFAULT_DOMAIN_THRESHOLD
+        )
     return {"rare_domains_count": len(rare), "threshold": used_threshold}
 
 
@@ -430,9 +464,7 @@ async def list_visit_domains_page(
             )
             for row in group_rows
         }
-        expanded_on_page = [
-            domain for domain in expanded_domains if domain in groups_by_domain
-        ]
+        expanded_on_page = [domain for domain in expanded_domains if domain in groups_by_domain]
         if expanded_on_page:
             placeholders = ",".join("?" for _ in expanded_on_page)
             child_rows = conn.execute(
@@ -489,7 +521,9 @@ async def search_bookmarks(
     # Load excluded tags first — before any embedding or SeekDB call.
     with get_conn() as _conn:
         _excl_raw = get_setting(_conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
-    _excluded_tags: set[str] = {t.strip().lower() for t in (_excl_raw or "").split(",") if t.strip()}
+    _excluded_tags: set[str] = {
+        t.strip().lower() for t in (_excl_raw or "").split(",") if t.strip()
+    }
 
     # If every token in the query is an excluded tag, return nothing immediately.
     # Searching for "favourites-bar" or "web" (nuisance tags) should produce no
@@ -500,11 +534,22 @@ async def search_bookmarks(
     query_embedding = (await embed("browser-links", [q]))[0]
 
     window = max(limit * 3, 30)
-    bm_kw = keyword_search_bookmarks(q, window)
-    bm_vec = vector_search_bookmarks(query_embedding, window)
-
-    vis_kw = keyword_search_visits(q, window) if include_visits else []
-    vis_vec = vector_search_visits(query_embedding, window) if include_visits else []
+    search_tasks = [
+        keyword_search_bookmarks_async(q, window),
+        vector_search_bookmarks_async(query_embedding, window),
+    ]
+    if include_visits:
+        search_tasks.extend(
+            [
+                keyword_search_visits_async(q, window),
+                vector_search_visits_async(query_embedding, window),
+            ]
+        )
+    search_results = await asyncio.gather(*search_tasks)
+    bm_kw = search_results[0]
+    bm_vec = search_results[1]
+    vis_kw = search_results[2] if include_visits else []
+    vis_vec = search_results[3] if include_visits else []
 
     def _searchable_tags(tags_json_str: str | None) -> str:
         """Return space-joined tag text with excluded tags removed."""
@@ -610,12 +655,17 @@ async def search_bookmarks(
 
     if len(results) > 1:
         docs = [
-            " ".join(filter(None, [
-                r.get("title", ""),
-                r.get("url", ""),
-                r.get("description", ""),
-                r.get("notes", ""),
-            ])).strip()
+            " ".join(
+                filter(
+                    None,
+                    [
+                        r.get("title", ""),
+                        r.get("url", ""),
+                        r.get("description", ""),
+                        r.get("notes", ""),
+                    ],
+                )
+            ).strip()
             for r in results
         ]
         ranked = await rerank("browser-links", q, docs, top_n=min(limit, len(docs)))
@@ -661,11 +711,13 @@ async def search_bookmarks(
     # within each tier); rrf_score as final tiebreaker.
     # null cosine_distance = float('inf') → keyword-only results sort after dual-match
     # results within the same tier, but still above pure-embedding (tier 4) results.
-    results.sort(key=lambda r: (
-        _exact_tier(r),
-        r.get("cosine_distance") if r.get("cosine_distance") is not None else float("inf"),
-        -(r.get("rrf_score") or 0.0),
-    ))
+    results.sort(
+        key=lambda r: (
+            _exact_tier(r),
+            r.get("cosine_distance") if r.get("cosine_distance") is not None else float("inf"),
+            -(r.get("rrf_score") or 0.0),
+        )
+    )
     for r in results:
         r["exact_tier"] = _exact_tier(r)
 
@@ -712,12 +764,30 @@ The user's search query and full result JSON will be provided. Explain each metr
 """.strip()
 
 _FOCUS_CONTEXT = {
-    "score_sources": ("Score Sources", "score_sources lists which of the 4 pipeline arms found THIS SPECIFIC BOOKMARK in their top candidates (bookmark_keyword, bookmark_vector, visit_keyword, visit_vector). IMPORTANT: all four arms always run for every search. An arm missing from score_sources means this bookmark was not in that arm's top candidates — not that the arm was skipped. Other results in the same search may have different sources. Each arm that finds a result adds 1/(60+rank+1) to the RRF score. Being found by multiple arms is a strong relevance signal."),
-    "rrf_score": ("RRF Score", "rrf_score is the Reciprocal Rank Fusion total. For each source list a result appears in, the formula 1/(60+rank+1) is added, where rank is 0-indexed position in that list. Higher = better. Typical values: ~0.015 for a top result, ~0.005 for a lower one. The k=60 constant dampens rank differences — it prevents one very-top rank from dominating."),
-    "kw_tier": ("Keyword Tier (kw_tier)", "kw_tier is the pre-RRF quality tier for keyword matches (0=best, 7=worst). It determines sort order within the keyword result list before RRF merging. 0: full phrase in title. 1: full phrase in URL. 2: all query tokens found across title+url+tags combined. 3: full phrase in tags. 4: any token in title. 5: any token in URL. 6: any token in any tag. 7: match only in description or notes (document body). Null means this result was NOT found by keyword search at all — it came from vector search only."),
-    "cosine_distance": ("Cosine Distance", "cosine_distance is the geometric distance between the query embedding and the bookmark's embedding in the HNSW vector index. Both are computed from a concatenation of title+description+tags+notes+url. Scale: 0=identical direction, 1=orthogonal (no semantic overlap). Values below 0.3 indicate strong semantic match; 0.4-0.6 is moderate; above 0.6 is weak. Null means this result was NOT found by vector search — it appeared only via keyword match. The vector search ran but this bookmark was not in its top candidates."),
-    "reranker_rank": ("Reranker Rank", "reranker_rank is the 1-indexed position assigned by the cross-encoder reranker. The reranker reads the bookmark's title+url+description+notes together with the query and produces a relevance score — it understands full sentences and context, unlike the embedding model which computes a single vector. rank=1 is best. A null value means only one result was returned (no reranking needed) or the result was below the top-N cutoff."),
-    "exact_tier": ("Exact Tier", "exact_tier is the post-reranker promotion tier (stable sort, so reranker order is preserved within each tier). 0: full phrase in title or URL. 1: all query tokens found across title+url+tags. 2: any query token in title or URL. 3: phrase or token only in tags. 4: pure semantic match (no token overlap at all). This ensures that a result containing the literal query words is never buried below a purely semantic result, even if the reranker ranked it lower."),
+    "score_sources": (
+        "Score Sources",
+        "score_sources lists which of the 4 pipeline arms found THIS SPECIFIC BOOKMARK in their top candidates (bookmark_keyword, bookmark_vector, visit_keyword, visit_vector). IMPORTANT: all four arms always run for every search. An arm missing from score_sources means this bookmark was not in that arm's top candidates — not that the arm was skipped. Other results in the same search may have different sources. Each arm that finds a result adds 1/(60+rank+1) to the RRF score. Being found by multiple arms is a strong relevance signal.",
+    ),
+    "rrf_score": (
+        "RRF Score",
+        "rrf_score is the Reciprocal Rank Fusion total. For each source list a result appears in, the formula 1/(60+rank+1) is added, where rank is 0-indexed position in that list. Higher = better. Typical values: ~0.015 for a top result, ~0.005 for a lower one. The k=60 constant dampens rank differences — it prevents one very-top rank from dominating.",
+    ),
+    "kw_tier": (
+        "Keyword Tier (kw_tier)",
+        "kw_tier is the pre-RRF quality tier for keyword matches (0=best, 7=worst). It determines sort order within the keyword result list before RRF merging. 0: full phrase in title. 1: full phrase in URL. 2: all query tokens found across title+url+tags combined. 3: full phrase in tags. 4: any token in title. 5: any token in URL. 6: any token in any tag. 7: match only in description or notes (document body). Null means this result was NOT found by keyword search at all — it came from vector search only.",
+    ),
+    "cosine_distance": (
+        "Cosine Distance",
+        "cosine_distance is the geometric distance between the query embedding and the bookmark's embedding in the HNSW vector index. Both are computed from a concatenation of title+description+tags+notes+url. Scale: 0=identical direction, 1=orthogonal (no semantic overlap). Values below 0.3 indicate strong semantic match; 0.4-0.6 is moderate; above 0.6 is weak. Null means this result was NOT found by vector search — it appeared only via keyword match. The vector search ran but this bookmark was not in its top candidates.",
+    ),
+    "reranker_rank": (
+        "Reranker Rank",
+        "reranker_rank is the 1-indexed position assigned by the cross-encoder reranker. The reranker reads the bookmark's title+url+description+notes together with the query and produces a relevance score — it understands full sentences and context, unlike the embedding model which computes a single vector. rank=1 is best. A null value means only one result was returned (no reranking needed) or the result was below the top-N cutoff.",
+    ),
+    "exact_tier": (
+        "Exact Tier",
+        "exact_tier is the post-reranker promotion tier (stable sort, so reranker order is preserved within each tier). 0: full phrase in title or URL. 1: all query tokens found across title+url+tags. 2: any query token in title or URL. 3: phrase or token only in tags. 4: pure semantic match (no token overlap at all). This ensures that a result containing the literal query words is never buried below a purely semantic result, even if the reranker ranked it lower.",
+    ),
 }
 
 
@@ -739,8 +809,8 @@ async def post_score_explain(body: dict) -> dict:
         )
         user_content = (
             f"/no-think\n"
-            f"Search query: \"{query}\"\n"
-            f"Bookmark: \"{title}\"\n"
+            f'Search query: "{query}"\n'
+            f'Bookmark: "{title}"\n'
             f"Metric: {metric_label}\n"
             f"Value: {json.dumps(metric_value)}\n\n"
             f"Full result JSON for context:\n{json.dumps(result, indent=2, default=str)}\n\n"
@@ -752,8 +822,8 @@ async def post_score_explain(body: dict) -> dict:
         system = _SCORE_PIPELINE_CONTEXT
         user_content = (
             f"/no-think\n"
-            f"Search query: \"{query}\"\n"
-            f"Bookmark title: \"{title}\"\n\n"
+            f'Search query: "{query}"\n'
+            f'Bookmark title: "{title}"\n\n'
             f"Full result JSON:\n{json.dumps(result, indent=2, default=str)}\n\n"
             f"Explain each scoring metric for this result. For each metric, say what the value means "
             f"specifically for this bookmark and this query. Does each metric suggest this result is relevant? "
@@ -841,18 +911,20 @@ async def post_sort_explain(body: dict) -> dict:
     # that explain ordering: visible URL text, sort tiers, score arms, and scores.
     slim = []
     for i, r in enumerate(results[:20]):
-        slim.append({
-            "rank": i + 1,
-            "title": (r.get("title") or "")[:120],
-            "url_text": _sort_explain_url_text(r.get("url")),
-            "score_sources": r.get("score_sources"),
-            "kw_tier": r.get("kw_tier"),
-            "cosine_distance": _sort_explain_number(r.get("cosine_distance")),
-            "rrf_score": _sort_explain_number(r.get("rrf_score")),
-            "reranker_rank": r.get("reranker_rank"),
-            "exact_tier": r.get("exact_tier"),
-            "item_type": r.get("item_type"),
-        })
+        slim.append(
+            {
+                "rank": i + 1,
+                "title": (r.get("title") or "")[:120],
+                "url_text": _sort_explain_url_text(r.get("url")),
+                "score_sources": r.get("score_sources"),
+                "kw_tier": r.get("kw_tier"),
+                "cosine_distance": _sort_explain_number(r.get("cosine_distance")),
+                "rrf_score": _sort_explain_number(r.get("rrf_score")),
+                "reranker_rank": r.get("reranker_rank"),
+                "exact_tier": r.get("exact_tier"),
+                "item_type": r.get("item_type"),
+            }
+        )
 
     sort_note = (
         f"NOTE: The user has manually re-sorted the table by column '{sort_col}' ({sort_dir}). "
@@ -863,7 +935,7 @@ async def post_sort_explain(body: dict) -> dict:
 
     user_content = (
         f"/no-think\n"
-        f"Search query: \"{query}\"\n"
+        f'Search query: "{query}"\n'
         f"{sort_note}\n\n"
         f"Results in current display order (top {len(slim)}):\n"
         f"{json.dumps(slim, indent=2, default=str)}\n\n"
@@ -874,8 +946,10 @@ async def post_sort_explain(body: dict) -> dict:
     try:
         answer = await complete(
             "browser-links",
-            [{"role": "system", "content": _SORT_EXPLAIN_SYSTEM},
-             {"role": "user", "content": user_content}],
+            [
+                {"role": "system", "content": _SORT_EXPLAIN_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
             max_tokens=2500,
             strip_think=True,
             no_think=True,
@@ -904,7 +978,9 @@ async def download_extension() -> StreamingResponse:
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="blueprints-bookmarks-extension.zip"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="blueprints-bookmarks-extension.zip"'
+        },
     )
 
 
@@ -921,6 +997,7 @@ async def extension_version() -> dict:
 
 
 # ── CRUD routes ───────────────────────────────────────────────────────────────
+
 
 @router.post("", response_model=BookmarkOut, status_code=201)
 async def create_bookmark(body: BookmarkCreate) -> BookmarkOut:
@@ -991,7 +1068,9 @@ async def import_bookmarks(body: BookmarkImportRequest) -> BookmarkImportResult:
                     bm.source,
                 ),
             )
-            row = conn.execute("SELECT * FROM bookmarks WHERE bookmark_id=?", (bookmark_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM bookmarks WHERE bookmark_id=?", (bookmark_id,)
+            ).fetchone()
             gen = increment_gen(conn, "human")
             enqueue_for_all_peers(conn, "INSERT", "bookmarks", bookmark_id, dict(row), gen)
             imported += 1
@@ -1043,7 +1122,8 @@ async def create_visit(body: VisitCreate) -> VisitOut:
                 """,
                 (
                     visited_at,
-                    body.title, body.title,
+                    body.title,
+                    body.title,
                     body.dwell_seconds,
                     bookmark_id,
                     normalized_url,
@@ -1075,9 +1155,7 @@ async def create_visit(body: VisitCreate) -> VisitOut:
                     visited_at,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM visits WHERE visit_id=?", (visit_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM visits WHERE visit_id=?", (visit_id,)).fetchone()
             gen = increment_gen(conn, "human")
             enqueue_for_all_peers(conn, "INSERT", "visits", visit_id, dict(row), gen)
 
@@ -1110,12 +1188,22 @@ async def check_dead_links(
                 resp = await client.head(url, follow_redirects=True)
                 status = resp.status_code
                 dead = status in (404, 410)
-                return {"bookmark_id": bm["bookmark_id"], "url": url,
-                        "title": bm.get("title") or url, "status": status, "dead": dead}
+                return {
+                    "bookmark_id": bm["bookmark_id"],
+                    "url": url,
+                    "title": bm.get("title") or url,
+                    "status": status,
+                    "dead": dead,
+                }
             except Exception as exc:
-                return {"bookmark_id": bm["bookmark_id"], "url": url,
-                        "title": bm.get("title") or url, "status": None,
-                        "dead": False, "error": str(exc)[:120]}
+                return {
+                    "bookmark_id": bm["bookmark_id"],
+                    "url": url,
+                    "title": bm.get("title") or url,
+                    "status": None,
+                    "dead": False,
+                    "error": str(exc)[:120],
+                }
 
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=10)
     async with httpx.AsyncClient(
@@ -1149,8 +1237,12 @@ async def check_dead_links(
         "archived": len(dead),
         "errors": len(errors),
         "dead": [
-            {"bookmark_id": r["bookmark_id"], "url": r["url"],
-             "title": r["title"], "status": r.get("status")}
+            {
+                "bookmark_id": r["bookmark_id"],
+                "url": r["url"],
+                "title": r["title"],
+                "status": r.get("status"),
+            }
             for r in dead
         ],
     }
