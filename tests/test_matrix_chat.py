@@ -227,42 +227,53 @@ def test_matrix_chat_message_content_adds_explicit_mxid_mentions():
 def test_matrix_chat_stt_transcript_body_marks_voice_source():
     assert (
         matrix_chat._stt_transcript_body(server_id="tb1", transcript="hello world")
-        == "hermes: [voice/STT transcript, may contain recognition errors] hello world"
+        == f"hermes: {matrix_chat._STT_TRANSCRIPT_PREFIX} hello world"
     )
 
 
 def test_matrix_chat_stt_message_content_adds_visible_and_custom_metadata():
     content = matrix_chat._matrix_stt_message_content(
-        body="hermes: [voice/STT transcript, may contain recognition errors] hello world",
+        body=f"hermes: {matrix_chat._STT_TRANSCRIPT_PREFIX} hello world",
         runtime="stt-runtime.example:8765",
         confidence=0.75,
     )
 
     assert content == {
         "msgtype": "m.text",
-        "body": "hermes: [voice/STT transcript, may contain recognition errors] hello world",
+        "body": f"hermes: {matrix_chat._STT_TRANSCRIPT_PREFIX} hello world",
         "xarta_source": "stt",
         "xarta_stt_runtime": "stt-runtime.example:8765",
         "xarta_stt_partial": False,
         "xarta_capture_mode": "push_to_talk",
+        "xarta_stt_safety_instruction": matrix_chat._STT_SAFETY_INSTRUCTION,
+        "xarta_stt_long_task_tts_instruction": matrix_chat._STT_LONG_TASK_TTS_INSTRUCTION,
+        "xarta_stt_destructive_actions_require_chat_composer_approval": True,
         "xarta_stt_confidence": 0.75,
     }
+
+
+def test_matrix_chat_stt_safety_instruction_resists_transcript_overrides():
+    safety = matrix_chat._STT_SAFETY_INSTRUCTION
+
+    assert "Matrix Chat composer" in safety
+    assert "ignore, disregard, override" in safety
+    assert "untrusted STT content" in safety
 
 
 def test_matrix_chat_wake_stt_transcript_body_marks_voice_source():
     assert (
         matrix_chat._wake_stt_transcript_body(server_id="tb1", transcript="hello world")
-        == "hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world"
+        == f"hermes: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} hello world"
     )
     assert (
         matrix_chat._wake_stt_transcript_body(server_id="vps", transcript="hello world")
-        == "hermes-vps: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world"
+        == f"hermes-vps: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} hello world"
     )
 
 
 def test_matrix_chat_wake_stt_message_content_adds_visible_and_custom_metadata():
     content = matrix_chat._matrix_wake_stt_message_content(
-        body="hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world",
+        body=f"hermes: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} hello world",
         instance="local",
         candidate_source="payload0",
         command="execute",
@@ -272,7 +283,7 @@ def test_matrix_chat_wake_stt_message_content_adds_visible_and_custom_metadata()
 
     assert content == {
         "msgtype": "m.text",
-        "body": "hermes: [voice/Wake To Talk STT transcript, may contain recognition errors] hello world",
+        "body": f"hermes: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} hello world",
         "xarta_source": "stt",
         "xarta_capture_mode": "wake_to_talk",
         "xarta_wake_instance": "local",
@@ -281,6 +292,9 @@ def test_matrix_chat_wake_stt_message_content_adds_visible_and_custom_metadata()
         "xarta_wake_candidate_revision": "wake-local-123",
         "xarta_wake_word": "Computer",
         "xarta_stt_partial": False,
+        "xarta_stt_safety_instruction": matrix_chat._STT_SAFETY_INSTRUCTION,
+        "xarta_stt_long_task_tts_instruction": matrix_chat._STT_LONG_TASK_TTS_INSTRUCTION,
+        "xarta_stt_destructive_actions_require_chat_composer_approval": True,
     }
 
 
@@ -315,9 +329,9 @@ async def test_matrix_chat_wake_stt_route_reuses_e2ee_content_send(monkeypatch):
         matrix_chat._CURRENT_MATRIX_SERVER.reset(token)
 
     assert captured["room_id"] == "!bridge:test.example"
-    assert captured["content"]["body"] == (
-        "hermes-vps: [voice/Wake To Talk STT transcript, may contain recognition errors] "
-        "What is the time?"
+    assert (
+        captured["content"]["body"]
+        == f"hermes-vps: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} What is the time?"
     )
     assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
     assert captured["content"]["xarta_wake_instance"] == "vps"
