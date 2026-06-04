@@ -32,6 +32,7 @@ router = APIRouter(prefix="/nodes", tags=["nodes"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _row_to_out(row) -> NodeOut:
     addrs = row["addresses"]
     keys = row.keys()
@@ -39,10 +40,9 @@ def _row_to_out(row) -> NodeOut:
 
     # A node is a fleet peer if it is self, or if any of its addresses appears
     # in the configured PEER_SYNC_URLS (these are the nodes this instance syncs to).
-    _peer_set = {u.rstrip('/') for urls in cfg.PEER_SYNC_URLS.values() for u in urls}
-    fleet_peer: bool = (
-        row["node_id"] == cfg.NODE_ID
-        or any(a.rstrip('/') in _peer_set for a in addr_list)
+    _peer_set = {u.rstrip("/") for urls in cfg.PEER_SYNC_URLS.values() for u in urls}
+    fleet_peer: bool = row["node_id"] == cfg.NODE_ID or any(
+        a.rstrip("/") in _peer_set for a in addr_list
     )
 
     return NodeOut(
@@ -64,6 +64,7 @@ def _row_to_out(row) -> NodeOut:
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
 
 @router.get("/self", response_model=NodeOut)
 async def get_self() -> NodeOut:
@@ -102,7 +103,10 @@ async def refresh_nodes() -> dict:
     """
     _upsert_nodes_from_config()
     log.info("nodes refreshed from .nodes.json via API")
-    return {"status": "ok", "active_nodes": len([n for n in cfg.NODES_DATA if n.get("active", False)])}
+    return {
+        "status": "ok",
+        "active_nodes": len([n for n in cfg.NODES_DATA if n.get("active", False)]),
+    }
 
 
 def _upsert_nodes_from_config() -> int:
@@ -112,27 +116,27 @@ def _upsert_nodes_from_config() -> int:
         for node in cfg.NODES_DATA:
             if not node.get("active", False):
                 continue
-            nid     = node["node_id"]
-            name    = node["display_name"]
-            order   = node.get("display_order", 0)
-            host    = node["host_machine"]
+            nid = node["node_id"]
+            name = node["display_name"]
+            order = node.get("display_order", 0)
+            host = node["host_machine"]
             tailnet = node.get("tailnet", "")
-            pip     = node["primary_ip"]
-            ph      = node["primary_hostname"]
-            tip     = node["tailnet_ip"]
-            th      = node.get("tailnet_hostname", "")
-            port    = node["sync_port"]
-            scheme  = node.get("sync_scheme", "http")
+            pip = node["primary_ip"]
+            ph = node["primary_hostname"]
+            tip = node["tailnet_ip"]
+            th = node.get("tailnet_hostname", "")
+            port = node["sync_port"]
+            scheme = node.get("sync_scheme", "http")
 
-            addresses = json.dumps([
-                f"{scheme}://{pip}:{port}",
-                f"{scheme}://{tip}:{port}",
-            ])
+            addresses = json.dumps(
+                [
+                    f"{scheme}://{pip}:{port}",
+                    f"{scheme}://{tip}:{port}",
+                ]
+            )
             ui_url = f"https://{ph}"
 
-            existing = conn.execute(
-                "SELECT node_id FROM nodes WHERE node_id=?", (nid,)
-            ).fetchone()
+            existing = conn.execute("SELECT node_id FROM nodes WHERE node_id=?", (nid,)).fetchone()
             if existing:
                 conn.execute(
                     "UPDATE nodes SET display_name=?, display_order=?, host_machine=?, tailnet=?, "
@@ -166,21 +170,19 @@ async def delete_node(node_id: str) -> Response:
     if os.path.isfile(script):
         result = subprocess.run(
             ["bash", script, node_id],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode != 0:
             log.error("bp-nodes-delete.sh failed: %s", result.stderr)
             raise HTTPException(500, f"failed to update .nodes.json: {result.stderr.strip()}")
         log.info("bp-nodes-delete.sh marked %s inactive in .nodes.json", node_id)
     else:
-        log.warning(
-            "bp-nodes-delete.sh not found at %s — deleting from DB only", script
-        )
+        log.warning("bp-nodes-delete.sh not found at %s — deleting from DB only", script)
 
     with get_conn() as conn:
-        deleted = conn.execute(
-            "DELETE FROM nodes WHERE node_id=?", (node_id,)
-        ).rowcount
+        deleted = conn.execute("DELETE FROM nodes WHERE node_id=?", (node_id,)).rowcount
         if not deleted:
             raise HTTPException(404, f"node '{node_id}' not found")
 
@@ -203,9 +205,7 @@ async def purge_node_sync_queue(node_id: str) -> Response:
 async def proxy_node_git_pull(node_id: str) -> Response:
     """Proxy a git-pull (scope=outer) request to the named peer node."""
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
-        ).fetchone()
+        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
     if not row or not row["addresses"]:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
     addrs: list[str] = json.loads(row["addresses"])
@@ -231,9 +231,7 @@ async def proxy_node_git_pull(node_id: str) -> Response:
 async def proxy_node_restart(node_id: str) -> Response:
     """Proxy a service restart request to the named peer node."""
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
-        ).fetchone()
+        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
     if not row or not row["addresses"]:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
     addrs: list[str] = json.loads(row["addresses"])
@@ -259,12 +257,11 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
     """Return outer/inner/non-root repo versions for the named node."""
     if node_id == cfg.NODE_ID:
         from .routes_health import repo_versions
+
         return await repo_versions()
 
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
-        ).fetchone()
+        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
     if not row or not row["addresses"]:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
     addrs: list[str] = json.loads(row["addresses"])
@@ -286,6 +283,135 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
 
 class PctAction(BaseModel):
     action: str  # "start" | "stop" | "reboot" | "force-cycle"
+
+
+class FleetHealthCheckRequest(BaseModel):
+    source: str = "manual"
+    expected_versions: dict[str, object] | None = None
+    only_node: str | None = None
+    timeout_seconds: int = 190
+
+
+def _fleet_health_blocked_report(reason: str, *, source: str = "manual") -> dict:
+    log_dir = "/xarta-node/.lone-wolf/state/fleet-health-checks"
+    text = (
+        "Fleet health check: not run\n"
+        f"Source: {source}\n"
+        "Nodes checked: 0/0\n"
+        "Nodes not checked: unknown\n"
+        "Problems found: 1\n"
+        "Checks not run: 1\n"
+        f"Blocked: {reason}\n"
+        f"Log directory: {log_dir}\n"
+    )
+    return {
+        "ok": False,
+        "source": source,
+        "summary": {
+            "nodes_targeted": 0,
+            "nodes_checked": 0,
+            "nodes_not_checked": [],
+            "problems_found": 1,
+            "checks_not_run": 1,
+        },
+        "reports": [],
+        "text_report": text,
+        "log_dir": log_dir,
+        "log_path": None,
+        "json_log_path": None,
+        "harness": {"returncode": 127, "stdout": "", "stderr": reason},
+    }
+
+
+@router.post("/fleet-health-check", status_code=200)
+async def run_fleet_health_check(body: FleetHealthCheckRequest | None = None) -> dict:
+    """Run the shared read-only fleet health helper and return its report."""
+    body = body or FleetHealthCheckRequest()
+    source = (body.source or "manual").strip()[:80] or "manual"
+    timeout = max(15, min(int(body.timeout_seconds or 190), 300))
+    helper = os.environ.get("XARTA_FLEET_HEALTH_HELPER")
+    if not helper:
+        inner = cfg.REPO_INNER_PATH or os.path.join(
+            cfg.REPO_OUTER_PATH or "/root/xarta-node", ".xarta"
+        )
+        helper = os.path.join(inner, ".agents", "bin", "fleet-health-check")
+    if not os.path.isfile(helper):
+        return _fleet_health_blocked_report(f"helper missing: {helper}", source=source)
+    if not os.access(helper, os.X_OK):
+        return _fleet_health_blocked_report(f"helper is not executable: {helper}", source=source)
+
+    cmd = [
+        helper,
+        "--json",
+        "--source",
+        source,
+        "--timeout-seconds",
+        str(timeout),
+    ]
+    if body.only_node:
+        cmd.extend(["--only-node", body.only_node])
+    if body.expected_versions:
+        cmd.extend(
+            ["--expected-repos-json", json.dumps(body.expected_versions, separators=(",", ":"))]
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _fleet_health_blocked_report(
+            f"helper timed out after {timeout + 15}s: {(exc.stderr or exc.stdout or '').strip()}",
+            source=source,
+        )
+    except Exception as exc:
+        return _fleet_health_blocked_report(f"{type(exc).__name__}: {exc}", source=source)
+
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        text = (
+            "Fleet health check: helper output was not JSON\n"
+            f"Source: {source}\n"
+            "Nodes checked: 0/0\n"
+            "Problems found: 1\n"
+            "Checks not run: 1\n"
+            f"Return code: {result.returncode}\n"
+            f"stdout: {(result.stdout or '').strip()[:1200]}\n"
+            f"stderr: {(result.stderr or '').strip()[:1200]}\n"
+        )
+        return {
+            "ok": False,
+            "source": source,
+            "summary": {
+                "nodes_targeted": 0,
+                "nodes_checked": 0,
+                "nodes_not_checked": [],
+                "problems_found": 1,
+                "checks_not_run": 1,
+            },
+            "reports": [],
+            "text_report": text,
+            "log_dir": "/xarta-node/.lone-wolf/state/fleet-health-checks",
+            "log_path": None,
+            "json_log_path": None,
+            "harness": {
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
+        }
+    data.setdefault("ok", result.returncode == 0)
+    data.setdefault("source", source)
+    data.setdefault("harness", {})
+    data["helper_returncode"] = result.returncode
+    if result.stderr:
+        data["helper_stderr"] = result.stderr
+    return data
 
 
 def _get_node_lxc_target(node_id: str) -> tuple[str, str, int]:
@@ -323,10 +449,14 @@ def _make_pve_ssh_args(pve_host: str, connect_timeout: int = 10) -> list[str]:
         except SshKeyMissing as exc:
             raise HTTPException(503, f"SSH key not available: {exc}") from exc
         return [
-            "-i", key_path,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
-            "-o", f"ConnectTimeout={connect_timeout}",
+            "-i",
+            key_path,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={connect_timeout}",
         ]
     except SshKeyMissing as exc:
         raise HTTPException(503, f"SSH key not available: {exc}") from exc
@@ -376,9 +506,21 @@ async def get_node_pct_status(node_id: str) -> dict:
         )
     except HTTPException as exc:
         if exc.status_code == 503:
-            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": str(exc.detail)}
+            return {
+                "node_id": node_id,
+                "status": "unknown",
+                "vmid": vmid,
+                "pve_host": pve_host,
+                "error": str(exc.detail),
+            }
         if exc.status_code == 504:
-            return {"node_id": node_id, "status": "unknown", "vmid": vmid, "pve_host": pve_host, "error": "SSH timed out"}
+            return {
+                "node_id": node_id,
+                "status": "unknown",
+                "vmid": vmid,
+                "pve_host": pve_host,
+                "error": "SSH timed out",
+            }
         raise
     if result.returncode != 0:
         return {
@@ -405,7 +547,9 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
     """Start, stop, reboot, or force stop/start the named node's LXC."""
     action = body.action.strip().lower()
     if action not in ("start", "stop", "reboot", "force-cycle"):
-        raise HTTPException(400, f"invalid action '{action}'; must be start, stop, reboot, or force-cycle")
+        raise HTTPException(
+            400, f"invalid action '{action}'; must be start, stop, reboot, or force-cycle"
+        )
 
     _, pve_host, vmid = _get_node_lxc_target(node_id)
 
@@ -414,7 +558,11 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
         stop_result = await _run_pct_command(pve_host, vmid, "stop", command_timeout=45)
         stop_output = stop_result.stderr.strip() or stop_result.stdout.strip()
         outputs.append(stop_output)
-        if stop_result.returncode != 0 and "not running" not in stop_output.lower() and "already stopped" not in stop_output.lower():
+        if (
+            stop_result.returncode != 0
+            and "not running" not in stop_output.lower()
+            and "already stopped" not in stop_output.lower()
+        ):
             raise HTTPException(
                 500,
                 f"pct stop {vmid} on {pve_host} failed: {stop_output or '(no output)'}",
@@ -433,11 +581,11 @@ async def node_pct_action(node_id: str, body: PctAction) -> dict:
     log.info("pct %s %s on %s (node %s) succeeded", action, vmid, pve_host, node_id)
     final_output = "\n".join(line for line in outputs + [result.stdout.strip()] if line)
     return {
-        "status":   "ok",
-        "action":   action,
-        "vmid":     vmid,
+        "status": "ok",
+        "action": action,
+        "vmid": vmid,
         "pve_host": pve_host,
-        "output":   final_output,
+        "output": final_output,
     }
 
 
