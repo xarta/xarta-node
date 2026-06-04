@@ -6,7 +6,11 @@ Canonical bookmark/visit records remain in SQLite.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 
 import pyseekdb
@@ -21,6 +25,10 @@ VECTOR_DIM = 2048
 _client: pyseekdb.Client | None = None
 _bookmarks_col = None
 _visits_col = None
+_io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seekdb-io")
+_io_lock = threading.RLock()
+
+DEFAULT_SEEKDB_TIMEOUT_SECONDS = 5.0
 
 
 def _client_instance() -> pyseekdb.Client:
@@ -34,6 +42,49 @@ def _client_instance() -> pyseekdb.Client:
             password=cfg.SEEKDB_PASSWORD,
         )
     return _client
+
+
+def reset_seekdb_cache() -> None:
+    """Drop cached client/collections after connection-level failures."""
+    global _client, _bookmarks_col, _visits_col
+    with _io_lock:
+        _client = None
+        _bookmarks_col = None
+        _visits_col = None
+
+
+def short_seekdb_error(exc: BaseException) -> str:
+    """Return a compact non-secret error summary suitable for health payloads."""
+    first_line = str(exc).replace("\r", " ").split("\n", 1)[0].strip()
+    if not first_line:
+        first_line = exc.__class__.__name__
+    return first_line[:180]
+
+
+def _blocking_call(fn, *args, **kwargs):
+    with _io_lock:
+        return fn(*args, **kwargs)
+
+
+async def run_seekdb_blocking_async(
+    fn,
+    *args,
+    timeout: float = DEFAULT_SEEKDB_TIMEOUT_SECONDS,
+    reset_on_error: bool = True,
+    **kwargs,
+):
+    """Run a pyseekdb operation in the dedicated single-worker executor."""
+    loop = asyncio.get_running_loop()
+    call = partial(_blocking_call, fn, *args, **kwargs)
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_io_executor, call),
+            timeout=timeout,
+        )
+    except Exception:
+        if reset_on_error:
+            reset_seekdb_cache()
+        raise
 
 
 def _collection_config() -> Configuration:
@@ -59,6 +110,10 @@ def init_seekdb() -> None:
             embedding_function=None,
             configuration=_collection_config(),
         )
+
+
+async def init_seekdb_async(timeout: float = DEFAULT_SEEKDB_TIMEOUT_SECONDS) -> None:
+    await run_seekdb_blocking_async(init_seekdb, timeout=timeout)
 
 
 def bookmarks_col():
@@ -176,13 +231,13 @@ def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     nested = bool(raw_ids) and isinstance(raw_ids[0], list)
 
     if nested:
-        ids   = raw_ids[0]
-        docs  = (payload.get("documents") or [[]])[0]
+        ids = raw_ids[0]
+        docs = (payload.get("documents") or [[]])[0]
         metas = (payload.get("metadatas") or [[]])[0]
         dists = (payload.get("distances") or [[]])[0]
     else:
-        ids   = raw_ids
-        docs  = payload.get("documents") or []
+        ids = raw_ids
+        docs = payload.get("documents") or []
         metas = payload.get("metadatas") or []
         dists = payload.get("distances") or []
 
@@ -263,3 +318,86 @@ def seekdb_counts() -> dict[str, int]:
         "bookmarks_indexed": int(bookmarks_col().count()),
         "visits_indexed": int(visits_col().count()),
     }
+
+
+async def seekdb_counts_async(timeout: float = DEFAULT_SEEKDB_TIMEOUT_SECONDS) -> dict[str, int]:
+    return await run_seekdb_blocking_async(seekdb_counts, timeout=timeout)
+
+
+async def keyword_search_bookmarks_async(query: str, limit: int) -> list[dict[str, Any]]:
+    return await run_seekdb_blocking_async(keyword_search_bookmarks, query, limit)
+
+
+async def vector_search_bookmarks_async(
+    query_embedding: list[float],
+    limit: int,
+) -> list[dict[str, Any]]:
+    return await run_seekdb_blocking_async(vector_search_bookmarks, query_embedding, limit)
+
+
+async def keyword_search_visits_async(query: str, limit: int) -> list[dict[str, Any]]:
+    return await run_seekdb_blocking_async(keyword_search_visits, query, limit)
+
+
+async def vector_search_visits_async(
+    query_embedding: list[float],
+    limit: int,
+) -> list[dict[str, Any]]:
+    return await run_seekdb_blocking_async(vector_search_visits, query_embedding, limit)
+
+
+async def bookmark_embedding_by_normalized_url_async(normalized_url: str) -> list[float] | None:
+    return await run_seekdb_blocking_async(bookmark_embedding_by_normalized_url, normalized_url)
+
+
+async def visit_embedding_by_normalized_url_async(normalized_url: str) -> list[float] | None:
+    return await run_seekdb_blocking_async(visit_embedding_by_normalized_url, normalized_url)
+
+
+async def upsert_bookmark_index_async(
+    row: dict[str, Any],
+    embedding: list[float],
+    visit_count: int,
+    last_visited: str | None,
+    document: str | None = None,
+) -> None:
+    await run_seekdb_blocking_async(
+        upsert_bookmark_index,
+        row,
+        embedding,
+        visit_count,
+        last_visited,
+        document,
+    )
+
+
+async def upsert_visit_index_async(row: dict[str, Any], embedding: list[float]) -> None:
+    await run_seekdb_blocking_async(upsert_visit_index, row, embedding)
+
+
+async def delete_bookmark_index_async(bookmark_id: str) -> None:
+    await run_seekdb_blocking_async(delete_bookmark_index, bookmark_id)
+
+
+async def delete_visit_index_async(visit_id: str) -> None:
+    await run_seekdb_blocking_async(delete_visit_index, visit_id)
+
+
+def _bookmark_index_metadata_sync() -> tuple[list[str], list[dict[str, Any]]]:
+    col = bookmarks_col()
+    raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
+    return raw.get("ids") or [], raw.get("metadatas") or []
+
+
+async def bookmark_index_metadata_async() -> tuple[list[str], list[dict[str, Any]]]:
+    return await run_seekdb_blocking_async(_bookmark_index_metadata_sync)
+
+
+def _visit_index_metadata_sync() -> tuple[list[str], list[dict[str, Any]]]:
+    col = visits_col()
+    raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
+    return raw.get("ids") or [], raw.get("metadatas") or []
+
+
+async def visit_index_metadata_async() -> tuple[list[str], list[dict[str, Any]]]:
+    return await run_seekdb_blocking_async(_visit_index_metadata_sync)

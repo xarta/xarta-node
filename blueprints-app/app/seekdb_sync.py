@@ -6,21 +6,25 @@ import asyncio
 import json
 import logging
 import random
+import time
 from collections import Counter
 from urllib.parse import urlparse
 
 from .ai_client import embed
 from .db import get_conn, get_setting, increment_gen, set_setting
+from .events import AppEvent, bus
 from .seekdb import (
-    bookmark_embedding_by_normalized_url,
-    bookmarks_col,
-    delete_bookmark_index,
-    delete_visit_index,
-    init_seekdb,
-    upsert_bookmark_index,
-    upsert_visit_index,
-    visit_embedding_by_normalized_url,
-    visits_col,
+    bookmark_embedding_by_normalized_url_async,
+    bookmark_index_metadata_async,
+    delete_bookmark_index_async,
+    delete_visit_index_async,
+    init_seekdb_async,
+    reset_seekdb_cache,
+    short_seekdb_error,
+    upsert_bookmark_index_async,
+    upsert_visit_index_async,
+    visit_embedding_by_normalized_url_async,
+    visit_index_metadata_async,
 )
 from .sync.queue import enqueue_for_all_peers
 
@@ -41,6 +45,22 @@ SYNC_MAX_STALE_PER_CYCLE = (
 
 _loop_started = False
 _loop_task: asyncio.Task | None = None
+_sync_lock: asyncio.Lock | None = None
+_sync_followup_requested = False
+_sync_state: dict = {
+    "running": False,
+    "failures": 0,
+    "backoff_until": 0.0,
+    "last_error": "",
+    "degraded": False,
+    "last_degraded_event_at": 0.0,
+    "last_recovered_event_at": 0.0,
+}
+
+SYNC_TIMEOUT_SECONDS = 30.0
+SYNC_BACKOFF_BASE_SECONDS = 5.0
+SYNC_BACKOFF_MAX_SECONDS = 60.0
+SYNC_EVENT_DEDUPE_SECONDS = 300.0
 
 # Progress state for full reindex operations (in-memory, resets on restart)
 _reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
@@ -48,6 +68,146 @@ _reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
 
 def get_reindex_state() -> dict:
     return dict(_reindex_state)
+
+
+def get_sync_controller_state() -> dict:
+    state = dict(_sync_state)
+    state["backoff_remaining"] = max(0.0, float(state["backoff_until"]) - time.monotonic())
+    state["followup_requested"] = _sync_followup_requested
+    return state
+
+
+def _reset_sync_controller_for_tests() -> None:
+    global _sync_lock, _sync_followup_requested
+    _sync_lock = None
+    _sync_followup_requested = False
+    _sync_state.update(
+        {
+            "running": False,
+            "failures": 0,
+            "backoff_until": 0.0,
+            "last_error": "",
+            "degraded": False,
+            "last_degraded_event_at": 0.0,
+            "last_recovered_event_at": 0.0,
+        }
+    )
+
+
+def _get_sync_lock() -> asyncio.Lock:
+    global _sync_lock
+    if _sync_lock is None:
+        _sync_lock = asyncio.Lock()
+    return _sync_lock
+
+
+def _empty_stats(**extra: int | str | bool) -> dict[str, int | str | bool]:
+    stats: dict[str, int | str | bool] = {
+        "bookmarks_synced": 0,
+        "bookmarks_deleted": 0,
+        "visits_synced": 0,
+        "visits_deleted": 0,
+    }
+    stats.update(extra)
+    return stats
+
+
+async def _publish_seekdb_status_event(
+    *,
+    event_type: str,
+    severity: str,
+    title: str,
+    message: str,
+    payload: dict,
+) -> None:
+    event = AppEvent.create(
+        event_type=event_type,
+        severity=severity,
+        title=title,
+        message=message,
+        source="browser-links-seekdb-sync",
+        payload=payload,
+    )
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO events
+                  (event_id, event_type, severity, title, message, source, created_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.event_type,
+                    event.severity,
+                    event.title,
+                    event.message,
+                    event.source,
+                    event.created_at,
+                    json.dumps(event.payload),
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("seekdb_sync: failed to persist status event: %s", exc)
+    try:
+        await bus.publish(event)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("seekdb_sync: failed to publish status event: %s", exc)
+
+
+async def _record_sync_failure(exc: BaseException) -> None:
+    now = time.monotonic()
+    failures = int(_sync_state["failures"]) + 1
+    backoff = min(SYNC_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)), SYNC_BACKOFF_MAX_SECONDS)
+    error = short_seekdb_error(exc)
+    _sync_state.update(
+        {
+            "failures": failures,
+            "backoff_until": now + backoff,
+            "last_error": error,
+            "degraded": True,
+        }
+    )
+    reset_seekdb_cache()
+
+    last_event = float(_sync_state.get("last_degraded_event_at") or 0.0)
+    if now - last_event < SYNC_EVENT_DEDUPE_SECONDS:
+        return
+    _sync_state["last_degraded_event_at"] = now
+    await _publish_seekdb_status_event(
+        event_type="browser_links.seekdb.degraded",
+        severity="warn",
+        title="Browser Links SeekDB Degraded",
+        message="Browser Links search index sync is degraded.",
+        payload={
+            "error": error,
+            "failures": failures,
+            "backoff_seconds": backoff,
+        },
+    )
+
+
+async def _record_sync_success() -> None:
+    was_degraded = bool(_sync_state.get("degraded"))
+    _sync_state.update(
+        {
+            "failures": 0,
+            "backoff_until": 0.0,
+            "last_error": "",
+            "degraded": False,
+        }
+    )
+    if not was_degraded:
+        return
+    now = time.monotonic()
+    _sync_state["last_recovered_event_at"] = now
+    await _publish_seekdb_status_event(
+        event_type="browser_links.seekdb.recovered",
+        severity="info",
+        title="Browser Links SeekDB Recovered",
+        message="Browser Links search index sync recovered.",
+        payload={},
+    )
 
 
 def _parse_tags(tags_json: str) -> list[str]:
@@ -235,7 +395,7 @@ async def reindex_all() -> None:
                     ).fetchone()
                     visit_count = int(stats["cnt"] if stats else 0)
                     last_visited = stats["last_v"] if stats else None
-                    upsert_bookmark_index(
+                    await upsert_bookmark_index_async(
                         row=row,
                         embedding=embeddings[idx],
                         visit_count=visit_count,
@@ -290,14 +450,11 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     sqlite_dict = {r["bookmark_id"]: dict(r) for r in sqlite_rows}
 
     try:
-        col = bookmarks_col()
-        raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
+        raw_ids, raw_metas = await bookmark_index_metadata_async()
     except Exception:
         log.exception("seekdb_sync: failed to read bookmark index — skipping")
-        return 0, 0
+        raise
 
-    raw_ids = raw.get("ids") or []
-    raw_metas = raw.get("metadatas") or []
     seekdb_map: dict[str, str] = {
         raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "") for i in range(len(raw_ids))
     }
@@ -306,7 +463,7 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     deleted = 0
     for bid in list(seekdb_map):
         if bid not in sqlite_dict:
-            delete_bookmark_index(bid)
+            await delete_bookmark_index_async(bid)
             deleted += 1
 
     # Find bookmarks with missing or outdated embeddings
@@ -328,19 +485,31 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in stale]
     embeddings = await _embed_texts(texts)
 
+    prepared: list[tuple[dict, list[float], int, str | None, str]] = []
     with get_conn() as conn:
         for idx, row in enumerate(stale):
             stats = conn.execute(
                 "SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v FROM visits WHERE normalized_url = ?",
                 (row["normalized_url"],),
             ).fetchone()
-            upsert_bookmark_index(
-                row=row,
-                embedding=embeddings[idx],
-                visit_count=int(stats["cnt"] if stats else 0),
-                last_visited=stats["last_v"] if stats else None,
-                document=texts[idx],
+            prepared.append(
+                (
+                    row,
+                    embeddings[idx],
+                    int(stats["cnt"] if stats else 0),
+                    stats["last_v"] if stats else None,
+                    texts[idx],
+                )
             )
+
+    for row, embedding, visit_count, last_visited, document in prepared:
+        await upsert_bookmark_index_async(
+            row=row,
+            embedding=embedding,
+            visit_count=visit_count,
+            last_visited=last_visited,
+            document=document,
+        )
 
     return len(stale), deleted
 
@@ -357,14 +526,11 @@ async def _sync_visits_stale() -> tuple[int, int]:
     sqlite_dict = {r["visit_id"]: dict(r) for r in sqlite_rows}
 
     try:
-        col = visits_col()
-        raw = col.get(include=["metadatas"], limit=max(col.count(), 1))
+        raw_ids, raw_metas = await visit_index_metadata_async()
     except Exception:
         log.exception("seekdb_sync: failed to read visit index — skipping")
-        return 0, 0
+        raise
 
-    raw_ids = raw.get("ids") or []
-    raw_metas = raw.get("metadatas") or []
     seekdb_map: dict[str, str] = {
         raw_ids[i]: (raw_metas[i] or {}).get("updated_at", "") for i in range(len(raw_ids))
     }
@@ -373,7 +539,7 @@ async def _sync_visits_stale() -> tuple[int, int]:
     deleted = 0
     for vid in list(seekdb_map):
         if vid not in sqlite_dict:
-            delete_visit_index(vid)
+            await delete_visit_index_async(vid)
             deleted += 1
 
     # Find visits with missing or outdated embeddings
@@ -395,9 +561,9 @@ async def _sync_visits_stale() -> tuple[int, int]:
 
     for d in stale:
         norm = d.get("normalized_url") or ""
-        embedding = bookmark_embedding_by_normalized_url(norm)
+        embedding = await bookmark_embedding_by_normalized_url_async(norm)
         if embedding is None:
-            embedding = visit_embedding_by_normalized_url(norm)
+            embedding = await visit_embedding_by_normalized_url_async(norm)
         if embedding is None:
             domain = d.get("domain") or _domain_from_url(d.get("url") or "")
             d["domain"] = domain
@@ -412,12 +578,12 @@ async def _sync_visits_stale() -> tuple[int, int]:
             prepared.append((d, new_embeddings[idx]))
 
     for row, emb in prepared:
-        upsert_visit_index(row, emb)
+        await upsert_visit_index_async(row, emb)
 
     return len(stale), deleted
 
 
-async def sync_once() -> dict[str, int]:
+async def _sync_once_body() -> dict[str, int]:
     """One sync cycle: embed stale bookmarks/visits, delete orphans from SeekDB.
 
     Uses per-row updated_at comparison between SQLite and SeekDB metadata —
@@ -432,20 +598,26 @@ async def sync_once() -> dict[str, int]:
             "visits_deleted": 0,
         }
 
-    init_seekdb()
+    await init_seekdb_async(timeout=5.0)
 
     bookmarks_synced = bookmarks_deleted = 0
     visits_synced = visits_deleted = 0
+    failures: list[BaseException] = []
 
     try:
         bookmarks_synced, bookmarks_deleted = await _sync_bookmarks_stale()
-    except Exception:
+    except Exception as exc:
+        failures.append(exc)
         log.exception("seekdb_sync: bookmark sync failed")
 
     try:
         visits_synced, visits_deleted = await _sync_visits_stale()
-    except Exception:
+    except Exception as exc:
+        failures.append(exc)
         log.exception("seekdb_sync: visit sync failed")
+
+    if failures:
+        raise RuntimeError("; ".join(short_seekdb_error(exc) for exc in failures))
 
     return {
         "bookmarks_synced": bookmarks_synced,
@@ -453,6 +625,51 @@ async def sync_once() -> dict[str, int]:
         "visits_synced": visits_synced,
         "visits_deleted": visits_deleted,
     }
+
+
+async def sync_once() -> dict[str, int | str | bool]:
+    """Run a bounded single-flight sync cycle with coalesced follow-up work."""
+    global _sync_followup_requested
+    now = time.monotonic()
+    backoff_until = float(_sync_state.get("backoff_until") or 0.0)
+    if now < backoff_until:
+        return _empty_stats(skipped="backoff", backoff_remaining=backoff_until - now)
+
+    lock = _get_sync_lock()
+    if lock.locked():
+        _sync_followup_requested = True
+        return _empty_stats(coalesced=True)
+
+    combined = _empty_stats()
+    async with lock:
+        while True:
+            now = time.monotonic()
+            backoff_until = float(_sync_state.get("backoff_until") or 0.0)
+            if now < backoff_until:
+                combined["skipped"] = "backoff"
+                combined["backoff_remaining"] = backoff_until - now
+                return combined
+
+            _sync_state["running"] = True
+            try:
+                stats = await asyncio.wait_for(_sync_once_body(), timeout=SYNC_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await _record_sync_failure(exc)
+                combined["skipped"] = "failure"
+                combined["error"] = short_seekdb_error(exc)
+                return combined
+            finally:
+                _sync_state["running"] = False
+
+            await _record_sync_success()
+            for key in ("bookmarks_synced", "bookmarks_deleted", "visits_synced", "visits_deleted"):
+                combined[key] = int(combined[key]) + int(stats.get(key, 0))
+
+            if not _sync_followup_requested:
+                return combined
+            _sync_followup_requested = False
 
 
 async def _sync_loop() -> None:
@@ -495,4 +712,9 @@ async def stop_seekdb_sync_loop() -> None:
 
 def trigger_seekdb_sync() -> None:
     """Run a one-shot sync soon after a direct local write."""
-    asyncio.create_task(sync_once())
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.debug("seekdb_sync: trigger ignored outside a running event loop")
+        return
+    loop.create_task(sync_once())

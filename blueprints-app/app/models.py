@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ── Machine ───────────────────────────────────────────────────────────────────
 
@@ -1203,6 +1203,21 @@ class BookmarkCreate(BaseModel):
     notes: str = ""
     favicon_url: str = ""
     source: str = "manual"
+
+    @field_validator("title", "description", "folder", "notes", "favicon_url", mode="before")
+    @classmethod
+    def _none_to_empty_string(cls, value):
+        return "" if value is None else value
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _blank_source_to_manual(cls, value):
+        return "manual" if value is None or value == "" else value
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _none_tags_to_empty_list(cls, value):
+        return [] if value is None else value
 
 
 class BookmarkUpdate(BaseModel):
