@@ -209,6 +209,7 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "close_modal",
     "open_page",
     "open_modal",
+    "open_doc",
     "menu_function",
     "open_synthesis",
     "open_probes",
@@ -229,6 +230,8 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "open_tab": "open_page",
     "tab": "open_page",
     "modal": "open_modal",
+    "doc": "open_doc",
+    "document": "open_doc",
     "fn": "menu_function",
     "function": "menu_function",
     "menu_fn": "menu_function",
@@ -337,6 +340,10 @@ class ActiveBrowserCommandBody(BaseModel):
     menu_item_id: str | None = None
     fn: str | None = None
     modal_id: str | None = None
+    doc_id: str | None = None
+    path: str | None = None
+    doc_path: str | None = None
+    highlight_terms: list[str] | None = None
     selector_action: str | None = None
     event_kind: str | None = None
     target_active_browser: bool = True
@@ -358,6 +365,7 @@ class BrowserViewBody(BaseModel):
     url_hash: str | None = None
     frontend: dict[str, Any] | None = None
     automation: dict[str, Any] | None = None
+    docs: dict[str, Any] | None = None
     tts: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
@@ -1770,6 +1778,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     viewport = _clean_browser_viewport(body.viewport)
     viewport_classification = _classify_browser_viewport(viewport)
     voice = _clean_browser_voice_state(body.voice)
+    docs = _bounded_json(body.docs if isinstance(body.docs, dict) else {}, 4000)
+    if not isinstance(docs, dict):
+        docs = {}
     modals: list[dict[str, Any]] = []
     for modal in body.modals or []:
         if not isinstance(modal, dict):
@@ -1830,6 +1841,7 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "url_hash": _clean_string(body.url_hash, "", 180),
         "frontend": frontend_report,
         "automation": _clean_active_browser_automation_report(body.automation),
+        "docs": docs,
         "tts": tts,
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,
@@ -2845,6 +2857,13 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
     modal_id = _clean_active_browser_modal_id(body.modal_id)
     selector_action = _clean_active_browser_selector_action(body.selector_action)
     event_kind = _clean_active_browser_event_kind(body.event_kind)
+    doc_id = _clean_string(body.doc_id, "", 120)
+    doc_path = _clean_string(body.path or body.doc_path, "", 300)
+    highlight_terms = [
+        term
+        for term in (_clean_string(item, "", 80) for item in (body.highlight_terms or []))
+        if term
+    ][:8]
     payload = {
         "schema": "xarta.active_browser.command.v1",
         "command_id": command_id,
@@ -2866,6 +2885,12 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload["fn"] = fn_key
     if modal_id:
         payload["modal_id"] = modal_id
+    if doc_id:
+        payload["doc_id"] = doc_id
+    if doc_path:
+        payload["path"] = doc_path
+    if highlight_terms:
+        payload["highlight_terms"] = highlight_terms
     if selector_action:
         payload["selector_action"] = selector_action
     if body.event_kind is not None:

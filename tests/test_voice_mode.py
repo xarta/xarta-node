@@ -193,6 +193,8 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("page") == "open_page"
     assert voice_mode._clean_active_browser_command_action("open tab") == "open_page"
     assert voice_mode._clean_active_browser_command_action("modal") == "open_modal"
+    assert voice_mode._clean_active_browser_command_action("doc") == "open_doc"
+    assert voice_mode._clean_active_browser_command_action("document") == "open_doc"
     assert voice_mode._clean_active_browser_command_action("fn") == "menu_function"
     assert voice_mode._clean_active_browser_command_action("menu-fn") == "menu_function"
     assert voice_mode._clean_active_browser_command_action("synthesis") == "open_synthesis"
