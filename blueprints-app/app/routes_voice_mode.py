@@ -215,6 +215,7 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "open_probes",
     "open_settings",
     "selector_action",
+    "set_body_shade",
 }
 _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "refresh": "hard_refresh",
@@ -239,6 +240,11 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "probes": "open_probes",
     "settings": "open_settings",
     "selector": "selector_action",
+    "body_shade": "set_body_shade",
+    "body shade": "set_body_shade",
+    "shade": "set_body_shade",
+    "shade_up": "set_body_shade",
+    "shade up": "set_body_shade",
 }
 _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
     "": "click",
@@ -253,6 +259,7 @@ _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
     "long_tap": "long_press",
 }
 _ACTIVE_BROWSER_EVENT_KINDS = {"click", "double_click", "long_press"}
+_ACTIVE_BROWSER_BODY_SHADE_STATES = {"up", "down", "toggle"}
 
 
 class BrowserVoiceState(BaseModel):
@@ -346,6 +353,9 @@ class ActiveBrowserCommandBody(BaseModel):
     highlight_terms: list[str] | None = None
     selector_action: str | None = None
     event_kind: str | None = None
+    body_shade: str | None = None
+    shade: str | None = None
+    instant: bool | None = None
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
 
@@ -366,6 +376,7 @@ class BrowserViewBody(BaseModel):
     frontend: dict[str, Any] | None = None
     automation: dict[str, Any] | None = None
     docs: dict[str, Any] | None = None
+    body_shade: dict[str, Any] | None = None
     tts: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
@@ -509,6 +520,35 @@ def _clean_active_browser_event_kind(value: str | None) -> str:
     event_kind = _clean_dev_command_action(value)
     event_kind = _ACTIVE_BROWSER_EVENT_KIND_ALIASES.get(event_kind, event_kind)
     return event_kind if event_kind in _ACTIVE_BROWSER_EVENT_KINDS else "click"
+
+
+def _clean_active_browser_body_shade(value: str | None) -> str:
+    raw = _clean_dev_command_action(value)
+    aliases = {
+        "": "",
+        "raise": "up",
+        "raised": "up",
+        "open": "up",
+        "opened": "up",
+        "on": "up",
+        "true": "up",
+        "1": "up",
+        "up": "up",
+        "lower": "down",
+        "lowered": "down",
+        "close": "down",
+        "closed": "down",
+        "off": "down",
+        "false": "down",
+        "0": "down",
+        "down": "down",
+        "toggle": "toggle",
+        "flip": "toggle",
+    }
+    state = aliases.get(raw, raw)
+    if not state:
+        return ""
+    return state if state in _ACTIVE_BROWSER_BODY_SHADE_STATES else "up"
 
 
 def _clean_active_browser_modal_id(value: str | None) -> str:
@@ -1775,6 +1815,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     tts = _bounded_json(body.tts if isinstance(body.tts, dict) else {}, 8000)
     if not isinstance(tts, dict):
         tts = {}
+    body_shade = _bounded_json(body.body_shade if isinstance(body.body_shade, dict) else {}, 1000)
+    if not isinstance(body_shade, dict):
+        body_shade = {}
     viewport = _clean_browser_viewport(body.viewport)
     viewport_classification = _classify_browser_viewport(viewport)
     voice = _clean_browser_voice_state(body.voice)
@@ -1842,6 +1885,13 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "frontend": frontend_report,
         "automation": _clean_active_browser_automation_report(body.automation),
         "docs": docs,
+        "body_shade": {
+            "available": bool(body_shade.get("available")),
+            "is_up": bool(body_shade.get("is_up")),
+            "state": "up" if bool(body_shade.get("is_up")) else "down",
+            "active_panel_id": _clean_string(body_shade.get("active_panel_id"), "", 120),
+            "handle_present": bool(body_shade.get("handle_present")),
+        },
         "tts": tts,
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,
@@ -2859,6 +2909,7 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
     event_kind = _clean_active_browser_event_kind(body.event_kind)
     doc_id = _clean_string(body.doc_id, "", 120)
     doc_path = _clean_string(body.path or body.doc_path, "", 300)
+    body_shade = _clean_active_browser_body_shade(body.body_shade or body.shade)
     highlight_terms = [
         term
         for term in (_clean_string(item, "", 80) for item in (body.highlight_terms or []))
@@ -2895,6 +2946,12 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload["selector_action"] = selector_action
     if body.event_kind is not None:
         payload["event_kind"] = event_kind
+    if action == "set_body_shade":
+        payload["body_shade"] = body_shade or "up"
+    elif body_shade:
+        payload["body_shade"] = body_shade
+    if body.instant is not None:
+        payload["instant"] = bool(body.instant)
     event = AppEvent.create(
         _ACTIVE_BROWSER_COMMAND_EVENT_TYPE,
         "Active Browser Command",
