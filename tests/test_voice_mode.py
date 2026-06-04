@@ -201,6 +201,8 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("probes") == "open_probes"
     assert voice_mode._clean_active_browser_command_action("settings") == "open_settings"
     assert voice_mode._clean_active_browser_command_action("selector") == "selector_action"
+    assert voice_mode._clean_active_browser_command_action("body shade") == "set_body_shade"
+    assert voice_mode._clean_active_browser_command_action("shade-up") == "set_body_shade"
 
 
 def test_voice_dev_vad_detector_actions_are_allowed():
@@ -239,6 +241,11 @@ def test_active_browser_command_parameters_are_sanitized():
     assert voice_mode._clean_active_browser_event_kind("double tap") == "double_click"
     assert voice_mode._clean_active_browser_event_kind("long-press") == "long_press"
     assert voice_mode._clean_active_browser_event_kind("something else") == "click"
+    assert voice_mode._clean_active_browser_body_shade("raise") == "up"
+    assert voice_mode._clean_active_browser_body_shade("lower") == "down"
+    assert voice_mode._clean_active_browser_body_shade("flip") == "toggle"
+    assert voice_mode._clean_active_browser_body_shade("unexpected") == "up"
+    assert voice_mode._clean_active_browser_body_shade(None) == ""
     assert (
         voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
     )
@@ -323,6 +330,12 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             },
         },
         frontend={"app": "fallback-ui", "asset_version": "dev-test"},
+        body_shade={
+            "available": True,
+            "is_up": True,
+            "active_panel_id": "tab-docs",
+            "handle_present": True,
+        },
         tts={
             "client_available": True,
             "client": {
@@ -415,6 +428,13 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert view["automation"]["menus"][0]["pages"][0]["id"] == "matrix-chat"
     assert view["automation"]["menus"][0]["function_items"][0]["fn"] == "chat.vadDev"
     assert view["automation"]["selector_actions"][0]["action"] == "settings"
+    assert view["body_shade"] == {
+        "available": True,
+        "is_up": True,
+        "state": "up",
+        "active_panel_id": "tab-docs",
+        "handle_present": True,
+    }
     assert view["tts"]["client_available"] is True
     assert view["tts"]["client"]["status"] == "playing"
     assert view["tts"]["client"]["utterance_id"] == "utt-live-proof"
