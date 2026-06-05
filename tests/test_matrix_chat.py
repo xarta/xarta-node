@@ -372,6 +372,27 @@ def test_matrix_chat_wake_stt_direct_diagnostic_content_is_not_addressed():
     assert "m.mentions" not in content
 
 
+def test_matrix_chat_wake_stt_direct_response_content_is_speech_suppressed():
+    content = matrix_chat._matrix_wake_stt_direct_response_content(
+        body="Wake STT reply: I sent the rest to Matrix.",
+        instance="local",
+        candidate_source="payload0",
+        command="execute",
+        wake_word="Computer",
+        candidate_revision="wake-local-response",
+        tts_status="streamed",
+    )
+
+    assert content["body"] == "Wake STT reply: I sent the rest to Matrix."
+    assert not content["body"].lower().startswith("hermes:")
+    assert content["xarta_source"] == "wake_stt_direct_response"
+    assert content["xarta_tts_companion_copy"] is True
+    assert content["xarta_tts_status"] == "streamed"
+    assert content["xarta_suppress_speech"] is True
+    assert content["suppress_speech"] is True
+    assert "m.mentions" not in content
+
+
 def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
     captured = {}
 
@@ -528,9 +549,18 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
             },
         }
 
+    async def fake_report(**kwargs):
+        captured["report"] = kwargs
+        return {"ok": True, "event_id": "$response-copy"}
+
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
     monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
     monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
 
     result = asyncio.run(
         matrix_chat.matrix_chat_send_wake_stt(
@@ -557,8 +587,89 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     assert captured["agent_id"] == "hermes-stt"
     assert captured["interrupt"] is True
     assert captured["metadata"]["schema"] == "xarta.wake-stt.direct-response.v1"
+    assert result["delivery"]["assistant_report_scheduled"] is True
     assert "api_server_key" not in str(captured).lower()
     assert "secret" not in str(captured).lower()
+
+
+def test_matrix_chat_wake_stt_direct_route_uses_streamed_tts_chunks(monkeypatch):
+    captured = {"texts": [], "interrupts": []}
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        callback = kwargs.get("assistant_delta_callback")
+        await callback("First streamed Wake response sentence is long enough to speak early. ")
+        await callback("Second streamed Wake response sentence closes the thought.")
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text=(
+                    "First streamed Wake response sentence is long enough to speak early. "
+                    "Second streamed Wake response sentence closes the thought."
+                ),
+            ),
+        )
+
+    async def fake_publish_tts_payload(payload):
+        captured["texts"].append(payload["text"])
+        captured["interrupts"].append(payload["interrupt"])
+        return {
+            "ok": True,
+            "event": {"event_id": f"tts-wake-direct-{len(captured['texts'])}"},
+            "payload": {
+                "utterance_id": payload["utterance_id"],
+                "source": payload["source"],
+                "agent_id": payload["agent_id"],
+            },
+        }
+
+    async def fake_report(**kwargs):
+        captured["report"] = kwargs
+        return {"ok": True, "event_id": "$response-copy"}
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="Are you okay?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-tts-stream",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["delivery"]["route"] == "direct_local"
+    assert result["delivery"]["tts"]["streamed"] is True
+    assert result["delivery"]["tts"]["chunks"] == 2
+    assert captured["texts"] == [
+        "First streamed Wake response sentence is long enough to speak early.",
+        "Second streamed Wake response sentence closes the thought.",
+    ]
+    assert captured["interrupts"] == [True, False]
+    assert result["delivery"]["assistant_report_scheduled"] is True
 
 
 def test_matrix_chat_wake_stt_route_rolls_direct_request_back_to_matrix(monkeypatch):

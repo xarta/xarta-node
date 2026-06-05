@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -266,6 +267,117 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert public["matched_code_id"] == "alpha"
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public)
     assert "secret-test-key" not in str(public)
+
+
+def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
+    deltas = []
+    captured = {}
+
+    def chunk(content: str) -> str:
+        return (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+            + "\n\n"
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.read().decode("utf-8")
+        body = chunk("direct ") + 'event: hermes.tool.progress\ndata: {"tool":"ignored"}\n\n'
+        body += chunk("stream ok") + "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            content=body.encode("utf-8"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    transport = httpx.MockTransport(handler)
+
+    async def run_submit():
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await wake_stt_direct.submit_wake_stt_to_hermes(
+                "Please stream the reply.",
+                codes=[],
+                config=wake_stt_direct.HermesSttConfig(
+                    api_base="http://127.0.0.1:8643",
+                    api_key="secret-test-key",
+                    session_id="wake-stt-local",
+                    sessions_dir=tmp_path,
+                    stream_chat=True,
+                ),
+                client=client,
+                assistant_delta_callback=on_delta,
+            )
+
+    result = asyncio.run(run_submit())
+
+    assert result.ok is True
+    assert result.assistant_text == "direct stream ok"
+    assert deltas == ["direct ", "stream ok"]
+    assert '"stream":true' in captured["body"].replace(" ", "")
+    assert wake_stt_direct.AUTHORISED_PHRASE not in captured["body"]
+    assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
+
+
+def test_submit_wake_stt_stream_suppresses_early_deltas_for_authorised_requests(tmp_path):
+    deltas = []
+
+    def chunk(content: str) -> str:
+        return (
+            "data: "
+            + json.dumps({"choices": [{"index": 0, "delta": {"content": content}}]})
+            + "\n\n"
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = chunk("authorised ") + chunk("stream ok") + "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            content=body.encode("utf-8"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def on_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    transport = httpx.MockTransport(handler)
+
+    async def run_submit():
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await wake_stt_direct.submit_wake_stt_to_hermes(
+                "alpha one Please stream only after scrub.",
+                codes=wake_stt_direct.command_codes_from_config(
+                    [{"id": "alpha", "aliases": ["alpha one"]}]
+                ),
+                config=wake_stt_direct.HermesSttConfig(
+                    api_base="http://127.0.0.1:8643",
+                    api_key="secret-test-key",
+                    session_id="wake-stt-local",
+                    sessions_dir=tmp_path,
+                    stream_chat=True,
+                ),
+                client=client,
+                assistant_delta_callback=on_delta,
+            )
+
+    result = asyncio.run(run_submit())
+
+    assert result.ok is True
+    assert result.assistant_text == "authorised stream ok"
+    assert deltas == []
+    assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
 
 
 def test_submit_wake_stt_to_hermes_requires_matrix_fallback_on_api_error(tmp_path):
