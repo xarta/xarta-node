@@ -2080,6 +2080,7 @@ async def _deliver_wake_stt_with_direct_fallback(
     direct_enabled: bool,
     diagnostic_enabled: bool = False,
     await_diagnostic: bool = False,
+    timing: wake_stt_direct.WakeSttRouteTiming | None = None,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     settings = _settings()
 
@@ -2116,6 +2117,7 @@ async def _deliver_wake_stt_with_direct_fallback(
         direct_enabled=direct_enabled,
         diagnostic_enabled=diagnostic_enabled,
         await_diagnostic=await_diagnostic,
+        timing=timing,
     )
 
 
@@ -3514,6 +3516,14 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
 @router.post("/rooms/{room_id}/wake-stt")
 async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> dict[str, Any]:
     settings = _settings()
+    timing = wake_stt_direct.WakeSttRouteTiming()
+    timing.mark(
+        "stt_final_transcript_received",
+        instance=body.instance,
+        candidate_source=body.candidate_source,
+        candidate_revision=body.candidate_revision,
+        text_chars=len(body.text),
+    )
     route_readback = wake_stt_direct.wake_stt_route_readback(
         instance=body.instance,
         requested_delivery_mode=body.delivery_mode,
@@ -3528,11 +3538,14 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                 direct_enabled=bool(route_readback["direct_enabled"]),
                 diagnostic_enabled=bool(body.direct_diagnostic_enabled),
                 await_diagnostic=bool(body.direct_await_diagnostic),
+                timing=timing,
             )
         )
+        timing.mark("blueprints_delivery_task_created")
         pre_roll_tts: dict[str, Any] = {}
         pre_roll_delay = _wake_stt_direct_pre_roll_delay_seconds()
         if bool(route_readback["direct_enabled"]) and pre_roll_delay:
+            timing.mark("pre_roll_wait_start", threshold_ms=round(pre_roll_delay * 1000, 1))
             done, _pending = await asyncio.wait({delivery_task}, timeout=pre_roll_delay)
             if not done:
                 pre_roll_tts = await _publish_wake_stt_direct_tts(
@@ -3541,6 +3554,11 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     route="direct_local",
                     interrupt=True,
                     pre_roll=True,
+                )
+                timing.mark(
+                    "pre_roll_tts_queued",
+                    ok=bool(pre_roll_tts.get("ok")),
+                    event_id_present=bool(pre_roll_tts.get("event_id")),
                 )
         delivered = await delivery_task
         public = delivered.public_dict()
@@ -3563,6 +3581,12 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     route="direct_local",
                 )
                 public["tts"] = tts_result
+                timing.mark(
+                    "tts_queued",
+                    ok=bool(tts_result.get("ok")),
+                    status=_safe_str(tts_result.get("status")),
+                    event_id_present=bool(tts_result.get("event_id")),
+                )
             else:
                 public["tts"] = {
                     "ok": False,
@@ -3570,6 +3594,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     "skipped": True,
                     "reason": "no_hermes_elected_speech",
                 }
+                timing.mark("tts_not_queued", reason="no_hermes_elected_speech")
             if matrix_detail:
                 asyncio.create_task(
                     _send_wake_stt_direct_response_report_safely(
@@ -3584,11 +3609,34 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     )
                 )
                 public["assistant_report_scheduled"] = True
+                timing.mark("matrix_detail_scheduled", detail_chars=len(matrix_detail))
             public["assistant_report_detail_present"] = bool(matrix_detail)
             public["tts_elected_by_hermes"] = bool(speech)
         matrix_result = public.get("matrix") if isinstance(public.get("matrix"), dict) else {}
         diagnostic = public.get("diagnostic") if isinstance(public.get("diagnostic"), dict) else {}
         event_id = matrix_result.get("event_id") or diagnostic.get("event_id")
+        timing.mark(
+            "route_response",
+            route=_safe_str(public.get("route")),
+            status=_safe_str(public.get("status")),
+            event_id_present=bool(event_id),
+        )
+        public["timing"] = timing.public_dict()
+        if isinstance(public.get("direct"), dict):
+            public["direct"]["timing"] = public["timing"]
+        log.info(
+            "Wake STT route timing %s",
+            json.dumps(
+                {
+                    "room_id_present": bool(room_id),
+                    "instance": body.instance,
+                    "route": public.get("route"),
+                    "status": public.get("status"),
+                    "timing": public["timing"],
+                },
+                sort_keys=True,
+            ),
+        )
         return {
             "room_id": matrix_result.get("room_id") or diagnostic.get("room_id") or room_id,
             "event_id": event_id,

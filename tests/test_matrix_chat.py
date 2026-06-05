@@ -729,6 +729,12 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     assert result["delivery"]["direct"]["companion"]["speech"] == "I am okay."
     assert result["delivery"]["tts"]["ok"] is True
     assert result["delivery"]["tts"]["event_id"] == "tts-wake-direct"
+    stages = [mark["stage"] for mark in result["delivery"]["timing"]["marks"]]
+    assert stages[0] == "stt_final_transcript_received"
+    assert "blueprints_delivery_task_created" in stages
+    assert "tts_queued" in stages
+    assert "matrix_detail_scheduled" in stages
+    assert stages[-1] == "route_response"
     assert captured["text"] == "I am okay."
     assert captured["source"] == "hermes-stt"
     assert captured["agent_id"] == "hermes-stt"

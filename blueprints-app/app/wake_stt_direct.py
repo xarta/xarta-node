@@ -7,7 +7,9 @@ import contextlib
 import json
 import os
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -171,6 +173,47 @@ class HermesSttBudgetFacts:
         }
 
 
+@dataclass
+class WakeSttRouteTiming:
+    """Small public-safe monotonic timing recorder for Wake STT route stages."""
+
+    started_at: str = field(
+        default_factory=lambda: (
+            datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        )
+    )
+    started_monotonic: float = field(default_factory=time.perf_counter)
+    marks: list[dict[str, Any]] = field(default_factory=list)
+
+    def mark(self, stage: str, **fields: Any) -> None:
+        clean_stage = _SPACE_RE.sub("_", str(stage or "").strip().lower())[:80]
+        if not clean_stage:
+            return
+        item: dict[str, Any] = {
+            "stage": clean_stage,
+            "elapsed_ms": round((time.perf_counter() - self.started_monotonic) * 1000, 1),
+        }
+        for key, value in fields.items():
+            clean_key = _SPACE_RE.sub("_", str(key or "").strip().lower())[:80]
+            if not clean_key:
+                continue
+            if isinstance(value, (bool, int, float)) or value is None:
+                item[clean_key] = value
+            else:
+                item[clean_key] = str(value)[:240]
+        self.marks.append(item)
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "started_at": self.started_at,
+            "total_elapsed_ms": round(
+                (time.perf_counter() - self.started_monotonic) * 1000,
+                1,
+            ),
+            "marks": list(self.marks),
+        }
+
+
 @dataclass(frozen=True)
 class HermesSttSubmitResult:
     ok: bool
@@ -185,6 +228,7 @@ class HermesSttSubmitResult:
     error: str = ""
     context_scrub: dict[str, Any] | None = None
     context_check: dict[str, Any] | None = None
+    timing: WakeSttRouteTiming | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -202,6 +246,7 @@ class HermesSttSubmitResult:
             "error": self.error,
             "context_scrub": self.context_scrub or {},
             "context_check": self.context_check or {},
+            "timing": self.timing.public_dict() if self.timing else {},
         }
 
 
@@ -216,6 +261,7 @@ class WakeSttDeliveryResult:
     diagnostic: dict[str, Any] | None = None
     diagnostic_scheduled: bool = False
     fallback_reason: str = ""
+    timing: WakeSttRouteTiming | None = None
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -230,6 +276,7 @@ class WakeSttDeliveryResult:
             "matrix": self.matrix or {},
             "diagnostic": self.diagnostic or {},
             "diagnostic_scheduled": self.diagnostic_scheduled,
+            "timing": self.timing.public_dict() if self.timing else {},
         }
 
 
@@ -967,6 +1014,7 @@ async def submit_wake_stt_to_hermes(
     client: httpx.AsyncClient | None = None,
     inspect_context: bool = True,
     assistant_delta_callback: AssistantDeltaCallback | None = None,
+    timing: WakeSttRouteTiming | None = None,
 ) -> HermesSttSubmitResult:
     """Submit one gated Wake STT request to the local hermes-stt API server.
 
@@ -983,6 +1031,7 @@ async def submit_wake_stt_to_hermes(
             gate=gate,
             attempted=False,
             fallback_required=False,
+            timing=timing,
         )
     if not config.api_key or not config.api_base:
         return HermesSttSubmitResult(
@@ -992,6 +1041,7 @@ async def submit_wake_stt_to_hermes(
             attempted=False,
             fallback_required=True,
             error="hermes-stt API base or key is not configured",
+            timing=timing,
         )
     if not config.loopback_ok:
         return HermesSttSubmitResult(
@@ -1001,6 +1051,7 @@ async def submit_wake_stt_to_hermes(
             attempted=False,
             fallback_required=True,
             error="hermes-stt API base must be loopback unless explicitly allowed",
+            timing=timing,
         )
 
     budget = hermes_stt_budget_facts(config)
@@ -1016,6 +1067,25 @@ async def submit_wake_stt_to_hermes(
     http_client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
     try:
         response_json: dict[str, Any] = {}
+        if timing:
+            timing.mark(
+                "hermes_request_start",
+                stream=bool(config.stream_chat),
+                session_id=config.session_id or DEFAULT_HERMES_STT_SESSION_ID,
+                authorised=gate.authorised,
+                request_chars=len(gate.meat),
+                max_tokens=config.max_tokens,
+            )
+        first_delta_seen = False
+        external_delta_callback = None if gate.authorised else assistant_delta_callback
+
+        async def record_delta(delta: str) -> None:
+            nonlocal first_delta_seen
+            if timing and delta and not first_delta_seen:
+                first_delta_seen = True
+                timing.mark("hermes_first_delta", delta_chars=len(delta))
+            await _maybe_call_assistant_delta(external_delta_callback, delta)
+
         if config.stream_chat:
             async with http_client.stream(
                 "POST",
@@ -1026,9 +1096,7 @@ async def submit_wake_stt_to_hermes(
                 if response.is_success:
                     assistant_text = await _stream_chat_completion_text(
                         response,
-                        assistant_delta_callback=(
-                            None if gate.authorised else assistant_delta_callback
-                        ),
+                        assistant_delta_callback=record_delta,
                     )
                 else:
                     await response.aread()
@@ -1048,6 +1116,14 @@ async def submit_wake_stt_to_hermes(
             assistant_text = (
                 _assistant_text_from_chat_response(response_json) if response.is_success else ""
             )
+        if timing:
+            timing.mark(
+                "hermes_complete",
+                http_status=http_status,
+                stream=bool(config.stream_chat),
+                assistant_chars=len(assistant_text),
+                first_delta=first_delta_seen,
+            )
         if not response.is_success:
             return HermesSttSubmitResult(
                 ok=False,
@@ -1057,6 +1133,7 @@ async def submit_wake_stt_to_hermes(
                 fallback_required=True,
                 http_status=http_status,
                 error=f"hermes-stt API returned HTTP {http_status}",
+                timing=timing,
             )
         if not assistant_text:
             return HermesSttSubmitResult(
@@ -1068,6 +1145,7 @@ async def submit_wake_stt_to_hermes(
                 http_status=http_status,
                 error="hermes-stt API response did not include assistant text",
                 budget=budget,
+                timing=timing,
             )
         companion = parse_hermes_stt_companion_output(assistant_text)
         context_scrub = (
@@ -1091,6 +1169,7 @@ async def submit_wake_stt_to_hermes(
                 budget=budget,
                 context_scrub=context_scrub,
                 error="authorisation phrase could not be scrubbed from hermes-stt session context",
+                timing=timing,
             )
         context_check = (
             inspect_hermes_stt_session_phrase_absence(
@@ -1114,6 +1193,14 @@ async def submit_wake_stt_to_hermes(
                 context_scrub=context_scrub,
                 context_check=context_check,
                 error="authorisation phrase was found in hermes-stt session context",
+                timing=timing,
+            )
+        if timing:
+            timing.mark(
+                "hermes_context_checked",
+                scrub_ok=bool(context_scrub.get("ok", False)),
+                check_ok=bool(context_check.get("ok", False)),
+                scanned_files=context_check.get("scanned_files"),
             )
         return HermesSttSubmitResult(
             ok=True,
@@ -1127,8 +1214,11 @@ async def submit_wake_stt_to_hermes(
             budget=budget,
             context_scrub=context_scrub,
             context_check=context_check,
+            timing=timing,
         )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
+        if timing:
+            timing.mark("hermes_request_error", error_type=type(exc).__name__)
         return HermesSttSubmitResult(
             ok=False,
             status="request_error",
@@ -1136,6 +1226,7 @@ async def submit_wake_stt_to_hermes(
             attempted=True,
             fallback_required=True,
             error=str(exc)[:240],
+            timing=timing,
         )
     finally:
         if close_client:
@@ -1168,6 +1259,7 @@ async def deliver_wake_stt_with_matrix_fallback(
     await_diagnostic: bool = False,
     inspect_context: bool = True,
     assistant_delta_callback: AssistantDeltaCallback | None = None,
+    timing: WakeSttRouteTiming | None = None,
 ) -> WakeSttDeliveryResult:
     """Deliver Wake STT through hermes-stt, falling back to Matrix when needed.
 
@@ -1182,10 +1274,13 @@ async def deliver_wake_stt_with_matrix_fallback(
             status="empty_request",
             route="none",
             gate=gate,
+            timing=timing,
         )
 
     direct_result: HermesSttSubmitResult | None = None
     if direct_enabled:
+        if timing:
+            timing.mark("blueprints_direct_submit_start")
         direct_result = await submit_wake_stt_to_hermes(
             text,
             codes=code_list,
@@ -1193,16 +1288,27 @@ async def deliver_wake_stt_with_matrix_fallback(
             client=client,
             inspect_context=inspect_context,
             assistant_delta_callback=assistant_delta_callback,
+            timing=timing,
         )
         if direct_result.ok:
             diagnostic: dict[str, Any] | None = None
             diagnostic_scheduled = False
             if diagnostic_enabled and diagnostic_send:
                 if await_diagnostic:
+                    if timing:
+                        timing.mark("matrix_diagnostic_send_start")
                     diagnostic = await _send_delivery_safely(diagnostic_send, gate.meat)
+                    if timing:
+                        timing.mark(
+                            "matrix_diagnostic_sent",
+                            ok=bool(diagnostic.get("ok")),
+                            event_id_present=bool(diagnostic.get("event_id")),
+                        )
                 else:
                     asyncio.create_task(_send_delivery_safely(diagnostic_send, gate.meat))
                     diagnostic_scheduled = True
+                    if timing:
+                        timing.mark("matrix_diagnostic_scheduled")
             return WakeSttDeliveryResult(
                 ok=True,
                 status="delivered",
@@ -1211,6 +1317,7 @@ async def deliver_wake_stt_with_matrix_fallback(
                 direct=direct_result,
                 diagnostic=diagnostic,
                 diagnostic_scheduled=diagnostic_scheduled,
+                timing=timing,
             )
         if not direct_result.fallback_required:
             return WakeSttDeliveryResult(
@@ -1220,9 +1327,18 @@ async def deliver_wake_stt_with_matrix_fallback(
                 gate=gate,
                 direct=direct_result,
                 fallback_reason=direct_result.status,
+                timing=timing,
             )
 
+    if timing:
+        timing.mark("matrix_fallback_send_start", direct_enabled=direct_enabled)
     matrix_result = await _send_delivery_safely(matrix_send, gate.meat)
+    if timing:
+        timing.mark(
+            "matrix_fallback_sent",
+            ok=bool(matrix_result.get("ok")),
+            event_id_present=bool(matrix_result.get("event_id")),
+        )
     ok = bool(matrix_result.get("ok"))
     return WakeSttDeliveryResult(
         ok=ok,
@@ -1232,4 +1348,5 @@ async def deliver_wake_stt_with_matrix_fallback(
         direct=direct_result,
         matrix=matrix_result,
         fallback_reason=direct_result.status if direct_result else "",
+        timing=timing,
     )
