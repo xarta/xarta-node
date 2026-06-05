@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
 from starlette.websockets import WebSocketDisconnect
 
+from . import wake_stt_direct
 from .events import AppEvent
 from .events import bus as events_bus
 
@@ -1782,6 +1783,33 @@ def _matrix_wake_stt_message_content(
     return content
 
 
+def _matrix_wake_stt_direct_diagnostic_content(
+    *,
+    body: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str,
+    candidate_revision: str,
+) -> dict[str, Any]:
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "xarta_source": "wake_stt_direct_observation",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_wake_instance": _safe_str(instance) or "local",
+            "xarta_wake_candidate_source": _safe_str(candidate_source),
+            "xarta_wake_command": _safe_str(command) or "execute",
+            "xarta_wake_candidate_revision": _safe_str(candidate_revision),
+            "xarta_wake_word": _safe_str(wake_word),
+            "xarta_stt_partial": False,
+            "xarta_suppress_speech": True,
+            "suppress_speech": True,
+        }
+    )
+    return content
+
+
 async def _send_stt_transcript_message(
     *,
     room_id: str,
@@ -1851,6 +1879,87 @@ async def _send_wake_stt_transcript_message(
         sent = {"room_id": room_id, "event_id": data.get("event_id")}
     sent.update(content)
     return sent
+
+
+async def _send_wake_stt_direct_diagnostic_message(
+    *,
+    room_id: str,
+    text: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str = "",
+    candidate_revision: str = "",
+) -> dict[str, Any]:
+    body = wake_stt_direct.wake_stt_bridge_diagnostic_body(text)
+    content = _matrix_wake_stt_direct_diagnostic_content(
+        body=body,
+        instance=instance,
+        candidate_source=candidate_source,
+        command=command,
+        wake_word=wake_word,
+        candidate_revision=candidate_revision,
+    )
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-wake-stt-direct-diag-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update(content)
+    return sent
+
+
+async def _deliver_wake_stt_with_direct_fallback(
+    *,
+    room_id: str,
+    body: _WakeSttMessageBody,
+    direct_enabled: bool,
+    diagnostic_enabled: bool = False,
+    await_diagnostic: bool = False,
+) -> wake_stt_direct.WakeSttDeliveryResult:
+    settings = _settings()
+
+    async def matrix_send(text: str) -> dict[str, Any]:
+        return await _send_wake_stt_transcript_message(
+            room_id=room_id,
+            server_id=settings["server_id"],
+            transcript=text,
+            instance=body.instance,
+            candidate_source=body.candidate_source,
+            command=body.command,
+            wake_word=body.wake_word,
+            candidate_revision=body.candidate_revision,
+            hermes_prefix=body.hermes_prefix,
+        )
+
+    async def diagnostic_send(text: str) -> dict[str, Any]:
+        return await _send_wake_stt_direct_diagnostic_message(
+            room_id=room_id,
+            text=text,
+            instance=body.instance,
+            candidate_source=body.candidate_source,
+            command=body.command,
+            wake_word=body.wake_word,
+            candidate_revision=body.candidate_revision,
+        )
+
+    return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+        body.text,
+        matrix_send=matrix_send,
+        diagnostic_send=diagnostic_send,
+        direct_enabled=direct_enabled,
+        diagnostic_enabled=diagnostic_enabled,
+        await_diagnostic=await_diagnostic,
+    )
 
 
 def _safe_media_filename(filename: str | None, default: str = "voice-message.webm") -> str:

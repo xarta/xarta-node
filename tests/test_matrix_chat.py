@@ -352,6 +352,145 @@ async def test_matrix_chat_wake_stt_route_reuses_e2ee_content_send(monkeypatch):
     }
 
 
+def test_matrix_chat_wake_stt_direct_diagnostic_content_is_not_addressed():
+    content = matrix_chat._matrix_wake_stt_direct_diagnostic_content(
+        body="Wake STT: What is the time?",
+        instance="local",
+        candidate_source="payload0",
+        command="execute",
+        wake_word="Computer",
+        candidate_revision="wake-local-456",
+    )
+
+    assert content["body"] == "Wake STT: What is the time?"
+    assert not content["body"].lower().startswith("hermes:")
+    assert "authorised" not in content["body"].lower()
+    assert content["xarta_source"] == "wake_stt_direct_observation"
+    assert content["xarta_capture_mode"] == "wake_to_talk"
+    assert content["xarta_suppress_speech"] is True
+    assert content["suppress_speech"] is True
+    assert "m.mentions" not in content
+
+
+def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$fallback"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    async def fake_submit(text, *, codes=None, **_kwargs):
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=False,
+            status="request_error",
+            gate=gate,
+            attempted=True,
+            fallback_required=True,
+            error="connection refused",
+        )
+
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"alpha","aliases":["alpha one"]}]}',
+    )
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="alpha one This command is authorised. What is the time?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-789",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert result.ok is True
+    assert result.route == "matrix_fallback"
+    assert captured["room_id"] == "!bridge:test.example"
+    assert captured["content"]["body"].startswith("hermes: ")
+    assert "What is the time?" in captured["content"]["body"]
+    assert "alpha one" not in captured["content"]["body"].lower()
+    assert "authorised" not in captured["content"]["body"].lower()
+    assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
+
+
+def test_matrix_chat_direct_wrapper_posts_redacted_diagnostic_on_success(monkeypatch):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$diag"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    async def fake_submit(text, *, codes=None, **_kwargs):
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text="ok",
+        )
+
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"bravo","aliases":["bravo two"]}]}',
+    )
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="bravo two This command is authorised. Please check status.",
+                instance="local",
+                candidate_source="payload1",
+                command="auto_execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-999",
+            ),
+            direct_enabled=True,
+            diagnostic_enabled=True,
+            await_diagnostic=True,
+        )
+    )
+
+    assert result.ok is True
+    assert result.route == "direct_local"
+    assert captured["content"]["body"] == "Wake STT: Please check status."
+    assert not captured["content"]["body"].lower().startswith("hermes:")
+    assert "bravo" not in captured["content"]["body"].lower()
+    assert "authorised" not in captured["content"]["body"].lower()
+    assert captured["content"]["xarta_source"] == "wake_stt_direct_observation"
+
+
 def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
     content = matrix_chat._audio_message_content(
         content_uri="mxc://example.org/audio123",
