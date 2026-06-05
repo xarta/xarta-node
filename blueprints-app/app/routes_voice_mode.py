@@ -2294,6 +2294,67 @@ def _public_active(active: dict[str, Any] | None) -> dict[str, Any] | None:
     return public_active
 
 
+def _wake_debug_path_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _wake_debug_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if raw in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return None
+
+
+def _wake_debug_auto_execute_guard(
+    state: dict[str, Any],
+    public_debug: dict[str, Any] | None,
+) -> dict[str, Any]:
+    policy = _clean_policy(state.get("policy"))
+    local_policy = policy["wake_to_talk"]["instances"]["local"]
+    policy_auto_ms = int(local_policy.get("auto_execute_silence_ms") or 0)
+    active = _public_active(state.get("active") if isinstance(state.get("active"), dict) else None)
+    if not isinstance(public_debug, dict):
+        return {
+            "ok": True,
+            "mismatch": False,
+            "policy_auto_execute_silence_ms": policy_auto_ms,
+            "reported_auto_execute_enabled": None,
+        }
+    snapshot = (
+        public_debug.get("snapshot") if isinstance(public_debug.get("snapshot"), dict) else {}
+    )
+    reported = None
+    for path in (
+        ("downstream", "instances", "local", "auto_execute_enabled"),
+        ("instances", "local", "auto_execute_enabled"),
+        ("auto_execute_enabled",),
+    ):
+        reported = _wake_debug_bool(_wake_debug_path_value(snapshot or public_debug, path))
+        if reported is not None:
+            break
+    authoritative = bool(public_debug.get("authoritative_browser_active"))
+    wake_active = bool(active and active.get("stt_mode") == "wake_to_talk")
+    mismatch = bool(authoritative and wake_active and policy_auto_ms > 0 and reported is False)
+    return {
+        "ok": not mismatch,
+        "mismatch": mismatch,
+        "policy_auto_execute_silence_ms": policy_auto_ms,
+        "reported_auto_execute_enabled": reported,
+    }
+
+
 def _select_wake_dev_report(
     state: dict[str, Any],
     debug: dict[str, Any],
@@ -2359,6 +2420,7 @@ def _public_wake_dev_debug(
         public_debug["authoritative_browser_active"] = bool(
             active_browser_id and report_browser_id == active_browser_id
         )
+        public_debug["auto_execute_guard"] = _wake_debug_auto_execute_guard(state, public_debug)
     reported_at = (
         float(public_debug.get("reported_at") or 0.0) if isinstance(public_debug, dict) else 0.0
     )

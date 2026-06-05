@@ -1052,6 +1052,56 @@ def test_voice_mode_wake_dev_debug_reports_non_active_browser_as_non_authoritati
     assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
+def test_voice_mode_wake_dev_debug_flags_auto_execute_policy_mismatch():
+    state = {
+        "active": {
+            "browser_id": "active-browser",
+            "browser_label": "Browser on Win32",
+            "stt_enabled": True,
+            "stt_mode": "wake_to_talk",
+            "tts_enabled": True,
+        },
+        "policy": {
+            "wake_to_talk": {
+                "instances": {
+                    "local": {
+                        "auto_execute_silence_ms": 900,
+                        "execute_cancel_ms": 3000,
+                        "partial_settle_ms": 2100,
+                    }
+                }
+            }
+        },
+    }
+    debug = {
+        "reports": {
+            "active-browser:wake_dev": {
+                "browser_id": "active-browser",
+                "surface": "wake_dev",
+                "snapshot": {
+                    "downstream": {
+                        "instances": {
+                            "local": {
+                                "auto_execute_enabled": False,
+                            }
+                        }
+                    }
+                },
+                "reported_at": 2,
+            },
+        }
+    }
+
+    wake_debug = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+
+    guard = wake_debug["debug"]["auto_execute_guard"]
+    assert wake_debug["debug"]["authoritative_browser_active"] is True
+    assert guard["ok"] is False
+    assert guard["mismatch"] is True
+    assert guard["policy_auto_execute_silence_ms"] == 900
+    assert guard["reported_auto_execute_enabled"] is False
+
+
 def test_active_browser_activation_fsm_replaces_existing_active_browser():
     state = {
         "active": {
