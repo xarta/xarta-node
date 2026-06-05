@@ -62,6 +62,16 @@ For shared modal, chooser, or reusable admin-surface work, also read:
 - `/xarta-node/.lone-wolf/docs/web-design/MODAL.md`
 - `/xarta-node/.lone-wolf/docs/web-design/COMPONENT-LIBRARY.md`
 
+Dropdown/select rule: native `<select>` controls must visibly look like
+dropdowns. When page-local CSS overrides a select face, use
+`background-color:` rather than the `background:` shorthand unless the same
+rule restores the shared chevron `background-image`. Run the guard before
+sign-off on GUI CSS/select work:
+
+```bash
+bash /root/xarta-node/.xarta/.claude/skills/web-design/scripts/detect-select-chevron-regressions.sh /xarta-node/gui-fallback
+```
+
 For ultrawide sidecar debug panel behavior and extending debug scenarios:
 
 - `/xarta-node/.lone-wolf/docs/web-design/ULTRA-WIDE-DEBUG-PANELS.md`
