@@ -42,6 +42,9 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert local["auto_execute_silence_ms"] == 300
     assert local["execute_cancel_ms"] == 900
     assert local["partial_settle_ms"] == 300
+    assert local["delivery_mode"] == "matrix"
+    assert local["direct_available"] is True
+    assert local["direct_enabled"] is False
     assert local["commands"]["execute"] == "execute"
     assert local["commands"]["pause"] == "pause-dictation"
     assert local["hermes_prefix"] == "hermes: "
@@ -51,9 +54,41 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert vps["auto_execute_silence_ms"] == 3000
     assert vps["execute_cancel_ms"] == 0
     assert vps["partial_settle_ms"] == 1200
+    assert vps["delivery_mode"] == "matrix"
+    assert vps["direct_available"] is False
+    assert vps["direct_enabled"] is False
     assert vps["hermes_prefix"] == "hermes-vps: "
     assert "mini me" in vps["wake_aliases"]
     assert "minime" in vps["wake_aliases"]
+
+
+def test_voice_mode_wake_direct_delivery_is_default_off_and_local_only():
+    policy = voice_mode._clean_wake_to_talk_policy(
+        {
+            "instances": {
+                "local": {
+                    "delivery_mode": "direct-hermes",
+                    "direct_enabled": True,
+                },
+                "vps": {
+                    "delivery_mode": "direct-hermes",
+                    "direct_enabled": True,
+                },
+            }
+        }
+    )
+
+    local = policy["instances"]["local"]
+    assert local["delivery_mode"] == "direct_local"
+    assert local["direct_available"] is True
+    assert local["direct_enabled"] is True
+    assert local["direct_status"] == "not_configured"
+
+    vps = policy["instances"]["vps"]
+    assert vps["delivery_mode"] == "matrix"
+    assert vps["direct_available"] is False
+    assert vps["direct_enabled"] is False
+    assert vps["direct_status"] == "not_available"
 
 
 def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
