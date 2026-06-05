@@ -109,6 +109,7 @@ def test_hermes_stt_config_loads_profile_env_without_exposing_key(tmp_path):
     assert public["key_length"] == len("super-secret-test-key")
     assert "super-secret-test-key" not in str(public)
     assert public["loopback_ok"] is True
+    assert public["max_tokens"] == wake_stt_direct.DEFAULT_HERMES_STT_MAX_TOKENS
 
 
 def test_hermes_stt_config_rejects_non_loopback_by_default():
@@ -165,6 +166,74 @@ def test_command_codes_from_env_accepts_bounded_json():
     assert len(codes) == 1
     assert codes[0].code_id == "alpha"
     assert codes[0].aliases == ("alpha one",)
+
+
+def test_parse_hermes_stt_companion_output_requires_elected_speech():
+    parsed = wake_stt_direct.parse_hermes_stt_companion_output(
+        '{"speech":"Say this aloud.","matrix_detail":"Longer Matrix detail.","status":"ok"}'
+    )
+    raw = wake_stt_direct.parse_hermes_stt_companion_output("Plain assistant text.")
+
+    assert parsed.structured is True
+    assert parsed.speech == "Say this aloud."
+    assert parsed.matrix_detail == "Longer Matrix detail."
+    assert parsed.status == "ok"
+    assert raw.structured is False
+    assert raw.speech == "Plain assistant text."
+    assert raw.matrix_detail == "Plain assistant text."
+    assert raw.status == "unstructured_speech_fallback"
+
+
+def test_hermes_stt_budget_facts_read_profile_and_litellm_config(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    profile_env = profile / ".env"
+    profile_env.write_text("API_SERVER_KEY=secret\n", encoding="utf-8")
+    (profile / "config.yaml").write_text(
+        """
+model:
+  default: TEST-LOCAL
+custom_providers:
+  - name: test
+    models:
+      TEST-LOCAL:
+        context_length: 128000
+""",
+        encoding="utf-8",
+    )
+    litellm_config = tmp_path / "litellm.yaml"
+    litellm_config.write_text(
+        """
+model_list:
+  - model_name: TEST-LOCAL
+    model_info:
+      max_input_tokens: 131584
+      max_output_tokens: 65536
+      xarta_total_context_tokens: 204800
+      xarta_context_window_buffer_tokens: 256
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOC_SPEECH_LITELLM_CONFIG_PATH", str(litellm_config))
+
+    facts = wake_stt_direct.hermes_stt_budget_facts(
+        wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            profile_env_path=profile_env,
+            max_tokens=9000,
+        )
+    )
+
+    assert facts.model_alias == "TEST-LOCAL"
+    assert facts.profile_context_tokens == 128000
+    assert facts.max_input_tokens == 131584
+    assert facts.max_output_tokens == 65536
+    assert facts.total_context_tokens == 204800
+    assert facts.context_buffer_tokens == 256
+    assert facts.request_max_tokens == 9000
+    prompt = wake_stt_direct._budget_context_for_prompt(facts)
+    assert "2000-word essay request is normally well within" in prompt
 
 
 def test_hermes_stt_session_phrase_scanner_reports_counts_without_context(tmp_path):
@@ -225,7 +294,13 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
                     {
                         "message": {
                             "role": "assistant",
-                            "content": "direct delivery acknowledged",
+                            "content": json.dumps(
+                                {
+                                    "speech": "direct delivery acknowledged",
+                                    "matrix_detail": "direct delivery acknowledged in detail",
+                                    "status": "ok",
+                                }
+                            ),
                         }
                     }
                 ],
@@ -262,9 +337,13 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert captured["session_id"] == "wake-stt-local"
     assert captured["session_key"] == "session-test-key"
     assert wake_stt_direct.AUTHORISED_PHRASE in captured["body"]
+    assert '"max_tokens":8192' in captured["body"].replace(" ", "")
+    assert "Configured model/profile facts" in captured["body"]
     assert "alpha one" not in captured["body"].lower()
     assert public["diagnostic_text"] == "Please check the time."
     assert public["matched_code_id"] == "alpha"
+    assert public["companion"]["speech"] == "direct delivery acknowledged"
+    assert public["companion"]["matrix_detail"] == "direct delivery acknowledged in detail"
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public)
     assert "secret-test-key" not in str(public)
 
@@ -292,8 +371,11 @@ def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = request.read().decode("utf-8")
-        body = chunk("direct ") + 'event: hermes.tool.progress\ndata: {"tool":"ignored"}\n\n'
-        body += chunk("stream ok") + "data: [DONE]\n\n"
+        body = (
+            chunk('{"speech":"direct ')
+            + 'event: hermes.tool.progress\ndata: {"tool":"ignored"}\n\n'
+        )
+        body += chunk('stream ok","matrix_detail":"detail","status":"ok"}') + "data: [DONE]\n\n"
         return httpx.Response(
             200,
             content=body.encode("utf-8"),
@@ -324,8 +406,11 @@ def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
     result = asyncio.run(run_submit())
 
     assert result.ok is True
-    assert result.assistant_text == "direct stream ok"
-    assert deltas == ["direct ", "stream ok"]
+    assert result.assistant_text == (
+        '{"speech":"direct stream ok","matrix_detail":"detail","status":"ok"}'
+    )
+    assert result.companion and result.companion.speech == "direct stream ok"
+    assert deltas == ['{"speech":"direct ', 'stream ok","matrix_detail":"detail","status":"ok"}']
     assert '"stream":true' in captured["body"].replace(" ", "")
     assert wake_stt_direct.AUTHORISED_PHRASE not in captured["body"]
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
@@ -342,7 +427,11 @@ def test_submit_wake_stt_stream_suppresses_early_deltas_for_authorised_requests(
         )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        body = chunk("authorised ") + chunk("stream ok") + "data: [DONE]\n\n"
+        body = (
+            chunk('{"speech":"authorised ')
+            + chunk('stream ok","matrix_detail":"detail","status":"ok"}')
+            + "data: [DONE]\n\n"
+        )
         return httpx.Response(
             200,
             content=body.encode("utf-8"),
@@ -375,7 +464,10 @@ def test_submit_wake_stt_stream_suppresses_early_deltas_for_authorised_requests(
     result = asyncio.run(run_submit())
 
     assert result.ok is True
-    assert result.assistant_text == "authorised stream ok"
+    assert result.assistant_text == (
+        '{"speech":"authorised stream ok","matrix_detail":"detail","status":"ok"}'
+    )
+    assert result.companion and result.companion.speech == "authorised stream ok"
     assert deltas == []
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
 

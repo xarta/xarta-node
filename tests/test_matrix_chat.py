@@ -452,6 +452,134 @@ def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
     assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
 
 
+def test_matrix_chat_direct_wrapper_uses_active_session_without_auto_rotation(
+    monkeypatch, tmp_path
+):
+    captured = {}
+    active_session = tmp_path / "active-session.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-kept"}),
+        encoding="utf-8",
+    )
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            return {"room_id": room_id, "event_id": "$fallback"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["session_id"] = config.session_id
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=False,
+            status="request_error",
+            gate=gate,
+            attempted=True,
+            fallback_required=True,
+            error="connection refused",
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="What is five times seven?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-kept",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert captured["session_id"] == "wake-stt-local-operator-kept"
+    assert json.loads(active_session.read_text(encoding="utf-8"))["session_id"] == (
+        "wake-stt-local-operator-kept"
+    )
+
+
+def test_matrix_chat_direct_wrapper_rotates_session_only_on_operator_request(monkeypatch, tmp_path):
+    captured = {"session_ids": []}
+    active_session = tmp_path / "active-session.json"
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["session_ids"].append(config.session_id)
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text="Session handled.",
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="Session handled.",
+                matrix_detail="Session handled.",
+                status="ok",
+                structured=False,
+                raw_assistant_text="Session handled.",
+            ),
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    async def run_turn(text: str):
+        return await matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text=text,
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-reset",
+            ),
+            direct_enabled=True,
+        )
+
+    asyncio.run(run_turn("Please start a new session."))
+    stored = json.loads(active_session.read_text(encoding="utf-8"))["session_id"]
+    asyncio.run(run_turn("What is five times seven?"))
+
+    assert stored.startswith("wake-stt-local-operator-")
+    assert captured["session_ids"] == [stored, stored]
+
+
 def test_matrix_chat_direct_wrapper_posts_redacted_diagnostic_on_success(monkeypatch):
     captured = {}
 
@@ -473,6 +601,13 @@ def test_matrix_chat_direct_wrapper_posts_redacted_diagnostic_on_success(monkeyp
             attempted=True,
             fallback_required=False,
             assistant_text="ok",
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="ok",
+                matrix_detail="ok",
+                status="ok",
+                structured=True,
+                raw_assistant_text='{"speech":"ok","matrix_detail":"ok","status":"ok"}',
+            ),
         )
 
     monkeypatch.setenv(
@@ -529,7 +664,19 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
                 gate=gate,
                 attempted=True,
                 fallback_required=False,
-                assistant_text="I am okay.",
+                assistant_text=(
+                    '{"speech":"I am okay.","matrix_detail":"I am okay in detail.","status":"ok"}'
+                ),
+                companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                    speech="I am okay.",
+                    matrix_detail="I am okay in detail.",
+                    status="ok",
+                    structured=True,
+                    raw_assistant_text=(
+                        '{"speech":"I am okay.","matrix_detail":"I am okay in detail.",'
+                        '"status":"ok"}'
+                    ),
+                ),
             ),
         )
 
@@ -579,7 +726,7 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     )
 
     assert result["delivery"]["route"] == "direct_local"
-    assert result["delivery"]["direct"]["assistant_text"] == "I am okay."
+    assert result["delivery"]["direct"]["companion"]["speech"] == "I am okay."
     assert result["delivery"]["tts"]["ok"] is True
     assert result["delivery"]["tts"]["event_id"] == "tts-wake-direct"
     assert captured["text"] == "I am okay."
@@ -587,20 +734,21 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     assert captured["agent_id"] == "hermes-stt"
     assert captured["interrupt"] is True
     assert captured["metadata"]["schema"] == "xarta.wake-stt.direct-response.v1"
+    assert captured["metadata"]["speech_elected_by"] == "hermes-stt"
+    assert captured["report"]["matrix_detail"] == "I am okay in detail."
     assert result["delivery"]["assistant_report_scheduled"] is True
+    assert result["delivery"]["tts_elected_by_hermes"] is True
     assert "api_server_key" not in str(captured).lower()
     assert "secret" not in str(captured).lower()
 
 
-def test_matrix_chat_wake_stt_direct_route_uses_streamed_tts_chunks(monkeypatch):
-    captured = {"texts": [], "interrupts": []}
+def test_matrix_chat_wake_stt_direct_route_pre_rolls_then_speaks_final(monkeypatch):
+    published: list[dict[str, object]] = []
 
     async def fake_deliver(**kwargs):
+        await asyncio.sleep(0.02)
         body = kwargs["body"]
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
-        callback = kwargs.get("assistant_delta_callback")
-        await callback("First streamed Wake response sentence is long enough to speak early. ")
-        await callback("Second streamed Wake response sentence closes the thought.")
         return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
             ok=True,
             status="delivered",
@@ -613,18 +761,108 @@ def test_matrix_chat_wake_stt_direct_route_uses_streamed_tts_chunks(monkeypatch)
                 attempted=True,
                 fallback_required=False,
                 assistant_text=(
-                    "First streamed Wake response sentence is long enough to speak early. "
-                    "Second streamed Wake response sentence closes the thought."
+                    '{"speech":"I am online.","matrix_detail":"Wake STT check completed.",'
+                    '"status":"ok"}'
+                ),
+                companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                    speech="I am online.",
+                    matrix_detail="Wake STT check completed.",
+                    status="ok",
+                    structured=True,
+                    raw_assistant_text="{}",
                 ),
             ),
         )
 
     async def fake_publish_tts_payload(payload):
-        captured["texts"].append(payload["text"])
-        captured["interrupts"].append(payload["interrupt"])
+        published.append(payload)
         return {
             "ok": True,
-            "event": {"event_id": f"tts-wake-direct-{len(captured['texts'])}"},
+            "event": {"event_id": f"tts-{len(published)}"},
+            "payload": {
+                "utterance_id": payload["utterance_id"],
+                "source": payload["source"],
+                "agent_id": payload["agent_id"],
+            },
+        }
+
+    async def fake_report(**kwargs):
+        return {"ok": True, "event_id": "$response-copy"}
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_direct_pre_roll_delay_seconds",
+        lambda: 0.001,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="Are you okay?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-pre-roll",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["delivery"]["route"] == "direct_local"
+    assert result["delivery"]["pre_roll_tts"]["event_id"] == "tts-1"
+    assert result["delivery"]["tts"]["event_id"] == "tts-2"
+    assert [payload["text"] for payload in published] == ["I heard you.", "I am online."]
+    assert published[0]["interrupt"] is True
+    assert published[0]["metadata"]["pre_roll"] is True
+    assert published[0]["metadata"]["speech_elected_by"] == "blueprints_transport_ack"
+    assert published[1]["metadata"]["pre_roll"] is False
+    assert published[1]["metadata"]["speech_elected_by"] == "hermes-stt"
+
+
+def test_matrix_chat_wake_stt_direct_route_speaks_short_unstructured_response(monkeypatch):
+    captured = {}
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text="Plain raw assistant text should not be auto-spoken.",
+                companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                    speech="Plain raw assistant text should be spoken as fallback.",
+                    matrix_detail="Plain raw assistant text should not be auto-spoken.",
+                    status="unstructured_speech_fallback",
+                    structured=False,
+                    raw_assistant_text="Plain raw assistant text should not be auto-spoken.",
+                ),
+            ),
+        )
+
+    async def fake_publish_tts_payload(payload):
+        captured["text"] = payload["text"]
+        return {
+            "ok": True,
+            "event": {"event_id": "tts-unstructured-fallback"},
             "payload": {
                 "utterance_id": payload["utterance_id"],
                 "source": payload["source"],
@@ -662,14 +900,92 @@ def test_matrix_chat_wake_stt_direct_route_uses_streamed_tts_chunks(monkeypatch)
     )
 
     assert result["delivery"]["route"] == "direct_local"
-    assert result["delivery"]["tts"]["streamed"] is True
-    assert result["delivery"]["tts"]["chunks"] == 2
-    assert captured["texts"] == [
-        "First streamed Wake response sentence is long enough to speak early.",
-        "Second streamed Wake response sentence closes the thought.",
-    ]
-    assert captured["interrupts"] == [True, False]
+    assert result["delivery"]["tts"]["status"] == "queued"
+    assert result["delivery"]["tts"]["event_id"] == "tts-unstructured-fallback"
+    assert result["delivery"]["tts_elected_by_hermes"] is True
+    assert captured["text"] == "Plain raw assistant text should be spoken as fallback."
+    assert (
+        captured["report"]["matrix_detail"] == "Plain raw assistant text should not be auto-spoken."
+    )
     assert result["delivery"]["assistant_report_scheduled"] is True
+
+
+def test_matrix_chat_wake_stt_direct_route_preserves_long_elected_speech(monkeypatch):
+    captured = {}
+    long_speech = " ".join(["computer"] * 360)
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text=json.dumps(
+                    {
+                        "speech": long_speech,
+                        "matrix_detail": "Long spoken essay requested and elected.",
+                        "status": "long_speech",
+                    }
+                ),
+                companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                    speech=long_speech,
+                    matrix_detail="Long spoken essay requested and elected.",
+                    status="long_speech",
+                    structured=True,
+                    raw_assistant_text="{}",
+                ),
+            ),
+        )
+
+    async def fake_publish_tts_payload(payload):
+        captured["text"] = payload["text"]
+        return {
+            "ok": True,
+            "event": {"event_id": "tts-long"},
+            "payload": {"utterance_id": payload["utterance_id"]},
+        }
+
+    async def fake_report(**kwargs):
+        captured["report"] = kwargs
+        return {"ok": True, "event_id": "$response-copy"}
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="Read a long essay.",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-long-speech",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["delivery"]["route"] == "direct_local"
+    assert captured["text"] == long_speech
+    assert "I sent the rest to Matrix" not in captured["text"]
+    assert result["delivery"]["tts"]["event_id"] == "tts-long"
 
 
 def test_matrix_chat_wake_stt_route_rolls_direct_request_back_to_matrix(monkeypatch):
