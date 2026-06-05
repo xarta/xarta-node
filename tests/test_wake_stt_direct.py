@@ -293,3 +293,85 @@ def test_submit_wake_stt_to_hermes_fails_if_authorisation_phrase_persists(tmp_pa
     assert result.fallback_required is True
     assert public["context_check"]["hit_count"] == 1
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public["context_check"]["hits"])
+
+
+def test_deliver_wake_stt_matrix_fallback_strips_codes_and_authorisation():
+    matrix_seen = {}
+
+    async def matrix_send(text):
+        matrix_seen["text"] = text
+        return {"event_id": "$fallback"}
+
+    async def run_delivery():
+        return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+            "delta four This command is authorised. Please check the time.",
+            codes=wake_stt_direct.command_codes_from_config(
+                [{"id": "delta", "aliases": ["delta four"]}]
+            ),
+            config=wake_stt_direct.HermesSttConfig(
+                api_base="http://127.0.0.1:8643",
+                api_key="",
+            ),
+            matrix_send=matrix_send,
+            direct_enabled=True,
+        )
+
+    result = asyncio.run(run_delivery())
+    public = result.public_dict()
+
+    assert result.ok is True
+    assert result.route == "matrix_fallback"
+    assert result.fallback_reason == "not_configured"
+    assert matrix_seen["text"] == "Please check the time."
+    assert "delta four" not in str(public).lower()
+    assert "authorised" not in public["diagnostic_text"].lower()
+
+
+def test_deliver_wake_stt_direct_success_can_schedule_redacted_diagnostic(tmp_path):
+    diagnostic_seen = {}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "direct ok"}}],
+                "model": "hermes-stt",
+            },
+        )
+    )
+
+    async def matrix_send(text):
+        raise AssertionError(f"matrix fallback should not run: {text}")
+
+    async def diagnostic_send(text):
+        diagnostic_seen["text"] = text
+        return {"event_id": "$diag"}
+
+    async def run_delivery():
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+                "echo five Please list system status.",
+                codes=wake_stt_direct.command_codes_from_config(
+                    [{"id": "echo", "aliases": ["echo five"]}]
+                ),
+                config=wake_stt_direct.HermesSttConfig(
+                    api_base="http://127.0.0.1:8643",
+                    api_key="secret-test-key",
+                    sessions_dir=tmp_path,
+                ),
+                client=client,
+                matrix_send=matrix_send,
+                diagnostic_send=diagnostic_send,
+                direct_enabled=True,
+                diagnostic_enabled=True,
+                await_diagnostic=True,
+            )
+
+    result = asyncio.run(run_delivery())
+    public = result.public_dict()
+
+    assert result.ok is True
+    assert result.route == "direct_local"
+    assert diagnostic_seen["text"] == "Please list system status."
+    assert public["diagnostic"]["event_id"] == "$diag"
+    assert "secret-test-key" not in str(public)
+    assert wake_stt_direct.AUTHORISED_PHRASE not in str(public)
