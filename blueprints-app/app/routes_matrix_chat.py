@@ -267,14 +267,15 @@ class _WakeSttMessageBody(BaseModel):
     direct_enabled: bool | None = None
     direct_diagnostic_enabled: bool = False
     direct_await_diagnostic: bool = False
+    address_hermes: bool = True
 
 
 def _wake_stt_direct_pre_roll_delay_seconds() -> float:
-    raw = os.getenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "350")
+    raw = os.getenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "3000")
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError):
-        value = 350
+        value = 3000
     if value <= 0:
         return 0.0
     return max(50, min(value, 5000)) / 1000.0
@@ -1798,15 +1799,19 @@ def _wake_stt_transcript_body(
     server_id: str,
     transcript: str,
     hermes_prefix: str | None = None,
+    address_hermes: bool = True,
 ) -> str:
-    prefix = _safe_str(hermes_prefix).replace("\r", " ").replace("\n", " ")
-    if prefix:
-        prefix = " ".join(prefix.split())
-        if not prefix.endswith(":"):
-            prefix = prefix.rstrip(":") + ":"
-        prefix = f"{prefix} "
+    if not address_hermes:
+        prefix = ""
     else:
-        prefix = _HERMES_BRIDGE_PREFIXES.get(server_id, "hermes: ")
+        prefix = _safe_str(hermes_prefix).replace("\r", " ").replace("\n", " ")
+        if prefix:
+            prefix = " ".join(prefix.split())
+            if not prefix.endswith(":"):
+                prefix = prefix.rstrip(":") + ":"
+            prefix = f"{prefix} "
+        else:
+            prefix = _HERMES_BRIDGE_PREFIXES.get(server_id, "hermes: ")
     return f"{prefix}{_WAKE_STT_TRANSCRIPT_PREFIX} {(transcript or '').strip()}"
 
 
@@ -1956,11 +1961,13 @@ async def _send_wake_stt_transcript_message(
     wake_word: str = "",
     candidate_revision: str = "",
     hermes_prefix: str | None = None,
+    address_hermes: bool = True,
 ) -> dict[str, Any]:
     body = _wake_stt_transcript_body(
         server_id=server_id,
         transcript=transcript,
         hermes_prefix=hermes_prefix,
+        address_hermes=address_hermes,
     )
     content = _matrix_wake_stt_message_content(
         body=body,
@@ -2095,6 +2102,7 @@ async def _deliver_wake_stt_with_direct_fallback(
             wake_word=body.wake_word,
             candidate_revision=body.candidate_revision,
             hermes_prefix=body.hermes_prefix,
+            address_hermes=body.address_hermes,
         )
 
     async def diagnostic_send(text: str) -> dict[str, Any]:
@@ -3660,6 +3668,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         wake_word=body.wake_word,
         candidate_revision=body.candidate_revision,
         hermes_prefix=body.hermes_prefix,
+        address_hermes=body.address_hermes,
     )
     return {
         "room_id": sent.get("room_id"),

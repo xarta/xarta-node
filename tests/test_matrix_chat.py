@@ -168,6 +168,12 @@ def test_matrix_chat_noise_relay_treats_late_client_close_after_final_request_as
     asyncio.run(run())
 
 
+def test_matrix_chat_wake_stt_direct_pre_roll_delay_defaults_to_three_seconds(monkeypatch):
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", raising=False)
+
+    assert matrix_chat._wake_stt_direct_pre_roll_delay_seconds() == 3.0
+
+
 def test_matrix_chat_hermes_matrix_patch_status_reduces_report(tmp_path):
     report_path = tmp_path / "matrix_platform_patch.json"
     report_path.write_text(
@@ -268,6 +274,14 @@ def test_matrix_chat_wake_stt_transcript_body_marks_voice_source():
     assert (
         matrix_chat._wake_stt_transcript_body(server_id="vps", transcript="hello world")
         == f"hermes-vps: {matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} hello world"
+    )
+    assert (
+        matrix_chat._wake_stt_transcript_body(
+            server_id="tb1",
+            transcript="validation only",
+            address_hermes=False,
+        )
+        == f"{matrix_chat._WAKE_STT_TRANSCRIPT_PREFIX} validation only"
     )
 
 
