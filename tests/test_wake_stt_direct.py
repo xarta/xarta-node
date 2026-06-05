@@ -312,6 +312,7 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
 
     async def run_submit():
         async with httpx.AsyncClient(transport=transport) as client:
+            timing = wake_stt_direct.WakeSttRouteTiming()
             return await wake_stt_direct.submit_wake_stt_to_hermes(
                 "alpha one Please check the time.",
                 codes=wake_stt_direct.command_codes_from_config(
@@ -325,6 +326,7 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
                     sessions_dir=tmp_path,
                 ),
                 client=client,
+                timing=timing,
             )
 
     result = asyncio.run(run_submit())
@@ -344,6 +346,9 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert public["matched_code_id"] == "alpha"
     assert public["companion"]["speech"] == "direct delivery acknowledged"
     assert public["companion"]["matrix_detail"] == "direct delivery acknowledged in detail"
+    stages = [mark["stage"] for mark in public["timing"]["marks"]]
+    assert "hermes_request_start" in stages
+    assert "hermes_complete" in stages
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public)
     assert "secret-test-key" not in str(public)
 
@@ -389,6 +394,7 @@ def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
 
     async def run_submit():
         async with httpx.AsyncClient(transport=transport) as client:
+            timing = wake_stt_direct.WakeSttRouteTiming()
             return await wake_stt_direct.submit_wake_stt_to_hermes(
                 "Please stream the reply.",
                 codes=[],
@@ -401,6 +407,7 @@ def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
                 ),
                 client=client,
                 assistant_delta_callback=on_delta,
+                timing=timing,
             )
 
     result = asyncio.run(run_submit())
@@ -411,6 +418,10 @@ def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
     )
     assert result.companion and result.companion.speech == "direct stream ok"
     assert deltas == ['{"speech":"direct ', 'stream ok","matrix_detail":"detail","status":"ok"}']
+    stages = [mark["stage"] for mark in result.public_dict()["timing"]["marks"]]
+    assert "hermes_first_delta" in stages
+    assert stages.index("hermes_request_start") < stages.index("hermes_first_delta")
+    assert stages.index("hermes_first_delta") < stages.index("hermes_complete")
     assert '"stream":true' in captured["body"].replace(" ", "")
     assert wake_stt_direct.AUTHORISED_PHRASE not in captured["body"]
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
