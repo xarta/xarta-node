@@ -268,6 +268,11 @@ class _WakeSttMessageBody(BaseModel):
     direct_await_diagnostic: bool = False
 
 
+_WAKE_STT_DIRECT_TTS_MAX_CHARS = 1400
+_WAKE_STT_DIRECT_TTS_MIN_FLUSH_CHARS = 48
+_WAKE_STT_DIRECT_TTS_FORCE_FLUSH_CHARS = 220
+
+
 class _RoomSettingsBody(BaseModel):
     hermes_command_catalog: bool = False
     hide_system_messages: bool = False
@@ -1814,6 +1819,35 @@ def _matrix_wake_stt_direct_diagnostic_content(
     return content
 
 
+def _matrix_wake_stt_direct_response_content(
+    *,
+    body: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str,
+    candidate_revision: str,
+    tts_status: str = "",
+) -> dict[str, Any]:
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "xarta_source": "wake_stt_direct_response",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_wake_instance": _safe_str(instance) or "local",
+            "xarta_wake_candidate_source": _safe_str(candidate_source),
+            "xarta_wake_command": _safe_str(command) or "execute",
+            "xarta_wake_candidate_revision": _safe_str(candidate_revision),
+            "xarta_wake_word": _safe_str(wake_word),
+            "xarta_tts_companion_copy": True,
+            "xarta_tts_status": _safe_str(tts_status),
+            "xarta_suppress_speech": True,
+            "suppress_speech": True,
+        }
+    )
+    return content
+
+
 async def _send_stt_transcript_message(
     *,
     room_id: str,
@@ -1922,6 +1956,54 @@ async def _send_wake_stt_direct_diagnostic_message(
     return sent
 
 
+async def _send_wake_stt_direct_response_report_message(
+    *,
+    room_id: str,
+    assistant_text: str,
+    tts_status: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str = "",
+    candidate_revision: str = "",
+) -> dict[str, Any]:
+    text = _safe_str(assistant_text).strip()
+    body = f"Wake STT reply: {text}" if text else "Wake STT reply:"
+    content = _matrix_wake_stt_direct_response_content(
+        body=body,
+        instance=instance,
+        candidate_source=candidate_source,
+        command=command,
+        wake_word=wake_word,
+        candidate_revision=candidate_revision,
+        tts_status=tts_status,
+    )
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-wake-stt-direct-response-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update(content)
+    return sent
+
+
+async def _send_wake_stt_direct_response_report_safely(**kwargs: Any) -> dict[str, Any]:
+    try:
+        return await _send_wake_stt_direct_response_report_message(**kwargs)
+    except Exception as exc:  # pragma: no cover - Matrix runtime failures vary.
+        log.warning("wake_stt_direct_response_report_failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:240]}
+
+
 async def _deliver_wake_stt_with_direct_fallback(
     *,
     room_id: str,
@@ -1929,6 +2011,7 @@ async def _deliver_wake_stt_with_direct_fallback(
     direct_enabled: bool,
     diagnostic_enabled: bool = False,
     await_diagnostic: bool = False,
+    assistant_delta_callback: wake_stt_direct.AssistantDeltaCallback | None = None,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     settings = _settings()
 
@@ -1963,7 +2046,106 @@ async def _deliver_wake_stt_with_direct_fallback(
         direct_enabled=direct_enabled,
         diagnostic_enabled=diagnostic_enabled,
         await_diagnostic=await_diagnostic,
+        assistant_delta_callback=assistant_delta_callback,
     )
+
+
+def _trim_wake_stt_direct_spoken_text(text: str) -> str:
+    clean = " ".join(_safe_str(text).split())
+    if len(clean) <= _WAKE_STT_DIRECT_TTS_MAX_CHARS:
+        return clean
+    clipped = clean[:_WAKE_STT_DIRECT_TTS_MAX_CHARS].rsplit(" ", 1)[0].strip()
+    return f"{clipped}. I sent the rest to Matrix."
+
+
+class _WakeSttDirectTtsStreamer:
+    def __init__(self, body: _WakeSttMessageBody):
+        self.body = body
+        self.buffer = ""
+        self.spoken_chars = 0
+        self.chunk_index = 0
+        self.results: list[dict[str, Any]] = []
+        self.truncated = False
+
+    @property
+    def published_count(self) -> int:
+        return len(self.results)
+
+    def _take_segment(self, *, force: bool = False) -> str:
+        if not self.buffer.strip():
+            return ""
+        clean = " ".join(self.buffer.split())
+        boundary = -1
+        for marker in (". ", "? ", "! ", "\n"):
+            boundary = max(boundary, clean.rfind(marker))
+        if boundary >= _WAKE_STT_DIRECT_TTS_MIN_FLUSH_CHARS:
+            segment = clean[: boundary + 1].strip()
+        elif force or len(clean) >= _WAKE_STT_DIRECT_TTS_FORCE_FLUSH_CHARS:
+            if len(clean) <= _WAKE_STT_DIRECT_TTS_FORCE_FLUSH_CHARS:
+                segment = clean
+            else:
+                segment = clean[:_WAKE_STT_DIRECT_TTS_FORCE_FLUSH_CHARS].rsplit(" ", 1)[0].strip()
+        else:
+            return ""
+        self.buffer = clean[len(segment) :].strip()
+        return segment
+
+    async def _publish(self, segment: str, *, final: bool = False) -> None:
+        text = _trim_wake_stt_direct_spoken_text(segment)
+        if not text:
+            return
+        remaining = _WAKE_STT_DIRECT_TTS_MAX_CHARS - self.spoken_chars
+        if remaining <= 0:
+            if not self.truncated:
+                text = "I sent the rest to Matrix."
+                self.truncated = True
+            else:
+                return
+        elif len(text) > remaining:
+            text = text[:remaining].rsplit(" ", 1)[0].strip()
+            text = f"{text}. I sent the rest to Matrix."
+            self.truncated = True
+        self.chunk_index += 1
+        self.spoken_chars += len(text)
+        self.results.append(
+            await _publish_wake_stt_direct_tts(
+                assistant_text=text,
+                body=self.body,
+                route="direct_local",
+                interrupt=self.chunk_index == 1,
+                chunk_index=self.chunk_index,
+                chunk_final=final,
+            )
+        )
+
+    async def handle_delta(self, delta: str) -> None:
+        if self.truncated:
+            return
+        self.buffer = f"{self.buffer}{delta}"
+        segment = self._take_segment()
+        if segment:
+            await self._publish(segment, final=False)
+
+    async def flush(self) -> None:
+        segment = self._take_segment(force=True)
+        if segment:
+            await self._publish(segment, final=True)
+
+    def public_result(self) -> dict[str, Any]:
+        ok_results = [item for item in self.results if item.get("ok")]
+        first = ok_results[0] if ok_results else {}
+        last = ok_results[-1] if ok_results else {}
+        return {
+            "ok": bool(ok_results),
+            "status": "streamed" if ok_results else "not_queued",
+            "streamed": True,
+            "chunks": len(self.results),
+            "first_event_id": first.get("event_id", ""),
+            "event_id": last.get("event_id", ""),
+            "first_utterance_id": first.get("utterance_id", ""),
+            "utterance_id": last.get("utterance_id", ""),
+            "truncated_for_speech": self.truncated,
+        }
 
 
 async def _publish_wake_stt_direct_tts(
@@ -1971,12 +2153,16 @@ async def _publish_wake_stt_direct_tts(
     assistant_text: str,
     body: _WakeSttMessageBody,
     route: str,
+    interrupt: bool = True,
+    chunk_index: int = 0,
+    chunk_final: bool = True,
 ) -> dict[str, Any]:
     text = _safe_str(assistant_text).strip()
     if not text:
         return {"ok": False, "skipped": True, "error": "missing assistant text"}
+    utterance_suffix = f"-chunk-{chunk_index}" if chunk_index else ""
     payload = {
-        "utterance_id": f"wake-stt-direct-{uuid.uuid4().hex}",
+        "utterance_id": f"wake-stt-direct-{uuid.uuid4().hex}{utterance_suffix}",
         "source": "hermes-stt",
         "agent_id": "hermes-stt",
         "subagent_id": "wake-stt-direct",
@@ -1984,7 +2170,7 @@ async def _publish_wake_stt_direct_tts(
         "text": text,
         "mode": "stream",
         "format": "wav",
-        "interrupt": True,
+        "interrupt": interrupt,
         "client_id": "hermes-stt:wake-to-talk",
         "target": {
             "kind": "all_listeners",
@@ -2007,6 +2193,9 @@ async def _publish_wake_stt_direct_tts(
             "command": _safe_str(body.command),
             "candidate_revision": _safe_str(body.candidate_revision),
             "interruptible": True,
+            "streamed_from_hermes": bool(chunk_index),
+            "chunk_index": int(chunk_index),
+            "chunk_final": bool(chunk_final),
             "pre_roll": False,
         },
     }
@@ -3365,24 +3554,43 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
     )
     direct_requested = bool(route_readback["requested_direct_enabled"])
     if direct_requested:
+        tts_streamer = _WakeSttDirectTtsStreamer(body)
         delivered = await _deliver_wake_stt_with_direct_fallback(
             room_id=room_id,
             body=body,
             direct_enabled=bool(route_readback["direct_enabled"]),
             diagnostic_enabled=bool(body.direct_diagnostic_enabled),
             await_diagnostic=bool(body.direct_await_diagnostic),
+            assistant_delta_callback=tts_streamer.handle_delta,
         )
         public = delivered.public_dict()
         tts_result: dict[str, Any] = {}
         direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
         assistant_text = _safe_str(direct_result.get("assistant_text"))
         if public.get("route") == "direct_local" and assistant_text:
-            tts_result = await _publish_wake_stt_direct_tts(
-                assistant_text=assistant_text,
-                body=body,
-                route="direct_local",
-            )
+            await tts_streamer.flush()
+            if tts_streamer.published_count:
+                tts_result = tts_streamer.public_result()
+            else:
+                tts_result = await _publish_wake_stt_direct_tts(
+                    assistant_text=_trim_wake_stt_direct_spoken_text(assistant_text),
+                    body=body,
+                    route="direct_local",
+                )
             public["tts"] = tts_result
+            asyncio.create_task(
+                _send_wake_stt_direct_response_report_safely(
+                    room_id=room_id,
+                    assistant_text=assistant_text,
+                    tts_status=_safe_str(tts_result.get("status")),
+                    instance=body.instance,
+                    candidate_source=body.candidate_source,
+                    command=body.command,
+                    wake_word=body.wake_word,
+                    candidate_revision=body.candidate_revision,
+                )
+            )
+            public["assistant_report_scheduled"] = True
         matrix_result = public.get("matrix") if isinstance(public.get("matrix"), dict) else {}
         diagnostic = public.get("diagnostic") if isinstance(public.get("diagnostic"), dict) else {}
         event_id = matrix_result.get("event_id") or diagnostic.get("event_id")

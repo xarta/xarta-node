@@ -70,6 +70,7 @@ class HermesSttConfig:
     profile_env_path: Path = DEFAULT_HERMES_STT_PROFILE_ENV_PATH
     sessions_dir: Path = DEFAULT_HERMES_STT_SESSIONS_DIR
     allow_non_loopback: bool = False
+    stream_chat: bool = False
 
     @property
     def configured(self) -> bool:
@@ -96,6 +97,7 @@ class HermesSttConfig:
             "profile_env_path": str(self.profile_env_path),
             "sessions_dir": str(self.sessions_dir),
             "loopback_ok": self.loopback_ok,
+            "stream_chat": self.stream_chat,
         }
 
 
@@ -158,6 +160,7 @@ class WakeSttDeliveryResult:
 
 
 MatrixDeliverySender = Callable[[str], Awaitable[dict[str, Any]]]
+AssistantDeltaCallback = Callable[[str], Awaitable[None] | None]
 
 
 def _truthy(value: Any) -> bool:
@@ -467,6 +470,18 @@ def load_hermes_stt_config(
         .strip()
         .lower()
         in {"1", "true", "yes", "on"},
+        stream_chat=str(
+            _env_first(
+                env,
+                file_values,
+                "BLUEPRINTS_HERMES_STT_STREAM_CHAT",
+                "HERMES_STT_STREAM_CHAT",
+            )
+            or "true"
+        )
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"},
     )
 
 
@@ -508,6 +523,65 @@ def _chat_completion_payload(gate: CommandCodeGateResult, model: str) -> dict[st
         ],
         "stream": False,
     }
+
+
+async def _maybe_call_assistant_delta(
+    callback: AssistantDeltaCallback | None,
+    delta: str,
+) -> None:
+    if not callback or not delta:
+        return
+    result = callback(delta)
+    if result is not None:
+        await result
+
+
+def _assistant_delta_from_chat_sse_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
+    return str(delta.get("content") or "")
+
+
+async def _stream_chat_completion_text(
+    response: httpx.Response,
+    *,
+    assistant_delta_callback: AssistantDeltaCallback | None = None,
+) -> str:
+    """Read OpenAI-style chat-completions SSE and return accumulated assistant text."""
+    chunks: list[str] = []
+    current_event = "message"
+    async for raw_line in response.aiter_lines():
+        line = str(raw_line or "").strip()
+        if not line:
+            current_event = "message"
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            current_event = line.partition(":")[2].strip() or "message"
+            continue
+        if not line.startswith("data:"):
+            continue
+        if current_event and current_event != "message":
+            continue
+        data = line.partition(":")[2].strip()
+        if data == "[DONE]":
+            break
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        delta = _assistant_delta_from_chat_sse_payload(payload)
+        if not delta:
+            continue
+        chunks.append(delta)
+        await _maybe_call_assistant_delta(assistant_delta_callback, delta)
+    return "".join(chunks).strip()[:8000]
 
 
 def _chat_headers(config: HermesSttConfig) -> dict[str, str]:
@@ -658,6 +732,7 @@ async def submit_wake_stt_to_hermes(
     config: HermesSttConfig | None = None,
     client: httpx.AsyncClient | None = None,
     inspect_context: bool = True,
+    assistant_delta_callback: AssistantDeltaCallback | None = None,
 ) -> HermesSttSubmitResult:
     """Submit one gated Wake STT request to the local hermes-stt API server.
 
@@ -695,18 +770,44 @@ async def submit_wake_stt_to_hermes(
         )
 
     payload = _chat_completion_payload(gate, config.model)
+    if config.stream_chat:
+        payload["stream"] = True
     close_client = client is None
     http_client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
     try:
-        response = await http_client.post(
-            f"{config.api_base}/v1/chat/completions",
-            headers=_chat_headers(config),
-            json=payload,
-        )
-        try:
-            response_json = response.json()
-        except ValueError:
-            response_json = {}
+        response_json: dict[str, Any] = {}
+        if config.stream_chat:
+            async with http_client.stream(
+                "POST",
+                f"{config.api_base}/v1/chat/completions",
+                headers=_chat_headers(config),
+                json=payload,
+            ) as response:
+                if response.is_success:
+                    assistant_text = await _stream_chat_completion_text(
+                        response,
+                        assistant_delta_callback=(
+                            None if gate.authorised else assistant_delta_callback
+                        ),
+                    )
+                else:
+                    await response.aread()
+                    assistant_text = ""
+                http_status = response.status_code
+        else:
+            response = await http_client.post(
+                f"{config.api_base}/v1/chat/completions",
+                headers=_chat_headers(config),
+                json=payload,
+            )
+            try:
+                response_json = response.json()
+            except ValueError:
+                response_json = {}
+            http_status = response.status_code
+            assistant_text = (
+                _assistant_text_from_chat_response(response_json) if response.is_success else ""
+            )
         if not response.is_success:
             return HermesSttSubmitResult(
                 ok=False,
@@ -714,10 +815,9 @@ async def submit_wake_stt_to_hermes(
                 gate=gate,
                 attempted=True,
                 fallback_required=True,
-                http_status=response.status_code,
-                error=f"hermes-stt API returned HTTP {response.status_code}",
+                http_status=http_status,
+                error=f"hermes-stt API returned HTTP {http_status}",
             )
-        assistant_text = _assistant_text_from_chat_response(response_json)
         if not assistant_text:
             return HermesSttSubmitResult(
                 ok=False,
@@ -725,7 +825,7 @@ async def submit_wake_stt_to_hermes(
                 gate=gate,
                 attempted=True,
                 fallback_required=True,
-                http_status=response.status_code,
+                http_status=http_status,
                 error="hermes-stt API response did not include assistant text",
             )
         context_scrub = (
@@ -743,7 +843,7 @@ async def submit_wake_stt_to_hermes(
                 gate=gate,
                 attempted=True,
                 fallback_required=True,
-                http_status=response.status_code,
+                http_status=http_status,
                 assistant_text=assistant_text,
                 context_scrub=context_scrub,
                 error="authorisation phrase could not be scrubbed from hermes-stt session context",
@@ -763,7 +863,7 @@ async def submit_wake_stt_to_hermes(
                 gate=gate,
                 attempted=True,
                 fallback_required=True,
-                http_status=response.status_code,
+                http_status=http_status,
                 assistant_text=assistant_text,
                 context_scrub=context_scrub,
                 context_check=context_check,
@@ -775,7 +875,7 @@ async def submit_wake_stt_to_hermes(
             gate=gate,
             attempted=True,
             fallback_required=False,
-            http_status=response.status_code,
+            http_status=http_status,
             assistant_text=assistant_text,
             context_scrub=context_scrub,
             context_check=context_check,
@@ -819,6 +919,7 @@ async def deliver_wake_stt_with_matrix_fallback(
     diagnostic_enabled: bool = False,
     await_diagnostic: bool = False,
     inspect_context: bool = True,
+    assistant_delta_callback: AssistantDeltaCallback | None = None,
 ) -> WakeSttDeliveryResult:
     """Deliver Wake STT through hermes-stt, falling back to Matrix when needed.
 
@@ -843,6 +944,7 @@ async def deliver_wake_stt_with_matrix_fallback(
             config=config,
             client=client,
             inspect_context=inspect_context,
+            assistant_delta_callback=assistant_delta_callback,
         )
         if direct_result.ok:
             diagnostic: dict[str, Any] | None = None
