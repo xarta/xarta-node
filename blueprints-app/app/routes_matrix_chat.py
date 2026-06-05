@@ -262,6 +262,10 @@ class _WakeSttMessageBody(BaseModel):
     wake_word: str = Field(default="", max_length=160)
     candidate_revision: str = Field(default="", max_length=160)
     hermes_prefix: str | None = Field(default=None, max_length=80)
+    delivery_mode: str | None = Field(default=None, max_length=40)
+    direct_enabled: bool | None = None
+    direct_diagnostic_enabled: bool = False
+    direct_await_diagnostic: bool = False
 
 
 class _RoomSettingsBody(BaseModel):
@@ -3287,6 +3291,37 @@ async def matrix_chat_send_message(room_id: str, body: _SendMessageBody) -> dict
 @router.post("/rooms/{room_id}/wake-stt")
 async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> dict[str, Any]:
     settings = _settings()
+    route_readback = wake_stt_direct.wake_stt_route_readback(
+        instance=body.instance,
+        requested_delivery_mode=body.delivery_mode,
+        requested_direct_enabled=body.direct_enabled,
+    )
+    direct_requested = bool(route_readback["requested_direct_enabled"])
+    if direct_requested:
+        delivered = await _deliver_wake_stt_with_direct_fallback(
+            room_id=room_id,
+            body=body,
+            direct_enabled=bool(route_readback["direct_enabled"]),
+            diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+            await_diagnostic=bool(body.direct_await_diagnostic),
+        )
+        public = delivered.public_dict()
+        matrix_result = public.get("matrix") if isinstance(public.get("matrix"), dict) else {}
+        diagnostic = public.get("diagnostic") if isinstance(public.get("diagnostic"), dict) else {}
+        event_id = matrix_result.get("event_id") or diagnostic.get("event_id")
+        return {
+            "room_id": matrix_result.get("room_id") or diagnostic.get("room_id") or room_id,
+            "event_id": event_id,
+            "body": matrix_result.get("body") or diagnostic.get("body"),
+            "server_id": settings["server_id"],
+            "xarta_source": matrix_result.get("xarta_source") or diagnostic.get("xarta_source"),
+            "xarta_capture_mode": "wake_to_talk",
+            "delivery": {
+                **public,
+                "readback": route_readback,
+            },
+        }
+
     sent = await _send_wake_stt_transcript_message(
         room_id=room_id,
         server_id=settings["server_id"],
