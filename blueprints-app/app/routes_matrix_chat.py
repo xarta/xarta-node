@@ -1966,6 +1966,73 @@ async def _deliver_wake_stt_with_direct_fallback(
     )
 
 
+async def _publish_wake_stt_direct_tts(
+    *,
+    assistant_text: str,
+    body: _WakeSttMessageBody,
+    route: str,
+) -> dict[str, Any]:
+    text = _safe_str(assistant_text).strip()
+    if not text:
+        return {"ok": False, "skipped": True, "error": "missing assistant text"}
+    payload = {
+        "utterance_id": f"wake-stt-direct-{uuid.uuid4().hex}",
+        "source": "hermes-stt",
+        "agent_id": "hermes-stt",
+        "subagent_id": "wake-stt-direct",
+        "conversation_id": f"wake-stt:{_safe_str(body.instance) or 'local'}",
+        "text": text,
+        "mode": "stream",
+        "format": "wav",
+        "interrupt": True,
+        "client_id": "hermes-stt:wake-to-talk",
+        "target": {
+            "kind": "all_listeners",
+            "dedupe": "one_webpage_per_client_ip_plus_phone",
+        },
+        "sanitize_text": True,
+        "transform_profile": "conversation",
+        "allow_llm_sanitizer": False,
+        "timeout_ms": 120000,
+        "allow_fallback": True,
+        "metadata": {
+            "schema": "xarta.wake-stt.direct-response.v1",
+            "purpose": "wake_stt_direct_response",
+            "hermes_instance": "hermes-stt",
+            "origin_platform": "direct_api",
+            "capture_mode": "wake_to_talk",
+            "route": route,
+            "wake_instance": _safe_str(body.instance) or "local",
+            "candidate_source": _safe_str(body.candidate_source),
+            "command": _safe_str(body.command),
+            "candidate_revision": _safe_str(body.candidate_revision),
+            "interruptible": True,
+            "pre_roll": False,
+        },
+    }
+    try:
+        published = await _publish_tts_utterance_payload(payload)
+    except Exception as exc:  # pragma: no cover - exact TTS failures vary by runtime.
+        log.warning("wake_stt_direct_tts_publish_failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:240]}
+    event = published.get("event") if isinstance(published, dict) else {}
+    payload = published.get("payload") if isinstance(published, dict) else {}
+    return {
+        "ok": bool(published.get("ok")) if isinstance(published, dict) else False,
+        "event_id": event.get("event_id") if isinstance(event, dict) else "",
+        "utterance_id": payload.get("utterance_id") if isinstance(payload, dict) else "",
+        "source": payload.get("source") if isinstance(payload, dict) else "hermes-stt",
+        "agent_id": payload.get("agent_id") if isinstance(payload, dict) else "hermes-stt",
+        "status": "queued" if isinstance(published, dict) and published.get("ok") else "error",
+    }
+
+
+async def _publish_tts_utterance_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    from .routes_tts import UtteranceRequest, tts_create_utterance
+
+    return await tts_create_utterance(UtteranceRequest(**payload))
+
+
 def _safe_media_filename(filename: str | None, default: str = "voice-message.webm") -> str:
     raw = Path(filename or "").name.strip()
     clean = re.sub(r"[^0-9A-Za-z._ -]+", "_", raw).strip(" .")
@@ -3306,6 +3373,16 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             await_diagnostic=bool(body.direct_await_diagnostic),
         )
         public = delivered.public_dict()
+        tts_result: dict[str, Any] = {}
+        direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
+        assistant_text = _safe_str(direct_result.get("assistant_text"))
+        if public.get("route") == "direct_local" and assistant_text:
+            tts_result = await _publish_wake_stt_direct_tts(
+                assistant_text=assistant_text,
+                body=body,
+                route="direct_local",
+            )
+            public["tts"] = tts_result
         matrix_result = public.get("matrix") if isinstance(public.get("matrix"), dict) else {}
         diagnostic = public.get("diagnostic") if isinstance(public.get("diagnostic"), dict) else {}
         event_id = matrix_result.get("event_id") or diagnostic.get("event_id")

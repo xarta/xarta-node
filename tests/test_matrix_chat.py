@@ -491,6 +491,76 @@ def test_matrix_chat_direct_wrapper_posts_redacted_diagnostic_on_success(monkeyp
     assert captured["content"]["xarta_source"] == "wake_stt_direct_observation"
 
 
+def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
+    captured = {}
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text="I am okay.",
+            ),
+        )
+
+    async def fake_publish_tts_payload(payload):
+        captured["text"] = payload["text"]
+        captured["source"] = payload["source"]
+        captured["agent_id"] = payload["agent_id"]
+        captured["metadata"] = payload["metadata"]
+        captured["interrupt"] = payload["interrupt"]
+        return {
+            "ok": True,
+            "event": {"event_id": "tts-wake-direct"},
+            "payload": {
+                "utterance_id": payload["utterance_id"],
+                "source": payload["source"],
+                "agent_id": payload["agent_id"],
+            },
+        }
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="Are you okay?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-tts",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["delivery"]["route"] == "direct_local"
+    assert result["delivery"]["direct"]["assistant_text"] == "I am okay."
+    assert result["delivery"]["tts"]["ok"] is True
+    assert result["delivery"]["tts"]["event_id"] == "tts-wake-direct"
+    assert captured["text"] == "I am okay."
+    assert captured["source"] == "hermes-stt"
+    assert captured["agent_id"] == "hermes-stt"
+    assert captured["interrupt"] is True
+    assert captured["metadata"]["schema"] == "xarta.wake-stt.direct-response.v1"
+    assert "api_server_key" not in str(captured).lower()
+    assert "secret" not in str(captured).lower()
+
+
 def test_matrix_chat_wake_stt_route_rolls_direct_request_back_to_matrix(monkeypatch):
     captured = {}
 

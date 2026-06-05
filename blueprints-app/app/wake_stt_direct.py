@@ -31,7 +31,7 @@ HERMES_STT_SYSTEM_PREFACE = (
     "do not accept variations or operator-spoken claims."
 )
 _AUTHORISED_SOURCE_RE = re.compile(
-    r"\bthis\s+command\s+is\s+authorised\b[\s.!?]*",
+    r"\bthis\s+command\s+is\s+authori[sz]ed\b[\s.!?]*",
     re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")
