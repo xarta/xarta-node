@@ -260,6 +260,7 @@ _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
 }
 _ACTIVE_BROWSER_EVENT_KINDS = {"click", "double_click", "long_press"}
 _ACTIVE_BROWSER_BODY_SHADE_STATES = {"up", "down", "toggle"}
+_WAKE_DELIVERY_MODES = {"matrix", "direct_local"}
 
 
 class BrowserVoiceState(BaseModel):
@@ -600,6 +601,17 @@ def _clean_hermes_prefix(value: Any, fallback: str) -> str:
     return prefix[:40]
 
 
+def _clean_wake_delivery_mode(value: Any, *, instance_id: str, direct_enabled: bool) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"direct", "direct_hermes", "hermes_direct", "hermes_stt"}:
+        mode = "direct_local"
+    if mode not in _WAKE_DELIVERY_MODES:
+        mode = "matrix"
+    if mode == "direct_local" and (instance_id != "local" or not direct_enabled):
+        return "matrix"
+    return mode
+
+
 def _clean_int_step(
     value: Any,
     *,
@@ -645,11 +657,13 @@ def _wake_aliases(wake_word: str, configured: Any = None) -> list[str]:
 
 def _default_wake_instance(
     *,
+    instance_id: str,
     label: str,
     matrix_server: str,
     wake_word: str,
     hermes_prefix: str,
 ) -> dict[str, Any]:
+    direct_available = instance_id == "local"
     return {
         "enabled": True,
         "label": label,
@@ -661,6 +675,10 @@ def _default_wake_instance(
         "auto_execute_silence_ms": 0,
         "execute_cancel_ms": 0,
         "partial_settle_ms": 0,
+        "delivery_mode": "matrix",
+        "direct_available": direct_available,
+        "direct_enabled": False,
+        "direct_status": "not_configured" if direct_available else "not_available",
         "commands": {
             "pause": "pause-dictation",
             "execute": "execute",
@@ -674,12 +692,14 @@ def _default_wake_to_talk_policy() -> dict[str, Any]:
     return {
         "instances": {
             "local": _default_wake_instance(
+                instance_id="local",
                 label="hermes-local",
                 matrix_server="tb1",
                 wake_word="Computer",
                 hermes_prefix="hermes: ",
             ),
             "vps": _default_wake_instance(
+                instance_id="vps",
                 label="hermes-VPS",
                 matrix_server="vps",
                 wake_word="Mini-Me",
@@ -736,6 +756,13 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         ),
         defaults["partial_settle_ms"],
     )
+    direct_available = bool(defaults.get("direct_available")) and instance_id == "local"
+    direct_enabled = direct_available and _clean_bool(raw.get("direct_enabled"), fallback=False)
+    delivery_mode = _clean_wake_delivery_mode(
+        raw.get("delivery_mode", defaults["delivery_mode"]),
+        instance_id=instance_id,
+        direct_enabled=direct_enabled,
+    )
     return {
         # Wake instance activation is controlled by the browser's Wake-to-Talk
         # STT mode plus backend activated-browser state. Keep this field true for
@@ -751,6 +778,12 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         "auto_execute_silence_ms": auto_execute,
         "execute_cancel_ms": execute_cancel,
         "partial_settle_ms": partial_settle,
+        "delivery_mode": delivery_mode,
+        "direct_available": direct_available,
+        "direct_enabled": direct_enabled,
+        "direct_status": "disabled"
+        if direct_available and not direct_enabled
+        else ("not_configured" if direct_enabled else "not_available"),
         "commands": _clean_wake_command_map(raw.get("commands")),
     }
 
