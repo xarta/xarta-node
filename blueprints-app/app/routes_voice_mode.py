@@ -1816,6 +1816,27 @@ def _clean_active_browser_selector_capability(item: Any) -> dict[str, Any] | Non
 
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
+    last_command_raw = (
+        automation.get("last_command") if isinstance(automation.get("last_command"), dict) else {}
+    )
+    last_command = {
+        "command_id": _clean_active_browser_command_id(last_command_raw.get("command_id")),
+        "action": _clean_active_browser_command_action(last_command_raw.get("action")),
+        "modal_id": _clean_active_browser_modal_id(last_command_raw.get("modal_id")),
+        "group": _clean_active_browser_group(last_command_raw.get("group")),
+        "page_id": _clean_active_browser_page_id(last_command_raw.get("page_id")),
+        "fn": _clean_active_browser_fn_key(last_command_raw.get("fn")),
+        "ok": bool(last_command_raw.get("ok")),
+        "error": _clean_string(last_command_raw.get("error"), "", 180),
+        "recorded_at_ms": _clean_browser_page_int(
+            last_command_raw.get("recorded_at_ms"), maximum=9999999999999
+        ),
+    }
+    if not any(
+        last_command.get(key)
+        for key in ("command_id", "action", "modal_id", "group", "page_id", "fn", "error")
+    ):
+        last_command = {}
     menus = [
         clean
         for clean in (
@@ -1845,6 +1866,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         "menus": menus,
         "current_menu": current_menu,
         "selector_actions": selector_actions,
+        "last_command": last_command,
     }
 
 
@@ -1875,6 +1897,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
                 "id": modal_id,
                 "label": _clean_string(modal.get("label"), "", 120),
                 "open": bool(modal.get("open")),
+                "native_open": bool(modal.get("native_open")),
+                "modal": bool(modal.get("modal")),
+                "visible": bool(modal.get("visible")),
             }
         )
         if len(modals) >= 24:
