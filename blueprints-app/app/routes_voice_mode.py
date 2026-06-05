@@ -18,6 +18,7 @@ from fastapi import APIRouter, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from . import wake_stt_direct
 from .db import get_conn, get_setting
 from .events import AppEvent
 from .routes_events import publish_event
@@ -756,13 +757,16 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         ),
         defaults["partial_settle_ms"],
     )
-    direct_available = bool(defaults.get("direct_available")) and instance_id == "local"
-    direct_enabled = direct_available and _clean_bool(raw.get("direct_enabled"), fallback=False)
-    delivery_mode = _clean_wake_delivery_mode(
-        raw.get("delivery_mode", defaults["delivery_mode"]),
-        instance_id=instance_id,
-        direct_enabled=direct_enabled,
+    route_readback = wake_stt_direct.wake_stt_route_readback(
+        instance=instance_id,
+        requested_delivery_mode=raw.get("delivery_mode", defaults["delivery_mode"]),
+        requested_direct_enabled=raw.get("direct_enabled"),
     )
+    direct_available = bool(defaults.get("direct_available")) and bool(
+        route_readback["direct_available"]
+    )
+    direct_enabled = bool(direct_available and route_readback["direct_enabled"])
+    delivery_mode = route_readback["delivery_mode"]
     return {
         # Wake instance activation is controlled by the browser's Wake-to-Talk
         # STT mode plus backend activated-browser state. Keep this field true for
@@ -781,9 +785,11 @@ def _clean_wake_instance(instance_id: str, value: Any) -> dict[str, Any]:
         "delivery_mode": delivery_mode,
         "direct_available": direct_available,
         "direct_enabled": direct_enabled,
-        "direct_status": "disabled"
-        if direct_available and not direct_enabled
-        else ("not_configured" if direct_enabled else "not_available"),
+        "direct_status": route_readback["direct_status"] if direct_available else "not_available",
+        "direct_route_enabled": route_readback["direct_route_enabled"],
+        "direct_requested": route_readback["requested_direct_enabled"],
+        "direct_rollback_applied": route_readback["rollback_applied"],
+        "direct_rollback_reason": route_readback["rollback_reason"],
         "commands": _clean_wake_command_map(raw.get("commands")),
     }
 

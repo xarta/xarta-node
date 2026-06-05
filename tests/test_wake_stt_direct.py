@@ -110,6 +110,36 @@ def test_hermes_stt_config_rejects_non_loopback_by_default():
     assert config.loopback_ok is False
 
 
+def test_wake_stt_route_readback_rolls_back_direct_by_default():
+    readback = wake_stt_direct.wake_stt_route_readback(
+        instance="local",
+        requested_delivery_mode="direct-hermes",
+        requested_direct_enabled=True,
+        environ={},
+    )
+
+    assert readback["delivery_mode"] == "matrix"
+    assert readback["direct_available"] is True
+    assert readback["direct_enabled"] is False
+    assert readback["direct_route_enabled"] is False
+    assert readback["rollback_applied"] is True
+    assert readback["rollback_reason"] == "direct_route_disabled"
+
+
+def test_wake_stt_route_readback_allows_local_direct_only_when_enabled():
+    readback = wake_stt_direct.wake_stt_route_readback(
+        instance="local",
+        requested_delivery_mode="direct-hermes",
+        requested_direct_enabled=True,
+        environ={"BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED": "1"},
+    )
+
+    assert readback["delivery_mode"] == "direct_local"
+    assert readback["direct_enabled"] is True
+    assert readback["direct_status"] == "enabled"
+    assert readback["rollback_applied"] is False
+
+
 def test_command_codes_from_env_accepts_bounded_json():
     codes = wake_stt_direct.command_codes_from_env(
         {
@@ -255,7 +285,7 @@ def test_submit_wake_stt_to_hermes_requires_matrix_fallback_on_api_error(tmp_pat
     assert "authorised" not in public["diagnostic_text"].lower()
 
 
-def test_submit_wake_stt_to_hermes_fails_if_authorisation_phrase_persists(tmp_path):
+def test_submit_wake_stt_to_hermes_scrubs_authorisation_phrase_after_response(tmp_path):
     sessions = tmp_path / "sessions"
     sessions.mkdir()
     (sessions / "session_wake-stt-local.json").write_text(
@@ -288,11 +318,15 @@ def test_submit_wake_stt_to_hermes_fails_if_authorisation_phrase_persists(tmp_pa
     result = asyncio.run(run_submit())
 
     public = result.public_dict()
-    assert result.ok is False
-    assert result.status == "context_phrase_present"
-    assert result.fallback_required is True
-    assert public["context_check"]["hit_count"] == 1
+    assert result.ok is True
+    assert result.status == "delivered"
+    assert result.fallback_required is False
+    assert public["context_scrub"]["scrubbed_count"] == 1
+    assert public["context_check"]["hit_count"] == 0
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public["context_check"]["hits"])
+    assert wake_stt_direct.AUTHORISED_PHRASE not in (
+        sessions / "session_wake-stt-local.json"
+    ).read_text(encoding="utf-8")
 
 
 def test_deliver_wake_stt_matrix_fallback_strips_codes_and_authorisation():

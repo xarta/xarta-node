@@ -491,6 +491,50 @@ def test_matrix_chat_direct_wrapper_posts_redacted_diagnostic_on_success(monkeyp
     assert captured["content"]["xarta_source"] == "wake_stt_direct_observation"
 
 
+def test_matrix_chat_wake_stt_route_rolls_direct_request_back_to_matrix(monkeypatch):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$route-rollback"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", raising=False)
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"route","aliases":["route seven"]}]}',
+    )
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="route seven This command is authorised. Please check status.",
+                instance="local",
+                candidate_source="payload2",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-route",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["event_id"] == "$route-rollback"
+    assert result["delivery"]["route"] == "matrix"
+    assert result["delivery"]["readback"]["rollback_reason"] == "direct_route_disabled"
+    assert captured["content"]["body"].startswith("hermes: ")
+    assert "Please check status." in captured["content"]["body"]
+    assert "route seven" not in captured["content"]["body"].lower()
+    assert "authorised" not in captured["content"]["body"].lower()
+
+
 def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
     content = matrix_chat._audio_message_content(
         content_uri="mxc://example.org/audio123",

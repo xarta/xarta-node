@@ -45,6 +45,8 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert local["delivery_mode"] == "matrix"
     assert local["direct_available"] is True
     assert local["direct_enabled"] is False
+    assert local["direct_route_enabled"] is False
+    assert local["direct_rollback_applied"] is False
     assert local["commands"]["execute"] == "execute"
     assert local["commands"]["pause"] == "pause-dictation"
     assert local["hermes_prefix"] == "hermes: "
@@ -62,7 +64,9 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert "minime" in vps["wake_aliases"]
 
 
-def test_voice_mode_wake_direct_delivery_is_default_off_and_local_only():
+def test_voice_mode_wake_direct_delivery_rolls_back_until_route_enabled(monkeypatch):
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", raising=False)
+
     policy = voice_mode._clean_wake_to_talk_policy(
         {
             "instances": {
@@ -79,16 +83,43 @@ def test_voice_mode_wake_direct_delivery_is_default_off_and_local_only():
     )
 
     local = policy["instances"]["local"]
-    assert local["delivery_mode"] == "direct_local"
+    assert local["delivery_mode"] == "matrix"
     assert local["direct_available"] is True
-    assert local["direct_enabled"] is True
-    assert local["direct_status"] == "not_configured"
+    assert local["direct_enabled"] is False
+    assert local["direct_requested"] is True
+    assert local["direct_status"] == "rollback_disabled"
+    assert local["direct_rollback_applied"] is True
+    assert local["direct_rollback_reason"] == "direct_route_disabled"
 
     vps = policy["instances"]["vps"]
     assert vps["delivery_mode"] == "matrix"
     assert vps["direct_available"] is False
     assert vps["direct_enabled"] is False
     assert vps["direct_status"] == "not_available"
+    assert vps["direct_rollback_reason"] == "direct_not_available"
+
+
+def test_voice_mode_wake_direct_delivery_can_survive_when_route_enabled(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "true")
+
+    policy = voice_mode._clean_wake_to_talk_policy(
+        {
+            "instances": {
+                "local": {
+                    "delivery_mode": "direct-hermes",
+                    "direct_enabled": True,
+                },
+            }
+        }
+    )
+
+    local = policy["instances"]["local"]
+    assert local["delivery_mode"] == "direct_local"
+    assert local["direct_available"] is True
+    assert local["direct_enabled"] is True
+    assert local["direct_status"] == "enabled"
+    assert local["direct_route_enabled"] is True
+    assert local["direct_rollback_applied"] is False
 
 
 def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():

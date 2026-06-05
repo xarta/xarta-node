@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -21,6 +22,8 @@ DEFAULT_HERMES_STT_SESSIONS_DIR = Path(
     "/xarta-node/.lone-wolf/stacks/hermes-local/data/profiles/hermes-stt/sessions"
 )
 DEFAULT_HERMES_STT_SESSION_ID = "wake-stt-local"
+DIRECT_ROUTE_ENABLED_ENV = "BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED"
+WAKE_DELIVERY_MODES = {"matrix", "direct_local"}
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -106,6 +109,7 @@ class HermesSttSubmitResult:
     http_status: int | None = None
     assistant_text: str = ""
     error: str = ""
+    context_scrub: dict[str, Any] | None = None
     context_check: dict[str, Any] | None = None
 
     def public_dict(self) -> dict[str, Any]:
@@ -120,6 +124,7 @@ class HermesSttSubmitResult:
             "diagnostic_text": self.gate.meat,
             "assistant_text": self.assistant_text,
             "error": self.error,
+            "context_scrub": self.context_scrub or {},
             "context_check": self.context_check or {},
         }
 
@@ -153,6 +158,67 @@ class WakeSttDeliveryResult:
 
 
 MatrixDeliverySender = Callable[[str], Awaitable[dict[str, Any]]]
+
+
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clean_delivery_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"direct", "direct_hermes", "hermes_direct", "hermes_stt"}:
+        mode = "direct_local"
+    return mode if mode in WAKE_DELIVERY_MODES else "matrix"
+
+
+def direct_route_rollout_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Return whether the browser-facing direct Wake route may be applied.
+
+    This is deliberately default-off while live gates are being proven. Private
+    helpers can still exercise the server-side connector directly without
+    exposing the Hermes API key or enabling the Wake UI route.
+    """
+    env = os.environ if environ is None else environ
+    return _truthy(env.get(DIRECT_ROUTE_ENABLED_ENV))
+
+
+def wake_stt_route_readback(
+    *,
+    instance: str,
+    requested_delivery_mode: Any = None,
+    requested_direct_enabled: Any = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve a Wake route request into public readback plus rollback state."""
+    clean_instance = str(instance or "local").strip().lower()
+    direct_available = clean_instance == "local"
+    requested_mode = _clean_delivery_mode(requested_delivery_mode)
+    direct_requested = requested_mode == "direct_local" or _truthy(requested_direct_enabled)
+    rollout_enabled = direct_route_rollout_enabled(environ)
+    direct_enabled = bool(direct_available and direct_requested and rollout_enabled)
+    rollback_reason = ""
+    if direct_requested and not direct_available:
+        rollback_reason = "direct_not_available"
+    elif direct_requested and not rollout_enabled:
+        rollback_reason = "direct_route_disabled"
+    delivery_mode = "direct_local" if direct_enabled else "matrix"
+    if direct_enabled:
+        direct_status = "enabled"
+    elif direct_available:
+        direct_status = "rollback_disabled" if rollback_reason else "disabled"
+    else:
+        direct_status = "not_available"
+    return {
+        "requested_delivery_mode": requested_mode,
+        "requested_direct_enabled": direct_requested,
+        "delivery_mode": delivery_mode,
+        "direct_available": direct_available,
+        "direct_enabled": direct_enabled,
+        "direct_route_enabled": rollout_enabled,
+        "direct_status": direct_status,
+        "rollback_applied": bool(rollback_reason),
+        "rollback_reason": rollback_reason,
+    }
 
 
 def _clean_code_id(value: Any) -> str:
@@ -515,6 +581,76 @@ def inspect_hermes_stt_session_phrase_absence(
     }
 
 
+def scrub_hermes_stt_session_phrase(
+    *,
+    sessions_dir: Path = DEFAULT_HERMES_STT_SESSIONS_DIR,
+    session_id: str = DEFAULT_HERMES_STT_SESSION_ID,
+    phrase: str = AUTHORISED_PHRASE,
+    replacement: str = "[authorisation marker removed]",
+    max_bytes_per_file: int = 2_000_000,
+) -> dict[str, Any]:
+    """Remove the exact authorisation phrase from the exact session file."""
+    clean_phrase = str(phrase or "").strip()
+    files = _candidate_session_files(sessions_dir, session_id=session_id, max_files=1)
+    if not clean_phrase or not files:
+        return {
+            "ok": True,
+            "scrubbed_count": 0,
+            "scanned_files": len(files),
+            "session_id": session_id,
+        }
+    path = files[0]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return {
+            "ok": False,
+            "scrubbed_count": 0,
+            "scanned_files": 1,
+            "session_id": session_id,
+            "error": str(exc)[:240],
+        }
+    if len(raw) > max_bytes_per_file:
+        return {
+            "ok": False,
+            "scrubbed_count": 0,
+            "scanned_files": 1,
+            "session_id": session_id,
+            "error": "session file is too large to scrub safely",
+        }
+    text = raw.decode("utf-8", errors="ignore")
+    count = text.count(clean_phrase)
+    if not count:
+        return {
+            "ok": True,
+            "scrubbed_count": 0,
+            "scanned_files": 1,
+            "session_id": session_id,
+        }
+    updated = text.replace(clean_phrase, replacement)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        temp_path.write_text(updated, encoding="utf-8")
+        temp_path.replace(path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+        return {
+            "ok": False,
+            "scrubbed_count": 0,
+            "scanned_files": 1,
+            "session_id": session_id,
+            "error": str(exc)[:240],
+        }
+    return {
+        "ok": True,
+        "scrubbed_count": count,
+        "scanned_files": 1,
+        "session_id": session_id,
+        "path": str(path),
+    }
+
+
 async def submit_wake_stt_to_hermes(
     text: str,
     *,
@@ -592,6 +728,26 @@ async def submit_wake_stt_to_hermes(
                 http_status=response.status_code,
                 error="hermes-stt API response did not include assistant text",
             )
+        context_scrub = (
+            scrub_hermes_stt_session_phrase(
+                sessions_dir=config.sessions_dir,
+                session_id=config.session_id,
+            )
+            if gate.authorised
+            else {"ok": True, "skipped": True}
+        )
+        if not context_scrub.get("ok", False):
+            return HermesSttSubmitResult(
+                ok=False,
+                status="context_scrub_failed",
+                gate=gate,
+                attempted=True,
+                fallback_required=True,
+                http_status=response.status_code,
+                assistant_text=assistant_text,
+                context_scrub=context_scrub,
+                error="authorisation phrase could not be scrubbed from hermes-stt session context",
+            )
         context_check = (
             inspect_hermes_stt_session_phrase_absence(
                 sessions_dir=config.sessions_dir,
@@ -609,6 +765,7 @@ async def submit_wake_stt_to_hermes(
                 fallback_required=True,
                 http_status=response.status_code,
                 assistant_text=assistant_text,
+                context_scrub=context_scrub,
                 context_check=context_check,
                 error="authorisation phrase was found in hermes-stt session context",
             )
@@ -620,6 +777,7 @@ async def submit_wake_stt_to_hermes(
             fallback_required=False,
             http_status=response.status_code,
             assistant_text=assistant_text,
+            context_scrub=context_scrub,
             context_check=context_check,
         )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
