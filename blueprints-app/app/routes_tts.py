@@ -134,6 +134,9 @@ class UtteranceRequest(BaseModel):
     volume_gain: float | None = None
     timeout_ms: int | None = None
     allow_fallback: bool | None = None
+    priority: int | None = None
+    queue_policy: str | None = None
+    stale_after_ms: int | None = None
     created_at: float | None = None
     metadata: dict[str, Any] | None = None
 
@@ -252,6 +255,29 @@ def _safe_event_id(prefix: str, value: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value.strip())
     safe = safe.strip("-._") or uuid.uuid4().hex
     return f"{prefix}{safe}"[:160]
+
+
+def _utterance_priority(source: str, agent_id: str, explicit: int | None) -> int:
+    if explicit is not None:
+        try:
+            return max(0, min(100, int(explicit)))
+        except Exception:
+            return 0
+    identifiers = {source.strip().lower(), agent_id.strip().lower()}
+    if "hermes-stt" in identifiers:
+        return 100
+    if any(value.startswith("hermes") for value in identifiers if value):
+        return 90
+    return 0
+
+
+def _utterance_queue_policy(source: str, agent_id: str, explicit: str | None) -> str:
+    raw = (explicit or "").strip().lower().replace("-", "_")
+    allowed = {"normal", "hermes_priority_stream"}
+    if raw in allowed:
+        return raw
+    priority = _utterance_priority(source, agent_id, None)
+    return "hermes_priority_stream" if priority >= 90 else "normal"
 
 
 def _fallback_response(
@@ -603,6 +629,8 @@ async def tts_create_utterance(body: UtteranceRequest):
     settings, missing = _resolve_settings()
     shared_playback_volume = None if missing else _shared_tts_playback_volume(settings)
     shared_volume_gain = None if missing else _shared_tts_volume_gain(settings)
+    priority = _utterance_priority(source, agent_id, body.priority)
+    queue_policy = _utterance_queue_policy(source, agent_id, body.queue_policy)
 
     payload: dict[str, Any] = {
         "utterance_id": utterance_id,
@@ -623,6 +651,13 @@ async def tts_create_utterance(body: UtteranceRequest):
         "volume_gain": body.volume_gain if body.volume_gain is not None else shared_volume_gain,
         "timeout_ms": body.timeout_ms,
         "allow_fallback": body.allow_fallback,
+        "priority": priority,
+        "queue_policy": queue_policy,
+        "stale_after_ms": (
+            max(1000, min(600000, int(body.stale_after_ms)))
+            if body.stale_after_ms is not None
+            else None
+        ),
         "created_at": created_at,
         "metadata": body.metadata or {},
         "target": {

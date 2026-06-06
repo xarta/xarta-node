@@ -2160,6 +2160,9 @@ async def _publish_wake_stt_direct_tts(
         "allow_llm_sanitizer": False,
         "timeout_ms": 120000,
         "allow_fallback": True,
+        "priority": 100,
+        "queue_policy": "hermes_priority_stream",
+        "stale_after_ms": 180000,
         "metadata": {
             "schema": "xarta.wake-stt.direct-response.v1",
             "purpose": "wake_stt_direct_pre_roll" if pre_roll else "wake_stt_direct_response",
@@ -2172,6 +2175,8 @@ async def _publish_wake_stt_direct_tts(
             "command": _safe_str(body.command),
             "candidate_revision": _safe_str(body.candidate_revision),
             "interruptible": True,
+            "tts_queue_policy": "hermes_priority_stream",
+            "tts_priority": 100,
             "speech_elected_by": "blueprints_transport_ack" if pre_roll else "hermes-stt",
             "pre_roll": bool(pre_roll),
         },
