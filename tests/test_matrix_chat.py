@@ -755,6 +755,8 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     assert captured["interrupt"] is True
     assert captured["metadata"]["schema"] == "xarta.wake-stt.direct-response.v1"
     assert captured["metadata"]["speech_elected_by"] == "hermes-stt"
+    assert captured["metadata"]["tts_queue_policy"] == "hermes_priority_stream"
+    assert captured["metadata"]["tts_priority"] == 100
     assert captured["report"]["matrix_detail"] == "I am okay in detail."
     assert result["delivery"]["assistant_report_scheduled"] is True
     assert result["delivery"]["tts_elected_by_hermes"] is True
@@ -846,8 +848,12 @@ def test_matrix_chat_wake_stt_direct_route_pre_rolls_then_speaks_final(monkeypat
     assert published[0]["interrupt"] is True
     assert published[0]["metadata"]["pre_roll"] is True
     assert published[0]["metadata"]["speech_elected_by"] == "blueprints_transport_ack"
+    assert published[0]["priority"] == 100
+    assert published[0]["queue_policy"] == "hermes_priority_stream"
     assert published[1]["metadata"]["pre_roll"] is False
     assert published[1]["metadata"]["speech_elected_by"] == "hermes-stt"
+    assert published[1]["priority"] == 100
+    assert published[1]["queue_policy"] == "hermes_priority_stream"
 
 
 def test_matrix_chat_wake_stt_direct_route_speaks_short_unstructured_response(monkeypatch):

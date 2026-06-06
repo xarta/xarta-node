@@ -99,6 +99,8 @@ def test_tts_utterance_event_preserves_volume_gain(monkeypatch):
 
     assert response["payload"]["volume"] == 0.85
     assert response["payload"]["volume_gain"] == 1.5
+    assert response["payload"]["priority"] == 90
+    assert response["payload"]["queue_policy"] == "hermes_priority_stream"
     assert response["event"]["payload"]["volume_gain"] == 1.5
 
 
@@ -141,7 +143,53 @@ def test_tts_utterance_event_defaults_volume_gain_from_shared_volume(monkeypatch
 
     assert response["payload"]["volume"] == 1.0
     assert response["payload"]["volume_gain"] == 1.5
+    assert response["payload"]["priority"] == 0
+    assert response["payload"]["queue_policy"] == "normal"
     assert response["event"]["payload"]["volume_gain"] == 1.5
+
+
+def test_tts_utterance_event_preserves_explicit_queue_policy(monkeypatch):
+    class PublishedEvent:
+        def __init__(self, event):
+            self.event = event
+
+        def model_dump(self):
+            return {
+                "event_id": self.event.event_id,
+                "event_type": self.event.event_type,
+                "severity": self.event.severity,
+                "title": self.event.title,
+                "message": self.event.message,
+                "source": self.event.source,
+                "created_at": self.event.created_at,
+                "payload": self.event.payload,
+            }
+
+    async def fake_publish(event):
+        return PublishedEvent(event)
+
+    monkeypatch.setattr(routes_tts, "publish_event", fake_publish)
+    monkeypatch.setattr(routes_tts, "_resolve_settings", lambda: (_tts_settings(), []))
+
+    async def run():
+        return await routes_tts.tts_create_utterance(
+            routes_tts.UtteranceRequest(
+                utterance_id="queue-policy-test",
+                source="hermes-stt",
+                agent_id="hermes-stt",
+                text="Priority queue event test.",
+                priority=100,
+                queue_policy="hermes_priority_stream",
+                stale_after_ms=180000,
+            )
+        )
+
+    response = asyncio.run(run())
+
+    assert response["payload"]["priority"] == 100
+    assert response["payload"]["queue_policy"] == "hermes_priority_stream"
+    assert response["payload"]["stale_after_ms"] == 180000
+    assert response["event"]["payload"]["priority"] == 100
 
 
 def test_tts_speak_forwards_volume_gain_to_pockettts(monkeypatch):
@@ -291,3 +339,19 @@ def test_browser_hermes_tts_path_forwards_volume_gain():
     assert "volume_gain:" in client
     assert "opts.volumeGain" in client
     assert "getTtsVolumeGain()" in client
+
+
+def test_browser_hermes_tts_priority_queue_control_contract():
+    workspace = Path("/xarta-node")
+    announcer = (workspace / "gui-fallback/js/model-change-announcer.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "_isHermesPriorityUtterance" in announcer
+    assert "hermes_priority_stream" in announcer
+    assert "_pauseNormalQueueForPriority" in announcer
+    assert "_resumeNormalQueueAfterPriority" in announcer
+    assert "_queueInterruptedItemForResume" in announcer
+    assert "blueprints:notification-speech-skipped" in announcer
+    assert "normal_queue_paused" in announcer
+    assert "priority_queue_length" in announcer
