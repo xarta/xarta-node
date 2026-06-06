@@ -13,6 +13,7 @@ import contextvars
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -270,15 +271,159 @@ class _WakeSttMessageBody(BaseModel):
     address_hermes: bool = True
 
 
-def _wake_stt_direct_pre_roll_delay_seconds() -> float:
-    raw = os.getenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "3000")
+_DEFAULT_WAKE_STT_PRE_ROLL_CONFIG_FILE = (
+    "/xarta-node/.lone-wolf/config/hermes-stt/wake-stt-pre-roll.json"
+)
+_DEFAULT_WAKE_STT_PRE_ROLL_DELAY_MS = 3000
+_DEFAULT_WAKE_STT_PRE_ROLL_UTTERANCES = ("I heard you.",)
+_DEFAULT_WAKE_STT_PRE_ROLL_SPECIAL_UTTERANCES = {
+    "command_code_accepted": ("Command Codes accepted.",),
+    "command_code_inline_accepted": ("OK. Processing.",),
+}
+_WAKE_STT_PRE_ROLL_RANDOM = random.SystemRandom()
+_WAKE_STT_PRE_ROLL_POOLS: dict[str, list[str]] = {}
+
+
+def _wake_stt_pre_roll_config_file() -> Path:
+    raw = os.getenv(
+        "BLUEPRINTS_WAKE_STT_PRE_ROLL_CONFIG_FILE",
+        _DEFAULT_WAKE_STT_PRE_ROLL_CONFIG_FILE,
+    )
+    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_PRE_ROLL_CONFIG_FILE)
+
+
+def _wake_stt_pre_roll_clean_utterances(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    utterances: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = _safe_str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        utterances.append(text[:160])
+        if len(utterances) >= 80:
+            break
+    return utterances
+
+
+def _wake_stt_pre_roll_config() -> dict[str, Any]:
+    path = _wake_stt_pre_roll_config_file()
     try:
-        value = int(str(raw).strip())
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    delay_value = raw.get("delay_ms", raw.get("threshold_ms"))
+    if delay_value is None and raw.get("delay_seconds") is not None:
+        try:
+            delay_value = float(str(raw.get("delay_seconds")).strip()) * 1000
+        except (TypeError, ValueError):
+            delay_value = None
+    try:
+        delay_ms = int(float(str(delay_value).strip()))
     except (TypeError, ValueError):
-        value = 3000
+        delay_ms = _DEFAULT_WAKE_STT_PRE_ROLL_DELAY_MS
+
+    utterances = _wake_stt_pre_roll_clean_utterances(raw.get("utterances"))
+    if not utterances:
+        utterances = list(_DEFAULT_WAKE_STT_PRE_ROLL_UTTERANCES)
+
+    special: dict[str, list[str]] = {}
+    raw_special = raw.get("special_utterances", raw.get("special_cases"))
+    if isinstance(raw_special, dict):
+        for key, value in raw_special.items():
+            clean_key = _safe_str(key).strip().lower()
+            if not clean_key:
+                continue
+            if isinstance(value, dict):
+                value = value.get("utterances")
+            clean = _wake_stt_pre_roll_clean_utterances(value)
+            if clean:
+                special[clean_key] = clean
+    for key, value in _DEFAULT_WAKE_STT_PRE_ROLL_SPECIAL_UTTERANCES.items():
+        special.setdefault(key, list(value))
+
+    return {
+        "delay_ms": max(0, min(delay_ms, 30_000)),
+        "utterances": utterances,
+        "special_utterances": special,
+    }
+
+
+def _wake_stt_direct_pre_roll_delay_seconds() -> float:
+    raw = os.getenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS")
+    if raw is None or not str(raw).strip():
+        value = int(_wake_stt_pre_roll_config().get("delay_ms") or 0)
+    else:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = int(_wake_stt_pre_roll_config().get("delay_ms") or 0)
     if value <= 0:
         return 0.0
-    return max(50, min(value, 5000)) / 1000.0
+    return max(50, min(value, 30_000)) / 1000.0
+
+
+def _wake_stt_pre_roll_pool_key(reason: str, utterances: list[str]) -> str:
+    return json.dumps(
+        {
+            "reason": _safe_str(reason).strip().lower() or "default",
+            "utterances": utterances,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+
+
+def _wake_stt_select_pre_roll_utterance(reason: str = "default") -> tuple[str, str]:
+    config = _wake_stt_pre_roll_config()
+    clean_reason = _safe_str(reason).strip().lower() or "default"
+    special = config.get("special_utterances")
+    utterances = (
+        special.get(clean_reason)
+        if isinstance(special, dict) and isinstance(special.get(clean_reason), list)
+        else config.get("utterances")
+    )
+    if not isinstance(utterances, list) or not utterances:
+        utterances = list(_DEFAULT_WAKE_STT_PRE_ROLL_UTTERANCES)
+    key = _wake_stt_pre_roll_pool_key(clean_reason, utterances)
+    pool = _WAKE_STT_PRE_ROLL_POOLS.get(key)
+    if not pool:
+        pool = list(utterances)
+    index = _WAKE_STT_PRE_ROLL_RANDOM.randrange(len(pool))
+    speech = pool.pop(index)
+    _WAKE_STT_PRE_ROLL_POOLS[key] = pool
+    return speech, clean_reason
+
+
+def _wake_stt_pre_roll_status(delay_seconds: float, reason: str) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "threshold_ms": round(delay_seconds * 1000, 1) if delay_seconds else 0,
+        "queued": False,
+        "pending_after_threshold": False,
+        "meaning": "pending_direct_task_ack_not_hermes_receipt",
+        "direct_receipt_status": "unknown",
+        "reason": _safe_str(reason).strip().lower() or "default",
+    }
+
+
+def _wake_stt_pre_roll_reason(
+    *, trusted_authorised_retry: bool, inline_authorised: bool = False
+) -> str:
+    if trusted_authorised_retry:
+        return "command_code_accepted"
+    if inline_authorised:
+        return "command_code_inline_accepted"
+    return "default"
+
+
+def _wake_stt_clear_pre_roll_pool_state_for_tests() -> None:
+    _WAKE_STT_PRE_ROLL_POOLS.clear()
 
 
 _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE = (
@@ -2370,6 +2515,7 @@ async def _publish_wake_stt_direct_tts(
     route: str,
     interrupt: bool = True,
     pre_roll: bool = False,
+    pre_roll_reason: str = "default",
 ) -> dict[str, Any]:
     text = _safe_str(speech).strip()
     if not text:
@@ -2413,6 +2559,7 @@ async def _publish_wake_stt_direct_tts(
             "tts_priority": 100,
             "speech_elected_by": "blueprints_transport_ack" if pre_roll else "hermes-stt",
             "pre_roll": bool(pre_roll),
+            "pre_roll_reason": (_safe_str(pre_roll_reason).strip().lower() if pre_roll else ""),
         },
     }
     try:
@@ -3779,6 +3926,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
     direct_requested = bool(route_readback["requested_direct_enabled"])
     body_for_delivery = body
     trusted_authorised_retry = False
+    inline_authorised = False
     if direct_requested:
         code_list = wake_stt_direct.command_codes_from_env()
         pending_key = _wake_stt_pending_command_key(room_id, body.instance)
@@ -3831,6 +3979,10 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                 )
             )
         elif bool(route_readback["direct_enabled"]):
+            inline_authorised = wake_stt_direct.apply_command_code_gate(
+                body_for_delivery.text,
+                code_list,
+            ).authorised
             delivery_task = asyncio.create_task(
                 _deliver_wake_stt_with_direct_fallback(
                     room_id=room_id,
@@ -3842,6 +3994,10 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                 )
             )
         else:
+            inline_authorised = wake_stt_direct.apply_command_code_gate(
+                body_for_delivery.text,
+                code_list,
+            ).authorised
             delivery_task = asyncio.create_task(
                 _deliver_wake_stt_with_direct_fallback(
                     room_id=room_id,
@@ -3867,30 +4023,39 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         timing.mark("blueprints_delivery_task_created")
         pre_roll_tts: dict[str, Any] = {}
         pre_roll_delay = _wake_stt_direct_pre_roll_delay_seconds()
-        pre_roll_status: dict[str, Any] = {
-            "enabled": bool(route_readback["direct_enabled"]) and bool(pre_roll_delay),
-            "threshold_ms": round(pre_roll_delay * 1000, 1) if pre_roll_delay else 0,
-            "queued": False,
-            "pending_after_threshold": False,
-            "meaning": "pending_direct_task_ack_not_hermes_receipt",
-            "direct_receipt_status": "unknown",
-        }
+        pre_roll_reason = _wake_stt_pre_roll_reason(
+            trusted_authorised_retry=trusted_authorised_retry,
+            inline_authorised=inline_authorised,
+        )
+        pre_roll_status = _wake_stt_pre_roll_status(pre_roll_delay, pre_roll_reason)
+        pre_roll_status["enabled"] = bool(route_readback["direct_enabled"]) and bool(pre_roll_delay)
         if bool(route_readback["direct_enabled"]) and pre_roll_delay:
-            timing.mark("pre_roll_wait_start", threshold_ms=round(pre_roll_delay * 1000, 1))
+            timing.mark(
+                "pre_roll_wait_start",
+                threshold_ms=round(pre_roll_delay * 1000, 1),
+                reason=pre_roll_reason,
+            )
             done, _pending = await asyncio.wait({delivery_task}, timeout=pre_roll_delay)
             if not done:
                 pre_roll_status["pending_after_threshold"] = True
+                pre_roll_speech, selected_pre_roll_reason = _wake_stt_select_pre_roll_utterance(
+                    pre_roll_reason
+                )
+                pre_roll_status["reason"] = selected_pre_roll_reason
+                pre_roll_status["speech"] = pre_roll_speech
                 pre_roll_tts = await _publish_wake_stt_direct_tts(
-                    speech="I heard you.",
+                    speech=pre_roll_speech,
                     body=body,
                     route="direct_local",
                     interrupt=True,
                     pre_roll=True,
+                    pre_roll_reason=selected_pre_roll_reason,
                 )
                 timing.mark(
                     "pre_roll_tts_queued",
                     ok=bool(pre_roll_tts.get("ok")),
                     event_id_present=bool(pre_roll_tts.get("event_id")),
+                    reason=selected_pre_roll_reason,
                 )
                 pre_roll_status["queued"] = bool(pre_roll_tts.get("ok"))
         delivered = await delivery_task
@@ -3905,12 +4070,8 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             held_saved = _wake_stt_store_pending_command(pending_key, held)
             companion_override = _wake_stt_command_code_companion(
                 "command_code_required",
-                "Command Code required. Please say the Command Code now.",
-                (
-                    "Command Code required; the Wake request is held for the next Wake turn only."
-                    if held_saved
-                    else "Command Code required; no request was held."
-                ),
+                "Authorisation Command Code required.",
+                "Authorisation Command Code required." if held_saved else "Command Code required.",
             )
             direct_result["companion"] = companion_override
             direct_result["assistant_text"] = companion_override["raw_assistant_text"]
