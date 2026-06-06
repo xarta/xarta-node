@@ -436,6 +436,7 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
         captured["authorization"] = request.headers.get("authorization")
         captured["session_id"] = request.headers.get("x-hermes-session-id")
         captured["session_key"] = request.headers.get("x-hermes-session-key")
+        captured["tool_surface"] = request.headers.get("x-xarta-hermes-stt-tool-surface")
         captured["body"] = request.read().decode("utf-8")
         return httpx.Response(
             200,
@@ -473,6 +474,7 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
                     api_key="secret-test-key",
                     session_id="wake-stt-local",
                     session_key="session-test-key",
+                    tool_surface="xarta_time_lookup_only",
                     sessions_dir=tmp_path,
                 ),
                 client=client,
@@ -488,6 +490,7 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert captured["authorization"] == "Bearer secret-test-key"
     assert captured["session_id"] == "wake-stt-local"
     assert captured["session_key"] == "session-test-key"
+    assert captured["tool_surface"] == "xarta_time_lookup_only"
     assert wake_stt_direct.AUTHORISED_PHRASE in captured["body"]
     assert '"max_tokens":8192' in captured["body"].replace(" ", "")
     assert "Configured model/profile facts" in captured["body"]
