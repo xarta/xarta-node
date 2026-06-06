@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -284,12 +284,23 @@ def _wake_stt_direct_pre_roll_delay_seconds() -> float:
 _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE = (
     "/xarta-node/.lone-wolf/state/hermes-stt/active-wake-session.json"
 )
+_DEFAULT_WAKE_STT_FAST_ROUTES_FILE = (
+    "/xarta-node/.lone-wolf/config/hermes-stt/wake-stt-fast-routes.json"
+)
 _WAKE_STT_DIRECT_NEW_SESSION_RE = re.compile(
     r"(?:^|\b)(?:/new|new session|start a new session|reset session|reset conversation|"
     r"start a new conversation|new conversation|clear session|clear conversation)(?:\b|$)",
     re.IGNORECASE,
 )
 _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS: dict[str, dict[str, Any]] = {}
+
+
+@dataclass(frozen=True)
+class _WakeSttFastRouteDecision:
+    route_id: str
+    action: str
+    session_id: str
+    persist_session: bool
 
 
 def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
@@ -422,9 +433,88 @@ def _wake_stt_direct_active_session_file() -> Path:
     return Path(str(raw).strip() or _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE)
 
 
+def _wake_stt_fast_routes_file() -> Path:
+    raw = os.getenv(
+        "BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE",
+        _DEFAULT_WAKE_STT_FAST_ROUTES_FILE,
+    )
+    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_FAST_ROUTES_FILE)
+
+
 def _wake_stt_direct_operator_requested_new_session(text: str) -> bool:
     clean = re.sub(r"\s+", " ", _safe_str(text)).strip().lower()
     return bool(clean and _WAKE_STT_DIRECT_NEW_SESSION_RE.search(clean))
+
+
+def _wake_stt_fast_route_normalise_text(text: str) -> str:
+    clean = _safe_str(text).lower().replace("’", "'")
+    clean = re.sub(r"[^a-z0-9]+", " ", clean)
+    clean = re.sub(r"\bwhat s\b", "whats", clean)
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def _wake_stt_fast_route_config() -> list[dict[str, Any]]:
+    path = _wake_stt_fast_routes_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    routes = raw.get("routes") if isinstance(raw, dict) else raw
+    if not isinstance(routes, list):
+        return []
+    return [route for route in routes if isinstance(route, dict)]
+
+
+def _wake_stt_fast_route_matches(text: str, route: dict[str, Any]) -> bool:
+    match = route.get("match") if isinstance(route.get("match"), dict) else {}
+    kind = _safe_str(match.get("kind") or match.get("type") or "exact").strip().lower()
+    phrases_raw = match.get("phrases")
+    phrases = phrases_raw if isinstance(phrases_raw, list) else []
+    normalised_text = _wake_stt_fast_route_normalise_text(text)
+    if not normalised_text:
+        return False
+    for phrase in phrases:
+        normalised_phrase = _wake_stt_fast_route_normalise_text(str(phrase or ""))
+        if not normalised_phrase:
+            continue
+        if kind == "exact" and normalised_text == normalised_phrase:
+            return True
+        if kind == "prefix" and (
+            normalised_text == normalised_phrase
+            or normalised_text.startswith(f"{normalised_phrase} ")
+        ):
+            return True
+    return False
+
+
+def _wake_stt_fast_route_decision(
+    text: str,
+    *,
+    base_session_id: str,
+) -> _WakeSttFastRouteDecision | None:
+    for route in _wake_stt_fast_route_config():
+        action = _safe_str(route.get("action")).strip().lower()
+        if action != "time_fast_session":
+            continue
+        if not _wake_stt_fast_route_matches(text, route):
+            continue
+        route_id = _safe_str(route.get("id")).strip() or "time_fast"
+        session_cfg = route.get("session") if isinstance(route.get("session"), dict) else {}
+        prefix = _safe_str(session_cfg.get("prefix") or route_id).strip() or route_id
+        prefix = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", prefix).strip("-")[:48] or "fast"
+        persist_session = bool(session_cfg.get("persist_session", False))
+        mode = _safe_str(session_cfg.get("mode") or "ephemeral").strip().lower()
+        if mode == "stable":
+            suffix = prefix
+        else:
+            suffix = f"{prefix}-{uuid.uuid4().hex[:12]}"
+        return _WakeSttFastRouteDecision(
+            route_id=route_id[:80],
+            action=action,
+            session_id=f"{base_session_id}-{suffix}",
+            persist_session=persist_session,
+        )
+    return None
 
 
 def _read_wake_stt_direct_active_session_id(default_session_id: str) -> str:
@@ -455,15 +545,18 @@ def _write_wake_stt_direct_active_session_id(session_id: str) -> None:
 
 def _wake_stt_direct_config_for_request(
     body: _WakeSttMessageBody,
-) -> wake_stt_direct.HermesSttConfig:
+) -> tuple[wake_stt_direct.HermesSttConfig, _WakeSttFastRouteDecision | None]:
     config = wake_stt_direct.load_hermes_stt_config()
     base_session_id = _safe_str(config.session_id) or wake_stt_direct.DEFAULT_HERMES_STT_SESSION_ID
+    fast_route = _wake_stt_fast_route_decision(body.text, base_session_id=base_session_id)
+    if fast_route:
+        return replace(config, session_id=fast_route.session_id), fast_route
     session_id = _read_wake_stt_direct_active_session_id(base_session_id)
     if _wake_stt_direct_operator_requested_new_session(body.text):
         suffix = uuid.uuid4().hex[:12]
         session_id = f"{base_session_id}-operator-{suffix}"
         _write_wake_stt_direct_active_session_id(session_id)
-    return replace(config, session_id=session_id)
+    return replace(config, session_id=session_id), None
 
 
 class _RoomSettingsBody(BaseModel):
@@ -2241,8 +2334,8 @@ async def _deliver_wake_stt_with_direct_fallback(
             candidate_revision=body.candidate_revision,
         )
 
-    config = _wake_stt_direct_config_for_request(body)
-    return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+    config, fast_route = _wake_stt_direct_config_for_request(body)
+    result = await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
         body.text,
         matrix_send=matrix_send,
         diagnostic_send=diagnostic_send,
@@ -2253,6 +2346,21 @@ async def _deliver_wake_stt_with_direct_fallback(
         timing=timing,
         trusted_authorised=trusted_authorised,
     )
+    if fast_route and not fast_route.persist_session:
+        cleanup = await wake_stt_direct.remove_hermes_stt_session_file(
+            sessions_dir=config.sessions_dir,
+            session_id=config.session_id,
+        )
+        if timing:
+            timing.mark(
+                "fast_route_session_cleanup",
+                route_id=fast_route.route_id,
+                action=fast_route.action,
+                ok=bool(cleanup.get("ok")),
+                removed=bool(cleanup.get("removed")),
+                attempts=cleanup.get("attempts"),
+            )
+    return result
 
 
 async def _publish_wake_stt_direct_tts(

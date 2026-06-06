@@ -620,6 +620,282 @@ def test_matrix_chat_direct_wrapper_uses_active_session_without_auto_rotation(
     )
 
 
+def test_matrix_chat_direct_wrapper_uses_compact_session_for_time_lookup(monkeypatch, tmp_path):
+    captured = {}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-heavy"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_fast",
+                        "action": "time_fast_session",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["what's the time", "what is the time"],
+                        },
+                        "session": {
+                            "mode": "ephemeral",
+                            "prefix": "time-fast",
+                            "persist_session": False,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["session_id"] = config.session_id
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text='{"speech":"ten oh five","matrix_detail":"time","status":"ok"}',
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="ten oh five",
+                matrix_detail="time",
+                status="ok",
+                structured=True,
+                raw_assistant_text=(
+                    '{"speech":"ten oh five","matrix_detail":"time","status":"ok"}'
+                ),
+            ),
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="what is the time",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-time",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert captured["session_id"].startswith("wake-stt-local-time-fast-")
+    assert json.loads(active_session.read_text(encoding="utf-8"))["session_id"] == (
+        "wake-stt-local-operator-heavy"
+    )
+
+
+def test_wake_stt_fast_routes_file_uses_lone_wolf_config_default(monkeypatch, tmp_path):
+    fast_routes = tmp_path / "wake-stt-fast-routes.json"
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", raising=False)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_DEFAULT_WAKE_STT_FAST_ROUTES_FILE",
+        str(fast_routes),
+    )
+
+    assert matrix_chat._wake_stt_fast_routes_file() == fast_routes
+
+
+def test_matrix_chat_direct_wrapper_uses_prefix_fast_route_from_config(monkeypatch, tmp_path):
+    captured = {}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-heavy"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_fast",
+                        "action": "time_fast_session",
+                        "match": {
+                            "kind": "prefix",
+                            "phrases": ["what will be the time"],
+                        },
+                        "session": {
+                            "mode": "ephemeral",
+                            "prefix": "time-fast",
+                            "persist_session": False,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["session_id"] = config.session_id
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text='{"speech":"ten oh seven","matrix_detail":"time","status":"ok"}',
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="ten oh seven",
+                matrix_detail="time",
+                status="ok",
+                structured=True,
+                raw_assistant_text=(
+                    '{"speech":"ten oh seven","matrix_detail":"time","status":"ok"}'
+                ),
+            ),
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="what will be the time in two minutes",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-time-prefix",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert captured["session_id"].startswith("wake-stt-local-time-fast-")
+
+
+def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_lookup(
+    monkeypatch, tmp_path
+):
+    captured = {}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-kept"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_fast",
+                        "action": "time_fast_session",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["what is the time"],
+                        },
+                        "session": {
+                            "mode": "ephemeral",
+                            "prefix": "time-fast",
+                            "persist_session": False,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["session_id"] = config.session_id
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text="35",
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="35",
+                matrix_detail="35",
+                status="ok",
+                structured=False,
+                raw_assistant_text="35",
+            ),
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="What is five times seven?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-math",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert captured["session_id"] == "wake-stt-local-operator-kept"
+
+
 def test_matrix_chat_direct_wrapper_rotates_session_only_on_operator_request(monkeypatch, tmp_path):
     captured = {"session_ids": []}
     active_session = tmp_path / "active-session.json"
