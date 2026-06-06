@@ -101,6 +101,7 @@ class HermesSttConfig:
     allow_non_loopback: bool = False
     stream_chat: bool = False
     max_tokens: int = DEFAULT_HERMES_STT_MAX_TOKENS
+    tool_surface: str = ""
 
     @property
     def configured(self) -> bool:
@@ -129,6 +130,7 @@ class HermesSttConfig:
             "loopback_ok": self.loopback_ok,
             "stream_chat": self.stream_chat,
             "max_tokens": self.max_tokens,
+            "tool_surface": self.tool_surface,
         }
 
 
@@ -994,6 +996,9 @@ def _chat_headers(config: HermesSttConfig) -> dict[str, str]:
     }
     if config.session_key:
         headers["X-Hermes-Session-Key"] = config.session_key
+    tool_surface = str(config.tool_surface or "").strip()
+    if tool_surface:
+        headers["X-Xarta-Hermes-Stt-Tool-Surface"] = tool_surface
     return headers
 
 

@@ -446,6 +446,7 @@ class _WakeSttFastRouteDecision:
     action: str
     session_id: str
     persist_session: bool
+    tool_surface: str = ""
 
 
 def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
@@ -658,6 +659,7 @@ def _wake_stt_fast_route_decision(
             action=action,
             session_id=f"{base_session_id}-{suffix}",
             persist_session=persist_session,
+            tool_surface="xarta_time_lookup_only",
         )
     return None
 
@@ -695,7 +697,14 @@ def _wake_stt_direct_config_for_request(
     base_session_id = _safe_str(config.session_id) or wake_stt_direct.DEFAULT_HERMES_STT_SESSION_ID
     fast_route = _wake_stt_fast_route_decision(body.text, base_session_id=base_session_id)
     if fast_route:
-        return replace(config, session_id=fast_route.session_id), fast_route
+        return (
+            replace(
+                config,
+                session_id=fast_route.session_id,
+                tool_surface=fast_route.tool_surface,
+            ),
+            fast_route,
+        )
     session_id = _read_wake_stt_direct_active_session_id(base_session_id)
     if _wake_stt_direct_operator_requested_new_session(body.text):
         suffix = uuid.uuid4().hex[:12]

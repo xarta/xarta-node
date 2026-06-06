@@ -596,6 +596,7 @@ def test_matrix_chat_direct_wrapper_uses_active_session_without_auto_rotation(
 
     async def fake_submit(text, *, config=None, codes=None, **_kwargs):
         captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
         return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
             ok=False,
@@ -677,6 +678,7 @@ def test_matrix_chat_direct_wrapper_uses_compact_session_for_time_lookup(monkeyp
 
     async def fake_submit(text, *, config=None, codes=None, **_kwargs):
         captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
         return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
             ok=True,
@@ -729,6 +731,7 @@ def test_matrix_chat_direct_wrapper_uses_compact_session_for_time_lookup(monkeyp
     )
 
     assert captured["session_id"].startswith("wake-stt-local-time-fast-")
+    assert captured["tool_surface"] == "xarta_time_lookup_only"
     assert json.loads(active_session.read_text(encoding="utf-8"))["session_id"] == (
         "wake-stt-local-operator-heavy"
     )
@@ -779,6 +782,7 @@ def test_matrix_chat_direct_wrapper_uses_prefix_fast_route_from_config(monkeypat
 
     async def fake_submit(text, *, config=None, codes=None, **_kwargs):
         captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
         return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
             ok=True,
@@ -831,6 +835,7 @@ def test_matrix_chat_direct_wrapper_uses_prefix_fast_route_from_config(monkeypat
     )
 
     assert captured["session_id"].startswith("wake-stt-local-time-fast-")
+    assert captured["tool_surface"] == "xarta_time_lookup_only"
 
 
 def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_lookup(
@@ -868,6 +873,7 @@ def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_look
 
     async def fake_submit(text, *, config=None, codes=None, **_kwargs):
         captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
         return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
             ok=True,
@@ -918,6 +924,7 @@ def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_look
     )
 
     assert captured["session_id"] == "wake-stt-local-operator-kept"
+    assert captured["tool_surface"] == ""
 
 
 def test_matrix_chat_direct_wrapper_rotates_session_only_on_operator_request(monkeypatch, tmp_path):
