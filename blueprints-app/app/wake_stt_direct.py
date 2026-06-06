@@ -61,6 +61,9 @@ _AUTHORISED_SOURCE_RE = re.compile(
     re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")
+_COMMAND_CODE_WORD_STRIP = " \t\r\n.,!?;:\"'()[]{}<>"
+_COMMAND_CODE_AUTH_WORDS = ("authorisation", "authorization", "authorise", "authorize")
+_AUTH_SPAN_REDACTION = "[redacted authorisation]"
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,7 @@ class CommandCodeGateResult:
             "authorised": self.authorised,
             "matched_code_id": self.matched_code_id,
             "meat": self.meat,
-            "hermes_text": self.hermes_text,
+            "hermes_text": self.meat,
         }
 
 
@@ -356,6 +359,31 @@ def _clean_alias(value: Any) -> str:
     return text[:160]
 
 
+def _normalise_code_text(value: Any) -> str:
+    return " ".join(str(value or "").lower().split())
+
+
+def _canonical_code_sample_from_words(words: list[str]) -> str:
+    cleaned = [word.strip(_COMMAND_CODE_WORD_STRIP).lower() for word in words]
+    if len(cleaned) != 4 or cleaned[0] not in _COMMAND_CODE_AUTH_WORDS:
+        return ""
+    if any(not word for word in cleaned[1:]):
+        return ""
+    return " ".join(("authorisation", *cleaned[1:]))
+
+
+def _normalised_configured_samples(alias: str) -> tuple[str, ...]:
+    words = [
+        word.strip(_COMMAND_CODE_WORD_STRIP).lower()
+        for word in _normalise_code_text(alias).split(" ")
+        if word.strip(_COMMAND_CODE_WORD_STRIP)
+    ]
+    if len(words) == 3:
+        return (" ".join(("authorisation", *words)),)
+    sample = _canonical_code_sample_from_words(words)
+    return (sample,) if sample else ()
+
+
 def command_codes_from_config(value: Any) -> list[CommandCode]:
     """Read up to 100 private Command Code entries without exposing aliases."""
     raw_entries = value if isinstance(value, list) else []
@@ -371,9 +399,14 @@ def command_codes_from_config(value: Any) -> list[CommandCode]:
             continue
         aliases_raw = raw.get("aliases")
         aliases_list = aliases_raw if isinstance(aliases_raw, list) else []
-        aliases = tuple(alias for alias in (_clean_alias(item) for item in aliases_list) if alias)[
-            :20
-        ]
+        samples: list[str] = []
+        seen_samples: set[str] = set()
+        for item in aliases_list:
+            for sample in _normalised_configured_samples(_clean_alias(item)):
+                if sample and sample not in seen_samples:
+                    samples.append(sample)
+                    seen_samples.add(sample)
+        aliases = tuple(samples[:20])
         if not aliases:
             continue
         seen_ids.add(code_id)
@@ -381,36 +414,124 @@ def command_codes_from_config(value: Any) -> list[CommandCode]:
     return codes
 
 
-def _alias_regex(alias: str) -> re.Pattern[str]:
-    words = [re.escape(part) for part in re.split(r"[\s\-_]+", alias.strip()) if part]
-    if not words:
-        return re.compile(r"(?!x)x")
-    separator = r"[\s\-_]+"
-    return re.compile(
-        rf"(?<!\w){separator.join(words)}(?!\w)[\s.!?,;:]*",
-        re.IGNORECASE,
+def _find_command_code_sample(text: str) -> tuple[str, str]:
+    normalised = _normalise_code_text(text)
+    if not normalised:
+        return "", normalised
+    padded = f" {normalised} "
+    matches: list[tuple[int, str]] = []
+    for word in _COMMAND_CODE_AUTH_WORDS:
+        needle = f" {word} "
+        index = padded.find(needle)
+        if index >= 0:
+            matches.append((index, word))
+    if not matches:
+        return "", normalised
+    index, _word = min(matches, key=lambda item: item[0])
+    tail = padded[index + 1 :].strip()
+    words = tail.split(" ")
+    if len(words) < 4:
+        return "", normalised
+    sample = _canonical_code_sample_from_words(words[:4])
+    return sample, normalised
+
+
+def command_code_slot1_sample(codes: list[CommandCode]) -> str:
+    if not codes or not codes[0].aliases:
+        return ""
+    return codes[0].aliases[0]
+
+
+def is_exact_slot1_command_code_response(text: str, codes: list[CommandCode]) -> bool:
+    sample, normalised = _find_command_code_sample(text)
+    slot1 = command_code_slot1_sample(codes)
+    variants = (
+        {f"{word} {sample.split(' ', 1)[1]}" for word in _COMMAND_CODE_AUTH_WORDS}
+        if sample.startswith("authorisation ")
+        else set()
     )
+    return bool(sample and slot1 and sample == slot1 and normalised in variants)
 
 
-def apply_command_code_gate(text: str, codes: list[CommandCode]) -> CommandCodeGateResult:
+def looks_like_command_code_response(text: str) -> bool:
+    sample, normalised = _find_command_code_sample(text)
+    first_word = normalised.split(" ", 1)[0] if normalised else ""
+    return bool(sample or first_word in _COMMAND_CODE_AUTH_WORDS)
+
+
+def _remove_first_command_code_sample(text: str, sample: str) -> str:
+    normalised = _normalise_code_text(text)
+    if not normalised or not sample:
+        return _SPACE_RE.sub(" ", str(text or "").strip())
+    words = normalised.split(" ")
+    for index, word in enumerate(words):
+        if word.strip(_COMMAND_CODE_WORD_STRIP) not in _COMMAND_CODE_AUTH_WORDS:
+            continue
+        if index + 4 > len(words):
+            break
+        candidate = _canonical_code_sample_from_words(words[index : index + 4])
+        if candidate != sample:
+            continue
+        return _SPACE_RE.sub(" ", " ".join(words[:index] + words[index + 4 :])).strip()
+    return _SPACE_RE.sub(" ", str(text or "").strip())
+
+
+def _replace_auth_prefix_spans(text: str, replacement: str) -> str:
+    words = str(text or "").split()
+    if not words:
+        return ""
+    cleaned: list[str] = []
+    index = 0
+    while index < len(words):
+        token = words[index].strip(_COMMAND_CODE_WORD_STRIP).lower()
+        if token.startswith("auth"):
+            if replacement:
+                cleaned.append(replacement)
+            index = min(len(words), index + 5)
+            continue
+        cleaned.append(words[index])
+        index += 1
+    return _SPACE_RE.sub(" ", " ".join(cleaned)).strip()
+
+
+def redact_authorisation_spans_for_matrix(text: str) -> str:
+    """Scrub STT auth-like spans before text is sent to Matrix/Synapse."""
+    scrubbed = _AUTHORISED_SOURCE_RE.sub(_AUTH_SPAN_REDACTION, str(text or ""))
+    return _replace_auth_prefix_spans(scrubbed, _AUTH_SPAN_REDACTION)
+
+
+def command_code_storage_safe_text(text: str) -> str:
+    """Return request text safe for one-turn pending state and public diagnostics."""
+    scrubbed = _AUTHORISED_SOURCE_RE.sub(" ", str(text or ""))
+    scrubbed = _replace_auth_prefix_spans(scrubbed, "")
+    return _SPACE_RE.sub(" ", scrubbed).strip()
+
+
+def apply_command_code_gate(
+    text: str,
+    codes: list[CommandCode],
+    *,
+    trusted_authorised: bool = False,
+) -> CommandCodeGateResult:
     """Strip spoken codes/authorisation claims and inject the canonical phrase once.
 
     Raw Command Code aliases must stay private. Callers should log only the returned
     code id, boolean authorisation state, and redacted text.
     """
-    meat = _AUTHORISED_SOURCE_RE.sub(" ", str(text or ""))
+    meat_source = _AUTHORISED_SOURCE_RE.sub(" ", str(text or ""))
     matched_code_id = ""
-    for code in codes[:100]:
-        for alias in code.aliases:
-            pattern = _alias_regex(alias)
-            if not pattern.search(meat):
-                continue
-            meat = pattern.sub(" ", meat)
-            matched_code_id = code.code_id
-            break
-        if matched_code_id:
-            break
-    meat = _SPACE_RE.sub(" ", meat).strip()
+    sample, _normalised = _find_command_code_sample(meat_source)
+    slot1 = command_code_slot1_sample(codes)
+    if sample and slot1 and sample == slot1:
+        meat_source = _remove_first_command_code_sample(meat_source, sample)
+        matched_code_id = codes[0].code_id
+    if trusted_authorised and not matched_code_id:
+        matched_code_id = codes[0].code_id if codes else "server_authorised"
+        sample, _normalised = _find_command_code_sample(meat_source)
+        if sample:
+            meat_source = _remove_first_command_code_sample(meat_source, sample)
+    meat_source = _replace_auth_prefix_spans(meat_source, "")
+    meat = _SPACE_RE.sub(" ", meat_source).strip()
     authorised = bool(matched_code_id)
     hermes_text = meat
     if authorised:
@@ -430,7 +551,7 @@ def strip_direct_wake_diagnostic(text: str, codes: list[CommandCode]) -> str:
 
 def wake_stt_bridge_diagnostic_body(text: str) -> str:
     """Format a non-addressed Bridge observation for the direct Wake route."""
-    meat = _SPACE_RE.sub(" ", str(text or "").strip())
+    meat = redact_authorisation_spans_for_matrix(text)
     return f"Wake STT: {meat}" if meat else "Wake STT:"
 
 
@@ -1015,6 +1136,7 @@ async def submit_wake_stt_to_hermes(
     inspect_context: bool = True,
     assistant_delta_callback: AssistantDeltaCallback | None = None,
     timing: WakeSttRouteTiming | None = None,
+    trusted_authorised: bool = False,
 ) -> HermesSttSubmitResult:
     """Submit one gated Wake STT request to the local hermes-stt API server.
 
@@ -1023,7 +1145,11 @@ async def submit_wake_stt_to_hermes(
     """
     config = config or load_hermes_stt_config()
     code_list = command_codes_from_env() if codes is None else codes
-    gate = apply_command_code_gate(text, code_list)
+    gate = apply_command_code_gate(
+        text,
+        code_list,
+        trusted_authorised=trusted_authorised,
+    )
     if not gate.meat:
         return HermesSttSubmitResult(
             ok=False,
@@ -1260,6 +1386,7 @@ async def deliver_wake_stt_with_matrix_fallback(
     inspect_context: bool = True,
     assistant_delta_callback: AssistantDeltaCallback | None = None,
     timing: WakeSttRouteTiming | None = None,
+    trusted_authorised: bool = False,
 ) -> WakeSttDeliveryResult:
     """Deliver Wake STT through the selected explicit route.
 
@@ -1269,7 +1396,11 @@ async def deliver_wake_stt_with_matrix_fallback(
     a failed direct transport; callers must select Matrix explicitly.
     """
     code_list = command_codes_from_env() if codes is None else codes
-    gate = apply_command_code_gate(text, code_list)
+    gate = apply_command_code_gate(
+        text,
+        code_list,
+        trusted_authorised=trusted_authorised,
+    )
     if not gate.meat:
         return WakeSttDeliveryResult(
             ok=False,
@@ -1291,6 +1422,7 @@ async def deliver_wake_stt_with_matrix_fallback(
             inspect_context=inspect_context,
             assistant_delta_callback=assistant_delta_callback,
             timing=timing,
+            trusted_authorised=trusted_authorised,
         )
         if direct_result.ok:
             diagnostic: dict[str, Any] | None = None
