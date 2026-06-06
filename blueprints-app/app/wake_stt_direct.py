@@ -1039,7 +1039,7 @@ async def submit_wake_stt_to_hermes(
             status="not_configured",
             gate=gate,
             attempted=False,
-            fallback_required=True,
+            fallback_required=False,
             error="hermes-stt API base or key is not configured",
             timing=timing,
         )
@@ -1049,7 +1049,7 @@ async def submit_wake_stt_to_hermes(
             status="non_loopback_api_base",
             gate=gate,
             attempted=False,
-            fallback_required=True,
+            fallback_required=False,
             error="hermes-stt API base must be loopback unless explicitly allowed",
             timing=timing,
         )
@@ -1130,7 +1130,7 @@ async def submit_wake_stt_to_hermes(
                 status="api_error",
                 gate=gate,
                 attempted=True,
-                fallback_required=True,
+                fallback_required=False,
                 http_status=http_status,
                 error=f"hermes-stt API returned HTTP {http_status}",
                 timing=timing,
@@ -1141,7 +1141,7 @@ async def submit_wake_stt_to_hermes(
                 status="bad_response",
                 gate=gate,
                 attempted=True,
-                fallback_required=True,
+                fallback_required=False,
                 http_status=http_status,
                 error="hermes-stt API response did not include assistant text",
                 budget=budget,
@@ -1162,7 +1162,7 @@ async def submit_wake_stt_to_hermes(
                 status="context_scrub_failed",
                 gate=gate,
                 attempted=True,
-                fallback_required=True,
+                fallback_required=False,
                 http_status=http_status,
                 assistant_text=assistant_text,
                 companion=companion,
@@ -1185,7 +1185,7 @@ async def submit_wake_stt_to_hermes(
                 status="context_phrase_present",
                 gate=gate,
                 attempted=True,
-                fallback_required=True,
+                fallback_required=False,
                 http_status=http_status,
                 assistant_text=assistant_text,
                 companion=companion,
@@ -1224,7 +1224,7 @@ async def submit_wake_stt_to_hermes(
             status="request_error",
             gate=gate,
             attempted=True,
-            fallback_required=True,
+            fallback_required=False,
             error=str(exc)[:240],
             timing=timing,
         )
@@ -1261,10 +1261,12 @@ async def deliver_wake_stt_with_matrix_fallback(
     assistant_delta_callback: AssistantDeltaCallback | None = None,
     timing: WakeSttRouteTiming | None = None,
 ) -> WakeSttDeliveryResult:
-    """Deliver Wake STT through hermes-stt, falling back to Matrix when needed.
+    """Deliver Wake STT through the selected explicit route.
 
-    Matrix fallback and diagnostic senders are injected by server-side callers so
-    Matrix credentials stay outside this helper and away from the browser.
+    Matrix and diagnostic senders are injected by server-side callers so Matrix
+    credentials stay outside this helper and away from the browser. When
+    direct-local is selected, Matrix is not used as an automatic substitute for
+    a failed direct transport; callers must select Matrix explicitly.
     """
     code_list = command_codes_from_env() if codes is None else codes
     gate = apply_command_code_gate(text, code_list)
@@ -1319,31 +1321,50 @@ async def deliver_wake_stt_with_matrix_fallback(
                 diagnostic_scheduled=diagnostic_scheduled,
                 timing=timing,
             )
-        if not direct_result.fallback_required:
-            return WakeSttDeliveryResult(
-                ok=False,
-                status=direct_result.status,
-                route="direct_local",
-                gate=gate,
-                direct=direct_result,
-                fallback_reason=direct_result.status,
-                timing=timing,
-            )
+        diagnostic = None
+        diagnostic_scheduled = False
+        if diagnostic_enabled and diagnostic_send:
+            if await_diagnostic:
+                if timing:
+                    timing.mark("matrix_diagnostic_send_start", direct_status=direct_result.status)
+                diagnostic = await _send_delivery_safely(diagnostic_send, gate.meat)
+                if timing:
+                    timing.mark(
+                        "matrix_diagnostic_sent",
+                        ok=bool(diagnostic.get("ok")),
+                        event_id_present=bool(diagnostic.get("event_id")),
+                    )
+            else:
+                asyncio.create_task(_send_delivery_safely(diagnostic_send, gate.meat))
+                diagnostic_scheduled = True
+                if timing:
+                    timing.mark("matrix_diagnostic_scheduled", direct_status=direct_result.status)
+        return WakeSttDeliveryResult(
+            ok=False,
+            status=direct_result.status,
+            route="direct_local",
+            gate=gate,
+            direct=direct_result,
+            diagnostic=diagnostic,
+            diagnostic_scheduled=diagnostic_scheduled,
+            fallback_reason=direct_result.status,
+            timing=timing,
+        )
 
     if timing:
-        timing.mark("matrix_fallback_send_start", direct_enabled=direct_enabled)
+        timing.mark("matrix_send_start", direct_enabled=direct_enabled)
     matrix_result = await _send_delivery_safely(matrix_send, gate.meat)
     if timing:
         timing.mark(
-            "matrix_fallback_sent",
+            "matrix_sent",
             ok=bool(matrix_result.get("ok")),
             event_id_present=bool(matrix_result.get("event_id")),
         )
     ok = bool(matrix_result.get("ok"))
     return WakeSttDeliveryResult(
         ok=ok,
-        status="delivered" if ok else "matrix_fallback_error",
-        route="matrix_fallback" if direct_enabled else "matrix",
+        status="delivered" if ok else "matrix_error",
+        route="matrix",
         gate=gate,
         direct=direct_result,
         matrix=matrix_result,

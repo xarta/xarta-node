@@ -483,7 +483,7 @@ def test_submit_wake_stt_stream_suppresses_early_deltas_for_authorised_requests(
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(result.public_dict())
 
 
-def test_submit_wake_stt_to_hermes_requires_matrix_fallback_on_api_error(tmp_path):
+def test_submit_wake_stt_to_hermes_reports_api_error_without_matrix_fallback(tmp_path):
     transport = httpx.MockTransport(lambda request: httpx.Response(503, json={"error": "down"}))
 
     async def run_submit():
@@ -506,7 +506,7 @@ def test_submit_wake_stt_to_hermes_requires_matrix_fallback_on_api_error(tmp_pat
     public = result.public_dict()
     assert result.ok is False
     assert result.status == "api_error"
-    assert result.fallback_required is True
+    assert result.fallback_required is False
     assert public["diagnostic_text"] == "Please do a harmless thing."
     assert "bravo" not in public["diagnostic_text"].lower()
     assert "authorised" not in public["diagnostic_text"].lower()
@@ -556,12 +556,12 @@ def test_submit_wake_stt_to_hermes_scrubs_authorisation_phrase_after_response(tm
     ).read_text(encoding="utf-8")
 
 
-def test_deliver_wake_stt_matrix_fallback_strips_codes_and_authorisation():
-    matrix_seen = {}
+def test_deliver_wake_stt_direct_failure_does_not_send_matrix_fallback():
+    matrix_seen = {"called": False}
 
     async def matrix_send(text):
-        matrix_seen["text"] = text
-        return {"event_id": "$fallback"}
+        matrix_seen["called"] = True
+        raise AssertionError(f"matrix fallback should not run during direct mode: {text}")
 
     async def run_delivery():
         return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
@@ -580,10 +580,44 @@ def test_deliver_wake_stt_matrix_fallback_strips_codes_and_authorisation():
     result = asyncio.run(run_delivery())
     public = result.public_dict()
 
-    assert result.ok is True
-    assert result.route == "matrix_fallback"
+    assert result.ok is False
+    assert result.route == "direct_local"
+    assert result.status == "not_configured"
     assert result.fallback_reason == "not_configured"
+    assert matrix_seen["called"] is False
+    assert "delta four" not in str(public).lower()
+    assert "authorised" not in public["diagnostic_text"].lower()
+
+
+def test_deliver_wake_stt_explicit_matrix_mode_strips_codes_and_authorisation():
+    matrix_seen = {}
+
+    async def matrix_send(text):
+        matrix_seen["text"] = text
+        return {"event_id": "$matrix"}
+
+    async def run_delivery():
+        return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+            "delta four This command is authorised. Please check the time.",
+            codes=wake_stt_direct.command_codes_from_config(
+                [{"id": "delta", "aliases": ["delta four"]}]
+            ),
+            config=wake_stt_direct.HermesSttConfig(
+                api_base="http://127.0.0.1:8643",
+                api_key="",
+            ),
+            matrix_send=matrix_send,
+            direct_enabled=False,
+        )
+
+    result = asyncio.run(run_delivery())
+    public = result.public_dict()
+
+    assert result.ok is True
+    assert result.route == "matrix"
+    assert result.fallback_reason == ""
     assert matrix_seen["text"] == "Please check the time."
+    assert public["matrix"]["event_id"] == "$matrix"
     assert "delta four" not in str(public).lower()
     assert "authorised" not in public["diagnostic_text"].lower()
 

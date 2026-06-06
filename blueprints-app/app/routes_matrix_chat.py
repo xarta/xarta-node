@@ -3557,10 +3557,19 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         timing.mark("blueprints_delivery_task_created")
         pre_roll_tts: dict[str, Any] = {}
         pre_roll_delay = _wake_stt_direct_pre_roll_delay_seconds()
+        pre_roll_status: dict[str, Any] = {
+            "enabled": bool(route_readback["direct_enabled"]) and bool(pre_roll_delay),
+            "threshold_ms": round(pre_roll_delay * 1000, 1) if pre_roll_delay else 0,
+            "queued": False,
+            "pending_after_threshold": False,
+            "meaning": "pending_direct_task_ack_not_hermes_receipt",
+            "direct_receipt_status": "unknown",
+        }
         if bool(route_readback["direct_enabled"]) and pre_roll_delay:
             timing.mark("pre_roll_wait_start", threshold_ms=round(pre_roll_delay * 1000, 1))
             done, _pending = await asyncio.wait({delivery_task}, timeout=pre_roll_delay)
             if not done:
+                pre_roll_status["pending_after_threshold"] = True
                 pre_roll_tts = await _publish_wake_stt_direct_tts(
                     speech="I heard you.",
                     body=body,
@@ -3573,12 +3582,22 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     ok=bool(pre_roll_tts.get("ok")),
                     event_id_present=bool(pre_roll_tts.get("event_id")),
                 )
+                pre_roll_status["queued"] = bool(pre_roll_tts.get("ok"))
         delivered = await delivery_task
         public = delivered.public_dict()
+        direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
+        if public.get("route") == "direct_local":
+            pre_roll_status["direct_receipt_status"] = "delivered" if public.get("ok") else "failed"
+            if not public.get("ok"):
+                pre_roll_status["failure_status"] = _safe_str(direct_result.get("status"))
+        elif public.get("route") == "matrix":
+            pre_roll_status["direct_receipt_status"] = "explicit_matrix_mode"
+        else:
+            pre_roll_status["direct_receipt_status"] = _safe_str(public.get("route")) or "unknown"
+        public["pre_roll"] = pre_roll_status
         if pre_roll_tts:
             public["pre_roll_tts"] = pre_roll_tts
         tts_result: dict[str, Any] = {}
-        direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
         companion = (
             direct_result.get("companion")
             if isinstance(direct_result.get("companion"), dict)

@@ -407,14 +407,15 @@ def test_matrix_chat_wake_stt_direct_response_content_is_speech_suppressed():
     assert "m.mentions" not in content
 
 
-def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
-    captured = {}
+def test_matrix_chat_direct_wrapper_failure_does_not_post_matrix_fallback(monkeypatch):
+    captured = {"called": False}
 
     class FakeE2EEClient:
         async def send_message_content(self, room_id, content):
+            captured["called"] = True
             captured["room_id"] = room_id
             captured["content"] = content
-            return {"room_id": room_id, "event_id": "$fallback"}
+            return {"room_id": room_id, "event_id": "$unexpected"}
 
     async def fake_get_e2ee_client(settings=None):
         return FakeE2EEClient()
@@ -426,7 +427,7 @@ def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
             status="request_error",
             gate=gate,
             attempted=True,
-            fallback_required=True,
+            fallback_required=False,
             error="connection refused",
         )
 
@@ -456,14 +457,75 @@ def test_matrix_chat_direct_wrapper_falls_back_with_redacted_meat(monkeypatch):
         )
     )
 
-    assert result.ok is True
-    assert result.route == "matrix_fallback"
+    assert result.ok is False
+    assert result.route == "direct_local"
+    assert result.status == "request_error"
+    assert result.fallback_reason == "request_error"
+    assert captured["called"] is False
+
+
+def test_matrix_chat_direct_wrapper_failure_can_post_explicit_non_addressed_diagnostic(
+    monkeypatch,
+):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$diag"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    async def fake_submit(text, *, codes=None, **_kwargs):
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=False,
+            status="request_error",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            error="connection refused",
+        )
+
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"alpha","aliases":["alpha one"]}]}',
+    )
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_to_hermes",
+        fake_submit,
+    )
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="alpha one This command is authorised. What is the time?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-789",
+            ),
+            direct_enabled=True,
+            diagnostic_enabled=True,
+            await_diagnostic=True,
+        )
+    )
+
+    assert result.ok is False
+    assert result.route == "direct_local"
+    assert result.diagnostic and result.diagnostic["event_id"] == "$diag"
     assert captured["room_id"] == "!bridge:test.example"
-    assert captured["content"]["body"].startswith("hermes: ")
-    assert "What is the time?" in captured["content"]["body"]
+    assert captured["content"]["body"] == "Wake STT: What is the time?"
+    assert not captured["content"]["body"].lower().startswith("hermes:")
     assert "alpha one" not in captured["content"]["body"].lower()
     assert "authorised" not in captured["content"]["body"].lower()
-    assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
+    assert captured["content"]["xarta_source"] == "wake_stt_direct_observation"
 
 
 def test_matrix_chat_direct_wrapper_uses_active_session_without_auto_rotation(
@@ -491,7 +553,7 @@ def test_matrix_chat_direct_wrapper_uses_active_session_without_auto_rotation(
             status="request_error",
             gate=gate,
             attempted=True,
-            fallback_required=True,
+            fallback_required=False,
             error="connection refused",
         )
 
@@ -741,6 +803,9 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
 
     assert result["delivery"]["route"] == "direct_local"
     assert result["delivery"]["direct"]["companion"]["speech"] == "I am okay."
+    assert result["delivery"]["pre_roll"]["queued"] is False
+    assert result["delivery"]["pre_roll"]["pending_after_threshold"] is False
+    assert result["delivery"]["pre_roll"]["direct_receipt_status"] == "delivered"
     assert result["delivery"]["tts"]["ok"] is True
     assert result["delivery"]["tts"]["event_id"] == "tts-wake-direct"
     stages = [mark["stage"] for mark in result["delivery"]["timing"]["marks"]]
@@ -843,6 +908,12 @@ def test_matrix_chat_wake_stt_direct_route_pre_rolls_then_speaks_final(monkeypat
 
     assert result["delivery"]["route"] == "direct_local"
     assert result["delivery"]["pre_roll_tts"]["event_id"] == "tts-1"
+    assert result["delivery"]["pre_roll"]["queued"] is True
+    assert result["delivery"]["pre_roll"]["pending_after_threshold"] is True
+    assert result["delivery"]["pre_roll"]["direct_receipt_status"] == "delivered"
+    assert result["delivery"]["pre_roll"]["meaning"] == (
+        "pending_direct_task_ack_not_hermes_receipt"
+    )
     assert result["delivery"]["tts"]["event_id"] == "tts-2"
     assert [payload["text"] for payload in published] == ["I heard you.", "I am online."]
     assert published[0]["interrupt"] is True
@@ -1012,6 +1083,101 @@ def test_matrix_chat_wake_stt_direct_route_preserves_long_elected_speech(monkeyp
     assert captured["text"] == long_speech
     assert "I sent the rest to Matrix" not in captured["text"]
     assert result["delivery"]["tts"]["event_id"] == "tts-long"
+
+
+def test_matrix_chat_wake_stt_direct_route_failure_has_receipt_without_matrix_post(monkeypatch):
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=False,
+            status="request_error",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=False,
+                status="request_error",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                error="connection refused",
+            ),
+            fallback_reason="request_error",
+        )
+
+    async def fake_publish_tts_payload(payload):
+        raise AssertionError(f"TTS should not queue without elected speech: {payload}")
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="Are you okay?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-direct-failure",
+                delivery_mode="direct-hermes",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    delivery = result["delivery"]
+    assert result["event_id"] is None
+    assert delivery["ok"] is False
+    assert delivery["route"] == "direct_local"
+    assert delivery["status"] == "request_error"
+    assert delivery["fallback_reason"] == "request_error"
+    assert delivery["matrix"] == {}
+    assert delivery["direct"]["fallback_required"] is False
+    assert delivery["pre_roll"]["queued"] is False
+    assert delivery["pre_roll"]["pending_after_threshold"] is False
+    assert delivery["pre_roll"]["direct_receipt_status"] == "failed"
+    assert delivery["pre_roll"]["failure_status"] == "request_error"
+    assert delivery["tts"]["reason"] == "no_hermes_elected_speech"
+
+
+def test_matrix_chat_wake_stt_route_explicit_matrix_mode_posts_addressed_transcript(monkeypatch):
+    captured = {}
+
+    class FakeE2EEClient:
+        async def send_message_content(self, room_id, content):
+            captured["room_id"] = room_id
+            captured["content"] = content
+            return {"room_id": room_id, "event_id": "$explicit-matrix"}
+
+    async def fake_get_e2ee_client(settings=None):
+        return FakeE2EEClient()
+
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="What is the time?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-matrix",
+                delivery_mode="matrix",
+                direct_enabled=False,
+            ),
+        )
+    )
+
+    assert result["event_id"] == "$explicit-matrix"
+    assert captured["room_id"] == "!bridge:test.example"
+    assert captured["content"]["body"].startswith("hermes: ")
+    assert "What is the time?" in captured["content"]["body"]
+    assert captured["content"]["xarta_capture_mode"] == "wake_to_talk"
 
 
 def test_matrix_chat_wake_stt_route_rolls_direct_request_back_to_matrix(monkeypatch):
