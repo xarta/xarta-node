@@ -17,6 +17,7 @@ import random
 import re
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from collections import deque
@@ -432,6 +433,20 @@ _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE = (
 _DEFAULT_WAKE_STT_FAST_ROUTES_FILE = (
     "/xarta-node/.lone-wolf/config/hermes-stt/wake-stt-fast-routes.json"
 )
+_WAKE_STT_FAST_ACTION_TIME_FAST_SESSION = "time_fast_session"
+_WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC = "time_current_deterministic_response"
+_WAKE_STT_FAST_ACTIONS = {
+    _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION,
+    _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+}
+_WAKE_STT_FAST_HERMES_TOOL_SURFACES = {
+    _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION: "xarta_time_lookup_only",
+}
+_WAKE_STT_FAST_LOCAL_ACTIONS = {
+    _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+}
+_DEFAULT_WAKE_STT_TIMEZONE = "Europe/London"
+_DEFAULT_WAKE_STT_TIME_TOOL = "/root/xarta-node/.xarta/.agents/bin/hermes-stt-time-tool"
 _WAKE_STT_DIRECT_NEW_SESSION_RE = re.compile(
     r"(?:^|\b)(?:/new|new session|start a new session|reset session|reset conversation|"
     r"start a new conversation|new conversation|clear session|clear conversation)(?:\b|$)",
@@ -447,6 +462,7 @@ class _WakeSttFastRouteDecision:
     session_id: str
     persist_session: bool
     tool_surface: str = ""
+    route_config: dict[str, Any] | None = None
 
 
 def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
@@ -504,6 +520,21 @@ def _wake_stt_command_code_companion(
     }
 
 
+def _wake_stt_companion_output(
+    *, status: str, speech: str, matrix_detail: str
+) -> wake_stt_direct.HermesSttCompanionOutput:
+    return wake_stt_direct.HermesSttCompanionOutput(
+        speech=speech,
+        matrix_detail=matrix_detail,
+        status=status,
+        structured=True,
+        raw_assistant_text=json.dumps(
+            {"speech": speech, "matrix_detail": matrix_detail, "status": status},
+            sort_keys=True,
+        ),
+    )
+
+
 async def _wake_stt_command_code_local_delivery(
     *,
     text: str,
@@ -515,15 +546,10 @@ async def _wake_stt_command_code_local_delivery(
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     safe_text = wake_stt_direct.command_code_storage_safe_text(text)
     gate = wake_stt_direct.apply_command_code_gate(safe_text, [])
-    companion = wake_stt_direct.HermesSttCompanionOutput(
+    companion = _wake_stt_companion_output(
+        status=status,
         speech=speech,
         matrix_detail=matrix_detail,
-        status=status,
-        structured=True,
-        raw_assistant_text=json.dumps(
-            {"speech": speech, "matrix_detail": matrix_detail, "status": status},
-            sort_keys=True,
-        ),
     )
     direct = wake_stt_direct.HermesSttSubmitResult(
         ok=False,
@@ -542,6 +568,194 @@ async def _wake_stt_command_code_local_delivery(
         gate=gate,
         direct=direct,
         fallback_reason=status,
+        timing=timing,
+    )
+
+
+def _wake_stt_fast_route_is_local_action(route: _WakeSttFastRouteDecision | None) -> bool:
+    return bool(route and route.action in _WAKE_STT_FAST_LOCAL_ACTIONS)
+
+
+def _wake_stt_fast_route_uses_hermes(route: _WakeSttFastRouteDecision | None) -> bool:
+    return bool(route and route.action in _WAKE_STT_FAST_HERMES_TOOL_SURFACES)
+
+
+def _wake_stt_fast_route_response_config(
+    route: _WakeSttFastRouteDecision,
+) -> dict[str, Any]:
+    cfg = route.route_config if isinstance(route.route_config, dict) else {}
+    response_cfg = cfg.get("response") if isinstance(cfg.get("response"), dict) else {}
+    return response_cfg
+
+
+def _wake_stt_time_tool_path() -> Path:
+    raw = os.getenv("BLUEPRINTS_WAKE_STT_TIME_TOOL", _DEFAULT_WAKE_STT_TIME_TOOL)
+    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_TIME_TOOL)
+
+
+def _wake_stt_time_tool_timeout_seconds() -> float:
+    raw = os.getenv("BLUEPRINTS_WAKE_STT_TIME_TOOL_TIMEOUT_SECONDS", "2")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 2.0
+    return max(0.2, min(value, 10.0))
+
+
+def _wake_stt_time_tool_response_fields(
+    *,
+    text: str,
+    route: _WakeSttFastRouteDecision,
+) -> dict[str, str]:
+    response_cfg = _wake_stt_fast_route_response_config(route)
+    timezone_name = (
+        _safe_str(response_cfg.get("timezone") or response_cfg.get("tz")).strip()
+        or _DEFAULT_WAKE_STT_TIMEZONE
+    )
+    kind = _safe_str(response_cfg.get("kind")).strip().lower() or "time"
+    include_seconds = bool(response_cfg.get("include_seconds", False))
+    cmd = [
+        sys.executable,
+        str(_wake_stt_time_tool_path()),
+        "--query",
+        text,
+        "--kind",
+        kind,
+        "--timezone",
+        timezone_name,
+        "--include-seconds" if include_seconds else "--no-seconds",
+    ]
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_wake_stt_time_tool_timeout_seconds(),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"time tool failed: {type(exc).__name__}: {exc}") from exc
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "time tool failed: "
+            f"returncode={completed.returncode} stderr={completed.stderr.strip()[:160]}"
+        )
+    try:
+        payload = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("time tool returned invalid JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise RuntimeError("time tool returned unsuccessful response")
+    speech = _safe_str(payload.get("speech")).strip()
+    matrix_detail = _safe_str(payload.get("matrix_detail")).strip() or speech
+    if not speech:
+        raise RuntimeError("time tool returned empty speech")
+    return {
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "status": _safe_str(payload.get("status")).strip() or "ok",
+        "kind": _safe_str(payload.get("kind")).strip(),
+        "timezone": _safe_str(payload.get("timezone")).strip() or timezone_name,
+        "time_24h": _safe_str(payload.get("local_time_24h")).strip(),
+        "helper_elapsed_ms": str(elapsed_ms),
+    }
+
+
+async def _wake_stt_fast_route_local_delivery(
+    *,
+    text: str,
+    fast_route: _WakeSttFastRouteDecision,
+    timing: wake_stt_direct.WakeSttRouteTiming | None = None,
+    trusted_authorised: bool = False,
+) -> wake_stt_direct.WakeSttDeliveryResult:
+    if fast_route.action != _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC:
+        raise ValueError(f"unsupported local Wake STT fast route action: {fast_route.action}")
+    code_list = wake_stt_direct.command_codes_from_env()
+    gate = wake_stt_direct.apply_command_code_gate(
+        text,
+        code_list,
+        trusted_authorised=trusted_authorised,
+    )
+    if not gate.meat:
+        return wake_stt_direct.WakeSttDeliveryResult(
+            ok=False,
+            status="empty_request",
+            route="none",
+            gate=gate,
+            timing=timing,
+        )
+    if timing:
+        timing.mark(
+            "fast_route_local_action_start",
+            route_id=fast_route.route_id,
+            action=fast_route.action,
+        )
+    try:
+        fields = _wake_stt_time_tool_response_fields(text=text, route=fast_route)
+    except RuntimeError as exc:
+        if timing:
+            timing.mark(
+                "fast_route_local_action_failed",
+                route_id=fast_route.route_id,
+                action=fast_route.action,
+                error=str(exc)[:160],
+            )
+        companion = _wake_stt_companion_output(
+            status="time_tool_unavailable",
+            speech="I could not read the local time just now.",
+            matrix_detail=f"Local deterministic time helper failed: {exc}",
+        )
+        direct = wake_stt_direct.HermesSttSubmitResult(
+            ok=False,
+            status="time_tool_unavailable",
+            gate=gate,
+            attempted=False,
+            fallback_required=False,
+            assistant_text=companion.raw_assistant_text,
+            companion=companion,
+            timing=timing,
+        )
+        return wake_stt_direct.WakeSttDeliveryResult(
+            ok=False,
+            status="time_tool_unavailable",
+            route="direct_local",
+            gate=gate,
+            direct=direct,
+            fallback_reason="time_tool_unavailable",
+            timing=timing,
+        )
+    companion = _wake_stt_companion_output(
+        status=fields["status"],
+        speech=fields["speech"],
+        matrix_detail=fields["matrix_detail"],
+    )
+    direct = wake_stt_direct.HermesSttSubmitResult(
+        ok=True,
+        status=fast_route.action,
+        gate=gate,
+        attempted=False,
+        fallback_required=False,
+        assistant_text=companion.raw_assistant_text,
+        companion=companion,
+        timing=timing,
+    )
+    if timing:
+        timing.mark(
+            "fast_route_local_action_delivered",
+            route_id=fast_route.route_id,
+            action=fast_route.action,
+            timezone=fields["timezone"],
+            time_24h=fields["time_24h"],
+            helper_elapsed_ms=fields["helper_elapsed_ms"],
+        )
+    return wake_stt_direct.WakeSttDeliveryResult(
+        ok=True,
+        status="delivered",
+        route="direct_local",
+        gate=gate,
+        direct=direct,
         timing=timing,
     )
 
@@ -640,7 +854,7 @@ def _wake_stt_fast_route_decision(
 ) -> _WakeSttFastRouteDecision | None:
     for route in _wake_stt_fast_route_config():
         action = _safe_str(route.get("action")).strip().lower()
-        if action != "time_fast_session":
+        if action not in _WAKE_STT_FAST_ACTIONS:
             continue
         if not _wake_stt_fast_route_matches(text, route):
             continue
@@ -659,7 +873,8 @@ def _wake_stt_fast_route_decision(
             action=action,
             session_id=f"{base_session_id}-{suffix}",
             persist_session=persist_session,
-            tool_surface="xarta_time_lookup_only",
+            tool_surface=_WAKE_STT_FAST_HERMES_TOOL_SURFACES.get(action, ""),
+            route_config=route,
         )
     return None
 
@@ -2489,6 +2704,13 @@ async def _deliver_wake_stt_with_direct_fallback(
         )
 
     config, fast_route = _wake_stt_direct_config_for_request(body)
+    if direct_enabled and _wake_stt_fast_route_is_local_action(fast_route) and fast_route:
+        return await _wake_stt_fast_route_local_delivery(
+            text=body.text,
+            fast_route=fast_route,
+            timing=timing,
+            trusted_authorised=trusted_authorised,
+        )
     result = await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
         body.text,
         matrix_send=matrix_send,
@@ -2500,7 +2722,11 @@ async def _deliver_wake_stt_with_direct_fallback(
         timing=timing,
         trusted_authorised=trusted_authorised,
     )
-    if fast_route and not fast_route.persist_session:
+    if (
+        _wake_stt_fast_route_uses_hermes(fast_route)
+        and fast_route
+        and not fast_route.persist_session
+    ):
         cleanup = await wake_stt_direct.remove_hermes_stt_session_file(
             sessions_dir=config.sessions_dir,
             session_id=config.session_id,
