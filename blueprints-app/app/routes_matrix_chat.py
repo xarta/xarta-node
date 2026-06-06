@@ -289,6 +289,129 @@ _WAKE_STT_DIRECT_NEW_SESSION_RE = re.compile(
     r"start a new conversation|new conversation|clear session|clear conversation)(?:\b|$)",
     re.IGNORECASE,
 )
+_WAKE_STT_PENDING_COMMAND_CODE_REQUESTS: dict[str, dict[str, Any]] = {}
+
+
+def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
+    del instance
+    return _safe_str(room_id)
+
+
+def _wake_stt_pending_command_ttl_seconds() -> float:
+    raw = os.getenv("BLUEPRINTS_WAKE_STT_COMMAND_CODE_PENDING_TTL_SECONDS", "180")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 180.0
+    return max(5.0, min(value, 600.0))
+
+
+def _wake_stt_pop_pending_command(key: str) -> dict[str, Any] | None:
+    pending = _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.pop(key, None)
+    if not isinstance(pending, dict):
+        return None
+    created_at = pending.get("created_monotonic")
+    if not isinstance(created_at, (int, float)):
+        return None
+    if time.monotonic() - float(created_at) > _wake_stt_pending_command_ttl_seconds():
+        return None
+    text = _safe_str(pending.get("text")).strip()
+    if not text:
+        return None
+    return {"text": text}
+
+
+def _wake_stt_store_pending_command(key: str, text: str) -> bool:
+    safe_text = wake_stt_direct.command_code_storage_safe_text(text)
+    if not safe_text:
+        return False
+    _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS[key] = {
+        "text": safe_text,
+        "created_monotonic": time.monotonic(),
+    }
+    return True
+
+
+def _wake_stt_command_code_companion(
+    status: str, speech: str, matrix_detail: str
+) -> dict[str, Any]:
+    return {
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "status": status,
+        "structured": True,
+        "raw_assistant_text": json.dumps(
+            {"speech": speech, "matrix_detail": matrix_detail, "status": status},
+            sort_keys=True,
+        ),
+    }
+
+
+async def _wake_stt_command_code_local_delivery(
+    *,
+    text: str,
+    codes: list[wake_stt_direct.CommandCode],
+    status: str,
+    speech: str,
+    matrix_detail: str,
+    timing: wake_stt_direct.WakeSttRouteTiming | None = None,
+) -> wake_stt_direct.WakeSttDeliveryResult:
+    safe_text = wake_stt_direct.command_code_storage_safe_text(text)
+    gate = wake_stt_direct.apply_command_code_gate(safe_text, [])
+    companion = wake_stt_direct.HermesSttCompanionOutput(
+        speech=speech,
+        matrix_detail=matrix_detail,
+        status=status,
+        structured=True,
+        raw_assistant_text=json.dumps(
+            {"speech": speech, "matrix_detail": matrix_detail, "status": status},
+            sort_keys=True,
+        ),
+    )
+    direct = wake_stt_direct.HermesSttSubmitResult(
+        ok=False,
+        status=status,
+        gate=gate,
+        attempted=False,
+        fallback_required=False,
+        assistant_text=companion.raw_assistant_text,
+        companion=companion,
+        timing=timing,
+    )
+    return wake_stt_direct.WakeSttDeliveryResult(
+        ok=False,
+        status=status,
+        route="direct_local",
+        gate=gate,
+        direct=direct,
+        fallback_reason=status,
+        timing=timing,
+    )
+
+
+def _wake_stt_public_requires_command_code(public: dict[str, Any]) -> bool:
+    direct = public.get("direct") if isinstance(public.get("direct"), dict) else {}
+    companion = direct.get("companion") if isinstance(direct.get("companion"), dict) else {}
+    status = _safe_str(companion.get("status") or direct.get("status") or public.get("status"))
+    blob = json.dumps(
+        {
+            "status": status,
+            "speech": companion.get("speech"),
+            "matrix_detail": companion.get("matrix_detail"),
+        },
+        sort_keys=True,
+    ).lower()
+    return any(
+        marker in blob
+        for marker in (
+            "command_code_required",
+            "command code required",
+            "delegation_gate_failed_closed",
+            "delegation_schema_review_required",
+            "could not safely verify",
+            "delegation gate failed closed",
+        )
+    )
 
 
 def _wake_stt_direct_active_session_file() -> Path:
@@ -1801,6 +1924,7 @@ def _wake_stt_transcript_body(
     hermes_prefix: str | None = None,
     address_hermes: bool = True,
 ) -> str:
+    safe_transcript = wake_stt_direct.redact_authorisation_spans_for_matrix(transcript)
     if not address_hermes:
         prefix = ""
     else:
@@ -1812,7 +1936,7 @@ def _wake_stt_transcript_body(
             prefix = f"{prefix} "
         else:
             prefix = _HERMES_BRIDGE_PREFIXES.get(server_id, "hermes: ")
-    return f"{prefix}{_WAKE_STT_TRANSCRIPT_PREFIX} {(transcript or '').strip()}"
+    return f"{prefix}{_WAKE_STT_TRANSCRIPT_PREFIX} {safe_transcript}"
 
 
 def _matrix_stt_message_content(
@@ -2088,6 +2212,7 @@ async def _deliver_wake_stt_with_direct_fallback(
     diagnostic_enabled: bool = False,
     await_diagnostic: bool = False,
     timing: wake_stt_direct.WakeSttRouteTiming | None = None,
+    trusted_authorised: bool = False,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     settings = _settings()
 
@@ -2126,6 +2251,7 @@ async def _deliver_wake_stt_with_direct_fallback(
         diagnostic_enabled=diagnostic_enabled,
         await_diagnostic=await_diagnostic,
         timing=timing,
+        trusted_authorised=trusted_authorised,
     )
 
 
@@ -3543,17 +3669,93 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         requested_direct_enabled=body.direct_enabled,
     )
     direct_requested = bool(route_readback["requested_direct_enabled"])
+    body_for_delivery = body
+    trusted_authorised_retry = False
     if direct_requested:
-        delivery_task = asyncio.create_task(
-            _deliver_wake_stt_with_direct_fallback(
-                room_id=room_id,
-                body=body,
-                direct_enabled=bool(route_readback["direct_enabled"]),
-                diagnostic_enabled=bool(body.direct_diagnostic_enabled),
-                await_diagnostic=bool(body.direct_await_diagnostic),
-                timing=timing,
-            )
+        code_list = wake_stt_direct.command_codes_from_env()
+        pending_key = _wake_stt_pending_command_key(room_id, body.instance)
+        pending = _wake_stt_pop_pending_command(pending_key)
+        exact_code_response = wake_stt_direct.is_exact_slot1_command_code_response(
+            body.text,
+            code_list,
         )
+        if pending and exact_code_response and bool(route_readback["direct_enabled"]):
+            body_for_delivery = body.model_copy(update={"text": pending["text"]})
+            trusted_authorised_retry = True
+            timing.mark("command_code_retry_authorised")
+        elif pending:
+            code_like_response = wake_stt_direct.looks_like_command_code_response(body.text)
+            timing.mark(
+                "command_code_pending_cleared",
+                reason=("malformed_or_wrong_code" if code_like_response else "new_request"),
+            )
+            delivery_task = asyncio.create_task(
+                _wake_stt_command_code_local_delivery(
+                    text=body.text,
+                    codes=code_list,
+                    status="command_code_aborted",
+                    speech=(
+                        "Command Code not accepted. The pending request was aborted."
+                        if code_like_response
+                        else "The pending Command Code request was aborted."
+                    ),
+                    matrix_detail=(
+                        "Command Code not accepted; the held Wake request was aborted."
+                        if code_like_response
+                        else (
+                            "The next Wake turn was not the exact Command Code, so the "
+                            "held request was aborted."
+                        )
+                    ),
+                    timing=timing,
+                )
+            )
+        elif exact_code_response:
+            timing.mark("command_code_stale_aborted")
+            delivery_task = asyncio.create_task(
+                _wake_stt_command_code_local_delivery(
+                    text=body.text,
+                    codes=code_list,
+                    status="command_code_stale",
+                    speech="No pending request needed that Command Code.",
+                    matrix_detail="No pending Wake request was authorised.",
+                    timing=timing,
+                )
+            )
+        elif bool(route_readback["direct_enabled"]):
+            delivery_task = asyncio.create_task(
+                _deliver_wake_stt_with_direct_fallback(
+                    room_id=room_id,
+                    body=body_for_delivery,
+                    direct_enabled=bool(route_readback["direct_enabled"]),
+                    diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                    await_diagnostic=bool(body.direct_await_diagnostic),
+                    timing=timing,
+                )
+            )
+        else:
+            delivery_task = asyncio.create_task(
+                _deliver_wake_stt_with_direct_fallback(
+                    room_id=room_id,
+                    body=body_for_delivery,
+                    direct_enabled=bool(route_readback["direct_enabled"]),
+                    diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                    await_diagnostic=bool(body.direct_await_diagnostic),
+                    timing=timing,
+                )
+            )
+        if trusted_authorised_retry:
+            delivery_task = asyncio.create_task(
+                _deliver_wake_stt_with_direct_fallback(
+                    room_id=room_id,
+                    body=body_for_delivery,
+                    direct_enabled=bool(route_readback["direct_enabled"]),
+                    diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                    await_diagnostic=bool(body.direct_await_diagnostic),
+                    timing=timing,
+                    trusted_authorised=True,
+                )
+            )
         timing.mark("blueprints_delivery_task_created")
         pre_roll_tts: dict[str, Any] = {}
         pre_roll_delay = _wake_stt_direct_pre_roll_delay_seconds()
@@ -3586,6 +3788,35 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         delivered = await delivery_task
         public = delivered.public_dict()
         direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
+        if (
+            public.get("route") == "direct_local"
+            and not direct_result.get("authorised")
+            and _wake_stt_public_requires_command_code(public)
+        ):
+            held = _safe_str(direct_result.get("diagnostic_text") or body_for_delivery.text)
+            held_saved = _wake_stt_store_pending_command(pending_key, held)
+            companion_override = _wake_stt_command_code_companion(
+                "command_code_required",
+                "Command Code required. Please say the Command Code now.",
+                (
+                    "Command Code required; the Wake request is held for the next Wake turn only."
+                    if held_saved
+                    else "Command Code required; no request was held."
+                ),
+            )
+            direct_result["companion"] = companion_override
+            direct_result["assistant_text"] = companion_override["raw_assistant_text"]
+            direct_result["status"] = "command_code_required"
+            direct_result["error"] = ""
+            public["direct"] = direct_result
+            public["status"] = "command_code_required"
+            public["ok"] = False
+            public["fallback_reason"] = "command_code_required"
+            public["command_code_pending"] = {
+                "held": bool(held_saved),
+                "scope": "next_wake_turn",
+            }
+            timing.mark("command_code_challenge_held", held=bool(held_saved))
         if public.get("route") == "direct_local":
             pre_roll_status["direct_receipt_status"] = "delivered" if public.get("ok") else "failed"
             if not public.get("ok"):
@@ -3609,7 +3840,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             if speech:
                 tts_result = await _publish_wake_stt_direct_tts(
                     speech=speech,
-                    body=body,
+                    body=body_for_delivery,
                     route="direct_local",
                 )
                 public["tts"] = tts_result

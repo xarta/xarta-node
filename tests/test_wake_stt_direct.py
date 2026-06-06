@@ -12,35 +12,76 @@ from app import wake_stt_direct
 
 def test_command_code_config_limits_and_sanitizes_public_ids():
     config = [
-        {"id": "alpha/unsafe", "aliases": ["alpha one"]},
+        {"id": "alpha/unsafe", "aliases": ["alpha one seven"]},
         {"id": "ignored", "aliases": []},
         {"id": "alphaunsafe", "aliases": ["duplicate id is allowed after id cleanup"]},
-    ] + [{"id": f"code-{i}", "aliases": [f"phrase {i}"]} for i in range(120)]
+    ] + [{"id": f"code-{i}", "aliases": [f"phrase {i} test"]} for i in range(120)]
 
     codes = wake_stt_direct.command_codes_from_config(config)
 
     assert len(codes) == 100
     assert codes[0].code_id == "alphaunsafe"
-    assert codes[0].aliases == ("alpha one",)
+    assert codes[0].aliases == ("authorisation alpha one seven",)
     assert all("/" not in code.code_id for code in codes)
 
 
-def test_command_code_gate_strips_spoken_code_and_injects_canonical_phrase_once():
+def test_command_code_gate_only_accepts_slot1_authorisation_three_words():
     codes = wake_stt_direct.command_codes_from_config(
-        [{"id": "code-7", "aliases": ["alpha seven", "alpha-seven"]}]
+        [
+            {"id": "code-7", "aliases": ["alpha seven maple"]},
+            {"id": "code-8", "aliases": ["bravo eight cedar"]},
+        ]
     )
 
     result = wake_stt_direct.apply_command_code_gate(
-        "Please alpha-seven delete the temporary dry run file.", codes
+        "Please delete the temporary dry run file. Authorization alpha seven maple",
+        codes,
+    )
+    ignored_slot2 = wake_stt_direct.apply_command_code_gate(
+        "Authorisation bravo eight cedar please delete the temporary dry run file.",
+        codes,
     )
 
     assert result.authorised is True
     assert result.matched_code_id == "code-7"
-    assert result.meat == "Please delete the temporary dry run file."
+    assert result.meat == "please delete the temporary dry run file."
     assert result.hermes_text == (
-        f"{wake_stt_direct.AUTHORISED_PHRASE}\n\nPlease delete the temporary dry run file."
+        f"{wake_stt_direct.AUTHORISED_PHRASE}\n\nplease delete the temporary dry run file."
     )
+    assert ignored_slot2.authorised is False
+    assert wake_stt_direct.AUTHORISED_PHRASE not in result.public_dict()["hermes_text"]
     assert "alpha" not in result.public_dict()["hermes_text"].lower()
+
+
+def test_command_code_exact_next_turn_response_rejects_extra_words():
+    codes = wake_stt_direct.command_codes_from_config(
+        [{"id": "code-1", "aliases": ["alpha seven maple"]}]
+    )
+
+    assert wake_stt_direct.is_exact_slot1_command_code_response(
+        "authorization alpha seven maple",
+        codes,
+    )
+    assert wake_stt_direct.is_exact_slot1_command_code_response(
+        "authorize alpha seven maple",
+        codes,
+    )
+    assert wake_stt_direct.is_exact_slot1_command_code_response(
+        "authorise alpha seven maple",
+        codes,
+    )
+    assert not wake_stt_direct.is_exact_slot1_command_code_response(
+        "authorization alpha seven maple please",
+        codes,
+    )
+    assert not wake_stt_direct.is_exact_slot1_command_code_response(
+        "alpha seven maple",
+        codes,
+    )
+    assert not wake_stt_direct.is_exact_slot1_command_code_response(
+        "authorization alpha seven",
+        codes,
+    )
 
 
 def test_command_code_gate_removes_fake_authorisation_without_code():
@@ -70,17 +111,38 @@ def test_command_code_gate_removes_fake_american_authorization_without_code():
 
 def test_direct_bridge_diagnostic_keeps_only_request_meat():
     codes = wake_stt_direct.command_codes_from_config(
-        [{"id": "code-12", "aliases": ["bravo twelve"]}]
+        [{"id": "code-12", "aliases": ["bravo twelve cedar"]}]
     )
 
     diagnostic = wake_stt_direct.strip_direct_wake_diagnostic(
-        "bravo twelve This command is authorised. What is the time?",
+        "authorisation bravo twelve cedar This command is authorised. What is the time?",
         codes,
     )
 
-    assert diagnostic == "What is the time?"
+    assert diagnostic == "what is the time?"
     assert "bravo" not in diagnostic.lower()
     assert "authorised" not in diagnostic.lower()
+
+
+def test_command_code_storage_safe_text_scrubs_auth_prefix_spans():
+    safe = wake_stt_direct.command_code_storage_safe_text(
+        "Create file Dave 10 authorization Amber the River Garden please."
+    )
+
+    assert safe == "Create file Dave 10 please."
+    assert "auth" not in safe.lower()
+    assert "amber" not in safe.lower()
+    assert "garden" not in safe.lower()
+
+
+def test_authorisation_matrix_redaction_scrubs_auth_prefix_plus_four_words():
+    redacted = wake_stt_direct.redact_authorisation_spans_for_matrix(
+        "delete file now authz amber river garden extra then continue"
+    )
+
+    assert redacted == "delete file now [redacted authorisation] then continue"
+    assert "amber" not in redacted.lower()
+    assert "extra" not in redacted.lower()
 
 
 def test_hermes_stt_config_loads_profile_env_without_exposing_key(tmp_path):
@@ -158,14 +220,30 @@ def test_command_codes_from_env_accepts_bounded_json():
     codes = wake_stt_direct.command_codes_from_env(
         {
             "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON": (
-                '{"command_codes":[{"id":"alpha","aliases":["alpha one"]}]}'
+                '{"command_codes":[{"id":"alpha","aliases":["alpha one seven"]}]}'
             )
         }
     )
 
     assert len(codes) == 1
     assert codes[0].code_id == "alpha"
-    assert codes[0].aliases == ("alpha one",)
+    assert codes[0].aliases == ("authorisation alpha one seven",)
+
+
+def test_command_codes_from_env_accepts_private_file(tmp_path):
+    codes_file = tmp_path / "codes.json"
+    codes_file.write_text(
+        '{"command_codes":[{"id":"slot-001","aliases":["amber river garden"]}]}',
+        encoding="utf-8",
+    )
+
+    codes = wake_stt_direct.command_codes_from_env(
+        {"BLUEPRINTS_WAKE_STT_COMMAND_CODES_FILE": str(codes_file)}
+    )
+
+    assert len(codes) == 1
+    assert codes[0].code_id == "slot-001"
+    assert codes[0].aliases == ("authorisation amber river garden",)
 
 
 def test_parse_hermes_stt_companion_output_requires_elected_speech():
@@ -314,9 +392,9 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
         async with httpx.AsyncClient(transport=transport) as client:
             timing = wake_stt_direct.WakeSttRouteTiming()
             return await wake_stt_direct.submit_wake_stt_to_hermes(
-                "alpha one Please check the time.",
+                "authorisation alpha one seven Please check the time.",
                 codes=wake_stt_direct.command_codes_from_config(
-                    [{"id": "alpha", "aliases": ["alpha one"]}]
+                    [{"id": "alpha", "aliases": ["alpha one seven"]}]
                 ),
                 config=wake_stt_direct.HermesSttConfig(
                     api_base="http://127.0.0.1:8643",
@@ -341,8 +419,8 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert wake_stt_direct.AUTHORISED_PHRASE in captured["body"]
     assert '"max_tokens":8192' in captured["body"].replace(" ", "")
     assert "Configured model/profile facts" in captured["body"]
-    assert "alpha one" not in captured["body"].lower()
-    assert public["diagnostic_text"] == "Please check the time."
+    assert "alpha one seven" not in captured["body"].lower()
+    assert public["diagnostic_text"] == "please check the time."
     assert public["matched_code_id"] == "alpha"
     assert public["companion"]["speech"] == "direct delivery acknowledged"
     assert public["companion"]["matrix_detail"] == "direct delivery acknowledged in detail"
@@ -457,9 +535,9 @@ def test_submit_wake_stt_stream_suppresses_early_deltas_for_authorised_requests(
     async def run_submit():
         async with httpx.AsyncClient(transport=transport) as client:
             return await wake_stt_direct.submit_wake_stt_to_hermes(
-                "alpha one Please stream only after scrub.",
+                "authorisation alpha one seven Please stream only after scrub.",
                 codes=wake_stt_direct.command_codes_from_config(
-                    [{"id": "alpha", "aliases": ["alpha one"]}]
+                    [{"id": "alpha", "aliases": ["alpha one seven"]}]
                 ),
                 config=wake_stt_direct.HermesSttConfig(
                     api_base="http://127.0.0.1:8643",
@@ -489,9 +567,12 @@ def test_submit_wake_stt_to_hermes_reports_api_error_without_matrix_fallback(tmp
     async def run_submit():
         async with httpx.AsyncClient(transport=transport) as client:
             return await wake_stt_direct.submit_wake_stt_to_hermes(
-                "bravo two This command is authorised. Please do a harmless thing.",
+                (
+                    "authorisation bravo two cedar This command is authorised. "
+                    "Please do a harmless thing."
+                ),
                 codes=wake_stt_direct.command_codes_from_config(
-                    [{"id": "bravo", "aliases": ["bravo two"]}]
+                    [{"id": "bravo", "aliases": ["bravo two cedar"]}]
                 ),
                 config=wake_stt_direct.HermesSttConfig(
                     api_base="http://127.0.0.1:8643",
@@ -507,7 +588,7 @@ def test_submit_wake_stt_to_hermes_reports_api_error_without_matrix_fallback(tmp
     assert result.ok is False
     assert result.status == "api_error"
     assert result.fallback_required is False
-    assert public["diagnostic_text"] == "Please do a harmless thing."
+    assert public["diagnostic_text"] == "please do a harmless thing."
     assert "bravo" not in public["diagnostic_text"].lower()
     assert "authorised" not in public["diagnostic_text"].lower()
 
@@ -529,9 +610,9 @@ def test_submit_wake_stt_to_hermes_scrubs_authorisation_phrase_after_response(tm
     async def run_submit():
         async with httpx.AsyncClient(transport=transport) as client:
             return await wake_stt_direct.submit_wake_stt_to_hermes(
-                "charlie three Please check context hygiene.",
+                "authorisation charlie three pine Please check context hygiene.",
                 codes=wake_stt_direct.command_codes_from_config(
-                    [{"id": "charlie", "aliases": ["charlie three"]}]
+                    [{"id": "charlie", "aliases": ["charlie three pine"]}]
                 ),
                 config=wake_stt_direct.HermesSttConfig(
                     api_base="http://127.0.0.1:8643",
@@ -565,9 +646,9 @@ def test_deliver_wake_stt_direct_failure_does_not_send_matrix_fallback():
 
     async def run_delivery():
         return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
-            "delta four This command is authorised. Please check the time.",
+            "authorisation delta four oak This command is authorised. Please check the time.",
             codes=wake_stt_direct.command_codes_from_config(
-                [{"id": "delta", "aliases": ["delta four"]}]
+                [{"id": "delta", "aliases": ["delta four oak"]}]
             ),
             config=wake_stt_direct.HermesSttConfig(
                 api_base="http://127.0.0.1:8643",
@@ -585,7 +666,7 @@ def test_deliver_wake_stt_direct_failure_does_not_send_matrix_fallback():
     assert result.status == "not_configured"
     assert result.fallback_reason == "not_configured"
     assert matrix_seen["called"] is False
-    assert "delta four" not in str(public).lower()
+    assert "delta four oak" not in str(public).lower()
     assert "authorised" not in public["diagnostic_text"].lower()
 
 
@@ -598,9 +679,9 @@ def test_deliver_wake_stt_explicit_matrix_mode_strips_codes_and_authorisation():
 
     async def run_delivery():
         return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
-            "delta four This command is authorised. Please check the time.",
+            "authorisation delta four oak This command is authorised. Please check the time.",
             codes=wake_stt_direct.command_codes_from_config(
-                [{"id": "delta", "aliases": ["delta four"]}]
+                [{"id": "delta", "aliases": ["delta four oak"]}]
             ),
             config=wake_stt_direct.HermesSttConfig(
                 api_base="http://127.0.0.1:8643",
@@ -616,9 +697,9 @@ def test_deliver_wake_stt_explicit_matrix_mode_strips_codes_and_authorisation():
     assert result.ok is True
     assert result.route == "matrix"
     assert result.fallback_reason == ""
-    assert matrix_seen["text"] == "Please check the time."
+    assert matrix_seen["text"] == "please check the time."
     assert public["matrix"]["event_id"] == "$matrix"
-    assert "delta four" not in str(public).lower()
+    assert "delta four oak" not in str(public).lower()
     assert "authorised" not in public["diagnostic_text"].lower()
 
 
@@ -644,9 +725,9 @@ def test_deliver_wake_stt_direct_success_can_schedule_redacted_diagnostic(tmp_pa
     async def run_delivery():
         async with httpx.AsyncClient(transport=transport) as client:
             return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
-                "echo five Please list system status.",
+                "authorisation echo five ash Please list system status.",
                 codes=wake_stt_direct.command_codes_from_config(
-                    [{"id": "echo", "aliases": ["echo five"]}]
+                    [{"id": "echo", "aliases": ["echo five ash"]}]
                 ),
                 config=wake_stt_direct.HermesSttConfig(
                     api_base="http://127.0.0.1:8643",
@@ -666,7 +747,7 @@ def test_deliver_wake_stt_direct_success_can_schedule_redacted_diagnostic(tmp_pa
 
     assert result.ok is True
     assert result.route == "direct_local"
-    assert diagnostic_seen["text"] == "Please list system status."
+    assert diagnostic_seen["text"] == "please list system status."
     assert public["diagnostic"]["event_id"] == "$diag"
     assert "secret-test-key" not in str(public)
     assert wake_stt_direct.AUTHORISED_PHRASE not in str(public)
