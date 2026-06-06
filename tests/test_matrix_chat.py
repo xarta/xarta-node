@@ -737,6 +737,207 @@ def test_matrix_chat_direct_wrapper_uses_compact_session_for_time_lookup(monkeyp
     )
 
 
+def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_time(
+    monkeypatch, tmp_path
+):
+    captured = {"fallback_calls": 0, "helper_texts": []}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-heavy"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_current_exact",
+                        "action": "time_current_deterministic_response",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": [
+                                "what's the time",
+                                "whats the time",
+                                "what is the time",
+                                "time please",
+                            ],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_delivery(*_args, **_kwargs):
+        captured["fallback_calls"] += 1
+        raise AssertionError("deterministic current-time action must not call Hermes")
+
+    def fake_time_tool_response_fields(*, text, route):
+        captured["helper_texts"].append(text)
+        assert route.action == "time_current_deterministic_response"
+        return {
+            "speech": "twenty-one fifteen",
+            "matrix_detail": "Local time (Europe/London, BST): 2026-06-06 21:15.",
+            "status": "ok",
+            "kind": "time",
+            "timezone": "Europe/London",
+            "time_24h": "21:15",
+            "helper_elapsed_ms": "1.2",
+        }
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fail_delivery,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_time_tool_response_fields",
+        fake_time_tool_response_fields,
+    )
+
+    for phrase in ("what's the time", "whats the time", "what is the time", "time please"):
+        result = asyncio.run(
+            matrix_chat._deliver_wake_stt_with_direct_fallback(
+                room_id="!bridge:test.example",
+                body=matrix_chat._WakeSttMessageBody(
+                    text=phrase,
+                    instance="local",
+                    candidate_source="payload0",
+                    command="execute",
+                    wake_word="Computer",
+                    candidate_revision="wake-local-time",
+                ),
+                direct_enabled=True,
+            )
+        )
+        public = result.public_dict()
+        companion = public["direct"]["companion"]
+        assert public["ok"] is True
+        assert public["route"] == "direct_local"
+        assert public["direct"]["attempted"] is False
+        assert public["direct"]["status"] == "time_current_deterministic_response"
+        assert companion["status"] == "ok"
+        assert companion["speech"] == "twenty-one fifteen"
+        assert companion["matrix_detail"].startswith("Local time (Europe/London")
+
+    assert captured["fallback_calls"] == 0
+    assert captured["helper_texts"] == [
+        "what's the time",
+        "whats the time",
+        "what is the time",
+        "time please",
+    ]
+    assert json.loads(active_session.read_text(encoding="utf-8"))["session_id"] == (
+        "wake-stt-local-operator-heavy"
+    )
+
+
+def test_matrix_chat_deterministic_current_time_action_is_exact_only(monkeypatch, tmp_path):
+    captured = {}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-kept"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_current_exact",
+                        "action": "time_current_deterministic_response",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["what is the time"],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_delivery(text, *, config=None, codes=None, **_kwargs):
+        captured["text"] = text
+        captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        direct = matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text="Hermes path.",
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="Hermes path.",
+                matrix_detail="Hermes path.",
+                status="ok",
+                structured=False,
+                raw_assistant_text="Hermes path.",
+            ),
+        )
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=direct,
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fake_delivery,
+    )
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="what is the time in London",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-time-near-miss",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert result.ok is True
+    assert captured["text"] == "what is the time in London"
+    assert captured["session_id"] == "wake-stt-local-operator-kept"
+    assert captured["tool_surface"] == ""
+
+
 def test_wake_stt_fast_routes_file_uses_lone_wolf_config_default(monkeypatch, tmp_path):
     fast_routes = tmp_path / "wake-stt-fast-routes.json"
     monkeypatch.delenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", raising=False)
