@@ -1127,6 +1127,81 @@ def scrub_hermes_stt_session_phrase(
     }
 
 
+async def scrub_and_check_hermes_stt_session_phrase(
+    *,
+    sessions_dir: Path = DEFAULT_HERMES_STT_SESSIONS_DIR,
+    session_id: str = DEFAULT_HERMES_STT_SESSION_ID,
+    phrase: str = AUTHORISED_PHRASE,
+    attempts: int = 6,
+    delay_seconds: float = 0.05,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Scrub persisted markers after Hermes' async session save settles."""
+    total_scrubbed = 0
+    last_scrub: dict[str, Any] = {"ok": True, "scrubbed_count": 0, "scanned_files": 0}
+    last_check: dict[str, Any] = {"ok": True, "hits": [], "hit_count": 0, "scanned_files": 0}
+    for index in range(max(1, attempts)):
+        last_scrub = scrub_hermes_stt_session_phrase(
+            sessions_dir=sessions_dir,
+            session_id=session_id,
+            phrase=phrase,
+        )
+        total_scrubbed += int(last_scrub.get("scrubbed_count") or 0)
+        last_check = inspect_hermes_stt_session_phrase_absence(
+            sessions_dir=sessions_dir,
+            session_id=session_id,
+            phrase=phrase,
+        )
+        if last_scrub.get("ok", False) and last_check.get("ok", False):
+            break
+        if index + 1 < max(1, attempts):
+            await asyncio.sleep(delay_seconds)
+    scrub_result = dict(last_scrub)
+    scrub_result["scrubbed_count"] = total_scrubbed
+    scrub_result["attempts"] = index + 1
+    return scrub_result, last_check
+
+
+async def remove_hermes_stt_session_file(
+    *,
+    sessions_dir: Path = DEFAULT_HERMES_STT_SESSIONS_DIR,
+    session_id: str = DEFAULT_HERMES_STT_SESSION_ID,
+    attempts: int = 8,
+    delay_seconds: float = 0.05,
+) -> dict[str, Any]:
+    """Remove one exact session file after a deliberately ephemeral turn."""
+    files_seen = 0
+    removed = False
+    last_error = ""
+    for index in range(max(1, attempts)):
+        files = _candidate_session_files(sessions_dir, session_id=session_id, max_files=1)
+        files_seen = max(files_seen, len(files))
+        if files:
+            try:
+                files[0].unlink()
+                removed = True
+            except OSError as exc:
+                last_error = str(exc)[:240]
+        if not _candidate_session_files(sessions_dir, session_id=session_id, max_files=1):
+            return {
+                "ok": not last_error,
+                "removed": removed,
+                "scanned_files": files_seen,
+                "session_id": session_id,
+                "attempts": index + 1,
+                "error": last_error,
+            }
+        if index + 1 < max(1, attempts):
+            await asyncio.sleep(delay_seconds)
+    return {
+        "ok": False,
+        "removed": removed,
+        "scanned_files": files_seen,
+        "session_id": session_id,
+        "attempts": max(1, attempts),
+        "error": last_error or "session file remained after cleanup attempts",
+    }
+
+
 async def submit_wake_stt_to_hermes(
     text: str,
     *,
@@ -1274,13 +1349,9 @@ async def submit_wake_stt_to_hermes(
                 timing=timing,
             )
         companion = parse_hermes_stt_companion_output(assistant_text)
-        context_scrub = (
-            scrub_hermes_stt_session_phrase(
-                sessions_dir=config.sessions_dir,
-                session_id=config.session_id,
-            )
-            if gate.authorised
-            else {"ok": True, "skipped": True}
+        context_scrub, context_check = await scrub_and_check_hermes_stt_session_phrase(
+            sessions_dir=config.sessions_dir,
+            session_id=config.session_id,
         )
         if not context_scrub.get("ok", False):
             return HermesSttSubmitResult(
@@ -1297,14 +1368,8 @@ async def submit_wake_stt_to_hermes(
                 error="authorisation phrase could not be scrubbed from hermes-stt session context",
                 timing=timing,
             )
-        context_check = (
-            inspect_hermes_stt_session_phrase_absence(
-                sessions_dir=config.sessions_dir,
-                session_id=config.session_id,
-            )
-            if inspect_context
-            else {"ok": True, "skipped": True}
-        )
+        if not inspect_context:
+            context_check = {"ok": True, "skipped": True}
         if not context_check.get("ok", False):
             return HermesSttSubmitResult(
                 ok=False,

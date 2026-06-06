@@ -145,6 +145,78 @@ def test_authorisation_matrix_redaction_scrubs_auth_prefix_plus_four_words():
     assert "extra" not in redacted.lower()
 
 
+def test_scrub_and_check_hermes_stt_session_phrase_removes_late_marker(tmp_path):
+    session = tmp_path / "session_wake-stt-local.json"
+    session.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{wake_stt_direct.AUTHORISED_PHRASE}\n\ndelete the dry-run file"
+                        ),
+                    },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "arguments": json.dumps(
+                                        {
+                                            "context": (
+                                                "The trusted marker was "
+                                                f"{wake_stt_direct.AUTHORISED_PHRASE}."
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scrub, check = asyncio.run(
+        wake_stt_direct.scrub_and_check_hermes_stt_session_phrase(
+            sessions_dir=tmp_path,
+            session_id="wake-stt-local",
+            attempts=2,
+            delay_seconds=0,
+        )
+    )
+
+    updated = session.read_text(encoding="utf-8")
+    assert scrub["ok"] is True
+    assert scrub["scrubbed_count"] == 2
+    assert check["ok"] is True
+    assert wake_stt_direct.AUTHORISED_PHRASE not in updated
+
+
+def test_remove_hermes_stt_session_file_removes_exact_ephemeral_session(tmp_path):
+    keep = tmp_path / "session_wake-stt-local.json"
+    remove = tmp_path / "session_wake-stt-local-time-fast-abc123.json"
+    keep.write_text("keep", encoding="utf-8")
+    remove.write_text("remove", encoding="utf-8")
+
+    result = asyncio.run(
+        wake_stt_direct.remove_hermes_stt_session_file(
+            sessions_dir=tmp_path,
+            session_id="wake-stt-local-time-fast-abc123",
+            attempts=1,
+            delay_seconds=0,
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["removed"] is True
+    assert keep.exists()
+    assert not remove.exists()
+
+
 def test_hermes_stt_config_loads_profile_env_without_exposing_key(tmp_path):
     profile_env = tmp_path / "hermes-stt.env"
     profile_env.write_text(
