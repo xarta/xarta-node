@@ -12,7 +12,7 @@ usage() {
     cat <<'EOF'
 Usage: lone-wolf-stack-runtime-fix-owner.sh [--check] [--apply] [--verbose]
 
-Repairs known Postgres runtime mount ownership under /xarta-node/.lone-wolf/stacks.
+Repairs known Postgres and Redis runtime mount ownership under /xarta-node/.lone-wolf/stacks.
 It intentionally does not normalize source/docs ownership.
 EOF
 }
@@ -86,6 +86,12 @@ for compose in "$STACKS_DIR"/*/compose.yaml; do
     if grep -Eq 'image:[[:space:]]*"?pgvector/pgvector:pg16' "$compose"; then
         if grep -Eq '\./data/postgres:/var/lib/postgresql/data' "$compose"; then
             repair_path "$stack_dir/data/postgres" "999:999" "$stack_name pgvector-pg16"
+        fi
+    fi
+
+    if grep -Eq 'image:[[:space:]]*"?([^"[:space:]]*/)?redis:[^"[:space:]]*-alpine' "$compose"; then
+        if grep -Eq '\./data/redis:/data' "$compose"; then
+            repair_path "$stack_dir/data/redis" "999:1000" "$stack_name redis-alpine"
         fi
     fi
 done
