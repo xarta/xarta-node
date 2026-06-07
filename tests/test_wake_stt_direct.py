@@ -709,6 +709,82 @@ def test_deliver_wake_stt_reuses_stored_profile_routing_for_authorised_retry(mon
     }
 
 
+def test_submit_wake_stt_profile_handoff_schedules_assignment(monkeypatch, tmp_path):
+    assignments: list[dict[str, object]] = []
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-local",
+        requires_command_code=True,
+        complex=False,
+        risk_class="filesystem_mutation",
+        confidence=0.92,
+        reason="filesystem mutation",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    def fake_target_config(*_args, **_kwargs):
+        return wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8645",
+            api_key="secret-test-key",
+            model="hermes-stt-local",
+            sessions_dir=tmp_path,
+        )
+
+    async def fake_submit(text, *, codes=None, trusted_authorised=False, **_kwargs):
+        await asyncio.sleep(0)
+        gate = wake_stt_direct.apply_command_code_gate(
+            text,
+            codes or [],
+            trusted_authorised=trusted_authorised,
+        )
+        companion = wake_stt_direct.HermesSttCompanionOutput(
+            speech="handoff ok",
+            matrix_detail="handoff detail",
+            status="ok",
+            structured=True,
+            raw_assistant_text=(
+                '{"speech":"handoff ok","matrix_detail":"handoff detail","status":"ok"}'
+            ),
+        )
+        return wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+        )
+
+    def on_assignment(assignment):
+        assignments.append(dict(assignment))
+
+        async def mark_sent():
+            assignments.append({"sent": True})
+
+        return mark_sent()
+
+    monkeypatch.setattr(wake_stt_direct, "load_hermes_stt_target_config", fake_target_config)
+    monkeypatch.setattr(wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
+
+    async def run():
+        return await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "create a file called Dave Computer",
+            profile_routing=routing,
+            codes=[],
+            trusted_authorised=True,
+            handoff_assignment_callback=on_assignment,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert assignments[0]["target_profile"] == "hermes-stt-local"
+    assert assignments[0]["request_text"] == "create a file called Dave Computer"
+    assert assignments[0]["reason"] == "filesystem mutation"
+    assert assignments[1] == {"sent": True}
+
+
 def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
     deltas = []
     captured = {}

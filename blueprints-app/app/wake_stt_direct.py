@@ -361,6 +361,7 @@ class WakeSttDeliveryResult:
 
 MatrixDeliverySender = Callable[[str], Awaitable[dict[str, Any]]]
 AssistantDeltaCallback = Callable[[str], Awaitable[None] | None]
+HandoffAssignmentCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 def _truthy(value: Any) -> bool:
@@ -2064,6 +2065,7 @@ async def submit_wake_stt_profile_handoff(
     client: httpx.AsyncClient | None = None,
     timing: WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
+    handoff_assignment_callback: HandoffAssignmentCallback | None = None,
 ) -> HermesSttSubmitResult:
     code_list = command_codes_from_env() if codes is None else codes
     gate = apply_command_code_gate(text, code_list, trusted_authorised=trusted_authorised)
@@ -2140,6 +2142,19 @@ async def submit_wake_stt_profile_handoff(
         )
     if timing:
         timing.mark("profile_handoff_start", target_profile=profile_routing.target_profile)
+    _schedule_handoff_assignment_callback(
+        handoff_assignment_callback,
+        {
+            "target_profile": profile_routing.target_profile,
+            "request_text": command_code_storage_safe_text(gate.meat),
+            "reason": profile_routing.reason,
+            "risk_class": profile_routing.risk_class,
+            "complex": profile_routing.complex,
+            "requires_command_code": profile_routing.requires_command_code,
+            "status": "assigned",
+        },
+        timing=timing,
+    )
     result = await submit_wake_stt_to_hermes(
         text,
         codes=code_list,
@@ -2185,11 +2200,40 @@ async def _send_delivery_safely(
     return {"ok": True, "result": result}
 
 
+def _schedule_handoff_assignment_callback(
+    callback: HandoffAssignmentCallback | None,
+    assignment: dict[str, Any],
+    *,
+    timing: WakeSttRouteTiming | None = None,
+) -> bool:
+    if not callback:
+        return False
+    try:
+        result = callback(assignment)
+    except Exception as exc:  # pragma: no cover - callback implementations vary.
+        if timing:
+            timing.mark(
+                "profile_handoff_assignment_failed",
+                target_profile=assignment.get("target_profile"),
+                error=type(exc).__name__,
+            )
+        return False
+    if result is not None:
+        asyncio.create_task(result)
+    if timing:
+        timing.mark(
+            "profile_handoff_assignment_scheduled",
+            target_profile=assignment.get("target_profile"),
+        )
+    return True
+
+
 async def deliver_wake_stt_with_matrix_fallback(
     text: str,
     *,
     matrix_send: MatrixDeliverySender,
     diagnostic_send: MatrixDeliverySender | None = None,
+    handoff_assignment_callback: HandoffAssignmentCallback | None = None,
     codes: list[CommandCode] | None = None,
     config: HermesSttConfig | None = None,
     client: httpx.AsyncClient | None = None,
@@ -2296,6 +2340,7 @@ async def deliver_wake_stt_with_matrix_fallback(
                         timing=timing,
                         trusted_authorised=trusted_authorised,
                         profile_routing=profile_routing,
+                        handoff_assignment_callback=handoff_assignment_callback,
                     )
             else:
                 if base_submit_task:
@@ -2316,6 +2361,7 @@ async def deliver_wake_stt_with_matrix_fallback(
                     timing=timing,
                     trusted_authorised=trusted_authorised,
                     profile_routing=profile_routing,
+                    handoff_assignment_callback=handoff_assignment_callback,
                 )
         else:
             direct_result = await submit_wake_stt_to_hermes(
