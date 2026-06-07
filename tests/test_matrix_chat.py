@@ -10,6 +10,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 from app import routes_matrix_chat as matrix_chat
 
 
+@pytest.fixture(autouse=True)
+def _default_wake_stt_profile_classifier(monkeypatch):
+    async def fake_classifier(*_args, **_kwargs):
+        return matrix_chat.wake_stt_direct.WakeSttProfileRoutingResult(
+            target_profile="hermes-stt",
+            requires_command_code=False,
+            complex=False,
+            risk_class="safe_short_answer",
+            confidence=0.95,
+            reason="test default base profile",
+            speech_if_pending="",
+            status="classified",
+        )
+
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fake_classifier,
+    )
+
+
 def test_matrix_chat_reads_private_env_without_exposing_token(tmp_path, monkeypatch):
     env_file = tmp_path / "matrix.env"
     env_file.write_text(
@@ -759,6 +780,7 @@ def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_
                             "phrases": [
                                 "what's the time",
                                 "whats the time",
+                                "what time is it",
                                 "what is the time",
                                 "time please",
                             ],
@@ -773,6 +795,9 @@ def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_
     async def fail_delivery(*_args, **_kwargs):
         captured["fallback_calls"] += 1
         raise AssertionError("deterministic current-time action must not call Hermes")
+
+    async def fail_classifier(*_args, **_kwargs):
+        raise AssertionError("deterministic current-time action must not classify")
 
     def fake_time_tool_response_fields(*, text, route):
         captured["helper_texts"].append(text)
@@ -804,12 +829,23 @@ def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_
         fail_delivery,
     )
     monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fail_classifier,
+    )
+    monkeypatch.setattr(
         matrix_chat,
         "_wake_stt_time_tool_response_fields",
         fake_time_tool_response_fields,
     )
 
-    for phrase in ("what's the time", "whats the time", "what is the time", "time please"):
+    for phrase in (
+        "what's the time",
+        "whats the time",
+        "what time is it",
+        "what is the time",
+        "time please",
+    ):
         result = asyncio.run(
             matrix_chat._deliver_wake_stt_with_direct_fallback(
                 room_id="!bridge:test.example",
@@ -838,6 +874,7 @@ def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_
     assert captured["helper_texts"] == [
         "what's the time",
         "whats the time",
+        "what time is it",
         "what is the time",
         "time please",
     ]
@@ -1355,6 +1392,135 @@ def test_matrix_chat_wake_stt_command_code_retry_authorises_only_pending_request
     assert "alpha one seven" not in json.dumps(first).lower()
     assert "alpha one seven" not in json.dumps(second).lower()
     assert matrix_chat.wake_stt_direct.AUTHORISED_PHRASE not in json.dumps(second)
+
+
+def test_matrix_chat_wake_stt_pending_reuses_profile_routing(monkeypatch):
+    matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    classifier_calls = {"count": 0}
+    handoff_calls: list[dict[str, object]] = []
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"alpha","aliases":["alpha one seven"]}]}',
+    )
+
+    async def fake_classifier(*_args, **_kwargs):
+        classifier_calls["count"] += 1
+        return matrix_chat.wake_stt_direct.WakeSttProfileRoutingResult(
+            target_profile="hermes-stt-smart",
+            requires_command_code=True,
+            complex=True,
+            risk_class="scripting",
+            confidence=0.96,
+            reason="script building",
+            speech_if_pending="Authorisation Command Code required.",
+            status="classified",
+        )
+
+    async def fake_base_submit(text, *, codes=None, **_kwargs):
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+            speech="base should be ignored",
+            matrix_detail="base should be ignored",
+            status="ok",
+            structured=True,
+            raw_assistant_text=(
+                '{"speech":"base should be ignored","matrix_detail":"base should be ignored",'
+                '"status":"ok"}'
+            ),
+        )
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+        )
+
+    async def fake_handoff(text, *, profile_routing, trusted_authorised=False, **_kwargs):
+        handoff_calls.append(
+            {
+                "text": text,
+                "target_profile": profile_routing.target_profile,
+                "trusted_authorised": trusted_authorised,
+            }
+        )
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(
+            text,
+            matrix_chat.wake_stt_direct.command_codes_from_env(),
+            trusted_authorised=trusted_authorised,
+        )
+        companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+            speech="smart handoff ok",
+            matrix_detail="smart handoff detail",
+            status="ok",
+            structured=True,
+            raw_assistant_text=(
+                '{"speech":"smart handoff ok","matrix_detail":"smart handoff detail","status":"ok"}'
+            ),
+        )
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+            target_profile=profile_routing.target_profile,
+            profile_routing=profile_routing,
+        )
+
+    async def fake_publish(payload):
+        return {"ok": True, "event": {"event_id": "$tts"}, "payload": payload}
+
+    async def fake_report(**_kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(matrix_chat.wake_stt_direct, "classify_wake_stt_profile", fake_classifier)
+    monkeypatch.setattr(matrix_chat.wake_stt_direct, "submit_wake_stt_to_hermes", fake_base_submit)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "submit_wake_stt_profile_handoff",
+        fake_handoff,
+    )
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish)
+    monkeypatch.setattr(matrix_chat, "_send_wake_stt_direct_response_report_safely", fake_report)
+
+    first = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="build a script to validate Hermes STT",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+    second = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="authorize alpha one seven",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert first["delivery"]["status"] == "command_code_required"
+    assert first["delivery"]["command_code_pending"]["target_profile"] == "hermes-stt-smart"
+    assert second["delivery"]["ok"] is True
+    assert second["delivery"]["direct"]["target_profile"] == "hermes-stt-smart"
+    assert classifier_calls["count"] == 1
+    assert handoff_calls == [
+        {
+            "text": "build a script to validate Hermes STT",
+            "target_profile": "hermes-stt-smart",
+            "trusted_authorised": True,
+        }
+    ]
 
 
 def test_matrix_chat_wake_stt_pre_roll_uses_command_code_accepted_message(monkeypatch, tmp_path):

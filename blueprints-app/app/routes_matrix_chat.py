@@ -491,16 +491,25 @@ def _wake_stt_pop_pending_command(key: str) -> dict[str, Any] | None:
     text = _safe_str(pending.get("text")).strip()
     if not text:
         return None
-    return {"text": text}
+    profile_routing = (
+        pending.get("profile_routing") if isinstance(pending.get("profile_routing"), dict) else {}
+    )
+    return {"text": text, "profile_routing": profile_routing}
 
 
-def _wake_stt_store_pending_command(key: str, text: str) -> bool:
+def _wake_stt_store_pending_command(
+    key: str,
+    text: str,
+    *,
+    profile_routing: dict[str, Any] | None = None,
+) -> bool:
     safe_text = wake_stt_direct.command_code_storage_safe_text(text)
     if not safe_text:
         return False
     _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS[key] = {
         "text": safe_text,
         "created_monotonic": time.monotonic(),
+        "profile_routing": profile_routing if isinstance(profile_routing, dict) else {},
     }
     return True
 
@@ -2675,6 +2684,7 @@ async def _deliver_wake_stt_with_direct_fallback(
     await_diagnostic: bool = False,
     timing: wake_stt_direct.WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
+    profile_routing_result: dict[str, Any] | None = None,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     settings = _settings()
 
@@ -2721,6 +2731,8 @@ async def _deliver_wake_stt_with_direct_fallback(
         await_diagnostic=await_diagnostic,
         timing=timing,
         trusted_authorised=trusted_authorised,
+        profile_routing_enabled=bool(direct_enabled),
+        profile_routing_result=profile_routing_result,
     )
     if (
         _wake_stt_fast_route_uses_hermes(fast_route)
@@ -4162,6 +4174,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
     body_for_delivery = body
     trusted_authorised_retry = False
     inline_authorised = False
+    pending_profile_routing: dict[str, Any] = {}
     if direct_requested:
         code_list = wake_stt_direct.command_codes_from_env()
         pending_key = _wake_stt_pending_command_key(room_id, body.instance)
@@ -4172,6 +4185,11 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         )
         if pending and exact_code_response and bool(route_readback["direct_enabled"]):
             body_for_delivery = body.model_copy(update={"text": pending["text"]})
+            pending_profile_routing = (
+                pending.get("profile_routing")
+                if isinstance(pending.get("profile_routing"), dict)
+                else {}
+            )
             trusted_authorised_retry = True
             timing.mark("command_code_retry_authorised")
         elif pending:
@@ -4253,6 +4271,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     await_diagnostic=bool(body.direct_await_diagnostic),
                     timing=timing,
                     trusted_authorised=True,
+                    profile_routing_result=pending_profile_routing,
                 )
             )
         timing.mark("blueprints_delivery_task_created")
@@ -4302,7 +4321,16 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             and _wake_stt_public_requires_command_code(public)
         ):
             held = _safe_str(direct_result.get("diagnostic_text") or body_for_delivery.text)
-            held_saved = _wake_stt_store_pending_command(pending_key, held)
+            profile_routing = (
+                direct_result.get("profile_routing")
+                if isinstance(direct_result.get("profile_routing"), dict)
+                else {}
+            )
+            held_saved = _wake_stt_store_pending_command(
+                pending_key,
+                held,
+                profile_routing=profile_routing,
+            )
             companion_override = _wake_stt_command_code_companion(
                 "command_code_required",
                 "Authorisation Command Code required.",
@@ -4316,10 +4344,14 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             public["status"] = "command_code_required"
             public["ok"] = False
             public["fallback_reason"] = "command_code_required"
-            public["command_code_pending"] = {
+            pending_public = {
                 "held": bool(held_saved),
                 "scope": "next_wake_turn",
             }
+            target_profile = _safe_str(profile_routing.get("target_profile"))
+            if target_profile:
+                pending_public["target_profile"] = target_profile
+            public["command_code_pending"] = pending_public
             timing.mark("command_code_challenge_held", held=bool(held_saved))
         if public.get("route") == "direct_local":
             pre_roll_status["direct_receipt_status"] = "delivered" if public.get("ok") else "failed"
