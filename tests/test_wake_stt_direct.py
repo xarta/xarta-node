@@ -506,6 +506,209 @@ def test_submit_wake_stt_to_hermes_posts_gated_chat_completion(tmp_path):
     assert "secret-test-key" not in str(public)
 
 
+def test_validate_wake_stt_profile_classifier_forces_complex_command_code():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": "hermes-stt",
+            "requires_command_code": False,
+            "complex": True,
+            "risk_class": "scripting",
+            "confidence": 0.91,
+            "reason": "script work",
+            "speech_if_pending": "Command Code please.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.target_profile == "hermes-stt"
+    assert parsed.requires_command_code is True
+    assert parsed.complex is True
+
+
+def test_classify_wake_stt_profile_invalid_json_defaults_smart(tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "not json"}}]},
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "build a script",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                },
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == "hermes-stt-smart"
+    assert result.requires_command_code is True
+    assert result.status == "classifier_failed_closed"
+
+
+def test_classify_wake_stt_profile_timeout_defaults_smart(tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps({"classifier_model": "PRIMARY-LOCAL-TEST", "timeout_ms": 1200, "examples": []}),
+        encoding="utf-8",
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow classifier")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "diagnose the remote GPU host",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                },
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == "hermes-stt-smart"
+    assert result.requires_command_code is True
+    assert result.status == "classifier_timeout_defaulted_smart"
+
+
+def test_deliver_wake_stt_profile_classifier_runs_parallel_with_base_submit(monkeypatch):
+    events: list[str] = []
+    submit_started = asyncio.Event()
+
+    async def fake_classifier(*_args, **_kwargs):
+        events.append("classifier_start")
+        await submit_started.wait()
+        events.append("classifier_done")
+        return wake_stt_direct.WakeSttProfileRoutingResult(
+            target_profile="hermes-stt-smart",
+            requires_command_code=True,
+            complex=True,
+            risk_class="scripting",
+            confidence=0.94,
+            reason="script work",
+            speech_if_pending="Authorisation Command Code required.",
+            status="classified",
+        )
+
+    async def fake_submit(*_args, **_kwargs):
+        events.append("submit_start")
+        submit_started.set()
+        await asyncio.sleep(30)
+        raise AssertionError("base submit should be cancelled after complex routing")
+
+    async def matrix_send(_text):
+        raise AssertionError("matrix fallback should not be used")
+
+    monkeypatch.setattr(wake_stt_direct, "classify_wake_stt_profile", fake_classifier)
+    monkeypatch.setattr(wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
+
+    async def run():
+        return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+            "build a script",
+            matrix_send=matrix_send,
+            config=wake_stt_direct.HermesSttConfig(
+                api_base="http://127.0.0.1:8643",
+                api_key="secret",
+            ),
+            direct_enabled=True,
+            profile_routing_enabled=True,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.status == "command_code_required"
+    assert result.direct and result.direct.target_profile == "hermes-stt-smart"
+    assert events[:3] == ["classifier_start", "submit_start", "classifier_done"]
+
+
+def test_deliver_wake_stt_reuses_stored_profile_routing_for_authorised_retry(monkeypatch):
+    captured = {}
+
+    async def fail_classifier(*_args, **_kwargs):
+        raise AssertionError("stored profile routing should avoid a new classifier call")
+
+    async def fake_handoff(text, *, profile_routing, trusted_authorised=False, **_kwargs):
+        captured["text"] = text
+        captured["target_profile"] = profile_routing.target_profile
+        captured["trusted_authorised"] = trusted_authorised
+        gate = wake_stt_direct.apply_command_code_gate(text, [], trusted_authorised=True)
+        companion = wake_stt_direct.HermesSttCompanionOutput(
+            speech="handoff ok",
+            matrix_detail="handoff detail",
+            status="ok",
+            structured=True,
+            raw_assistant_text='{"speech":"handoff ok","matrix_detail":"handoff detail","status":"ok"}',
+        )
+        return wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+            target_profile=profile_routing.target_profile,
+            profile_routing=profile_routing,
+        )
+
+    async def matrix_send(_text):
+        raise AssertionError("matrix fallback should not be used")
+
+    monkeypatch.setattr(wake_stt_direct, "classify_wake_stt_profile", fail_classifier)
+    monkeypatch.setattr(wake_stt_direct, "submit_wake_stt_profile_handoff", fake_handoff)
+
+    async def run():
+        return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+            "delete that file",
+            matrix_send=matrix_send,
+            config=wake_stt_direct.HermesSttConfig(
+                api_base="http://127.0.0.1:8643",
+                api_key="secret",
+            ),
+            direct_enabled=True,
+            trusted_authorised=True,
+            profile_routing_result={
+                "target_profile": "hermes-stt-smart",
+                "requires_command_code": True,
+                "complex": True,
+                "risk_class": "destructive",
+                "confidence": 0.95,
+                "reason": "stored target",
+                "speech_if_pending": "Authorisation Command Code required.",
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert captured == {
+        "text": "delete that file",
+        "target_profile": "hermes-stt-smart",
+        "trusted_authorised": True,
+    }
+
+
 def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):
     deltas = []
     captured = {}
