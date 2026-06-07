@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import types
 from pathlib import Path
 
 import httpx
@@ -526,6 +527,44 @@ def test_validate_wake_stt_profile_classifier_forces_complex_command_code():
     assert parsed.complex is True
 
 
+def test_validate_wake_stt_profile_classifier_accepts_nullclaw_target():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": "hermes-stt-nullclaw",
+            "requires_command_code": True,
+            "complex": False,
+            "risk_class": "web_research",
+            "confidence": 0.93,
+            "reason": "bounded nullclaw research",
+            "speech_if_pending": "Command Code required for NullClaw research.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.target_profile == "hermes-stt-nullclaw"
+    assert parsed.requires_command_code is False
+
+
+def test_validate_wake_stt_profile_classifier_gates_complex_nullclaw_target():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": "hermes-stt-nullclaw",
+            "requires_command_code": False,
+            "complex": True,
+            "risk_class": "web_research",
+            "confidence": 0.93,
+            "reason": "complex research request",
+            "speech_if_pending": "Command Code required for complex research.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.target_profile == "hermes-stt-nullclaw"
+    assert parsed.requires_command_code is True
+
+
 def test_classify_wake_stt_profile_invalid_json_defaults_smart(tmp_path):
     examples = tmp_path / "profile-routing-examples.json"
     examples.write_text(
@@ -783,6 +822,237 @@ def test_submit_wake_stt_profile_handoff_schedules_assignment(monkeypatch, tmp_p
     assert assignments[0]["request_text"] == "create a file called Dave Computer"
     assert assignments[0]["reason"] == "filesystem mutation"
     assert assignments[1] == {"sent": True}
+
+
+def test_submit_wake_stt_nullclaw_target_uses_bounded_route(monkeypatch):
+    assignments: list[dict[str, object]] = []
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-nullclaw",
+        requires_command_code=False,
+        complex=False,
+        risk_class="web_research",
+        confidence=0.94,
+        reason="bounded public web research",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    async def fake_guard():
+        return {"ok": True, "status": "ok", "stdout": "all checked paths ok"}
+
+    async def fake_docs(text):
+        assert "OpenAI model routing" in text
+        return {
+            "ok": True,
+            "answer": "Local docs say OpenAI profiles use Hermes openai-codex auth.",
+            "sources": [{"path": "hermes/HERMES-STT-PROCESS-RUNBOOK.md"}],
+        }
+
+    async def fake_web(text):
+        assert "OpenAI model routing" in text
+        return {
+            "ok": True,
+            "display": {
+                "summary_markdown": "Public sources describe Responses, streaming, and tools.",
+                "source_items": [
+                    {"title": "OpenAI docs", "url": "https://platform.openai.com/docs"}
+                ],
+                "firewall_notes": ["Guarded adapter path used."],
+            },
+            "raw": {"timing": {"total_ms": 1234, "adapter_total_ms": 1000}},
+        }
+
+    def on_assignment(assignment):
+        assignments.append(dict(assignment))
+
+    monkeypatch.setattr(wake_stt_direct, "_run_nullclaw_runtime_guard_check", fake_guard)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_docs_explain", fake_docs)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_web_research", fake_web)
+
+    async def run():
+        return await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "Use NullClaw web research to compare current OpenAI model routing options",
+            profile_routing=routing,
+            codes=[],
+            handoff_assignment_callback=on_assignment,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.status == "bounded_nullclaw_completed"
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.handoff and result.handoff["mode"] == "bounded_blueprints_nullclaw"
+    assert "Local docs say" in result.companion.matrix_detail
+    assert "Public sources describe" in result.companion.matrix_detail
+    assert assignments[0]["target_profile"] == "hermes-stt-nullclaw"
+
+
+def test_call_nullclaw_web_research_uses_plain_query(monkeypatch):
+    captured = {}
+
+    class FakeWebResearchQueryBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    async def fake_query(body):
+        captured["body"] = body
+        return {"ok": True, "display": {"summary_markdown": "done"}}
+
+    fake_module = types.ModuleType("app.routes_web_research")
+    fake_module.WebResearchQueryBody = FakeWebResearchQueryBody
+    fake_module.web_research_query = fake_query
+    monkeypatch.setitem(sys.modules, "app.routes_web_research", fake_module)
+
+    result = asyncio.run(
+        wake_stt_direct._call_nullclaw_web_research(
+            "Please do some web research on the latest Stargate series proposed in 2025.",
+            timeout_seconds=1.0,
+        )
+    )
+
+    assert result["ok"] is True
+    body = captured["body"]
+    assert (
+        body.query == "Please do some web research on the latest Stargate series proposed in 2025."
+    )
+    assert not hasattr(body, "prompt")
+    assert "Bounded Wake STT" not in json.dumps(body.__dict__)
+
+
+def test_nullclaw_local_docs_are_only_used_when_requested():
+    assert not wake_stt_direct._nullclaw_request_wants_local_docs(
+        "Please do some web research on the latest Stargate series that was proposed last year in 2025."
+    )
+    assert wake_stt_direct._nullclaw_request_wants_local_docs(
+        "Use NullClaw web research and local docs to compare current OpenAI model routing options."
+    )
+
+
+def test_nullclaw_web_synthesis_speech_uses_local_model_section_only():
+    speech = wake_stt_direct._nullclaw_web_synthesis_speech(
+        {
+            "display": {
+                "summary_markdown": (
+                    "# Research: Doctor Who\n\n"
+                    "## Query Plan\n"
+                    "- Q1: `Doctor Who query`\n\n"
+                    "## Local Model Synthesis\n"
+                    "**Recent discoveries**\n\n"
+                    "- Two long-lost episodes were found [S5].\n"
+                    "- No extra discoveries were documented [S1].\n\n"
+                    "## Sources\n"
+                    "1. [BBC](https://example.test)\n"
+                )
+            }
+        }
+    )
+
+    assert "NullClaw found:" in speech
+    assert "Two long-lost episodes were found." in speech
+    assert "Query Plan" not in speech
+    assert "Sources" not in speech
+    assert "[S5]" not in speech
+
+
+def test_submit_wake_stt_nullclaw_web_only_public_request_skips_docs(monkeypatch):
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-nullclaw",
+        requires_command_code=False,
+        complex=False,
+        risk_class="web_research",
+        confidence=0.94,
+        reason="bounded public web research",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    async def fake_guard():
+        return {"ok": True, "status": "ok"}
+
+    async def fail_docs(_text):
+        raise AssertionError("public web-only request should not call local docs")
+
+    async def fake_web(text):
+        assert "Stargate" in text
+        return {
+            "ok": True,
+            "display": {
+                "summary_markdown": (
+                    "# Research: Stargate\n\n"
+                    "## Query Plan\n"
+                    "- Q1: `Stargate query`\n\n"
+                    "## Local Model Synthesis\n"
+                    "Amazon announced a new Stargate series in 2025 [S1].\n\n"
+                    "## Sources\n"
+                    "1. GateWorld\n"
+                ),
+                "source_items": [{"title": "GateWorld", "url": "https://www.gateworld.net/"}],
+                "firewall_notes": ["Guarded adapter path used."],
+            },
+            "raw": {"timing": {"total_ms": 1234, "adapter_total_ms": 1000}},
+        }
+
+    monkeypatch.setattr(wake_stt_direct, "_run_nullclaw_runtime_guard_check", fake_guard)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_docs_explain", fail_docs)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_web_research", fake_web)
+
+    async def run():
+        return await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "Please do some web research on the latest Stargate series that was proposed last year in 2025.",
+            profile_routing=routing,
+            codes=[],
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.status == "bounded_nullclaw_completed"
+    assert "Amazon announced a new Stargate series in 2025." in result.companion.speech
+    assert "Query Plan" not in result.companion.speech
+    assert "Local docs explain" not in result.companion.matrix_detail
+    assert "Amazon announced" in result.companion.matrix_detail
+
+
+def test_submit_wake_stt_nullclaw_target_fails_early_on_guard(monkeypatch):
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-nullclaw",
+        requires_command_code=False,
+        complex=False,
+        risk_class="web_research",
+        confidence=0.94,
+        reason="bounded public web research",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    async def fake_guard():
+        return {"ok": False, "status": "drift_detected", "stderr": "key owner drift"}
+
+    async def fail_docs(_text):
+        raise AssertionError("docs should not run when guard fails")
+
+    async def fail_web(_text):
+        raise AssertionError("web research should not run when guard fails")
+
+    monkeypatch.setattr(wake_stt_direct, "_run_nullclaw_runtime_guard_check", fake_guard)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_docs_explain", fail_docs)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_web_research", fail_web)
+
+    async def run():
+        return await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "Use NullClaw web research for a quick comparison",
+            profile_routing=routing,
+            codes=[],
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is False
+    assert result.fallback_required is False
+    assert result.status == "nullclaw_guard_failed"
+    assert "key owner drift" in result.companion.matrix_detail
 
 
 def test_submit_wake_stt_to_hermes_streams_chat_completion_deltas(tmp_path):

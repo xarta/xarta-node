@@ -35,11 +35,17 @@ DEFAULT_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE = Path(
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_MODEL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 1200
+WAKE_STT_NULLCLAW_PROFILE = "hermes-stt-nullclaw"
+WAKE_STT_NULLCLAW_GUARD_SCRIPT = (
+    Path("/xarta-node/.lone-wolf/stacks/nullclaw01/.claude/skills/dockge-stack-nullclaw01")
+    / "scripts/guard-nullclaw-runtime.sh"
+)
 WAKE_STT_PROFILE_TARGETS = frozenset(
     {
         "hermes-stt",
         "hermes-stt-local-duh",
         "hermes-stt-local",
+        WAKE_STT_NULLCLAW_PROFILE,
         "hermes-stt-average",
         "hermes-stt-smart",
     }
@@ -61,6 +67,7 @@ WAKE_STT_PROFILE_RISK_CLASSES = frozenset(
         "uncertain",
     }
 )
+WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES = frozenset({"docs_lookup", "web_research"})
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -1164,9 +1171,12 @@ def validate_wake_stt_profile_classifier_json(
     if confidence < 0.70 or risk_class == "uncertain":
         return None, "classifier result was uncertain"
     complex_request = bool(raw.get("complex"))
-    requires_code = bool(raw.get("requires_command_code"))
-    if complex_request or target != "hermes-stt":
-        requires_code = True
+    requires_code = _wake_stt_profile_requires_command_code(
+        target_profile=target,
+        risk_class=risk_class,
+        complex_request=complex_request,
+        classifier_requires_command_code=bool(raw.get("requires_command_code")),
+    )
     return (
         WakeSttProfileRoutingResult(
             target_profile=target,
@@ -1188,6 +1198,22 @@ def validate_wake_stt_profile_classifier_json(
     )
 
 
+def _wake_stt_profile_requires_command_code(
+    *,
+    target_profile: str,
+    risk_class: str,
+    complex_request: bool,
+    classifier_requires_command_code: bool,
+) -> bool:
+    if complex_request:
+        return True
+    if target_profile == WAKE_STT_NULLCLAW_PROFILE:
+        return risk_class not in WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES
+    if target_profile != "hermes-stt":
+        return True
+    return bool(classifier_requires_command_code)
+
+
 def _wake_stt_profile_classifier_prompt(
     *,
     request_text: str,
@@ -1206,10 +1232,14 @@ def _wake_stt_profile_classifier_prompt(
             "base": "Use hermes-stt only for ordinary low-risk short answers or when deterministic local routing already handled the request.",
             "local_duh": "Use hermes-stt-local-duh for simple local read-only/file/doc/status checks and exact transformations.",
             "local": "Use hermes-stt-local for local private thinking, local docs lookup, NullClaw docs synthesis, and non-cloud work that benefits from reasoning.",
+            "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required.",
             "average": "Use hermes-stt-average for medium-complex public web research, NullClaw web lookups, broader synthesis, and tasks likely too nuanced for local no-think.",
             "smart": "Use hermes-stt-smart for complex debugging, scripts, Proxmox/LXC/network/service diagnosis, SSH, Docker, destructive or high-impact work, and any uncertainty.",
             "authorisation": (
-                "Any non-base handoff currently requires Command Code authorisation. "
+                "Most non-base handoffs require Command Code authorisation. "
+                "The narrow exception is hermes-stt-nullclaw with risk_class docs_lookup "
+                "or web_research and complex=false; that route is bounded to local docs "
+                "and guarded NullClaw research APIs. "
                 "Any filesystem mutation, terminal, SSH, Docker, browser, web, messaging, "
                 "service, infrastructure, credential/access, destructive, externally visible, "
                 "or uncertain work requires Command Code authorisation. If complex=true then "
@@ -2056,6 +2086,411 @@ def _profile_command_code_submit_result(
     )
 
 
+def _clip_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _exception_message(exc: Exception) -> str:
+    detail = getattr(exc, "detail", None)
+    if detail:
+        return _clip_text(detail, 500)
+    return _clip_text(f"{type(exc).__name__}: {exc}", 500)
+
+
+async def _run_nullclaw_runtime_guard_check(
+    *,
+    timeout_seconds: float = 6.0,
+) -> dict[str, Any]:
+    """Run the check-only NullClaw drift guard before bounded web research."""
+    script = WAKE_STT_NULLCLAW_GUARD_SCRIPT
+    if not script.is_file():
+        return {"ok": False, "status": "missing_guard", "error": f"missing guard: {script}"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            str(script),
+            "--check",
+            "--silent",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(script.parents[4]),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout_seconds)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.communicate()
+            return {
+                "ok": False,
+                "status": "guard_timeout",
+                "error": f"NullClaw runtime guard timed out after {timeout_seconds:.1f}s",
+            }
+    except OSError as exc:
+        return {"ok": False, "status": "guard_error", "error": _exception_message(exc)}
+    out = stdout.decode("utf-8", errors="replace").strip()
+    err = stderr.decode("utf-8", errors="replace").strip()
+    return {
+        "ok": proc.returncode == 0,
+        "status": "ok" if proc.returncode == 0 else "drift_detected",
+        "returncode": proc.returncode,
+        "stdout": _clip_text(out, 1200),
+        "stderr": _clip_text(err, 1200),
+    }
+
+
+async def _call_nullclaw_docs_explain(
+    request_text: str,
+    *,
+    timeout_seconds: float = 75.0,
+) -> dict[str, Any]:
+    from .routes_docs import DocsSearchExplainBody, explain_docs_search
+
+    query = _clip_text(request_text, 1900)
+    body = DocsSearchExplainBody(
+        query=query,
+        max_searches=1,
+        max_docs=5,
+        max_chars_per_doc=3500,
+        top_k=8,
+        allowed_paths=[
+            "null-claw-web-research/",
+            "dockge/NULLCLAW01.md",
+            "hermes/",
+            "wake-to-talk/",
+        ],
+        include_history=False,
+        include_research=True,
+        include_unknown=True,
+        explanation_mode="answer",
+    )
+    try:
+        data = await asyncio.wait_for(explain_docs_search(body), timeout_seconds)
+    except Exception as exc:
+        return {"ok": False, "status": "docs_failed", "error": _exception_message(exc)}
+    return data if isinstance(data, dict) else {"ok": False, "status": "docs_invalid"}
+
+
+async def _call_nullclaw_web_research(
+    request_text: str,
+    *,
+    timeout_seconds: float = 190.0,
+) -> dict[str, Any]:
+    from .routes_web_research import WebResearchQueryBody, web_research_query
+
+    query = _clip_text(command_code_storage_safe_text(request_text), 300)
+    body = WebResearchQueryBody(
+        query=query,
+        depth="standard",
+        private_mode=False,
+    )
+    try:
+        data = await asyncio.wait_for(web_research_query(body), timeout_seconds)
+    except Exception as exc:
+        return {"ok": False, "status": "web_research_failed", "error": _exception_message(exc)}
+    return data if isinstance(data, dict) else {"ok": False, "status": "web_research_invalid"}
+
+
+def _nullclaw_request_wants_local_docs(request_text: str) -> bool:
+    text = _SPACE_RE.sub(" ", str(request_text or "").strip().lower())
+    if not text:
+        return False
+    docs_markers = (
+        "our docs",
+        "local docs",
+        "documentation",
+        "runbook",
+        "compare with our",
+        "compare it with our",
+        "compare them with our",
+        "xarta",
+        "hermes",
+        "nullclaw",
+        "null claw",
+        "norclaw",
+        "nor claw",
+        "norclore",
+        "wake stt",
+        "wake-to-talk",
+        "blueprints",
+        "model routing",
+        "profile routing",
+    )
+    return any(marker in text for marker in docs_markers)
+
+
+def _markdown_heading_key(value: str) -> str:
+    clean = re.sub(r"[*_`[\]()]+", "", str(value or "")).strip().lower()
+    clean = re.sub(r"[^a-z0-9]+", " ", clean)
+    return " ".join(clean.split())
+
+
+def _markdown_section(markdown: str, title: str) -> str:
+    target = _markdown_heading_key(title)
+    collecting = False
+    start_level = 0
+    lines: list[str] = []
+    for raw_line in str(markdown or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$", raw_line)
+        if heading:
+            level = len(heading.group(1))
+            key = _markdown_heading_key(heading.group(2))
+            if collecting and level <= start_level:
+                break
+            if key == target:
+                collecting = True
+                start_level = level
+                continue
+        if collecting:
+            lines.append(raw_line)
+    return "\n".join(lines).strip()
+
+
+def _speech_text_from_markdown(markdown: str, *, limit: int = 1800) -> str:
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\[([^\]\n]{1,180})\]\((?:https?://|mailto:)[^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "source link", text)
+    text = re.sub(r"mailto:\S+", "source link", text)
+    text = re.sub(r"\[[Ss]\d+\]", "", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-*+]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    text = re.sub(r"[*_`]+", "", text)
+    text = re.sub(r"\s+([.,;!?])", r"\1", text)
+    text = _SPACE_RE.sub(" ", text).strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[: max(0, limit - 42)].rstrip()
+    sentence_end = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+    if sentence_end > limit * 0.55:
+        clipped = clipped[: sentence_end + 1]
+    return f"{clipped} I've posted the full cited detail to Matrix."
+
+
+def _nullclaw_web_synthesis_speech(web: dict[str, Any] | None) -> str:
+    if not isinstance(web, dict):
+        return ""
+    display = web.get("display") if isinstance(web.get("display"), dict) else {}
+    summary = str(display.get("summary_markdown") or "")
+    synthesis = _markdown_section(summary, "Local Model Synthesis")
+    speech = _speech_text_from_markdown(synthesis)
+    if speech:
+        return f"NullClaw found: {speech}"
+    audio = str(display.get("audio_markdown") or "")
+    if audio:
+        audio = re.sub(r"(?is)^web research for:.*?(?:\n\s*\n|$)", "", audio).strip()
+        speech = _speech_text_from_markdown(audio)
+        if speech:
+            return speech
+    short_response = (
+        display.get("short_response") if isinstance(display.get("short_response"), dict) else {}
+    )
+    return _speech_text_from_markdown(str(short_response.get("text") or ""), limit=800)
+
+
+def _source_lines(items: Any, *, limit: int = 8) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    lines: list[str] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        title = _SPACE_RE.sub(" ", str(raw.get("title") or raw.get("path") or "source").strip())
+        url = str(raw.get("url") or raw.get("href") or raw.get("path") or "").strip()
+        if title and url:
+            lines.append(f"- {title}: {url}")
+        elif title:
+            lines.append(f"- {title}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _bounded_nullclaw_matrix_detail(
+    *,
+    request_text: str,
+    guard: dict[str, Any],
+    docs: dict[str, Any] | None,
+    web: dict[str, Any] | None,
+) -> str:
+    parts = [
+        "Wake STT bounded NullClaw handoff",
+        f"Target: {WAKE_STT_NULLCLAW_PROFILE}",
+        f"Request: {_clip_text(command_code_storage_safe_text(request_text), 600)}",
+        f"Runtime guard: {guard.get('status') or 'unknown'}",
+    ]
+    if guard.get("stdout"):
+        parts.append(f"Guard detail: {_clip_text(guard.get('stdout'), 800)}")
+    if guard.get("stderr"):
+        parts.append(f"Guard stderr: {_clip_text(guard.get('stderr'), 800)}")
+    if guard.get("error"):
+        parts.append(f"Guard error: {_clip_text(guard.get('error'), 800)}")
+
+    if docs is not None:
+        docs_ok = bool(docs.get("ok"))
+        parts.append("")
+        parts.append(f"Local docs explain: {'ok' if docs_ok else 'failed'}")
+        if docs_ok:
+            answer = _clip_text(docs.get("answer"), 2800)
+            if answer:
+                parts.append(answer)
+            source_lines = _source_lines(docs.get("sources"), limit=6)
+            if source_lines:
+                parts.append("Docs sources:")
+                parts.extend(source_lines)
+        else:
+            parts.append(_clip_text(docs.get("error") or docs.get("status"), 1000))
+
+    if web is not None:
+        web_ok = bool(web.get("ok"))
+        display = web.get("display") if isinstance(web.get("display"), dict) else {}
+        raw = web.get("raw") if isinstance(web.get("raw"), dict) else {}
+        timing = raw.get("timing") if isinstance(raw.get("timing"), dict) else {}
+        parts.append("")
+        parts.append(f"NullClaw web research: {'ok' if web_ok else 'failed'}")
+        if web_ok:
+            summary = _clip_text(display.get("summary_markdown"), 3800)
+            if summary:
+                parts.append(summary)
+            source_lines = _source_lines(display.get("source_items"), limit=8)
+            if source_lines:
+                parts.append("Web sources:")
+                parts.extend(source_lines)
+            notes = (
+                display.get("firewall_notes")
+                if isinstance(display.get("firewall_notes"), list)
+                else []
+            )
+            if notes:
+                parts.append("Firewall notes:")
+                parts.extend(f"- {_clip_text(note, 300)}" for note in notes[:5])
+        else:
+            parts.append(_clip_text(web.get("error") or web.get("status"), 1000))
+        if timing:
+            parts.append(
+                "Timing: "
+                f"blueprints_total_ms={timing.get('total_ms')}, "
+                f"adapter_total_ms={timing.get('adapter_total_ms')}, "
+                f"adapter_worker_elapsed_ms={timing.get('adapter_worker_elapsed_ms')}"
+            )
+
+    parts.append("")
+    parts.append(
+        "Conversation extension point: single-turn STT/TTS handoff only; no durable voice loop started."
+    )
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
+async def _submit_wake_stt_nullclaw_bounded_handoff(
+    text: str,
+    *,
+    gate: CommandCodeGateResult,
+    profile_routing: WakeSttProfileRoutingResult,
+    timing: WakeSttRouteTiming | None = None,
+    handoff_assignment_callback: HandoffAssignmentCallback | None = None,
+) -> HermesSttSubmitResult:
+    if timing:
+        timing.mark("profile_handoff_start", target_profile=profile_routing.target_profile)
+    _schedule_handoff_assignment_callback(
+        handoff_assignment_callback,
+        {
+            "target_profile": profile_routing.target_profile,
+            "request_text": command_code_storage_safe_text(gate.meat),
+            "reason": profile_routing.reason,
+            "risk_class": profile_routing.risk_class,
+            "complex": profile_routing.complex,
+            "requires_command_code": profile_routing.requires_command_code,
+            "status": "assigned",
+        },
+        timing=timing,
+    )
+    guard = await _run_nullclaw_runtime_guard_check()
+    docs: dict[str, Any] | None = None
+    web: dict[str, Any] | None = None
+    if guard.get("ok"):
+        docs_task = (
+            asyncio.create_task(_call_nullclaw_docs_explain(gate.meat))
+            if _nullclaw_request_wants_local_docs(gate.meat)
+            else None
+        )
+        web_task = asyncio.create_task(_call_nullclaw_web_research(gate.meat))
+        if docs_task is not None:
+            docs, web = await asyncio.gather(docs_task, web_task)
+        else:
+            web = await web_task
+
+    any_ok = bool((docs and docs.get("ok")) or (web and web.get("ok")))
+    if not guard.get("ok"):
+        speech = "NullClaw research is not healthy enough to start."
+        status = "nullclaw_guard_failed"
+    elif web and web.get("ok") and (docs is None or docs.get("ok")):
+        speech = (
+            _nullclaw_web_synthesis_speech(web)
+            or "NullClaw research completed. I've posted the cited detail to Matrix."
+        )
+        status = "bounded_nullclaw_completed"
+    elif any_ok:
+        speech = (
+            _nullclaw_web_synthesis_speech(web)
+            or "NullClaw research partially completed. I've posted the detail to Matrix."
+        )
+        status = "bounded_nullclaw_partial"
+    else:
+        speech = "NullClaw research could not complete. I've posted the failure detail to Matrix."
+        status = "bounded_nullclaw_failed"
+    matrix_detail = _bounded_nullclaw_matrix_detail(
+        request_text=gate.meat,
+        guard=guard,
+        docs=docs,
+        web=web,
+    )
+    companion_payload = {
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "status": status,
+    }
+    companion = HermesSttCompanionOutput(
+        speech=speech,
+        matrix_detail=matrix_detail,
+        status=status,
+        structured=True,
+        raw_assistant_text=json.dumps(companion_payload, ensure_ascii=True, sort_keys=True),
+    )
+    if timing:
+        timing.mark(
+            "profile_handoff_complete",
+            target_profile=profile_routing.target_profile,
+            status=status,
+        )
+    return HermesSttSubmitResult(
+        ok=any_ok,
+        status=status,
+        gate=gate,
+        attempted=True,
+        fallback_required=False,
+        assistant_text=companion.raw_assistant_text,
+        companion=companion,
+        timing=timing,
+        target_profile=profile_routing.target_profile,
+        profile_routing=profile_routing,
+        handoff={
+            "success": any_ok,
+            "status": status,
+            "target_profile": profile_routing.target_profile,
+            "mode": "bounded_blueprints_nullclaw",
+            "speech": speech,
+            "matrix_detail": matrix_detail,
+            "needs_followup": False,
+            "conversation": {"mode": "single_turn", "can_continue_with_stt_tts": False},
+        },
+    )
+
+
 async def submit_wake_stt_profile_handoff(
     text: str,
     *,
@@ -2094,6 +2529,14 @@ async def submit_wake_stt_profile_handoff(
             target_profile="hermes-stt",
             profile_routing=profile_routing,
             handoff={"status": "base_profile", "target_profile": "hermes-stt"},
+        )
+    if profile_routing.target_profile == WAKE_STT_NULLCLAW_PROFILE:
+        return await _submit_wake_stt_nullclaw_bounded_handoff(
+            text,
+            gate=gate,
+            profile_routing=profile_routing,
+            timing=timing,
+            handoff_assignment_callback=handoff_assignment_callback,
         )
 
     target_config = load_hermes_stt_target_config(
