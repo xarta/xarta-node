@@ -12,7 +12,7 @@ usage() {
     cat <<'EOF'
 Usage: lone-wolf-stack-runtime-fix-owner.sh [--check] [--apply] [--verbose]
 
-Repairs known Postgres and Redis runtime mount ownership under /xarta-node/.lone-wolf/stacks.
+Repairs known service-owned runtime mounts under /xarta-node/.lone-wolf/stacks.
 It intentionally does not normalize source/docs ownership.
 EOF
 }
@@ -92,6 +92,30 @@ for compose in "$STACKS_DIR"/*/compose.yaml; do
     if grep -Eq 'image:[[:space:]]*"?([^"[:space:]]*/)?redis:[^"[:space:]]*-alpine' "$compose"; then
         if grep -Eq '\./data/redis:/data' "$compose"; then
             repair_path "$stack_dir/data/redis" "999:1000" "$stack_name redis-alpine"
+        fi
+    fi
+
+    if grep -Eq 'image:[[:space:]]*"?([^"[:space:]]*/)?valkey/valkey:[^"[:space:]]*-alpine' "$compose"; then
+        if grep -Eq '\./data/valkey:/data' "$compose"; then
+            repair_path "$stack_dir/data/valkey" "999:1000" "$stack_name valkey-alpine"
+        fi
+    fi
+
+    if grep -Eq 'image:[[:space:]]*"?unclecode/crawl4ai:' "$compose"; then
+        if grep -Eq '\./data/output:/app/output' "$compose"; then
+            repair_path "$stack_dir/data/output" "999:999" "$stack_name crawl4ai-output"
+        fi
+    fi
+
+    if grep -Eq 'user:[[:space:]]*"?65534:65534"?' "$compose"; then
+        if grep -Eq '\./data:/data' "$compose"; then
+            repair_path "$stack_dir/data" "65534:65534" "$stack_name nobody-data"
+        fi
+    fi
+
+    if grep -Eq 'image:[[:space:]]*"?xarta/system-bridge-notifier:' "$compose"; then
+        if grep -Eq '\./data:/data' "$compose"; then
+            repair_path "$stack_dir/data" "65534:65534" "$stack_name system-bridge-notifier-data"
         fi
     fi
 done
