@@ -1523,6 +1523,33 @@ def test_matrix_chat_wake_stt_pending_reuses_profile_routing(monkeypatch):
     ]
 
 
+def test_matrix_chat_wake_stt_handoff_assignment_is_info_only_and_speech_suppressed():
+    body = matrix_chat._wake_stt_handoff_assignment_body(
+        {
+            "target_profile": "hermes-stt-local",
+            "request_text": "authorisation alpha one seven create a file called Dave Computer",
+            "reason": "filesystem mutation",
+        }
+    )
+    content = matrix_chat._matrix_wake_stt_handoff_assignment_content(
+        body=body,
+        target_profile="hermes-stt-local",
+        instance="local",
+        candidate_source="payload2",
+        command="execute",
+        wake_word="Computer",
+        candidate_revision="rev-1",
+    )
+
+    assert body.startswith("Wake STT handoff assigned: hermes-stt-local")
+    assert not body.lower().startswith("hermes:")
+    assert "alpha one seven" not in body.lower()
+    assert content["xarta_source"] == "wake_stt_handoff_assignment"
+    assert content["xarta_handoff_target_profile"] == "hermes-stt-local"
+    assert content["xarta_suppress_speech"] is True
+    assert content["suppress_speech"] is True
+
+
 def test_matrix_chat_wake_stt_pre_roll_uses_command_code_accepted_message(monkeypatch, tmp_path):
     published: list[dict[str, object]] = []
     room_id = "!bridge:test.example"

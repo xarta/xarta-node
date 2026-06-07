@@ -24,7 +24,7 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable
 from urllib.parse import quote
 
 import httpx
@@ -2517,6 +2517,35 @@ def _matrix_wake_stt_direct_response_content(
     return content
 
 
+def _matrix_wake_stt_handoff_assignment_content(
+    *,
+    body: str,
+    target_profile: str,
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str,
+    candidate_revision: str,
+) -> dict[str, Any]:
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "xarta_source": "wake_stt_handoff_assignment",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_wake_instance": _safe_str(instance) or "local",
+            "xarta_wake_candidate_source": _safe_str(candidate_source),
+            "xarta_wake_command": _safe_str(command) or "execute",
+            "xarta_wake_candidate_revision": _safe_str(candidate_revision),
+            "xarta_wake_word": _safe_str(wake_word),
+            "xarta_handoff_target_profile": _safe_str(target_profile),
+            "xarta_handoff_status": "assigned",
+            "xarta_suppress_speech": True,
+            "suppress_speech": True,
+        }
+    )
+    return content
+
+
 async def _send_stt_transcript_message(
     *,
     room_id: str,
@@ -2675,6 +2704,72 @@ async def _send_wake_stt_direct_response_report_safely(**kwargs: Any) -> dict[st
         return {"ok": False, "error": str(exc)[:240]}
 
 
+def _wake_stt_handoff_assignment_body(assignment: dict[str, Any]) -> str:
+    target = _safe_str(assignment.get("target_profile")) or "unknown"
+    request_text = _safe_str(assignment.get("request_text")).strip()
+    request_text = wake_stt_direct.command_code_storage_safe_text(request_text)
+    request_text = wake_stt_direct.redact_authorisation_spans_for_matrix(request_text)
+    if len(request_text) > 240:
+        request_text = f"{request_text[:237].rstrip()}..."
+    reason = _safe_str(assignment.get("reason")).strip()
+    if len(reason) > 160:
+        reason = f"{reason[:157].rstrip()}..."
+    body = f"Wake STT handoff assigned: {target}"
+    if request_text:
+        body = f"{body} — {request_text}"
+    if reason:
+        body = f"{body}\nReason: {reason}"
+    return body
+
+
+async def _send_wake_stt_handoff_assignment_report_message(
+    *,
+    room_id: str,
+    assignment: dict[str, Any],
+    instance: str,
+    candidate_source: str,
+    command: str,
+    wake_word: str = "",
+    candidate_revision: str = "",
+) -> dict[str, Any]:
+    target = _safe_str(assignment.get("target_profile"))
+    content = _matrix_wake_stt_handoff_assignment_content(
+        body=_wake_stt_handoff_assignment_body(assignment),
+        target_profile=target,
+        instance=instance,
+        candidate_source=candidate_source,
+        command=command,
+        wake_word=wake_word,
+        candidate_revision=candidate_revision,
+    )
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        sent = await e2ee_client.send_message_content(room_id, content)
+    else:
+        encoded_room = quote(room_id, safe="")
+        txn_id = f"bp-wake-stt-handoff-assigned-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        encoded_txn = quote(txn_id, safe="")
+        data = await _matrix_request(
+            "PUT",
+            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+            json_body=content,
+            expected=(200,),
+        )
+        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent.update(content)
+    return sent
+
+
+async def _send_wake_stt_handoff_assignment_report_safely(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        return await _send_wake_stt_handoff_assignment_report_message(**kwargs)
+    except Exception as exc:  # pragma: no cover - Matrix runtime failures vary.
+        log.warning("wake_stt_handoff_assignment_report_failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:240]}
+
+
 async def _deliver_wake_stt_with_direct_fallback(
     *,
     room_id: str,
@@ -2713,6 +2808,20 @@ async def _deliver_wake_stt_with_direct_fallback(
             candidate_revision=body.candidate_revision,
         )
 
+    def handoff_assignment_callback(assignment: dict[str, Any]) -> Awaitable[None]:
+        async def send_assignment() -> None:
+            await _send_wake_stt_handoff_assignment_report_safely(
+                room_id=room_id,
+                assignment=assignment,
+                instance=body.instance,
+                candidate_source=body.candidate_source,
+                command=body.command,
+                wake_word=body.wake_word,
+                candidate_revision=body.candidate_revision,
+            )
+
+        return send_assignment()
+
     config, fast_route = _wake_stt_direct_config_for_request(body)
     if direct_enabled and _wake_stt_fast_route_is_local_action(fast_route) and fast_route:
         return await _wake_stt_fast_route_local_delivery(
@@ -2725,6 +2834,7 @@ async def _deliver_wake_stt_with_direct_fallback(
         body.text,
         matrix_send=matrix_send,
         diagnostic_send=diagnostic_send,
+        handoff_assignment_callback=handoff_assignment_callback,
         config=config,
         direct_enabled=direct_enabled,
         diagnostic_enabled=diagnostic_enabled,
