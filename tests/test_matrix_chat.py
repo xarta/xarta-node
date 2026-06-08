@@ -975,6 +975,176 @@ def test_matrix_chat_deterministic_current_time_action_is_exact_only(monkeypatch
     assert captured["tool_surface"] == ""
 
 
+def test_matrix_chat_basic_health_action_is_exact_only(monkeypatch, tmp_path):
+    fast_routes = tmp_path / "fast-routes.json"
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "basic_health_exact",
+                        "action": "basic_health_deterministic_response",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["are you ok", "are you okay"],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+
+    assert (
+        matrix_chat._wake_stt_fast_route_decision(
+            "Are you okay?", base_session_id="wake-stt-local"
+        ).action
+        == "basic_health_deterministic_response"
+    )
+    assert (
+        matrix_chat._wake_stt_fast_route_decision(
+            "are you ok", base_session_id="wake-stt-local"
+        ).action
+        == "basic_health_deterministic_response"
+    )
+    assert (
+        matrix_chat._wake_stt_fast_route_decision(
+            "are you okay and delete a file", base_session_id="wake-stt-local"
+        )
+        is None
+    )
+
+
+def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_basic_health(
+    monkeypatch, tmp_path
+):
+    captured = {"fallback_calls": 0, "classifier_calls": 0}
+    active_session = tmp_path / "active-session.json"
+    fast_routes = tmp_path / "fast-routes.json"
+    active_session.write_text(
+        json.dumps({"session_id": "wake-stt-local-operator-heavy"}),
+        encoding="utf-8",
+    )
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "basic_health_exact",
+                        "action": "basic_health_deterministic_response",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["are you ok", "are you okay"],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_delivery(*_args, **_kwargs):
+        captured["fallback_calls"] += 1
+        raise AssertionError("deterministic basic-health action must not call Hermes")
+
+    async def fail_classifier(*_args, **_kwargs):
+        captured["classifier_calls"] += 1
+        raise AssertionError("deterministic basic-health action must not classify")
+
+    async def fake_health_fields():
+        return {
+            "speech": "I am functioning within normal parameters.",
+            "matrix_detail": "Deterministic Wake STT basic health check.",
+            "status": "basic_health_ok",
+            "helper_elapsed_ms": "1.0",
+        }
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE", str(active_session))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fail_delivery,
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fail_classifier,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_basic_health_response_fields",
+        fake_health_fields,
+    )
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="Are you okay?",
+                instance="local",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Computer",
+                candidate_revision="wake-local-health",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    public = result.public_dict()
+    companion = public["direct"]["companion"]
+    assert public["ok"] is True
+    assert public["route"] == "direct_local"
+    assert public["direct"]["attempted"] is False
+    assert public["direct"]["status"] == "basic_health_deterministic_response"
+    assert companion["speech"] == "I am functioning within normal parameters."
+    assert captured == {"fallback_calls": 0, "classifier_calls": 0}
+
+
+def test_matrix_chat_basic_health_reads_private_check_config(monkeypatch, tmp_path):
+    checks_file = tmp_path / "basic-health-checks.json"
+    checks_file.write_text(
+        json.dumps(
+            {
+                "checks": [
+                    {"label": "local model", "host": "127.0.0.1", "port": 4000},
+                    {"label": "test service", "host": "127.0.0.1", "port": 443},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen = []
+
+    def fake_probe(host, port, *, timeout_seconds=0.35):
+        seen.append((host, port, timeout_seconds))
+        return True, ""
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BASIC_HEALTH_CHECKS_FILE", str(checks_file))
+    monkeypatch.setattr(matrix_chat, "_wake_stt_tcp_probe", fake_probe)
+
+    fields = asyncio.run(matrix_chat._wake_stt_basic_health_response_fields())
+
+    assert fields["speech"] == "I am functioning within normal parameters."
+    assert fields["status"] == "basic_health_ok"
+    assert "Config: configured." in fields["matrix_detail"]
+    assert "- local model: ok (127.0.0.1:4000)" in fields["matrix_detail"]
+    assert "- test service: ok (127.0.0.1:443)" in fields["matrix_detail"]
+    assert seen == [("127.0.0.1", 4000, 0.35), ("127.0.0.1", 443, 0.35)]
+
+
 def test_wake_stt_fast_routes_file_uses_lone_wolf_config_default(monkeypatch, tmp_path):
     fast_routes = tmp_path / "wake-stt-fast-routes.json"
     monkeypatch.delenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", raising=False)
