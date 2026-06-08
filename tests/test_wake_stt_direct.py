@@ -565,6 +565,94 @@ def test_validate_wake_stt_profile_classifier_gates_complex_nullclaw_target():
     assert parsed.requires_command_code is True
 
 
+def test_classify_wake_stt_profile_routes_spoken_reb_research_without_model():
+    result = asyncio.run(
+        wake_stt_direct.classify_wake_stt_profile(
+            "Use your null claw reb research skill to find out about the true stark coffee from Azda.",
+            environ={},
+        )
+    )
+
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.requires_command_code is False
+    assert result.risk_class == "web_research"
+
+
+def test_spoken_rep_research_shortcut_does_not_need_brand_hint():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "Use your null claw rep research skill to find the latest Doctor Who news"
+    )
+
+    assert result is not None
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.reason == "deterministic bounded public web research phrase"
+
+
+def test_public_brand_lookup_shortcut_routes_to_nullclaw():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "Tell me about the true Stark Coffee brand that I get from Azda"
+    )
+
+    assert result is not None
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.requires_command_code is False
+
+
+def test_more_web_research_followup_shortcut_routes_to_nullclaw():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "Using more web research tell me more about the history of the company and what they do ethically"
+    )
+
+    assert result is not None
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.requires_command_code is False
+
+
+def test_generic_research_public_topic_shortcut_routes_to_nullclaw():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "Please do some research on the coffee brand called True Start in the UK concentrating on their history and ethical position"
+    )
+
+    assert result is not None
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.requires_command_code is False
+    assert result.reason == "deterministic bounded generic research defaults to public web"
+
+
+def test_more_research_followup_shortcut_without_web_word_routes_to_nullclaw():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "Using more research tell me more about the history of the company and what they do ethically"
+    )
+
+    assert result is not None
+    assert result.target_profile == "hermes-stt-nullclaw"
+    assert result.requires_command_code is False
+
+
+def test_document_research_qualifier_is_not_public_web_shortcut():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "do document research on the NullClaw task contract"
+    )
+
+    assert result is None
+
+
+def test_local_network_research_qualifier_is_not_public_web_shortcut():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "research current state in the local network"
+    )
+
+    assert result is None
+
+
+def test_docs_about_web_research_contract_is_not_public_web_shortcut():
+    result = wake_stt_direct._wake_stt_public_web_shortcut_result(
+        "look up our NullClaw docs and explain the current web research task contract"
+    )
+
+    assert result is None
+
+
 def test_classify_wake_stt_profile_invalid_json_defaults_smart(tmp_path):
     examples = tmp_path / "profile-routing-examples.json"
     examples.write_text(
@@ -930,6 +1018,15 @@ def test_nullclaw_local_docs_are_only_used_when_requested():
     )
 
 
+def test_nullclaw_generic_research_runs_public_web_unless_local_qualified():
+    assert wake_stt_direct._nullclaw_request_wants_web_research(
+        "Please do some research on the coffee brand called True Start in the UK"
+    )
+    assert not wake_stt_direct._nullclaw_request_wants_web_research(
+        "research current state in the local network"
+    )
+
+
 def test_nullclaw_web_synthesis_speech_uses_local_model_section_only():
     speech = wake_stt_direct._nullclaw_web_synthesis_speech(
         {
@@ -954,6 +1051,52 @@ def test_nullclaw_web_synthesis_speech_uses_local_model_section_only():
     assert "Query Plan" not in speech
     assert "Sources" not in speech
     assert "[S5]" not in speech
+
+
+def test_submit_wake_stt_nullclaw_docs_lookup_skips_web(monkeypatch):
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-nullclaw",
+        requires_command_code=False,
+        complex=False,
+        risk_class="docs_lookup",
+        confidence=0.94,
+        reason="bounded docs lookup",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    async def fake_guard():
+        return {"ok": True, "status": "ok"}
+
+    async def fake_docs(text):
+        assert "document skill" in text
+        return {
+            "ok": True,
+            "answer": "The local docs say NullClaw is a bounded research worker.",
+            "sources": [{"path": "null-claw-web-research/README.md"}],
+        }
+
+    async def fail_web(_text):
+        raise AssertionError("docs_lookup request should not call public web research")
+
+    monkeypatch.setattr(wake_stt_direct, "_run_nullclaw_runtime_guard_check", fake_guard)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_docs_explain", fake_docs)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_web_research", fail_web)
+
+    async def run():
+        return await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "Use your no claw document skill to summarise what we've been doing with the null claw skill.",
+            profile_routing=routing,
+            codes=[],
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.status == "bounded_nullclaw_completed"
+    assert "NullClaw docs found:" in result.companion.speech
+    assert "NullClaw web research" not in result.companion.matrix_detail
+    assert "Local docs explain: ok" in result.companion.matrix_detail
 
 
 def test_submit_wake_stt_nullclaw_web_only_public_request_skips_docs(monkeypatch):

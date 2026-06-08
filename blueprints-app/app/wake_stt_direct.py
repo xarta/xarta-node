@@ -68,6 +68,26 @@ WAKE_STT_PROFILE_RISK_CLASSES = frozenset(
     }
 )
 WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES = frozenset({"docs_lookup", "web_research"})
+_WAKE_STT_WEB_RESEARCH_SPOKEN_HINT_RE = re.compile(
+    r"\b(?:use|using|do|doing|try|please\s+do|more|with|via)(?:\s+\w+){0,5}\s+(?:web|website|rep|reb)\s+research\b|\bask(?:\s+\w+){0,4}\s+to\s+(?:web|website|rep|reb)\s+research\b|\b(?:research|look\s+up|find\s+out)\s+(?:online|on\s+the\s+web|from\s+the\s+web)\b",
+    re.IGNORECASE,
+)
+_WAKE_STT_PUBLIC_BRAND_HINT_RE = re.compile(
+    r"\b(?:brand|company|product|coffee|retailer|supermarket|asda|azda|tesco|sainsbury|aldi|lidl|morrisons|waitrose|buy|sold)\b",
+    re.IGNORECASE,
+)
+_WAKE_STT_GENERIC_RESEARCH_HINT_RE = re.compile(
+    r"\b(?:please\s+)?(?:do|doing|use|using|try)?\s*(?:some|more|a\s+bit\s+of)?\s*research(?:\s+(?:on|about|into|for|the|this|that))?\b|\b(?:using\s+)?more\s+research\b|\bresearch\s+(?:on|about|into|for|the|this|that|latest|current)\b",
+    re.IGNORECASE,
+)
+_WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE = re.compile(
+    r"\b(?:doc|docs|document|documents|documentation|runbook|our|we(?:'|’)?ve|we\s+have|local|local\s+network|current\s+state|local\s+state|repo|repository|code|file|logs?|service|stack|docker|ssh|infra|infrastructure|blueprints|wake\s+stt|wake-to-talk|hermes)\b",
+    re.IGNORECASE,
+)
+_WAKE_STT_COMPLEX_PUBLIC_WEB_HINT_RE = re.compile(
+    r"\b(?:deep|comprehensive|full\s+report|literature\s+review|strategy|implementation\s+plan|build|script|fix|debug|ssh|docker|delete|create\s+(?:a\s+)?file)\b",
+    re.IGNORECASE,
+)
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -1232,7 +1252,7 @@ def _wake_stt_profile_classifier_prompt(
             "base": "Use hermes-stt only for ordinary low-risk short answers or when deterministic local routing already handled the request.",
             "local_duh": "Use hermes-stt-local-duh for simple local read-only/file/doc/status checks and exact transformations.",
             "local": "Use hermes-stt-local for local private thinking, local docs lookup, NullClaw docs synthesis, and non-cloud work that benefits from reasoning.",
-            "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required.",
+            "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research, website research, rep research, reb research, unqualified public-topic research on/about something, public brand/product/company lookups, and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. For Wake STT, plain 'research on/about X' normally means public web research unless the request qualifies it as document/docs/local-network/current-state/repo/code/service research. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required. If the request says document skill, docs, or local docs without a web/public lookup cue, classify it as docs_lookup so the bounded route can stay docs-only.",
             "average": "Use hermes-stt-average for medium-complex public web research, NullClaw web lookups, broader synthesis, and tasks likely too nuanced for local no-think.",
             "smart": "Use hermes-stt-smart for complex debugging, scripts, Proxmox/LXC/network/service diagnosis, SSH, Docker, destructive or high-impact work, and any uncertainty.",
             "authorisation": (
@@ -1260,6 +1280,52 @@ def _wake_stt_profile_classifier_prompt(
     }
 
 
+def _wake_stt_public_web_shortcut_result(
+    request_text: str,
+    *,
+    elapsed_ms: float = 0.0,
+    model: str = "deterministic",
+) -> WakeSttProfileRoutingResult | None:
+    text = command_code_storage_safe_text(request_text)
+    if not text:
+        return None
+    if _WAKE_STT_COMPLEX_PUBLIC_WEB_HINT_RE.search(text):
+        return None
+    explicit_web = bool(_WAKE_STT_WEB_RESEARCH_SPOKEN_HINT_RE.search(text))
+    generic_research = bool(
+        _WAKE_STT_GENERIC_RESEARCH_HINT_RE.search(text)
+        and not _WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE.search(text)
+    )
+    public_brand_lookup = bool(
+        re.search(
+            r"\b(?:tell\s+me\s+about|find\s+out\s+about|what\s+is|who\s+are|more\s+about)\b",
+            text,
+            re.I,
+        )
+        and _WAKE_STT_PUBLIC_BRAND_HINT_RE.search(text)
+    )
+    if not (explicit_web or public_brand_lookup or generic_research):
+        return None
+    if explicit_web:
+        reason = "deterministic bounded public web research phrase"
+    elif public_brand_lookup:
+        reason = "deterministic bounded public brand/product lookup"
+    else:
+        reason = "deterministic bounded generic research defaults to public web"
+    return WakeSttProfileRoutingResult(
+        target_profile=WAKE_STT_NULLCLAW_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="web_research",
+        confidence=0.98,
+        reason=reason,
+        speech_if_pending="",
+        status="deterministic_nullclaw_public_web",
+        elapsed_ms=elapsed_ms,
+        model=model,
+    )
+
+
 async def classify_wake_stt_profile(
     request_text: str,
     *,
@@ -1272,6 +1338,16 @@ async def classify_wake_stt_profile(
     warning = "; ".join(part for part in (warning, model_warning) if part)
     timeout_ms = _wake_stt_profile_classifier_timeout_ms(examples_config)
     started = time.perf_counter()
+    shortcut = _wake_stt_public_web_shortcut_result(request_text, model=model or "deterministic")
+    if shortcut is not None:
+        if timing:
+            timing.mark(
+                "profile_classifier_deterministic_nullclaw",
+                target_profile=shortcut.target_profile,
+                risk_class=shortcut.risk_class,
+                reason=shortcut.reason,
+            )
+        return shortcut
     api_key = _wake_stt_profile_classifier_key(environ=environ)
     base_url = _wake_stt_profile_classifier_base_url(environ)
     if not model:
@@ -2222,6 +2298,31 @@ def _nullclaw_request_wants_local_docs(request_text: str) -> bool:
     return any(marker in text for marker in docs_markers)
 
 
+def _nullclaw_request_wants_web_research(request_text: str) -> bool:
+    text = _SPACE_RE.sub(" ", str(request_text or "").strip().lower())
+    if not text:
+        return False
+    if _WAKE_STT_WEB_RESEARCH_SPOKEN_HINT_RE.search(text):
+        return True
+    web_markers = ("public web", "search the web", "from the web", "online")
+    if any(marker in text for marker in web_markers):
+        return True
+    if _WAKE_STT_GENERIC_RESEARCH_HINT_RE.search(
+        text
+    ) and not _WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE.search(text):
+        return True
+    return bool(_WAKE_STT_PUBLIC_BRAND_HINT_RE.search(text))
+
+
+def _nullclaw_docs_speech(docs: dict[str, Any] | None) -> str:
+    if not isinstance(docs, dict) or not docs.get("ok"):
+        return ""
+    answer = _speech_text_from_markdown(str(docs.get("answer") or ""), limit=1500)
+    if not answer:
+        return ""
+    return f"NullClaw docs found: {answer}"
+
+
 def _markdown_heading_key(value: str) -> str:
     clean = re.sub(r"[*_`[\]()]+", "", str(value or "")).strip().lower()
     clean = re.sub(r"[^a-z0-9]+", " ", clean)
@@ -2412,16 +2513,27 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
     guard = await _run_nullclaw_runtime_guard_check()
     docs: dict[str, Any] | None = None
     web: dict[str, Any] | None = None
+    wants_docs = profile_routing.risk_class == "docs_lookup" or _nullclaw_request_wants_local_docs(
+        gate.meat
+    )
+    wants_web = (
+        profile_routing.risk_class == "web_research"
+        or _nullclaw_request_wants_web_research(gate.meat)
+    )
+    if not wants_docs and not wants_web:
+        wants_web = True
     if guard.get("ok"):
         docs_task = (
-            asyncio.create_task(_call_nullclaw_docs_explain(gate.meat))
-            if _nullclaw_request_wants_local_docs(gate.meat)
-            else None
+            asyncio.create_task(_call_nullclaw_docs_explain(gate.meat)) if wants_docs else None
         )
-        web_task = asyncio.create_task(_call_nullclaw_web_research(gate.meat))
-        if docs_task is not None:
+        web_task = (
+            asyncio.create_task(_call_nullclaw_web_research(gate.meat)) if wants_web else None
+        )
+        if docs_task is not None and web_task is not None:
             docs, web = await asyncio.gather(docs_task, web_task)
-        else:
+        elif docs_task is not None:
+            docs = await docs_task
+        elif web_task is not None:
             web = await web_task
 
     any_ok = bool((docs and docs.get("ok")) or (web and web.get("ok")))
@@ -2434,9 +2546,16 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
             or "NullClaw research completed. I've posted the cited detail to Matrix."
         )
         status = "bounded_nullclaw_completed"
+    elif docs and docs.get("ok") and not wants_web:
+        speech = (
+            _nullclaw_docs_speech(docs)
+            or "NullClaw docs research completed. I've posted the detail to Matrix."
+        )
+        status = "bounded_nullclaw_completed"
     elif any_ok:
         speech = (
             _nullclaw_web_synthesis_speech(web)
+            or _nullclaw_docs_speech(docs)
             or "NullClaw research partially completed. I've posted the detail to Matrix."
         )
         status = "bounded_nullclaw_partial"
