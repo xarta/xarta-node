@@ -101,3 +101,41 @@ def test_query_normalizer_model_env_override_wins(monkeypatch):
     monkeypatch.setenv("DOC_SPEECH_LLM_MODEL", "TEST-DOC-MODEL")
     monkeypatch.setenv("WEB_RESEARCH_QUERY_NORMALIZER_MODEL", "TEST-WEB-QUERY-MODEL")
     assert _web_research_query_normalizer_model() == "TEST-WEB-QUERY-MODEL"
+
+
+def test_web_research_egress_profile_aliases(monkeypatch):
+    monkeypatch.delenv("WEB_RESEARCH_SEARXNG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        routes_web_research,
+        "_read_egress_profile_config",
+        lambda: {
+            "default_profile": "normal-egress",
+            "profiles": {
+                "normal-egress": {},
+                "vpn-egress": {},
+            },
+            "aliases": {
+                "normal": "normal-egress",
+                "vpn": "vpn-egress",
+                "nordvpn": "vpn-egress",
+            },
+        },
+    )
+
+    assert routes_web_research._searxng_profile(None) == "normal-egress"
+    assert routes_web_research._searxng_profile("default") == "normal-egress"
+    assert routes_web_research._searxng_profile("vpn") == "vpn-egress"
+    assert routes_web_research._searxng_profile("nordvpn") == "vpn-egress"
+    assert routes_web_research._searxng_profile("normal") == "normal-egress"
+    assert routes_web_research._searxng_profile("normal-egress") == "normal-egress"
+
+
+def test_web_research_default_profile_comes_from_node_local_config(monkeypatch):
+    monkeypatch.delenv("WEB_RESEARCH_SEARXNG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        routes_web_research,
+        "_read_egress_profile_config",
+        lambda: {"default_profile": "normal-egress", "profiles": {"normal-egress": {}}},
+    )
+
+    assert routes_web_research._searxng_profile("default") == "normal-egress"
