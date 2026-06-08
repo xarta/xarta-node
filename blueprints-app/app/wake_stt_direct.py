@@ -84,6 +84,10 @@ _WAKE_STT_COMPLEX_PUBLIC_WEB_HINT_RE = re.compile(
     r"\b(?:deep|comprehensive|full\s+report|literature\s+review|strategy|implementation\s+plan|build|script|fix|debug|ssh|docker|delete|create\s+(?:a\s+)?file)\b",
     re.IGNORECASE,
 )
+_WAKE_STT_VPN_RESEARCH_HINT_RE = re.compile(
+    r"\b(?:vpn|nordvpn|nord\s+vpn|circumspect|privacy[-\s]?sensitive|private\s+web\s+research|use\s+the\s+vpn|via\s+vpn)\b",
+    re.IGNORECASE,
+)
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -2240,6 +2244,7 @@ async def _call_nullclaw_web_research(
     request_text: str,
     *,
     timeout_seconds: float = 190.0,
+    egress_profile: str | None = None,
 ) -> dict[str, Any]:
     from .routes_web_research import WebResearchQueryBody, web_research_query
 
@@ -2248,6 +2253,7 @@ async def _call_nullclaw_web_research(
         query=query,
         depth="standard",
         private_mode=False,
+        searxng_profile=egress_profile or _nullclaw_web_research_egress_profile(request_text),
     )
     try:
         data = await asyncio.wait_for(web_research_query(body), timeout_seconds)
@@ -2298,6 +2304,13 @@ def _nullclaw_request_wants_web_research(request_text: str) -> bool:
     ) and not _WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE.search(text):
         return True
     return False
+
+
+def _nullclaw_web_research_egress_profile(request_text: str) -> str:
+    text = _SPACE_RE.sub(" ", str(request_text or "").strip().lower())
+    if _WAKE_STT_VPN_RESEARCH_HINT_RE.search(text):
+        return "vlan99"
+    return "default"
 
 
 def _nullclaw_docs_speech(docs: dict[str, Any] | None) -> str:
@@ -2367,7 +2380,7 @@ def _nullclaw_web_synthesis_speech(web: dict[str, Any] | None) -> str:
     synthesis = _markdown_section(summary, "Local Model Synthesis")
     speech = _speech_text_from_markdown(synthesis)
     if speech:
-        return f"NullClaw found: {speech}"
+        return f"Web Research found: {speech}"
     audio = str(display.get("audio_markdown") or "")
     if audio:
         audio = re.sub(r"(?is)^web research for:.*?(?:\n\s*\n|$)", "", audio).strip()
@@ -2437,9 +2450,14 @@ def _bounded_nullclaw_matrix_detail(
         web_ok = bool(web.get("ok"))
         display = web.get("display") if isinstance(web.get("display"), dict) else {}
         raw = web.get("raw") if isinstance(web.get("raw"), dict) else {}
+        adapter = raw.get("adapter") if isinstance(raw.get("adapter"), dict) else {}
         timing = raw.get("timing") if isinstance(raw.get("timing"), dict) else {}
         parts.append("")
         parts.append(f"NullClaw web research: {'ok' if web_ok else 'failed'}")
+        parts.append(
+            "Egress profile: "
+            f"{web.get('egress_profile') or web.get('searxng_profile') or adapter.get('egress_profile') or 'unknown'}"
+        )
         if web_ok:
             summary = _clip_text(display.get("summary_markdown"), 3800)
             if summary:
@@ -2483,6 +2501,7 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
 ) -> HermesSttSubmitResult:
     if timing:
         timing.mark("profile_handoff_start", target_profile=profile_routing.target_profile)
+    web_egress_profile = _nullclaw_web_research_egress_profile(gate.meat)
     _schedule_handoff_assignment_callback(
         handoff_assignment_callback,
         {
@@ -2492,6 +2511,7 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
             "risk_class": profile_routing.risk_class,
             "complex": profile_routing.complex,
             "requires_command_code": profile_routing.requires_command_code,
+            "web_research_egress_profile": web_egress_profile,
             "status": "assigned",
         },
         timing=timing,
@@ -2513,7 +2533,14 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
             asyncio.create_task(_call_nullclaw_docs_explain(gate.meat)) if wants_docs else None
         )
         web_task = (
-            asyncio.create_task(_call_nullclaw_web_research(gate.meat)) if wants_web else None
+            asyncio.create_task(
+                _call_nullclaw_web_research(
+                    gate.meat,
+                    egress_profile=web_egress_profile,
+                )
+            )
+            if wants_web
+            else None
         )
         if docs_task is not None and web_task is not None:
             docs, web = await asyncio.gather(docs_task, web_task)

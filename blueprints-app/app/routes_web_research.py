@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,7 +133,18 @@ Rules:
 
 
 Depth = Literal["quick", "standard", "deep"]
-SearxngProfile = Literal["vpn", "bridge"]
+SearxngProfile = str
+_EGRESS_PROFILE_CONFIG = (
+    _NODE_LOCAL_ROOT / "docs" / "networking" / "web-research-egress-profiles.json"
+)
+_EGRESS_PROFILE_AUDIT_LOG = (
+    _NODE_LOCAL_ROOT / "docs" / "networking" / "web-research-egress-profile-audit.jsonl"
+)
+_EGRESS_PROFILE_APPLY_SCRIPT = (
+    _NODE_LOCAL_ROOT / "docs" / "networking" / "scripts" / "apply-web-research-egress-profile.sh"
+)
+_BRIDGE_EGRESS_PROFILE = "bridge"
+_FALLBACK_VPN_EGRESS_PROFILE = "vlan99"
 
 
 class WebResearchQueryBody(BaseModel):
@@ -160,6 +172,12 @@ class WebResearchSpeechBody(BaseModel):
     private_mode: bool = False
 
 
+class WebResearchEgressProfileBody(BaseModel):
+    default_profile: SearxngProfile
+    reason: str = Field(..., min_length=8, max_length=600)
+    operator: str = Field(default="blueprints-operator", max_length=120)
+
+
 def _adapter_url() -> str:
     return os.environ.get("NULLCLAW01_RESEARCH_URL", _DEFAULT_ADAPTER_URL).strip().rstrip("/")
 
@@ -172,42 +190,220 @@ def _timeout_seconds() -> float:
         return _DEFAULT_TIMEOUT_SECONDS
 
 
-def _default_searxng_profile() -> SearxngProfile:
-    raw = (os.environ.get("WEB_RESEARCH_SEARXNG_PROFILE") or "vpn").strip().lower()
-    aliases = {
-        "default": "vpn",
-        "vlan99": "vpn",
-        "nordvpn": "vpn",
-        "vpn": "vpn",
-        "vps": "bridge",
-        "xarta": "bridge",
-        "xarta-tech": "bridge",
-        "xarta_tech": "bridge",
-        "bridge": "bridge",
+def _read_egress_profile_config() -> dict[str, Any]:
+    try:
+        data = json.loads(_EGRESS_PROFILE_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_egress_profile_config(config: dict[str, Any]) -> None:
+    try:
+        _EGRESS_PROFILE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        _EGRESS_PROFILE_CONFIG.write_text(
+            json.dumps(config, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"Could not write egress profile config: {exc}") from exc
+
+
+def _append_egress_profile_audit(entry: dict[str, Any]) -> None:
+    try:
+        _EGRESS_PROFILE_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _EGRESS_PROFILE_AUDIT_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n")
+    except OSError as exc:
+        log.warning("web-research egress profile audit write failed: %s", exc)
+
+
+async def _apply_egress_profile(profile: str) -> dict[str, Any]:
+    if profile == "bridge":
+        return {"ok": True, "stdout": "profile=bridge route_apply=noop\n", "stderr": ""}
+    if not _EGRESS_PROFILE_APPLY_SCRIPT.exists():
+        raise HTTPException(
+            503, f"egress profile apply script is missing: {_EGRESS_PROFILE_APPLY_SCRIPT}"
+        )
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(_EGRESS_PROFILE_APPLY_SCRIPT), profile, "--restart"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    try:
+        completed = await asyncio.to_thread(run)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, f"egress profile apply timed out: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown apply failure").strip()
+        raise HTTPException(500, f"egress profile apply failed: {detail[:1200]}")
+    adapter_health = await _wait_for_adapter_health(timeout_seconds=150.0)
+    return {
+        "ok": True,
+        "stdout": completed.stdout[-4000:],
+        "stderr": completed.stderr[-4000:],
+        "adapter_health": adapter_health,
     }
-    value = aliases.get(raw, raw)
-    return "bridge" if value == "bridge" else "vpn"
+
+
+def _active_egress_profile() -> str:
+    config = _read_egress_profile_config()
+    return _searxng_profile(
+        str(config.get("active_profile") or config.get("default_profile") or "default")
+    )
+
+
+async def _ensure_active_egress_profile(profile: str) -> bool:
+    if _active_egress_profile() == profile:
+        return False
+    await _apply_egress_profile(profile)
+    return True
+
+
+async def _activate_research_egress_profile(
+    profile: str,
+    *,
+    default_profile: str,
+    timeline: list[dict[str, Any]],
+    origin: float,
+) -> str | None:
+    stage_started = time.monotonic()
+    switched = await _ensure_active_egress_profile(profile)
+    _timeline_span(
+        timeline,
+        origin=origin,
+        stage="blueprints.egress_profile_ready",
+        start=stage_started,
+        requested_profile=profile,
+        active_profile=_active_egress_profile(),
+        default_profile=default_profile,
+        switched=switched,
+    )
+    return default_profile if profile != default_profile else None
+
+
+async def _restore_research_egress_profile(
+    profile: str | None,
+    *,
+    timeline: list[dict[str, Any]],
+    origin: float,
+) -> None:
+    if not profile:
+        return
+    stage_started = time.monotonic()
+    switched = await _ensure_active_egress_profile(profile)
+    _timeline_span(
+        timeline,
+        origin=origin,
+        stage="blueprints.egress_profile_restore",
+        start=stage_started,
+        restored_profile=profile,
+        active_profile=_active_egress_profile(),
+        switched=switched,
+    )
+
+
+def _log_restore_task_result(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        log.warning("web research egress profile restore task was cancelled")
+    except Exception as exc:
+        log.exception("web research egress profile restore task failed: %s", exc)
+
+
+async def _restore_research_egress_profile_safely(
+    profile: str | None,
+    *,
+    timeline: list[dict[str, Any]],
+    origin: float,
+) -> None:
+    if not profile:
+        return
+    restore_task = asyncio.create_task(
+        _restore_research_egress_profile(profile, timeline=timeline, origin=origin)
+    )
+    restore_task.add_done_callback(_log_restore_task_result)
+    try:
+        await asyncio.shield(restore_task)
+    except asyncio.CancelledError:
+        log.warning(
+            "web research request was cancelled while restoring egress profile; "
+            "background restore to %s is still running",
+            profile,
+        )
+        raise
+
+
+def _default_searxng_profile() -> SearxngProfile:
+    config = _read_egress_profile_config()
+    raw = (
+        os.environ.get("WEB_RESEARCH_SEARXNG_PROFILE")
+        or config.get("default_profile")
+        or _FALLBACK_VPN_EGRESS_PROFILE
+    )
+    return _resolve_egress_profile(str(raw), config=config)
 
 
 def _searxng_profile(value: str | None) -> SearxngProfile:
     if value is None:
         return _default_searxng_profile()
+    return _resolve_egress_profile(value)
+
+
+def _configured_egress_profiles(config: dict[str, Any]) -> set[str]:
+    profiles = config.get("profiles") if isinstance(config.get("profiles"), dict) else {}
+    names = {str(name).strip().lower() for name in profiles if str(name).strip()}
+    names.add(_BRIDGE_EGRESS_PROFILE)
+    if not profiles:
+        names.add(_FALLBACK_VPN_EGRESS_PROFILE)
+    return names
+
+
+def _egress_profile_aliases(config: dict[str, Any]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    raw_aliases = config.get("aliases") if isinstance(config.get("aliases"), dict) else {}
+    for alias, target in raw_aliases.items():
+        alias_text = str(alias).strip().lower()
+        target_text = str(target).strip().lower()
+        if alias_text and target_text:
+            aliases[alias_text] = target_text
+
+    default_profile = str(config.get("default_profile") or "").strip().lower()
+    if default_profile:
+        aliases.setdefault("default", default_profile)
+        for alias in ("normal", "standard", "non-vpn", "non_vpn"):
+            aliases.setdefault(alias, default_profile)
+
+    vpn_profile = aliases.get("vpn")
+    if not vpn_profile and _FALLBACK_VPN_EGRESS_PROFILE in _configured_egress_profiles(config):
+        vpn_profile = _FALLBACK_VPN_EGRESS_PROFILE
+    if vpn_profile:
+        for alias in ("vpn", "nordvpn", "nord"):
+            aliases.setdefault(alias, vpn_profile)
+
+    for alias in ("vps", "xarta", "xarta-tech", "xarta_tech", "bridge"):
+        aliases.setdefault(alias, _BRIDGE_EGRESS_PROFILE)
+    return aliases
+
+
+def _resolve_egress_profile(value: str, *, config: dict[str, Any] | None = None) -> SearxngProfile:
+    config = config if config is not None else _read_egress_profile_config()
     raw = value.strip().lower()
-    aliases = {
-        "default": _default_searxng_profile(),
-        "vlan99": "vpn",
-        "nordvpn": "vpn",
-        "vpn": "vpn",
-        "vps": "bridge",
-        "xarta": "bridge",
-        "xarta-tech": "bridge",
-        "xarta_tech": "bridge",
-        "bridge": "bridge",
-    }
-    resolved = aliases.get(raw)
-    if resolved not in {"vpn", "bridge"}:
-        raise HTTPException(400, "searxng_profile must be vpn or bridge")
-    return "bridge" if resolved == "bridge" else "vpn"
+    if raw == "default":
+        raw = str(config.get("default_profile") or _FALLBACK_VPN_EGRESS_PROFILE).strip().lower()
+    resolved = _egress_profile_aliases(config).get(raw, raw)
+    if resolved not in _configured_egress_profiles(config):
+        raise HTTPException(
+            400,
+            "egress_profile must be default, normal, vpn/nordvpn, a configured profile, or bridge",
+        )
+    return resolved
 
 
 def _web_research_env_int(name: str, default: int, minimum: int = 0, maximum: int = 250000) -> int:
@@ -226,11 +422,15 @@ def _web_research_summary_char_limit() -> int:
 
 
 def _web_research_speech_source_char_limit() -> int:
-    return _web_research_env_int("WEB_RESEARCH_SPEECH_SOURCE_CHAR_LIMIT", 0, minimum=0, maximum=1000000)
+    return _web_research_env_int(
+        "WEB_RESEARCH_SPEECH_SOURCE_CHAR_LIMIT", 0, minimum=0, maximum=1000000
+    )
 
 
 def _web_research_speech_max_tokens() -> int:
-    return _web_research_env_int("WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS", 48000, minimum=1024, maximum=128000)
+    return _web_research_env_int(
+        "WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS", 48000, minimum=1024, maximum=128000
+    )
 
 
 def _now_iso() -> str:
@@ -348,12 +548,16 @@ async def _complete_web_research_query_normalization_local(query: str) -> str | 
     timeout = float(os.environ.get("WEB_RESEARCH_QUERY_NORMALIZER_TIMEOUT", "20"))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+            resp = await client.post(
+                f"{base_url}/v1/chat/completions", headers=headers, json=payload
+            )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         log.warning("web research query normalizer unavailable: %s", exc)
         return None
     if resp.status_code >= 400:
-        log.warning("web research query normalizer failed: HTTP %s %s", resp.status_code, resp.text[:240])
+        log.warning(
+            "web research query normalizer failed: HTTP %s %s", resp.status_code, resp.text[:240]
+        )
         return None
     try:
         data = resp.json()
@@ -391,7 +595,9 @@ def _decode_response(response: httpx.Response, operation: str) -> dict[str, Any]
     return data
 
 
-async def _adapter_get(path: str, *, timeout: float = 8.0) -> tuple[bool, dict[str, Any] | None, str | None]:
+async def _adapter_get(
+    path: str, *, timeout: float = 8.0
+) -> tuple[bool, dict[str, Any] | None, str | None]:
     base_url = _adapter_url()
     if not base_url:
         return False, None, "NULLCLAW01_RESEARCH_URL is not configured"
@@ -407,6 +613,28 @@ async def _adapter_get(path: str, *, timeout: float = 8.0) -> tuple[bool, dict[s
     except HTTPException as exc:
         return False, None, str(exc.detail)
     return True, data, None
+
+
+async def _wait_for_adapter_health(*, timeout_seconds: float = 120.0) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "not checked"
+    while time.monotonic() < deadline:
+        ok, data, error = await _adapter_get("/health", timeout=6.0)
+        if ok and isinstance(data, dict):
+            return {
+                "ok": True,
+                "waited_ms": _elapsed_ms(deadline - timeout_seconds),
+                "health": data,
+            }
+        last_error = error or "unhealthy"
+        await asyncio.sleep(2.0)
+    raise HTTPException(
+        503,
+        (
+            "nullclaw01 research adapter did not become healthy after egress "
+            f"profile apply: {last_error}"
+        ),
+    )
 
 
 def _source_items(raw_sources: Any, raw_citations: Any = None) -> list[dict[str, Any]]:
@@ -428,8 +656,12 @@ def _source_items(raw_sources: Any, raw_citations: Any = None) -> list[dict[str,
         source_id = _text(source.get("source_id"), 80)
         url = _text(source.get("url"), 2000)
         title = _text(source.get("title"), 240) or url or f"Source {index}"
-        snippet = _text(source.get("selection_reason") or source.get("snippet") or source.get("content"), 700)
-        claims = claims_by_source.get(source_id) or _list_text(source.get("claims"), limit=6, item_limit=360)
+        snippet = _text(
+            source.get("selection_reason") or source.get("snippet") or source.get("content"), 700
+        )
+        claims = claims_by_source.get(source_id) or _list_text(
+            source.get("claims"), limit=6, item_limit=360
+        )
         items.append(
             {
                 "label": _text(source.get("citation_label"), 20) or f"[S{index}]",
@@ -527,7 +759,9 @@ def _strip_non_speech_sections(markdown: str) -> str:
     return "\n".join(out).strip()
 
 
-def _clamp_speech_source_markdown(markdown: str, limit: int | None = None) -> tuple[str, dict[str, Any]]:
+def _clamp_speech_source_markdown(
+    markdown: str, limit: int | None = None
+) -> tuple[str, dict[str, Any]]:
     text = str(markdown or "").strip()
     source_limit = _web_research_speech_source_char_limit() if limit is None else max(0, int(limit))
     meta = {
@@ -584,7 +818,9 @@ async def _speech_markdown(*, query: str, summary_markdown: str) -> str:
     return re.sub(r"\s+([.,;!?])", r"\1", result.text)
 
 
-async def _complete_web_research_speech_local(messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
+async def _complete_web_research_speech_local(
+    messages: list[dict[str, str]],
+) -> tuple[str, dict[str, Any]]:
     base_url = (os.environ.get("LITELLM_BASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("LITELLM_API_KEY") or "").strip()
     model = (
@@ -597,7 +833,9 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
     if not api_key:
         raise HTTPException(503, "LITELLM_API_KEY is not configured for web research narration")
     if not model:
-        raise HTTPException(503, "WEB_RESEARCH_SPEECH_LLM_MODEL or DOC_SPEECH_LLM_MODEL is not configured")
+        raise HTTPException(
+            503, "WEB_RESEARCH_SPEECH_LLM_MODEL or DOC_SPEECH_LLM_MODEL is not configured"
+        )
 
     max_tokens = _web_research_speech_max_tokens()
     payload = {
@@ -607,14 +845,16 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     timeout = float(
-            os.environ.get(
-                "WEB_RESEARCH_SPEECH_LLM_TIMEOUT",
-                os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"),
-            )
+        os.environ.get(
+            "WEB_RESEARCH_SPEECH_LLM_TIMEOUT",
+            os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"),
         )
+    )
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+            resp = await client.post(
+                f"{base_url}/v1/chat/completions", headers=headers, json=payload
+            )
     except httpx.TimeoutException as exc:
         await publish_local_llm_offline_event(
             operation="web-research:narration",
@@ -646,7 +886,9 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
         choice = data["choices"][0]
         answer = choice["message"]["content"]
     except Exception as exc:
-        raise HTTPException(502, "Local LLM returned an invalid web research narration response") from exc
+        raise HTTPException(
+            502, "Local LLM returned an invalid web research narration response"
+        ) from exc
     meta = {
         "llm_model": data.get("model") or model,
         "max_tokens": max_tokens,
@@ -656,7 +898,9 @@ async def _complete_web_research_speech_local(messages: list[dict[str, str]]) ->
     return _strip_think_blocks(str(answer or "")), meta
 
 
-async def _generate_web_research_speech_markdown(query: str, summary_markdown: str) -> tuple[str, dict[str, Any]]:
+async def _generate_web_research_speech_markdown(
+    query: str, summary_markdown: str
+) -> tuple[str, dict[str, Any]]:
     try:
         prepared_source = await prepare_tts_markdown_for_llm_via_service(
             _strip_non_speech_sections(summary_markdown)
@@ -784,7 +1028,9 @@ async def _display_envelope(
                 adapter_notes.append(clean)
             if len(adapter_notes) >= 8:
                 break
-    firewall_notes = adapter_notes or ["Guarded public-web adapter enforced URL and content restrictions."]
+    firewall_notes = adapter_notes or [
+        "Guarded public-web adapter enforced URL and content restrictions."
+    ]
     markdown = _summary_markdown(data, body.query, sources)
     audio = await _speech_markdown(
         query=body.query,
@@ -844,8 +1090,12 @@ async def web_research_egress_ip() -> dict[str, Any]:
         "source": _text(data.get("source"), 120),
         "tool_path": _text(data.get("tool_path"), 220),
         "reverse_dns": _text(data.get("reverse_dns"), 220) if data.get("reverse_dns") else None,
-        "server_domain": _text(data.get("server_domain"), 220) if data.get("server_domain") else None,
-        "server_dns_lookup": data.get("server_dns_lookup") if isinstance(data.get("server_dns_lookup"), list) else None,
+        "server_domain": _text(data.get("server_domain"), 220)
+        if data.get("server_domain")
+        else None,
+        "server_dns_lookup": data.get("server_dns_lookup")
+        if isinstance(data.get("server_dns_lookup"), list)
+        else None,
     }
 
 
@@ -869,6 +1119,72 @@ async def web_research_privacy_doc() -> dict[str, Any]:
     }
 
 
+@router.get("/egress-profile", response_model=dict)
+async def web_research_egress_profile() -> dict[str, Any]:
+    config = _read_egress_profile_config()
+    default_profile = _searxng_profile(str(config.get("default_profile") or "default"))
+    return {
+        "ok": True,
+        "default_profile": default_profile,
+        "active_profile": _searxng_profile(str(config.get("active_profile") or default_profile)),
+        "intended_default_profile": str(config.get("intended_default_profile") or ""),
+        "config_path": str(_EGRESS_PROFILE_CONFIG),
+        "switch_endpoint": "/api/v1/web-research/egress-profile",
+        "switch_requires_auth": True,
+        "switching": config.get("switching") if isinstance(config.get("switching"), dict) else {},
+        "profiles": config.get("profiles") if isinstance(config.get("profiles"), dict) else {},
+        "aliases": _egress_profile_aliases(config),
+    }
+
+
+@router.post("/egress-profile", response_model=dict)
+async def set_web_research_egress_profile(body: WebResearchEgressProfileBody) -> dict[str, Any]:
+    requested = _searxng_profile(body.default_profile)
+    config = _read_egress_profile_config()
+    profiles = config.get("profiles") if isinstance(config.get("profiles"), dict) else {}
+    profile_config = profiles.get(requested) if isinstance(profiles.get(requested), dict) else {}
+    if profile_config.get("ready") is False:
+        raise HTTPException(
+            409,
+            f"egress profile {requested} is documented but not marked ready for activation",
+        )
+    previous = str(config.get("default_profile") or _FALLBACK_VPN_EGRESS_PROFILE)
+    now = _now_iso()
+    apply_result = await _apply_egress_profile(requested)
+    config["default_profile"] = requested
+    config["active_profile"] = requested
+    config["updated_at"] = now
+    config["updated_by"] = body.operator
+    config["update_reason"] = body.reason
+    _write_egress_profile_config(config)
+    audit = {
+        "ts": now,
+        "event": "web_research_egress_profile_switch",
+        "operator": body.operator,
+        "previous_default_profile": previous,
+        "new_default_profile": requested,
+        "reason": body.reason,
+        "config_path": str(_EGRESS_PROFILE_CONFIG),
+        "apply_stdout": apply_result.get("stdout"),
+        "apply_stderr": apply_result.get("stderr"),
+    }
+    _append_egress_profile_audit(audit)
+    log.warning(
+        "web research egress profile switched from %s to %s by %s: %s",
+        previous,
+        requested,
+        body.operator,
+        body.reason,
+    )
+    return {
+        "ok": True,
+        "default_profile": requested,
+        "active_profile": requested,
+        "previous_default_profile": previous,
+        "apply": apply_result,
+    }
+
+
 def _task_payload(
     query: str,
     depth: str,
@@ -879,12 +1195,15 @@ def _task_payload(
     searxng_profile: str | None = None,
 ) -> dict[str, Any]:
     policy = dict(_DEPTH_POLICIES.get(depth, _DEPTH_POLICIES["standard"]))
+    egress_profile = _searxng_profile(searxng_profile)
     policy.update(
         {
             "require_citations": True,
-            "require_vlan99_diagnostics": True,
+            "require_egress_diagnostics": True,
+            "require_vlan99_diagnostics": egress_profile == "vlan99",
             "allowed_schemes": ["https", "http"],
-            "searxng_profile": _searxng_profile(searxng_profile),
+            "searxng_profile": egress_profile,
+            "egress_profile": egress_profile,
         }
     )
     task_objective = _text(objective or query, 4000)
@@ -940,13 +1259,18 @@ async def _poll_task(base_url: str, task_id: str) -> dict[str, Any]:
                 response = await client.get(f"{base_url}/tasks/{task_id}")
                 data = _decode_response(response, "task status")
             except httpx.RequestError as exc:
-                raise HTTPException(503, f"nullclaw01 research adapter unavailable while polling: {exc}") from exc
+                raise HTTPException(
+                    503, f"nullclaw01 research adapter unavailable while polling: {exc}"
+                ) from exc
             last = data
             if str(data.get("state") or "") in _TASK_TERMINAL_STATES:
                 return data
             await asyncio.sleep(1.2)
     state = str(last.get("state") or "unknown") if last else "unknown"
-    raise HTTPException(504, f"nullclaw01 web research did not finish before the Blueprints timeout (state: {state})")
+    raise HTTPException(
+        504,
+        f"nullclaw01 web research did not finish before the Blueprints timeout (state: {state})",
+    )
 
 
 @router.post("/query", response_model=dict)
@@ -955,86 +1279,128 @@ async def web_research_query(body: WebResearchQueryBody) -> dict[str, Any]:
     timeline: list[dict[str, Any]] = []
     stage_started = time.monotonic()
     query = await _normalize_web_research_query(body.query)
-    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.query_normalization", start=stage_started)
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.query_normalization",
+        start=stage_started,
+    )
     _validate_public_query(query)
 
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
     searxng_profile = _searxng_profile(body.searxng_profile)
-    stage_started = time.monotonic()
-    submitted = await _submit_task(
-        base_url,
-        _task_payload(query, body.depth, body.private_mode, searxng_profile=searxng_profile),
-    )
-    _timeline_span(
-        timeline,
+    default_profile = _default_searxng_profile()
+    restore_profile = await _activate_research_egress_profile(
+        searxng_profile,
+        default_profile=default_profile,
+        timeline=timeline,
         origin=timeline_origin,
-        stage="blueprints.task_submit",
-        start=stage_started,
-        task_id=submitted.get("id"),
     )
-    task_id = str(submitted.get("id") or "").strip()
-    if not task_id:
-        raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
-    stage_started = time.monotonic()
-    data = await _poll_task(base_url, task_id)
-    status = str(data.get("state") or "unknown")
-    _timeline_span(
-        timeline,
-        origin=timeline_origin,
-        stage="blueprints.task_poll_until_terminal",
-        start=stage_started,
-        task_id=task_id,
-        terminal_state=status,
-    )
-    stage_started = time.monotonic()
-    display = await _display_envelope(body=body, data=data)
-    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.display_envelope", start=stage_started)
-    cache_key = None if body.private_mode else _cache_key(
-        query=query,
-        depth=body.depth,
-        markdown=display["summary_markdown"],
-    )
-    stage_started = time.monotonic()
-    purge = await _purge_task(base_url, task_id) if body.private_mode else None
-    if body.private_mode:
-        _timeline_span(timeline, origin=timeline_origin, stage="blueprints.private_task_purge", start=stage_started)
-    adapter_diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
-    total_ms = _elapsed_ms(timeline_origin)
-    return {
-        "ok": status in {"succeeded", "partial"},
-        "query": query,
-        "depth": body.depth,
-        "private_mode": body.private_mode,
-        "searxng_profile": searxng_profile,
-        "status": status,
-        "display": display,
-        "raw": {
-            "adapter": {
-                "task_id": task_id,
-                "state": status,
-                "progress": data.get("progress") if isinstance(data.get("progress"), dict) else {},
-                "diagnostics_summary": (
-                    data.get("diagnostics", {}).get("summary")
-                    if isinstance(data.get("diagnostics"), dict)
-                    else {}
-                ),
-                "source_count": len(display["source_items"]),
-                "warning_count": len(display["warnings"]),
-                "searxng_profile": searxng_profile,
-                "purged": purge if body.private_mode else None,
+    try:
+        stage_started = time.monotonic()
+        submitted = await _submit_task(
+            base_url,
+            _task_payload(query, body.depth, body.private_mode, searxng_profile=searxng_profile),
+        )
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.task_submit",
+            start=stage_started,
+            task_id=submitted.get("id"),
+        )
+        task_id = str(submitted.get("id") or "").strip()
+        if not task_id:
+            raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
+        stage_started = time.monotonic()
+        data = await _poll_task(base_url, task_id)
+        status = str(data.get("state") or "unknown")
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.task_poll_until_terminal",
+            start=stage_started,
+            task_id=task_id,
+            terminal_state=status,
+        )
+        stage_started = time.monotonic()
+        display = await _display_envelope(body=body, data=data)
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.display_envelope",
+            start=stage_started,
+        )
+        cache_key = (
+            None
+            if body.private_mode
+            else _cache_key(
+                query=query,
+                depth=body.depth,
+                markdown=display["summary_markdown"],
+            )
+        )
+        stage_started = time.monotonic()
+        purge = await _purge_task(base_url, task_id) if body.private_mode else None
+        if body.private_mode:
+            _timeline_span(
+                timeline,
+                origin=timeline_origin,
+                stage="blueprints.private_task_purge",
+                start=stage_started,
+            )
+        adapter_diagnostics = (
+            data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+        )
+        total_ms = _elapsed_ms(timeline_origin)
+        return {
+            "ok": status in {"succeeded", "partial"},
+            "query": query,
+            "depth": body.depth,
+            "private_mode": body.private_mode,
+            "searxng_profile": searxng_profile,
+            "egress_profile": searxng_profile,
+            "status": status,
+            "display": display,
+            "raw": {
+                "adapter": {
+                    "task_id": task_id,
+                    "state": status,
+                    "progress": data.get("progress")
+                    if isinstance(data.get("progress"), dict)
+                    else {},
+                    "diagnostics_summary": (
+                        data.get("diagnostics", {}).get("summary")
+                        if isinstance(data.get("diagnostics"), dict)
+                        else {}
+                    ),
+                    "source_count": len(display["source_items"]),
+                    "warning_count": len(display["warnings"]),
+                    "searxng_profile": searxng_profile,
+                    "egress_profile": searxng_profile,
+                    "egress_diagnostics": adapter_diagnostics.get("egress_profile"),
+                    "purged": purge if body.private_mode else None,
+                },
+                "timing": {
+                    "total_ms": total_ms,
+                    "blueprints_stages": timeline,
+                    "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
+                    "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
+                    "adapter_stages": adapter_diagnostics.get("timeline")
+                    if isinstance(adapter_diagnostics.get("timeline"), list)
+                    else [],
+                },
             },
-            "timing": {
-                "total_ms": total_ms,
-                "blueprints_stages": timeline,
-                "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
-                "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
-                "adapter_stages": adapter_diagnostics.get("timeline") if isinstance(adapter_diagnostics.get("timeline"), list) else [],
-            },
-        },
-        "cache_key": cache_key,
-    }
+            "cache_key": cache_key,
+        }
+    finally:
+        await _restore_research_egress_profile_safely(
+            restore_profile,
+            timeline=timeline,
+            origin=timeline_origin,
+        )
 
 
 @router.post("/query-prompt", response_model=dict)
@@ -1046,101 +1412,143 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
     query_source = body.query or prompt
     stage_started = time.monotonic()
     query = await _normalize_web_research_query(query_source)
-    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.query_normalization", start=stage_started)
+    _timeline_span(
+        timeline,
+        origin=timeline_origin,
+        stage="blueprints.query_normalization",
+        start=stage_started,
+    )
     _validate_public_query(query)
 
     base_url = _adapter_url()
     if not base_url:
         raise HTTPException(503, "NULLCLAW01_RESEARCH_URL is not configured")
     searxng_profile = _searxng_profile(body.searxng_profile)
-    stage_started = time.monotonic()
-    submitted = await _submit_task(
-        base_url,
-        _task_payload(
-            query,
-            body.depth,
-            body.private_mode,
-            objective=prompt,
-            seed_terms=[],
-            searxng_profile=searxng_profile,
-        ),
-    )
-    _timeline_span(
-        timeline,
+    default_profile = _default_searxng_profile()
+    restore_profile = await _activate_research_egress_profile(
+        searxng_profile,
+        default_profile=default_profile,
+        timeline=timeline,
         origin=timeline_origin,
-        stage="blueprints.task_submit",
-        start=stage_started,
-        task_id=submitted.get("id"),
     )
-    task_id = str(submitted.get("id") or "").strip()
-    if not task_id:
-        raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
-    stage_started = time.monotonic()
-    data = await _poll_task(base_url, task_id)
-    status = str(data.get("state") or "unknown")
-    _timeline_span(
-        timeline,
-        origin=timeline_origin,
-        stage="blueprints.task_poll_until_terminal",
-        start=stage_started,
-        task_id=task_id,
-        terminal_state=status,
-    )
-    stage_started = time.monotonic()
-    display = await _display_envelope(
-        body=WebResearchQueryBody(
-            query=query,
-            depth=body.depth,
-            private_mode=body.private_mode,
-            searxng_profile=searxng_profile,
-        ),
-        data=data,
-    )
-    _timeline_span(timeline, origin=timeline_origin, stage="blueprints.display_envelope", start=stage_started)
-    cache_key = None if body.private_mode else _cache_key(
-        query=query,
-        depth=body.depth,
-        markdown=display["summary_markdown"],
-    )
-    stage_started = time.monotonic()
-    purge = await _purge_task(base_url, task_id) if body.private_mode else None
-    if body.private_mode:
-        _timeline_span(timeline, origin=timeline_origin, stage="blueprints.private_task_purge", start=stage_started)
-    adapter_diagnostics = data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
-    total_ms = _elapsed_ms(timeline_origin)
-    return {
-        "ok": status in {"succeeded", "partial"},
-        "query": query,
-        "depth": body.depth,
-        "private_mode": body.private_mode,
-        "searxng_profile": searxng_profile,
-        "status": status,
-        "display": display,
-        "raw": {
-            "adapter": {
-                "task_id": task_id,
-                "state": status,
-                "progress": data.get("progress") if isinstance(data.get("progress"), dict) else {},
-                "diagnostics_summary": (
-                    data.get("diagnostics", {}).get("summary")
-                    if isinstance(data.get("diagnostics"), dict)
-                    else {}
-                ),
-                "source_count": len(display["source_items"]),
-                "warning_count": len(display["warnings"]),
-                "searxng_profile": searxng_profile,
-                "purged": purge if body.private_mode else None,
+    try:
+        stage_started = time.monotonic()
+        submitted = await _submit_task(
+            base_url,
+            _task_payload(
+                query,
+                body.depth,
+                body.private_mode,
+                objective=prompt,
+                seed_terms=[],
+                searxng_profile=searxng_profile,
+            ),
+        )
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.task_submit",
+            start=stage_started,
+            task_id=submitted.get("id"),
+        )
+        task_id = str(submitted.get("id") or "").strip()
+        if not task_id:
+            raise HTTPException(502, "nullclaw01 research adapter did not return a task id")
+        stage_started = time.monotonic()
+        data = await _poll_task(base_url, task_id)
+        status = str(data.get("state") or "unknown")
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.task_poll_until_terminal",
+            start=stage_started,
+            task_id=task_id,
+            terminal_state=status,
+        )
+        stage_started = time.monotonic()
+        display = await _display_envelope(
+            body=WebResearchQueryBody(
+                query=query,
+                depth=body.depth,
+                private_mode=body.private_mode,
+                searxng_profile=searxng_profile,
+            ),
+            data=data,
+        )
+        _timeline_span(
+            timeline,
+            origin=timeline_origin,
+            stage="blueprints.display_envelope",
+            start=stage_started,
+        )
+        cache_key = (
+            None
+            if body.private_mode
+            else _cache_key(
+                query=query,
+                depth=body.depth,
+                markdown=display["summary_markdown"],
+            )
+        )
+        stage_started = time.monotonic()
+        purge = await _purge_task(base_url, task_id) if body.private_mode else None
+        if body.private_mode:
+            _timeline_span(
+                timeline,
+                origin=timeline_origin,
+                stage="blueprints.private_task_purge",
+                start=stage_started,
+            )
+        adapter_diagnostics = (
+            data.get("diagnostics") if isinstance(data.get("diagnostics"), dict) else {}
+        )
+        total_ms = _elapsed_ms(timeline_origin)
+        return {
+            "ok": status in {"succeeded", "partial"},
+            "query": query,
+            "depth": body.depth,
+            "private_mode": body.private_mode,
+            "searxng_profile": searxng_profile,
+            "egress_profile": searxng_profile,
+            "status": status,
+            "display": display,
+            "raw": {
+                "adapter": {
+                    "task_id": task_id,
+                    "state": status,
+                    "progress": data.get("progress")
+                    if isinstance(data.get("progress"), dict)
+                    else {},
+                    "diagnostics_summary": (
+                        data.get("diagnostics", {}).get("summary")
+                        if isinstance(data.get("diagnostics"), dict)
+                        else {}
+                    ),
+                    "source_count": len(display["source_items"]),
+                    "warning_count": len(display["warnings"]),
+                    "searxng_profile": searxng_profile,
+                    "egress_profile": searxng_profile,
+                    "egress_diagnostics": adapter_diagnostics.get("egress_profile"),
+                    "purged": purge if body.private_mode else None,
+                },
+                "timing": {
+                    "total_ms": total_ms,
+                    "blueprints_stages": timeline,
+                    "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
+                    "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
+                    "adapter_stages": adapter_diagnostics.get("timeline")
+                    if isinstance(adapter_diagnostics.get("timeline"), list)
+                    else [],
+                },
             },
-            "timing": {
-                "total_ms": total_ms,
-                "blueprints_stages": timeline,
-                "adapter_total_ms": adapter_diagnostics.get("timeline_total_ms"),
-                "adapter_worker_elapsed_ms": adapter_diagnostics.get("worker_elapsed_ms"),
-                "adapter_stages": adapter_diagnostics.get("timeline") if isinstance(adapter_diagnostics.get("timeline"), list) else [],
-            },
-        },
-        "cache_key": cache_key,
-    }
+            "cache_key": cache_key,
+        }
+    finally:
+        await _restore_research_egress_profile_safely(
+            restore_profile,
+            timeline=timeline,
+            origin=timeline_origin,
+        )
 
 
 @router.post("/speech", response_model=dict)
@@ -1154,7 +1562,9 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
                 "cache": "hit",
                 "cache_key": cache_key,
                 "generated_at": cached.get("generated_at"),
-                "generation": cached.get("meta", {}).get("generation") if isinstance(cached.get("meta"), dict) else None,
+                "generation": cached.get("meta", {}).get("generation")
+                if isinstance(cached.get("meta"), dict)
+                else None,
                 "markdown": cached["markdown"],
             }
 
@@ -1167,7 +1577,9 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
 
     query = (body.query or display.get("query") or "web research").strip()
     _validate_public_query(query)
-    audio, generation_meta = await _generate_web_research_speech_markdown(query=query, summary_markdown=markdown)
+    audio, generation_meta = await _generate_web_research_speech_markdown(
+        query=query, summary_markdown=markdown
+    )
     if body.private_mode:
         return {
             "ok": True,
@@ -1187,7 +1599,9 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            raise HTTPException(500, f"Could not invalidate web research speech cache: {exc}") from exc
+            raise HTTPException(
+                500, f"Could not invalidate web research speech cache: {exc}"
+            ) from exc
     _write_speech_cache(
         cache_key,
         audio,

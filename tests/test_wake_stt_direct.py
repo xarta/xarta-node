@@ -935,7 +935,7 @@ def test_submit_wake_stt_nullclaw_target_uses_bounded_route(monkeypatch):
             "sources": [{"path": "hermes/HERMES-STT-PROCESS-RUNBOOK.md"}],
         }
 
-    async def fake_web(text):
+    async def fake_web(text, **_kwargs):
         assert "OpenAI model routing" in text
         return {
             "ok": True,
@@ -1004,7 +1004,35 @@ def test_call_nullclaw_web_research_uses_plain_query(monkeypatch):
         body.query == "Please do some web research on the latest Stargate series proposed in 2025."
     )
     assert not hasattr(body, "prompt")
+    assert body.searxng_profile == "default"
     assert "Bounded Wake STT" not in json.dumps(body.__dict__)
+
+
+def test_call_nullclaw_web_research_uses_vpn_profile_for_circumspect_request(monkeypatch):
+    captured = {}
+
+    class FakeWebResearchQueryBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    async def fake_query(body):
+        captured["body"] = body
+        return {"ok": True, "display": {"summary_markdown": "done"}}
+
+    fake_module = types.ModuleType("app.routes_web_research")
+    fake_module.WebResearchQueryBody = FakeWebResearchQueryBody
+    fake_module.web_research_query = fake_query
+    monkeypatch.setitem(sys.modules, "app.routes_web_research", fake_module)
+
+    result = asyncio.run(
+        wake_stt_direct._call_nullclaw_web_research(
+            "Please use VPN web research and be circumspect about this topic.",
+            timeout_seconds=1.0,
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["body"].searxng_profile == "vlan99"
 
 
 def test_nullclaw_local_docs_are_only_used_when_requested():
@@ -1044,7 +1072,7 @@ def test_nullclaw_web_synthesis_speech_uses_local_model_section_only():
         }
     )
 
-    assert "NullClaw found:" in speech
+    assert "Web Research found:" in speech
     assert "Two long-lost episodes were found." in speech
     assert "Query Plan" not in speech
     assert "Sources" not in speech
@@ -1115,7 +1143,7 @@ def test_submit_wake_stt_nullclaw_web_only_public_request_skips_docs(monkeypatch
     async def fail_docs(_text):
         raise AssertionError("public web-only request should not call local docs")
 
-    async def fake_web(text):
+    async def fake_web(text, **_kwargs):
         assert "Stargate" in text
         return {
             "ok": True,
