@@ -50,23 +50,45 @@ repair_path() {
     local path="$1"
     local owner="$2"
     local label="$3"
+    local mode="${4:-}"
 
     [[ -e "$path" ]] || return 0
 
-    if ! find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -print -quit 2>/dev/null | grep -q .; then
-        [[ "$VERBOSE" == "1" ]] && echo "OK: $label $path owner=$owner"
+    local owner_drift=0
+    local mode_drift=0
+
+    if find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -print -quit 2>/dev/null | grep -q .; then
+        owner_drift=1
+    fi
+
+    if [[ -n "$mode" ]]; then
+        while IFS= read -r item; do
+            [[ "$(stat -c '%a' "$item")" == "$mode" ]] || {
+                mode_drift=1
+                break
+            }
+        done < <(find "$path" -xdev -print 2>/dev/null)
+    fi
+
+    if [[ "$owner_drift" == "0" && "$mode_drift" == "0" ]]; then
+        [[ "$VERBOSE" == "1" ]] && echo "OK: $label $path owner=$owner${mode:+ mode=$mode}"
         return 0
     fi
 
     drift=$((drift + 1))
     if [[ "$MODE" == "check" ]]; then
-        echo "DRIFT: $label $path expected_owner=$owner"
+        echo "DRIFT: $label $path expected_owner=$owner${mode:+ expected_mode=$mode}"
         return 0
     fi
 
-    find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -exec chown "$owner" {} +
+    if [[ "$owner_drift" == "1" ]]; then
+        find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -exec chown "$owner" {} +
+    fi
+    if [[ "$mode_drift" == "1" ]]; then
+        find "$path" -xdev ! -perm "$mode" -exec chmod "$mode" {} +
+    fi
     changed=$((changed + 1))
-    [[ "$VERBOSE" == "1" ]] && echo "FIXED: $label $path owner=$owner"
+    [[ "$VERBOSE" == "1" ]] && echo "FIXED: $label $path owner=$owner${mode:+ mode=$mode}"
 }
 
 for compose in "$STACKS_DIR"/*/compose.yaml; do
@@ -116,6 +138,26 @@ for compose in "$STACKS_DIR"/*/compose.yaml; do
     if grep -Eq 'image:[[:space:]]*"?xarta/system-bridge-notifier:' "$compose"; then
         if grep -Eq '\./data:/data' "$compose"; then
             repair_path "$stack_dir/data" "65534:65534" "$stack_name system-bridge-notifier-data"
+        fi
+    fi
+
+    if grep -Eq 'image:[[:space:]]*"?([^"[:space:]]*/)?matrixdotorg/synapse([:@][^"[:space:]]*)?' "$compose"; then
+        if grep -Eq '\./data:/data' "$compose"; then
+            synapse_config="$stack_dir/data/homeserver.yaml"
+            repair_path "$synapse_config" "991:991" "$stack_name synapse-config" "600"
+            signing_key_path=""
+            if [[ -r "$synapse_config" ]]; then
+                signing_key_path="$(sed -nE 's/^[[:space:]]*signing_key_path:[[:space:]]*"?([^"#]+)"?[[:space:]]*(#.*)?$/\1/p' "$synapse_config" | head -n 1)"
+                signing_key_path="${signing_key_path%\"}"
+            fi
+            if [[ "$signing_key_path" == /data/* ]]; then
+                repair_path "$stack_dir/data/${signing_key_path#/data/}" "991:991" "$stack_name synapse-signing-key" "600"
+            else
+                for signing_key in "$stack_dir"/data/*.signing.key; do
+                    [[ -e "$signing_key" ]] || continue
+                    repair_path "$signing_key" "991:991" "$stack_name synapse-signing-key" "600"
+                done
+            fi
         fi
     fi
 done
