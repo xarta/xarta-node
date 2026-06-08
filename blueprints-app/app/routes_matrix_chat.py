@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -1483,6 +1484,26 @@ class _MatrixChatE2EEClient:
                 return
             await self._start()
 
+    async def close(self) -> None:
+        async with self._lock:
+            self._started = False
+            api = self._api
+            crypto_db = self._crypto_db
+            self._api = None
+            self._client = None
+            self._crypto_db = None
+
+            if crypto_db is not None:
+                with suppress(Exception):
+                    await crypto_db.stop()
+            session = getattr(api, "session", None)
+            close = getattr(session, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    with suppress(Exception):
+                        await result
+
     async def _start(self) -> None:
         ok, detail = _check_e2ee_deps()
         if not ok:
@@ -1814,6 +1835,16 @@ async def _get_e2ee_client(settings: dict[str, str] | None = None) -> _MatrixCha
             _e2ee_clients[candidate.key] = client
     await client.ensure_started()
     return client
+
+
+async def close_matrix_chat_e2ee_clients() -> None:
+    async with _e2ee_client_lock:
+        clients = list(_e2ee_clients.values())
+        _e2ee_clients.clear()
+    if not clients:
+        return
+    await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
+    log.info("Matrix chat E2EE clients closed")
 
 
 async def _matrix_request_any(
