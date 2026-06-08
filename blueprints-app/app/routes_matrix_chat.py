@@ -435,16 +435,22 @@ _DEFAULT_WAKE_STT_FAST_ROUTES_FILE = (
 )
 _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION = "time_fast_session"
 _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC = "time_current_deterministic_response"
+_WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC = "basic_health_deterministic_response"
 _WAKE_STT_FAST_ACTIONS = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION,
     _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+    _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
 }
 _WAKE_STT_FAST_HERMES_TOOL_SURFACES = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION: "xarta_time_lookup_only",
 }
 _WAKE_STT_FAST_LOCAL_ACTIONS = {
     _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+    _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
 }
+_DEFAULT_WAKE_STT_BASIC_HEALTH_CHECKS_FILE = (
+    "/xarta-node/.lone-wolf/config/hermes-stt/basic-health-checks.json"
+)
 _DEFAULT_WAKE_STT_TIMEZONE = "Europe/London"
 _DEFAULT_WAKE_STT_TIME_TOOL = "/root/xarta-node/.xarta/.agents/bin/hermes-stt-time-tool"
 _WAKE_STT_DIRECT_NEW_SESSION_RE = re.compile(
@@ -672,6 +678,92 @@ def _wake_stt_time_tool_response_fields(
     }
 
 
+def _wake_stt_tcp_probe(host: str, port: int, *, timeout_seconds: float = 0.35) -> tuple[bool, str]:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True, ""
+    except OSError as exc:
+        return False, f"{host}:{port} {type(exc).__name__}"
+
+
+def _wake_stt_basic_health_checks_file() -> Path:
+    raw = os.getenv(
+        "BLUEPRINTS_WAKE_STT_BASIC_HEALTH_CHECKS_FILE",
+        _DEFAULT_WAKE_STT_BASIC_HEALTH_CHECKS_FILE,
+    )
+    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_BASIC_HEALTH_CHECKS_FILE)
+
+
+def _wake_stt_basic_health_checks() -> tuple[list[tuple[str, str, int]], str]:
+    fallback = [("local AI", "127.0.0.1", 4000)]
+    path = _wake_stt_basic_health_checks_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback, "default_local_only"
+    items = raw.get("checks") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return fallback, "default_local_only"
+    checks: list[tuple[str, str, int]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = _safe_str(item.get("label")).strip()
+        host = _safe_str(item.get("host")).strip()
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if not label or not host or not (0 < port < 65536):
+            continue
+        checks.append((label, host, port))
+    if not checks:
+        return fallback, "default_local_only"
+    return checks, "configured"
+
+
+async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
+    checks, config_status = _wake_stt_basic_health_checks()
+    started = time.perf_counter()
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_wake_stt_tcp_probe, host, port) for _label, host, port in checks]
+    )
+    failures = [
+        f"{label} unreachable"
+        for (label, _host, _port), (ok, _error) in zip(checks, results, strict=False)
+        if not ok
+    ]
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    if failures:
+        speech = "I found a basic health issue: " + "; ".join(failures[:4]) + "."
+        if len(failures) > 4:
+            speech += f" And {len(failures) - 4} more checks failed."
+        status = "basic_health_degraded"
+    else:
+        speech = "I am functioning within normal parameters."
+        status = "basic_health_ok"
+    detail_lines = [
+        "Deterministic Wake STT basic health check.",
+        f"Elapsed: {elapsed_ms} ms.",
+        f"Config: {config_status}.",
+    ]
+    for (label, host, port), (ok, error) in zip(checks, results, strict=False):
+        detail_lines.append(f"- {label}: {'ok' if ok else 'fail'} ({host}:{port})")
+        if error:
+            detail_lines[-1] += f" {error}"
+    detail_lines.append(
+        "- ZFS: not checked by this first fast path; reserved for a future cached/quick PVE probe."
+    )
+    return {
+        "speech": speech,
+        "matrix_detail": "\n".join(detail_lines),
+        "status": status,
+        "helper_elapsed_ms": str(elapsed_ms),
+    }
+
+
 async def _wake_stt_fast_route_local_delivery(
     *,
     text: str,
@@ -679,7 +771,7 @@ async def _wake_stt_fast_route_local_delivery(
     timing: wake_stt_direct.WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
-    if fast_route.action != _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC:
+    if fast_route.action not in _WAKE_STT_FAST_LOCAL_ACTIONS:
         raise ValueError(f"unsupported local Wake STT fast route action: {fast_route.action}")
     code_list = wake_stt_direct.command_codes_from_env()
     gate = wake_stt_direct.apply_command_code_gate(
@@ -702,7 +794,10 @@ async def _wake_stt_fast_route_local_delivery(
             action=fast_route.action,
         )
     try:
-        fields = _wake_stt_time_tool_response_fields(text=text, route=fast_route)
+        if fast_route.action == _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC:
+            fields = _wake_stt_time_tool_response_fields(text=text, route=fast_route)
+        else:
+            fields = await _wake_stt_basic_health_response_fields()
     except RuntimeError as exc:
         if timing:
             timing.mark(
@@ -755,9 +850,9 @@ async def _wake_stt_fast_route_local_delivery(
             "fast_route_local_action_delivered",
             route_id=fast_route.route_id,
             action=fast_route.action,
-            timezone=fields["timezone"],
-            time_24h=fields["time_24h"],
-            helper_elapsed_ms=fields["helper_elapsed_ms"],
+            timezone=fields.get("timezone", ""),
+            time_24h=fields.get("time_24h", ""),
+            helper_elapsed_ms=fields.get("helper_elapsed_ms", ""),
         )
     return wake_stt_direct.WakeSttDeliveryResult(
         ok=True,

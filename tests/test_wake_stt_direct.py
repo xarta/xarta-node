@@ -588,14 +588,12 @@ def test_spoken_rep_research_shortcut_does_not_need_brand_hint():
     assert result.reason == "deterministic bounded public web research phrase"
 
 
-def test_public_brand_lookup_shortcut_routes_to_nullclaw():
+def test_public_brand_lookup_alone_is_not_public_web_shortcut():
     result = wake_stt_direct._wake_stt_public_web_shortcut_result(
         "Tell me about the true Stark Coffee brand that I get from Azda"
     )
 
-    assert result is not None
-    assert result.target_profile == "hermes-stt-nullclaw"
-    assert result.requires_command_code is False
+    assert result is None
 
 
 def test_more_web_research_followup_shortcut_routes_to_nullclaw():

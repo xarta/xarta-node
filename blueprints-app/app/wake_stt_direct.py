@@ -72,10 +72,6 @@ _WAKE_STT_WEB_RESEARCH_SPOKEN_HINT_RE = re.compile(
     r"\b(?:use|using|do|doing|try|please\s+do|more|with|via)(?:\s+\w+){0,5}\s+(?:web|website|rep|reb)\s+research\b|\bask(?:\s+\w+){0,4}\s+to\s+(?:web|website|rep|reb)\s+research\b|\b(?:research|look\s+up|find\s+out)\s+(?:online|on\s+the\s+web|from\s+the\s+web)\b",
     re.IGNORECASE,
 )
-_WAKE_STT_PUBLIC_BRAND_HINT_RE = re.compile(
-    r"\b(?:brand|company|product|coffee|retailer|supermarket|asda|azda|tesco|sainsbury|aldi|lidl|morrisons|waitrose|buy|sold)\b",
-    re.IGNORECASE,
-)
 _WAKE_STT_GENERIC_RESEARCH_HINT_RE = re.compile(
     r"\b(?:please\s+)?(?:do|doing|use|using|try)?\s*(?:some|more|a\s+bit\s+of)?\s*research(?:\s+(?:on|about|into|for|the|this|that))?\b|\b(?:using\s+)?more\s+research\b|\bresearch\s+(?:on|about|into|for|the|this|that|latest|current)\b",
     re.IGNORECASE,
@@ -1252,7 +1248,7 @@ def _wake_stt_profile_classifier_prompt(
             "base": "Use hermes-stt only for ordinary low-risk short answers or when deterministic local routing already handled the request.",
             "local_duh": "Use hermes-stt-local-duh for simple local read-only/file/doc/status checks and exact transformations.",
             "local": "Use hermes-stt-local for local private thinking, local docs lookup, NullClaw docs synthesis, and non-cloud work that benefits from reasoning.",
-            "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research, website research, rep research, reb research, unqualified public-topic research on/about something, public brand/product/company lookups, and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. For Wake STT, plain 'research on/about X' normally means public web research unless the request qualifies it as document/docs/local-network/current-state/repo/code/service research. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required. If the request says document skill, docs, or local docs without a web/public lookup cue, classify it as docs_lookup so the bounded route can stay docs-only.",
+            "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research, website research, rep research, reb research, unqualified public-topic research on/about something, explicit public brand/product/company research requests, and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. For Wake STT, plain 'research on/about X' normally means public web research unless the request qualifies it as document/docs/local-network/current-state/repo/code/service research. A brand, shop, product, or company name can support a research intent but must not create that intent by itself. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required. If the request says document skill, docs, or local docs without a web/public lookup cue, classify it as docs_lookup so the bounded route can stay docs-only.",
             "average": "Use hermes-stt-average for medium-complex public web research, NullClaw web lookups, broader synthesis, and tasks likely too nuanced for local no-think.",
             "smart": "Use hermes-stt-smart for complex debugging, scripts, Proxmox/LXC/network/service diagnosis, SSH, Docker, destructive or high-impact work, and any uncertainty.",
             "authorisation": (
@@ -1296,20 +1292,10 @@ def _wake_stt_public_web_shortcut_result(
         _WAKE_STT_GENERIC_RESEARCH_HINT_RE.search(text)
         and not _WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE.search(text)
     )
-    public_brand_lookup = bool(
-        re.search(
-            r"\b(?:tell\s+me\s+about|find\s+out\s+about|what\s+is|who\s+are|more\s+about)\b",
-            text,
-            re.I,
-        )
-        and _WAKE_STT_PUBLIC_BRAND_HINT_RE.search(text)
-    )
-    if not (explicit_web or public_brand_lookup or generic_research):
+    if not (explicit_web or generic_research):
         return None
     if explicit_web:
         reason = "deterministic bounded public web research phrase"
-    elif public_brand_lookup:
-        reason = "deterministic bounded public brand/product lookup"
     else:
         reason = "deterministic bounded generic research defaults to public web"
     return WakeSttProfileRoutingResult(
@@ -2311,7 +2297,7 @@ def _nullclaw_request_wants_web_research(request_text: str) -> bool:
         text
     ) and not _WAKE_STT_LOCAL_RESEARCH_QUALIFIER_RE.search(text):
         return True
-    return bool(_WAKE_STT_PUBLIC_BRAND_HINT_RE.search(text))
+    return False
 
 
 def _nullclaw_docs_speech(docs: dict[str, Any] | None) -> str:
