@@ -262,6 +262,9 @@ def _active_egress_profile() -> str:
 
 
 async def _ensure_active_egress_profile(profile: str) -> bool:
+    if profile == "bridge":
+        await _apply_egress_profile(profile)
+        return False
     if _active_egress_profile() == profile:
         return False
     await _apply_egress_profile(profile)
