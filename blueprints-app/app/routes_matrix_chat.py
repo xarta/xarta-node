@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
 from starlette.websockets import WebSocketDisconnect
 
-from . import wake_stt_direct
+from . import pve_fast_health, wake_stt_direct
 from .events import AppEvent
 from .events import bus as events_bus
 
@@ -725,7 +725,7 @@ def _wake_stt_basic_health_checks() -> tuple[list[tuple[str, str, int]], str]:
     return checks, "configured"
 
 
-async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
+async def _wake_stt_legacy_basic_health_response_fields() -> dict[str, str]:
     checks, config_status = _wake_stt_basic_health_checks()
     started = time.perf_counter()
     results = await asyncio.gather(
@@ -763,6 +763,15 @@ async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
         "status": status,
         "helper_elapsed_ms": str(elapsed_ms),
     }
+
+
+async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
+    result = await pve_fast_health.aggregate_fast_health(intent="operator_query")
+    if result.get("config_status") == "missing":
+        fields = await _wake_stt_legacy_basic_health_response_fields()
+        fields["matrix_detail"] += "\nPVE fast-health config missing; used legacy TCP checks."
+        return fields
+    return pve_fast_health.response_fields_from_result(result)
 
 
 async def _wake_stt_fast_route_local_delivery(
