@@ -1132,6 +1132,10 @@ def test_matrix_chat_basic_health_reads_private_check_config(monkeypatch, tmp_pa
         seen.append((host, port, timeout_seconds))
         return True, ""
 
+    monkeypatch.setenv(
+        "BLUEPRINTS_PVE_FAST_HEALTH_CONFIG_FILE",
+        str(tmp_path / "missing-pve-fast-health.json"),
+    )
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BASIC_HEALTH_CHECKS_FILE", str(checks_file))
     monkeypatch.setattr(matrix_chat, "_wake_stt_tcp_probe", fake_probe)
 
