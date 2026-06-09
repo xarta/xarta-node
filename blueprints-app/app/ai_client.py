@@ -45,7 +45,7 @@ from typing import Any
 import httpx
 
 from .db import get_conn
-from .local_llm_events import publish_local_llm_offline_event
+from .local_llm_events import publish_local_llm_offline_event, publish_local_llm_recovered_event
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ def _split_think(text: str) -> dict[str, str]:
     m = re.search(r"<think>(.*?)</think>\s*", text, flags=re.DOTALL)
     if m:
         thinking = m.group(1).strip()
-        answer = text[m.end():].strip()
+        answer = text[m.end() :].strip()
         return {"thinking": thinking, "answer": answer}
     return {"thinking": "", "answer": text.strip()}
 
@@ -250,6 +250,11 @@ async def complete(
             detail=detail,
         )
     resp.raise_for_status()
+    await publish_local_llm_recovered_event(
+        operation=f"{project_name}:complete",
+        model=active_model,
+        base_url=base_url,
+    )
 
     raw = resp.json()["choices"][0]["message"]["content"]
 

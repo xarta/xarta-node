@@ -19,7 +19,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .db import get_conn
-from .local_llm_events import publish_local_llm_offline_event
+from .local_llm_events import (
+    publish_local_llm_offline_event,
+    publish_local_llm_recovered_event,
+)
 from .tts_sanitizer_client import (
     TtsSanitizerUnavailable,
     clean_tts_markdown_via_service,
@@ -881,6 +884,11 @@ async def _complete_web_research_speech_local(
             detail=detail,
         )
         raise HTTPException(502, f"Local LLM web research narration generation failed: {detail}")
+    await publish_local_llm_recovered_event(
+        operation="web-research:narration",
+        model=model,
+        base_url=base_url,
+    )
     try:
         data = resp.json()
         choice = data["choices"][0]

@@ -21,6 +21,10 @@ _OFFLINE_DEDUPE_SECONDS = 300.0
 _last_offline_notice: dict[str, float] = {}
 
 
+def _dedupe_key(operation: str, model: str | None, base_url: str | None) -> str:
+    return f"{operation}|{model}|{_sanitize_base_url(base_url)}"
+
+
 def _sanitize_base_url(value: str | None) -> str:
     """Return a URL safe for local event payloads and diagnostics."""
     raw = str(value or "").strip()
@@ -121,7 +125,7 @@ async def publish_local_llm_offline_event(
         return
 
     safe_base = _sanitize_base_url(base_url)
-    dedupe_key = f"{operation}|{model}|{safe_base}"
+    dedupe_key = _dedupe_key(operation, model, base_url)
     now = time.monotonic()
     last = _last_offline_notice.get(dedupe_key, 0.0)
     if now - last < _OFFLINE_DEDUPE_SECONDS:
@@ -161,3 +165,53 @@ async def publish_local_llm_offline_event(
         await bus.publish(event)
     except Exception as exc:  # noqa: BLE001
         log.warning("local LLM offline event publish failed: %s", exc)
+
+
+async def publish_local_llm_recovered_event(
+    *,
+    operation: str,
+    model: str | None,
+    base_url: str | None,
+) -> None:
+    """Publish one information bulletin after a previously offline local LLM recovers."""
+    if not _looks_like_local_primary(model):
+        return
+
+    safe_base = _sanitize_base_url(base_url)
+    dedupe_key = _dedupe_key(operation, model, base_url)
+    if dedupe_key not in _last_offline_notice:
+        return
+    _last_offline_notice.pop(dedupe_key, None)
+
+    event = AppEvent.create(
+        event_type="local.llm.recovered",
+        severity="info",
+        title="Local LLM Recovered",
+        message="Local Large Language Model is back online.",
+        source="blueprints-local-llm",
+        payload={
+            "operation": operation,
+            "model": model or "",
+            "base_url": safe_base,
+            "recovered_from": "local.llm.offline",
+        },
+    )
+    notifier_ok = await post_notifier_event(
+        event_type=event.event_type,
+        title=event.title,
+        message=event.message,
+        severity=event.severity,
+        source_component=event.source,
+        tags=["blueprints", "litellm", "local-llm"],
+        data=event.payload,
+        importance="neutral",
+        dedupe_key=dedupe_key,
+        recovery=True,
+    )
+    if notifier_primary_enabled() and notifier_ok:
+        return
+    try:
+        _persist(event)
+        await bus.publish(event)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("local LLM recovered event publish failed: %s", exc)
