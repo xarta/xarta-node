@@ -15,27 +15,31 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .db import get_conn, get_setting
-from .local_llm_events import publish_local_llm_offline_event
+from .local_llm_events import publish_local_llm_offline_event, publish_local_llm_recovered_event
 
 router = APIRouter(prefix="/litellm", tags=["litellm"])
 
 # ── Default paths (overridden by DB settings) ──────────────────────────────
 _DEFAULT_CONFIG_PATH = "/xarta-node/.lone-wolf/stacks/litellm/config.yaml"
-_DEFAULT_BASE_URL    = "http://localhost:4000"
-_DEFAULT_ENV_PATH    = "/xarta-node/.lone-wolf/stacks/litellm/.env"
-_CONNECT_TIMEOUT     = 5.0
-_READ_TIMEOUT        = 60.0
-_CANARY              = "SYS_CANARY_7f9a2e"
+_DEFAULT_BASE_URL = "http://localhost:4000"
+_DEFAULT_ENV_PATH = "/xarta-node/.lone-wolf/stacks/litellm/.env"
+_CONNECT_TIMEOUT = 5.0
+_READ_TIMEOUT = 60.0
+_CANARY = "SYS_CANARY_7f9a2e"
 
 
 def _cfg_path() -> str:
     with get_conn() as conn:
-        return get_setting(conn, "litellm.config_path", _DEFAULT_CONFIG_PATH) or _DEFAULT_CONFIG_PATH
+        return (
+            get_setting(conn, "litellm.config_path", _DEFAULT_CONFIG_PATH) or _DEFAULT_CONFIG_PATH
+        )
 
 
 def _base_url() -> str:
     with get_conn() as conn:
-        return (get_setting(conn, "litellm.base_url", _DEFAULT_BASE_URL) or _DEFAULT_BASE_URL).rstrip("/")
+        return (
+            get_setting(conn, "litellm.base_url", _DEFAULT_BASE_URL) or _DEFAULT_BASE_URL
+        ).rstrip("/")
 
 
 def _env_path() -> str:
@@ -70,6 +74,7 @@ async def _litellm_reachable() -> bool:
 
 # ── GET /litellm/status ──────────────────────────────────────────────────────
 
+
 @router.get("/status")
 async def litellm_status() -> dict:
     """Check if the LiteLLM stack is present (config exists) and reachable."""
@@ -81,6 +86,7 @@ async def litellm_status() -> dict:
 
 
 # ── GET /litellm/mcp-servers ─────────────────────────────────────────────────
+
 
 @router.get("/mcp-servers")
 async def litellm_mcp_servers() -> dict:
@@ -144,6 +150,7 @@ async def litellm_mcp_servers() -> dict:
 
 
 # ── GET /litellm/guardrail-status ────────────────────────────────────────────
+
 
 @router.get("/guardrail-status")
 async def litellm_guardrail_status() -> dict:
@@ -211,6 +218,7 @@ def _mcp_guardrails_on_path() -> list[dict]:
 
 # ── GET /litellm/health ──────────────────────────────────────────────────────
 
+
 @router.get("/health")
 async def litellm_health_proxy() -> dict:
     """Proxy to LiteLLM /health for model availability checks."""
@@ -228,6 +236,7 @@ async def litellm_health_proxy() -> dict:
 
 
 # ── POST /litellm/chat ───────────────────────────────────────────────────────
+
 
 class _ChatBody(BaseModel):
     model: str
@@ -274,6 +283,11 @@ async def litellm_chat_proxy(body: _ChatBody) -> dict:
                 detail=detail,
             )
             raise HTTPException(r.status_code, detail)
+        await publish_local_llm_recovered_event(
+            operation="litellm:chat-proxy",
+            model=body.model,
+            base_url=url,
+        )
         return r.json()
     except HTTPException:
         raise
@@ -289,10 +303,11 @@ async def litellm_chat_proxy(body: _ChatBody) -> dict:
 
 # ── POST /litellm/mcp-tool-call ──────────────────────────────────────────────
 
+
 class _McpToolCallBody(BaseModel):
-    server_name: str          # e.g. "searxng_web_search"
-    tool_name: str            # e.g. "searxng_web_search-web_search"
-    arguments: dict           # e.g. {"query": "...", "num_results": 5}
+    server_name: str  # e.g. "searxng_web_search"
+    tool_name: str  # e.g. "searxng_web_search-web_search"
+    arguments: dict  # e.g. {"query": "...", "num_results": 5}
 
 
 @router.post("/mcp-tool-call")
@@ -533,9 +548,7 @@ async def litellm_injection_test() -> StreamingResponse:
                     else:
                         data = r.json()
                         content = (
-                            data.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
+                            data.get("choices", [{}])[0].get("message", {}).get("content", "")
                         ) or ""
                         breach = _CANARY in content
                         if not vec["expect_block"]:

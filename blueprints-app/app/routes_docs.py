@@ -47,7 +47,10 @@ from .doc_speech_long import (
     split_sections,
     split_text_to_records,
 )
-from .local_llm_events import publish_local_llm_offline_event
+from .local_llm_events import (
+    publish_local_llm_offline_event,
+    publish_local_llm_recovered_event,
+)
 from .models import DocContentBody, DocCreate, DocOut, DocUpdate, DocWithContent
 from .nullclaw_docs_search import (
     SynthesisControls,
@@ -423,7 +426,9 @@ async def _complete_doc_speech_local(
     if not model:
         raise HTTPException(503, "DOC_SPEECH_LLM_MODEL is not configured for local doc narration")
 
-    requested_max_tokens = _doc_speech_max_tokens() if max_tokens is None else max(256, int(max_tokens))
+    requested_max_tokens = (
+        _doc_speech_max_tokens() if max_tokens is None else max(256, int(max_tokens))
+    )
     payload = {
         "model": model,
         "messages": messages,
@@ -433,7 +438,9 @@ async def _complete_doc_speech_local(
     timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"))
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            resp = await client.post(f"{base_url}/v1/chat/completions", headers=headers, json=payload)
+            resp = await client.post(
+                f"{base_url}/v1/chat/completions", headers=headers, json=payload
+            )
     except httpx.TimeoutException as exc:
         await publish_local_llm_offline_event(
             operation=operation,
@@ -460,6 +467,11 @@ async def _complete_doc_speech_local(
             detail=detail,
         )
         raise HTTPException(502, f"Local LLM narration generation failed: {detail}")
+    await publish_local_llm_recovered_event(
+        operation=operation,
+        model=model,
+        base_url=base_url,
+    )
     try:
         data = resp.json()
         choice = data["choices"][0]
@@ -512,7 +524,9 @@ def _doc_value(doc: Any, key: str, default: Any = None) -> Any:
 
 
 def _doc_speech_effective_input_budget(model_budget: Any, requested_output_tokens: int) -> int:
-    by_input = max(1, int(model_budget.max_input_tokens) - max(0, int(model_budget.context_buffer_tokens)))
+    by_input = max(
+        1, int(model_budget.max_input_tokens) - max(0, int(model_budget.context_buffer_tokens))
+    )
     by_total = (
         max(1, int(model_budget.total_context_tokens))
         - max(0, int(requested_output_tokens))
@@ -904,7 +918,9 @@ async def _generate_long_doc_speech(
     _normalize_node_local_ownership(work_dir)
 
     section_output_tokens = approx_output_tokens_for_words(max(120, min(max_words, 900)))
-    max_input_tokens = int(_doc_speech_effective_input_budget(model_budget, section_output_tokens) * 0.82)
+    max_input_tokens = int(
+        _doc_speech_effective_input_budget(model_budget, section_output_tokens) * 0.82
+    )
     sections = split_sections(
         prepared_source,
         work_dir=work_dir,
@@ -955,9 +971,16 @@ async def _generate_long_doc_speech(
         approx_output_tokens_for_words(max_words),
     )
     for _attempt in range(5):
-        if count_text_tokens(_cohesive_summary_system_prompt() + "\n" + cohesive_prompt_prefix + combined).tokens <= cohesive_input_budget:
+        if (
+            count_text_tokens(
+                _cohesive_summary_system_prompt() + "\n" + cohesive_prompt_prefix + combined
+            ).tokens
+            <= cohesive_input_budget
+        ):
             break
-        largest_index = max(range(len(summary_pieces)), key=lambda idx: len(summary_pieces[idx][1].split()))
+        largest_index = max(
+            range(len(summary_pieces)), key=lambda idx: len(summary_pieces[idx][1].split())
+        )
         section, piece = summary_pieces[largest_index]
         compressed_piece = await _compress_doc_speech_text(
             text=piece,
@@ -969,7 +992,9 @@ async def _generate_long_doc_speech(
         Path(section.summary_path).write_text(compressed_piece + "\n", encoding="utf-8")
         combined = "\n\n".join(summary for _section, summary in summary_pieces)
     else:
-        raise HTTPException(502, "Long document summaries did not fit the model budget after compression")
+        raise HTTPException(
+            502, "Long document summaries did not fit the model budget after compression"
+        )
 
     cohesive_prompt = cohesive_prompt_prefix + combined
     cohesive, cohesive_meta = await _complete_doc_speech_local(
@@ -1047,13 +1072,20 @@ async def _generate_long_doc_speech(
         "speech_chars": len(speech),
         "speech_words": len(speech.split()),
     }
-    metadata_path.write_text(json.dumps(long_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(long_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return speech, long_meta
 
 
-async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple[str, dict[str, Any]]:
+async def _generate_doc_speech_markdown(
+    doc: Any, source_markdown: str
+) -> tuple[str, dict[str, Any]]:
     started = time.monotonic()
-    title = str(_doc_value(doc, "label", "") or Path(str(_doc_value(doc, "path", ""))).stem.replace("-", " ").replace("_", " ")).strip()
+    title = str(
+        _doc_value(doc, "label", "")
+        or Path(str(_doc_value(doc, "path", ""))).stem.replace("-", " ").replace("_", " ")
+    ).strip()
     description = str(_doc_value(doc, "description", "") or "").strip()
     doc_path = str(_doc_value(doc, "path", "") or "").strip()
     source_bytes = len(str(source_markdown or "").encode("utf-8", "replace"))
@@ -1064,7 +1096,9 @@ async def _generate_doc_speech_markdown(doc: Any, source_markdown: str) -> tuple
     max_words = doc_speech_max_words()
     threshold_ratio = doc_speech_budget_threshold_ratio()
     direct_requested_output_tokens = _doc_speech_max_tokens()
-    effective_input_budget = _doc_speech_effective_input_budget(model_budget, direct_requested_output_tokens)
+    effective_input_budget = _doc_speech_effective_input_budget(
+        model_budget, direct_requested_output_tokens
+    )
 
     if max_source_bytes > 0 and source_bytes > max_source_bytes:
         speech = _too_large_doc_speech(doc_path, source_bytes, max_source_bytes)
