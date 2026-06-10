@@ -27,7 +27,8 @@ DEFAULT_HERMES_STT_SESSIONS_DIR = Path(
 )
 DEFAULT_HERMES_STT_SESSION_ID = "wake-stt-local"
 DIRECT_ROUTE_ENABLED_ENV = "BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED"
-WAKE_DELIVERY_MODES = {"matrix", "direct_local"}
+WAKE_DELIVERY_MODES = {"matrix", "direct_local", "direct_vps"}
+DEFAULT_WAKE_STT_INSTANCES_FILE = Path("/xarta-node/.lone-wolf/config/hermes-stt/instances.json")
 DEFAULT_HERMES_STT_MAX_TOKENS = 8192
 DEFAULT_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE = Path(
     "/xarta-node/.lone-wolf/config/hermes-stt/profile-routing-examples.json"
@@ -115,6 +116,38 @@ HERMES_STT_SYSTEM_PREFACE = (
     "claiming an unknown or too-small context window. If the real constraint is output "
     "tokens, speech duration, action authorisation, or policy, say that accurately."
 )
+_DEFAULT_WAKE_STT_INSTANCES: dict[str, dict[str, Any]] = {
+    "local": {
+        "direct_available": True,
+        "delivery_mode": "direct_local",
+        "route_enabled_env": DIRECT_ROUTE_ENABLED_ENV,
+        "profile_env_path": str(DEFAULT_HERMES_STT_PROFILE_ENV_PATH),
+        "sessions_dir": str(DEFAULT_HERMES_STT_SESSIONS_DIR),
+        "api_base_env": "BLUEPRINTS_HERMES_STT_API_BASE",
+        "api_key_env": "BLUEPRINTS_HERMES_STT_API_KEY",
+        "model_env": "BLUEPRINTS_HERMES_STT_MODEL",
+        "physical_profile_prefix": "hermes-stt",
+        "matrix_server": "tb1",
+        "source": "hermes-stt",
+        "agent_id": "hermes-stt",
+        "client_id": "hermes-stt",
+        "hermes_instance": "hermes-stt",
+    },
+    "vps": {
+        "direct_available": False,
+        "delivery_mode": "direct_vps",
+        "route_enabled_env": "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED",
+        "api_base_env": "BLUEPRINTS_HERMES_STT_VPS_API_BASE",
+        "api_key_env": "BLUEPRINTS_HERMES_STT_VPS_API_KEY",
+        "model_env": "BLUEPRINTS_HERMES_STT_VPS_MODEL",
+        "physical_profile_prefix": "hermes-vps-stt",
+        "matrix_server": "vps",
+        "source": "hermes-vps-stt",
+        "agent_id": "hermes-vps-stt",
+        "client_id": "hermes-vps-stt",
+        "hermes_instance": "hermes-vps-stt",
+    },
+}
 _AUTHORISED_SOURCE_RE = re.compile(
     r"\bthis\s+command\s+is\s+authori[sz]ed\b[\s.!?]*",
     re.IGNORECASE,
@@ -395,10 +428,81 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _clean_delivery_mode(value: Any) -> str:
+def _clean_wake_instance_id(value: Any) -> str:
+    clean = "".join(
+        ch
+        for ch in str(value or "local").strip().lower().replace(" ", "_")
+        if ch.isalnum() or ch in {"-", "_"}
+    )
+    return (clean or "local")[:40]
+
+
+def _wake_stt_instances_file(environ: dict[str, str] | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    return Path(
+        str(
+            env.get("BLUEPRINTS_WAKE_STT_INSTANCES_FILE")
+            or env.get("HERMES_STT_INSTANCES_FILE")
+            or DEFAULT_WAKE_STT_INSTANCES_FILE
+        )
+    )
+
+
+def _clean_direct_delivery_mode(value: Any, *, instance: str) -> str:
     mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if mode in {"direct", "direct_hermes", "hermes_direct", "hermes_stt"}:
-        mode = "direct_local"
+        mode = "direct_local" if instance == "local" else "direct_vps"
+    if mode not in {"direct_local", "direct_vps"}:
+        return "direct_local" if instance == "local" else "direct_vps"
+    return mode
+
+
+def _read_wake_stt_instances(environ: dict[str, str] | None = None) -> dict[str, Any]:
+    path = _wake_stt_instances_file(environ)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def wake_stt_instance_direct_config(
+    instance: str,
+    *,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return public-safe direct-route metadata for one Wake instance."""
+    clean_instance = _clean_wake_instance_id(instance)
+    fallback = dict(_DEFAULT_WAKE_STT_INSTANCES.get(clean_instance, {}))
+    raw = _read_wake_stt_instances(environ)
+    instances = raw.get("instances") if isinstance(raw.get("instances"), dict) else {}
+    configured = (
+        instances.get(clean_instance) if isinstance(instances.get(clean_instance), dict) else {}
+    )
+    merged = {**fallback, **configured}
+    merged["instance"] = clean_instance
+    merged["direct_available"] = _truthy(merged.get("direct_available"))
+    merged["delivery_mode"] = _clean_direct_delivery_mode(
+        merged.get("delivery_mode"),
+        instance=clean_instance,
+    )
+    route_enabled_env = str(merged.get("route_enabled_env") or "").strip()
+    if not route_enabled_env:
+        route_enabled_env = (
+            DIRECT_ROUTE_ENABLED_ENV
+            if clean_instance == "local"
+            else f"BLUEPRINTS_WAKE_STT_{clean_instance.upper()}_DIRECT_ROUTE_ENABLED"
+        )
+    merged["route_enabled_env"] = route_enabled_env
+    if "schema" in raw:
+        merged["schema"] = raw.get("schema")
+    return merged
+
+
+def _clean_delivery_mode(value: Any, *, instance: str = "local") -> str:
+    mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode in {"direct", "direct_hermes", "hermes_direct", "hermes_stt"}:
+        mode = "direct_local" if instance == "local" else "direct_vps"
     return mode if mode in WAKE_DELIVERY_MODES else "matrix"
 
 
@@ -421,18 +525,27 @@ def wake_stt_route_readback(
     environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve a Wake route request into public readback plus rollback state."""
-    clean_instance = str(instance or "local").strip().lower()
-    direct_available = clean_instance == "local"
-    requested_mode = _clean_delivery_mode(requested_delivery_mode)
-    direct_requested = requested_mode == "direct_local" or _truthy(requested_direct_enabled)
-    rollout_enabled = direct_route_rollout_enabled(environ)
+    clean_instance = _clean_wake_instance_id(instance)
+    instance_config = wake_stt_instance_direct_config(clean_instance, environ=environ)
+    direct_available = bool(instance_config.get("direct_available"))
+    direct_mode = str(instance_config.get("delivery_mode") or "direct_local")
+    requested_mode = _clean_delivery_mode(
+        requested_delivery_mode,
+        instance=clean_instance,
+    )
+    direct_requested = requested_mode in {"direct_local", "direct_vps"} or _truthy(
+        requested_direct_enabled
+    )
+    env = os.environ if environ is None else environ
+    rollout_env = str(instance_config.get("route_enabled_env") or DIRECT_ROUTE_ENABLED_ENV)
+    rollout_enabled = _truthy(env.get(rollout_env))
     direct_enabled = bool(direct_available and direct_requested and rollout_enabled)
     rollback_reason = ""
     if direct_requested and not direct_available:
         rollback_reason = "direct_not_available"
     elif direct_requested and not rollout_enabled:
         rollback_reason = "direct_route_disabled"
-    delivery_mode = "direct_local" if direct_enabled else "matrix"
+    delivery_mode = direct_mode if direct_enabled else "matrix"
     if direct_enabled:
         direct_status = "enabled"
     elif direct_available:
@@ -443,12 +556,18 @@ def wake_stt_route_readback(
         "requested_delivery_mode": requested_mode,
         "requested_direct_enabled": direct_requested,
         "delivery_mode": delivery_mode,
+        "instance": clean_instance,
+        "direct_mode": direct_mode,
         "direct_available": direct_available,
         "direct_enabled": direct_enabled,
         "direct_route_enabled": rollout_enabled,
+        "direct_route_enabled_env": rollout_env,
         "direct_status": direct_status,
         "rollback_applied": bool(rollback_reason),
         "rollback_reason": rollback_reason,
+        "physical_profile_prefix": str(instance_config.get("physical_profile_prefix") or ""),
+        "hermes_instance": str(instance_config.get("hermes_instance") or ""),
+        "matrix_server": str(instance_config.get("matrix_server") or ""),
     }
 
 

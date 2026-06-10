@@ -473,8 +473,13 @@ class _WakeSttFastRouteDecision:
 
 
 def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
-    del instance
-    return _safe_str(room_id)
+    clean_room = _safe_str(room_id)
+    clean_instance = "".join(
+        ch
+        for ch in _safe_str(instance or "local").lower().replace(" ", "_")
+        if ch.isalnum() or ch in {"-", "_"}
+    )
+    return f"{clean_room}::{clean_instance or 'local'}"
 
 
 def _wake_stt_pending_command_ttl_seconds() -> float:
@@ -547,6 +552,24 @@ def _wake_stt_companion_output(
         raw_assistant_text=json.dumps(
             {"speech": speech, "matrix_detail": matrix_detail, "status": status},
             sort_keys=True,
+        ),
+    )
+
+
+def _wake_stt_authorised_retry_failure_companion(
+    *,
+    status: str,
+    target_profile: str = "",
+) -> dict[str, Any]:
+    safe_status = _safe_str(status).strip() or "request_error"
+    safe_target = _safe_str(target_profile).strip()
+    profile_text = f"selected profile `{safe_target}`" if safe_target else "selected STT profile"
+    return _wake_stt_command_code_companion(
+        safe_status,
+        "Command Code accepted, but the local Hermes profile did not respond.",
+        (
+            "Command Code accepted; the held Wake request was authorised, but the "
+            f"{profile_text} returned `{safe_status}` before completing."
         ),
     )
 
@@ -4598,6 +4621,38 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                 pending_public["target_profile"] = target_profile
             public["command_code_pending"] = pending_public
             timing.mark("command_code_challenge_held", held=bool(held_saved))
+        if (
+            trusted_authorised_retry
+            and public.get("route") == "direct_local"
+            and not public.get("ok")
+            and isinstance(direct_result, dict)
+        ):
+            companion = (
+                direct_result.get("companion")
+                if isinstance(direct_result.get("companion"), dict)
+                else {}
+            )
+            if (
+                not _safe_str(companion.get("speech")).strip()
+                and not _safe_str(companion.get("matrix_detail")).strip()
+            ):
+                status = _safe_str(direct_result.get("status") or public.get("status"))
+                target_profile = _safe_str(
+                    direct_result.get("target_profile")
+                    or pending_profile_routing.get("target_profile")
+                )
+                companion_override = _wake_stt_authorised_retry_failure_companion(
+                    status=status,
+                    target_profile=target_profile,
+                )
+                direct_result["companion"] = companion_override
+                direct_result["assistant_text"] = companion_override["raw_assistant_text"]
+                public["direct"] = direct_result
+                timing.mark(
+                    "command_code_authorised_failure_companion",
+                    status=status,
+                    target_profile=target_profile,
+                )
         if public.get("route") == "direct_local":
             pre_roll_status["direct_receipt_status"] = "delivered" if public.get("ok") else "failed"
             if not public.get("ok"):

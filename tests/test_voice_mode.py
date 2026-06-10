@@ -122,6 +122,45 @@ def test_voice_mode_wake_direct_delivery_can_survive_when_route_enabled(monkeypa
     assert local["direct_rollback_applied"] is False
 
 
+def test_voice_mode_wake_vps_direct_uses_instance_config_and_rollout_env(tmp_path, monkeypatch):
+    instances_file = tmp_path / "instances.json"
+    instances_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.instances.v1",
+                "instances": {
+                    "vps": {
+                        "direct_available": True,
+                        "delivery_mode": "direct_vps",
+                        "route_enabled_env": "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_INSTANCES_FILE", str(instances_file))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED", "1")
+
+    policy = voice_mode._clean_wake_to_talk_policy(
+        {
+            "instances": {
+                "vps": {
+                    "delivery_mode": "direct-hermes",
+                    "direct_enabled": True,
+                },
+            }
+        }
+    )
+
+    vps = policy["instances"]["vps"]
+    assert vps["delivery_mode"] == "direct_vps"
+    assert vps["direct_available"] is True
+    assert vps["direct_enabled"] is True
+    assert vps["direct_route_enabled"] is True
+    assert vps["direct_status"] == "enabled"
+
+
 def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
     def expected(**overrides):
         base = {

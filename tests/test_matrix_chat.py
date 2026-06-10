@@ -93,6 +93,15 @@ def test_matrix_chat_reads_private_stt_noise_reduction_settings(tmp_path, monkey
     assert settings["stt_noise_atten_lim_db"] == "6.5"
 
 
+def test_wake_stt_pending_command_key_is_scoped_by_instance():
+    local_key = matrix_chat._wake_stt_pending_command_key("!bridge:test.example", "local")
+    vps_key = matrix_chat._wake_stt_pending_command_key("!bridge:test.example", "vps")
+
+    assert local_key == "!bridge:test.example::local"
+    assert vps_key == "!bridge:test.example::vps"
+    assert local_key != vps_key
+
+
 def test_matrix_chat_noise_relay_waits_for_stt_final_after_filter_closes():
     async def run():
         done = asyncio.Event()
@@ -1747,7 +1756,11 @@ def test_matrix_chat_wake_stt_pre_roll_uses_command_code_accepted_message(monkey
         "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
         '{"command_codes":[{"id":"alpha","aliases":["alpha one seven"]}]}',
     )
-    matrix_chat._wake_stt_store_pending_command(room_id, "create a new file called Dave")
+    pending_key = matrix_chat._wake_stt_pending_command_key(room_id, "local")
+    matrix_chat._wake_stt_store_pending_command(
+        pending_key,
+        "create a new file called Dave",
+    )
 
     async def fake_deliver(**kwargs):
         await asyncio.sleep(0.07)
@@ -2131,7 +2144,7 @@ def test_matrix_chat_wake_stt_wrong_malformed_extra_and_stale_codes_do_not_retry
     assert matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS == {}
 
 
-def test_matrix_chat_wake_stt_intervening_turn_clears_pending_across_instances(
+def test_matrix_chat_wake_stt_intervening_turn_preserves_pending_across_instances(
     monkeypatch,
 ):
     matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
@@ -2149,6 +2162,7 @@ def test_matrix_chat_wake_stt_intervening_turn_clears_pending_across_instances(
         gate = matrix_chat.wake_stt_direct.apply_command_code_gate(
             body.text,
             matrix_chat.wake_stt_direct.command_codes_from_env(),
+            trusted_authorised=bool(kwargs.get("trusted_authorised")),
         )
         companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
             speech="needs code",
@@ -2214,9 +2228,145 @@ def test_matrix_chat_wake_stt_intervening_turn_clears_pending_across_instances(
     )
 
     assert first["delivery"]["status"] == "command_code_required"
-    assert intervening["delivery"]["status"] == "command_code_aborted"
-    assert later_code["delivery"]["status"] == "command_code_stale"
-    assert calls == [{"text": "create file Dave 10", "trusted": False}]
+    assert intervening["delivery"]["status"] == "command_code_required"
+    assert later_code["delivery"]["ok"] is True
+    assert later_code["delivery"]["direct"]["authorised"] is True
+    assert calls == [
+        {"text": "create file Dave 10", "trusted": False},
+        {"text": "what time is it", "trusted": False},
+        {"text": "create file Dave 10", "trusted": True},
+    ]
+    local_key = matrix_chat._wake_stt_pending_command_key("!bridge:test.example", "local")
+    vps_key = matrix_chat._wake_stt_pending_command_key("!bridge:test.example", "vps")
+    assert local_key not in matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS
+    assert vps_key in matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS
+
+
+def test_matrix_chat_wake_stt_authorised_retry_reports_profile_transport_error(
+    monkeypatch,
+):
+    matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"alpha","aliases":["alpha one seven"]}]}',
+    )
+    calls: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+    reports: list[dict[str, object]] = []
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        trusted = bool(kwargs.get("trusted_authorised"))
+        calls.append({"text": body.text, "trusted": trusted})
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(
+            body.text,
+            matrix_chat.wake_stt_direct.command_codes_from_env(),
+            trusted_authorised=trusted,
+        )
+        if trusted:
+            return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+                ok=False,
+                status="request_error",
+                route="direct_local",
+                gate=gate,
+                direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                    ok=False,
+                    status="request_error",
+                    gate=gate,
+                    attempted=True,
+                    fallback_required=True,
+                    error="ConnectError",
+                    target_profile="hermes-stt-local",
+                ),
+                fallback_reason="request_error",
+            )
+        companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+            speech="needs code",
+            matrix_detail="needs code",
+            status="command_code_required",
+            structured=True,
+            raw_assistant_text='{"speech":"needs code","matrix_detail":"needs code","status":"command_code_required"}',
+        )
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text=companion.raw_assistant_text,
+                companion=companion,
+            ),
+        )
+
+    async def fake_publish(payload):
+        published.append(payload)
+        return {
+            "ok": True,
+            "event": {"event_id": f"$tts-{len(published)}"},
+            "payload": payload,
+        }
+
+    async def fake_report(**kwargs):
+        reports.append(kwargs)
+        return {"ok": True, "event_id": f"$report-{len(reports)}"}
+
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+
+    first = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="create file Dave 10",
+                instance="local",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+    accepted_error = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="authorize alpha one seven",
+                instance="local",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert first["delivery"]["status"] == "command_code_required"
+    assert accepted_error["delivery"]["status"] == "request_error"
+    assert accepted_error["delivery"]["direct"]["authorised"] is True
+    assert accepted_error["delivery"]["direct"]["companion"]["speech"] == (
+        "Command Code accepted, but the local Hermes profile did not respond."
+    )
+    assert (
+        "selected profile `hermes-stt-local` returned `request_error`"
+        in reports[-1]["matrix_detail"]
+    )
+    assert published[-1]["text"] == (
+        "Command Code accepted, but the local Hermes profile did not respond."
+    )
+    stages = [mark["stage"] for mark in accepted_error["delivery"]["timing"]["marks"]]
+    assert "command_code_authorised_failure_companion" in stages
+    assert calls == [
+        {"text": "create file Dave 10", "trusted": False},
+        {"text": "create file Dave 10", "trusted": True},
+    ]
     assert matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS == {}
 
 

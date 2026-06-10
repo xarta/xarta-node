@@ -289,6 +289,58 @@ def test_wake_stt_route_readback_allows_local_direct_only_when_enabled():
     assert readback["rollback_applied"] is False
 
 
+def test_wake_stt_route_readback_uses_instance_specific_vps_rollout_env(tmp_path):
+    instances_file = tmp_path / "instances.json"
+    instances_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.instances.v1",
+                "instances": {
+                    "vps": {
+                        "direct_available": True,
+                        "delivery_mode": "direct_vps",
+                        "route_enabled_env": "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED",
+                        "physical_profile_prefix": "hermes-vps-stt",
+                        "hermes_instance": "hermes-vps-stt",
+                        "matrix_server": "vps",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    global_only = wake_stt_direct.wake_stt_route_readback(
+        instance="vps",
+        requested_delivery_mode="direct-hermes",
+        requested_direct_enabled=True,
+        environ={
+            "BLUEPRINTS_WAKE_STT_INSTANCES_FILE": str(instances_file),
+            "BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED": "1",
+        },
+    )
+    enabled = wake_stt_direct.wake_stt_route_readback(
+        instance="vps",
+        requested_delivery_mode="direct-hermes",
+        requested_direct_enabled=True,
+        environ={
+            "BLUEPRINTS_WAKE_STT_INSTANCES_FILE": str(instances_file),
+            "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED": "1",
+        },
+    )
+
+    assert global_only["direct_available"] is True
+    assert global_only["requested_delivery_mode"] == "direct_vps"
+    assert global_only["direct_enabled"] is False
+    assert global_only["rollback_reason"] == "direct_route_disabled"
+    assert global_only["direct_route_enabled_env"] == "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED"
+    assert enabled["delivery_mode"] == "direct_vps"
+    assert enabled["direct_mode"] == "direct_vps"
+    assert enabled["direct_enabled"] is True
+    assert enabled["physical_profile_prefix"] == "hermes-vps-stt"
+    assert enabled["matrix_server"] == "vps"
+
+
 def test_command_codes_from_env_accepts_bounded_json():
     codes = wake_stt_direct.command_codes_from_env(
         {
