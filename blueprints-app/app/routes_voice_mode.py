@@ -261,7 +261,7 @@ _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
 }
 _ACTIVE_BROWSER_EVENT_KINDS = {"click", "double_click", "long_press"}
 _ACTIVE_BROWSER_BODY_SHADE_STATES = {"up", "down", "toggle"}
-_WAKE_DELIVERY_MODES = {"matrix", "direct_local"}
+_WAKE_DELIVERY_MODES = {"matrix", "direct_local", "direct_vps"}
 
 
 class BrowserVoiceState(BaseModel):
@@ -605,10 +605,10 @@ def _clean_hermes_prefix(value: Any, fallback: str) -> str:
 def _clean_wake_delivery_mode(value: Any, *, instance_id: str, direct_enabled: bool) -> str:
     mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if mode in {"direct", "direct_hermes", "hermes_direct", "hermes_stt"}:
-        mode = "direct_local"
+        mode = "direct_local" if instance_id == "local" else "direct_vps"
     if mode not in _WAKE_DELIVERY_MODES:
         mode = "matrix"
-    if mode == "direct_local" and (instance_id != "local" or not direct_enabled):
+    if mode in {"direct_local", "direct_vps"} and not direct_enabled:
         return "matrix"
     return mode
 
@@ -664,7 +664,8 @@ def _default_wake_instance(
     wake_word: str,
     hermes_prefix: str,
 ) -> dict[str, Any]:
-    direct_available = instance_id == "local"
+    direct_config = wake_stt_direct.wake_stt_instance_direct_config(instance_id)
+    direct_available = bool(direct_config.get("direct_available"))
     return {
         "enabled": True,
         "label": label,
