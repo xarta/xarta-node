@@ -709,7 +709,11 @@ def _wake_stt_fast_route_is_local_action(
     if (
         clean_instance == "vps"
         and route
-        and route.action == _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC
+        and route.action
+        in {
+            _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+            _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
+        }
     ):
         return True
     return bool(
