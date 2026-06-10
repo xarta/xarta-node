@@ -1488,8 +1488,8 @@ def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path)
     assert result.direct.profile_routing.target_profile == "example-vps-stt"
 
 
-def test_matrix_chat_vps_basic_health_uses_vps_health_tool_surface(monkeypatch, tmp_path):
-    captured = {}
+def test_matrix_chat_vps_basic_health_exact_is_deterministic(monkeypatch, tmp_path):
+    captured = {"fallback_calls": 0, "classifier_calls": 0, "health_calls": 0}
     fast_routes = tmp_path / "fast-routes.json"
     fast_routes.write_text(
         json.dumps(
@@ -1506,29 +1506,22 @@ def test_matrix_chat_vps_basic_health_uses_vps_health_tool_surface(monkeypatch, 
         encoding="utf-8",
     )
 
-    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
-        captured["text"] = text
-        captured["tool_surface"] = config.tool_surface
-        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
-        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
-            ok=True,
-            status="delivered",
-            gate=gate,
-            attempted=True,
-            fallback_required=False,
-            assistant_text='{"speech":"I am okay.","matrix_detail":"vps health","status":"ok"}',
-            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
-                speech="I am okay.",
-                matrix_detail="vps health",
-                status="ok",
-                structured=True,
-                raw_assistant_text='{"speech":"I am okay.","matrix_detail":"vps health","status":"ok"}',
-            ),
-            target_profile=config.model,
-        )
+    async def fail_delivery(*_args, **_kwargs):
+        captured["fallback_calls"] += 1
+        raise AssertionError("exact VPS health must not call Hermes or Matrix fallback")
 
-    async def fail_local_health():
-        raise AssertionError("VPS health must not use the Blueprints-local health shortcut")
+    async def fail_classifier(*_args, **_kwargs):
+        captured["classifier_calls"] += 1
+        raise AssertionError("exact VPS health must not classify")
+
+    async def fake_vps_health_fields():
+        captured["health_calls"] += 1
+        return {
+            "speech": "I'm okay. Hermes VPS is online and ready.",
+            "matrix_detail": "Deterministic VPS Wake STT health check passed.",
+            "status": "vps_health_ok",
+            "helper_elapsed_ms": "1.0",
+        }
 
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
     monkeypatch.setattr(
@@ -1542,8 +1535,21 @@ def test_matrix_chat_vps_basic_health_uses_vps_health_tool_surface(monkeypatch, 
             allow_non_loopback=True,
         ),
     )
-    monkeypatch.setattr(matrix_chat.wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
-    monkeypatch.setattr(matrix_chat, "_wake_stt_basic_health_response_fields", fail_local_health)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fail_delivery,
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fail_classifier,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_vps_basic_health_response_fields",
+        fake_vps_health_fields,
+    )
 
     result = asyncio.run(
         matrix_chat._deliver_wake_stt_with_direct_fallback(
@@ -1560,10 +1566,14 @@ def test_matrix_chat_vps_basic_health_uses_vps_health_tool_surface(monkeypatch, 
         )
     )
 
-    assert result.ok is True
-    assert captured["tool_surface"] == "xarta_vps_health_only"
-    assert result.direct.target_profile == "example-vps-stt"
-    assert result.direct.profile_routing.target_profile == "example-vps-stt"
+    public = result.public_dict()
+    companion = public["direct"]["companion"]
+    assert public["ok"] is True
+    assert public["route"] == "direct_vps"
+    assert public["direct"]["attempted"] is False
+    assert public["direct"]["status"] == "basic_health_deterministic_response"
+    assert companion["speech"] == "I'm okay. Hermes VPS is online and ready."
+    assert captured == {"fallback_calls": 0, "classifier_calls": 0, "health_calls": 1}
 
 
 def test_matrix_chat_direct_wrapper_rotates_session_only_on_operator_request(monkeypatch, tmp_path):
@@ -2807,6 +2817,7 @@ def test_matrix_chat_wake_stt_vps_direct_route_queues_tts(monkeypatch):
         captured["source"] = payload["source"]
         captured["agent_id"] = payload["agent_id"]
         captured["client_id"] = payload["client_id"]
+        captured["voice"] = payload["voice"]
         captured["metadata"] = payload["metadata"]
         captured["interrupt"] = payload["interrupt"]
         return {
@@ -2825,6 +2836,7 @@ def test_matrix_chat_wake_stt_vps_direct_route_queues_tts(monkeypatch):
 
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
     monkeypatch.setenv("BLUEPRINTS_HERMES_STT_VPS_MODEL", "vps-test-agent")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_VPS_TTS_VOICE", "vps-test-voice.wav")
     monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
     monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
     monkeypatch.setattr(
@@ -2854,10 +2866,12 @@ def test_matrix_chat_wake_stt_vps_direct_route_queues_tts(monkeypatch):
     assert result["delivery"]["pre_roll"]["direct_receipt_status"] == "delivered"
     assert result["delivery"]["tts"]["ok"] is True
     assert result["delivery"]["tts"]["event_id"] == "tts-wake-vps-direct"
+    assert result["delivery"]["tts"]["voice_set"] is True
     assert captured["text"] == "sixteen thirty-one"
     assert captured["source"] == "vps-test-agent"
     assert captured["agent_id"] == "vps-test-agent"
     assert captured["client_id"] == "vps-test-agent:wake-to-talk"
+    assert captured["voice"] == "vps-test-voice.wav"
     assert captured["interrupt"] is True
     assert captured["metadata"]["route"] == "direct_vps"
     assert captured["metadata"]["wake_instance"] == "vps"
