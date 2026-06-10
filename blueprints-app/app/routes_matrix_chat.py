@@ -437,10 +437,14 @@ _DEFAULT_WAKE_STT_FAST_ROUTES_FILE = (
 _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION = "time_fast_session"
 _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC = "time_current_deterministic_response"
 _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC = "basic_health_deterministic_response"
+_WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL = "voice_stop_control"
+_WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL = "clear_house_control"
 _WAKE_STT_FAST_ACTIONS = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION,
     _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
     _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
+    _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
+    _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
 }
 _WAKE_STT_FAST_HERMES_TOOL_SURFACES = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION: "xarta_time_lookup_only",
@@ -448,9 +452,14 @@ _WAKE_STT_FAST_HERMES_TOOL_SURFACES = {
 _WAKE_STT_FAST_LOCAL_ACTIONS = {
     _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
     _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
+    _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
+    _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
 }
 _DEFAULT_WAKE_STT_BASIC_HEALTH_CHECKS_FILE = (
     "/xarta-node/.lone-wolf/config/hermes-stt/basic-health-checks.json"
+)
+_DEFAULT_WAKE_STT_TTS_COMPANION_STATE_FILE = (
+    "/xarta-node/.lone-wolf/stacks/hermes-local/data/tts-companion/state.json"
 )
 _DEFAULT_WAKE_STT_TIMEZONE = "Europe/London"
 _DEFAULT_WAKE_STT_TIME_TOOL = "/root/xarta-node/.xarta/.agents/bin/hermes-stt-time-tool"
@@ -459,7 +468,42 @@ _WAKE_STT_DIRECT_NEW_SESSION_RE = re.compile(
     r"start a new conversation|new conversation|clear session|clear conversation)(?:\b|$)",
     re.IGNORECASE,
 )
+_WAKE_STT_STOP_CONTROL_PHRASES = {
+    "stop",
+    "abort",
+    "computer stop",
+    "computer abort",
+    "stop speaking",
+    "stop talking",
+    "stop tts",
+    "stop t t s",
+    "abort speech",
+    "abort tts",
+    "abort t t s",
+}
+_WAKE_STT_CLEAR_HOUSE_PHRASES = {
+    "clear house",
+    "clearhouse",
+    "clear all house",
+    "computer clear house",
+    "computer clearhouse",
+}
 _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS: dict[str, dict[str, Any]] = {}
+_WAKE_STT_ACTIVE_DELIVERY_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
+_WAKE_STT_CONTROL_CANCELLED_TASK_IDS: set[int] = set()
+
+
+def _wake_stt_immediate_control_kind(text: str) -> str:
+    normalised = _wake_stt_fast_route_normalise_text(text)
+    if normalised in _WAKE_STT_STOP_CONTROL_PHRASES:
+        return "voice_stop"
+    if normalised in _WAKE_STT_CLEAR_HOUSE_PHRASES:
+        return "clear_house"
+    return ""
+
+
+def _wake_stt_is_immediate_control_text(text: str) -> bool:
+    return bool(_wake_stt_immediate_control_kind(text))
 
 
 @dataclass(frozen=True)
@@ -480,6 +524,51 @@ def _wake_stt_pending_command_key(room_id: str, instance: str | None) -> str:
         if ch.isalnum() or ch in {"-", "_"}
     )
     return f"{clean_room}::{clean_instance or 'local'}"
+
+
+def _wake_stt_active_delivery_key(room_id: str, instance: str | None) -> str:
+    return _wake_stt_pending_command_key(room_id, instance)
+
+
+def _wake_stt_track_active_delivery_task(
+    key: str,
+    task: asyncio.Task[Any],
+) -> None:
+    if not key or task.done():
+        return
+    tasks = _WAKE_STT_ACTIVE_DELIVERY_TASKS.setdefault(key, set())
+    tasks.add(task)
+
+    def _forget(done: asyncio.Task[Any]) -> None:
+        tasks.discard(done)
+        _WAKE_STT_CONTROL_CANCELLED_TASK_IDS.discard(id(done))
+        if not tasks:
+            _WAKE_STT_ACTIVE_DELIVERY_TASKS.pop(key, None)
+
+    task.add_done_callback(_forget)
+
+
+def _wake_stt_cancel_active_delivery_tasks(
+    key: str | None = None,
+) -> int:
+    keys = [key] if key else list(_WAKE_STT_ACTIVE_DELIVERY_TASKS.keys())
+    current = asyncio.current_task()
+    cancelled = 0
+    for active_key in keys:
+        tasks = _WAKE_STT_ACTIVE_DELIVERY_TASKS.get(active_key) or set()
+        for task in list(tasks):
+            if task.done():
+                tasks.discard(task)
+                _WAKE_STT_CONTROL_CANCELLED_TASK_IDS.discard(id(task))
+                continue
+            if task is current:
+                continue
+            _WAKE_STT_CONTROL_CANCELLED_TASK_IDS.add(id(task))
+            task.cancel()
+            cancelled += 1
+        if not tasks:
+            _WAKE_STT_ACTIVE_DELIVERY_TASKS.pop(active_key, None)
+    return cancelled
 
 
 def _wake_stt_pending_command_ttl_seconds() -> float:
@@ -611,8 +700,16 @@ async def _wake_stt_command_code_local_delivery(
     )
 
 
-def _wake_stt_fast_route_is_local_action(route: _WakeSttFastRouteDecision | None) -> bool:
-    return bool(route and route.action in _WAKE_STT_FAST_LOCAL_ACTIONS)
+def _wake_stt_fast_route_is_local_action(
+    route: _WakeSttFastRouteDecision | None,
+    *,
+    instance: str = "local",
+) -> bool:
+    return bool(
+        _safe_str(instance).strip().lower() == "local"
+        and route
+        and route.action in _WAKE_STT_FAST_LOCAL_ACTIONS
+    )
 
 
 def _wake_stt_fast_route_uses_hermes(route: _WakeSttFastRouteDecision | None) -> bool:
@@ -797,6 +894,104 @@ async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
     return pve_fast_health.response_fields_from_result(result)
 
 
+async def _publish_wake_stt_tts_stop_event(reason: str) -> dict[str, Any]:
+    clean_reason = _safe_str(reason).strip().lower() or "wake_stt_stop"
+    event = AppEvent.create(
+        "tts.stop.requested",
+        "TTS stop requested",
+        "Wake STT requested browser TTS stop.",
+        severity="info",
+        source="wake-stt",
+        payload={
+            "schema": "xarta.tts.stop-request.v1",
+            "reason": clean_reason,
+            "target": {
+                "kind": "all_listeners",
+                "dedupe": "one_webpage_per_client_ip_plus_phone",
+            },
+            "clear_queues": True,
+            "interrupt_active": True,
+            "created_at": time.time(),
+        },
+        event_id=f"tts-stop-{uuid.uuid4().hex}",
+    )
+    await events_bus.publish(event)
+    return {
+        "ok": True,
+        "event_id": event.event_id,
+        "reason": clean_reason,
+        "subscriber_count": events_bus.subscriber_count,
+    }
+
+
+async def _wake_stt_voice_stop_response_fields(
+    *,
+    reason: str = "wake_stt_stop",
+) -> dict[str, str]:
+    stop = await _publish_wake_stt_tts_stop_event(reason)
+    return {
+        "speech": "",
+        "matrix_detail": (
+            "Deterministic Wake STT stop control executed.\n"
+            f"TTS stop event: {'ok' if stop.get('ok') else 'failed'}.\n"
+            f"Event id: {_safe_str(stop.get('event_id')) or 'none'}.\n"
+            "Current browser speech and queued browser-directed speech were asked to stop."
+        ),
+        "status": "voice_stop_requested",
+        "helper_elapsed_ms": "0",
+    }
+
+
+def _wake_stt_tts_companion_state_file() -> Path:
+    raw = os.getenv(
+        "BLUEPRINTS_WAKE_STT_TTS_COMPANION_STATE_FILE",
+        _DEFAULT_WAKE_STT_TTS_COMPANION_STATE_FILE,
+    )
+    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_TTS_COMPANION_STATE_FILE)
+
+
+def _reset_wake_stt_tts_companion_state() -> dict[str, Any]:
+    path = _wake_stt_tts_companion_state_file()
+    payload = {"schema_version": 1, "sessions": {}, "known_client_ids": []}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "path": str(path), "error": str(exc)[:240]}
+    return {"ok": True, "path": str(path), "reset": True}
+
+
+async def _wake_stt_clear_house_response_fields() -> dict[str, str]:
+    config = wake_stt_direct.load_hermes_stt_config()
+    base_session_id = _safe_str(config.session_id) or wake_stt_direct.DEFAULT_HERMES_STT_SESSION_ID
+    previous_session_id = _read_wake_stt_direct_active_session_id(base_session_id)
+    new_session_id = f"{base_session_id}-operator-{uuid.uuid4().hex[:12]}"
+    _write_wake_stt_direct_active_session_id(new_session_id)
+    pending_count = len(_WAKE_STT_PENDING_COMMAND_CODE_REQUESTS)
+    _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    research_clear = wake_stt_direct.clear_wake_stt_research_context()
+    tts_companion = _reset_wake_stt_tts_companion_state()
+    stop = await _publish_wake_stt_tts_stop_event("wake_stt_clear_house")
+    detail = "\n".join(
+        [
+            "Deterministic Wake STT clear-house control executed.",
+            f"Previous Wake STT session: {previous_session_id or 'none'}.",
+            f"New Wake STT session: {new_session_id}.",
+            f"Pending Command Code holds cleared: {pending_count}.",
+            f"Research follow-up context cleared: {bool(research_clear.get('ok'))}.",
+            f"TTS companion state reset: {bool(tts_companion.get('ok'))}.",
+            f"TTS stop event: {'ok' if stop.get('ok') else 'failed'}.",
+            "Matrix history was not redacted or deleted.",
+        ]
+    )
+    return {
+        "speech": "Clear house complete. I started a fresh Wake STT session.",
+        "matrix_detail": detail,
+        "status": "clear_house_complete",
+        "helper_elapsed_ms": "0",
+    }
+
+
 async def _wake_stt_fast_route_local_delivery(
     *,
     text: str,
@@ -829,9 +1024,13 @@ async def _wake_stt_fast_route_local_delivery(
     try:
         if fast_route.action == _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC:
             fields = _wake_stt_time_tool_response_fields(text=text, route=fast_route)
+        elif fast_route.action == _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL:
+            fields = await _wake_stt_voice_stop_response_fields(reason=fast_route.route_id)
+        elif fast_route.action == _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL:
+            fields = await _wake_stt_clear_house_response_fields()
         else:
             fields = await _wake_stt_basic_health_response_fields()
-    except RuntimeError as exc:
+    except Exception as exc:
         if timing:
             timing.mark(
                 "fast_route_local_action_failed",
@@ -839,14 +1038,26 @@ async def _wake_stt_fast_route_local_delivery(
                 action=fast_route.action,
                 error=str(exc)[:160],
             )
+        if fast_route.action == _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL:
+            status = "voice_stop_failed"
+            speech = ""
+            matrix_detail = f"Deterministic Wake STT stop control failed: {exc}"
+        elif fast_route.action == _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL:
+            status = "clear_house_failed"
+            speech = "Clear house failed."
+            matrix_detail = f"Deterministic Wake STT clear-house control failed: {exc}"
+        else:
+            status = "time_tool_unavailable"
+            speech = "I could not read the local time just now."
+            matrix_detail = f"Local deterministic time helper failed: {exc}"
         companion = _wake_stt_companion_output(
-            status="time_tool_unavailable",
-            speech="I could not read the local time just now.",
-            matrix_detail=f"Local deterministic time helper failed: {exc}",
+            status=status,
+            speech=speech,
+            matrix_detail=matrix_detail,
         )
         direct = wake_stt_direct.HermesSttSubmitResult(
             ok=False,
-            status="time_tool_unavailable",
+            status=status,
             gate=gate,
             attempted=False,
             fallback_required=False,
@@ -856,11 +1067,11 @@ async def _wake_stt_fast_route_local_delivery(
         )
         return wake_stt_direct.WakeSttDeliveryResult(
             ok=False,
-            status="time_tool_unavailable",
+            status=status,
             route="direct_local",
             gate=gate,
             direct=direct,
-            fallback_reason="time_tool_unavailable",
+            fallback_reason=status,
             timing=timing,
         )
     companion = _wake_stt_companion_output(
@@ -922,12 +1133,18 @@ def _wake_stt_public_requires_command_code(public: dict[str, Any]) -> bool:
     )
 
 
-def _wake_stt_direct_active_session_file() -> Path:
+def _wake_stt_direct_active_session_file(instance: str = "local") -> Path:
     raw = os.getenv(
         "BLUEPRINTS_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE",
-        _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE,
+        "",
     )
-    return Path(str(raw).strip() or _DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE)
+    if str(raw).strip():
+        return Path(str(raw).strip())
+    clean_instance = _safe_str(instance).strip().lower() or "local"
+    if clean_instance == "local":
+        return Path(_DEFAULT_WAKE_STT_DIRECT_ACTIVE_SESSION_FILE)
+    safe_instance = re.sub(r"[^a-z0-9_.:-]+", "-", clean_instance).strip("-") or "remote"
+    return Path(f"/xarta-node/.lone-wolf/state/hermes-stt/active-wake-session-{safe_instance}.json")
 
 
 def _wake_stt_fast_routes_file() -> Path:
@@ -989,6 +1206,29 @@ def _wake_stt_fast_route_decision(
     *,
     base_session_id: str,
 ) -> _WakeSttFastRouteDecision | None:
+    normalised_text = _wake_stt_fast_route_normalise_text(text)
+    if normalised_text in _WAKE_STT_STOP_CONTROL_PHRASES:
+        return _WakeSttFastRouteDecision(
+            route_id="voice_stop_control",
+            action=_WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
+            session_id=f"{base_session_id}-voice-stop-control",
+            persist_session=False,
+            route_config={
+                "id": "voice_stop_control",
+                "action": _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
+            },
+        )
+    if normalised_text in _WAKE_STT_CLEAR_HOUSE_PHRASES:
+        return _WakeSttFastRouteDecision(
+            route_id="clear_house_control",
+            action=_WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
+            session_id=f"{base_session_id}-clear-house-control",
+            persist_session=False,
+            route_config={
+                "id": "clear_house_control",
+                "action": _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
+            },
+        )
     for route in _wake_stt_fast_route_config():
         action = _safe_str(route.get("action")).strip().lower()
         if action not in _WAKE_STT_FAST_ACTIONS:
@@ -1016,8 +1256,12 @@ def _wake_stt_fast_route_decision(
     return None
 
 
-def _read_wake_stt_direct_active_session_id(default_session_id: str) -> str:
-    path = _wake_stt_direct_active_session_file()
+def _read_wake_stt_direct_active_session_id(
+    default_session_id: str,
+    *,
+    instance: str = "local",
+) -> str:
+    path = _wake_stt_direct_active_session_file(instance)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1028,8 +1272,12 @@ def _read_wake_stt_direct_active_session_id(default_session_id: str) -> str:
     return session_id or default_session_id
 
 
-def _write_wake_stt_direct_active_session_id(session_id: str) -> None:
-    path = _wake_stt_direct_active_session_file()
+def _write_wake_stt_direct_active_session_id(
+    session_id: str,
+    *,
+    instance: str = "local",
+) -> None:
+    path = _wake_stt_direct_active_session_file(instance)
     payload = {
         "session_id": session_id,
         "updated_at": int(time.time()),
@@ -1045,23 +1293,36 @@ def _write_wake_stt_direct_active_session_id(session_id: str) -> None:
 def _wake_stt_direct_config_for_request(
     body: _WakeSttMessageBody,
 ) -> tuple[wake_stt_direct.HermesSttConfig, _WakeSttFastRouteDecision | None]:
-    config = wake_stt_direct.load_hermes_stt_config()
+    clean_instance = _safe_str(body.instance).strip().lower() or "local"
+    config = wake_stt_direct.load_hermes_stt_instance_config(clean_instance)
     base_session_id = _safe_str(config.session_id) or wake_stt_direct.DEFAULT_HERMES_STT_SESSION_ID
     fast_route = _wake_stt_fast_route_decision(body.text, base_session_id=base_session_id)
     if fast_route:
+        tool_surface = fast_route.tool_surface
+        if clean_instance == "vps":
+            if fast_route.action in {
+                _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
+                _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION,
+            }:
+                tool_surface = "xarta_time_lookup_only"
+            elif fast_route.action == _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC:
+                tool_surface = "xarta_vps_health_only"
         return (
             replace(
                 config,
                 session_id=fast_route.session_id,
-                tool_surface=fast_route.tool_surface,
+                tool_surface=tool_surface,
             ),
             fast_route,
         )
-    session_id = _read_wake_stt_direct_active_session_id(base_session_id)
+    session_id = _read_wake_stt_direct_active_session_id(
+        base_session_id,
+        instance=clean_instance,
+    )
     if _wake_stt_direct_operator_requested_new_session(body.text):
         suffix = uuid.uuid4().hex[:12]
         session_id = f"{base_session_id}-operator-{suffix}"
-        _write_wake_stt_direct_active_session_id(session_id)
+        _write_wake_stt_direct_active_session_id(session_id, instance=clean_instance)
     return replace(config, session_id=session_id), None
 
 
@@ -2981,7 +3242,11 @@ async def _deliver_wake_stt_with_direct_fallback(
         return send_assignment()
 
     config, fast_route = _wake_stt_direct_config_for_request(body)
-    if direct_enabled and _wake_stt_fast_route_is_local_action(fast_route) and fast_route:
+    if (
+        direct_enabled
+        and _wake_stt_fast_route_is_local_action(fast_route, instance=body.instance)
+        and fast_route
+    ):
         return await _wake_stt_fast_route_local_delivery(
             text=body.text,
             fast_route=fast_route,
@@ -3001,6 +3266,9 @@ async def _deliver_wake_stt_with_direct_fallback(
         trusted_authorised=trusted_authorised,
         profile_routing_enabled=bool(direct_enabled),
         profile_routing_result=profile_routing_result,
+        direct_route="direct_vps"
+        if _safe_str(body.instance).strip().lower() == "vps"
+        else "direct_local",
     )
     if (
         _wake_stt_fast_route_uses_hermes(fast_route)
@@ -4438,7 +4706,21 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         requested_delivery_mode=body.delivery_mode,
         requested_direct_enabled=body.direct_enabled,
     )
-    direct_requested = bool(route_readback["requested_direct_enabled"])
+    immediate_control_kind = _wake_stt_immediate_control_kind(body.text)
+    immediate_control_requested = bool(immediate_control_kind)
+    direct_requested = (
+        bool(route_readback["requested_direct_enabled"]) or immediate_control_requested
+    )
+    if immediate_control_requested:
+        route_readback = {
+            **route_readback,
+            "requested_direct_enabled": True,
+            "delivery_mode": "direct_local",
+            "direct_enabled": True,
+            "direct_status": "enabled_control_override",
+            "rollback_applied": False,
+            "rollback_reason": "",
+        }
     body_for_delivery = body
     trusted_authorised_retry = False
     inline_authorised = False
@@ -4451,7 +4733,32 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             body.text,
             code_list,
         )
-        if pending and exact_code_response and bool(route_readback["direct_enabled"]):
+        if immediate_control_requested:
+            if pending:
+                timing.mark("command_code_pending_cleared", reason="immediate_control")
+            cancel_key = (
+                None
+                if immediate_control_kind == "clear_house"
+                else _wake_stt_active_delivery_key(room_id, body.instance)
+            )
+            cancelled_tasks = _wake_stt_cancel_active_delivery_tasks(cancel_key)
+            timing.mark(
+                "active_wake_delivery_cancel_requested",
+                control=immediate_control_kind,
+                cancelled_tasks=cancelled_tasks,
+                scope="all" if cancel_key is None else "room_instance",
+            )
+            delivery_task = asyncio.create_task(
+                _deliver_wake_stt_with_direct_fallback(
+                    room_id=room_id,
+                    body=body_for_delivery,
+                    direct_enabled=True,
+                    diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                    await_diagnostic=bool(body.direct_await_diagnostic),
+                    timing=timing,
+                )
+            )
+        elif pending and exact_code_response and bool(route_readback["direct_enabled"]):
             body_for_delivery = body.model_copy(update={"text": pending["text"]})
             pending_profile_routing = (
                 pending.get("profile_routing")
@@ -4542,6 +4849,11 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     profile_routing_result=pending_profile_routing,
                 )
             )
+        if not immediate_control_requested:
+            _wake_stt_track_active_delivery_task(
+                _wake_stt_active_delivery_key(room_id, body_for_delivery.instance),
+                delivery_task,
+            )
         timing.mark("blueprints_delivery_task_created")
         pre_roll_tts: dict[str, Any] = {}
         pre_roll_delay = _wake_stt_direct_pre_roll_delay_seconds()
@@ -4580,7 +4892,21 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     reason=selected_pre_roll_reason,
                 )
                 pre_roll_status["queued"] = bool(pre_roll_tts.get("ok"))
-        delivered = await delivery_task
+        try:
+            delivered = await delivery_task
+        except asyncio.CancelledError:
+            if id(delivery_task) not in _WAKE_STT_CONTROL_CANCELLED_TASK_IDS:
+                raise
+            _WAKE_STT_CONTROL_CANCELLED_TASK_IDS.discard(id(delivery_task))
+            timing.mark("blueprints_delivery_task_cancelled_by_control")
+            delivered = await _wake_stt_command_code_local_delivery(
+                text=body_for_delivery.text,
+                codes=[],
+                status="cancelled_by_voice_control",
+                speech="",
+                matrix_detail="This Wake STT request was cancelled by a stop or clear-house control.",
+                timing=timing,
+            )
         public = delivered.public_dict()
         direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
         if (

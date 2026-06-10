@@ -102,6 +102,64 @@ def test_wake_stt_pending_command_key_is_scoped_by_instance():
     assert local_key != vps_key
 
 
+def test_wake_stt_builtin_control_fast_routes_do_not_need_config():
+    stop = matrix_chat._wake_stt_fast_route_decision(
+        "Computer stop",
+        base_session_id="wake-stt-local",
+    )
+    clear = matrix_chat._wake_stt_fast_route_decision(
+        "clear-house",
+        base_session_id="wake-stt-local",
+    )
+
+    assert stop is not None
+    assert stop.action == matrix_chat._WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL
+    assert stop.persist_session is False
+    assert clear is not None
+    assert clear.action == matrix_chat._WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL
+    assert clear.persist_session is False
+
+
+def test_wake_stt_voice_stop_publishes_silent_stop_event(monkeypatch):
+    published = []
+
+    async def fake_publish(event):
+        published.append(event)
+
+    monkeypatch.setattr(matrix_chat.events_bus, "publish", fake_publish)
+
+    result = asyncio.run(matrix_chat._wake_stt_voice_stop_response_fields(reason="abort"))
+
+    assert result["speech"] == ""
+    assert result["status"] == "voice_stop_requested"
+    assert published[0].event_type == "tts.stop.requested"
+    assert published[0].payload["interrupt_active"] is True
+    assert published[0].payload["clear_queues"] is True
+
+
+def test_wake_stt_active_delivery_cancel_tracks_control_cancel():
+    async def run():
+        key = matrix_chat._wake_stt_active_delivery_key("!room:test", "local")
+        task = asyncio.create_task(asyncio.sleep(60))
+        try:
+            matrix_chat._wake_stt_track_active_delivery_task(key, task)
+            cancelled = matrix_chat._wake_stt_cancel_active_delivery_tasks(key)
+            assert cancelled == 1
+            assert id(task) in matrix_chat._WAKE_STT_CONTROL_CANCELLED_TASK_IDS
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert key not in matrix_chat._WAKE_STT_ACTIVE_DELIVERY_TASKS
+            assert id(task) not in matrix_chat._WAKE_STT_CONTROL_CANCELLED_TASK_IDS
+        finally:
+            task.cancel()
+            matrix_chat._WAKE_STT_ACTIVE_DELIVERY_TASKS.clear()
+            matrix_chat._WAKE_STT_CONTROL_CANCELLED_TASK_IDS.clear()
+
+    asyncio.run(run())
+
+
 def test_matrix_chat_noise_relay_waits_for_stt_final_after_filter_closes():
     async def run():
         done = asyncio.Event()
@@ -1346,6 +1404,166 @@ def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_look
 
     assert captured["session_id"] == "wake-stt-local-operator-kept"
     assert captured["tool_surface"] == ""
+
+
+def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path):
+    captured = {}
+    fast_routes = tmp_path / "fast-routes.json"
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "time_current_exact",
+                        "action": "time_current_deterministic_response",
+                        "match": {"kind": "exact", "phrases": ["what is the time"]},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["text"] = text
+        captured["api_base"] = config.api_base
+        captured["session_id"] = config.session_id
+        captured["tool_surface"] = config.tool_surface
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text='{"speech":"ten oh five","matrix_detail":"vps time","status":"ok"}',
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="ten oh five",
+                matrix_detail="vps time",
+                status="ok",
+                structured=True,
+                raw_assistant_text='{"speech":"ten oh five","matrix_detail":"vps time","status":"ok"}',
+            ),
+            target_profile=config.model,
+        )
+
+    def fail_local_time(*_args, **_kwargs):
+        raise AssertionError("VPS exact time must not use the Blueprints-local shortcut")
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_instance_config",
+        lambda instance: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://10.253.2.99:8648",
+            api_key="secret",
+            model="example-vps-stt",
+            session_id="wake-stt-vps",
+            allow_non_loopback=True,
+        ),
+    )
+    monkeypatch.setattr(matrix_chat.wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
+    monkeypatch.setattr(matrix_chat, "_wake_stt_time_tool_response_fields", fail_local_time)
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="what is the time",
+                instance="vps",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Dave",
+                candidate_revision="wake-vps-time",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert result.ok is True
+    assert captured["api_base"] == "http://10.253.2.99:8648"
+    assert captured["session_id"].startswith("wake-stt-vps-time_current_exact-")
+    assert captured["tool_surface"] == "xarta_time_lookup_only"
+    assert result.direct.target_profile == "example-vps-stt"
+    assert result.direct.profile_routing.target_profile == "example-vps-stt"
+
+
+def test_matrix_chat_vps_basic_health_uses_vps_health_tool_surface(monkeypatch, tmp_path):
+    captured = {}
+    fast_routes = tmp_path / "fast-routes.json"
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "basic_health_exact",
+                        "action": "basic_health_deterministic_response",
+                        "match": {"kind": "exact", "phrases": ["are you okay"]},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
+        captured["text"] = text
+        captured["tool_surface"] = config.tool_surface
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
+        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="delivered",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            assistant_text='{"speech":"I am okay.","matrix_detail":"vps health","status":"ok"}',
+            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                speech="I am okay.",
+                matrix_detail="vps health",
+                status="ok",
+                structured=True,
+                raw_assistant_text='{"speech":"I am okay.","matrix_detail":"vps health","status":"ok"}',
+            ),
+            target_profile=config.model,
+        )
+
+    async def fail_local_health():
+        raise AssertionError("VPS health must not use the Blueprints-local health shortcut")
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_instance_config",
+        lambda instance: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://10.253.2.99:8648",
+            api_key="secret",
+            model="example-vps-stt",
+            session_id="wake-stt-vps",
+            allow_non_loopback=True,
+        ),
+    )
+    monkeypatch.setattr(matrix_chat.wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
+    monkeypatch.setattr(matrix_chat, "_wake_stt_basic_health_response_fields", fail_local_health)
+
+    result = asyncio.run(
+        matrix_chat._deliver_wake_stt_with_direct_fallback(
+            room_id="!bridge:test.example",
+            body=matrix_chat._WakeSttMessageBody(
+                text="are you okay",
+                instance="vps",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Dave",
+                candidate_revision="wake-vps-health",
+            ),
+            direct_enabled=True,
+        )
+    )
+
+    assert result.ok is True
+    assert captured["tool_surface"] == "xarta_vps_health_only"
+    assert result.direct.target_profile == "example-vps-stt"
+    assert result.direct.profile_routing.target_profile == "example-vps-stt"
 
 
 def test_matrix_chat_direct_wrapper_rotates_session_only_on_operator_request(monkeypatch, tmp_path):
