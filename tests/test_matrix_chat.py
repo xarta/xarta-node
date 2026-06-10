@@ -2768,6 +2768,108 @@ def test_matrix_chat_wake_stt_direct_route_queues_tts(monkeypatch):
     assert "secret" not in str(captured).lower()
 
 
+def test_matrix_chat_wake_stt_vps_direct_route_queues_tts(monkeypatch):
+    captured = {}
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_vps",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=True,
+                status="delivered",
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text=(
+                    '{"speech":"sixteen thirty-one","matrix_detail":"VPS time check completed.",'
+                    '"status":"ok"}'
+                ),
+                companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+                    speech="sixteen thirty-one",
+                    matrix_detail="VPS time check completed.",
+                    status="ok",
+                    structured=True,
+                    raw_assistant_text=(
+                        '{"speech":"sixteen thirty-one","matrix_detail":"VPS time check completed.",'
+                        '"status":"ok"}'
+                    ),
+                ),
+            ),
+        )
+
+    async def fake_publish_tts_payload(payload):
+        captured["text"] = payload["text"]
+        captured["source"] = payload["source"]
+        captured["agent_id"] = payload["agent_id"]
+        captured["client_id"] = payload["client_id"]
+        captured["metadata"] = payload["metadata"]
+        captured["interrupt"] = payload["interrupt"]
+        return {
+            "ok": True,
+            "event": {"event_id": "tts-wake-vps-direct"},
+            "payload": {
+                "utterance_id": payload["utterance_id"],
+                "source": payload["source"],
+                "agent_id": payload["agent_id"],
+            },
+        }
+
+    async def fake_report(**kwargs):
+        captured["report"] = kwargs
+        return {"ok": True, "event_id": "$vps-response-copy"}
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setenv("BLUEPRINTS_HERMES_STT_VPS_MODEL", "vps-test-agent")
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish_tts_payload)
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!vps:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="What's the time?",
+                instance="vps",
+                candidate_source="payload0",
+                command="execute",
+                wake_word="Mini-Me",
+                candidate_revision="wake-vps-time",
+                delivery_mode="direct_vps",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert result["delivery"]["route"] == "direct_vps"
+    assert result["delivery"]["direct"]["companion"]["speech"] == "sixteen thirty-one"
+    assert result["delivery"]["pre_roll"]["direct_receipt_status"] == "delivered"
+    assert result["delivery"]["tts"]["ok"] is True
+    assert result["delivery"]["tts"]["event_id"] == "tts-wake-vps-direct"
+    assert captured["text"] == "sixteen thirty-one"
+    assert captured["source"] == "vps-test-agent"
+    assert captured["agent_id"] == "vps-test-agent"
+    assert captured["client_id"] == "vps-test-agent:wake-to-talk"
+    assert captured["interrupt"] is True
+    assert captured["metadata"]["route"] == "direct_vps"
+    assert captured["metadata"]["wake_instance"] == "vps"
+    assert captured["metadata"]["hermes_instance"] == "vps-test-agent"
+    assert captured["metadata"]["speech_elected_by"] == "vps-test-agent"
+    assert captured["report"]["matrix_detail"] == "VPS time check completed."
+    assert result["delivery"]["assistant_report_scheduled"] is True
+    assert result["delivery"]["tts_elected_by_hermes"] is True
+    assert "api_server_key" not in str(captured).lower()
+    assert "secret" not in str(captured).lower()
+
+
 def test_matrix_chat_wake_stt_direct_route_pre_rolls_then_speaks_final(monkeypatch, tmp_path):
     published: list[dict[str, object]] = []
     pre_roll_config = tmp_path / "wake-stt-pre-roll.json"

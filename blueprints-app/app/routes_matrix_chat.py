@@ -716,6 +716,31 @@ def _wake_stt_fast_route_uses_hermes(route: _WakeSttFastRouteDecision | None) ->
     return bool(route and route.action in _WAKE_STT_FAST_HERMES_TOOL_SURFACES)
 
 
+def _wake_stt_route_is_direct(route: Any) -> bool:
+    return _safe_str(route).strip().lower() in {"direct_local", "direct_vps"}
+
+
+def _wake_stt_direct_route_for_instance(instance: Any) -> str:
+    return "direct_vps" if _safe_str(instance).strip().lower() == "vps" else "direct_local"
+
+
+def _wake_stt_tts_agent_for_instance(instance: Any) -> str:
+    clean_instance = _safe_str(instance).strip().lower() or "local"
+    direct_config = wake_stt_direct.wake_stt_instance_direct_config(clean_instance)
+    model_env = _safe_str(direct_config.get("model_env")).strip()
+    candidates = [
+        os.getenv(model_env, "") if model_env else "",
+        direct_config.get("hermes_instance"),
+        direct_config.get("agent_id"),
+        direct_config.get("source"),
+    ]
+    for candidate in candidates:
+        value = _safe_str(candidate).strip()
+        if value:
+            return value
+    return "hermes-stt" if clean_instance == "local" else f"{clean_instance}-stt-profile"
+
+
 def _wake_stt_fast_route_response_config(
     route: _WakeSttFastRouteDecision,
 ) -> dict[str, Any]:
@@ -3303,17 +3328,19 @@ async def _publish_wake_stt_direct_tts(
     text = _safe_str(speech).strip()
     if not text:
         return {"ok": False, "skipped": True, "error": "missing elected speech"}
+    wake_instance = _safe_str(body.instance) or "local"
+    tts_agent = _wake_stt_tts_agent_for_instance(wake_instance)
     payload = {
         "utterance_id": f"wake-stt-direct-{uuid.uuid4().hex}",
-        "source": "hermes-stt",
-        "agent_id": "hermes-stt",
+        "source": tts_agent,
+        "agent_id": tts_agent,
         "subagent_id": "wake-stt-direct",
-        "conversation_id": f"wake-stt:{_safe_str(body.instance) or 'local'}",
+        "conversation_id": f"wake-stt:{wake_instance}",
         "text": text,
         "mode": "stream",
         "format": "wav",
         "interrupt": interrupt,
-        "client_id": "hermes-stt:wake-to-talk",
+        "client_id": f"{tts_agent}:wake-to-talk",
         "target": {
             "kind": "all_listeners",
             "dedupe": "one_webpage_per_client_ip_plus_phone",
@@ -3329,18 +3356,18 @@ async def _publish_wake_stt_direct_tts(
         "metadata": {
             "schema": "xarta.wake-stt.direct-response.v1",
             "purpose": "wake_stt_direct_pre_roll" if pre_roll else "wake_stt_direct_response",
-            "hermes_instance": "hermes-stt",
+            "hermes_instance": tts_agent,
             "origin_platform": "direct_api",
             "capture_mode": "wake_to_talk",
             "route": route,
-            "wake_instance": _safe_str(body.instance) or "local",
+            "wake_instance": wake_instance,
             "candidate_source": _safe_str(body.candidate_source),
             "command": _safe_str(body.command),
             "candidate_revision": _safe_str(body.candidate_revision),
             "interruptible": True,
             "tts_queue_policy": "hermes_priority_stream",
             "tts_priority": 100,
-            "speech_elected_by": "blueprints_transport_ack" if pre_roll else "hermes-stt",
+            "speech_elected_by": "blueprints_transport_ack" if pre_roll else tts_agent,
             "pre_roll": bool(pre_roll),
             "pre_roll_reason": (_safe_str(pre_roll_reason).strip().lower() if pre_roll else ""),
         },
@@ -3356,8 +3383,8 @@ async def _publish_wake_stt_direct_tts(
         "ok": bool(published.get("ok")) if isinstance(published, dict) else False,
         "event_id": event.get("event_id") if isinstance(event, dict) else "",
         "utterance_id": payload.get("utterance_id") if isinstance(payload, dict) else "",
-        "source": payload.get("source") if isinstance(payload, dict) else "hermes-stt",
-        "agent_id": payload.get("agent_id") if isinstance(payload, dict) else "hermes-stt",
+        "source": payload.get("source") if isinstance(payload, dict) else tts_agent,
+        "agent_id": payload.get("agent_id") if isinstance(payload, dict) else tts_agent,
         "status": "queued" if isinstance(published, dict) and published.get("ok") else "error",
     }
 
@@ -4715,7 +4742,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         route_readback = {
             **route_readback,
             "requested_direct_enabled": True,
-            "delivery_mode": "direct_local",
+            "delivery_mode": _wake_stt_direct_route_for_instance(body.instance),
             "direct_enabled": True,
             "direct_status": "enabled_control_override",
             "rollback_applied": False,
@@ -4863,6 +4890,9 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         )
         pre_roll_status = _wake_stt_pre_roll_status(pre_roll_delay, pre_roll_reason)
         pre_roll_status["enabled"] = bool(route_readback["direct_enabled"]) and bool(pre_roll_delay)
+        pre_roll_route = _safe_str(route_readback.get("delivery_mode")).strip().lower()
+        if not _wake_stt_route_is_direct(pre_roll_route):
+            pre_roll_route = _wake_stt_direct_route_for_instance(body_for_delivery.instance)
         if bool(route_readback["direct_enabled"]) and pre_roll_delay:
             timing.mark(
                 "pre_roll_wait_start",
@@ -4880,7 +4910,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                 pre_roll_tts = await _publish_wake_stt_direct_tts(
                     speech=pre_roll_speech,
                     body=body,
-                    route="direct_local",
+                    route=pre_roll_route,
                     interrupt=True,
                     pre_roll=True,
                     pre_roll_reason=selected_pre_roll_reason,
@@ -4910,7 +4940,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         public = delivered.public_dict()
         direct_result = public.get("direct") if isinstance(public.get("direct"), dict) else {}
         if (
-            public.get("route") == "direct_local"
+            _wake_stt_route_is_direct(public.get("route"))
             and not direct_result.get("authorised")
             and _wake_stt_public_requires_command_code(public)
         ):
@@ -4949,7 +4979,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             timing.mark("command_code_challenge_held", held=bool(held_saved))
         if (
             trusted_authorised_retry
-            and public.get("route") == "direct_local"
+            and _wake_stt_route_is_direct(public.get("route"))
             and not public.get("ok")
             and isinstance(direct_result, dict)
         ):
@@ -4979,14 +5009,15 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     status=status,
                     target_profile=target_profile,
                 )
-        if public.get("route") == "direct_local":
+        direct_route = _safe_str(public.get("route")).strip().lower()
+        if _wake_stt_route_is_direct(direct_route):
             pre_roll_status["direct_receipt_status"] = "delivered" if public.get("ok") else "failed"
             if not public.get("ok"):
                 pre_roll_status["failure_status"] = _safe_str(direct_result.get("status"))
-        elif public.get("route") == "matrix":
+        elif direct_route == "matrix":
             pre_roll_status["direct_receipt_status"] = "explicit_matrix_mode"
         else:
-            pre_roll_status["direct_receipt_status"] = _safe_str(public.get("route")) or "unknown"
+            pre_roll_status["direct_receipt_status"] = direct_route or "unknown"
         public["pre_roll"] = pre_roll_status
         if pre_roll_tts:
             public["pre_roll_tts"] = pre_roll_tts
@@ -4998,12 +5029,12 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
         )
         speech = _safe_str(companion.get("speech")).strip()
         matrix_detail = _safe_str(companion.get("matrix_detail")).strip()
-        if public.get("route") == "direct_local":
+        if _wake_stt_route_is_direct(direct_route):
             if speech:
                 tts_result = await _publish_wake_stt_direct_tts(
                     speech=speech,
                     body=body_for_delivery,
-                    route="direct_local",
+                    route=direct_route,
                 )
                 public["tts"] = tts_result
                 timing.mark(
