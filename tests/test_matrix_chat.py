@@ -1406,8 +1406,8 @@ def test_matrix_chat_direct_wrapper_does_not_treat_times_arithmetic_as_time_look
     assert captured["tool_surface"] == ""
 
 
-def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path):
-    captured = {}
+def test_matrix_chat_vps_exact_time_is_deterministic(monkeypatch, tmp_path):
+    captured = {"fallback_calls": 0, "classifier_calls": 0, "helper_texts": []}
     fast_routes = tmp_path / "fast-routes.json"
     fast_routes.write_text(
         json.dumps(
@@ -1424,31 +1424,26 @@ def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path)
         encoding="utf-8",
     )
 
-    async def fake_submit(text, *, config=None, codes=None, **_kwargs):
-        captured["text"] = text
-        captured["api_base"] = config.api_base
-        captured["session_id"] = config.session_id
-        captured["tool_surface"] = config.tool_surface
-        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(text, codes or [])
-        return matrix_chat.wake_stt_direct.HermesSttSubmitResult(
-            ok=True,
-            status="delivered",
-            gate=gate,
-            attempted=True,
-            fallback_required=False,
-            assistant_text='{"speech":"ten oh five","matrix_detail":"vps time","status":"ok"}',
-            companion=matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
-                speech="ten oh five",
-                matrix_detail="vps time",
-                status="ok",
-                structured=True,
-                raw_assistant_text='{"speech":"ten oh five","matrix_detail":"vps time","status":"ok"}',
-            ),
-            target_profile=config.model,
-        )
+    async def fail_delivery(*_args, **_kwargs):
+        captured["fallback_calls"] += 1
+        raise AssertionError("exact VPS current-time must not call Hermes or Matrix fallback")
 
-    def fail_local_time(*_args, **_kwargs):
-        raise AssertionError("VPS exact time must not use the Blueprints-local shortcut")
+    async def fail_classifier(*_args, **_kwargs):
+        captured["classifier_calls"] += 1
+        raise AssertionError("exact VPS current-time must not classify")
+
+    def fake_time_tool_response_fields(*, text, route):
+        captured["helper_texts"].append(text)
+        assert route.action == "time_current_deterministic_response"
+        return {
+            "speech": "ten oh five",
+            "matrix_detail": "Local time (Europe/London, BST): 2026-06-10 10:05.",
+            "status": "ok",
+            "kind": "time",
+            "timezone": "Europe/London",
+            "time_24h": "10:05",
+            "helper_elapsed_ms": "1.1",
+        }
 
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
     monkeypatch.setattr(
@@ -1462,8 +1457,21 @@ def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path)
             allow_non_loopback=True,
         ),
     )
-    monkeypatch.setattr(matrix_chat.wake_stt_direct, "submit_wake_stt_to_hermes", fake_submit)
-    monkeypatch.setattr(matrix_chat, "_wake_stt_time_tool_response_fields", fail_local_time)
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fail_delivery,
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fail_classifier,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_time_tool_response_fields",
+        fake_time_tool_response_fields,
+    )
 
     result = asyncio.run(
         matrix_chat._deliver_wake_stt_with_direct_fallback(
@@ -1480,12 +1488,18 @@ def test_matrix_chat_vps_exact_time_uses_vps_tool_surface(monkeypatch, tmp_path)
         )
     )
 
-    assert result.ok is True
-    assert captured["api_base"] == "http://10.253.2.99:8648"
-    assert captured["session_id"].startswith("wake-stt-vps-time_current_exact-")
-    assert captured["tool_surface"] == "xarta_time_lookup_only"
-    assert result.direct.target_profile == "example-vps-stt"
-    assert result.direct.profile_routing.target_profile == "example-vps-stt"
+    public = result.public_dict()
+    companion = public["direct"]["companion"]
+    assert public["ok"] is True
+    assert public["route"] == "direct_vps"
+    assert public["direct"]["attempted"] is False
+    assert public["direct"]["status"] == "time_current_deterministic_response"
+    assert companion["speech"] == "ten oh five"
+    assert captured == {
+        "fallback_calls": 0,
+        "classifier_calls": 0,
+        "helper_texts": ["what is the time"],
+    }
 
 
 def test_matrix_chat_vps_basic_health_exact_is_deterministic(monkeypatch, tmp_path):
