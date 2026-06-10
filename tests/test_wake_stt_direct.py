@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -259,6 +260,54 @@ def test_hermes_stt_config_rejects_non_loopback_by_default():
     assert config.loopback_ok is False
 
 
+def test_hermes_stt_instance_config_allows_reviewed_vps_bridge_only(tmp_path):
+    instances_file = tmp_path / "instances.json"
+    instances_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.instances.v1",
+                "instances": {
+                    "vps": {
+                        "direct_available": True,
+                        "delivery_mode": "direct_vps",
+                        "api_base_env": "BLUEPRINTS_HERMES_STT_VPS_API_BASE",
+                        "api_key_env": "BLUEPRINTS_HERMES_STT_VPS_API_KEY",
+                        "model_env": "BLUEPRINTS_HERMES_STT_VPS_MODEL",
+                        "hermes_instance": "example-vps-stt",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = wake_stt_direct.load_hermes_stt_instance_config(
+        "vps",
+        environ={
+            "BLUEPRINTS_WAKE_STT_INSTANCES_FILE": str(instances_file),
+            "BLUEPRINTS_HERMES_STT_VPS_API_BASE": "http://10.253.2.99:8648",
+            "BLUEPRINTS_HERMES_STT_VPS_API_KEY": "secret",
+            "BLUEPRINTS_HERMES_STT_VPS_MODEL": "example-vps-stt",
+        },
+    )
+    public_config = wake_stt_direct.load_hermes_stt_instance_config(
+        "vps",
+        environ={
+            "BLUEPRINTS_WAKE_STT_INSTANCES_FILE": str(instances_file),
+            "BLUEPRINTS_HERMES_STT_VPS_API_BASE": "http://203.0.113.8:8648",
+            "BLUEPRINTS_HERMES_STT_VPS_API_KEY": "secret",
+            "BLUEPRINTS_HERMES_STT_VPS_MODEL": "example-vps-stt",
+        },
+    )
+
+    assert config.configured is True
+    assert config.loopback_ok is True
+    assert config.model == "example-vps-stt"
+    assert config.session_id == "wake-stt-vps"
+    assert public_config.configured is False
+    assert public_config.loopback_ok is False
+
+
 def test_wake_stt_route_readback_rolls_back_direct_by_default():
     readback = wake_stt_direct.wake_stt_route_readback(
         instance="local",
@@ -300,8 +349,8 @@ def test_wake_stt_route_readback_uses_instance_specific_vps_rollout_env(tmp_path
                         "direct_available": True,
                         "delivery_mode": "direct_vps",
                         "route_enabled_env": "BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED",
-                        "physical_profile_prefix": "hermes-vps-stt",
-                        "hermes_instance": "hermes-vps-stt",
+                        "physical_profile_prefix": "example-vps-stt",
+                        "hermes_instance": "example-vps-stt",
                         "matrix_server": "vps",
                     }
                 },
@@ -337,7 +386,7 @@ def test_wake_stt_route_readback_uses_instance_specific_vps_rollout_env(tmp_path
     assert enabled["delivery_mode"] == "direct_vps"
     assert enabled["direct_mode"] == "direct_vps"
     assert enabled["direct_enabled"] is True
-    assert enabled["physical_profile_prefix"] == "hermes-vps-stt"
+    assert enabled["physical_profile_prefix"] == "example-vps-stt"
     assert enabled["matrix_server"] == "vps"
 
 
@@ -820,6 +869,122 @@ def test_deliver_wake_stt_profile_classifier_runs_parallel_with_base_submit(monk
     assert events[:3] == ["classifier_start", "submit_start", "classifier_done"]
 
 
+def test_deliver_wake_stt_research_followup_classifier_runs_speculative_parallel(
+    monkeypatch,
+    tmp_path,
+):
+    context_file = tmp_path / "research-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.research-context.v1",
+                "updated_at_epoch": time.time(),
+                "request_text": "Research the River Warden weather satellite project.",
+                "query": "River Warden weather satellite project instruments",
+                "summary_excerpt": "The River Warden project included a narrowband rain sensor.",
+                "source_titles": ["River Warden mission overview"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE", str(context_file))
+    events: list[str] = []
+    followup_started = asyncio.Event()
+    base_started = asyncio.Event()
+
+    async def fake_followup(*_args, **_kwargs):
+        events.append("followup_start")
+        followup_started.set()
+        await base_started.wait()
+        events.append("followup_done")
+        return wake_stt_direct.WakeSttResearchFollowupResult(
+            relation="follow_up",
+            confidence=0.9,
+            interpreted_request="Please research the River Warden rain sensor.",
+            reason="research-ish request with recent research context",
+            status="classified",
+            model="test-classifier",
+        )
+
+    async def fake_profile(*_args, **_kwargs):
+        events.append("profile_start")
+        await followup_started.wait()
+        await base_started.wait()
+        events.append("profile_done")
+        return wake_stt_direct.WakeSttProfileRoutingResult(
+            target_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+            requires_command_code=False,
+            complex=False,
+            risk_class="web_research",
+            confidence=0.94,
+            reason="bounded public web research",
+            speech_if_pending="",
+            status="classified",
+        )
+
+    async def fake_base_submit(*_args, **_kwargs):
+        events.append("base_start")
+        base_started.set()
+        await asyncio.sleep(30)
+        raise AssertionError("base submit should be cancelled for NullClaw handoff")
+
+    async def fake_handoff(text, *, research_followup_task=None, profile_routing, **_kwargs):
+        events.append("handoff_start")
+        assert profile_routing.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
+        assert research_followup_task is not None
+        followup = await research_followup_task
+        events.append(f"handoff_followup:{followup.relation}")
+        gate = wake_stt_direct.apply_command_code_gate(text, [])
+        companion = wake_stt_direct.HermesSttCompanionOutput(
+            speech="handoff ok",
+            matrix_detail="handoff detail",
+            status="ok",
+            structured=True,
+            raw_assistant_text='{"speech":"handoff ok","matrix_detail":"handoff detail","status":"ok"}',
+        )
+        return wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="bounded_nullclaw_completed",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+            target_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+            profile_routing=profile_routing,
+        )
+
+    async def matrix_send(_text):
+        raise AssertionError("matrix fallback should not be used")
+
+    monkeypatch.setattr(wake_stt_direct, "classify_wake_stt_research_followup", fake_followup)
+    monkeypatch.setattr(wake_stt_direct, "classify_wake_stt_profile", fake_profile)
+    monkeypatch.setattr(wake_stt_direct, "submit_wake_stt_to_hermes", fake_base_submit)
+    monkeypatch.setattr(wake_stt_direct, "submit_wake_stt_profile_handoff", fake_handoff)
+
+    async def run():
+        return await wake_stt_direct.deliver_wake_stt_with_matrix_fallback(
+            "Please research the wever rain sensor.",
+            matrix_send=matrix_send,
+            config=wake_stt_direct.HermesSttConfig(
+                api_base="http://127.0.0.1:8643",
+                api_key="secret",
+            ),
+            direct_enabled=True,
+            profile_routing_enabled=True,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert (
+        result.direct and result.direct.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
+    )
+    assert events.index("followup_start") < events.index("profile_done")
+    assert events.index("profile_start") < events.index("handoff_start")
+    assert events.index("base_start") < events.index("handoff_start")
+    assert "handoff_followup:follow_up" in events
+
+
 def test_deliver_wake_stt_reuses_stored_profile_routing_for_authorised_retry(monkeypatch):
     captured = {}
 
@@ -1027,7 +1192,11 @@ def test_submit_wake_stt_nullclaw_target_uses_bounded_route(monkeypatch):
     assert assignments[0]["target_profile"] == "hermes-stt-nullclaw"
 
 
-def test_call_nullclaw_web_research_uses_plain_query(monkeypatch):
+def test_call_nullclaw_web_research_uses_plain_query(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE",
+        str(tmp_path / "research-context.json"),
+    )
     captured = {}
 
     class FakeWebResearchQueryBody:
@@ -1060,7 +1229,188 @@ def test_call_nullclaw_web_research_uses_plain_query(monkeypatch):
     assert "Bounded Wake STT" not in json.dumps(body.__dict__)
 
 
-def test_call_nullclaw_web_research_uses_vpn_profile_for_circumspect_request(monkeypatch):
+def test_call_nullclaw_web_research_uses_classifier_followup_context(monkeypatch, tmp_path):
+    context_file = tmp_path / "research-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.research-context.v1",
+                "updated_at_epoch": time.time(),
+                "request_text": "Research the River Warden weather satellite project.",
+                "query": "River Warden weather satellite project instruments",
+                "summary_excerpt": "The River Warden project included a narrowband rain sensor.",
+                "source_titles": ["River Warden mission overview"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE", str(context_file))
+    captured = {}
+
+    class FakeWebResearchQueryBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeWebResearchPromptBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    async def fail_query(_body):
+        raise AssertionError("follow-up research should use query-prompt")
+
+    async def fake_query_prompt(body):
+        captured["body"] = body
+        return {
+            "ok": True,
+            "display": {
+                "summary_markdown": "The rain sensor flew on the River Warden project.",
+                "source_items": [
+                    {"title": "River Warden sensors", "url": "https://example.test/river"}
+                ],
+            },
+        }
+
+    fake_module = types.ModuleType("app.routes_web_research")
+    fake_module.WebResearchQueryBody = FakeWebResearchQueryBody
+    fake_module.WebResearchPromptBody = FakeWebResearchPromptBody
+    fake_module.web_research_query = fail_query
+    fake_module.web_research_query_prompt = fake_query_prompt
+    monkeypatch.setitem(sys.modules, "app.routes_web_research", fake_module)
+    followup = wake_stt_direct.WakeSttResearchFollowupResult(
+        relation="follow_up",
+        confidence=0.91,
+        reason="short research request plausibly continues previous River Warden context",
+        interpreted_request="Please research the River Warden rain sensor only.",
+        status="classified",
+        model="test-classifier",
+    )
+
+    result = asyncio.run(
+        wake_stt_direct._call_nullclaw_web_research(
+            "Please research wever rain sensor only.",
+            timeout_seconds=1.0,
+            followup=followup,
+        )
+    )
+
+    assert result["ok"] is True
+    body = captured["body"]
+    assert "River Warden" in body.query
+    assert "rain sensor" in body.query
+    assert "Current STT text: Please research wever rain sensor only." in body.prompt
+    assert (
+        "Classifier-guided request: Please research the River Warden rain sensor only."
+        in body.prompt
+    )
+    assert "relation=follow_up" in body.prompt
+    assert result["wake_stt_research_context"]["used"] is True
+    assert result["wake_stt_research_context"]["classifier"]["model"] == "test-classifier"
+    updated = json.loads(context_file.read_text(encoding="utf-8"))
+    assert updated["query"] == body.query
+
+
+def test_call_nullclaw_web_research_suppresses_context_for_classifier_fresh(monkeypatch, tmp_path):
+    context_file = tmp_path / "research-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.research-context.v1",
+                "updated_at_epoch": time.time(),
+                "request_text": "Research old observatory rain records.",
+                "query": "old observatory rain records",
+                "summary_excerpt": "The previous research covered historical rainfall archives.",
+                "source_titles": ["Observatory rainfall archive"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE", str(context_file))
+    captured = {}
+
+    class FakeWebResearchQueryBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeWebResearchPromptBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    async def fake_query(body):
+        captured["body"] = body
+        return {"ok": True, "display": {"summary_markdown": "fresh"}}
+
+    async def fail_query_prompt(_body):
+        raise AssertionError("unrelated context must not force query-prompt mode")
+
+    fake_module = types.ModuleType("app.routes_web_research")
+    fake_module.WebResearchQueryBody = FakeWebResearchQueryBody
+    fake_module.WebResearchPromptBody = FakeWebResearchPromptBody
+    fake_module.web_research_query = fake_query
+    fake_module.web_research_query_prompt = fail_query_prompt
+    monkeypatch.setitem(sys.modules, "app.routes_web_research", fake_module)
+    followup = wake_stt_direct.WakeSttResearchFollowupResult(
+        relation="fresh",
+        confidence=0.96,
+        reason="current request names a different topic",
+        interpreted_request="Research transistor radios from the 1960s.",
+        status="classified",
+        model="test-classifier",
+    )
+
+    result = asyncio.run(
+        wake_stt_direct._call_nullclaw_web_research(
+            "Do more research on transistor radios from the 1960s.",
+            timeout_seconds=1.0,
+            followup=followup,
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["body"].query == "Do more research on transistor radios from the 1960s."
+    assert result["wake_stt_research_context"]["used"] is False
+
+
+def test_call_nullclaw_web_research_does_not_rewrite_no_context_query(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE",
+        str(tmp_path / "research-context.json"),
+    )
+    captured = {}
+
+    class FakeWebResearchQueryBody:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    async def fake_query(body):
+        captured["body"] = body
+        return {"ok": True, "display": {"summary_markdown": "fresh"}}
+
+    fake_module = types.ModuleType("app.routes_web_research")
+    fake_module.WebResearchQueryBody = FakeWebResearchQueryBody
+    fake_module.web_research_query = fake_query
+    monkeypatch.setitem(sys.modules, "app.routes_web_research", fake_module)
+
+    result = asyncio.run(
+        wake_stt_direct._call_nullclaw_web_research(
+            "Please do web research on a homophonic project name from the transcript.",
+            timeout_seconds=1.0,
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["body"].query == (
+        "Please do web research on a homophonic project name from the transcript."
+    )
+
+
+def test_call_nullclaw_web_research_uses_vpn_profile_for_circumspect_request(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE",
+        str(tmp_path / "research-context.json"),
+    )
     captured = {}
 
     class FakeWebResearchQueryBody:
@@ -1175,6 +1525,58 @@ def test_submit_wake_stt_nullclaw_docs_lookup_skips_web(monkeypatch):
     assert "NullClaw docs found:" in result.companion.speech
     assert "NullClaw web research" not in result.companion.matrix_detail
     assert "Local docs explain: ok" in result.companion.matrix_detail
+
+
+def test_submit_wake_stt_nullclaw_docs_lookup_cancels_speculative_followup_task(
+    monkeypatch,
+):
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile="hermes-stt-nullclaw",
+        requires_command_code=False,
+        complex=False,
+        risk_class="docs_lookup",
+        confidence=0.94,
+        reason="bounded docs lookup",
+        speech_if_pending="Authorisation Command Code required.",
+        status="classified",
+    )
+
+    async def fake_guard():
+        return {"ok": True, "status": "ok"}
+
+    async def fake_docs(_text):
+        return {"ok": True, "summary": "ok"}
+
+    async def fail_web(_text, **_kwargs):
+        raise AssertionError("docs_lookup request should not call public web research")
+
+    async def slow_followup():
+        await asyncio.sleep(30)
+        return wake_stt_direct.WakeSttResearchFollowupResult(
+            relation="follow_up",
+            confidence=0.9,
+            status="classified",
+        )
+
+    monkeypatch.setattr(wake_stt_direct, "_run_nullclaw_runtime_guard_check", fake_guard)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_docs_explain", fake_docs)
+    monkeypatch.setattr(wake_stt_direct, "_call_nullclaw_web_research", fail_web)
+
+    async def run():
+        task = asyncio.create_task(slow_followup())
+        result = await wake_stt_direct.submit_wake_stt_profile_handoff(
+            "Use your no claw document skill to summarise the local notes.",
+            profile_routing=routing,
+            codes=[],
+            research_followup_task=task,
+        )
+        return result, task.cancelled()
+
+    result, task_cancelled = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.status == "bounded_nullclaw_completed"
+    assert task_cancelled is True
 
 
 def test_submit_wake_stt_nullclaw_web_only_public_request_skips_docs(monkeypatch):
