@@ -705,10 +705,15 @@ def _wake_stt_fast_route_is_local_action(
     *,
     instance: str = "local",
 ) -> bool:
-    return bool(
-        _safe_str(instance).strip().lower() == "local"
+    clean_instance = _safe_str(instance).strip().lower() or "local"
+    if (
+        clean_instance == "vps"
         and route
-        and route.action in _WAKE_STT_FAST_LOCAL_ACTIONS
+        and route.action == _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC
+    ):
+        return True
+    return bool(
+        clean_instance == "local" and route and route.action in _WAKE_STT_FAST_LOCAL_ACTIONS
     )
 
 
@@ -739,6 +744,26 @@ def _wake_stt_tts_agent_for_instance(instance: Any) -> str:
         if value:
             return value
     return "hermes-stt" if clean_instance == "local" else f"{clean_instance}-stt-profile"
+
+
+def _wake_stt_tts_voice_for_instance(instance: Any) -> str:
+    clean_instance = _safe_str(instance).strip().lower() or "local"
+    direct_config = wake_stt_direct.wake_stt_instance_direct_config(clean_instance)
+    instance_env = f"BLUEPRINTS_WAKE_STT_{clean_instance.upper()}_TTS_VOICE"
+    candidates = [
+        os.getenv(instance_env, ""),
+        os.getenv("BLUEPRINTS_WAKE_STT_DIRECT_TTS_VOICE", ""),
+        direct_config.get("tts_voice"),
+        direct_config.get("voice"),
+        direct_config.get("companion_voice"),
+    ]
+    if clean_instance == "vps":
+        candidates.append(os.getenv("XARTA_TTS_COMPANION_VOICE", ""))
+    for candidate in candidates:
+        value = _safe_str(candidate).strip()
+        if value:
+            return value
+    return ""
 
 
 def _wake_stt_fast_route_response_config(
@@ -919,6 +944,66 @@ async def _wake_stt_basic_health_response_fields() -> dict[str, str]:
     return pve_fast_health.response_fields_from_result(result)
 
 
+async def _wake_stt_vps_basic_health_response_fields() -> dict[str, str]:
+    started = time.perf_counter()
+    config = wake_stt_direct.load_hermes_stt_instance_config("vps")
+    if not config.api_base:
+        return {
+            "speech": "I can hear you, but the VPS health endpoint is not configured.",
+            "matrix_detail": "Deterministic VPS Wake STT health check did not find an API base.",
+            "status": "vps_health_unconfigured",
+            "helper_elapsed_ms": "0",
+        }
+
+    timeout = max(0.2, min(float(config.timeout_seconds or 2.0), 3.0))
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{config.api_base.rstrip('/')}/health")
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        return {
+            "speech": "I can hear you, but the VPS health check did not pass.",
+            "matrix_detail": (
+                "Deterministic VPS Wake STT health check failed before a response: "
+                f"{type(exc).__name__}."
+            ),
+            "status": "vps_health_unreachable",
+            "helper_elapsed_ms": str(elapsed_ms),
+        }
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    ok = 200 <= response.status_code < 300
+    status_text = ""
+    with suppress(ValueError):
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            status_text = _safe_str(parsed.get("status") or parsed.get("ok"))
+    if ok and status_text.lower() not in {"false", "fail", "failed", "error", "unhealthy"}:
+        return {
+            "speech": "I'm okay. Hermes VPS, Matrix, and the STT profile are online and ready.",
+            "matrix_detail": (
+                "Deterministic VPS Wake STT health check passed.\n"
+                f"HTTP health: {response.status_code}.\n"
+                f"Elapsed: {elapsed_ms} ms.\n"
+                "Route: private VPS direct path."
+            ),
+            "status": "vps_health_ok",
+            "helper_elapsed_ms": str(elapsed_ms),
+        }
+
+    return {
+        "speech": "I can hear you, but the VPS health check reported a problem.",
+        "matrix_detail": (
+            "Deterministic VPS Wake STT health check returned a non-green response.\n"
+            f"HTTP health: {response.status_code}.\n"
+            f"Elapsed: {elapsed_ms} ms.\n"
+            "Route: private VPS direct path."
+        ),
+        "status": "vps_health_degraded",
+        "helper_elapsed_ms": str(elapsed_ms),
+    }
+
+
 async def _publish_wake_stt_tts_stop_event(reason: str) -> dict[str, Any]:
     clean_reason = _safe_str(reason).strip().lower() or "wake_stt_stop"
     event = AppEvent.create(
@@ -1021,11 +1106,13 @@ async def _wake_stt_fast_route_local_delivery(
     *,
     text: str,
     fast_route: _WakeSttFastRouteDecision,
+    instance: str = "local",
     timing: wake_stt_direct.WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     if fast_route.action not in _WAKE_STT_FAST_LOCAL_ACTIONS:
         raise ValueError(f"unsupported local Wake STT fast route action: {fast_route.action}")
+    direct_route = _wake_stt_direct_route_for_instance(instance)
     code_list = wake_stt_direct.command_codes_from_env()
     gate = wake_stt_direct.apply_command_code_gate(
         text,
@@ -1053,6 +1140,8 @@ async def _wake_stt_fast_route_local_delivery(
             fields = await _wake_stt_voice_stop_response_fields(reason=fast_route.route_id)
         elif fast_route.action == _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL:
             fields = await _wake_stt_clear_house_response_fields()
+        elif _safe_str(instance).strip().lower() == "vps":
+            fields = await _wake_stt_vps_basic_health_response_fields()
         else:
             fields = await _wake_stt_basic_health_response_fields()
     except Exception as exc:
@@ -1071,6 +1160,10 @@ async def _wake_stt_fast_route_local_delivery(
             status = "clear_house_failed"
             speech = "Clear house failed."
             matrix_detail = f"Deterministic Wake STT clear-house control failed: {exc}"
+        elif fast_route.action == _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC:
+            status = "basic_health_unavailable"
+            speech = "I could not check health just now."
+            matrix_detail = f"Deterministic Wake STT health helper failed: {exc}"
         else:
             status = "time_tool_unavailable"
             speech = "I could not read the local time just now."
@@ -1093,7 +1186,7 @@ async def _wake_stt_fast_route_local_delivery(
         return wake_stt_direct.WakeSttDeliveryResult(
             ok=False,
             status=status,
-            route="direct_local",
+            route=direct_route,
             gate=gate,
             direct=direct,
             fallback_reason=status,
@@ -1126,7 +1219,7 @@ async def _wake_stt_fast_route_local_delivery(
     return wake_stt_direct.WakeSttDeliveryResult(
         ok=True,
         status="delivered",
-        route="direct_local",
+        route=direct_route,
         gate=gate,
         direct=direct,
         timing=timing,
@@ -3275,6 +3368,7 @@ async def _deliver_wake_stt_with_direct_fallback(
         return await _wake_stt_fast_route_local_delivery(
             text=body.text,
             fast_route=fast_route,
+            instance=body.instance,
             timing=timing,
             trusted_authorised=trusted_authorised,
         )
@@ -3330,6 +3424,7 @@ async def _publish_wake_stt_direct_tts(
         return {"ok": False, "skipped": True, "error": "missing elected speech"}
     wake_instance = _safe_str(body.instance) or "local"
     tts_agent = _wake_stt_tts_agent_for_instance(wake_instance)
+    tts_voice = _wake_stt_tts_voice_for_instance(wake_instance)
     payload = {
         "utterance_id": f"wake-stt-direct-{uuid.uuid4().hex}",
         "source": tts_agent,
@@ -3337,6 +3432,7 @@ async def _publish_wake_stt_direct_tts(
         "subagent_id": "wake-stt-direct",
         "conversation_id": f"wake-stt:{wake_instance}",
         "text": text,
+        "voice": tts_voice,
         "mode": "stream",
         "format": "wav",
         "interrupt": interrupt,
@@ -3385,6 +3481,7 @@ async def _publish_wake_stt_direct_tts(
         "utterance_id": payload.get("utterance_id") if isinstance(payload, dict) else "",
         "source": payload.get("source") if isinstance(payload, dict) else tts_agent,
         "agent_id": payload.get("agent_id") if isinstance(payload, dict) else tts_agent,
+        "voice_set": bool(tts_voice),
         "status": "queued" if isinstance(published, dict) and published.get("ok") else "error",
     }
 
