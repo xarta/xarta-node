@@ -682,6 +682,16 @@ def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
         assert wake_stt_direct._wake_stt_exact_set_alarm_signal(text) is expected
 
 
+def test_alarm_clock_help_is_weak_classifier_signal_not_exact_set_alarm_signal():
+    prompt = wake_stt_direct._wake_stt_profile_classifier_prompt(
+        request_text="help me use the alarm clock settings",
+        examples_config={},
+    )
+
+    assert prompt["alarm_clock_signals"]["contains_help_word"] is True
+    assert prompt["alarm_clock_signals"]["exact_set_and_exact_alarm"] is False
+
+
 def test_validate_wake_stt_profile_classifier_gates_complex_nullclaw_target():
     parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
         {
