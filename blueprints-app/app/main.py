@@ -33,6 +33,8 @@ from .events import bus as events_bus
 from .middleware_auth import AuthMiddleware
 from .routes_ai_project_assignments import router as ai_project_assignments_router
 from .routes_ai_providers import router as ai_providers_router
+from .routes_alarms import router as alarms_router
+from .routes_alarms import run_alarm_scheduler
 from .routes_arp_manual import router as arp_manual_router
 from .routes_assumptions import router as assumptions_router
 from .routes_auth_time import router as auth_time_router
@@ -132,6 +134,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     seeded_vlans_task: asyncio.Task | None = None
     memory_monitor_task: asyncio.Task | None = None
     terminal_reaper_task: asyncio.Task | None = None
+    alarm_scheduler_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -173,6 +176,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Sweep terminal child processes that survive websocket disconnect paths.
     terminal_reaper_task = asyncio.create_task(run_terminal_process_reaper())
 
+    # Server-side alarms publish browser SSE ring events when due.
+    alarm_scheduler_task = asyncio.create_task(run_alarm_scheduler())
+
     # Fan Matrix /sync updates into the existing browser SSE stream.
     await start_matrix_chat_sync_workers()
 
@@ -188,6 +194,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
     await _cancel_background_task(memory_monitor_task, "memory_monitor")
     await _cancel_background_task(terminal_reaper_task, "terminal_process_reaper")
+    await _cancel_background_task(alarm_scheduler_task, "alarm_scheduler")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 
@@ -396,6 +403,7 @@ def create_app() -> FastAPI:
     application.include_router(firewall_router, prefix="/api/v1")
     application.include_router(ai_providers_router, prefix="/api/v1")
     application.include_router(ai_project_assignments_router, prefix="/api/v1")
+    application.include_router(alarms_router, prefix="/api/v1")
     application.include_router(bookmarks_router, prefix="/api/v1")
     application.include_router(form_controls_router, prefix="/api/v1")
     application.include_router(nav_items_router, prefix="/api/v1")
