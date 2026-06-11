@@ -439,12 +439,16 @@ _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC = "time_current_deterministic_r
 _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC = "basic_health_deterministic_response"
 _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL = "voice_stop_control"
 _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL = "clear_house_control"
+_WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL = "alarm_dismiss_control"
+_WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL = "alarm_snooze_control"
 _WAKE_STT_FAST_ACTIONS = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION,
     _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
     _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
     _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
     _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
+    _WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL,
+    _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL,
 }
 _WAKE_STT_FAST_HERMES_TOOL_SURFACES = {
     _WAKE_STT_FAST_ACTION_TIME_FAST_SESSION: "xarta_time_lookup_only",
@@ -454,6 +458,8 @@ _WAKE_STT_FAST_LOCAL_ACTIONS = {
     _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
     _WAKE_STT_FAST_ACTION_VOICE_STOP_CONTROL,
     _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
+    _WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL,
+    _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL,
 }
 _DEFAULT_WAKE_STT_BASIC_HEALTH_CHECKS_FILE = (
     "/xarta-node/.lone-wolf/config/hermes-stt/basic-health-checks.json"
@@ -713,6 +719,8 @@ def _wake_stt_fast_route_is_local_action(
         in {
             _WAKE_STT_FAST_ACTION_TIME_CURRENT_DETERMINISTIC,
             _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC,
+            _WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL,
+            _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL,
         }
     ):
         return True
@@ -1056,6 +1064,47 @@ async def _wake_stt_voice_stop_response_fields(
     }
 
 
+async def _wake_stt_alarm_control_response_fields(
+    *,
+    action: str,
+    route: _WakeSttFastRouteDecision,
+) -> dict[str, str]:
+    from .routes_alarms import AlarmCommandBody, alarm_command
+
+    control = "snooze" if action == _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL else "dismiss"
+    body = AlarmCommandBody(
+        action=control,
+        scope="active",
+        snooze_minutes=9 if control == "snooze" else None,
+        command_id=f"wake-stt-{control}-{uuid.uuid4().hex[:12]}",
+    )
+    result = await alarm_command(body)
+    if not result.get("ok"):
+        raise RuntimeError(_safe_str(result.get("detail")) or "alarm command failed")
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    event_id = (
+        _safe_str((result.get("event") or {}).get("event_id"))
+        if isinstance(result.get("event"), dict)
+        else ""
+    )
+    speech = "Alarm snoozed." if control == "snooze" else "Alarm dismissed."
+    detail = "\n".join(
+        [
+            f"Deterministic Wake STT alarm {control} control executed.",
+            f"Fast route: {_safe_str(route.route_id) or 'unknown'}.",
+            f"Command id: {_safe_str(payload.get('command_id')) or 'none'}.",
+            f"Event id: {event_id or 'none'}.",
+            "Open browser alarm modals will apply the command locally.",
+        ]
+    )
+    return {
+        "speech": speech,
+        "matrix_detail": detail,
+        "status": action,
+        "helper_elapsed_ms": "0",
+    }
+
+
 def _wake_stt_tts_companion_state_file() -> Path:
     raw = os.getenv(
         "BLUEPRINTS_WAKE_STT_TTS_COMPANION_STATE_FILE",
@@ -1144,6 +1193,14 @@ async def _wake_stt_fast_route_local_delivery(
             fields = await _wake_stt_voice_stop_response_fields(reason=fast_route.route_id)
         elif fast_route.action == _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL:
             fields = await _wake_stt_clear_house_response_fields()
+        elif fast_route.action in {
+            _WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL,
+            _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL,
+        }:
+            fields = await _wake_stt_alarm_control_response_fields(
+                action=fast_route.action,
+                route=fast_route,
+            )
         elif _safe_str(instance).strip().lower() == "vps":
             fields = await _wake_stt_vps_basic_health_response_fields()
         else:
@@ -1164,6 +1221,13 @@ async def _wake_stt_fast_route_local_delivery(
             status = "clear_house_failed"
             speech = "Clear house failed."
             matrix_detail = f"Deterministic Wake STT clear-house control failed: {exc}"
+        elif fast_route.action in {
+            _WAKE_STT_FAST_ACTION_ALARM_DISMISS_CONTROL,
+            _WAKE_STT_FAST_ACTION_ALARM_SNOOZE_CONTROL,
+        }:
+            status = "alarm_control_failed"
+            speech = "I could not control the alarm just now."
+            matrix_detail = f"Deterministic Wake STT alarm control failed: {exc}"
         elif fast_route.action == _WAKE_STT_FAST_ACTION_BASIC_HEALTH_DETERMINISTIC:
             status = "basic_health_unavailable"
             speech = "I could not check health just now."

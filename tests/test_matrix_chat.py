@@ -950,6 +950,132 @@ def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_exact_current_
     )
 
 
+def test_matrix_chat_direct_wrapper_uses_deterministic_alarm_controls(monkeypatch, tmp_path):
+    captured = {"fallback_calls": 0, "classifier_calls": 0, "actions": []}
+    fast_routes = tmp_path / "fast-routes.json"
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "alarm_dismiss_exact",
+                        "action": "alarm_dismiss_control",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": [
+                                "dismiss",
+                                "dismiss alarm",
+                                "computer alarm dismiss",
+                            ],
+                        },
+                    },
+                    {
+                        "id": "alarm_snooze_exact",
+                        "action": "alarm_snooze_control",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": [
+                                "snooze",
+                                "snooze alarm",
+                                "computer alarm snooze",
+                            ],
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_delivery(*_args, **_kwargs):
+        captured["fallback_calls"] += 1
+        raise AssertionError("deterministic alarm controls must not call Hermes")
+
+    async def fail_classifier(*_args, **_kwargs):
+        captured["classifier_calls"] += 1
+        raise AssertionError("deterministic alarm controls must not classify")
+
+    async def fake_alarm_control_response_fields(*, action, route):
+        captured["actions"].append((action, route.route_id))
+        return {
+            "speech": "Alarm snoozed." if action == "alarm_snooze_control" else "Alarm dismissed.",
+            "matrix_detail": f"alarm control {action}",
+            "status": action,
+            "helper_elapsed_ms": "0",
+        }
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "load_hermes_stt_config",
+        lambda: matrix_chat.wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="secret",
+            session_id="wake-stt-local",
+        ),
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "deliver_wake_stt_with_matrix_fallback",
+        fail_delivery,
+    )
+    monkeypatch.setattr(
+        matrix_chat.wake_stt_direct,
+        "classify_wake_stt_profile",
+        fail_classifier,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_wake_stt_alarm_control_response_fields",
+        fake_alarm_control_response_fields,
+    )
+
+    cases = [
+        ("dismiss", "alarm_dismiss_control", "Alarm dismissed."),
+        ("dismiss alarm", "alarm_dismiss_control", "Alarm dismissed."),
+        ("computer alarm dismiss", "alarm_dismiss_control", "Alarm dismissed."),
+        ("snooze", "alarm_snooze_control", "Alarm snoozed."),
+        ("snooze alarm", "alarm_snooze_control", "Alarm snoozed."),
+        ("computer alarm snooze", "alarm_snooze_control", "Alarm snoozed."),
+    ]
+    for phrase, status, speech in cases:
+        result = asyncio.run(
+            matrix_chat._deliver_wake_stt_with_direct_fallback(
+                room_id="!bridge:test.example",
+                body=matrix_chat._WakeSttMessageBody(
+                    text=phrase,
+                    instance="local",
+                    candidate_source="payload0",
+                    command="execute",
+                    wake_word="Computer",
+                    candidate_revision="wake-local-alarm",
+                ),
+                direct_enabled=True,
+            )
+        )
+        public = result.public_dict()
+        companion = public["direct"]["companion"]
+        assert public["ok"] is True
+        assert public["route"] == "direct_local"
+        assert public["direct"]["attempted"] is False
+        assert public["direct"]["status"] == status
+        assert companion["status"] == status
+        assert companion["speech"] == speech
+
+    assert captured == {
+        "fallback_calls": 0,
+        "classifier_calls": 0,
+        "actions": [
+            ("alarm_dismiss_control", "alarm_dismiss_exact"),
+            ("alarm_dismiss_control", "alarm_dismiss_exact"),
+            ("alarm_dismiss_control", "alarm_dismiss_exact"),
+            ("alarm_snooze_control", "alarm_snooze_exact"),
+            ("alarm_snooze_control", "alarm_snooze_exact"),
+            ("alarm_snooze_control", "alarm_snooze_exact"),
+        ],
+    }
+
+
 def test_matrix_chat_deterministic_current_time_action_is_exact_only(monkeypatch, tmp_path):
     captured = {}
     active_session = tmp_path / "active-session.json"
