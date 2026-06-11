@@ -111,6 +111,7 @@ _WAKE_STT_RESEARCH_CONTEXT_RESET_RE = re.compile(
 )
 _WAKE_STT_EXACT_SET_WORD_RE = re.compile(r"\bset\b", re.IGNORECASE)
 _WAKE_STT_EXACT_ALARM_WORD_RE = re.compile(r"\balarm\b", re.IGNORECASE)
+_WAKE_STT_HELP_WORD_RE = re.compile(r"\bhelp\b", re.IGNORECASE)
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -1653,6 +1654,9 @@ def _wake_stt_profile_classifier_prompt(
         "allowed_targets": sorted(WAKE_STT_PROFILE_TARGETS),
         "alarm_clock_signals": {
             "exact_set_and_exact_alarm": _wake_stt_exact_set_alarm_signal(request_text),
+            "contains_help_word": bool(
+                _WAKE_STT_HELP_WORD_RE.search(command_code_storage_safe_text(request_text))
+            ),
         },
         "policy": {
             "base": "Use hermes-stt only for ordinary low-risk short answers or when deterministic local routing already handled the request.",
@@ -1664,14 +1668,17 @@ def _wake_stt_profile_classifier_prompt(
                 "or update the Blueprints alarm clock: local active-browser alarms, "
                 "server alarms, sleep sounds, snooze/dismiss/open-settings controls, "
                 "connectivity-notice reset, enable/disable/edit alarm slots, days, "
-                "recurrence, time, sound, fade, volume, loop, snooze, and server TTS. "
+                "recurrence, time, sound, fade, volume, loop, snooze, server TTS, "
+                "and help using alarm clock settings. "
                 "The exact word set and the exact word alarm appearing together in the "
                 "same request are one strong deterministic pre-signal. That exact-only "
                 "rule applies only to the deterministic pre-signal; the classifier itself "
                 "must still read the whole noisy STT request for meaning, patterns, "
                 "synonyms, related phrasing, corrections, and context. Absence of the "
                 "exact pre-signal is not an inverse signal; the classifier may still "
-                "select this target from the request meaning. Do not choose this target "
+                "select this target from the request meaning. The word help may be a "
+                "weak signal when the request asks how to use alarm clock settings, but "
+                "it is not a deterministic route. Do not choose this target "
                 "for bug reports, coding requests, docs summaries, implementation work, "
                 "future Home Assistant/MQTT planning, or generic discussion mentioning "
                 "alarms. When target_profile is hermes-stt-alarm-clock and risk_class is "
