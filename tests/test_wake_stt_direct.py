@@ -647,6 +647,41 @@ def test_validate_wake_stt_profile_classifier_accepts_nullclaw_target():
     assert parsed.requires_command_code is False
 
 
+def test_validate_wake_stt_profile_classifier_accepts_alarm_clock_target_without_code():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": wake_stt_direct.WAKE_STT_ALARM_PROFILE,
+            "requires_command_code": True,
+            "complex": False,
+            "risk_class": "alarm_clock",
+            "confidence": 0.94,
+            "reason": "bounded alarm clock settings request",
+            "speech_if_pending": "Command Code required.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.target_profile == wake_stt_direct.WAKE_STT_ALARM_PROFILE
+    assert parsed.requires_command_code is False
+
+
+def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
+    cases = {
+        "set alarm": True,
+        "please set an alarm for seven": True,
+        "alarm set": True,
+        "set alarms": False,
+        "create alarm": False,
+        "add alarm": False,
+        "schedule alarm": False,
+        "set reminder": False,
+    }
+
+    for text, expected in cases.items():
+        assert wake_stt_direct._wake_stt_exact_set_alarm_signal(text) is expected
+
+
 def test_validate_wake_stt_profile_classifier_gates_complex_nullclaw_target():
     parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
         {

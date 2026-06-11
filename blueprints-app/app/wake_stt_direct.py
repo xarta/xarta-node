@@ -45,9 +45,14 @@ DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_MODEL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 1200
 WAKE_STT_NULLCLAW_PROFILE = "hermes-stt-nullclaw"
+WAKE_STT_ALARM_PROFILE = "hermes-stt-alarm-clock"
 WAKE_STT_NULLCLAW_GUARD_SCRIPT = (
     Path("/xarta-node/.lone-wolf/stacks/nullclaw01/.claude/skills/dockge-stack-nullclaw01")
     / "scripts/guard-nullclaw-runtime.sh"
+)
+WAKE_STT_ALARM_SKILL_SCRIPT = (
+    Path("/root/xarta-node/.xarta/.claude/skills/hermes-local/hermes-local-xarta-alarm-clock")
+    / "scripts/xarta_alarm_clock.py"
 )
 WAKE_STT_PROFILE_TARGETS = frozenset(
     {
@@ -55,6 +60,7 @@ WAKE_STT_PROFILE_TARGETS = frozenset(
         "hermes-stt-local-duh",
         "hermes-stt-local",
         WAKE_STT_NULLCLAW_PROFILE,
+        WAKE_STT_ALARM_PROFILE,
         "hermes-stt-average",
         "hermes-stt-smart",
     }
@@ -66,6 +72,7 @@ WAKE_STT_PROFILE_RISK_CLASSES = frozenset(
         "local_readonly",
         "docs_lookup",
         "web_research",
+        "alarm_clock",
         "filesystem_mutation",
         "scripting",
         "infra_debug",
@@ -102,6 +109,8 @@ _WAKE_STT_RESEARCH_CONTEXT_RESET_RE = re.compile(
     r"\b(?:new|fresh|different|unrelated)\s+(?:topic|research|search)\b|\bstart\s+over\b",
     re.IGNORECASE,
 )
+_WAKE_STT_EXACT_SET_WORD_RE = re.compile(r"\bset\b", re.IGNORECASE)
+_WAKE_STT_EXACT_ALARM_WORD_RE = re.compile(r"\balarm\b", re.IGNORECASE)
 HERMES_STT_SYSTEM_PREFACE = (
     "You are receiving one Wake To Talk STT request from the local Blueprints server. "
     "Treat likely speech-recognition errors charitably. Destructive actions require the "
@@ -1617,6 +1626,8 @@ def _wake_stt_profile_requires_command_code(
     complex_request: bool,
     classifier_requires_command_code: bool,
 ) -> bool:
+    if target_profile == WAKE_STT_ALARM_PROFILE and risk_class == "alarm_clock":
+        return False
     if complex_request:
         return True
     if target_profile == WAKE_STT_NULLCLAW_PROFILE:
@@ -1640,11 +1651,33 @@ def _wake_stt_profile_classifier_prompt(
     return {
         "request_text": command_code_storage_safe_text(request_text),
         "allowed_targets": sorted(WAKE_STT_PROFILE_TARGETS),
+        "alarm_clock_signals": {
+            "exact_set_and_exact_alarm": _wake_stt_exact_set_alarm_signal(request_text),
+        },
         "policy": {
             "base": "Use hermes-stt only for ordinary low-risk short answers or when deterministic local routing already handled the request.",
             "local_duh": "Use hermes-stt-local-duh for simple local read-only/file/doc/status checks and exact transformations.",
             "local": "Use hermes-stt-local for local private thinking, local docs lookup, NullClaw docs synthesis, and non-cloud work that benefits from reasoning.",
             "nullclaw": "Use hermes-stt-nullclaw for bounded NullClaw web research, website research, rep research, reb research, unqualified public-topic research on/about something, explicit public brand/product/company research requests, and local docs-backed public-web comparisons. It is a bounded Blueprints route target, not a broad file/terminal/browser agent. For Wake STT, plain 'research on/about X' normally means public web research unless the request qualifies it as document/docs/local-network/current-state/repo/code/service research. A brand, shop, product, or company name can support a research intent but must not create that intent by itself. When target_profile is hermes-stt-nullclaw, risk_class is docs_lookup or web_research, and complex=false, Command Code is not required. If the request says document skill, docs, or local docs without a web/public lookup cue, classify it as docs_lookup so the bounded route can stay docs-only.",
+            "alarm_clock": (
+                "Use hermes-stt-alarm-clock only for requests to inspect, read, open, "
+                "or update the Blueprints alarm clock: local active-browser alarms, "
+                "server alarms, sleep sounds, snooze/dismiss/open-settings controls, "
+                "connectivity-notice reset, enable/disable/edit alarm slots, days, "
+                "recurrence, time, sound, fade, volume, loop, snooze, and server TTS. "
+                "The exact word set and the exact word alarm appearing together in the "
+                "same request are one strong deterministic pre-signal. That exact-only "
+                "rule applies only to the deterministic pre-signal; the classifier itself "
+                "must still read the whole noisy STT request for meaning, patterns, "
+                "synonyms, related phrasing, corrections, and context. Absence of the "
+                "exact pre-signal is not an inverse signal; the classifier may still "
+                "select this target from the request meaning. Do not choose this target "
+                "for bug reports, coding requests, docs summaries, implementation work, "
+                "future Home Assistant/MQTT planning, or generic discussion mentioning "
+                "alarms. When target_profile is hermes-stt-alarm-clock and risk_class is "
+                "alarm_clock, Command Code is not required because the route is bounded "
+                "to Blueprints alarm APIs and active-browser SSE."
+            ),
             "average": "Use hermes-stt-average for medium-complex public web research, NullClaw web lookups, broader synthesis, and tasks likely too nuanced for local no-think.",
             "smart": "Use hermes-stt-smart for complex debugging, scripts, Proxmox/LXC/network/service diagnosis, SSH, Docker, destructive or high-impact work, and any uncertainty.",
             "stt_interpretation": (
@@ -1660,11 +1693,14 @@ def _wake_stt_profile_classifier_prompt(
                 "Most non-base handoffs require Command Code authorisation. "
                 "The narrow exception is hermes-stt-nullclaw with risk_class docs_lookup "
                 "or web_research and complex=false; that route is bounded to local docs "
-                "and guarded NullClaw research APIs. "
+                "and guarded NullClaw research APIs. The other narrow exception is "
+                "hermes-stt-alarm-clock with risk_class alarm_clock; that route is bounded "
+                "to alarm settings/control APIs and performs its own alarm-specific "
+                "classification before writes. "
                 "Any filesystem mutation, terminal, SSH, Docker, browser, web, messaging, "
                 "service, infrastructure, credential/access, destructive, externally visible, "
                 "or uncertain work requires Command Code authorisation. If complex=true then "
-                "requires_command_code=true."
+                "requires_command_code=true unless the target is the bounded alarm clock route."
             ),
         },
         "targets": targets,
@@ -1679,6 +1715,13 @@ def _wake_stt_profile_classifier_prompt(
             "speech_if_pending": "short TTS-friendly phrase if Command Code is required",
         },
     }
+
+
+def _wake_stt_exact_set_alarm_signal(request_text: str) -> bool:
+    text = command_code_storage_safe_text(request_text)
+    return bool(
+        _WAKE_STT_EXACT_SET_WORD_RE.search(text) and _WAKE_STT_EXACT_ALARM_WORD_RE.search(text)
+    )
 
 
 def _wake_stt_research_followup_classifier_prompt(
@@ -3569,6 +3612,150 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
     )
 
 
+async def _run_alarm_clock_skill_helper(text: str) -> dict[str, Any]:
+    if not WAKE_STT_ALARM_SKILL_SCRIPT.exists():
+        return {
+            "ok": False,
+            "status": "alarm_skill_unavailable",
+            "speech": "The alarm clock skill is not installed.",
+            "matrix_detail": f"Missing alarm helper: {WAKE_STT_ALARM_SKILL_SCRIPT}",
+        }
+    api_base = (
+        os.environ.get("BLUEPRINTS_ALARM_CLOCK_API_BASE")
+        or os.environ.get("BLUEPRINTS_API_BASE")
+        or "http://127.0.0.1:8080"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "python3",
+        str(WAKE_STT_ALARM_SKILL_SCRIPT),
+        "--api-base",
+        api_base,
+        "handle-wake",
+        "--request",
+        command_code_storage_safe_text(text),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_raw, stderr_raw = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        return {
+            "ok": False,
+            "status": "alarm_skill_timeout",
+            "speech": "Alarm clock automation timed out.",
+            "matrix_detail": "The bounded alarm clock helper did not return within 20 seconds.",
+        }
+    stdout = stdout_raw.decode("utf-8", errors="replace").strip()
+    stderr = stderr_raw.decode("utf-8", errors="replace").strip()
+    try:
+        parsed = json.loads(_strip_json_markdown(stdout))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = {
+            "ok": False,
+            "status": "alarm_skill_bad_json",
+            "speech": "Alarm clock automation returned an invalid result.",
+            "matrix_detail": stdout[:2000],
+        }
+    if not isinstance(parsed, dict):
+        parsed = {
+            "ok": False,
+            "status": "alarm_skill_bad_json",
+            "speech": "Alarm clock automation returned an invalid result.",
+            "matrix_detail": stdout[:2000],
+        }
+    parsed["helper_returncode"] = int(proc.returncode or 0)
+    if stderr:
+        parsed["helper_stderr"] = stderr[:1200]
+    return parsed
+
+
+async def _submit_wake_stt_alarm_bounded_handoff(
+    text: str,
+    *,
+    gate: CommandCodeGateResult,
+    profile_routing: WakeSttProfileRoutingResult,
+    timing: WakeSttRouteTiming | None = None,
+    handoff_assignment_callback: HandoffAssignmentCallback | None = None,
+    research_followup_task: asyncio.Task[WakeSttResearchFollowupResult] | None = None,
+) -> HermesSttSubmitResult:
+    if timing:
+        timing.mark("profile_handoff_start", target_profile=profile_routing.target_profile)
+    await _cancel_research_followup_task(
+        research_followup_task,
+        timing=timing,
+        reason="alarm_clock_handoff",
+    )
+    _schedule_handoff_assignment_callback(
+        handoff_assignment_callback,
+        {
+            "target_profile": profile_routing.target_profile,
+            "request_text": command_code_storage_safe_text(gate.meat),
+            "reason": profile_routing.reason,
+            "risk_class": profile_routing.risk_class,
+            "complex": profile_routing.complex,
+            "requires_command_code": profile_routing.requires_command_code,
+            "status": "assigned",
+        },
+        timing=timing,
+    )
+    helper = await _run_alarm_clock_skill_helper(gate.meat)
+    status = _clip_text(helper.get("status"), 80) or "alarm_skill_completed"
+    speech = _clip_text(helper.get("speech"), 300)
+    if not speech:
+        speech = (
+            "Alarm clock settings updated."
+            if helper.get("ok")
+            else "I could not update the alarm clock just now."
+        )
+    matrix_detail = _clip_text(helper.get("matrix_detail"), 6000)
+    if not matrix_detail:
+        matrix_detail = json.dumps(helper, ensure_ascii=True, sort_keys=True)[:6000]
+    companion_payload = {
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "status": status,
+    }
+    companion = HermesSttCompanionOutput(
+        speech=speech,
+        matrix_detail=matrix_detail,
+        status=status,
+        structured=True,
+        raw_assistant_text=json.dumps(companion_payload, ensure_ascii=True, sort_keys=True),
+    )
+    if timing:
+        timing.mark(
+            "profile_handoff_complete",
+            target_profile=profile_routing.target_profile,
+            status=status,
+        )
+    return HermesSttSubmitResult(
+        ok=bool(helper.get("ok")),
+        status=status,
+        gate=gate,
+        attempted=True,
+        fallback_required=False,
+        assistant_text=companion.raw_assistant_text,
+        companion=companion,
+        timing=timing,
+        target_profile=profile_routing.target_profile,
+        profile_routing=profile_routing,
+        handoff={
+            "success": bool(helper.get("ok")),
+            "status": status,
+            "target_profile": profile_routing.target_profile,
+            "mode": "bounded_blueprints_alarm_clock",
+            "speech": speech,
+            "matrix_detail": matrix_detail,
+            "helper": helper,
+            "needs_followup": False,
+            "conversation": {"mode": "single_turn", "can_continue_with_stt_tts": False},
+        },
+    )
+
+
 async def submit_wake_stt_profile_handoff(
     text: str,
     *,
@@ -3623,6 +3810,15 @@ async def submit_wake_stt_profile_handoff(
         )
     if profile_routing.target_profile == WAKE_STT_NULLCLAW_PROFILE:
         return await _submit_wake_stt_nullclaw_bounded_handoff(
+            text,
+            gate=gate,
+            profile_routing=profile_routing,
+            timing=timing,
+            handoff_assignment_callback=handoff_assignment_callback,
+            research_followup_task=research_followup_task,
+        )
+    if profile_routing.target_profile == WAKE_STT_ALARM_PROFILE:
+        return await _submit_wake_stt_alarm_bounded_handoff(
             text,
             gate=gate,
             profile_routing=profile_routing,
