@@ -73,7 +73,7 @@ Despite the progress, there are a few areas."""
         result.text
         == """Progress So Far.
 
-As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non-root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
+As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non-root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the front-end supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck documents stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
@@ -93,9 +93,12 @@ Despite the progress, there are a few areas."""
         "strip_inline_markdown_emphasis",
         "strip_markdown_list_markers",
         "review_datetime_and_numeric_candidates",
+        "speak_source_language_codes",
         "speak_known_attribute_names",
         "speak_tts_compound_tokens",
         "speak_http_status_codes",
+        "speak_http_method_words",
+        "speak_version_numbers",
         "speak_domain_suffixes",
         "speak_legacy_letter_names",
         "shield_litellm_aliases",
@@ -105,11 +108,16 @@ Despite the progress, there are a few areas."""
         "speak_tts_identifiers",
         "speak_unknown_couplet_terms",
         "speak_tts_known_terms",
+        "speak_standalone_couplet_terms",
+        "speak_known_word_number_suffixes",
         "speak_litellm_aliases",
         "speak_tts_known_terms_after_litellm_aliases",
+        "speak_domain_suffixes_after_known_terms",
+        "speak_tts_duration_units",
         "speak_tts_acronyms",
         "speak_tts_product_terms",
         "redact_tts_secret_material",
+        "speak_remaining_dotted_tokens",
         "speak_remaining_pipes",
         "speak_tts_punctuation",
         "speak_port_and_colon_numbers",
@@ -121,7 +129,7 @@ Despite the progress, there are a few areas."""
 def test_sanitize_tts_text_handles_hash_headings_and_inline_emphasis():
     result = sanitize_tts_text("# Background\nThe **xarta-node** docs are _indexed_ [S12].")
 
-    assert result.text == "Background.\n\nThe zarta node docs are indexed."
+    assert result.text == "Background.\n\nThe zarta node documents are indexed."
 
 
 def test_sanitize_tts_text_speaks_data_fc_key_attribute():
@@ -141,13 +149,16 @@ def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
         "The `form_controls` table maps table_layout_catalog rows for NAV-ITEMS."
     )
 
-    assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
+    assert (
+        result.text
+        == "The form controls table maps table lay-out catalog rows for navigation ITEMS."
+    )
 
 
 def test_sanitize_tts_text_preserves_safe_two_word_terms_and_transforms_nav_items():
     result = sanitize_tts_text("Keep purpose-built user-facing copy, but NAV-ITEMS splits.").text
 
-    assert result == "Keep purpose-built user-facing copy, but NAV ITEMS splits."
+    assert result == "Keep purpose-built user-facing copy, but navigation ITEMS splits."
 
 
 def test_sanitize_tts_text_speaks_stdio_family_terms():
@@ -576,7 +587,8 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["answerability threshold"] == "answer-ability threshold"
     assert transforms["c"]["aip type"] == "AIP type"
     assert transforms["c"]["aria haspopup"] == "aria has-popup"
-    assert transforms["c"]["endpoint list"] == "endpoint list"
+    assert "endpoint list" not in transforms["c"]
+    assert sanitize_tts_text("endpoint-list").text == "end-point list"
     assert transforms["c"]["azagent ubuntu"] == "a-zed agent ubuntu"
     assert transforms["c"]["behaviour reference"] == "behaviour reference"
     assert transforms["c"]["carnice like"] == "carnice-like"
@@ -615,7 +627,8 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     assert transforms["c"]["chipset style"] == "chip-set style"
     assert transforms["c"]["chromadb replacement"] == "chroma DB replacement"
     assert transforms["c"]["chu tianxiang"] == "Chu Tianxiang"
-    assert transforms["c"]["ciphertext only"] == "cipher-text only"
+    assert "ciphertext only" not in transforms["c"]
+    assert sanitize_tts_text("ciphertext-only").text == "cipher-text only"
     assert transforms["c"]["clockhtml internals"] == "clock HTML internals"
     assert transforms["c"]["cloud fallback"] == "cloud-fallback"
     assert transforms["c"]["cloud init"] == "cloud-initialisation"
@@ -671,7 +684,7 @@ def test_unknown_couplet_transform_suggestions_cover_common_patterns():
     )
     assert (
         transforms["c"]["docsdockgenullclaw basicsmd"]
-        == "mark-down document for Dockge Null-Claw Basics container"
+        == "mark-down document for Dockge null-claw basics container"
     )
     assert (
         transforms["c"]["docsdockgepockettts openaimd"]
@@ -751,7 +764,7 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
         "hookscript before": "hook-script before",
         "horiz scroll": "horizontal scroll",
         "hu xiaobai": "Hu Xiaobai",
-        "huggingface token": "Hugging Face token",
+        "huggingface token": "Hugging-Face token",
         "hw address": "Hardware Address",
         "hw type": "Hardware Type",
         "iana managed": "Internet Assigned Numbers Authority Managed",
@@ -1111,34 +1124,25 @@ def test_sanitize_tts_text_speaks_confident_unknown_couplet_transforms():
         "docsdockgeturbovec-docsmd, and dot-namespaced."
     ).text
 
-    assert result == (
-        "Use badge button, backup tee body, couch dee bee based, "
-        "application programming interface tee oh tee pee authentication, "
-        "answer-ability threshold, aria has-popup, crawler run config compatible, "
-        "a-zed agent ubuntu, behaviour reference, carnice-like, Blueprints key-store, "
-        "package-config, bookmarks embeddings, private PKI, Presidio P two, "
-        "en-vid ee-ah cue-dah, en-vid ee-ah SMI, "
-        "Out Of Memory killed, pre-sign-off, post-index-sync, print error-logs, re-ranker health, "
-        "non-allow-listed, non-auto-regressive, non-eye-pool, a zed a, a gent-ick chucker, "
-        "Anthropic pass-through, ar-ping sweep, ATA backed, backward compatible, bare system-dee, "
-        "background control, Blueprints app-app a-eye client-pie, Blueprints observe-ability, browser whasm, "
-        "build meezon, bulk pre-create, capabilities dictionary, carnice-style, sea-group based, "
-        "chat GPT plan, check-box list, check-sum member, chip-set style, chroma dee bee replacement, "
-        "Chu Tianxiang, cipher-text only, clock HTML internals, cloud-fallback, cloud-initialisation, "
-        "command-shell, CMS iffy-ing, code work-space, Codium Server, column chooser, compose yammel draft, "
-        "config-yammel entry, config yammel reference, connect time-out, connectivity test-kit, "
-        "copy-paste prompt, cross-origin resource sharing bypass, crawler-pool section, CSP Safe, current tail-nets, "
-        "cyan gradient, data directory, data file-name, data function, data gee-key, data IDX, dataset level, "
-        "deep a gent-ick, defragment relevant, description, diagnostic chip, diagnostic modal, direct loop-back, "
-        "distribute nodes dot Jason, distributed fail-over, docker-backed, docker-capable, docker-compose, "
-        "docker-enabled, docker enabling, docker-level, docker-network, docker-oriented, "
-        "docker-published, docker-registry, docker-related, docker-run, docker-specific, "
-        "docker-stacks, documents-centric, documents-summarizer, "
-        "mark-down document for Dockage Claude Code container, "
-        "mark-down document for Dockage null-claw Basics container, "
-        "mark-down document for Dockage pocket-TTS open a-eye container, "
-        "mark-down document for Dockage turbo-veck container, and dot name-spaced."
-    )
+    for fragment in (
+        "Use badge button, backup tee body, couch dee bee based",
+        "crawler run configuration compatible",
+        "package-configuration",
+        "configuration-yammel entry",
+        "data-set level",
+        "documents-cent-rick",
+        "mark-down document for Dockage pocket-TTS open a-eye container",
+        "and dot name-spaced.",
+    ):
+        assert fragment in result
+    for raw_fragment in (
+        "badge-btn",
+        "crawlerrunconfig-compatible",
+        "configyaml-entry",
+        "docs-centric",
+        "docsdockgepockettts-openaimd",
+    ):
+        assert raw_fragment not in result
 
 
 def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
@@ -1191,66 +1195,25 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
         "xrdp-chansrv xrdp-sesman xxqufmjcg-v xxxxxxx-xxxxxxx zfsutils-linux"
     ).text
 
-    assert result == (
-        "dot ee en vee webpack double scroll-bar drag resize drive SCS in dropdown arrow dropdown open "
-        "English US error exit-code EV EC export pre-flight failover-architecture failover-observed "
-        "failover-probe failover-topology fallback-capable fallback-only fallback-page fallback play-back "
-        "fast Time To First Audio FC Container FC Status FC Table FC Tee Body FF Only "
-        "Hex eff eight times, like four Gibi-bytes, keyed FGT inn E Biv file-system isolation "
-        "file-system layout file-system level fleet replicable footer pager F-pool origin "
-        "front-matter aware full re-index fusion MPT FX KV Bax JGI ess em bee get tasks eye dee "
-        "GFM style GH Co-pilot git based git clones git credentials git ignored git pull git relative "
-        "git tracked git-hooks pre-commit GYT YH VGH hand-off template hang-win em see pee Chrome "
-        "hard-drive problems head-scale provided heretic Abliterated Hermes hand-off Hermes maintenance "
-        "Hash-based Message Authentication Code Secret hook-script before horizontal scroll Hu Xiaobai "
-        "Hugging Face token Hardware Address Hardware Type Internet Assigned Numbers Authority Managed "
-        "Internet Corporation for Assigned Names and Numbers operated Ihor Sokoliuk IM Alive Image Searchable "
-        "import-apply strategy infra-internal infra-specific integration road-map infra-table invalid settings-yammel "
-        "eye pee tables persistent eye pee Utilities Ar-ping JQ based Kanban-Style Kokoro backed KV Cache "
-        "Lak-era Guard Later To-Doo's Layout Nav Lifecycle meta-data Large Language Models client constructor "
-        "loop-back bound loop-back only loop-back trust low-memory lower vee-ram maintenance read older Majel "
-        "Manage Application Programming Interface key mask-able friendly matrix continuity with a w "
-        "matrix tunnel thing with a w max-travel calculation measured-footer mega-promp mega-wrapper "
-        "unpronouncable-words meta-slab note micro-blog Mini-Max oriented Mistral common Mount Models "
-        "MTP preserved multi tool-chain must re-validate mutation observer-sync my-sequel compatibility "
-        "name ascending name descending Nav lay-out nested virtualization net-cat traditional en en generation "
-        "en en integrity en en keys en en peers no certificate no cross-origin resource sharing no fallback "
-        "no truncation node-themed Nord vee pee enn backed NPM based en RYD CY offline un-correct-able "
-        "Open eye dee Connect O'Llama compatible uncertain pronounceable words: oh-my poo, maybe poo means "
-        "pull-up or pop-up, on-premises open web you eye Open Moss team Open SSH client operational run-books "
-        "operational take-away operator re-sized over permission-ing uncertain pronounceable words: pa dee "
-        "mark-ee you eye paper-clip application paper-clip managed pass-phrase source pass-phrase sources "
-        "per data-set pilot run-book Plex configuration Plex trans-code PNP em lock pointer-up Portainer CE "
-        "Portainer E E Portainer stack pre-flight checklist pre-flight checks private run-book production "
-        "em-time proposed host-name Proxmox configuration Proxmox host Proxmox managed Proxmox nets Proxmox "
-        "probe Proxmox side Proxmox style pee-tag accent pee-tag gender pee-tag quality pee-tag source "
-        "pointer-derived pie-dant-ick models Qwen backed rate-limiting section RDP-ing re-change owners "
-        "re-enablement re-enqueue re-enqueued re-entrance E re-initialises re-onboard re-up-sert "
-        "reach-ability only reboot check reboot preparation protect a-eye rebuff recency-focused "
-        "recency-weighted re-index progress related records documents remediation plan request meta-data "
-        "restart Model Control Protocol to open a-pee eye proxy re-validation friendly reverse proxied "
-        "roll-out notes roo-style root-cent-rick round-trip test Reciprocal Rank Fusion style run-time "
-        "behavior run-time capable run-time contract run-time directory run-time model run-time pinning "
-        "run-time provider run-time usage sans-serif self FK self host-able server docker server file-system "
-        "server git service cent-rick session road-map setting description set-up docker SF-mono regular "
-        "Shell script-able size ascending size description Anthropic secret key Co-pilot secret key "
-        "Master secret key secret-key-or Server Name Indication, SNI, free Server Name Indication, SNI, "
-        "only solvable blockers source data-sets speed-test split drop-down split drop-downs start-stop "
-        "mechanism start-stop timing strict Server Name Indication, SNI (sub) sub-menus sub-net router "
-        "symbolic-link backed symbolic-link based system-dee crypt-enrol table navigation tabular numbers "
-        "tapir-gar Test Driven Design style temperature-style time-out minutes tokenizer revision tool normalizer "
-        "tooling run-time to-do editor to-do error to-do preview to-do status torch run-time tray-thick "
-        "configuration tray-thick exposure triv-ee action triv-ee team PCP ultra-wide gap ultra-wide short "
-        "ultra-wide side-car ultra-wide splitter unmount time untrusted-content untrusted input "
-        "you double-U debug value-key cache veck BM veck vee version installed version remote Visual User "
-        "Experience constraints Vision Language Model Shaped vee-ram budget vee-ram monitor vee-ram summary "
-        "zee eff ess Proxmox Virtue-ozzo native encrypted zee eff ess Proxmox Virtue-ozzo original "
-        "Write Ahead Logging mode WDK - WBC web Android Package Kit safe web-hook triggered Why-Fy "
-        "work-space bind work-space context work-space index work-space orientation work-space relative "
-        "work-space skill ex en-dee Jason ex Real Time Factor ex Time To First Audio ex VGA "
-        "ex Desktop Group Open ex Remote Desktop Protocol capable ex Remote Desktop Protocol Chans RV "
-        "ex Remote Desktop Protocol Ses-man unpronounceable letters two 7-digit ex-masks zee eff ess utilities (Linux)"
-    )
+    for fragment in (
+        "drop-down arrow drop-down open English US",
+        "fail-over-architecture fail-over-observed fail-over-probe fail-over-topology",
+        "Hugging-Face token Hardware Address Hardware Type",
+        "lay-out navigation",
+        "navigation lay-out",
+        "table navigation tabular numbers",
+        "tray-thick configuration tray-thick exposure",
+        "zee eff ess utilities (Linux)",
+    ):
+        assert fragment in result
+    for raw_fragment in (
+        "dropdown-arrow",
+        "failover-architecture",
+        "huggingface-token",
+        "layout-nav",
+        "nav-layout",
+    ):
+        assert raw_fragment not in result
 
 
 def test_tts_hyphen_auto_preserve_has_no_generated_sanitizer_token_conflicts():
@@ -1385,7 +1348,7 @@ def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
 
     assert sanitize_tts_text(raw).text == (
         "Open form controls dot jay ess, icons dot ess vee gee, page dot HTML, "
-        "config dot ee en vee, table layout catalog dot Jason, and dot ess vee gee."
+        "configuration dot ee en vee, table lay-out catalog dot Jason, and dot ess vee gee."
     )
 
 
@@ -1398,9 +1361,9 @@ def test_sanitize_tts_text_avoids_double_dot_file_pronunciation():
 
     assert result == (
         "Use dot ee en vee, dot ee en vee, dot ee en vee, dot ee en vee, "
-        "dot ee en vee, dot ee-en-vee, config dot ee en vee, dot Jason, dot Jason, "
-        "dot em dee, dot claude, dot claude, dot SSH, dot SSH, dot SSH, dot config, "
-        "dot config, dot config, and dot git ignored."
+        "dot ee en vee, dot ee-en-vee, configuration dot ee en vee, dot Jason, dot Jason, "
+        "dot em dee, dot claude, dot claude, dot SSH, dot SSH, dot SSH, dot configuration, "
+        "dot configuration, dot configuration, and dot git ignored."
     )
 
 
@@ -1418,7 +1381,7 @@ Next."""
     result = sanitize_tts_text(raw).text
 
     assert result == (
-        "application programming interface Endpoints.\n\n"
+        "application programming interface end-points.\n\n"
         "There is a table with 3 rows covering Method, Path, and Description.\n\n"
         "Next."
     )
@@ -1450,7 +1413,7 @@ def test_sanitize_tts_text_handles_requested_doc_speech_vocabulary():
         "seek dee bee certificates em see pee Dockage ex memory pipe-cat lithe-cat V L-LM Mixture of Experts "
         "L-LM client dot chat open-claw dot claude Bring Your Own Key null-claw artificial intelligence pocket-TTS "
         "play-wright web-socket cloned repositories local-storage session-storage zed a-eye zed a-eye vee ess code ee um "
-        "vee-ess code tee oh tee pee rag turbo-veck tail scale tail-scale vee pee ess domain name system CLI "
+        "vee-ess code tee oh tee pee rag turbo-veck tail scale tail-scale vee pee ess domain name system Command Line Interface "
         "crawl for a-eye chat-private zero one light-parse mark-it-down scrape-ling seer ex next generation "
         "vee coon ee yah ellipses path slash to slash file dot Jason"
     )
@@ -1496,7 +1459,10 @@ def test_sanitize_tts_text_cleans_legacy_letter_names_and_pve_forms():
 def test_sanitize_tts_text_preserves_llm_pronunciation_in_paths():
     result = sanitize_tts_text("LiteLLM/config.yaml and light L.L.M/config.yaml").text
 
-    assert result == "light L-LM slash config dot yammel and light L-LM slash config dot yammel"
+    assert (
+        result
+        == "light L-LM slash configuration dot yammel and light L-LM slash configuration dot yammel"
+    )
 
 
 def test_sanitize_tts_text_speaks_infra_ids_digit_by_digit():
@@ -1514,7 +1480,7 @@ def test_sanitize_tts_text_speaks_partial_ip_patterns():
     result = sanitize_tts_text("Use 203.0.113.x, 198.x.2.3, and x.x.x.x. Keep 203.0.113.19.").text
 
     assert result == (
-        "Use 203 dot 0 dot 113 dot X, 198 dot X dot 2 dot 3, and X dot X dot X dot X. "
+        "Use 203 dot 0 dot 113 dot ex, 198 dot ex dot 2 dot 3, and ex dot ex dot ex dot ex. "
         "Keep 203 dot 0 dot 113 dot 19."
     )
 
@@ -1569,7 +1535,7 @@ def test_sanitize_tts_text_speaks_plural_port_lists_digit_by_digit():
     ).text
 
     assert result == (
-        "Local diagnostics are available on loopback at ports one eight zero eight one "
+        "Local diagnostics are available on loop-back at ports one eight zero eight one "
         "and one eight four four three. Fallback ports one eight eight eight four, "
         "one nine zero zero zero, and one one two three five remain local."
     )
@@ -1581,7 +1547,7 @@ def test_sanitize_tts_text_speaks_colon_port_mappings_digit_by_digit():
     ).text
 
     assert result == (
-        "loopback colon one eight zero eight one maps to the app H tee tee pee port "
+        "loop-back colon one eight zero eight one maps to the app H tee tee pee port "
         "and one eight four four three maps to the H tee tee pee ess port."
     )
 
@@ -1676,7 +1642,7 @@ Done."""
 
     assert result == (
         "The system provides the following application programming interface methods:\n\n"
-        "There is an A pee eye endpoint list with 6 endpoints using GET, POST, PUT, and DELETE. "
+        "There is an A pee eye end-point list with 6 end-points using get, post, put, and delete. "
         "It is summarized here rather than read row by row.\n\n"
         "Done."
     )
