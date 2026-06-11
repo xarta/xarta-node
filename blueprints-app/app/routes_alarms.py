@@ -48,6 +48,24 @@ class AlarmCommandBody(BaseModel):
     max_age_seconds: int = Field(default=120, ge=5, le=3600)
 
 
+class AlarmBrowserStateBody(BaseModel):
+    schema: str | None = None
+    command_id: str = ""
+    browser_id: str | None = None
+    browser_label: str | None = None
+    tab_id: str | None = None
+    settings: dict[str, Any] | None = None
+    active_ring: dict[str, Any] | None = None
+    status: str | None = None
+    ok: bool = True
+    client_now_ms: float | None = None
+
+
+_BROWSER_STATE_RESPONSES: list[dict[str, Any]] = []
+_BROWSER_STATE_TTL_SECONDS = 5 * 60
+_BROWSER_STATE_MAX_RESPONSES = 64
+
+
 def _clean_text(value: Any, fallback: str = "", maximum: int = 300) -> str:
     text = str(value or fallback).strip()
     return text[:maximum]
@@ -215,6 +233,16 @@ def save_server_alarm_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
+def _prune_browser_state_responses(now: float | None = None) -> None:
+    now = time.time() if now is None else float(now)
+    fresh = [
+        item
+        for item in _BROWSER_STATE_RESPONSES
+        if (now - float(item.get("received_at") or 0.0)) <= _BROWSER_STATE_TTL_SECONDS
+    ][-_BROWSER_STATE_MAX_RESPONSES:]
+    _BROWSER_STATE_RESPONSES[:] = fresh
+
+
 def _now_for_settings(settings: dict[str, Any]) -> datetime:
     timezone = _clean_timezone(settings.get("timezone"))
     return datetime.now(ZoneInfo(timezone))
@@ -295,6 +323,61 @@ async def put_server_settings(body: AlarmSettingsBody) -> dict[str, Any]:
     return {"ok": True, "settings": save_server_alarm_settings(body.settings)}
 
 
+@router.post("/browser-state")
+async def post_browser_state(body: AlarmBrowserStateBody) -> dict[str, Any]:
+    command_id = _clean_text(body.command_id, "", 120)
+    if not command_id:
+        return {"ok": False, "detail": "Missing command_id"}
+    now = time.time()
+    record = {
+        "schema": "xarta.alarm.browser_state.v1",
+        "command_id": command_id,
+        "browser_id": _clean_text(body.browser_id, "", 120),
+        "browser_label": _clean_text(body.browser_label, "", 160),
+        "tab_id": _clean_text(body.tab_id, "", 120),
+        "settings": body.settings if isinstance(body.settings, dict) else {},
+        "active_ring": body.active_ring if isinstance(body.active_ring, dict) else {},
+        "status": _clean_text(body.status, "ok", 160),
+        "ok": bool(body.ok),
+        "client_now_ms": float(body.client_now_ms or 0.0),
+        "received_at": now,
+    }
+    _BROWSER_STATE_RESPONSES.append(record)
+    _prune_browser_state_responses(now)
+    return {
+        "ok": True,
+        "stored": True,
+        "command_id": command_id,
+        "received_at": now,
+    }
+
+
+@router.get("/browser-state")
+async def get_browser_state(
+    command_id: str = "",
+    browser_id: str = "",
+    tab_id: str = "",
+    limit: int = 8,
+) -> dict[str, Any]:
+    _prune_browser_state_responses()
+    clean_command_id = _clean_text(command_id, "", 120)
+    clean_browser_id = _clean_text(browser_id, "", 120)
+    clean_tab_id = _clean_text(tab_id, "", 120)
+    bounded_limit = _clean_int(limit, 8, 1, 32)
+    matches = []
+    for item in reversed(_BROWSER_STATE_RESPONSES):
+        if clean_command_id and item.get("command_id") != clean_command_id:
+            continue
+        if clean_browser_id and item.get("browser_id") != clean_browser_id:
+            continue
+        if clean_tab_id and item.get("tab_id") != clean_tab_id:
+            continue
+        matches.append(dict(item))
+        if len(matches) >= bounded_limit:
+            break
+    return {"ok": True, "responses": matches, "count": len(matches)}
+
+
 @router.post("/command")
 async def alarm_command(body: AlarmCommandBody) -> dict[str, Any]:
     action = _clean_text(body.action, "dismiss", 80).lower().replace("-", "_").replace(" ", "_")
@@ -306,6 +389,7 @@ async def alarm_command(body: AlarmCommandBody) -> dict[str, Any]:
         "update_local_settings",
         "update_local_slot",
         "update_sleep",
+        "request_local_state",
     }:
         return {"ok": False, "detail": f"Unsupported alarm command: {action}"}
     command_id = _clean_text(body.command_id, "", 120) or uuid.uuid4().hex
