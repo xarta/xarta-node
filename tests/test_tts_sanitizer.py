@@ -25,7 +25,9 @@ _HYPHEN_UNKNOWN_COUPLETS = Path(
 _UNKNOWN_COUPLET_TRANSFORMS = Path(
     "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_unknown_couplet_transforms.json"
 )
-_SPEC = importlib.util.spec_from_file_location("pockettts_service_tts_sanitizer", _SERVICE_SANITIZER)
+_SPEC = importlib.util.spec_from_file_location(
+    "pockettts_service_tts_sanitizer", _SERVICE_SANITIZER
+)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
@@ -67,13 +69,16 @@ Despite the progress, there are a few areas."""
 
     result = sanitize_tts_text(raw)
 
-    assert result.text == """Progress So Far.
+    assert (
+        result.text
+        == """Progress So Far.
 
 As of late April 2026, the first pass of the Blueprints integration has been successfully deployed across public root and non-root repositories. The backend now proxies search requests through the Blueprints application programming interface, and the frontend supports multiple search modes with persistent state in local storage. Additionally, the turbo-veck Docs stack is fully operational, with a complete corpus index and successful smoke tests confirming health and performance.
 
 Current Challenges.
 
 Despite the progress, there are a few areas."""
+    )
     assert list(result.transforms) == [
         "normalize_newlines",
         "strip_top_backlink_line",
@@ -132,7 +137,9 @@ def test_sanitize_tts_text_speaks_data_fc_key_attribute():
 
 
 def test_sanitize_tts_text_speaks_snake_case_and_kebab_case_identifiers():
-    result = sanitize_tts_text("The `form_controls` table maps table_layout_catalog rows for NAV-ITEMS.")
+    result = sanitize_tts_text(
+        "The `form_controls` table maps table_layout_catalog rows for NAV-ITEMS."
+    )
 
     assert result.text == "The form controls table maps table layout catalog rows for NAV ITEMS."
 
@@ -262,7 +269,10 @@ def test_sanitize_tts_text_can_use_llm_version_density_rewrite(monkeypatch):
         "Versions tested: 1.2.3.45678, 1.2.4.98765, and 2.0.0.12345 behaved differently."
     ).text
 
-    assert result == "The tests compare earlier one point two builds with a later two point zero build."
+    assert (
+        result
+        == "The tests compare earlier one point two builds with a later two point zero build."
+    )
 
 
 def test_narration_review_chunks_long_numeric_sentences(monkeypatch):
@@ -991,7 +1001,9 @@ def test_unknown_couplet_transform_suggestions_cover_reviewed_e_to_i_batch():
 
 
 def test_unknown_couplet_suggestion_builder_preserves_existing_choices():
-    unknown = {"e": {"badge-btn": {"m": ["btn"], "c": 1}, "custom-token": {"m": ["custom"], "c": 2}}}
+    unknown = {
+        "e": {"badge-btn": {"m": ["btn"], "c": 1}, "custom-token": {"m": ["custom"], "c": 2}}
+    }
     existing = {"c": {"badge btn": "badge control"}, "u": {"custom token": "custom token"}}
 
     suggestions = _SUGGEST_MODULE.build_transform_suggestions(
@@ -1244,12 +1256,19 @@ def test_sanitize_tts_text_speaks_reviewed_e_to_i_unknown_couplets():
 def test_tts_hyphen_auto_preserve_has_no_generated_sanitizer_token_conflicts():
     tokens = _AUTO_MODULE.sanitizer_transform_tokens(_SERVICE_SANITIZER)
     force_transform_terms = _AUTO_MODULE.load_force_transform_terms(
-        Path("/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_transform_terms.json")
+        Path(
+            "/xarta-node/.lone-wolf/stacks/pockettts-openai/app/services/tts_hyphenation_transform_terms.json"
+        )
     )
     dictionary_words = _AUTO_MODULE.load_dictionary_words(Path("/usr/share/dict/american-english"))
     runtime_policy = json.loads(_HYPHEN_RUNTIME_POLICY.read_text(encoding="utf-8"))
 
-    assert _AUTO_MODULE.validate_runtime_policy(runtime_policy, tokens, force_transform_terms, dictionary_words) == []
+    assert (
+        _AUTO_MODULE.validate_runtime_policy(
+            runtime_policy, tokens, force_transform_terms, dictionary_words
+        )
+        == []
+    )
 
 
 def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
@@ -1266,9 +1285,14 @@ def test_sanitize_tts_text_speaks_environment_and_nodes_keys():
 
 
 def test_sanitize_tts_text_speaks_webauthn_compounds_before_auth():
-    result = sanitize_tts_text("WebAuthn-backed auth-token, yubikey-derived, and WebAuthn auth.").text
+    result = sanitize_tts_text(
+        "WebAuthn-backed auth-token, yubikey-derived, and WebAuthn auth."
+    ).text
 
-    assert result == "web orff en backed authorisation token, Yubi-key derived, and web orff en authorisation."
+    assert (
+        result
+        == "web orff en backed authorisation token, Yubi-key derived, and web orff en authorisation."
+    )
 
 
 def test_sanitize_tts_text_speaks_known_joined_policy_terms():
@@ -1308,13 +1332,16 @@ def test_prepare_tts_markdown_for_llm_preserves_fenced_code_blocks():
 
 Then mention SVG."""
 
-    assert prepare_tts_markdown_for_llm(raw) == """Use `form_controls` and this example:
+    assert (
+        prepare_tts_markdown_for_llm(raw)
+        == """Use `form_controls` and this example:
 
 ```html
 <input type="text" data-fc-key="bookmarks.filter.search" />
 ```
 
 Then mention SVG."""
+    )
 
 
 def test_sanitize_tts_text_summarizes_fenced_code_blocks():
@@ -1332,14 +1359,11 @@ Done."""
 def test_sanitize_tts_text_speaks_common_technical_acronyms():
     raw = "LED SVG png jpg VM LXC805 AI API GUI DNS HTTPS mTLS IPv6 UUID SQLite pfSense CI/CD js html MCPO RRF"
 
-    assert (
-        sanitize_tts_text(raw).text
-        == (
-            "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
-            "artificial intelligence application programming interface GUI domain name system H tee tee pee ess mTLS "
-            "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
-            "JavaScript HTML Model Control Protocol to open a-pee eye proxy Reciprocal Rank Fusion"
-        )
+    assert sanitize_tts_text(raw).text == (
+        "LED ess vee gee pee enn gee jay peg vee em LXC eight zero five "
+        "artificial intelligence application programming interface GUI domain name system H tee tee pee ess mTLS "
+        "eye pee vee six you you eye dee sequel lite pee eff sense see eye, see dee "
+        "JavaScript HTML Model Control Protocol to open a-pee eye proxy Reciprocal Rank Fusion"
     )
 
 
@@ -1359,12 +1383,9 @@ def test_sanitize_tts_text_speaks_ms_as_milliseconds():
 def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
     raw = "Open `form-controls.js`, icons.svg, page.HTML, config.env, table_layout_catalog.json, and .svg."
 
-    assert (
-        sanitize_tts_text(raw).text
-        == (
-            "Open form controls dot jay ess, icons dot ess vee gee, page dot HTML, "
-            "config dot ee en vee, table layout catalog dot Jason, and dot ess vee gee."
-        )
+    assert sanitize_tts_text(raw).text == (
+        "Open form controls dot jay ess, icons dot ess vee gee, page dot HTML, "
+        "config dot ee en vee, table layout catalog dot Jason, and dot ess vee gee."
     )
 
 
@@ -1454,11 +1475,7 @@ def test_sanitize_tts_text_speaks_colons_only_when_structural():
     raw = "status: ok\nstatus1: ok\nstatus1:status2\nstatus3 : status4\n: leading"
 
     assert sanitize_tts_text(raw).text == (
-        "status: okay\n"
-        "status1: okay\n"
-        "status1 colon status2\n"
-        "status3 colon status4\n"
-        "colon leading"
+        "status: okay\nstatus1: okay\nstatus1 colon status2\nstatus3 colon status4\ncolon leading"
     )
 
 
@@ -1469,13 +1486,10 @@ def test_sanitize_tts_text_cleans_legacy_letter_names_and_pve_forms():
         "H tee em ell, ell ex sea 805, tee ell ess, PVee999, pee vee ee 998"
     )
 
-    assert (
-        sanitize_tts_text(raw).text
-        == (
-            "light L-LM, light L-LM, light L-LM, light L-LM, light L-LM, "
-            "V L-LM, L-LM client, L-LM, HTML, LXC eight zero five, TLS, "
-            "PVE nine nine nine, PVE nine nine eight"
-        )
+    assert sanitize_tts_text(raw).text == (
+        "light L-LM, light L-LM, light L-LM, light L-LM, light L-LM, "
+        "V L-LM, L-LM client, L-LM, HTML, LXC eight zero five, TLS, "
+        "PVE nine nine nine, PVE nine nine eight"
     )
 
 
@@ -1486,7 +1500,9 @@ def test_sanitize_tts_text_preserves_llm_pronunciation_in_paths():
 
 
 def test_sanitize_tts_text_speaks_infra_ids_digit_by_digit():
-    result = sanitize_tts_text("PVE987 lxc654 LXC 805 pve-998 paths00 paths10 paths 07 paths00sub2").text
+    result = sanitize_tts_text(
+        "PVE987 lxc654 LXC 805 pve-998 paths00 paths10 paths 07 paths00sub2"
+    ).text
 
     assert result == (
         "PVE nine eight seven LXC six five four LXC eight zero five PVE nine nine eight "
@@ -1623,7 +1639,9 @@ def test_prepare_tts_markdown_for_llm_preserves_ssh_for_model_prompt():
 
 
 def test_terminate_tts_line_endings_adds_pause_punctuation():
-    result = terminate_tts_line_endings("Implementation tracking append\n\nDone in this session:\nAlready done.")
+    result = terminate_tts_line_endings(
+        "Implementation tracking append\n\nDone in this session:\nAlready done."
+    )
 
     assert result == "Implementation tracking append.\n\nDone in this session.\nAlready done."
 
@@ -1677,4 +1695,6 @@ The page body remains."""
 
     result = sanitize_tts_text(raw)
 
-    assert result.text == "FORM CONTROLS.\n\n← [README](README dot em dee)\n\nThe page body remains."
+    assert (
+        result.text == "FORM CONTROLS.\n\n← [README](README dot em dee)\n\nThe page body remains."
+    )
