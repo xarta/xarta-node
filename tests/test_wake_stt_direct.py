@@ -690,6 +690,37 @@ def test_alarm_clock_help_is_weak_classifier_signal_not_exact_set_alarm_signal()
 
     assert prompt["alarm_clock_signals"]["contains_help_word"] is True
     assert prompt["alarm_clock_signals"]["exact_set_and_exact_alarm"] is False
+    assert (
+        wake_stt_direct._wake_stt_alarm_clock_presignal_result(
+            "help me use the alarm clock settings"
+        )
+        is None
+    )
+
+
+def test_alarm_clock_exact_set_alarm_presignal_routes_bounded_without_code():
+    result = wake_stt_direct._wake_stt_alarm_clock_presignal_result(
+        "help me understand how to set the alarm clock"
+    )
+
+    assert result is not None
+    assert result.target_profile == wake_stt_direct.WAKE_STT_ALARM_PROFILE
+    assert result.requires_command_code is False
+    assert result.risk_class == "alarm_clock"
+    assert result.status == "alarm_clock_exact_set_alarm_presignal"
+
+
+def test_classify_wake_stt_profile_exact_set_alarm_works_without_profile_classifier_env():
+    result = asyncio.run(
+        wake_stt_direct.classify_wake_stt_profile(
+            "set local alarm slot number four for 19:10 called Test alarm",
+            environ={},
+        )
+    )
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_ALARM_PROFILE
+    assert result.requires_command_code is False
+    assert result.status == "alarm_clock_exact_set_alarm_presignal"
 
 
 def test_validate_wake_stt_profile_classifier_gates_complex_nullclaw_target():
