@@ -1343,6 +1343,19 @@ def test_sanitize_tts_text_speaks_common_technical_acronyms():
     )
 
 
+def test_sanitize_tts_text_speaks_ms_as_milliseconds():
+    raw = (
+        "Elapsed: 80 ms. Render: 12ms. Delay: 1 ms. "
+        "word_detection_payload0_timeout_ms and AUTO_EXECUTE_SILENCE_MS."
+    )
+
+    assert sanitize_tts_text(raw).text == (
+        "Elapsed colon eight zero milliseconds. Render colon one two milliseconds. "
+        "Delay: 1 millisecond. "
+        "word detection payload0 time-out milliseconds and auto execute silence milliseconds."
+    )
+
+
 def test_sanitize_tts_text_speaks_file_extensions_differently_from_acronyms():
     raw = "Open `form-controls.js`, icons.svg, page.HTML, config.env, table_layout_catalog.json, and .svg."
 
