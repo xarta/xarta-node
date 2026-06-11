@@ -43,7 +43,7 @@ DEFAULT_WAKE_STT_RESEARCH_CONTEXT_FILE = Path(
 DEFAULT_WAKE_STT_RESEARCH_CONTEXT_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_MODEL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL = ""
-DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 1200
+DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 2500
 WAKE_STT_NULLCLAW_PROFILE = "hermes-stt-nullclaw"
 WAKE_STT_ALARM_PROFILE = "hermes-stt-alarm-clock"
 WAKE_STT_NULLCLAW_GUARD_SCRIPT = (
@@ -1977,6 +1977,31 @@ def _wake_stt_public_web_shortcut_result(
     )
 
 
+def _wake_stt_alarm_clock_presignal_result(
+    request_text: str,
+    *,
+    elapsed_ms: float = 0.0,
+    model: str = "exact-set-alarm-presignal",
+) -> WakeSttProfileRoutingResult | None:
+    if not _wake_stt_exact_set_alarm_signal(request_text):
+        return None
+    return WakeSttProfileRoutingResult(
+        target_profile=WAKE_STT_ALARM_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="alarm_clock",
+        confidence=0.98,
+        reason=(
+            "exact set+alarm pre-signal selected bounded alarm-clock helper; "
+            "dedicated alarm classifier must decide intent"
+        ),
+        speech_if_pending="",
+        status="alarm_clock_exact_set_alarm_presignal",
+        elapsed_ms=elapsed_ms,
+        model=model,
+    )
+
+
 async def classify_wake_stt_profile(
     request_text: str,
     *,
@@ -2003,6 +2028,19 @@ async def classify_wake_stt_profile(
                 reason=shortcut.reason,
             )
         return shortcut
+    alarm_presignal = _wake_stt_alarm_clock_presignal_result(
+        request_text,
+        model=model or "exact-set-alarm-presignal",
+    )
+    if alarm_presignal is not None:
+        if timing:
+            timing.mark(
+                "profile_classifier_alarm_clock_presignal",
+                target_profile=alarm_presignal.target_profile,
+                risk_class=alarm_presignal.risk_class,
+                reason=alarm_presignal.reason,
+            )
+        return alarm_presignal
     api_key = _wake_stt_profile_classifier_key(environ=environ)
     base_url = _wake_stt_profile_classifier_base_url(environ)
     if not model:
