@@ -2261,6 +2261,171 @@ def test_matrix_chat_wake_stt_pending_reuses_profile_routing(monkeypatch):
     ]
 
 
+def test_matrix_chat_wake_stt_direct_writes_minutes_and_schedules_post(monkeypatch, tmp_path):
+    matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    minutes_file = tmp_path / "minutes.jsonl"
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    captured: dict[str, object] = {}
+
+    async def fake_deliver(*, room_id, body, timing, conversation_key, **_kwargs):
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(body.text, [])
+        routing = matrix_chat.wake_stt_direct.WakeSttProfileRoutingResult(
+            target_profile=matrix_chat.wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+            requires_command_code=False,
+            complex=False,
+            risk_class="blueprints_navigation",
+            confidence=0.94,
+            reason="bounded active browser navigation",
+            speech_if_pending="",
+            status="classified",
+        )
+        companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+            speech="Opening the VPS Shared Bridge room.",
+            matrix_detail="Wake STT bounded Blueprints navigation\nStatus: blueprints_nav_dispatched",
+            status="blueprints_nav_dispatched",
+            structured=True,
+            raw_assistant_text=json.dumps(
+                {
+                    "speech": "Opening the VPS Shared Bridge room.",
+                    "matrix_detail": (
+                        "Wake STT bounded Blueprints navigation\nStatus: blueprints_nav_dispatched"
+                    ),
+                    "status": "blueprints_nav_dispatched",
+                }
+            ),
+        )
+        direct = matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+            ok=True,
+            status="blueprints_nav_dispatched",
+            gate=gate,
+            attempted=True,
+            fallback_required=False,
+            companion=companion,
+            target_profile=matrix_chat.wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+            profile_routing=routing,
+        )
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=True,
+            status="delivered",
+            route="direct_local",
+            gate=gate,
+            direct=direct,
+            timing=timing,
+        )
+
+    async def fake_publish(payload):
+        captured["tts_payload"] = payload
+        return {
+            "ok": True,
+            "status": "queued",
+            "event": {"event_id": "$tts-test"},
+            "payload": payload,
+        }
+
+    async def fake_report(**_kwargs):
+        return {"ok": True}
+
+    async def fake_minutes_post(summary):
+        captured["minutes_summary"] = summary
+        return {"ok": True, "room_id": "!minutes:test.example", "event_id": "$minutes"}
+
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish)
+    monkeypatch.setattr(matrix_chat, "_send_wake_stt_direct_response_report_safely", fake_report)
+    monkeypatch.setattr(matrix_chat, "_post_wake_stt_minutes_summary_safely", fake_minutes_post)
+
+    result = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            "!bridge:test.example",
+            matrix_chat._WakeSttMessageBody(
+                text="open the chat room for shared bridge please",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+                instance="local",
+            ),
+        )
+    )
+
+    assert result["delivery"]["ok"] is True
+    assert result["delivery"]["minutes"]["ok"] is True
+    assert result["delivery"]["minutes"]["matrix_post_scheduled"] is True
+    entries = [
+        json.loads(line)
+        for line in minutes_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert entries[-1]["event_kind"] == "turn_summary"
+    assert "shared bridge" in entries[-1]["payload"]["operator_intent_summary"].lower()
+    assert entries[-1]["payload"]["schema"] == matrix_chat.hermes_minutes.MINUTES_SUMMARY_SCHEMA
+    assert entries[-1]["payload"]["source_pointers"]["tts_utterance_ids"] == [
+        captured["tts_payload"]["utterance_id"]
+    ]
+
+
+def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch, tmp_path):
+    bridge_id = "!bridge:test.example"
+    minutes_id = "!minutes:test.example"
+
+    def room_state(name: str, *, encrypted: bool = True) -> dict[str, object]:
+        events = [
+            {
+                "type": "m.room.name",
+                "content": {"name": name},
+                "origin_server_ts": 1000,
+            }
+        ]
+        if encrypted:
+            events.append(
+                {
+                    "type": "m.room.encryption",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                    "origin_server_ts": 1001,
+                }
+            )
+        return {"state": {"events": events}, "timeline": {"events": []}}
+
+    e2ee_sync = {"rooms": {"join": {bridge_id: room_state("Bridge")}}, "next_batch": "e2ee"}
+    raw_sync = {
+        "rooms": {
+            "join": {
+                bridge_id: room_state("Bridge"),
+                minutes_id: room_state("Minutes"),
+            }
+        },
+        "next_batch": "raw",
+    }
+
+    monkeypatch.setattr(
+        matrix_chat,
+        "_settings",
+        lambda: {
+            "server_id": "tb1",
+            "server_label": "TB1",
+            "room_settings_file": str(tmp_path / "room-settings.json"),
+            "admin_access_token": "",
+        },
+    )
+
+    async def fake_sync_for_chat(**_kwargs):
+        return e2ee_sync, object()
+
+    async def fake_sync(**_kwargs):
+        return raw_sync
+
+    monkeypatch.setattr(matrix_chat, "_sync_for_chat", fake_sync_for_chat)
+    monkeypatch.setattr(matrix_chat, "_sync", fake_sync)
+
+    result = asyncio.run(matrix_chat.matrix_chat_rooms())
+
+    titles = [room["display_name"] for room in result["joined"]]
+    assert "Bridge" in titles
+    assert "Minutes" in titles
+    minutes = [room for room in result["joined"] if room["room_id"] == minutes_id][0]
+    assert minutes["encrypted"] is True
+
+
 def test_matrix_chat_wake_stt_handoff_assignment_is_info_only_and_speech_suppressed():
     body = matrix_chat._wake_stt_handoff_assignment_body(
         {

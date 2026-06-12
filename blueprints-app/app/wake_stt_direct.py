@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from . import hermes_minutes
 from .doc_speech_budget import read_model_budget
 
 AUTHORISED_PHRASE = "This command is authorised"
@@ -2421,7 +2422,7 @@ async def classify_wake_stt_profile(
     warning = "; ".join(part for part in (warning, model_warning) if part)
     timeout_ms = _wake_stt_profile_classifier_timeout_ms(examples_config)
     started = time.perf_counter()
-    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(
+    blueprints_nav_context = _read_wake_stt_blueprints_nav_repair_context(
         environ,
         conversation_key=conversation_key,
     )
@@ -3573,6 +3574,24 @@ def _read_wake_stt_blueprints_nav_context(
     )
 
 
+def _read_wake_stt_blueprints_nav_repair_context(
+    environ: dict[str, str] | None = None,
+    *,
+    conversation_key: str = "",
+) -> dict[str, Any]:
+    if _clean_wake_stt_conversation_key(conversation_key):
+        minutes_context = hermes_minutes.recent_blueprints_navigation_context(
+            environ=environ,
+            conversation_key=conversation_key,
+        )
+        if minutes_context:
+            return minutes_context
+    return _read_wake_stt_blueprints_nav_context(
+        environ,
+        conversation_key=conversation_key,
+    )
+
+
 def clear_wake_stt_blueprints_nav_context(
     environ: dict[str, str] | None = None,
     *,
@@ -3662,6 +3681,8 @@ def _write_wake_stt_blueprints_nav_context(
         "speech": _clip_text(decision.get("speech"), 300),
     }
     action_record = {
+        "route_profile": WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        "context_kind": context_kind,
         "request_text": _clip_text(command_code_storage_safe_text(request_text), 600),
         "status": _clip_text(status, 80),
         "decision": decision_public,
@@ -3762,12 +3783,21 @@ def _write_wake_stt_blueprints_nav_context(
         path.write_text(json.dumps(root, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         return {"ok": False, "path": str(path), "error": str(exc)[:240]}
+    minutes_update = hermes_minutes.append_bounded_action_fact(
+        conversation_key=clean_key,
+        request_text=request_text,
+        route_profile=WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        action_record=action_record,
+        context_kind=context_kind,
+        environ=environ,
+    )
     return {
         "ok": True,
         "path": str(path),
         "candidate_count": len(public_candidates),
         "conversation_key": clean_key,
         "context_kind": context_kind,
+        "minutes": minutes_update,
     }
 
 
@@ -3777,6 +3807,7 @@ def _blueprints_nav_context_for_prompt(context: dict[str, Any]) -> dict[str, Any
     decision = context.get("decision") if isinstance(context.get("decision"), dict) else {}
     candidates = context.get("candidates") if isinstance(context.get("candidates"), list) else []
     prompt_context = {
+        "source": _clip_text(context.get("source"), 80),
         "conversation_key": _clip_text(context.get("conversation_key"), 260),
         "request_text": _clip_text(context.get("request_text"), 600),
         "status": _clip_text(context.get("status"), 80),
@@ -3884,7 +3915,7 @@ def wake_stt_has_recent_bounded_navigation(
     conversation_key: str = "",
     environ: dict[str, str] | None = None,
 ) -> bool:
-    context = _read_wake_stt_blueprints_nav_context(
+    context = _read_wake_stt_blueprints_nav_repair_context(
         environ,
         conversation_key=conversation_key,
     )
@@ -5339,7 +5370,7 @@ async def _run_blueprints_nav_bounded_helper(
             "speech": "Blueprints navigation is not available.",
             "matrix_detail": base_error,
         }
-    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(
+    blueprints_nav_context = _read_wake_stt_blueprints_nav_repair_context(
         environ,
         conversation_key=conversation_key,
     )

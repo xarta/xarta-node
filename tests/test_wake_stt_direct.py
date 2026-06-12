@@ -9,7 +9,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 
-from app import wake_stt_direct
+from app import hermes_minutes, wake_stt_direct
 
 
 def test_command_code_config_limits_and_sanitizes_public_ids():
@@ -999,6 +999,180 @@ def test_classify_wake_stt_profile_routes_correction_to_bounded_nav_context(
     assert "previous_blueprints_navigation" in classifier_payload
     assert "last_navigation_action" in classifier_payload
     assert "Chat Admin" in classifier_payload
+
+
+def test_blueprints_nav_context_write_appends_local_minutes_action_fact(monkeypatch, tmp_path):
+    context_file = tmp_path / "blueprints-nav-context.json"
+    minutes_file = tmp_path / "minutes.jsonl"
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="tb1",
+    )
+
+    result = wake_stt_direct._write_wake_stt_blueprints_nav_context(
+        request_text="open the chat admin page",
+        status="blueprints_nav_dispatched",
+        decision={
+            "action": "dispatch",
+            "candidate_id": "page:settings.matrix-chat-admin",
+            "confidence": 0.87,
+            "ambiguous": False,
+            "reason": "selected admin candidate",
+            "speech": "Opening Chat Admin.",
+            "candidate": {
+                "id": "page:settings.matrix-chat-admin",
+                "kind": "open_page",
+                "label": "Chat Admin",
+                "group": "settings",
+                "page_id": "matrix-chat-admin",
+            },
+        },
+        candidates=[
+            {
+                "id": "page:settings.matrix-chat-admin",
+                "kind": "open_page",
+                "label": "Chat Admin",
+                "group": "settings",
+                "page_id": "matrix-chat-admin",
+            }
+        ],
+        conversation_key=conversation_key,
+        context_kind="last_navigation_action",
+    )
+
+    assert result["ok"] is True
+    assert result["minutes"]["ok"] is True
+    entries = [
+        json.loads(line)
+        for line in minutes_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert entries[-1]["event_kind"] == "bounded_action"
+    payload = entries[-1]["payload"]
+    assert payload["route_profile"] == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert payload["action"]["context_kind"] == "last_navigation_action"
+    assert payload["action"]["selected_candidate"]["label"] == "Chat Admin"
+
+
+def test_classify_wake_stt_profile_routes_correction_from_local_minutes(
+    monkeypatch,
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="vps",
+    )
+    action_record = {
+        "route_profile": wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        "context_kind": "last_navigation_action",
+        "request_text": "open the vps chat",
+        "status": "blueprints_nav_dispatched",
+        "decision": {
+            "action": "dispatch",
+            "candidate_id": "page:settings.matrix-chat-admin",
+            "confidence": 0.86,
+            "ambiguous": False,
+            "reason": "nearby page candidate",
+            "speech": "Opening Chat Admin.",
+        },
+        "selected_candidate": {
+            "id": "page:settings.matrix-chat-admin",
+            "kind": "open_page",
+            "label": "Chat Admin",
+            "group": "settings",
+            "page_id": "matrix-chat-admin",
+        },
+        "candidates": [
+            {
+                "id": "matrix_chat_room:vps.shared-bridge",
+                "kind": "open_matrix_chat_room",
+                "label": "Matrix Chat - VPS - Shared Bridge",
+                "group": "settings",
+                "page_id": "matrix-chat",
+                "server_id": "vps",
+                "room_hint": "Shared Bridge",
+            },
+            {
+                "id": "page:settings.matrix-chat-admin",
+                "kind": "open_page",
+                "label": "Chat Admin",
+                "group": "settings",
+                "page_id": "matrix-chat-admin",
+            },
+        ],
+    }
+    hermes_minutes.append_bounded_action_fact(
+        conversation_key=conversation_key,
+        request_text="open the vps chat",
+        route_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        action_record=action_record,
+        context_kind="last_navigation_action",
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["classifier"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "relation": "repair_previous_action",
+                                    "confidence": 0.93,
+                                    "reason": "local Minutes shows Chat Admin was opened",
+                                    "interpreted_request": (
+                                        "Open Matrix Chat, select VPS, and select Shared Bridge."
+                                    ),
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "I didn't want chat admin, I wanted the shared bridge room, I think that's the VPS chat",
+                client=client,
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert result.requires_command_code is False
+    assert result.status == "blueprints_nav_repair_classified"
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "local_minutes" in classifier_payload
+    assert "Chat Admin" in classifier_payload
+    assert "Matrix Chat - VPS - Shared Bridge" in classifier_payload
 
 
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():

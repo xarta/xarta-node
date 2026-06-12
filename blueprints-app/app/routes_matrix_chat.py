@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
 from starlette.websockets import WebSocketDisconnect
 
-from . import pve_fast_health, wake_stt_direct
+from . import hermes_minutes, pve_fast_health, wake_stt_direct
 from .events import AppEvent
 from .events import bus as events_bus
 
@@ -3313,6 +3313,97 @@ async def _send_wake_stt_direct_response_report_safely(**kwargs: Any) -> dict[st
         return {"ok": False, "error": str(exc)[:240]}
 
 
+def _matrix_minutes_summary_body(summary: dict[str, Any]) -> str:
+    intent = _safe_str(summary.get("operator_intent_summary")).strip()
+    action = _safe_str(summary.get("assistant_action_summary")).strip()
+    result = _safe_str(summary.get("result_summary")).strip()
+    question = _safe_str(summary.get("open_question")).strip()
+    parts = ["STT/TTS Minutes"]
+    if intent:
+        parts.append(f"Intent: {intent}")
+    if action:
+        parts.append(f"Action: {action}")
+    if result:
+        parts.append(f"Result: {result}")
+    if question:
+        parts.append(f"Open question: {question}")
+    body = "\n".join(parts).strip()
+    return body[:4000] if body else "STT/TTS Minutes"
+
+
+def _matrix_minutes_summary_content(summary: dict[str, Any]) -> dict[str, Any]:
+    body = _matrix_minutes_summary_body(summary)
+    content = _matrix_message_content(body)
+    content.update(
+        {
+            "msgtype": "m.notice",
+            "xarta_source": "wake_stt_minutes",
+            "xarta_capture_mode": "wake_to_talk",
+            "xarta_suppress_speech": True,
+            "suppress_speech": True,
+            "org.xarta.hermes.minutes": summary,
+            "org.xarta.system_message": {
+                "kind": "hermes_minutes_summary",
+                "schema": hermes_minutes.MINUTES_SUMMARY_SCHEMA,
+            },
+        }
+    )
+    return content
+
+
+async def _matrix_room_is_encrypted(room_id: str) -> bool:
+    encoded_room = quote(room_id, safe="")
+    data = await _matrix_request_any("GET", f"/rooms/{encoded_room}/state")
+    events = data if isinstance(data, list) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "m.room.encryption":
+            return True
+    return False
+
+
+async def _post_wake_stt_minutes_summary_message(summary: dict[str, Any]) -> dict[str, Any]:
+    config = hermes_minutes.read_minutes_config()
+    if not config.get("enabled") or not config.get("matrix_post_enabled"):
+        return {"ok": True, "skipped": True, "reason": "minutes_matrix_disabled"}
+    room_id = _safe_str(config.get("room_id")).strip()
+    if not room_id:
+        return {"ok": False, "skipped": True, "reason": "minutes_room_not_configured"}
+    server_id = _normalize_server_id(_safe_str(config.get("server_id")) or "tb1")
+    token = _CURRENT_MATRIX_SERVER.set(server_id)
+    try:
+        if bool(config.get("require_e2ee")) and not await _matrix_room_is_encrypted(room_id):
+            return {"ok": False, "skipped": True, "reason": "minutes_room_not_encrypted"}
+        content = _matrix_minutes_summary_content(summary)
+        e2ee_client = await _get_e2ee_client()
+        if e2ee_client:
+            sent = await e2ee_client.send_message_content(room_id, content)
+        else:
+            encoded_room = quote(room_id, safe="")
+            txn_id = f"bp-wake-stt-minutes-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+            encoded_txn = quote(txn_id, safe="")
+            data = await _matrix_request(
+                "PUT",
+                f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+                json_body=content,
+                expected=(200,),
+            )
+            sent = {"room_id": room_id, "event_id": data.get("event_id")}
+        sent.update({"ok": True, "server_id": server_id, "xarta_source": "wake_stt_minutes"})
+        return sent
+    finally:
+        _CURRENT_MATRIX_SERVER.reset(token)
+
+
+async def _post_wake_stt_minutes_summary_safely(summary: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return await _post_wake_stt_minutes_summary_message(summary)
+    except Exception as exc:  # pragma: no cover - Matrix runtime failures vary.
+        log.warning("wake_stt_minutes_post_failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:240]}
+
+
 def _wake_stt_handoff_assignment_body(assignment: dict[str, Any]) -> str:
     target = _safe_str(assignment.get("target_profile")) or "unknown"
     request_text = _safe_str(assignment.get("request_text")).strip()
@@ -4617,6 +4708,15 @@ async def matrix_chat_rooms() -> dict[str, Any]:
     settings = _settings()
     sync, _e2ee_client = await _sync_for_chat(timeout_ms=0, full_state=True)
     joined, invited = _rooms_from_sync(sync)
+    if _e2ee_client:
+        raw_sync = await _sync(timeout_ms=0, full_state=True)
+        raw_joined, raw_invited = _rooms_from_sync(raw_sync)
+        joined_ids = {room.get("room_id") for room in joined}
+        invite_ids = {room.get("room_id") for room in invited}
+        joined.extend(room for room in raw_joined if room.get("room_id") not in joined_ids)
+        invited.extend(room for room in raw_invited if room.get("room_id") not in invite_ids)
+        joined.sort(key=lambda room: room.get("last_event_ts") or 0, reverse=True)
+        invited.sort(key=lambda room: room.get("name") or room.get("room_id"))
     _annotate_room_settings(settings, joined)
     return {
         "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
@@ -5271,6 +5371,48 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             public["tts_elected_by_hermes"] = bool(speech)
         matrix_result = public.get("matrix") if isinstance(public.get("matrix"), dict) else {}
         diagnostic = public.get("diagnostic") if isinstance(public.get("diagnostic"), dict) else {}
+        tts_public = public.get("tts") if isinstance(public.get("tts"), dict) else {}
+        tts_event = tts_public.get("event") if isinstance(tts_public.get("event"), dict) else {}
+        tts_event_id = _safe_str(
+            tts_public.get("utterance_id")
+            or tts_event.get("event_id")
+            or tts_public.get("event_id")
+        )
+        direct_profile = _safe_str(
+            direct_result.get("target_profile")
+            or (
+                direct_result.get("profile_routing", {}).get("target_profile")
+                if isinstance(direct_result.get("profile_routing"), dict)
+                else ""
+            )
+        )
+        minutes_write = hermes_minutes.append_turn_summary(
+            conversation_key=conversation_key,
+            operator_text=body_for_delivery.text,
+            source_room_id=room_id,
+            route=direct_route or _safe_str(public.get("route")),
+            route_status=_safe_str(public.get("status")),
+            route_profile=direct_profile,
+            assistant_speech=speech,
+            matrix_detail=matrix_detail,
+            tts_event_id=tts_event_id,
+            delivery=public,
+        )
+        minutes_public = {
+            key: value for key, value in minutes_write.items() if key not in {"summary"}
+        }
+        summary = (
+            minutes_write.get("summary") if isinstance(minutes_write.get("summary"), dict) else {}
+        )
+        if summary:
+            asyncio.create_task(_post_wake_stt_minutes_summary_safely(summary))
+            minutes_public["matrix_post_scheduled"] = True
+        public["minutes"] = minutes_public
+        timing.mark(
+            "minutes_recorded",
+            ok=bool(minutes_write.get("ok")),
+            matrix_post_scheduled=bool(minutes_public.get("matrix_post_scheduled")),
+        )
         event_id = matrix_result.get("event_id") or diagnostic.get("event_id")
         timing.mark(
             "route_response",
