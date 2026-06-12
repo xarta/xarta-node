@@ -1417,6 +1417,8 @@ def _wake_stt_fast_route_decision(
                 "action": _WAKE_STT_FAST_ACTION_CLEAR_HOUSE_CONTROL,
             },
         )
+    if wake_stt_direct.wake_stt_has_explicit_correction_language(text):
+        return None
     for route in _wake_stt_fast_route_config():
         action = _safe_str(route.get("action")).strip().lower()
         if action not in _WAKE_STT_FAST_ACTIONS:
@@ -3387,6 +3389,7 @@ async def _deliver_wake_stt_with_direct_fallback(
     timing: wake_stt_direct.WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
     profile_routing_result: dict[str, Any] | None = None,
+    conversation_key: str = "",
 ) -> wake_stt_direct.WakeSttDeliveryResult:
     settings = _settings()
 
@@ -3458,6 +3461,7 @@ async def _deliver_wake_stt_with_direct_fallback(
         direct_route="direct_vps"
         if _safe_str(body.instance).strip().lower() == "vps"
         else "direct_local",
+        conversation_key=conversation_key,
     )
     if (
         _wake_stt_fast_route_uses_hermes(fast_route)
@@ -4922,6 +4926,10 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
     if direct_requested:
         code_list = wake_stt_direct.command_codes_from_env()
         pending_key = _wake_stt_pending_command_key(room_id, body.instance)
+        conversation_key = wake_stt_direct.wake_stt_conversation_key(
+            room_id=room_id,
+            instance=body.instance,
+        )
         pending = _wake_stt_pop_pending_command(pending_key)
         exact_code_response = wake_stt_direct.is_exact_slot1_command_code_response(
             body.text,
@@ -4950,6 +4958,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     diagnostic_enabled=bool(body.direct_diagnostic_enabled),
                     await_diagnostic=bool(body.direct_await_diagnostic),
                     timing=timing,
+                    conversation_key=conversation_key,
                 )
             )
         elif pending and exact_code_response and bool(route_readback["direct_enabled"]):
@@ -4963,31 +4972,53 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             timing.mark("command_code_retry_authorised")
         elif pending:
             code_like_response = wake_stt_direct.looks_like_command_code_response(body.text)
-            timing.mark(
-                "command_code_pending_cleared",
-                reason=("malformed_or_wrong_code" if code_like_response else "new_request"),
-            )
-            delivery_task = asyncio.create_task(
-                _wake_stt_command_code_local_delivery(
-                    text=body.text,
-                    codes=code_list,
-                    status="command_code_aborted",
-                    speech=(
-                        "Command Code not accepted. The pending request was aborted."
-                        if code_like_response
-                        else "The pending Command Code request was aborted."
-                    ),
-                    matrix_detail=(
-                        "Command Code not accepted; the held Wake request was aborted."
-                        if code_like_response
-                        else (
-                            "The next Wake turn was not the exact Command Code, so the "
-                            "held request was aborted."
-                        )
-                    ),
-                    timing=timing,
+            repairable_correction = (
+                not code_like_response
+                and bool(route_readback["direct_enabled"])
+                and wake_stt_direct.wake_stt_has_explicit_correction_language(body.text)
+                and wake_stt_direct.wake_stt_has_recent_bounded_navigation(
+                    conversation_key=conversation_key
                 )
             )
+            if repairable_correction:
+                timing.mark("command_code_pending_cleared", reason="bounded_navigation_repair")
+                delivery_task = asyncio.create_task(
+                    _deliver_wake_stt_with_direct_fallback(
+                        room_id=room_id,
+                        body=body_for_delivery,
+                        direct_enabled=bool(route_readback["direct_enabled"]),
+                        diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                        await_diagnostic=bool(body.direct_await_diagnostic),
+                        timing=timing,
+                        conversation_key=conversation_key,
+                    )
+                )
+            else:
+                timing.mark(
+                    "command_code_pending_cleared",
+                    reason=("malformed_or_wrong_code" if code_like_response else "new_request"),
+                )
+                delivery_task = asyncio.create_task(
+                    _wake_stt_command_code_local_delivery(
+                        text=body.text,
+                        codes=code_list,
+                        status="command_code_aborted",
+                        speech=(
+                            "Command Code not accepted. The pending request was aborted."
+                            if code_like_response
+                            else "The pending Command Code request was aborted."
+                        ),
+                        matrix_detail=(
+                            "Command Code not accepted; the held Wake request was aborted."
+                            if code_like_response
+                            else (
+                                "The next Wake turn was not the exact Command Code, so the "
+                                "held request was aborted."
+                            )
+                        ),
+                        timing=timing,
+                    )
+                )
         elif exact_code_response:
             timing.mark("command_code_stale_aborted")
             delivery_task = asyncio.create_task(
@@ -5013,6 +5044,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     diagnostic_enabled=bool(body.direct_diagnostic_enabled),
                     await_diagnostic=bool(body.direct_await_diagnostic),
                     timing=timing,
+                    conversation_key=conversation_key,
                 )
             )
         else:
@@ -5028,6 +5060,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     diagnostic_enabled=bool(body.direct_diagnostic_enabled),
                     await_diagnostic=bool(body.direct_await_diagnostic),
                     timing=timing,
+                    conversation_key=conversation_key,
                 )
             )
         if trusted_authorised_retry:
@@ -5041,6 +5074,7 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                     timing=timing,
                     trusted_authorised=True,
                     profile_routing_result=pending_profile_routing,
+                    conversation_key=conversation_key,
                 )
             )
         if not immediate_control_requested:

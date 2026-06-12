@@ -45,6 +45,7 @@ DEFAULT_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE = Path(
     "/xarta-node/.lone-wolf/state/hermes-stt/blueprints-nav-context.json"
 )
 DEFAULT_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_TTL_SECONDS = 15 * 60
+DEFAULT_WAKE_STT_BLUEPRINTS_NAV_RECENT_ACTIONS = 5
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_MODEL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 2500
@@ -109,9 +110,27 @@ WAKE_STT_PROFILE_RISK_CLASSES = frozenset(
     }
 )
 WAKE_STT_RESEARCH_FOLLOWUP_RELATIONS = frozenset({"follow_up", "fresh", "uncertain"})
-WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_RELATIONS = frozenset({"follow_up", "fresh", "uncertain"})
+WAKE_STT_BLUEPRINTS_NAV_REPAIR_RELATIONS = frozenset(
+    {"follow_up", "repair_previous_action", "clarify_previous_action"}
+)
+WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_RELATIONS = frozenset(
+    {*WAKE_STT_BLUEPRINTS_NAV_REPAIR_RELATIONS, "fresh", "uncertain"}
+)
 WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_MIN_CONFIDENCE = 0.80
 WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES = frozenset({"docs_lookup", "web_research"})
+_WAKE_STT_EXPLICIT_CORRECTION_RE = re.compile(
+    r"\b(?:no|nope|wrong|not\s+that|not\s+the\s+(?:one|page|thing)|"
+    r"did(?:n't| not)\s+want|i\s+(?:meant|wanted|asked\s+for)|"
+    r"that\s+(?:is|was)(?:n't| not)\s+what\s+i\s+(?:asked|wanted|meant)|"
+    r"you\s+(?:opened|picked|selected)\s+the\s+wrong|instead)\b",
+    re.IGNORECASE,
+)
+_WAKE_STT_EXPLICIT_ADMIN_REJECTION_RE = re.compile(
+    r"\b(?:not\s+(?:the\s+)?(?:chat\s+)?admin|"
+    r"did(?:n't| not)\s+want\s+(?:the\s+)?(?:chat\s+)?admin|"
+    r"(?:wrong|incorrect)\s+(?:chat\s+)?admin)\b",
+    re.IGNORECASE,
+)
 _WAKE_STT_WEB_RESEARCH_SPOKEN_HINT_RE = re.compile(
     r"\b(?:use|using|do|doing|try|please\s+do|more|with|via)(?:\s+\w+){0,5}\s+(?:web|website|rep|reb)\s+research\b|\bask(?:\s+\w+){0,4}\s+to\s+(?:web|website|rep|reb)\s+research\b|\b(?:research|look\s+up|find\s+out)\s+(?:online|on\s+the\s+web|from\s+the\s+web)\b",
     re.IGNORECASE,
@@ -541,6 +560,31 @@ def _clean_wake_instance_id(value: Any) -> str:
         if ch.isalnum() or ch in {"-", "_"}
     )
     return (clean or "local")[:40]
+
+
+def wake_stt_conversation_key(
+    *,
+    room_id: str = "",
+    instance: str = "local",
+    session_id: str = "",
+) -> str:
+    parts = [f"wake-stt:{_clean_wake_instance_id(instance)}"]
+    clean_room = _clip_text(_SPACE_RE.sub(" ", str(room_id or "").strip()), 180)
+    clean_session = _clip_text(_SPACE_RE.sub(" ", str(session_id or "").strip()), 120)
+    if clean_room:
+        parts.append(f"room={clean_room}")
+    if clean_session:
+        parts.append(f"session={clean_session}")
+    return ":".join(parts)
+
+
+def _clean_wake_stt_conversation_key(value: Any) -> str:
+    return _clip_text(_SPACE_RE.sub(" ", str(value or "").strip()), 260)
+
+
+def wake_stt_has_explicit_correction_language(text: str) -> bool:
+    current = command_code_storage_safe_text(text)
+    return bool(current and _WAKE_STT_EXPLICIT_CORRECTION_RE.search(current))
 
 
 def _wake_stt_instances_file(environ: dict[str, str] | None = None) -> Path:
@@ -1806,8 +1850,9 @@ def _wake_stt_profile_classifier_prompt(
                 "inverse signal. Classify from the full request meaning and noisy STT "
                 "context. When recent_blueprints_navigation_clarification is present, "
                 "treat it as non-deterministic context that may make a short correction, "
-                "pronunciation note, remembered purpose, or entity description a "
-                "navigation/document-opening follow-up. Do not choose this target for arbitrary "
+                "negative feedback turn, pronunciation note, remembered purpose, or entity "
+                "description a navigation/document-opening follow-up or repair of the last "
+                "bounded navigation action. Do not choose this target for arbitrary "
                 "external URLs, raw local "
                 "filesystem paths, terminal/browser automation, toggles, hard refreshes, "
                 "creating/editing/deleting documents, code changes, service control, or "
@@ -1845,6 +1890,14 @@ def _wake_stt_profile_classifier_prompt(
                 "service, infrastructure, credential/access, destructive, externally visible, "
                 "or uncertain work requires Command Code authorisation. If complex=true then "
                 "requires_command_code=true unless the target is the bounded alarm clock route."
+            ),
+            "repairs_and_health": (
+                "When the current utterance explicitly rejects a previous result, says no/not "
+                "that/wrong page/I meant something else, or names the thing the operator wanted "
+                "instead, classify it against recent bounded action context before generic "
+                "health/check-in interpretations. Do not choose a health/check-in/status route "
+                "for explicit negative feedback unless the current utterance clearly asks about "
+                "system health, status, or wellbeing as the intended task."
             ),
         },
         "targets": targets,
@@ -2092,25 +2145,39 @@ def _wake_stt_blueprints_nav_followup_classifier_prompt(
         "previous_blueprints_navigation": _blueprints_nav_context_for_prompt(context),
         "task": (
             "Classify whether the current noisy Wake STT text is probably a follow-up "
-            "clarification or refinement for the previous unresolved Blueprints Active "
-            "Browser page/document-opening request, probably fresh/unrelated, or uncertain."
+            "clarification, refinement, or repair for the previous bounded Blueprints Active "
+            "Browser page/document-opening action, probably fresh/unrelated, or uncertain."
         ),
         "policy": {
             "classifier_decides": (
                 "The previous navigation context is evidence only, not a command. Do not "
                 "route on keywords alone. Decide from the current text, the previous "
-                "unresolved request, candidate labels, document paths, snippets, and noisy "
-                "STT context."
+                "unresolved request, last dispatched bounded action, candidate labels, "
+                "document paths, snippets, and noisy STT context."
             ),
             "follow_up": (
                 "Return follow_up when the current utterance plausibly supplies a spelling, "
                 "pronunciation correction, description, remembered purpose, synonym, or "
                 "disambiguating detail for the previous page/document target."
             ),
+            "repair_previous_action": (
+                "Return repair_previous_action when the current utterance explicitly rejects "
+                "the page, document, room, or UI state that was just opened and gives a "
+                "corrected target that still appears to be inside bounded Blueprints navigation."
+            ),
+            "clarify_previous_action": (
+                "Return clarify_previous_action when the operator gives negative feedback "
+                "about the previous bounded action but the corrected target remains unclear "
+                "and should go back to the bounded navigation classifier for clarification."
+            ),
             "fresh": (
                 "Return fresh when the current utterance clearly starts a different task, "
                 "asks an ordinary conversational question, or is unrelated to opening a "
                 "Blueprints page/document."
+            ),
+            "health_check_exclusion": (
+                "Do not classify explicit correction language as a health/check-in turn unless "
+                "the operator clearly asks about health, status, or wellbeing as the intended task."
             ),
             "uncertain": "Return uncertain when the evidence is weak or ambiguous.",
         },
@@ -2347,12 +2414,53 @@ async def classify_wake_stt_profile(
     client: httpx.AsyncClient | None = None,
     environ: dict[str, str] | None = None,
     timing: WakeSttRouteTiming | None = None,
+    conversation_key: str = "",
 ) -> WakeSttProfileRoutingResult:
     examples_config, warning = _read_wake_stt_profile_examples(environ)
     model, model_warning = _wake_stt_profile_classifier_model(examples_config)
     warning = "; ".join(part for part in (warning, model_warning) if part)
     timeout_ms = _wake_stt_profile_classifier_timeout_ms(examples_config)
     started = time.perf_counter()
+    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(
+        environ,
+        conversation_key=conversation_key,
+    )
+    nav_followup: WakeSttBlueprintsNavFollowupResult | None = None
+    if blueprints_nav_context and wake_stt_has_explicit_correction_language(request_text):
+        nav_followup = await classify_wake_stt_blueprints_nav_followup(
+            request_text,
+            blueprints_nav_context,
+            client=client,
+            environ=environ,
+            timing=timing,
+        )
+        if (
+            nav_followup.relation in WAKE_STT_BLUEPRINTS_NAV_REPAIR_RELATIONS
+            and nav_followup.confidence >= WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_MIN_CONFIDENCE
+        ):
+            reason = nav_followup.reason or "current utterance repairs previous navigation action"
+            result = WakeSttProfileRoutingResult(
+                target_profile=WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+                requires_command_code=False,
+                complex=False,
+                risk_class="blueprints_navigation",
+                confidence=nav_followup.confidence,
+                reason=f"Blueprints navigation repair: {reason}"[:240],
+                speech_if_pending="",
+                status="blueprints_nav_repair_classified",
+                elapsed_ms=nav_followup.elapsed_ms,
+                model=nav_followup.model,
+                warning=nav_followup.warning,
+            )
+            if timing:
+                timing.mark(
+                    "profile_classifier_blueprints_nav_repair",
+                    target_profile=result.target_profile,
+                    risk_class=result.risk_class,
+                    confidence=result.confidence,
+                    relation=nav_followup.relation,
+                )
+            return result
     shortcut = _wake_stt_public_web_shortcut_result(
         request_text,
         model=model or "deterministic",
@@ -2380,17 +2488,17 @@ async def classify_wake_stt_profile(
                 reason=alarm_presignal.reason,
             )
         return alarm_presignal
-    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(environ)
     if blueprints_nav_context:
-        nav_followup = await classify_wake_stt_blueprints_nav_followup(
-            request_text,
-            blueprints_nav_context,
-            client=client,
-            environ=environ,
-            timing=timing,
-        )
+        if nav_followup is None:
+            nav_followup = await classify_wake_stt_blueprints_nav_followup(
+                request_text,
+                blueprints_nav_context,
+                client=client,
+                environ=environ,
+                timing=timing,
+            )
         if (
-            nav_followup.relation == "follow_up"
+            nav_followup.relation in WAKE_STT_BLUEPRINTS_NAV_REPAIR_RELATIONS
             and nav_followup.confidence >= WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_MIN_CONFIDENCE
         ):
             reason = nav_followup.reason or "current utterance resolves previous navigation context"
@@ -3264,6 +3372,19 @@ def _exception_message(exc: Exception) -> str:
     return _clip_text(f"{type(exc).__name__}: {exc}", 500)
 
 
+def _bounded_json_public(value: Any, limit: int = 1200) -> Any:
+    try:
+        text = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    except (TypeError, ValueError):
+        return _clip_text(value, limit)
+    if len(text) <= limit:
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
+    return {"truncated_json": _clip_text(text, limit)}
+
+
 def _wake_stt_research_context_file(environ: dict[str, str] | None = None) -> Path:
     env = os.environ if environ is None else environ
     raw = str(env.get("BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE") or "").strip()
@@ -3382,8 +3503,38 @@ def _wake_stt_blueprints_nav_context_ttl_seconds(
     )
 
 
+def _wake_stt_blueprints_nav_context_entry_valid(
+    entry: Any,
+    *,
+    environ: dict[str, str] | None = None,
+    conversation_key: str = "",
+) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    updated_at = entry.get("updated_at_epoch")
+    try:
+        age = time.time() - float(updated_at)
+    except (TypeError, ValueError):
+        return {}
+    if age < 0 or age > _wake_stt_blueprints_nav_context_ttl_seconds(environ):
+        return {}
+    clean_key = _clean_wake_stt_conversation_key(conversation_key)
+    entry_key = _clean_wake_stt_conversation_key(entry.get("conversation_key"))
+    if clean_key and entry_key and entry_key != clean_key:
+        return {}
+    for key in ("candidates", "recent_actions"):
+        if not isinstance(entry.get(key), list):
+            entry[key] = []
+    for key in ("unresolved_navigation", "last_navigation_action"):
+        if not isinstance(entry.get(key), dict):
+            entry[key] = {}
+    return entry
+
+
 def _read_wake_stt_blueprints_nav_context(
     environ: dict[str, str] | None = None,
+    *,
+    conversation_key: str = "",
 ) -> dict[str, Any]:
     path = _wake_stt_blueprints_nav_context_file(environ)
     try:
@@ -3394,23 +3545,74 @@ def _read_wake_stt_blueprints_nav_context(
         return {}
     if parsed.get("schema") != "xarta.wake-stt.blueprints-nav-context.v1":
         return {}
-    updated_at = parsed.get("updated_at_epoch")
-    try:
-        age = time.time() - float(updated_at)
-    except (TypeError, ValueError):
-        return {}
-    if age < 0 or age > _wake_stt_blueprints_nav_context_ttl_seconds(environ):
-        return {}
-    candidates = parsed.get("candidates")
-    if not isinstance(candidates, list):
-        parsed["candidates"] = []
-    return parsed
+    clean_key = _clean_wake_stt_conversation_key(conversation_key)
+    conversations = parsed.get("conversations")
+    if isinstance(conversations, dict):
+        if clean_key:
+            return _wake_stt_blueprints_nav_context_entry_valid(
+                conversations.get(clean_key),
+                environ=environ,
+                conversation_key=clean_key,
+            )
+        newest: dict[str, Any] = {}
+        newest_epoch = 0.0
+        for value in conversations.values():
+            entry = _wake_stt_blueprints_nav_context_entry_valid(value, environ=environ)
+            try:
+                epoch = float(entry.get("updated_at_epoch") or 0.0)
+            except (TypeError, ValueError):
+                epoch = 0.0
+            if entry and epoch >= newest_epoch:
+                newest = entry
+                newest_epoch = epoch
+        return newest
+    return _wake_stt_blueprints_nav_context_entry_valid(
+        parsed,
+        environ=environ,
+        conversation_key=clean_key,
+    )
 
 
 def clear_wake_stt_blueprints_nav_context(
     environ: dict[str, str] | None = None,
+    *,
+    conversation_key: str = "",
 ) -> dict[str, Any]:
     path = _wake_stt_blueprints_nav_context_file(environ)
+    clean_key = _clean_wake_stt_conversation_key(conversation_key)
+    if clean_key:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"ok": True, "cleared": False, "path": str(path)}
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "cleared": False, "path": str(path), "error": str(exc)[:240]}
+        conversations = parsed.get("conversations") if isinstance(parsed, dict) else None
+        if isinstance(conversations, dict):
+            cleared = clean_key in conversations
+            conversations.pop(clean_key, None)
+            if conversations:
+                parsed["updated_at_epoch"] = time.time()
+                try:
+                    path.write_text(
+                        json.dumps(parsed, ensure_ascii=True, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    return {
+                        "ok": False,
+                        "cleared": False,
+                        "path": str(path),
+                        "error": str(exc)[:240],
+                    }
+                return {"ok": True, "cleared": cleared, "path": str(path)}
+        entry = _wake_stt_blueprints_nav_context_entry_valid(
+            parsed,
+            environ=environ,
+            conversation_key=clean_key,
+        )
+        if not entry:
+            return {"ok": True, "cleared": False, "path": str(path)}
     try:
         path.unlink()
         return {"ok": True, "cleared": True, "path": str(path)}
@@ -3427,8 +3629,17 @@ def _write_wake_stt_blueprints_nav_context(
     decision: dict[str, Any],
     candidates: list[dict[str, Any]],
     environ: dict[str, str] | None = None,
+    conversation_key: str = "",
+    context_kind: str = "unresolved_navigation",
+    command: dict[str, Any] | None = None,
+    dispatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = _wake_stt_blueprints_nav_context_file(environ)
+    clean_key = _clean_wake_stt_conversation_key(conversation_key)
+    existing = _read_wake_stt_blueprints_nav_context(
+        environ,
+        conversation_key=clean_key,
+    )
     public_candidates: list[dict[str, Any]] = []
     for candidate in _blueprints_nav_prompt_candidates(candidates):
         if candidate.get("kind") == "selector_action":
@@ -3438,29 +3649,126 @@ def _write_wake_stt_blueprints_nav_context(
             public_candidates.append(public)
         if len(public_candidates) >= 24:
             break
+    selected_candidate = (
+        decision.get("candidate") if isinstance(decision.get("candidate"), dict) else {}
+    )
+    selected_public = _blueprints_nav_candidate_public(selected_candidate)
+    decision_public = {
+        "action": _clip_text(decision.get("action"), 40),
+        "candidate_id": _clip_text(decision.get("candidate_id"), 220),
+        "confidence": round(float(decision.get("confidence") or 0.0), 3),
+        "ambiguous": bool(decision.get("ambiguous")),
+        "reason": _clip_text(decision.get("reason"), 300),
+        "speech": _clip_text(decision.get("speech"), 300),
+    }
+    action_record = {
+        "request_text": _clip_text(command_code_storage_safe_text(request_text), 600),
+        "status": _clip_text(status, 80),
+        "decision": decision_public,
+        "selected_candidate": selected_public,
+        "candidates": public_candidates,
+        "updated_at_epoch": time.time(),
+        "updated_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+    if command is not None:
+        action_record["command"] = _bounded_json_public(command, 1200)
+    if dispatch is not None:
+        action_record["dispatch"] = _bounded_json_public(dispatch, 1200)
+    unresolved = (
+        action_record
+        if context_kind == "unresolved_navigation"
+        else (
+            existing.get("unresolved_navigation")
+            if isinstance(existing.get("unresolved_navigation"), dict)
+            else {}
+        )
+    )
+    last_action = (
+        action_record
+        if context_kind == "last_navigation_action"
+        else (
+            existing.get("last_navigation_action")
+            if isinstance(existing.get("last_navigation_action"), dict)
+            else {}
+        )
+    )
+    if context_kind == "last_navigation_action":
+        unresolved = {}
+    recent_actions = (
+        existing.get("recent_actions") if isinstance(existing.get("recent_actions"), list) else []
+    )
+    recent_actions = [action_record, *[item for item in recent_actions if isinstance(item, dict)]]
+    recent_actions = recent_actions[:DEFAULT_WAKE_STT_BLUEPRINTS_NAV_RECENT_ACTIONS]
     payload = {
         "schema": "xarta.wake-stt.blueprints-nav-context.v1",
         "updated_at_epoch": time.time(),
         "updated_at": datetime.now(timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
+        "conversation_key": clean_key,
         "request_text": _clip_text(command_code_storage_safe_text(request_text), 600),
         "status": _clip_text(status, 80),
-        "decision": {
-            "action": _clip_text(decision.get("action"), 40),
-            "confidence": round(float(decision.get("confidence") or 0.0), 3),
-            "ambiguous": bool(decision.get("ambiguous")),
-            "reason": _clip_text(decision.get("reason"), 300),
-            "speech": _clip_text(decision.get("speech"), 300),
-        },
+        "context_kind": context_kind,
+        "decision": decision_public,
         "candidates": public_candidates,
+        "selected_candidate": selected_public,
+        "unresolved_navigation": unresolved,
+        "last_navigation_action": last_action,
+        "recent_actions": recent_actions,
     }
+    root = payload
+    if clean_key:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            parsed = {}
+        conversations = parsed.get("conversations") if isinstance(parsed, dict) else None
+        if not isinstance(conversations, dict):
+            conversations = {}
+        conversations[clean_key] = payload
+        now = time.time()
+        ttl = _wake_stt_blueprints_nav_context_ttl_seconds(environ)
+
+        def entry_updated_at_epoch(value: dict[str, Any]) -> float:
+            try:
+                return float(value.get("updated_at_epoch") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        conversations = {
+            key: value
+            for key, value in conversations.items()
+            if isinstance(value, dict) and now - entry_updated_at_epoch(value) <= ttl
+        }
+        if len(conversations) > 12:
+            ordered = sorted(
+                conversations.items(),
+                key=lambda item: entry_updated_at_epoch(item[1]),
+                reverse=True,
+            )
+            conversations = dict(ordered[:12])
+        root = {
+            "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+            "updated_at_epoch": now,
+            "updated_at": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+            "conversations": conversations,
+        }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+        path.write_text(json.dumps(root, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
         return {"ok": False, "path": str(path), "error": str(exc)[:240]}
-    return {"ok": True, "path": str(path), "candidate_count": len(public_candidates)}
+    return {
+        "ok": True,
+        "path": str(path),
+        "candidate_count": len(public_candidates),
+        "conversation_key": clean_key,
+        "context_kind": context_kind,
+    }
 
 
 def _blueprints_nav_context_for_prompt(context: dict[str, Any]) -> dict[str, Any]:
@@ -3468,11 +3776,14 @@ def _blueprints_nav_context_for_prompt(context: dict[str, Any]) -> dict[str, Any
         return {}
     decision = context.get("decision") if isinstance(context.get("decision"), dict) else {}
     candidates = context.get("candidates") if isinstance(context.get("candidates"), list) else []
-    return {
+    prompt_context = {
+        "conversation_key": _clip_text(context.get("conversation_key"), 260),
         "request_text": _clip_text(context.get("request_text"), 600),
         "status": _clip_text(context.get("status"), 80),
+        "context_kind": _clip_text(context.get("context_kind"), 80),
         "decision": {
             "action": _clip_text(decision.get("action"), 40),
+            "candidate_id": _clip_text(decision.get("candidate_id"), 220),
             "confidence": decision.get("confidence"),
             "ambiguous": bool(decision.get("ambiguous")),
             "reason": _clip_text(decision.get("reason"), 300),
@@ -3484,27 +3795,107 @@ def _blueprints_nav_context_for_prompt(context: dict[str, Any]) -> dict[str, Any
             if isinstance(item, dict) and item.get("id") and item.get("kind")
         ],
     }
+    for key in ("unresolved_navigation", "last_navigation_action"):
+        item = context.get(key) if isinstance(context.get(key), dict) else {}
+        if item:
+            item_decision = item.get("decision") if isinstance(item.get("decision"), dict) else {}
+            selected = (
+                item.get("selected_candidate")
+                if isinstance(item.get("selected_candidate"), dict)
+                else {}
+            )
+            prompt_context[key] = {
+                "request_text": _clip_text(item.get("request_text"), 600),
+                "status": _clip_text(item.get("status"), 80),
+                "decision": {
+                    "action": _clip_text(item_decision.get("action"), 40),
+                    "candidate_id": _clip_text(item_decision.get("candidate_id"), 220),
+                    "confidence": item_decision.get("confidence"),
+                    "ambiguous": bool(item_decision.get("ambiguous")),
+                    "reason": _clip_text(item_decision.get("reason"), 300),
+                },
+                "selected_candidate": selected,
+                "candidates": [
+                    candidate
+                    for candidate in (
+                        item.get("candidates") if isinstance(item.get("candidates"), list) else []
+                    )[:12]
+                    if isinstance(candidate, dict) and candidate.get("id") and candidate.get("kind")
+                ],
+            }
+    recent_actions = (
+        context.get("recent_actions") if isinstance(context.get("recent_actions"), list) else []
+    )
+    if recent_actions:
+        prompt_context["recent_actions"] = [
+            {
+                "request_text": _clip_text(item.get("request_text"), 320),
+                "status": _clip_text(item.get("status"), 80),
+                "selected_candidate": item.get("selected_candidate")
+                if isinstance(item.get("selected_candidate"), dict)
+                else {},
+            }
+            for item in recent_actions[:DEFAULT_WAKE_STT_BLUEPRINTS_NAV_RECENT_ACTIONS]
+            if isinstance(item, dict)
+        ]
+    return prompt_context
 
 
 def _blueprints_nav_context_candidates(context: dict[str, Any]) -> list[dict[str, Any]]:
     if not context:
         return []
-    candidates = context.get("candidates") if isinstance(context.get("candidates"), list) else []
+    candidate_lists: list[Any] = [
+        context.get("candidates") if isinstance(context.get("candidates"), list) else []
+    ]
+    for key in ("unresolved_navigation", "last_navigation_action"):
+        item = context.get(key) if isinstance(context.get(key), dict) else {}
+        if item:
+            selected = item.get("selected_candidate")
+            if isinstance(selected, dict):
+                candidate_lists.append([selected])
+            candidate_lists.append(
+                item.get("candidates") if isinstance(item.get("candidates"), list) else []
+            )
     restored: list[dict[str, Any]] = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        kind = _blueprints_nav_text(item.get("kind"), 40)
-        if kind not in {"open_doc", "open_page", "open_modal"}:
-            continue
-        restored.append(
-            {
-                **item,
-                "kind": kind,
-                "source": "blueprints_nav_context",
-            }
-        )
+    seen: set[str] = set()
+    for candidates in candidate_lists:
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            candidate_id = _blueprints_nav_text(item.get("id"), 220)
+            if not candidate_id or candidate_id in seen:
+                continue
+            kind = _blueprints_nav_text(item.get("kind"), 40)
+            if kind not in {"open_doc", "open_page", "open_modal", "open_matrix_chat_room"}:
+                continue
+            seen.add(candidate_id)
+            restored.append(
+                {
+                    **item,
+                    "kind": kind,
+                    "source": "blueprints_nav_context",
+                }
+            )
     return restored
+
+
+def wake_stt_has_recent_bounded_navigation(
+    *,
+    conversation_key: str = "",
+    environ: dict[str, str] | None = None,
+) -> bool:
+    context = _read_wake_stt_blueprints_nav_context(
+        environ,
+        conversation_key=conversation_key,
+    )
+    if not context:
+        return False
+    return bool(
+        context.get("unresolved_navigation")
+        or context.get("last_navigation_action")
+        or context.get("recent_actions")
+        or context.get("candidates")
+    )
 
 
 def _wake_stt_research_request_resets_context(request_text: str) -> bool:
@@ -4255,6 +4646,9 @@ def _blueprints_nav_candidate_public(candidate: dict[str, Any]) -> dict[str, Any
         "page_id",
         "modal_id",
         "selector_action",
+        "server_id",
+        "room_id",
+        "room_hint",
         "doc_id",
         "path",
         "description",
@@ -4278,7 +4672,13 @@ def _blueprints_nav_add_candidate(
     label = _blueprints_nav_text(candidate.get("label"), 160)
     if not candidate_id or not kind or not label or candidate_id in seen:
         return
-    if kind not in {"open_page", "open_doc", "open_modal", "selector_action"}:
+    if kind not in {
+        "open_page",
+        "open_doc",
+        "open_modal",
+        "selector_action",
+        "open_matrix_chat_room",
+    }:
         return
     seen.add(candidate_id)
     candidates.append({**candidate, "id": candidate_id, "kind": kind, "label": label})
@@ -4336,6 +4736,59 @@ def _blueprints_nav_catalog_candidates(catalog: dict[str, Any]) -> list[dict[str
             },
         )
     return candidates
+
+
+def _blueprints_nav_matrix_chat_room_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    has_matrix_chat = any(
+        item.get("kind") == "open_page"
+        and _blueprints_nav_text(item.get("group"), 60) == "settings"
+        and _blueprints_nav_text(item.get("page_id"), 120) == "matrix-chat"
+        for item in candidates
+    )
+    if not has_matrix_chat:
+        return []
+    return [
+        {
+            "id": "matrix_chat_room:vps.shared-bridge",
+            "kind": "open_matrix_chat_room",
+            "source": "active_browser_state",
+            "label": "Matrix Chat - VPS - Shared Bridge",
+            "description": (
+                "Open the normal Matrix Chat page, switch to the VPS server, and "
+                "select the Shared Bridge room."
+            ),
+            "route": "settings.matrix-chat:vps.shared-bridge",
+            "group": "settings",
+            "page_id": "matrix-chat",
+            "server_id": "vps",
+            "room_hint": "Shared Bridge",
+            "aliases": [
+                "shared bridge room",
+                "vps chat",
+                "vps mode in chat",
+                "vps bridge",
+                "shared bridge",
+            ],
+        },
+        {
+            "id": "matrix_chat_room:tb1.bridge",
+            "kind": "open_matrix_chat_room",
+            "source": "active_browser_state",
+            "label": "Matrix Chat - TB1 - Bridge",
+            "description": (
+                "Open the normal Matrix Chat page, switch to the TB1 server, and "
+                "select the Bridge room."
+            ),
+            "route": "settings.matrix-chat:tb1.bridge",
+            "group": "settings",
+            "page_id": "matrix-chat",
+            "server_id": "tb1",
+            "room_hint": "Bridge",
+            "aliases": ["tb1 bridge room", "local bridge", "bridge room"],
+        },
+    ]
 
 
 def _blueprints_nav_selector_action_allowed(action: str, label: str) -> bool:
@@ -4448,14 +4901,31 @@ def _blueprints_nav_docs_candidates(search: dict[str, Any]) -> list[dict[str, An
     return candidates
 
 
+def _blueprints_nav_candidate_rejected_by_correction(
+    request_text: str,
+    candidate: dict[str, Any],
+) -> bool:
+    if not wake_stt_has_explicit_correction_language(request_text):
+        return False
+    text = command_code_storage_safe_text(request_text)
+    if _WAKE_STT_EXPLICIT_ADMIN_REJECTION_RE.search(text):
+        identity = " ".join(
+            _blueprints_nav_text(candidate.get(key), 220).lower()
+            for key in ("id", "label", "description", "route", "page_id")
+        )
+        return "admin" in identity
+    return False
+
+
 def _blueprints_nav_prompt_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    matrix_rooms = [item for item in candidates if item.get("kind") == "open_matrix_chat_room"][:8]
     docs = [item for item in candidates if item.get("kind") == "open_doc"][:18]
     selectors = [item for item in candidates if item.get("kind") == "selector_action"][:28]
     modals = [item for item in candidates if item.get("kind") == "open_modal"][:8]
     pages = [item for item in candidates if item.get("kind") == "open_page"]
     ordered: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for bucket in (docs, selectors, modals, pages):
+    for bucket in (matrix_rooms, docs, selectors, modals, pages):
         for item in bucket:
             candidate_id = str(item.get("id") or "")
             if not candidate_id or candidate_id in seen:
@@ -4506,6 +4976,8 @@ async def _collect_blueprints_nav_candidates(
         _blueprints_nav_add_candidate(candidates, seen, candidate)
     for candidate in _blueprints_nav_catalog_candidates(catalog):
         _blueprints_nav_add_candidate(candidates, seen, candidate)
+    for candidate in _blueprints_nav_matrix_chat_room_candidates(candidates):
+        _blueprints_nav_add_candidate(candidates, seen, candidate)
     for candidate in _blueprints_nav_docs_candidates(docs_search):
         _blueprints_nav_add_candidate(candidates, seen, candidate)
     context_candidate_count = 0
@@ -4524,6 +4996,15 @@ async def _collect_blueprints_nav_candidates(
         "active_view_status": active_view.get("status") or active_view.get("detail") or "",
         "docs_search_status": docs_search.get("status") or docs_search.get("detail") or "",
     }
+    if wake_stt_has_explicit_correction_language(request_text):
+        before_filter = len(candidates)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not _blueprints_nav_candidate_rejected_by_correction(request_text, candidate)
+        ]
+        diagnostics["rejected_by_correction_count"] = before_filter - len(candidates)
+        diagnostics["candidate_count"] = len(candidates)
     if timing:
         timing.mark(
             "blueprints_nav_candidates_collected",
@@ -4555,7 +5036,9 @@ def _blueprints_nav_classifier_prompt(
             ),
             "bounded_scope": (
                 "Allowed dispatches are opening a Blueprints page, a registered local "
-                "document, the help/docs-search modal, or a safe live selector surface. "
+                "document, the help/docs-search modal, a safe live selector surface, or a "
+                "safe compound UI state candidate such as opening Matrix Chat with a "
+                "specific server and room selected. "
                 "Do not choose actions that mutate files, create/edit/delete documents, "
                 "toggle settings, hard refresh assets, open external websites, run "
                 "terminal commands, control services, or browse arbitrary URLs."
@@ -4570,8 +5053,23 @@ def _blueprints_nav_classifier_prompt(
             "recent_context": (
                 "If recent_blueprints_navigation_clarification is present, use it as "
                 "non-deterministic context for interpreting the current utterance. It can "
-                "help resolve spellings, remembered purposes, and vague descriptions, but "
-                "it must not override the current request meaning."
+                "help resolve spellings, remembered purposes, vague descriptions, and "
+                "explicit repairs of a recently opened bounded action, but it must not "
+                "override the current request meaning."
+            ),
+            "matrix_chat_room_candidates": (
+                "For chat-room requests, a candidate with kind open_matrix_chat_room is the "
+                "normal Matrix Chat page with page-local state selected. Treat it as safer "
+                "and more semantically specific than an admin/management page when the "
+                "operator asks for a room such as Bridge, Shared Bridge, VPS chat, or VPS "
+                "mode in chat."
+            ),
+            "admin_candidates": (
+                "Admin pages are valid when the operator asks for admin, management, users, "
+                "room admin, server admin, Synapse admin, moderation, redaction, power levels, "
+                "or user/room management. Do not select admin pages for ordinary chat-room "
+                "navigation, and never select an admin candidate when the utterance explicitly "
+                "rejects admin."
             ),
             "ambiguity": (
                 "Return ask_clarify when two or more candidates are plausible and close, "
@@ -4769,6 +5267,15 @@ def _blueprints_nav_command_body(candidate: dict[str, Any]) -> dict[str, Any]:
             "action": "selector_action",
             "selector_action": candidate.get("selector_action") or "",
         }
+    if kind == "open_matrix_chat_room":
+        return {
+            "action": "open_matrix_chat_room",
+            "group": candidate.get("group") or "settings",
+            "page_id": candidate.get("page_id") or "matrix-chat",
+            "server_id": candidate.get("server_id") or "",
+            "room_id": candidate.get("room_id") or "",
+            "room_hint": candidate.get("room_hint") or "",
+        }
     return {"action": ""}
 
 
@@ -4822,6 +5329,7 @@ async def _run_blueprints_nav_bounded_helper(
     client: httpx.AsyncClient,
     environ: dict[str, str] | None = None,
     timing: WakeSttRouteTiming | None = None,
+    conversation_key: str = "",
 ) -> dict[str, Any]:
     api_base, base_error = _wake_stt_blueprints_nav_api_base(environ)
     if not api_base:
@@ -4831,7 +5339,10 @@ async def _run_blueprints_nav_bounded_helper(
             "speech": "Blueprints navigation is not available.",
             "matrix_detail": base_error,
         }
-    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(environ)
+    blueprints_nav_context = _read_wake_stt_blueprints_nav_context(
+        environ,
+        conversation_key=conversation_key,
+    )
     candidates, diagnostics = await _collect_blueprints_nav_candidates(
         text,
         client=client,
@@ -4885,6 +5396,8 @@ async def _run_blueprints_nav_bounded_helper(
                 decision=decision,
                 candidates=candidates,
                 environ=environ,
+                conversation_key=conversation_key,
+                context_kind="unresolved_navigation",
             )
             if timing:
                 timing.mark(
@@ -4893,7 +5406,10 @@ async def _run_blueprints_nav_bounded_helper(
                     candidate_count=context_update.get("candidate_count", 0),
                 )
         else:
-            context_update = clear_wake_stt_blueprints_nav_context(environ)
+            context_update = clear_wake_stt_blueprints_nav_context(
+                environ,
+                conversation_key=conversation_key,
+            )
             if timing:
                 timing.mark(
                     "blueprints_nav_context_cleared",
@@ -4919,8 +5435,18 @@ async def _run_blueprints_nav_bounded_helper(
         timeout_seconds=5.0,
     )
     dispatch_ok = bool(dispatch.get("ok"))
-    context_clear = clear_wake_stt_blueprints_nav_context(environ)
     status = "blueprints_nav_dispatched" if dispatch_ok else "blueprints_nav_dispatch_failed"
+    context_update = _write_wake_stt_blueprints_nav_context(
+        request_text=text,
+        status=status,
+        decision=decision,
+        candidates=candidates,
+        environ=environ,
+        conversation_key=conversation_key,
+        context_kind="last_navigation_action",
+        command=command_body,
+        dispatch={"command": command_body, "response": dispatch},
+    )
     if timing:
         timing.mark(
             "blueprints_nav_dispatch_complete",
@@ -4929,9 +5455,10 @@ async def _run_blueprints_nav_bounded_helper(
             ok=dispatch_ok,
         )
         timing.mark(
-            "blueprints_nav_context_cleared",
-            ok=bool(context_clear.get("ok")),
-            reason="nav_dispatch",
+            "blueprints_nav_context_saved",
+            ok=bool(context_update.get("ok")),
+            candidate_count=context_update.get("candidate_count", 0),
+            context_kind="last_navigation_action",
         )
     label = _blueprints_nav_text(candidate.get("label"), 120)
     speech = decision.get("speech") or (
@@ -4956,7 +5483,7 @@ async def _run_blueprints_nav_bounded_helper(
         "dispatch": dispatch,
         "command": command_body,
         "diagnostics": diagnostics,
-        "blueprints_nav_context": context_clear,
+        "blueprints_nav_context": context_update,
     }
 
 
@@ -4967,6 +5494,7 @@ async def _submit_wake_stt_blueprints_nav_bounded_handoff(
     profile_routing: WakeSttProfileRoutingResult,
     client: httpx.AsyncClient | None = None,
     timing: WakeSttRouteTiming | None = None,
+    conversation_key: str = "",
     handoff_assignment_callback: HandoffAssignmentCallback | None = None,
     research_followup_task: asyncio.Task[WakeSttResearchFollowupResult] | None = None,
 ) -> HermesSttSubmitResult:
@@ -4997,6 +5525,7 @@ async def _submit_wake_stt_blueprints_nav_bounded_handoff(
             gate.meat,
             client=http_client,
             timing=timing,
+            conversation_key=conversation_key,
         )
     finally:
         if close_client:
@@ -5208,6 +5737,7 @@ async def submit_wake_stt_profile_handoff(
     client: httpx.AsyncClient | None = None,
     timing: WakeSttRouteTiming | None = None,
     trusted_authorised: bool = False,
+    conversation_key: str = "",
     handoff_assignment_callback: HandoffAssignmentCallback | None = None,
     research_followup_task: asyncio.Task[WakeSttResearchFollowupResult] | None = None,
 ) -> HermesSttSubmitResult:
@@ -5276,6 +5806,7 @@ async def submit_wake_stt_profile_handoff(
             profile_routing=profile_routing,
             client=client,
             timing=timing,
+            conversation_key=conversation_key,
             handoff_assignment_callback=handoff_assignment_callback,
             research_followup_task=research_followup_task,
         )
@@ -5441,6 +5972,7 @@ async def deliver_wake_stt_with_matrix_fallback(
     profile_routing_enabled: bool = False,
     profile_routing_result: WakeSttProfileRoutingResult | dict[str, Any] | None = None,
     direct_route: str = "direct_local",
+    conversation_key: str = "",
 ) -> WakeSttDeliveryResult:
     """Deliver Wake STT through the selected explicit route.
 
@@ -5489,7 +6021,11 @@ async def deliver_wake_stt_with_matrix_fallback(
             base_submit_task: asyncio.Task[HermesSttSubmitResult] | None = None
             if stored_profile_routing is None:
                 profile_routing_task = asyncio.create_task(
-                    classify_wake_stt_profile(text, timing=timing)
+                    classify_wake_stt_profile(
+                        text,
+                        timing=timing,
+                        conversation_key=conversation_key,
+                    )
                 )
                 if not gate.authorised:
                     base_submit_task = asyncio.create_task(
@@ -5567,6 +6103,7 @@ async def deliver_wake_stt_with_matrix_fallback(
                         profile_routing=profile_routing,
                         handoff_assignment_callback=handoff_assignment_callback,
                         research_followup_task=research_followup_task,
+                        conversation_key=conversation_key,
                     )
             else:
                 if base_submit_task:
@@ -5589,6 +6126,7 @@ async def deliver_wake_stt_with_matrix_fallback(
                     profile_routing=profile_routing,
                     handoff_assignment_callback=handoff_assignment_callback,
                     research_followup_task=research_followup_task,
+                    conversation_key=conversation_key,
                 )
         else:
             direct_result = await submit_wake_stt_to_hermes(

@@ -853,6 +853,154 @@ def test_classify_wake_stt_profile_routes_blueprints_nav_followup(monkeypatch, t
     assert "Open Hermes documents on Trilio" in classifier_payload
 
 
+def test_classify_wake_stt_profile_routes_correction_to_bounded_nav_context(
+    monkeypatch,
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    context_file = tmp_path / "blueprints-nav-context.json"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="vps",
+    )
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+                "updated_at_epoch": time.time(),
+                "conversations": {
+                    conversation_key: {
+                        "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+                        "updated_at_epoch": time.time(),
+                        "conversation_key": conversation_key,
+                        "request_text": "open the vps chat",
+                        "status": "blueprints_nav_dispatched",
+                        "context_kind": "last_navigation_action",
+                        "decision": {
+                            "action": "dispatch",
+                            "candidate_id": "page:settings.matrix-chat-admin",
+                            "confidence": 0.86,
+                            "ambiguous": False,
+                            "reason": "nearby page candidate",
+                            "speech": "Opening Chat Admin.",
+                        },
+                        "candidates": [
+                            {
+                                "id": "matrix_chat_room:vps.shared-bridge",
+                                "kind": "open_matrix_chat_room",
+                                "label": "Matrix Chat - VPS - Shared Bridge",
+                                "group": "settings",
+                                "page_id": "matrix-chat",
+                                "server_id": "vps",
+                                "room_hint": "Shared Bridge",
+                            },
+                            {
+                                "id": "page:settings.matrix-chat-admin",
+                                "kind": "open_page",
+                                "label": "Chat Admin",
+                                "group": "settings",
+                                "page_id": "matrix-chat-admin",
+                            },
+                        ],
+                        "last_navigation_action": {
+                            "request_text": "open the vps chat",
+                            "status": "blueprints_nav_dispatched",
+                            "selected_candidate": {
+                                "id": "page:settings.matrix-chat-admin",
+                                "kind": "open_page",
+                                "label": "Chat Admin",
+                                "group": "settings",
+                                "page_id": "matrix-chat-admin",
+                            },
+                            "candidates": [
+                                {
+                                    "id": "matrix_chat_room:vps.shared-bridge",
+                                    "kind": "open_matrix_chat_room",
+                                    "label": "Matrix Chat - VPS - Shared Bridge",
+                                    "group": "settings",
+                                    "page_id": "matrix-chat",
+                                    "server_id": "vps",
+                                    "room_hint": "Shared Bridge",
+                                },
+                                {
+                                    "id": "page:settings.matrix-chat-admin",
+                                    "kind": "open_page",
+                                    "label": "Chat Admin",
+                                    "group": "settings",
+                                    "page_id": "matrix-chat-admin",
+                                },
+                            ],
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+    captured: dict[str, object] = {"calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["calls"] = int(captured["calls"]) + 1
+        captured["classifier"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "relation": "repair_previous_action",
+                                    "confidence": 0.93,
+                                    "reason": "negative feedback repairs the last bounded navigation",
+                                    "interpreted_request": (
+                                        "Open Matrix Chat, select VPS, and select Shared Bridge."
+                                    ),
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "I didn't want chat admin, I wanted the shared bridge room, I think that's the VPS chat",
+                client=client,
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert result.requires_command_code is False
+    assert result.status == "blueprints_nav_repair_classified"
+    assert captured["calls"] == 1
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "previous_blueprints_navigation" in classifier_payload
+    assert "last_navigation_action" in classifier_payload
+    assert "Chat Admin" in classifier_payload
+
+
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
     cases = {
         "set alarm": True,
@@ -1585,6 +1733,235 @@ def test_submit_wake_stt_blueprints_nav_target_opens_docs_result(monkeypatch, tm
     assert "doc:doc-webdesign" in json.dumps(captured["classifier"])
 
 
+def test_submit_wake_stt_blueprints_nav_target_opens_matrix_vps_shared_bridge(
+    monkeypatch,
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "pages": [
+                        {
+                            "group": "settings",
+                            "tab": "matrix-chat",
+                            "page_label": "Matrix Chat",
+                            "description": "Normal Matrix chat rooms.",
+                        },
+                        {
+                            "group": "settings",
+                            "tab": "matrix-chat-admin",
+                            "page_label": "Chat Admin",
+                            "description": "Matrix room and user management.",
+                        },
+                    ],
+                    "modals": [],
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            return httpx.Response(200, json={"ok": True, "results": []})
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            captured["classifier"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "dispatch",
+                                        "candidate_id": "matrix_chat_room:vps.shared-bridge",
+                                        "confidence": 0.94,
+                                        "ambiguous": False,
+                                        "reason": "shared bridge room maps to VPS Matrix Chat state",
+                                        "speech": "Opening the VPS Shared Bridge room.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+            captured["command"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "open the chat room for shared bridge please",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert captured["command"] == {
+        "action": "open_matrix_chat_room",
+        "group": "settings",
+        "page_id": "matrix-chat",
+        "server_id": "vps",
+        "room_id": "",
+        "room_hint": "Shared Bridge",
+    }
+    prompt = json.loads(captured["classifier"]["messages"][1]["content"])
+    candidate_ids = [candidate["id"] for candidate in prompt["candidates"]]
+    assert "matrix_chat_room:vps.shared-bridge" in candidate_ids
+    assert "page:settings.matrix-chat-admin" in candidate_ids
+    assert candidate_ids.index("matrix_chat_room:vps.shared-bridge") < candidate_ids.index(
+        "page:settings.matrix-chat-admin"
+    )
+
+
+def test_submit_wake_stt_blueprints_nav_explicit_admin_can_open_admin_surface(
+    monkeypatch,
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "pages": [
+                        {
+                            "group": "settings",
+                            "tab": "matrix-chat",
+                            "page_label": "Matrix Chat",
+                            "description": "Normal Matrix chat rooms.",
+                        },
+                        {
+                            "group": "settings",
+                            "tab": "matrix-chat-admin",
+                            "page_label": "Chat Admin",
+                            "description": "Matrix room and user management.",
+                        },
+                    ],
+                    "modals": [],
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            return httpx.Response(200, json={"ok": True, "results": []})
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "dispatch",
+                                        "candidate_id": "page:settings.matrix-chat-admin",
+                                        "confidence": 0.91,
+                                        "ambiguous": False,
+                                        "reason": "operator explicitly asked for Chat Admin",
+                                        "speech": "Opening Chat Admin.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+            captured["command"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "open chat admin",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert captured["command"] == {
+        "action": "open_page",
+        "group": "settings",
+        "page_id": "matrix-chat-admin",
+    }
+
+
 def test_submit_wake_stt_blueprints_nav_ask_clarify_saves_context(monkeypatch, tmp_path):
     examples = tmp_path / "profile-routing-examples.json"
     examples.write_text(
@@ -1822,7 +2199,10 @@ def test_submit_wake_stt_blueprints_nav_followup_dispatches_context_doc(
     classifier_payload = json.dumps(captured["classifier"])
     assert "recent_blueprints_navigation_clarification" in classifier_payload
     assert "doc:doc-twilio" in classifier_payload
-    assert not context_file.exists()
+    saved = json.loads(context_file.read_text(encoding="utf-8"))
+    assert saved["context_kind"] == "last_navigation_action"
+    assert saved["unresolved_navigation"] == {}
+    assert saved["last_navigation_action"]["selected_candidate"]["id"] == "doc:doc-twilio"
 
 
 def test_submit_wake_stt_blueprints_nav_target_opens_live_selector(monkeypatch, tmp_path):

@@ -209,6 +209,7 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "close_vad_dev",
     "close_modal",
     "open_page",
+    "open_matrix_chat_room",
     "open_modal",
     "open_doc",
     "menu_function",
@@ -231,6 +232,9 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "page": "open_page",
     "open_tab": "open_page",
     "tab": "open_page",
+    "matrix_chat_room": "open_matrix_chat_room",
+    "chat_room": "open_matrix_chat_room",
+    "open_chat_room": "open_matrix_chat_room",
     "modal": "open_modal",
     "doc": "open_doc",
     "document": "open_doc",
@@ -349,6 +353,10 @@ class ActiveBrowserCommandBody(BaseModel):
     menu_item_id: str | None = None
     fn: str | None = None
     modal_id: str | None = None
+    server_id: str | None = None
+    matrix_server: str | None = None
+    room_id: str | None = None
+    room_hint: str | None = None
     doc_id: str | None = None
     path: str | None = None
     doc_path: str | None = None
@@ -3032,6 +3040,11 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
     menu_item_id = _clean_active_browser_menu_item_id(body.menu_item_id or body.menu_id)
     fn_key = _clean_active_browser_fn_key(body.fn)
     modal_id = _clean_active_browser_modal_id(body.modal_id)
+    server_id = _clean_string(body.server_id or body.matrix_server, "", 16).lower()
+    if server_id not in {"tb1", "vps"}:
+        server_id = ""
+    room_id = _clean_string(body.room_id, "", 255)
+    room_hint = _clean_string(body.room_hint, "", 160)
     selector_action = _clean_active_browser_selector_action(body.selector_action)
     event_kind = _clean_active_browser_event_kind(body.event_kind)
     doc_id = _clean_string(body.doc_id, "", 120)
@@ -3063,6 +3076,12 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload["fn"] = fn_key
     if modal_id:
         payload["modal_id"] = modal_id
+    if server_id:
+        payload["server_id"] = server_id
+    if room_id:
+        payload["room_id"] = room_id
+    if room_hint:
+        payload["room_hint"] = room_hint
     if doc_id:
         payload["doc_id"] = doc_id
     if doc_path:
