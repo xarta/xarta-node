@@ -1133,6 +1133,7 @@ async def _wake_stt_clear_house_response_fields() -> dict[str, str]:
     pending_count = len(_WAKE_STT_PENDING_COMMAND_CODE_REQUESTS)
     _WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
     research_clear = wake_stt_direct.clear_wake_stt_research_context()
+    blueprints_nav_clear = wake_stt_direct.clear_wake_stt_blueprints_nav_context()
     tts_companion = _reset_wake_stt_tts_companion_state()
     stop = await _publish_wake_stt_tts_stop_event("wake_stt_clear_house")
     detail = "\n".join(
@@ -1142,6 +1143,7 @@ async def _wake_stt_clear_house_response_fields() -> dict[str, str]:
             f"New Wake STT session: {new_session_id}.",
             f"Pending Command Code holds cleared: {pending_count}.",
             f"Research follow-up context cleared: {bool(research_clear.get('ok'))}.",
+            f"Blueprints navigation follow-up context cleared: {bool(blueprints_nav_clear.get('ok'))}.",
             f"TTS companion state reset: {bool(tts_companion.get('ok'))}.",
             f"TTS stop event: {'ok' if stop.get('ok') else 'failed'}.",
             "Matrix history was not redacted or deleted.",
