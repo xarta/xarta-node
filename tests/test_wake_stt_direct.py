@@ -666,6 +666,55 @@ def test_validate_wake_stt_profile_classifier_accepts_alarm_clock_target_without
     assert parsed.requires_command_code is False
 
 
+def test_validate_wake_stt_profile_classifier_accepts_blueprints_nav_without_code():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+            "requires_command_code": True,
+            "complex": False,
+            "risk_class": "blueprints_navigation",
+            "confidence": 0.94,
+            "reason": "bounded active browser navigation",
+            "speech_if_pending": "Command Code required.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.target_profile == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert parsed.requires_command_code is False
+
+
+def test_validate_wake_stt_profile_classifier_gates_complex_blueprints_nav():
+    parsed, reason = wake_stt_direct.validate_wake_stt_profile_classifier_json(
+        {
+            "target_profile": wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+            "requires_command_code": False,
+            "complex": True,
+            "risk_class": "blueprints_navigation",
+            "confidence": 0.94,
+            "reason": "complex browser automation request",
+            "speech_if_pending": "Command Code required.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.requires_command_code is True
+
+
+def test_blueprints_nav_policy_treats_open_and_document_as_weak_signals():
+    prompt = wake_stt_direct._wake_stt_profile_classifier_prompt(
+        request_text="could you show me that web design thing",
+        examples_config={},
+    )
+
+    policy = prompt["policy"]["blueprints_navigation"]
+    assert "weak signals only" in policy
+    assert "absence is not an inverse signal" in policy
+    assert wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE in prompt["allowed_targets"]
+
+
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
     cases = {
         "set alarm": True,
@@ -1266,6 +1315,240 @@ def test_submit_wake_stt_nullclaw_target_uses_bounded_route(monkeypatch):
     assert "Local docs say" in result.companion.matrix_detail
     assert "Public sources describe" in result.companion.matrix_detail
     assert assignments[0]["target_profile"] == "hermes-stt-nullclaw"
+
+
+def test_submit_wake_stt_blueprints_nav_target_opens_docs_result(monkeypatch, tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "pages": [],
+                    "modals": [],
+                    "documents": [],
+                    "routes": {},
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "view": {
+                        "automation": {
+                            "menus": [],
+                            "selector_actions": [
+                                {"action": "clock", "label": "Clock", "bridge_group": ""}
+                            ],
+                        }
+                    },
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            captured["docs_search"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "results": [
+                        {
+                            "title": "WEB DESIGN",
+                            "doc_id": "doc-webdesign",
+                            "doc_path": "web-design/README.md",
+                            "snippet": "Web Design Documentation",
+                            "openable": True,
+                            "keyword_terms": ["web", "design"],
+                        }
+                    ],
+                },
+            )
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            captured["classifier"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "dispatch",
+                                        "candidate_id": "doc:doc-webdesign",
+                                        "confidence": 0.93,
+                                        "ambiguous": False,
+                                        "reason": "docs search result matches the request",
+                                        "speech": "Opening Web Design.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+            captured["command"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(200, json={"ok": True, "payload": captured["command"]})
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "show me the web design readme",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.target_profile == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert result.handoff and result.handoff["mode"] == "bounded_blueprints_navigation"
+    assert captured["docs_search"]["query"] == "show me the web design readme"
+    assert captured["command"] == {
+        "action": "open_doc",
+        "doc_id": "doc-webdesign",
+        "path": "web-design/README.md",
+        "highlight_terms": ["web", "design"],
+    }
+    assert "doc:doc-webdesign" in json.dumps(captured["classifier"])
+
+
+def test_submit_wake_stt_blueprints_nav_target_opens_live_selector(monkeypatch, tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "view": {
+                        "automation": {
+                            "menus": [],
+                            "selector_actions": [
+                                {"action": "clock", "label": "Clock", "bridge_group": ""},
+                                {
+                                    "action": "hard-refresh",
+                                    "label": "Hard Refresh App Assets",
+                                    "bridge_group": "",
+                                },
+                            ],
+                        }
+                    },
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            return httpx.Response(200, json={"ok": True, "results": []})
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            captured["classifier"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "dispatch",
+                                        "candidate_id": "selector:clock",
+                                        "confidence": 0.91,
+                                        "ambiguous": False,
+                                        "reason": "live safe selector matches clock page",
+                                        "speech": "Opening Clock.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+            captured["command"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "open the clock page",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert captured["command"] == {"action": "selector_action", "selector_action": "clock"}
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "selector:clock" in classifier_payload
+    assert "hard-refresh" not in classifier_payload
 
 
 def test_call_nullclaw_web_research_uses_plain_query(monkeypatch, tmp_path):

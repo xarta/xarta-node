@@ -46,6 +46,25 @@ DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL = ""
 DEFAULT_WAKE_STT_PROFILE_CLASSIFIER_TIMEOUT_MS = 2500
 WAKE_STT_NULLCLAW_PROFILE = "hermes-stt-nullclaw"
 WAKE_STT_ALARM_PROFILE = "hermes-stt-alarm-clock"
+WAKE_STT_BLUEPRINTS_NAV_PROFILE = "hermes-stt-blueprints-nav"
+WAKE_STT_BLUEPRINTS_NAV_MIN_CONFIDENCE = 0.80
+DEFAULT_BLUEPRINTS_NAV_API_BASE = "http://127.0.0.1:8080"
+BLUEPRINTS_NAV_SAFE_MODAL_CATALOG_IDS = frozenset(
+    {
+        "settings.docs.modal.docs-search",
+        "app.help.modal.help",
+    }
+)
+BLUEPRINTS_NAV_BLOCKED_SELECTOR_ACTIONS = frozenset(
+    {
+        "api-key",
+        "api-key-test",
+        "cache-mode",
+        "diag-chip",
+        "hard-refresh",
+        "pockettts-hard-refresh",
+    }
+)
 WAKE_STT_NULLCLAW_GUARD_SCRIPT = (
     Path("/xarta-node/.lone-wolf/stacks/nullclaw01/.claude/skills/dockge-stack-nullclaw01")
     / "scripts/guard-nullclaw-runtime.sh"
@@ -61,6 +80,7 @@ WAKE_STT_PROFILE_TARGETS = frozenset(
         "hermes-stt-local",
         WAKE_STT_NULLCLAW_PROFILE,
         WAKE_STT_ALARM_PROFILE,
+        WAKE_STT_BLUEPRINTS_NAV_PROFILE,
         "hermes-stt-average",
         "hermes-stt-smart",
     }
@@ -73,6 +93,7 @@ WAKE_STT_PROFILE_RISK_CLASSES = frozenset(
         "docs_lookup",
         "web_research",
         "alarm_clock",
+        "blueprints_navigation",
         "filesystem_mutation",
         "scripting",
         "infra_debug",
@@ -1631,6 +1652,8 @@ def _wake_stt_profile_requires_command_code(
         return False
     if complex_request:
         return True
+    if target_profile == WAKE_STT_BLUEPRINTS_NAV_PROFILE and risk_class == "blueprints_navigation":
+        return False
     if target_profile == WAKE_STT_NULLCLAW_PROFILE:
         return risk_class not in WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES
     if target_profile != "hermes-stt":
@@ -1685,6 +1708,25 @@ def _wake_stt_profile_classifier_prompt(
                 "alarm_clock, Command Code is not required because the route is bounded "
                 "to Blueprints alarm APIs and active-browser SSE."
             ),
+            "blueprints_navigation": (
+                "Use hermes-stt-blueprints-nav for requests whose intended result is to "
+                "find, show, display, navigate to, or open a Blueprints app page, safe "
+                "registered app surface, help surface, or registered local document in "
+                "the current Active Browser. This includes vague descriptions where the "
+                "speaker may not remember the exact page or document name. Words such as "
+                "open, page, document, docs, find, show, and display are weak signals only: "
+                "their presence is not sufficient by itself, and their absence is not an "
+                "inverse signal. Classify from the full request meaning and noisy STT "
+                "context. Do not choose this target for arbitrary external URLs, raw local "
+                "filesystem paths, terminal/browser automation, toggles, hard refreshes, "
+                "creating/editing/deleting documents, code changes, service control, or "
+                "anything outside the bounded Blueprints navigation catalog. When "
+                "target_profile is hermes-stt-blueprints-nav, risk_class is "
+                "blueprints_navigation, and complex=false, Command Code is not required "
+                "because a second bounded classifier must choose only from cataloged "
+                "Blueprints pages, safe live selector surfaces, and docs-search results "
+                "before dispatching to the Active Browser command API."
+            ),
             "average": "Use hermes-stt-average for medium-complex public web research, NullClaw web lookups, broader synthesis, and tasks likely too nuanced for local no-think.",
             "smart": "Use hermes-stt-smart for complex debugging, scripts, Proxmox/LXC/network/service diagnosis, SSH, Docker, destructive or high-impact work, and any uncertainty.",
             "stt_interpretation": (
@@ -1703,8 +1745,12 @@ def _wake_stt_profile_classifier_prompt(
                 "and guarded NullClaw research APIs. The other narrow exception is "
                 "hermes-stt-alarm-clock with risk_class alarm_clock; that route is bounded "
                 "to alarm settings/control APIs and performs its own alarm-specific "
-                "classification before writes. "
-                "Any filesystem mutation, terminal, SSH, Docker, browser, web, messaging, "
+                "classification before writes. The third narrow exception is "
+                "hermes-stt-blueprints-nav with risk_class blueprints_navigation and "
+                "complex=false; that route is bounded to cataloged Blueprints navigation "
+                "and registered-document opening in the current Active Browser. "
+                "Any filesystem mutation, terminal, SSH, Docker, browser action outside "
+                "that bounded Blueprints navigation route, web, messaging, "
                 "service, infrastructure, credential/access, destructive, externally visible, "
                 "or uncertain work requires Command Code authorisation. If complex=true then "
                 "requires_command_code=true unless the target is the bounded alarm clock route."
@@ -3657,6 +3703,828 @@ async def _submit_wake_stt_nullclaw_bounded_handoff(
     )
 
 
+def _wake_stt_blueprints_nav_api_base(
+    environ: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    env = os.environ if environ is None else environ
+    raw = (
+        str(
+            env.get("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE")
+            or env.get("BLUEPRINTS_API_BASE")
+            or DEFAULT_BLUEPRINTS_NAV_API_BASE
+        )
+        .strip()
+        .rstrip("/")
+    )
+    if not raw:
+        return "", "Blueprints navigation API base is not configured"
+    parsed = urlparse(raw)
+    hostname = (parsed.hostname or "").strip().lower()
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return "", "Blueprints navigation API base was invalid"
+    allow_non_loopback = _truthy(env.get("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK"))
+    if hostname not in {"127.0.0.1", "localhost", "::1"} and not allow_non_loopback:
+        return "", "Blueprints navigation API base was not loopback"
+    return raw, ""
+
+
+async def _blueprints_nav_request_json(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    try:
+        response = await client.request(
+            method.upper(),
+            url,
+            json=payload,
+            timeout=timeout_seconds,
+            headers={"Accept": "application/json"},
+        )
+    except httpx.RequestError as exc:
+        return {
+            "ok": False,
+            "status": "request_error",
+            "error": f"{type(exc).__name__}: {_clip_text(exc, 240)}",
+        }
+    if not response.is_success:
+        return {
+            "ok": False,
+            "status": "http_error",
+            "http_status": response.status_code,
+            "error": _clip_text(response.text, 500),
+        }
+    try:
+        parsed = response.json()
+    except ValueError:
+        return {"ok": False, "status": "bad_json", "error": _clip_text(response.text, 500)}
+    if not isinstance(parsed, dict):
+        return {"ok": False, "status": "non_object_json"}
+    return parsed
+
+
+def _blueprints_nav_text(value: Any, limit: int = 240) -> str:
+    return _clip_text(_SPACE_RE.sub(" ", str(value or "").strip()), limit)
+
+
+def _blueprints_nav_candidate_public(candidate: dict[str, Any]) -> dict[str, Any]:
+    public: dict[str, Any] = {
+        "id": candidate.get("id"),
+        "kind": candidate.get("kind"),
+        "label": candidate.get("label"),
+        "source": candidate.get("source"),
+    }
+    for key in (
+        "route",
+        "group",
+        "page_id",
+        "modal_id",
+        "selector_action",
+        "doc_id",
+        "path",
+        "description",
+        "snippet",
+    ):
+        value = candidate.get(key)
+        if value:
+            public[key] = _blueprints_nav_text(value, 500 if key == "snippet" else 180)
+    if candidate.get("aliases"):
+        public["aliases"] = candidate.get("aliases")
+    return public
+
+
+def _blueprints_nav_add_candidate(
+    candidates: list[dict[str, Any]],
+    seen: set[str],
+    candidate: dict[str, Any],
+) -> None:
+    candidate_id = _blueprints_nav_text(candidate.get("id"), 220)
+    kind = _blueprints_nav_text(candidate.get("kind"), 40)
+    label = _blueprints_nav_text(candidate.get("label"), 160)
+    if not candidate_id or not kind or not label or candidate_id in seen:
+        return
+    if kind not in {"open_page", "open_doc", "open_modal", "selector_action"}:
+        return
+    seen.add(candidate_id)
+    candidates.append({**candidate, "id": candidate_id, "kind": kind, "label": label})
+
+
+def _blueprints_nav_catalog_candidates(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in catalog.get("pages") if isinstance(catalog.get("pages"), list) else []:
+        if not isinstance(page, dict):
+            continue
+        group = _blueprints_nav_text(page.get("group"), 60)
+        page_id = _blueprints_nav_text(page.get("tab"), 120)
+        if not group or not page_id:
+            continue
+        _blueprints_nav_add_candidate(
+            candidates,
+            seen,
+            {
+                "id": f"page:{group}.{page_id}",
+                "kind": "open_page",
+                "source": "help_catalog",
+                "label": page.get("page_label") or page.get("label") or page_id,
+                "description": page.get("description") or page.get("parent") or "",
+                "route": page.get("route") or f"{group}.{page_id}",
+                "group": group,
+                "page_id": page_id,
+            },
+        )
+    for modal in catalog.get("modals") if isinstance(catalog.get("modals"), list) else []:
+        if not isinstance(modal, dict) or modal.get("dispatchable") is False:
+            continue
+        if modal.get("catalog_id") not in BLUEPRINTS_NAV_SAFE_MODAL_CATALOG_IDS:
+            continue
+        target = modal.get("target") if isinstance(modal.get("target"), dict) else {}
+        group = _blueprints_nav_text(target.get("group"), 60)
+        page_id = _blueprints_nav_text(target.get("tab"), 120)
+        modal_id = _blueprints_nav_text(target.get("modal_id"), 120)
+        if not modal_id:
+            continue
+        _blueprints_nav_add_candidate(
+            candidates,
+            seen,
+            {
+                "id": f"modal:{modal.get('catalog_id')}",
+                "kind": "open_modal",
+                "source": "help_catalog",
+                "label": modal.get("label") or modal.get("modal") or modal_id,
+                "description": modal.get("description") or "",
+                "route": modal.get("route") or "",
+                "group": group,
+                "page_id": page_id,
+                "modal_id": modal_id,
+                "aliases": modal.get("aliases") if isinstance(modal.get("aliases"), list) else [],
+            },
+        )
+    return candidates
+
+
+def _blueprints_nav_selector_action_allowed(action: str, label: str) -> bool:
+    if not action or action in BLUEPRINTS_NAV_BLOCKED_SELECTOR_ACTIONS:
+        return False
+    lowered = f"{action} {label}".lower()
+    if "toggle" in lowered or "hard refresh" in lowered or "hard-refresh" in lowered:
+        return False
+    return True
+
+
+def _blueprints_nav_active_view_candidates(active_view: dict[str, Any]) -> list[dict[str, Any]]:
+    view = active_view.get("view") if isinstance(active_view.get("view"), dict) else {}
+    automation = view.get("automation") if isinstance(view.get("automation"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    menus = automation.get("menus") if isinstance(automation.get("menus"), list) else []
+    for menu in menus:
+        if not isinstance(menu, dict):
+            continue
+        group = _blueprints_nav_text(menu.get("group"), 60)
+        pages = menu.get("pages") if isinstance(menu.get("pages"), list) else []
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            if page.get("blocked") is True or page.get("invokable") is False:
+                continue
+            page_id = _blueprints_nav_text(page.get("target_id") or page.get("id"), 180)
+            if not group or not page_id:
+                continue
+            _blueprints_nav_add_candidate(
+                candidates,
+                seen,
+                {
+                    "id": f"page:{group}.{page_id}",
+                    "kind": "open_page",
+                    "source": "active_browser_state",
+                    "label": page.get("page_label") or page.get("label") or page_id,
+                    "description": page.get("parent") or "",
+                    "route": f"{group}.{page_id}",
+                    "group": group,
+                    "page_id": page_id,
+                },
+            )
+    selectors = (
+        automation.get("selector_actions")
+        if isinstance(automation.get("selector_actions"), list)
+        else []
+    )
+    for item in selectors:
+        if not isinstance(item, dict):
+            continue
+        action = _blueprints_nav_text(item.get("action") or item.get("id"), 120)
+        label = _blueprints_nav_text(item.get("label") or action, 160)
+        if not _blueprints_nav_selector_action_allowed(action, label):
+            continue
+        _blueprints_nav_add_candidate(
+            candidates,
+            seen,
+            {
+                "id": f"selector:{action}",
+                "kind": "selector_action",
+                "source": "active_browser_state",
+                "label": label,
+                "selector_action": action,
+                "group": item.get("bridge_group") or "",
+            },
+        )
+    return candidates
+
+
+def _blueprints_nav_docs_candidates(search: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    candidate_seen: set[str] = set()
+    results = search.get("results") if isinstance(search.get("results"), list) else []
+    for result in results:
+        if not isinstance(result, dict) or result.get("openable") is False:
+            continue
+        doc_id = _blueprints_nav_text(result.get("doc_id"), 140)
+        path = _blueprints_nav_text(result.get("doc_path") or result.get("path"), 300)
+        if not doc_id and not path:
+            continue
+        identity = doc_id or path.lower()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidate_id = f"doc:{doc_id}" if doc_id else f"docpath:{path.lower()}"
+        _blueprints_nav_add_candidate(
+            candidates,
+            seen=candidate_seen,
+            candidate={
+                "id": candidate_id,
+                "kind": "open_doc",
+                "source": "docs_search",
+                "label": result.get("title") or path or doc_id,
+                "description": result.get("confidence_band") or "",
+                "doc_id": doc_id,
+                "path": path,
+                "snippet": result.get("snippet") or "",
+                "highlight_terms": (
+                    result.get("keyword_terms")
+                    if isinstance(result.get("keyword_terms"), list)
+                    else []
+                ),
+            },
+        )
+        if len(candidates) >= 12:
+            break
+    return candidates
+
+
+def _blueprints_nav_prompt_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    docs = [item for item in candidates if item.get("kind") == "open_doc"][:18]
+    selectors = [item for item in candidates if item.get("kind") == "selector_action"][:28]
+    modals = [item for item in candidates if item.get("kind") == "open_modal"][:8]
+    pages = [item for item in candidates if item.get("kind") == "open_page"]
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for bucket in (docs, selectors, modals, pages):
+        for item in bucket:
+            candidate_id = str(item.get("id") or "")
+            if not candidate_id or candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            ordered.append(item)
+            if len(ordered) >= 140:
+                return ordered
+    return ordered
+
+
+async def _collect_blueprints_nav_candidates(
+    request_text: str,
+    *,
+    client: httpx.AsyncClient,
+    api_base: str,
+    timing: WakeSttRouteTiming | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    safe_text = command_code_storage_safe_text(request_text)
+    catalog_task = asyncio.create_task(
+        _blueprints_nav_request_json(client, "GET", f"{api_base}/api/v1/help/catalog")
+    )
+    active_view_task = asyncio.create_task(
+        _blueprints_nav_request_json(
+            client,
+            "GET",
+            f"{api_base}/api/v1/voice-mode/active-browser-view",
+        )
+    )
+    docs_task = asyncio.create_task(
+        _blueprints_nav_request_json(
+            client,
+            "POST",
+            f"{api_base}/api/v1/docs/search",
+            payload={"query": safe_text or request_text, "mode": "hybrid", "top_k": 8},
+            timeout_seconds=8.0,
+        )
+    )
+    catalog, active_view, docs_search = await asyncio.gather(
+        catalog_task,
+        active_view_task,
+        docs_task,
+    )
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in _blueprints_nav_active_view_candidates(active_view):
+        _blueprints_nav_add_candidate(candidates, seen, candidate)
+    for candidate in _blueprints_nav_catalog_candidates(catalog):
+        _blueprints_nav_add_candidate(candidates, seen, candidate)
+    for candidate in _blueprints_nav_docs_candidates(docs_search):
+        _blueprints_nav_add_candidate(candidates, seen, candidate)
+    diagnostics = {
+        "catalog_ok": bool(catalog.get("ok")),
+        "active_view_ok": bool(active_view.get("ok")),
+        "docs_search_ok": bool(docs_search.get("ok")),
+        "candidate_count": len(candidates),
+        "catalog_status": catalog.get("status") or catalog.get("detail") or "",
+        "active_view_status": active_view.get("status") or active_view.get("detail") or "",
+        "docs_search_status": docs_search.get("status") or docs_search.get("detail") or "",
+    }
+    if timing:
+        timing.mark(
+            "blueprints_nav_candidates_collected",
+            candidate_count=len(candidates),
+            catalog_ok=diagnostics["catalog_ok"],
+            active_view_ok=diagnostics["active_view_ok"],
+            docs_search_ok=diagnostics["docs_search_ok"],
+        )
+    return candidates, diagnostics
+
+
+def _blueprints_nav_classifier_prompt(
+    *,
+    request_text: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "task": (
+            "Choose whether one candidate should be opened in the current Blueprints "
+            "Active Browser for this noisy Wake STT request. Do not execute anything."
+        ),
+        "request_text": command_code_storage_safe_text(request_text),
+        "policy": {
+            "candidate_only": (
+                "If dispatching, choose exactly one candidate_id from candidates. Never "
+                "invent a page, selector action, doc_id, path, URL, or command."
+            ),
+            "bounded_scope": (
+                "Allowed dispatches are opening a Blueprints page, a registered local "
+                "document, the help/docs-search modal, or a safe live selector surface. "
+                "Do not choose actions that mutate files, create/edit/delete documents, "
+                "toggle settings, hard refresh assets, open external websites, run "
+                "terminal commands, control services, or browse arbitrary URLs."
+            ),
+            "weak_signals": (
+                "Words like open, page, document, docs, find, show, and display are weak "
+                "signals only. Their presence is not sufficient by itself and their "
+                "absence is not an inverse signal. Use the whole request meaning, "
+                "candidate labels, paths, snippets, aliases, and noisy-STT context."
+            ),
+            "ambiguity": (
+                "Return ask_clarify when two or more candidates are plausible and close, "
+                "or when the request probably asks for navigation but the target is vague."
+            ),
+            "not_navigation": (
+                "Return none when the request is a question, coding task, research task, "
+                "file operation, external web request, or otherwise not a Blueprints "
+                "navigation/document-opening request."
+            ),
+        },
+        "candidates": [
+            _blueprints_nav_candidate_public(item)
+            for item in _blueprints_nav_prompt_candidates(candidates)
+        ],
+        "required_output": {
+            "action": "dispatch, ask_clarify, or none",
+            "candidate_id": "candidate id when action is dispatch, else empty",
+            "confidence": "number 0.0 to 1.0",
+            "ambiguous": "strict boolean",
+            "reason": "short reason",
+            "speech": "short TTS-friendly response",
+        },
+        "minimum_dispatch_confidence": WAKE_STT_BLUEPRINTS_NAV_MIN_CONFIDENCE,
+    }
+
+
+def _validate_blueprints_nav_decision(
+    raw: Any,
+    *,
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(_strip_json_markdown(raw))
+        except json.JSONDecodeError:
+            return None, "navigation classifier returned invalid JSON"
+    if not isinstance(raw, dict):
+        return None, "navigation classifier returned a non-object JSON value"
+    action = _blueprints_nav_text(raw.get("action"), 40).lower().replace("-", "_")
+    if action in {"clarify", "ask", "ask_clarification"}:
+        action = "ask_clarify"
+    if action in {"no_action", "not_navigation"}:
+        action = "none"
+    if action not in {"dispatch", "ask_clarify", "none"}:
+        return None, "navigation classifier returned an unknown action"
+    try:
+        confidence = float(raw.get("confidence"))
+    except (TypeError, ValueError):
+        return None, "navigation classifier confidence was not numeric"
+    confidence = max(0.0, min(confidence, 1.0))
+    ambiguous = raw.get("ambiguous")
+    if not isinstance(ambiguous, bool):
+        return None, "navigation classifier ambiguous field was not a strict boolean"
+    by_id = {str(candidate.get("id")): candidate for candidate in candidates}
+    candidate_id = _blueprints_nav_text(raw.get("candidate_id"), 220)
+    candidate = by_id.get(candidate_id) if candidate_id else None
+    if action == "dispatch":
+        if candidate is None:
+            return None, "navigation classifier selected an unknown candidate_id"
+        if ambiguous or confidence < WAKE_STT_BLUEPRINTS_NAV_MIN_CONFIDENCE:
+            action = "ask_clarify"
+    return (
+        {
+            "action": action,
+            "candidate_id": candidate_id if candidate else "",
+            "candidate": candidate,
+            "confidence": confidence,
+            "ambiguous": ambiguous,
+            "reason": _blueprints_nav_text(raw.get("reason"), 300),
+            "speech": _blueprints_nav_text(raw.get("speech"), 300),
+        },
+        "",
+    )
+
+
+async def _classify_blueprints_navigation(
+    request_text: str,
+    *,
+    candidates: list[dict[str, Any]],
+    client: httpx.AsyncClient,
+    environ: dict[str, str] | None = None,
+    timing: WakeSttRouteTiming | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    if not candidates:
+        return None, "no Blueprints navigation candidates were available"
+    examples_config, warning = _read_wake_stt_profile_examples(environ)
+    model, model_warning = _wake_stt_profile_classifier_model(examples_config)
+    warning = "; ".join(part for part in (warning, model_warning) if part)
+    api_key = _wake_stt_profile_classifier_key(environ=environ)
+    base_url = _wake_stt_profile_classifier_base_url(environ)
+    timeout_ms = _wake_stt_profile_classifier_timeout_ms(examples_config)
+    if not model:
+        return None, warning or "navigation classifier model is not configured"
+    if not api_key:
+        return None, "navigation classifier API key is not configured"
+    if not base_url:
+        return None, "navigation classifier base URL is not configured"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON only. Do not include markdown, prose, or think text. "
+                    "You are a narrow Blueprints Active Browser navigation classifier. "
+                    "Choose from provided candidates only; never invent routes or tools."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    _blueprints_nav_classifier_prompt(
+                        request_text=request_text,
+                        candidates=candidates,
+                    ),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 360,
+    }
+    try:
+        if timing:
+            timing.mark("blueprints_nav_classifier_start", model=model, timeout_ms=timeout_ms)
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout_ms / 1000.0,
+        )
+    except (httpx.TimeoutException, TimeoutError, asyncio.TimeoutError):
+        return None, "navigation classifier timed out"
+    except httpx.RequestError as exc:
+        return None, f"navigation classifier request failed: {type(exc).__name__}"
+    if not response.is_success:
+        return None, f"navigation classifier HTTP {response.status_code}"
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = {}
+    decision, reason = _validate_blueprints_nav_decision(
+        _assistant_text_from_chat_response(response_payload),
+        candidates=candidates,
+    )
+    if decision is None:
+        return None, reason
+    if timing:
+        timing.mark(
+            "blueprints_nav_classifier_complete",
+            action=decision["action"],
+            confidence=decision["confidence"],
+            candidate_id=decision["candidate_id"],
+        )
+    return decision, ""
+
+
+def _blueprints_nav_command_body(candidate: dict[str, Any]) -> dict[str, Any]:
+    kind = str(candidate.get("kind") or "")
+    if kind == "open_page":
+        return {
+            "action": "open_page",
+            "group": candidate.get("group") or "",
+            "page_id": candidate.get("page_id") or "",
+        }
+    if kind == "open_doc":
+        return {
+            "action": "open_doc",
+            "doc_id": candidate.get("doc_id") or "",
+            "path": candidate.get("path") or "",
+            "highlight_terms": [
+                _blueprints_nav_text(item, 80)
+                for item in candidate.get("highlight_terms", [])
+                if _blueprints_nav_text(item, 80)
+            ][:8],
+        }
+    if kind == "open_modal":
+        return {
+            "action": "open_modal",
+            "group": candidate.get("group") or "",
+            "page_id": candidate.get("page_id") or "",
+            "modal_id": candidate.get("modal_id") or "",
+        }
+    if kind == "selector_action":
+        return {
+            "action": "selector_action",
+            "selector_action": candidate.get("selector_action") or "",
+        }
+    return {"action": ""}
+
+
+def _blueprints_nav_matrix_detail(
+    *,
+    request_text: str,
+    status: str,
+    diagnostics: dict[str, Any],
+    decision: dict[str, Any] | None,
+    dispatch: dict[str, Any] | None,
+    error: str = "",
+) -> str:
+    parts = [
+        "Wake STT bounded Blueprints navigation",
+        f"Target: {WAKE_STT_BLUEPRINTS_NAV_PROFILE}",
+        f"Request: {_clip_text(command_code_storage_safe_text(request_text), 600)}",
+        f"Status: {status}",
+        f"Candidates: {diagnostics.get('candidate_count', 0)}",
+    ]
+    if decision:
+        candidate = decision.get("candidate") if isinstance(decision.get("candidate"), dict) else {}
+        parts.append(
+            "Decision: "
+            f"{decision.get('action')} confidence={round(float(decision.get('confidence') or 0), 3)} "
+            f"candidate={decision.get('candidate_id') or ''}"
+        )
+        if decision.get("reason"):
+            parts.append(f"Reason: {_clip_text(decision.get('reason'), 500)}")
+        if candidate:
+            parts.append(
+                "Candidate: "
+                f"{candidate.get('kind')} {_clip_text(candidate.get('label'), 160)} "
+                f"source={candidate.get('source')}"
+            )
+    if dispatch is not None:
+        parts.append(f"Dispatch: {json.dumps(dispatch, ensure_ascii=True, sort_keys=True)[:1200]}")
+    if error:
+        parts.append(f"Error: {_clip_text(error, 800)}")
+    for key in ("catalog_status", "active_view_status", "docs_search_status"):
+        if diagnostics.get(key):
+            parts.append(f"{key}: {_clip_text(diagnostics.get(key), 300)}")
+    parts.append(
+        "Conversation extension point: single-turn STT/TTS navigation only; no durable voice loop started."
+    )
+    return "\n".join(parts).strip()
+
+
+async def _run_blueprints_nav_bounded_helper(
+    text: str,
+    *,
+    client: httpx.AsyncClient,
+    environ: dict[str, str] | None = None,
+    timing: WakeSttRouteTiming | None = None,
+) -> dict[str, Any]:
+    api_base, base_error = _wake_stt_blueprints_nav_api_base(environ)
+    if not api_base:
+        return {
+            "ok": False,
+            "status": "blueprints_nav_unavailable",
+            "speech": "Blueprints navigation is not available.",
+            "matrix_detail": base_error,
+        }
+    candidates, diagnostics = await _collect_blueprints_nav_candidates(
+        text,
+        client=client,
+        api_base=api_base,
+        timing=timing,
+    )
+    decision, classify_error = await _classify_blueprints_navigation(
+        text,
+        candidates=candidates,
+        client=client,
+        environ=environ,
+        timing=timing,
+    )
+    if decision is None:
+        matrix_detail = _blueprints_nav_matrix_detail(
+            request_text=text,
+            status="blueprints_nav_classifier_failed",
+            diagnostics=diagnostics,
+            decision=None,
+            dispatch=None,
+            error=classify_error,
+        )
+        return {
+            "ok": False,
+            "status": "blueprints_nav_classifier_failed",
+            "speech": "I could not safely choose a Blueprints page or document.",
+            "matrix_detail": matrix_detail,
+            "diagnostics": diagnostics,
+        }
+    if decision["action"] != "dispatch":
+        speech = decision.get("speech") or (
+            "Which Blueprints page or document did you mean?"
+            if decision["action"] == "ask_clarify"
+            else "I did not find a Blueprints page or document to open."
+        )
+        status = f"blueprints_nav_{decision['action']}"
+        matrix_detail = _blueprints_nav_matrix_detail(
+            request_text=text,
+            status=status,
+            diagnostics=diagnostics,
+            decision=decision,
+            dispatch=None,
+        )
+        return {
+            "ok": True,
+            "status": status,
+            "speech": speech,
+            "matrix_detail": matrix_detail,
+            "decision": decision,
+            "diagnostics": diagnostics,
+        }
+    candidate = decision["candidate"] if isinstance(decision.get("candidate"), dict) else {}
+    command_body = _blueprints_nav_command_body(candidate)
+    dispatch = await _blueprints_nav_request_json(
+        client,
+        "POST",
+        f"{api_base}/api/v1/voice-mode/active-browser-command",
+        payload=command_body,
+        timeout_seconds=5.0,
+    )
+    dispatch_ok = bool(dispatch.get("ok"))
+    status = "blueprints_nav_dispatched" if dispatch_ok else "blueprints_nav_dispatch_failed"
+    if timing:
+        timing.mark(
+            "blueprints_nav_dispatch_complete",
+            status=status,
+            action=command_body.get("action"),
+            ok=dispatch_ok,
+        )
+    label = _blueprints_nav_text(candidate.get("label"), 120)
+    speech = decision.get("speech") or (
+        f"Opening {label}." if dispatch_ok and label else "Opening that in Blueprints."
+    )
+    if not dispatch_ok:
+        speech = "I found the target, but could not reach the Active Browser."
+    matrix_detail = _blueprints_nav_matrix_detail(
+        request_text=text,
+        status=status,
+        diagnostics=diagnostics,
+        decision=decision,
+        dispatch={"command": command_body, "response": dispatch},
+        error="" if dispatch_ok else dispatch.get("error") or dispatch.get("detail") or "",
+    )
+    return {
+        "ok": dispatch_ok,
+        "status": status,
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "decision": decision,
+        "dispatch": dispatch,
+        "command": command_body,
+        "diagnostics": diagnostics,
+    }
+
+
+async def _submit_wake_stt_blueprints_nav_bounded_handoff(
+    text: str,
+    *,
+    gate: CommandCodeGateResult,
+    profile_routing: WakeSttProfileRoutingResult,
+    client: httpx.AsyncClient | None = None,
+    timing: WakeSttRouteTiming | None = None,
+    handoff_assignment_callback: HandoffAssignmentCallback | None = None,
+    research_followup_task: asyncio.Task[WakeSttResearchFollowupResult] | None = None,
+) -> HermesSttSubmitResult:
+    if timing:
+        timing.mark("profile_handoff_start", target_profile=profile_routing.target_profile)
+    await _cancel_research_followup_task(
+        research_followup_task,
+        timing=timing,
+        reason="blueprints_navigation_handoff",
+    )
+    _schedule_handoff_assignment_callback(
+        handoff_assignment_callback,
+        {
+            "target_profile": profile_routing.target_profile,
+            "request_text": command_code_storage_safe_text(gate.meat),
+            "reason": profile_routing.reason,
+            "risk_class": profile_routing.risk_class,
+            "complex": profile_routing.complex,
+            "requires_command_code": profile_routing.requires_command_code,
+            "status": "assigned",
+        },
+        timing=timing,
+    )
+    close_client = client is None
+    http_client = client or httpx.AsyncClient(timeout=httpx.Timeout(12.0))
+    try:
+        helper = await _run_blueprints_nav_bounded_helper(
+            gate.meat,
+            client=http_client,
+            timing=timing,
+        )
+    finally:
+        if close_client:
+            await http_client.aclose()
+    status = _clip_text(helper.get("status"), 80) or "blueprints_nav_completed"
+    speech = _clip_text(helper.get("speech"), 300)
+    if not speech:
+        speech = (
+            "Blueprints navigation completed."
+            if helper.get("ok")
+            else "Blueprints navigation failed."
+        )
+    matrix_detail = _clip_text(helper.get("matrix_detail"), 6000)
+    if not matrix_detail:
+        matrix_detail = json.dumps(helper, ensure_ascii=True, sort_keys=True)[:6000]
+    companion_payload = {
+        "speech": speech,
+        "matrix_detail": matrix_detail,
+        "status": status,
+    }
+    companion = HermesSttCompanionOutput(
+        speech=speech,
+        matrix_detail=matrix_detail,
+        status=status,
+        structured=True,
+        raw_assistant_text=json.dumps(companion_payload, ensure_ascii=True, sort_keys=True),
+    )
+    if timing:
+        timing.mark(
+            "profile_handoff_complete",
+            target_profile=profile_routing.target_profile,
+            status=status,
+        )
+    return HermesSttSubmitResult(
+        ok=bool(helper.get("ok")),
+        status=status,
+        gate=gate,
+        attempted=True,
+        fallback_required=False,
+        assistant_text=companion.raw_assistant_text,
+        companion=companion,
+        timing=timing,
+        target_profile=profile_routing.target_profile,
+        profile_routing=profile_routing,
+        handoff={
+            "success": bool(helper.get("ok")),
+            "status": status,
+            "target_profile": profile_routing.target_profile,
+            "mode": "bounded_blueprints_navigation",
+            "speech": speech,
+            "matrix_detail": matrix_detail,
+            "helper": helper,
+            "needs_followup": False,
+            "conversation": {"mode": "single_turn", "can_continue_with_stt_tts": False},
+        },
+    )
+
+
 async def _run_alarm_clock_skill_helper(text: str) -> dict[str, Any]:
     if not WAKE_STT_ALARM_SKILL_SCRIPT.exists():
         return {
@@ -3867,6 +4735,16 @@ async def submit_wake_stt_profile_handoff(
             text,
             gate=gate,
             profile_routing=profile_routing,
+            timing=timing,
+            handoff_assignment_callback=handoff_assignment_callback,
+            research_followup_task=research_followup_task,
+        )
+    if profile_routing.target_profile == WAKE_STT_BLUEPRINTS_NAV_PROFILE:
+        return await _submit_wake_stt_blueprints_nav_bounded_handoff(
+            text,
+            gate=gate,
+            profile_routing=profile_routing,
+            client=client,
             timing=timing,
             handoff_assignment_callback=handoff_assignment_callback,
             research_followup_task=research_followup_task,
