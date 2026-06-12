@@ -703,6 +703,23 @@ def test_validate_wake_stt_profile_classifier_gates_complex_blueprints_nav():
     assert parsed.requires_command_code is True
 
 
+def test_validate_wake_stt_blueprints_nav_followup_json_accepts_followup():
+    parsed, reason = wake_stt_direct.validate_wake_stt_blueprints_nav_followup_json(
+        {
+            "relation": "follow_up",
+            "confidence": 0.91,
+            "reason": "the current utterance describes the previous Twilio document target",
+            "interpreted_request": "Open the Hermes Twilio SMS document.",
+        }
+    )
+
+    assert reason == ""
+    assert parsed is not None
+    assert parsed.relation == "follow_up"
+    assert parsed.confidence == 0.91
+    assert "Twilio" in parsed.interpreted_request
+
+
 def test_blueprints_nav_policy_treats_open_and_document_as_weak_signals():
     prompt = wake_stt_direct._wake_stt_profile_classifier_prompt(
         request_text="could you show me that web design thing",
@@ -713,6 +730,127 @@ def test_blueprints_nav_policy_treats_open_and_document_as_weak_signals():
     assert "weak signals only" in policy
     assert "absence is not an inverse signal" in policy
     assert wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE in prompt["allowed_targets"]
+
+
+def test_blueprints_nav_context_is_profile_classifier_context():
+    prompt = wake_stt_direct._wake_stt_profile_classifier_prompt(
+        request_text="I can't spell it well, the thing used for SMS messages in Hermes",
+        examples_config={},
+        blueprints_nav_context={
+            "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+            "request_text": "Open Hermes documents on Trilio",
+            "status": "blueprints_nav_ask_clarify",
+            "decision": {
+                "action": "ask_clarify",
+                "confidence": 0.45,
+                "ambiguous": True,
+                "reason": "target was unclear",
+                "speech": "Which Hermes document?",
+            },
+            "candidates": [
+                {
+                    "id": "doc:doc-twilio",
+                    "kind": "open_doc",
+                    "label": "Twilio Webhook Plan",
+                    "doc_id": "doc-twilio",
+                    "path": "hermes/TWILIO-WEBHOOK-PLAN.md",
+                }
+            ],
+        },
+    )
+
+    context = prompt["recent_blueprints_navigation_clarification"]
+    assert context["request_text"] == "Open Hermes documents on Trilio"
+    assert context["candidates"][0]["label"] == "Twilio Webhook Plan"
+    assert "non-deterministic context" in prompt["policy"]["blueprints_navigation"]
+
+
+def test_classify_wake_stt_profile_routes_blueprints_nav_followup(monkeypatch, tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    context_file = tmp_path / "blueprints-nav-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+                "updated_at_epoch": time.time(),
+                "request_text": "Open Hermes documents on Trilio",
+                "status": "blueprints_nav_ask_clarify",
+                "decision": {
+                    "action": "ask_clarify",
+                    "confidence": 0.45,
+                    "ambiguous": True,
+                    "reason": "target was unclear",
+                    "speech": "Which Hermes document?",
+                },
+                "candidates": [
+                    {
+                        "id": "doc:doc-twilio",
+                        "kind": "open_doc",
+                        "label": "Twilio Webhook Plan",
+                        "doc_id": "doc-twilio",
+                        "path": "hermes/TWILIO-WEBHOOK-PLAN.md",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["classifier"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "relation": "follow_up",
+                                    "confidence": 0.91,
+                                    "reason": "SMS describes the Twilio document target",
+                                    "interpreted_request": "Open the Hermes Twilio SMS document.",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "I can't spell it very well. It's the thing you use for SMS messages in Hermes.",
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE
+    assert result.requires_command_code is False
+    assert result.status == "blueprints_nav_followup_classified"
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "previous_blueprints_navigation" in classifier_payload
+    assert "Open Hermes documents on Trilio" in classifier_payload
 
 
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
@@ -1445,6 +1583,246 @@ def test_submit_wake_stt_blueprints_nav_target_opens_docs_result(monkeypatch, tm
         "highlight_terms": ["web", "design"],
     }
     assert "doc:doc-webdesign" in json.dumps(captured["classifier"])
+
+
+def test_submit_wake_stt_blueprints_nav_ask_clarify_saves_context(monkeypatch, tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    context_file = tmp_path / "blueprints-nav-context.json"
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "view": {
+                        "automation": {
+                            "menus": [],
+                            "selector_actions": [
+                                {"action": "clock", "label": "Clock", "bridge_group": ""}
+                            ],
+                        }
+                    },
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "results": [
+                        {
+                            "title": "Twilio Webhook Plan",
+                            "doc_id": "doc-twilio",
+                            "doc_path": "hermes/TWILIO-WEBHOOK-PLAN.md",
+                            "snippet": "Hermes SMS uses Twilio webhooks.",
+                            "openable": True,
+                            "keyword_terms": ["Twilio", "SMS", "Hermes"],
+                        }
+                    ],
+                },
+            )
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "ask_clarify",
+                                        "candidate_id": "",
+                                        "confidence": 0.45,
+                                        "ambiguous": True,
+                                        "reason": "Trilio may be a misheard document target",
+                                        "speech": "Which Hermes document did you mean?",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "Open Hermes documents on Trilio",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert result.status == "blueprints_nav_ask_clarify"
+    saved = json.loads(context_file.read_text(encoding="utf-8"))
+    assert saved["request_text"] == "Open Hermes documents on Trilio"
+    assert saved["decision"]["action"] == "ask_clarify"
+    assert saved["candidates"][0]["label"] == "Twilio Webhook Plan"
+    assert all(item["kind"] != "selector_action" for item in saved["candidates"])
+
+
+def test_submit_wake_stt_blueprints_nav_followup_dispatches_context_doc(
+    monkeypatch,
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    context_file = tmp_path / "blueprints-nav-context.json"
+    context_file.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.wake-stt.blueprints-nav-context.v1",
+                "updated_at_epoch": time.time(),
+                "request_text": "Open Hermes documents on Trilio",
+                "status": "blueprints_nav_ask_clarify",
+                "decision": {
+                    "action": "ask_clarify",
+                    "confidence": 0.45,
+                    "ambiguous": True,
+                    "reason": "target was unclear",
+                    "speech": "Which Hermes document?",
+                },
+                "candidates": [
+                    {
+                        "id": "doc:doc-twilio",
+                        "kind": "open_doc",
+                        "source": "docs_search",
+                        "label": "Twilio Webhook Plan",
+                        "doc_id": "doc-twilio",
+                        "path": "hermes/TWILIO-WEBHOOK-PLAN.md",
+                        "snippet": "Hermes SMS uses Twilio webhooks.",
+                        "highlight_terms": ["Twilio", "SMS", "Hermes"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE", str(examples))
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL",
+        "https://classifier.test/v1",
+    )
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_API_BASE", "https://blueprints.test")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_ALLOW_NON_LOOPBACK", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
+            return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+            return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
+        if str(request.url) == "https://blueprints.test/api/v1/docs/search":
+            return httpx.Response(200, json={"ok": True, "results": []})
+        if str(request.url) == "https://classifier.test/v1/chat/completions":
+            captured["classifier"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "dispatch",
+                                        "candidate_id": "doc:doc-twilio",
+                                        "confidence": 0.9,
+                                        "ambiguous": False,
+                                        "reason": "SMS description resolves Twilio document context",
+                                        "speech": "Opening Twilio Webhook Plan.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+            captured["command"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
+
+    routing = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="blueprints_navigation",
+        confidence=0.94,
+        reason="bounded active browser navigation",
+        speech_if_pending="",
+        status="classified",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_profile_handoff(
+                "It's the thing you use for SMS messages in Hermes.",
+                profile_routing=routing,
+                codes=[],
+                client=client,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    assert captured["command"] == {
+        "action": "open_doc",
+        "doc_id": "doc-twilio",
+        "path": "hermes/TWILIO-WEBHOOK-PLAN.md",
+        "highlight_terms": ["Twilio", "SMS", "Hermes"],
+    }
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "recent_blueprints_navigation_clarification" in classifier_payload
+    assert "doc:doc-twilio" in classifier_payload
+    assert not context_file.exists()
 
 
 def test_submit_wake_stt_blueprints_nav_target_opens_live_selector(monkeypatch, tmp_path):
