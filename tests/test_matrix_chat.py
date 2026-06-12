@@ -1210,6 +1210,36 @@ def test_matrix_chat_basic_health_action_is_exact_only(monkeypatch, tmp_path):
     )
 
 
+def test_matrix_chat_fast_routes_do_not_match_explicit_corrections(monkeypatch, tmp_path):
+    fast_routes = tmp_path / "fast-routes.json"
+    fast_routes.write_text(
+        json.dumps(
+            {
+                "routes": [
+                    {
+                        "id": "misconfigured_health",
+                        "action": "basic_health_deterministic_response",
+                        "match": {
+                            "kind": "exact",
+                            "phrases": ["i didn t want chat admin"],
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_FAST_ROUTES_FILE", str(fast_routes))
+
+    assert (
+        matrix_chat._wake_stt_fast_route_decision(
+            "I didn't want chat admin", base_session_id="wake-stt-local"
+        )
+        is None
+    )
+
+
 def test_matrix_chat_direct_wrapper_uses_deterministic_action_for_basic_health(
     monkeypatch, tmp_path
 ):
@@ -1943,6 +1973,163 @@ def test_matrix_chat_wake_stt_command_code_retry_authorises_only_pending_request
     assert "alpha one seven" not in json.dumps(first).lower()
     assert "alpha one seven" not in json.dumps(second).lower()
     assert matrix_chat.wake_stt_direct.AUTHORISED_PHRASE not in json.dumps(second)
+
+
+def test_matrix_chat_wake_stt_pending_command_correction_repairs_bounded_navigation(
+    monkeypatch,
+    tmp_path,
+):
+    room_id = "!bridge:test.example"
+    calls: list[dict[str, object]] = []
+    matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    context_file = tmp_path / "blueprints-nav-context.json"
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE", str(context_file))
+    monkeypatch.setenv(
+        "BLUEPRINTS_WAKE_STT_COMMAND_CODES_JSON",
+        '{"command_codes":[{"id":"alpha","aliases":["alpha one seven"]}]}',
+    )
+
+    async def fake_deliver(**kwargs):
+        body = kwargs["body"]
+        calls.append(
+            {
+                "text": body.text,
+                "trusted": bool(kwargs.get("trusted_authorised")),
+                "conversation_key": kwargs.get("conversation_key", ""),
+            }
+        )
+        gate = matrix_chat.wake_stt_direct.apply_command_code_gate(
+            body.text,
+            matrix_chat.wake_stt_direct.command_codes_from_env(),
+            trusted_authorised=bool(kwargs.get("trusted_authorised")),
+        )
+        requires_code = "create a new file" in body.text
+        status = "command_code_required" if requires_code else "blueprints_nav_dispatched"
+        speech = "needs code" if requires_code else "Opening the VPS Shared Bridge room."
+        companion = matrix_chat.wake_stt_direct.HermesSttCompanionOutput(
+            speech=speech,
+            matrix_detail=speech,
+            status=status,
+            structured=True,
+            raw_assistant_text=json.dumps(
+                {"speech": speech, "matrix_detail": speech, "status": status},
+                sort_keys=True,
+            ),
+        )
+        return matrix_chat.wake_stt_direct.WakeSttDeliveryResult(
+            ok=not requires_code,
+            status="delivered" if not requires_code else "command_code_required",
+            route="direct_local",
+            gate=gate,
+            direct=matrix_chat.wake_stt_direct.HermesSttSubmitResult(
+                ok=not requires_code,
+                status=status,
+                gate=gate,
+                attempted=True,
+                fallback_required=False,
+                assistant_text=companion.raw_assistant_text,
+                companion=companion,
+            ),
+        )
+
+    async def fake_publish(payload):
+        return {"ok": True, "event": {"event_id": "$tts"}, "payload": payload}
+
+    async def fake_report(**_kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(matrix_chat, "_deliver_wake_stt_with_direct_fallback", fake_deliver)
+    monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish)
+    monkeypatch.setattr(matrix_chat, "_send_wake_stt_direct_response_report_safely", fake_report)
+
+    first = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            room_id,
+            matrix_chat._WakeSttMessageBody(
+                text="create a new file called Dave",
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+    conversation_key = matrix_chat.wake_stt_direct.wake_stt_conversation_key(
+        room_id=room_id,
+        instance="local",
+    )
+    matrix_chat.wake_stt_direct._write_wake_stt_blueprints_nav_context(
+        request_text="open the vps chat",
+        status="blueprints_nav_dispatched",
+        decision={
+            "action": "dispatch",
+            "candidate_id": "page:settings.matrix-chat-admin",
+            "confidence": 0.86,
+            "ambiguous": False,
+            "reason": "wrong nearby page",
+            "speech": "Opening Chat Admin.",
+            "candidate": {
+                "id": "page:settings.matrix-chat-admin",
+                "kind": "open_page",
+                "label": "Chat Admin",
+                "group": "settings",
+                "page_id": "matrix-chat-admin",
+            },
+        },
+        candidates=[
+            {
+                "id": "matrix_chat_room:vps.shared-bridge",
+                "kind": "open_matrix_chat_room",
+                "label": "Matrix Chat - VPS - Shared Bridge",
+                "group": "settings",
+                "page_id": "matrix-chat",
+                "server_id": "vps",
+                "room_hint": "Shared Bridge",
+            },
+            {
+                "id": "page:settings.matrix-chat-admin",
+                "kind": "open_page",
+                "label": "Chat Admin",
+                "group": "settings",
+                "page_id": "matrix-chat-admin",
+            },
+        ],
+        conversation_key=conversation_key,
+        context_kind="last_navigation_action",
+    )
+    second = asyncio.run(
+        matrix_chat.matrix_chat_send_wake_stt(
+            room_id,
+            matrix_chat._WakeSttMessageBody(
+                text=(
+                    "I didn't want chat admin, I wanted the shared bridge room, "
+                    "I think that's the VPS chat"
+                ),
+                delivery_mode="direct_local",
+                direct_enabled=True,
+            ),
+        )
+    )
+
+    assert first["delivery"]["status"] == "command_code_required"
+    assert second["delivery"]["status"] == "delivered"
+    assert "command_code_pending" not in second["delivery"]
+    assert calls == [
+        {
+            "text": "create a new file called Dave",
+            "trusted": False,
+            "conversation_key": conversation_key,
+        },
+        {
+            "text": (
+                "I didn't want chat admin, I wanted the shared bridge room, "
+                "I think that's the VPS chat"
+            ),
+            "trusted": False,
+            "conversation_key": conversation_key,
+        },
+    ]
+    assert matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS == {}
 
 
 def test_matrix_chat_wake_stt_pending_reuses_profile_routing(monkeypatch):

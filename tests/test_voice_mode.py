@@ -297,6 +297,11 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("modal close") == "close_modal"
     assert voice_mode._clean_active_browser_command_action("page") == "open_page"
     assert voice_mode._clean_active_browser_command_action("open tab") == "open_page"
+    assert voice_mode._clean_active_browser_command_action("chat room") == "open_matrix_chat_room"
+    assert (
+        voice_mode._clean_active_browser_command_action("matrix-chat-room")
+        == "open_matrix_chat_room"
+    )
     assert voice_mode._clean_active_browser_command_action("modal") == "open_modal"
     assert voice_mode._clean_active_browser_command_action("doc") == "open_doc"
     assert voice_mode._clean_active_browser_command_action("document") == "open_doc"
@@ -386,6 +391,57 @@ def test_active_browser_command_rejects_unsupported_actions():
         json.loads(response.body)["detail"]
         == "Unsupported active browser action: delete_everything"
     )
+
+
+def test_active_browser_command_accepts_matrix_chat_room_payload(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "active": {
+                    "browser_id": "browser-a",
+                    "tab_id": "tab-a",
+                    "activated_at": 10,
+                },
+                "browser_views": {},
+                "revision": 1,
+                "updated_at": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    captured = {}
+
+    class Published:
+        def model_dump(self):
+            return {"event_id": "active-browser-command-test"}
+
+    async def fake_publish(event):
+        captured["event"] = event
+        return Published()
+
+    monkeypatch.setattr(voice_mode, "publish_event", fake_publish)
+
+    result = asyncio.run(
+        voice_mode.active_browser_command(
+            voice_mode.ActiveBrowserCommandBody(
+                action="chat room",
+                group="settings",
+                page_id="matrix-chat",
+                server_id="VPS",
+                room_hint="Shared Bridge",
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["payload"]["action"] == "open_matrix_chat_room"
+    assert result["payload"]["target_browser_id"] == "browser-a"
+    assert result["payload"]["target_tab_id"] == "tab-a"
+    assert result["payload"]["server_id"] == "vps"
+    assert result["payload"]["room_hint"] == "Shared Bridge"
 
 
 def test_active_browser_view_report_updates_active_tab_and_page():
