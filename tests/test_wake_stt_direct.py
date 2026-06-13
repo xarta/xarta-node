@@ -1175,6 +1175,46 @@ def test_classify_wake_stt_profile_routes_correction_from_local_minutes(
     assert "Matrix Chat - VPS - Shared Bridge" in classifier_payload
 
 
+def test_minutes_context_adds_fallible_timeliness_prior(tmp_path):
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+
+    hermes_minutes.append_turn_summary(
+        conversation_key=conversation_key,
+        operator_text="why do we have Dockge and DOCKGE folders?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile="hermes-stt-local",
+        assistant_speech="They look like related local documentation folders.",
+        matrix_detail="Local docs answer about Dockge folder naming.",
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    context = hermes_minutes.recent_conversation_context(
+        conversation_key=conversation_key,
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    assert context["timeliness_policy"]["basis"] == "time_only_fallible_prior"
+    assert context["timeliness_policy"]["semantic_match_required"] is True
+    assert context["entries"][-1]["time_association_prior"] == 0.75
+    assert context["entries"][-1]["time_association_bucket"] == "within_1_minute"
+    assert hermes_minutes._time_association_prior(60) == (0.75, "within_1_minute")
+    assert hermes_minutes._time_association_prior(61) == (0.70, "within_2_minutes")
+    assert hermes_minutes._time_association_prior(121) == (0.60, "within_3_minutes")
+    assert hermes_minutes._time_association_prior(181) == (0.55, "within_4_minutes")
+    assert hermes_minutes._time_association_prior(241) == (0.50, "within_5_minutes")
+    assert hermes_minutes._time_association_prior(359) == (0.50, "within_5_minutes")
+    assert hermes_minutes._time_association_prior(360) == (
+        None,
+        "six_minutes_or_more_no_time_prior",
+    )
+
+
 def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
     tmp_path,
 ):
@@ -1257,6 +1297,10 @@ def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
     assert "recent_conversation_minutes" in classifier_payload
     assert "Ronnie Barker" in classifier_payload
     assert "Peter Kay" in classifier_payload
+    prompt = json.loads(captured["classifier"]["messages"][1]["content"])
+    minutes_context = prompt["recent_conversation_minutes"]
+    assert minutes_context["timeliness_policy"]["basis"] == "time_only_fallible_prior"
+    assert minutes_context["entries"][-1]["time_association_prior"] == 0.75
 
 
 def test_submit_wake_stt_to_hermes_includes_recent_minutes_for_answers(tmp_path, monkeypatch):
