@@ -23,6 +23,10 @@ def append_minutes_summary_fixture(
     route_status: str = "delivered",
     route_profile: str = "hermes-stt-local",
     source_room_id: str = "!bridge:test.example",
+    source_event_ids: list[str] | None = None,
+    tts_utterance_ids: list[str] | None = None,
+    wake_route_record_ids: list[str] | None = None,
+    delivery: dict[str, object] | None = None,
     followups: list[str] | None = None,
 ) -> None:
     summary = {
@@ -41,15 +45,18 @@ def append_minutes_summary_fixture(
         "followup_affordances": followups or [],
         "source_pointers": {
             "source_room_id": source_room_id,
-            "matrix_event_ids": ["$fixture-source"],
-            "tts_utterance_ids": [],
+            "matrix_event_ids": ["$fixture-source"]
+            if source_event_ids is None
+            else source_event_ids,
+            "tts_utterance_ids": [] if tts_utterance_ids is None else tts_utterance_ids,
+            "wake_route_record_ids": [] if wake_route_record_ids is None else wake_route_record_ids,
         },
         "source_detail_available": True,
         "source_detail_policy": (
             "Minutes are model-written compact routing context, not source copies. "
             "Use source_pointers only when a later bounded source-check decision needs originals."
         ),
-        "delivery": {},
+        "delivery": delivery or {},
         "confidence": 0.8,
     }
     result_write = hermes_minutes.append_minutes_event(
@@ -1600,6 +1607,254 @@ def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
     source_context = minutes_context["current_turn_source_check"]["checked_sources"]
     assert source_context["profile_session"]["source"] == "profile_session"
     assert "Peter Kay" in json.dumps(source_context["profile_session"]["messages"])
+
+
+def test_classify_wake_stt_profile_uses_matrix_source_pointer_for_followup(
+    tmp_path,
+    monkeypatch,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator requested public research on Ronnie Barker and Ronnie Corbett.",
+        action="The system completed bounded NullClaw public research.",
+        result="Prior research concerned Ronnie Barker and Ronnie Corbett as The Two Ronnies.",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        source_event_ids=["$research-detail"],
+        followups=["Safe public-research follow-ups may continue the Ronnie thread."],
+    )
+
+    async def fake_fetch_bounded_minutes_source_events(**kwargs):
+        assert kwargs["room_id"] == "!bridge:test.example"
+        assert kwargs["event_ids"] == ["$research-detail"]
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "event_id": "$research-detail",
+                    "room_id": "!bridge:test.example",
+                    "sender": "@hermes:test.example",
+                    "origin_server_ts": 1760000000000,
+                    "msgtype": "m.text",
+                    "body": (
+                        "Ronnie Barker and Ronnie Corbett were The Two Ronnies. "
+                        "Peter Kay did not work as part of that duo; treat him as a later "
+                        "separate comedy reference."
+                    ),
+                    "encrypted": True,
+                    "decrypted": True,
+                }
+            ],
+        }
+
+    fake_matrix_chat = types.SimpleNamespace(
+        fetch_bounded_minutes_source_events=fake_fetch_bounded_minutes_source_events
+    )
+    import app
+
+    monkeypatch.setattr(app, "routes_matrix_chat", fake_matrix_chat, raising=False)
+    monkeypatch.setitem(sys.modules, "app.routes_matrix_chat", fake_matrix_chat)
+    captured: dict[str, object] = {"requests": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode("utf-8"))
+        captured["requests"].append(payload)
+        prompt = json.loads(payload["messages"][1]["content"])
+        if "current_turn_source_check_evidence" in prompt:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "should_check_sources": True,
+                                        "confidence": 0.91,
+                                        "source_scope": "matrix_source_pointer",
+                                        "reason": "The current turn asks a pronoun follow-up.",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "target_profile": wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+                                    "requires_command_code": False,
+                                    "complex": False,
+                                    "risk_class": "web_research",
+                                    "confidence": 0.9,
+                                    "reason": "safe public research follow-up from Matrix source pointer",
+                                    "speech_if_pending": "",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "did he work with Peter Kay then?",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                    "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+                    "BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE": str(
+                        tmp_path / "nav-context.json"
+                    ),
+                },
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
+    assert len(captured["requests"]) == 2
+    source_check_prompt = json.loads(captured["requests"][0]["messages"][1]["content"])
+    compact_minutes = json.dumps(source_check_prompt["compact_past_minutes"])
+    assert "Peter Kay" not in compact_minutes
+    assert "matrix_source_pointer" in compact_minutes
+    prompt = json.loads(captured["requests"][-1]["messages"][1]["content"])
+    source_context = prompt["recent_conversation_minutes"]["current_turn_source_check"][
+        "checked_sources"
+    ]
+    assert "Peter Kay" in json.dumps(source_context["matrix_source_pointer"]["messages"])
+    assert source_context["matrix_source_pointer"]["messages"][0]["decrypted"] is True
+
+
+def test_bounded_minutes_source_pointer_fetches_tts_and_wake_route_records(
+    tmp_path,
+    monkeypatch,
+):
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator asked to open the shared bridge room.",
+        action="Wake STT routed bounded navigation and queued TTS.",
+        result="The route opened a bounded Blueprints page.",
+        route_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        source_event_ids=[],
+        tts_utterance_ids=["wake-stt-direct-test"],
+        wake_route_record_ids=["wake-route-test"],
+        delivery={
+            "timing": {
+                "started_at": "2026-06-13T00:00:00.000Z",
+                "marks": [
+                    {"stage": "blueprints_nav_classifier_start", "elapsed_ms": 10.0},
+                    {"stage": "blueprints_nav_dispatched", "elapsed_ms": 42.0},
+                ],
+            }
+        },
+        followups=["Safe bounded navigation repairs may refer to this route."],
+    )
+    hermes_minutes.append_bounded_action_fact(
+        conversation_key=conversation_key,
+        request_text="open the chat room for shared bridge please",
+        route_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        context_kind="last_navigation_action",
+        action_record={
+            "status": "blueprints_nav_dispatched",
+            "selected_candidate": {
+                "id": "settings.matrix-chat.room.vps-shared-bridge",
+                "kind": "page_state",
+                "label": "Matrix Chat - VPS Shared Bridge",
+            },
+        },
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    def fake_load_recent_utterance_events(limit=20):
+        return [
+            {
+                "event_id": "tts-utterance-wake-stt-direct-test",
+                "event_type": "tts.utterance.requested",
+                "severity": "info",
+                "title": "Hermes speech",
+                "message": "Hermes requested browser speech.",
+                "source": "hermes-stt",
+                "created_at": 1760000000.0,
+                "payload": {
+                    "utterance_id": "wake-stt-direct-test",
+                    "source": "hermes-stt",
+                    "agent_id": "hermes-stt",
+                    "conversation_id": "wake-stt:local",
+                    "text": "Opening Matrix Chat with the VPS Shared Bridge room selected.",
+                    "metadata": {
+                        "route": "direct_local",
+                        "purpose": "wake_stt_direct_response",
+                    },
+                },
+            }
+        ]
+
+    fake_routes_tts = types.SimpleNamespace(
+        _load_recent_utterance_events=fake_load_recent_utterance_events
+    )
+    monkeypatch.setitem(sys.modules, "app.routes_tts", fake_routes_tts)
+    context = hermes_minutes.recent_conversation_context(
+        conversation_key=conversation_key,
+        limit=5,
+        nearby_limit=0,
+        ttl_seconds=24 * 60 * 60.0,
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    material = asyncio.run(
+        wake_stt_direct._bounded_current_turn_source_material(
+            source_scope="minutes_source_pointers",
+            minutes_context=context,
+            environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+        )
+    )
+
+    assert material.has_context is True
+    assert "tts_utterance_pointer" in material.sources_checked
+    assert "wake_route_record" in material.sources_checked
+    assert (
+        material.source_context["tts_utterance_pointer"]["utterances"][0]["text"]
+        == "Opening Matrix Chat with the VPS Shared Bridge room selected."
+    )
+    route_context = material.source_context["wake_route_record"]
+    assert route_context["records"][0]["record_ids"] == ["wake-route-test"]
+    assert (
+        "settings.matrix-chat.room.vps-shared-bridge"
+        in route_context["bounded_actions"][0]["action_excerpt"]
+    )
 
 
 def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):

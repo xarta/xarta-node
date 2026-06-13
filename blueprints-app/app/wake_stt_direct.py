@@ -119,6 +119,18 @@ WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_RELATIONS = frozenset(
 )
 WAKE_STT_BLUEPRINTS_NAV_FOLLOWUP_MIN_CONFIDENCE = 0.80
 WAKE_STT_NULLCLAW_UNGATED_RISK_CLASSES = frozenset({"docs_lookup", "web_research"})
+WAKE_STT_SOURCE_CHECK_SCOPES = frozenset(
+    {
+        "none",
+        "profile_session",
+        "nullclaw_research_context",
+        "matrix_source_pointer",
+        "tts_utterance_pointer",
+        "wake_route_record",
+        "minutes_source_pointers",
+        "mixed",
+    }
+)
 _WAKE_STT_EXPLICIT_CORRECTION_RE = re.compile(
     r"\b(?:no|nope|wrong|not\s+that|not\s+the\s+(?:one|page|thing)|"
     r"did(?:n't| not)\s+want|i\s+(?:meant|wanted|asked\s+for)|"
@@ -1490,6 +1502,7 @@ def _wake_stt_minutes_source_check_evidence(
     short_turn = word_count <= 18
     has_recent_followup_affordance = False
     strongest_time_prior = 0.0
+    source_pointer_types: set[str] = set()
     for entry in [*entries, *nearby]:
         if not isinstance(entry, dict):
             continue
@@ -1503,6 +1516,14 @@ def _wake_stt_minutes_source_check_evidence(
         )
         if affordances:
             has_recent_followup_affordance = True
+        pointer_types = (
+            entry.get("source_pointer_types")
+            if isinstance(entry.get("source_pointer_types"), list)
+            else []
+        )
+        for pointer_type in pointer_types:
+            if isinstance(pointer_type, str) and pointer_type.strip():
+                source_pointer_types.add(pointer_type.strip()[:80])
     should_run_source_check_classifier = bool(entries or nearby)
     return {
         "should_run_source_check_classifier": should_run_source_check_classifier,
@@ -1511,6 +1532,7 @@ def _wake_stt_minutes_source_check_evidence(
         "short_turn": short_turn,
         "has_recent_followup_affordance": has_recent_followup_affordance,
         "strongest_time_association_prior": round(strongest_time_prior, 3),
+        "source_pointer_types_available": sorted(source_pointer_types),
         "policy": (
             "This is current-turn source-check evidence, not deterministic routing. "
             "It is produced by comparing the new utterance with past compact Minutes. "
@@ -1554,6 +1576,13 @@ def _minutes_context_for_prompt(
         matrix_source_available = any(
             isinstance(entry, dict) and entry.get("source_room_id") for entry in source_entries
         )
+        tts_utterance_source_available = any(
+            isinstance(entry, dict) and entry.get("tts_utterance_ids") for entry in source_entries
+        )
+        wake_route_source_available = any(
+            isinstance(entry, dict) and entry.get("wake_route_record_ids")
+            for entry in source_entries
+        )
         context["current_turn_source_check"] = {
             "schema": "xarta.wake-stt.current-turn-source-check.v1",
             "evidence": evidence,
@@ -1568,6 +1597,8 @@ def _minutes_context_for_prompt(
                 "minutes_source_pointers": True,
                 "bounded_nullclaw_research_context_available": research_context_available,
                 "matrix_room_source_available": matrix_source_available,
+                "tts_utterance_source_available": tts_utterance_source_available,
+                "wake_route_record_source_available": wake_route_source_available,
             },
         }
     return context
@@ -1917,6 +1948,8 @@ def validate_wake_stt_source_check_json(
         return None, "source-check classifier confidence was not numeric"
     confidence = max(0.0, min(float(confidence_raw), 1.0))
     source_scope = _SPACE_RE.sub(" ", str(raw.get("source_scope") or "none").strip())[:80]
+    if source_scope not in WAKE_STT_SOURCE_CHECK_SCOPES:
+        return None, "source-check classifier returned an unknown source_scope"
     return (
         WakeSttSourceCheckResult(
             should_check_sources=bool(raw.get("should_check_sources")) and confidence >= 0.70,
@@ -1996,8 +2029,12 @@ def _wake_stt_source_check_classifier_prompt(
             ),
             "bounded_sources": (
                 "Allowed scopes are profile_session, nullclaw_research_context, "
-                "matrix_source_pointer, or mixed. Source checks provide evidence only; they "
-                "do not authorise side effects or bypass safety gates."
+                "matrix_source_pointer, tts_utterance_pointer, wake_route_record, "
+                "minutes_source_pointers, or mixed. matrix_source_pointer loads only the "
+                "referenced Matrix events, tts_utterance_pointer loads only referenced recent "
+                "browser-directed TTS utterances, and wake_route_record loads only referenced "
+                "Wake route timing/action facts. Source checks provide evidence only; they do "
+                "not authorise side effects or bypass safety gates."
             ),
         },
         "required_output": {
@@ -2008,6 +2045,9 @@ def _wake_stt_source_check_classifier_prompt(
                 "profile_session",
                 "nullclaw_research_context",
                 "matrix_source_pointer",
+                "tts_utterance_pointer",
+                "wake_route_record",
+                "minutes_source_pointers",
                 "mixed",
             ],
             "reason": "short reason",
@@ -2936,7 +2976,10 @@ async def classify_wake_stt_profile(
         conversation_key=conversation_key,
         environ=environ,
     )
-    if minutes_context and source_config is not None:
+    has_blueprints_nav_repair_cue = bool(
+        blueprints_nav_context and wake_stt_has_explicit_correction_language(request_text)
+    )
+    if minutes_context and not has_blueprints_nav_repair_cue:
         minutes_context = await _attach_current_turn_source_material_if_needed(
             request_text=request_text,
             minutes_context=minutes_context,
@@ -2954,7 +2997,7 @@ async def classify_wake_stt_profile(
             nearby_entries=len(nearby) if isinstance(nearby, list) else 0,
         )
     nav_followup: WakeSttBlueprintsNavFollowupResult | None = None
-    if blueprints_nav_context and wake_stt_has_explicit_correction_language(request_text):
+    if blueprints_nav_context and has_blueprints_nav_repair_cue:
         nav_followup = await classify_wake_stt_blueprints_nav_followup(
             request_text,
             blueprints_nav_context,
@@ -3390,15 +3433,326 @@ def _current_turn_research_source_context(environ: dict[str, str] | None = None)
     }
 
 
-def _bounded_current_turn_source_material(
+def _current_turn_source_scope_tokens(source_scope: str) -> set[str]:
+    scope = _SPACE_RE.sub("_", str(source_scope or "").strip().lower())
+    if not scope:
+        return {"mixed"}
+    if scope in WAKE_STT_SOURCE_CHECK_SCOPES:
+        return {scope}
+    tokens = {
+        token for token in re.split(r"[^a-z0-9_]+", scope) if token in WAKE_STT_SOURCE_CHECK_SCOPES
+    }
+    return tokens or {"none"}
+
+
+def _minutes_pointer_entries(minutes_context: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for key in ("entries", "nearby_entries"):
+        value = minutes_context.get(key) if isinstance(minutes_context, dict) else []
+        if isinstance(value, list):
+            entries.extend(item for item in value if isinstance(item, dict))
+    return entries
+
+
+def _pointer_values_from_minutes_entries(
+    entries: list[dict[str, Any]],
+    key: str,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    values: list[str] = []
+    for entry in entries:
+        raw_items = entry.get(key) if isinstance(entry.get(key), list) else []
+        for item in raw_items:
+            text = _clip_text(item, 260)
+            if text and text not in values:
+                values.append(text)
+            if len(values) >= limit:
+                return values
+    return values
+
+
+def _matrix_room_event_pairs_from_minutes(
+    entries: list[dict[str, Any]],
+    *,
+    limit: int = 4,
+) -> dict[str, list[str]]:
+    pairs: dict[str, list[str]] = {}
+    for entry in entries:
+        room_id = _clip_text(entry.get("source_room_id"), 260)
+        if not room_id:
+            continue
+        event_ids = (
+            entry.get("source_event_ids") if isinstance(entry.get("source_event_ids"), list) else []
+        )
+        for event_id in event_ids:
+            clean_event_id = _clip_text(event_id, 260)
+            if not clean_event_id:
+                continue
+            bucket = pairs.setdefault(room_id, [])
+            if clean_event_id not in bucket:
+                bucket.append(clean_event_id)
+            if sum(len(items) for items in pairs.values()) >= limit:
+                return pairs
+    return pairs
+
+
+async def _bounded_matrix_pointer_source_context(
+    minutes_context: dict[str, Any],
+    *,
+    max_events: int = 3,
+    max_chars_per_event: int = 900,
+) -> dict[str, Any]:
+    pairs = _matrix_room_event_pairs_from_minutes(
+        _minutes_pointer_entries(minutes_context),
+        limit=max_events,
+    )
+    if not pairs:
+        return {}
+    try:
+        from . import routes_matrix_chat
+    except Exception as exc:  # pragma: no cover - import/runtime posture varies.
+        return {"status": "load_failed", "source": "matrix_source_pointer", "error": str(exc)[:160]}
+
+    fetched: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    remaining = max(1, min(max_events, 8))
+    for room_id, event_ids in pairs.items():
+        if remaining <= 0:
+            break
+        fetch = getattr(routes_matrix_chat, "fetch_bounded_minutes_source_events", None)
+        if fetch is None:
+            return {
+                "status": "unavailable",
+                "source": "matrix_source_pointer",
+                "error": "Matrix source fetch helper is unavailable",
+            }
+        try:
+            result = await asyncio.wait_for(
+                fetch(
+                    room_id=room_id,
+                    event_ids=event_ids[:remaining],
+                    limit=remaining,
+                    max_body_chars=max_chars_per_event,
+                ),
+                timeout=2.0,
+            )
+        except Exception as exc:  # pragma: no cover - Matrix failures vary.
+            errors.append({"room_id": room_id[:80], "error": str(exc)[:160]})
+            continue
+        messages = result.get("messages") if isinstance(result, dict) else []
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict):
+                continue
+            body = _safe_current_turn_source_text(message.get("body"), limit=max_chars_per_event)
+            if not body:
+                continue
+            fetched.append(
+                {
+                    "event_id": _clip_text(message.get("event_id"), 260),
+                    "room_id_present": bool(message.get("room_id")),
+                    "sender": _clip_text(message.get("sender"), 160),
+                    "origin_server_ts": message.get("origin_server_ts"),
+                    "msgtype": _clip_text(message.get("msgtype"), 80),
+                    "body": body,
+                    "encrypted": bool(message.get("encrypted")),
+                    "decrypted": bool(message.get("decrypted")),
+                }
+            )
+            remaining -= 1
+            if remaining <= 0:
+                break
+    if not fetched and not errors:
+        return {}
+    return {
+        "status": "loaded" if fetched else "load_failed",
+        "source": "matrix_source_pointer",
+        "message_count": len(fetched),
+        "messages": fetched,
+        "errors": errors[:4],
+    }
+
+
+def _bounded_tts_utterance_pointer_source_context(
+    minutes_context: dict[str, Any],
+    *,
+    max_events: int = 5,
+) -> dict[str, Any]:
+    utterance_ids = set(
+        _pointer_values_from_minutes_entries(
+            _minutes_pointer_entries(minutes_context),
+            "tts_utterance_ids",
+            limit=max_events,
+        )
+    )
+    if not utterance_ids:
+        return {}
+    try:
+        from .routes_tts import _load_recent_utterance_events
+
+        recent = _load_recent_utterance_events(limit=100)
+    except Exception as exc:  # pragma: no cover - DB/runtime failures vary.
+        return {"status": "load_failed", "source": "tts_utterance_pointer", "error": str(exc)[:160]}
+    matched: list[dict[str, Any]] = []
+    for event in recent:
+        if not isinstance(event, dict):
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        utterance_id = _clip_text(payload.get("utterance_id"), 180)
+        event_id = _clip_text(event.get("event_id"), 180)
+        if utterance_id not in utterance_ids and event_id not in utterance_ids:
+            continue
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        matched.append(
+            {
+                "event_id": event_id,
+                "utterance_id": utterance_id,
+                "created_at": event.get("created_at"),
+                "source": _clip_text(payload.get("source") or event.get("source"), 120),
+                "agent_id": _clip_text(payload.get("agent_id"), 120),
+                "conversation_id": _clip_text(payload.get("conversation_id"), 180),
+                "voice_set": bool(payload.get("voice")),
+                "route": _clip_text(metadata.get("route"), 120),
+                "purpose": _clip_text(metadata.get("purpose"), 120),
+                "text": _safe_current_turn_source_text(payload.get("text"), limit=800),
+            }
+        )
+        if len(matched) >= max_events:
+            break
+    if not matched:
+        return {
+            "status": "not_found",
+            "source": "tts_utterance_pointer",
+            "requested_count": len(utterance_ids),
+        }
+    return {
+        "status": "loaded",
+        "source": "tts_utterance_pointer",
+        "utterance_count": len(matched),
+        "utterances": matched,
+    }
+
+
+def _bounded_wake_route_pointer_source_context(
+    minutes_context: dict[str, Any],
+    *,
+    environ: dict[str, str] | None = None,
+    max_records: int = 4,
+) -> dict[str, Any]:
+    entries = _minutes_pointer_entries(minutes_context)
+    route_record_ids = set(
+        _pointer_values_from_minutes_entries(
+            entries,
+            "wake_route_record_ids",
+            limit=max_records,
+        )
+    )
+    if not route_record_ids:
+        return {}
+    conversation_keys = {
+        _clean_wake_stt_conversation_key(entry.get("conversation_key"))
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    conversation_keys.discard("")
+    records: list[dict[str, Any]] = []
+    for event in hermes_minutes.read_recent_minutes(
+        event_kind="turn_summary",
+        limit=40,
+        ttl_seconds=24 * 60 * 60.0,
+        environ=environ,
+    ):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        pointers = (
+            payload.get("source_pointers")
+            if isinstance(payload.get("source_pointers"), dict)
+            else {}
+        )
+        event_record_ids = (
+            pointers.get("wake_route_record_ids")
+            if isinstance(pointers.get("wake_route_record_ids"), list)
+            else []
+        )
+        matched_ids = [item for item in event_record_ids if item in route_record_ids]
+        if not matched_ids:
+            continue
+        delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
+        timing = delivery.get("timing") if isinstance(delivery.get("timing"), dict) else {}
+        records.append(
+            {
+                "record_ids": matched_ids[:4],
+                "conversation_key": _clean_wake_stt_conversation_key(event.get("conversation_key")),
+                "route": _clip_text(payload.get("route"), 120),
+                "route_status": _clip_text(payload.get("route_status"), 120),
+                "route_profile": _clip_text(payload.get("route_profile"), 160),
+                "timing": timing if timing else {},
+                "delivery_excerpt": _safe_current_turn_source_text(delivery, limit=1400),
+            }
+        )
+        if len(records) >= max_records:
+            break
+
+    action_records: list[dict[str, Any]] = []
+    for conversation_key in sorted(conversation_keys):
+        for event in hermes_minutes.read_recent_minutes(
+            conversation_key=conversation_key,
+            event_kind="bounded_action",
+            limit=8,
+            ttl_seconds=24 * 60 * 60.0,
+            environ=environ,
+        ):
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if not payload:
+                continue
+            action_records.append(
+                {
+                    "conversation_key": conversation_key,
+                    "created_at": _clip_text(event.get("created_at"), 40),
+                    "route_profile": _clip_text(payload.get("route_profile"), 160),
+                    "context_kind": _clip_text(payload.get("context_kind"), 120),
+                    "request_text": _safe_current_turn_source_text(
+                        payload.get("request_text"),
+                        limit=500,
+                    ),
+                    "action_excerpt": _safe_current_turn_source_text(
+                        payload.get("action"),
+                        limit=1400,
+                    ),
+                }
+            )
+            if len(action_records) >= max_records:
+                break
+        if len(action_records) >= max_records:
+            break
+    if not records and not action_records:
+        return {
+            "status": "not_found",
+            "source": "wake_route_record",
+            "requested_count": len(route_record_ids),
+        }
+    return {
+        "status": "loaded",
+        "source": "wake_route_record",
+        "record_count": len(records),
+        "records": records,
+        "bounded_actions": action_records,
+    }
+
+
+async def _bounded_current_turn_source_material(
     *,
     source_config: HermesSttConfig | None = None,
     source_scope: str = "",
+    minutes_context: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
 ) -> WakeSttSourceMaterial:
-    scope = str(source_scope or "").strip().lower()
-    wants_session = scope in {"profile_session", "mixed", ""}
-    wants_research = scope in {"nullclaw_research_context", "mixed", ""}
+    scopes = _current_turn_source_scope_tokens(source_scope)
+    wants_all_pointers = bool(scopes & {"minutes_source_pointers", "mixed"})
+    wants_session = bool(scopes & {"profile_session", "mixed"})
+    wants_research = bool(scopes & {"nullclaw_research_context", "mixed"})
+    wants_matrix = wants_all_pointers or bool(scopes & {"matrix_source_pointer"})
+    wants_tts = wants_all_pointers or bool(scopes & {"tts_utterance_pointer"})
+    wants_route = wants_all_pointers or bool(scopes & {"wake_route_record"})
     source_context: dict[str, Any] = {
         "schema": "xarta.wake-stt.current-turn-source-material.v1",
         "policy": (
@@ -3417,6 +3771,25 @@ def _bounded_current_turn_source_material(
         if research_context:
             source_context["nullclaw_research_context"] = research_context
             sources_checked.append("nullclaw_research_context")
+    pointer_context = minutes_context if isinstance(minutes_context, dict) else {}
+    if wants_matrix and pointer_context:
+        matrix_context = await _bounded_matrix_pointer_source_context(pointer_context)
+        if matrix_context:
+            source_context["matrix_source_pointer"] = matrix_context
+            sources_checked.append("matrix_source_pointer")
+    if wants_tts and pointer_context:
+        tts_context = _bounded_tts_utterance_pointer_source_context(pointer_context)
+        if tts_context:
+            source_context["tts_utterance_pointer"] = tts_context
+            sources_checked.append("tts_utterance_pointer")
+    if wants_route and pointer_context:
+        route_context = _bounded_wake_route_pointer_source_context(
+            pointer_context,
+            environ=environ,
+        )
+        if route_context:
+            source_context["wake_route_record"] = route_context
+            sources_checked.append("wake_route_record")
     if not sources_checked:
         return WakeSttSourceMaterial()
     return WakeSttSourceMaterial(
@@ -3452,9 +3825,10 @@ async def _attach_current_turn_source_material_if_needed(
     )
     current_check["decision"] = decision.public_dict()
     if decision.should_check_sources:
-        material = _bounded_current_turn_source_material(
+        material = await _bounded_current_turn_source_material(
             source_config=source_config,
             source_scope=decision.source_scope,
+            minutes_context=context,
             environ=environ,
         )
         if material.has_context:

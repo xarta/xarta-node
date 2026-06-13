@@ -6,6 +6,7 @@ durable projection owned by Matrix Chat routes, not by this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -142,6 +143,43 @@ def _source_event_ids_from_delivery(delivery: dict[str, Any]) -> list[str]:
     return event_ids[:8]
 
 
+def _wake_route_record_ids_from_delivery(
+    delivery: dict[str, Any],
+    *,
+    conversation_key: str,
+    route: str,
+    route_status: str,
+) -> list[str]:
+    raw_ids = delivery.get("wake_route_record_ids")
+    record_ids: list[str] = []
+
+    def add(raw: Any) -> None:
+        text = _clip_text(raw, 160)
+        if text and text not in record_ids:
+            record_ids.append(text)
+
+    if isinstance(raw_ids, list):
+        for item in raw_ids[:8]:
+            add(item)
+    for key in ("wake_route_record_id", "route_record_id", "timing_id"):
+        add(delivery.get(key))
+    timing = delivery.get("timing") if isinstance(delivery.get("timing"), dict) else {}
+    if timing:
+        basis = json.dumps(
+            {
+                "conversation_key": _clean_key(conversation_key),
+                "route": _clip_text(route, 80),
+                "route_status": _clip_text(route_status, 80),
+                "started_at": timing.get("started_at"),
+                "marks": timing.get("marks"),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        add(f"wake-route-{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:20]}")
+    return record_ids[:8]
+
+
 def _minutes_api_key(environ: dict[str, str] | None = None) -> str:
     env = os.environ if environ is None else environ
     for key in (
@@ -217,6 +255,12 @@ def build_turn_packet(
     max_packet_chars = int(config.get("max_packet_chars") or DEFAULT_MINUTES_PACKET_CHARS)
     delivery_map = delivery if isinstance(delivery, dict) else {}
     source_event_ids = _source_event_ids_from_delivery(delivery_map)
+    wake_route_record_ids = _wake_route_record_ids_from_delivery(
+        delivery_map,
+        conversation_key=conversation_key,
+        route=route,
+        route_status=route_status,
+    )
     clean_detail = redact_minutes_text(matrix_detail, limit=min(max_packet_chars, 2400))
     return {
         "schema": "xarta.hermes.minutes.turn_packet.v1",
@@ -235,6 +279,7 @@ def build_turn_packet(
             "source_room_id": _clip_text(source_room_id, 260),
             "matrix_event_ids": source_event_ids,
             "tts_utterance_ids": [tts_event_id] if tts_event_id else [],
+            "wake_route_record_ids": wake_route_record_ids,
         },
         "delivery": _bounded_json_public(delivery_map, 1800),
     }
@@ -344,6 +389,12 @@ def validate_minutes_summary_json(
             "tts_utterance_ids": _redact_json_value(
                 source_pointers.get("tts_utterance_ids")
                 if isinstance(source_pointers.get("tts_utterance_ids"), list)
+                else [],
+                limit=600,
+            ),
+            "wake_route_record_ids": _redact_json_value(
+                source_pointers.get("wake_route_record_ids")
+                if isinstance(source_pointers.get("wake_route_record_ids"), list)
                 else [],
                 limit=600,
             ),
@@ -686,6 +737,28 @@ def _turn_summary_context_entry(event: dict[str, Any], *, now: float) -> dict[st
     followup_items = followups if isinstance(followups, list) else []
     entities = payload.get("entities")
     entity_items = entities if isinstance(entities, list) else []
+    source_event_ids = (
+        pointers.get("matrix_event_ids")
+        if isinstance(pointers.get("matrix_event_ids"), list)
+        else []
+    )
+    tts_utterance_ids = (
+        pointers.get("tts_utterance_ids")
+        if isinstance(pointers.get("tts_utterance_ids"), list)
+        else []
+    )
+    wake_route_record_ids = (
+        pointers.get("wake_route_record_ids")
+        if isinstance(pointers.get("wake_route_record_ids"), list)
+        else []
+    )
+    source_pointer_types: list[str] = []
+    if pointers.get("source_room_id") and source_event_ids:
+        source_pointer_types.append("matrix_source_pointer")
+    if tts_utterance_ids:
+        source_pointer_types.append("tts_utterance_pointer")
+    if wake_route_record_ids:
+        source_pointer_types.append("wake_route_record")
     try:
         age_seconds = max(0.0, now - float(event.get("created_at_epoch") or 0.0))
     except (TypeError, ValueError):
@@ -698,12 +771,10 @@ def _turn_summary_context_entry(event: dict[str, Any], *, now: float) -> dict[st
         "time_association_bucket": time_bucket,
         "conversation_key": _clean_key(event.get("conversation_key")),
         "source_room_id": _clip_text(pointers.get("source_room_id"), 260),
-        "source_event_ids": _redact_json_value(
-            pointers.get("matrix_event_ids")
-            if isinstance(pointers.get("matrix_event_ids"), list)
-            else [],
-            limit=600,
-        ),
+        "source_event_ids": _redact_json_value(source_event_ids, limit=600),
+        "tts_utterance_ids": _redact_json_value(tts_utterance_ids, limit=600),
+        "wake_route_record_ids": _redact_json_value(wake_route_record_ids, limit=600),
+        "source_pointer_types": source_pointer_types,
         "route": _clip_text(payload.get("route"), 80),
         "route_status": _clip_text(payload.get("route_status"), 80),
         "route_profile": _clip_text(payload.get("route_profile"), 120),
