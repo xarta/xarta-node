@@ -28,6 +28,8 @@ def append_minutes_summary_fixture(
     wake_route_record_ids: list[str] | None = None,
     delivery: dict[str, object] | None = None,
     followups: list[str] | None = None,
+    open_question: str = "",
+    entities: list[dict[str, object]] | None = None,
 ) -> None:
     summary = {
         "schema": hermes_minutes.MINUTES_SUMMARY_SCHEMA,
@@ -39,8 +41,8 @@ def append_minutes_summary_fixture(
         "operator_intent_summary": operator,
         "assistant_action_summary": action,
         "result_summary": result,
-        "open_question": "",
-        "entities": [],
+        "open_question": open_question,
+        "entities": [] if entities is None else entities,
         "problems": [],
         "followup_affordances": followups or [],
         "source_pointers": {
@@ -1268,6 +1270,126 @@ def test_minutes_context_adds_fallible_timeliness_prior(tmp_path):
     )
 
 
+def test_classify_wake_stt_profile_minutes_followup_routes_recent_caruso(tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator asked about Peter Kay.",
+        action="The system completed bounded NullClaw public research.",
+        result="Prior research concerned Peter Kay as a British comedian.",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        source_event_ids=[],
+        followups=["Safe public-research follow-ups may continue the Peter Kay thread."],
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator asked about Enriquo Cruso, the opera singer who died young.",
+        action=(
+            "The system did not find Enriquo Cruso and suggested the operator may have meant "
+            "Enrico Caruso."
+        ),
+        result="Research failed; entity not found. Suggested correction to Enrico Caruso.",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        source_event_ids=[],
+        followups=["Safe public-research follow-ups may confirm Enrico Caruso."],
+        open_question="Did the operator mean Enrico Caruso?",
+        entities=[
+            {
+                "name": "Enriquo Cruso",
+                "aliases": ["Enrico Caruso"],
+                "kind": "person",
+            }
+        ],
+    )
+    captured: dict[str, object] = {"requests": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode("utf-8"))
+        captured["requests"].append(payload)
+        prompt = json.loads(payload["messages"][1]["content"])
+        if "candidate" in prompt:
+            candidate_text = json.dumps(prompt["candidate"])
+            if "Enrico Caruso" in candidate_text:
+                content = {
+                    "relation": "follow_up",
+                    "safe_public_research_followup": True,
+                    "confidence": 0.96,
+                    "interpreted_request": "Research Enrico Caruso the Italian opera singer.",
+                    "reason": "current utterance confirms the most recent suggested person",
+                }
+            else:
+                content = {
+                    "relation": "fresh",
+                    "safe_public_research_followup": False,
+                    "confidence": 0.86,
+                    "interpreted_request": "",
+                    "reason": "older Peter Kay entry does not match the opera singer correction",
+                }
+        else:
+            content = {
+                "target_profile": "hermes-stt-smart",
+                "requires_command_code": True,
+                "complex": True,
+                "risk_class": "uncertain",
+                "confidence": 0.0,
+                "reason": "broad classifier should not be needed for the accepted recent entry",
+                "speech_if_pending": "Authorisation Command Code required.",
+            }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(content)}}]},
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "I did mean the person you said. Can you look into that one please?",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                    "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+                    "BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE": str(
+                        tmp_path / "nav-context.json"
+                    ),
+                },
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
+    assert result.requires_command_code is False
+    assert result.status == "minutes_followup_classified"
+    assert result.followup_context["accepted"]["interpreted_request"] == (
+        "Research Enrico Caruso the Italian opera singer."
+    )
+    assert "Enrico Caruso" in json.dumps(result.followup_context)
+    prompts = [json.loads(item["messages"][1]["content"]) for item in captured["requests"]]
+    candidate_prompts = [item for item in prompts if "candidate" in item]
+    assert candidate_prompts
+    assert all("recent_conversation_minutes" not in item for item in candidate_prompts)
+    assert all("candidate" in item for item in prompts)
+
+
 def test_minutes_summary_omits_long_source_detail_but_keeps_pointer(tmp_path):
     long_research_detail = (
         "Web Research found that Ronnie Barker worked with Ronnie Corbett as The Two Ronnies. "
@@ -1519,6 +1641,27 @@ def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
         payload = json.loads(request.read().decode("utf-8"))
         captured["requests"].append(payload)
         prompt = json.loads(payload["messages"][1]["content"])
+        if "candidate" in prompt:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "relation": "fresh",
+                                        "safe_public_research_followup": False,
+                                        "confidence": 0.86,
+                                        "interpreted_request": "",
+                                        "reason": "one-entry classifier leaves this for source check",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
         if "current_turn_source_check_evidence" in prompt:
             return httpx.Response(
                 200,
@@ -1592,12 +1735,16 @@ def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
 
     assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
     assert result.requires_command_code is False
-    assert len(captured["requests"]) == 2
+    assert len(captured["requests"]) == 3
     classifier_payload = json.dumps(captured["requests"][-1])
     assert "recent_conversation_minutes" in classifier_payload
     assert "Ronnie Barker" in classifier_payload
     assert "Peter Kay" in classifier_payload
-    source_check_prompt = json.loads(captured["requests"][0]["messages"][1]["content"])
+    source_check_prompt = next(
+        json.loads(item["messages"][1]["content"])
+        for item in captured["requests"]
+        if "current_turn_source_check_evidence" in json.loads(item["messages"][1]["content"])
+    )
     compact_minutes = json.dumps(source_check_prompt["compact_past_minutes"])
     assert "Peter Kay" not in compact_minutes
     prompt = json.loads(captured["requests"][-1]["messages"][1]["content"])
@@ -1676,6 +1823,27 @@ def test_classify_wake_stt_profile_uses_matrix_source_pointer_for_followup(
         payload = json.loads(request.read().decode("utf-8"))
         captured["requests"].append(payload)
         prompt = json.loads(payload["messages"][1]["content"])
+        if "candidate" in prompt:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "relation": "fresh",
+                                        "safe_public_research_followup": False,
+                                        "confidence": 0.85,
+                                        "interpreted_request": "",
+                                        "reason": "one-entry classifier leaves this for source check",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
         if "current_turn_source_check_evidence" in prompt:
             return httpx.Response(
                 200,
@@ -1739,8 +1907,12 @@ def test_classify_wake_stt_profile_uses_matrix_source_pointer_for_followup(
     result = asyncio.run(run())
 
     assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
-    assert len(captured["requests"]) == 2
-    source_check_prompt = json.loads(captured["requests"][0]["messages"][1]["content"])
+    assert len(captured["requests"]) == 3
+    source_check_prompt = next(
+        json.loads(item["messages"][1]["content"])
+        for item in captured["requests"]
+        if "current_turn_source_check_evidence" in json.loads(item["messages"][1]["content"])
+    )
     compact_minutes = json.dumps(source_check_prompt["compact_past_minutes"])
     assert "Peter Kay" not in compact_minutes
     assert "matrix_source_pointer" in compact_minutes
@@ -1978,6 +2150,27 @@ def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):
         payload = json.loads(request.read().decode("utf-8"))
         captured["requests"].append(payload)
         prompt = json.loads(payload["messages"][1]["content"])
+        if "candidate" in prompt:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "relation": "fresh",
+                                        "safe_public_research_followup": False,
+                                        "confidence": 0.87,
+                                        "interpreted_request": "",
+                                        "reason": "lexical cue is not enough for a research follow-up",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
         if "current_turn_source_check_evidence" in prompt:
             assert (
                 prompt["current_turn_source_check_evidence"]["evidence"][
@@ -2056,7 +2249,7 @@ def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):
     result = asyncio.run(run())
 
     assert result.target_profile == "hermes-stt-local-duh"
-    assert len(captured["requests"]) == 2
+    assert len(captured["requests"]) == 3
     prompt = json.loads(captured["requests"][-1]["messages"][1]["content"])
     current_check = prompt["recent_conversation_minutes"]["current_turn_source_check"]
     assert current_check["decision"]["should_check_sources"] is False
@@ -2131,6 +2324,117 @@ def test_submit_wake_stt_to_hermes_includes_recent_minutes_for_answers(tmp_path,
     assert "Recent STT/TTS Minutes context" in joined
     assert "Dockge and DOCKGE" in joined
     assert messages[-1]["role"] == "user"
+
+
+def test_submit_wake_stt_to_hermes_includes_followup_classifier_context(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "speech": "I will look into Enrico Caruso.",
+                                    "matrix_detail": "Used per-entry follow-up context.",
+                                    "status": "ok",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    config = wake_stt_direct.HermesSttConfig(
+        api_base="http://127.0.0.1:8643",
+        api_key="test-key",
+        session_id="wake-stt-local-test",
+        sessions_dir=tmp_path / "sessions",
+    )
+    followup_context = {
+        "schema": "xarta.wake-stt.minutes-followup-context.v1",
+        "current_stt_text": "I did mean the person you said.",
+        "accepted": {
+            "relation": "follow_up",
+            "safe_public_research_followup": True,
+            "confidence": 0.96,
+            "interpreted_request": "Research Enrico Caruso the Italian opera singer.",
+            "reason": "recent Caruso correction",
+            "recency_rank": 0,
+        },
+        "classifier_results": [],
+    }
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_to_hermes(
+                "I did mean the person you said. Can you look into that one please?",
+                config=config,
+                client=client,
+                inspect_context=False,
+                followup_context=followup_context,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    messages = captured["payload"]["messages"]
+    joined = json.dumps(messages)
+    assert "Bounded Wake STT per-entry follow-up classifier context" in joined
+    assert "Research Enrico Caruso the Italian opera singer" in joined
+    assert messages[-1]["role"] == "user"
+
+
+def test_minutes_followup_research_prompt_ignores_stale_research_context(tmp_path):
+    research_context_file = tmp_path / "research-context.json"
+    research_context_file.write_text(
+        json.dumps(
+            {
+                "query": "Peter Kay comedian",
+                "request_text": "tell me about Peter Kay",
+                "summary_excerpt": "Stale Peter Kay context.",
+                "source_titles": ["Peter Kay"],
+                "created_at_epoch": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile = wake_stt_direct.WakeSttProfileRoutingResult(
+        target_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        requires_command_code=False,
+        complex=False,
+        risk_class="web_research",
+        confidence=0.95,
+        reason="Minutes follow-up",
+        status="minutes_followup_classified",
+        followup_context={
+            "accepted": {
+                "relation": "follow_up",
+                "confidence": 0.96,
+                "interpreted_request": "Research Enrico Caruso the Italian opera singer.",
+                "reason": "recent Caruso correction",
+                "elapsed_ms": 12.0,
+                "model": "PRIMARY-LOCAL-TEST",
+            }
+        },
+    )
+    followup = wake_stt_direct._research_followup_from_minutes_profile(profile)
+
+    query, prompt, meta = wake_stt_direct._wake_stt_research_query_and_prompt(
+        "I did mean the person you said. Can you look into that one please?",
+        followup=followup,
+        environ={"BLUEPRINTS_WAKE_STT_RESEARCH_CONTEXT_FILE": str(research_context_file)},
+    )
+
+    assert query == "Research Enrico Caruso the Italian opera singer."
+    assert "Enrico Caruso" in prompt
+    assert "Peter Kay" not in prompt
+    assert meta["minutes_followup_classifier_guided"] is True
 
 
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
