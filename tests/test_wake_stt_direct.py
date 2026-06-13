@@ -1215,7 +1215,7 @@ def test_minutes_context_adds_fallible_timeliness_prior(tmp_path):
     )
 
 
-def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
+def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
     tmp_path,
 ):
     examples = tmp_path / "profile-routing-examples.json"
@@ -1244,14 +1244,61 @@ def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
         assistant_speech="Ronnie Barker and Ronnie Corbett were The Two Ronnies.",
         matrix_detail=(
             "NullClaw web research found that Ronnie Barker worked with Ronnie Corbett "
-            "as The Two Ronnies. Peter Kay was not part of that programme."
+            "as The Two Ronnies."
         ),
         environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
     )
-    captured: dict[str, object] = {}
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "session_wake-stt-local-test.json").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "do some research on Ronnie Barker and Ronnie Corbett",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Ronnie Barker worked with Ronnie Corbett as The Two Ronnies. "
+                            "A suggested follow-up choice mentioned Peter Kay."
+                        ),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {"requests": []}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["classifier"] = json.loads(request.read().decode("utf-8"))
+        payload = json.loads(request.read().decode("utf-8"))
+        captured["requests"].append(payload)
+        prompt = json.loads(payload["messages"][1]["content"])
+        if "current_turn_source_check_evidence" in prompt:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "should_check_sources": True,
+                                        "confidence": 0.92,
+                                        "source_scope": "profile_session",
+                                        "reason": (
+                                            "Current turn assumes prior context and compact "
+                                            "Minutes identify the thread but not the detail."
+                                        ),
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -1285,22 +1332,172 @@ def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
                     "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
                     "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
                     "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+                    "BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE": str(
+                        tmp_path / "nav-context.json"
+                    ),
                 },
                 conversation_key=conversation_key,
+                source_config=wake_stt_direct.HermesSttConfig(
+                    api_base="http://127.0.0.1:8643",
+                    api_key="test-key",
+                    session_id="wake-stt-local-test",
+                    sessions_dir=sessions_dir,
+                ),
             )
 
     result = asyncio.run(run())
 
     assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
     assert result.requires_command_code is False
-    classifier_payload = json.dumps(captured["classifier"])
+    assert len(captured["requests"]) == 2
+    classifier_payload = json.dumps(captured["requests"][-1])
     assert "recent_conversation_minutes" in classifier_payload
     assert "Ronnie Barker" in classifier_payload
     assert "Peter Kay" in classifier_payload
-    prompt = json.loads(captured["classifier"]["messages"][1]["content"])
+    source_check_prompt = json.loads(captured["requests"][0]["messages"][1]["content"])
+    compact_minutes = json.dumps(source_check_prompt["compact_past_minutes"])
+    assert "Peter Kay" not in compact_minutes
+    prompt = json.loads(captured["requests"][-1]["messages"][1]["content"])
     minutes_context = prompt["recent_conversation_minutes"]
     assert minutes_context["timeliness_policy"]["basis"] == "time_only_fallible_prior"
     assert minutes_context["entries"][-1]["time_association_prior"] == 0.75
+    source_context = minutes_context["current_turn_source_check"]["checked_sources"]
+    assert source_context["profile_session"]["source"] == "profile_session"
+    assert "Peter Kay" in json.dumps(source_context["profile_session"]["messages"])
+
+
+def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    hermes_minutes.append_turn_summary(
+        conversation_key=conversation_key,
+        operator_text="what is Ronnie Corbett known for?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        assistant_speech="Ronnie Corbett was a British comedian.",
+        matrix_detail="Public research answer about Ronnie Corbett.",
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "session_wake-stt-local-test.json").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "Source material that must not be fetched for a fresh topic.",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {"requests": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read().decode("utf-8"))
+        captured["requests"].append(payload)
+        prompt = json.loads(payload["messages"][1]["content"])
+        if "current_turn_source_check_evidence" in prompt:
+            assert (
+                prompt["current_turn_source_check_evidence"]["evidence"][
+                    "has_weak_earlier_context_lexical_cue"
+                ]
+                is True
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "should_check_sources": False,
+                                        "confidence": 0.88,
+                                        "source_scope": "none",
+                                        "reason": (
+                                            "The word previously is used in a fresh question, "
+                                            "not as a continuation of the Ronnie thread."
+                                        ),
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "target_profile": "hermes-stt-local-duh",
+                                    "requires_command_code": False,
+                                    "complex": False,
+                                    "risk_class": "local_readonly",
+                                    "confidence": 0.9,
+                                    "reason": "fresh simple read-only question",
+                                    "speech_if_pending": "",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "what did the file previously say about Dockge?",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                    "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+                    "BLUEPRINTS_WAKE_STT_BLUEPRINTS_NAV_CONTEXT_FILE": str(
+                        tmp_path / "nav-context.json"
+                    ),
+                },
+                conversation_key=conversation_key,
+                source_config=wake_stt_direct.HermesSttConfig(
+                    api_base="http://127.0.0.1:8643",
+                    api_key="test-key",
+                    session_id="wake-stt-local-test",
+                    sessions_dir=sessions_dir,
+                ),
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == "hermes-stt-local-duh"
+    assert len(captured["requests"]) == 2
+    prompt = json.loads(captured["requests"][-1]["messages"][1]["content"])
+    current_check = prompt["recent_conversation_minutes"]["current_turn_source_check"]
+    assert current_check["decision"]["should_check_sources"] is False
+    assert "checked_sources" not in current_check
 
 
 def test_submit_wake_stt_to_hermes_includes_recent_minutes_for_answers(tmp_path, monkeypatch):
