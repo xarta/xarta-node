@@ -1175,6 +1175,161 @@ def test_classify_wake_stt_profile_routes_correction_from_local_minutes(
     assert "Matrix Chat - VPS - Shared Bridge" in classifier_payload
 
 
+def test_classify_wake_stt_profile_includes_recent_minutes_for_followup(
+    tmp_path,
+):
+    examples = tmp_path / "profile-routing-examples.json"
+    examples.write_text(
+        json.dumps(
+            {
+                "classifier_model": "PRIMARY-LOCAL-TEST",
+                "timeout_ms": 1200,
+                "examples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    hermes_minutes.append_turn_summary(
+        conversation_key=conversation_key,
+        operator_text="do some research on Ronnie Barker and Ronnie Corbett",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        assistant_speech="Ronnie Barker and Ronnie Corbett were The Two Ronnies.",
+        matrix_detail=(
+            "NullClaw web research found that Ronnie Barker worked with Ronnie Corbett "
+            "as The Two Ronnies. Peter Kay was not part of that programme."
+        ),
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["classifier"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "target_profile": wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+                                    "requires_command_code": False,
+                                    "complex": False,
+                                    "risk_class": "web_research",
+                                    "confidence": 0.91,
+                                    "reason": "safe public research follow-up from Minutes",
+                                    "speech_if_pending": "",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.classify_wake_stt_profile(
+                "Peter K work with him as well then",
+                client=client,
+                environ={
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_API_KEY": "test-key",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_CLASSIFIER_BASE_URL": "https://classifier.test/v1",
+                    "BLUEPRINTS_WAKE_STT_PROFILE_ROUTING_EXAMPLES_FILE": str(examples),
+                    "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+                },
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.target_profile == wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE
+    assert result.requires_command_code is False
+    classifier_payload = json.dumps(captured["classifier"])
+    assert "recent_conversation_minutes" in classifier_payload
+    assert "Ronnie Barker" in classifier_payload
+    assert "Peter Kay" in classifier_payload
+
+
+def test_submit_wake_stt_to_hermes_includes_recent_minutes_for_answers(tmp_path, monkeypatch):
+    minutes_file = tmp_path / "minutes.jsonl"
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="local",
+    )
+    hermes_minutes.append_turn_summary(
+        conversation_key=conversation_key,
+        operator_text="why have we got two Dockge entries in our documents?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile="hermes-stt-local",
+        assistant_speech="One looks like the maintained docs entry and one looks legacy.",
+        matrix_detail=(
+            "Local docs answer: top-level Dockge and DOCKGE entries both refer to Dockge; "
+            "one is probably a legacy capitalization variant."
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "speech": "They both look like Dockge entries.",
+                                    "matrix_detail": "Used recent Minutes to answer the follow-up.",
+                                    "status": "ok",
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    config = wake_stt_direct.HermesSttConfig(
+        api_base="http://127.0.0.1:8643",
+        api_key="test-key",
+        session_id="wake-stt-local-test",
+        sessions_dir=tmp_path / "sessions",
+    )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await wake_stt_direct.submit_wake_stt_to_hermes(
+                "we have two top level entries, one river capital D and then lowercase letters "
+                "and another all in caps. So they're both for dockage, but why?",
+                config=config,
+                client=client,
+                inspect_context=False,
+                conversation_key=conversation_key,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.ok is True
+    messages = captured["payload"]["messages"]
+    joined = json.dumps(messages)
+    assert "Recent STT/TTS Minutes context" in joined
+    assert "Dockge and DOCKGE" in joined
+    assert messages[-1]["role"] == "user"
+
+
 def test_alarm_clock_exact_set_alarm_signal_is_exact_not_synonym_or_plural():
     cases = {
         "set alarm": True,

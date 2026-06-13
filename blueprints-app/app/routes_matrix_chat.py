@@ -5071,7 +5071,9 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
             trusted_authorised_retry = True
             timing.mark("command_code_retry_authorised")
         elif pending:
-            code_like_response = wake_stt_direct.looks_like_command_code_response(body.text)
+            code_like_response = wake_stt_direct.looks_like_command_code_response(
+                body.text
+            ) or wake_stt_direct.is_bare_slot1_command_code_words_response(body.text, code_list)
             repairable_correction = (
                 not code_like_response
                 and bool(route_readback["direct_enabled"])
@@ -5093,30 +5095,32 @@ async def matrix_chat_send_wake_stt(room_id: str, body: _WakeSttMessageBody) -> 
                         conversation_key=conversation_key,
                     )
                 )
-            else:
+            elif code_like_response:
                 timing.mark(
                     "command_code_pending_cleared",
-                    reason=("malformed_or_wrong_code" if code_like_response else "new_request"),
+                    reason="malformed_or_wrong_code",
                 )
                 delivery_task = asyncio.create_task(
                     _wake_stt_command_code_local_delivery(
                         text=body.text,
                         codes=code_list,
                         status="command_code_aborted",
-                        speech=(
-                            "Command Code not accepted. The pending request was aborted."
-                            if code_like_response
-                            else "The pending Command Code request was aborted."
-                        ),
-                        matrix_detail=(
-                            "Command Code not accepted; the held Wake request was aborted."
-                            if code_like_response
-                            else (
-                                "The next Wake turn was not the exact Command Code, so the "
-                                "held request was aborted."
-                            )
-                        ),
+                        speech="Command Code not accepted. The pending request was aborted.",
+                        matrix_detail="Command Code not accepted; the held Wake request was aborted.",
                         timing=timing,
+                    )
+                )
+            else:
+                timing.mark("command_code_pending_cleared", reason="new_turn_after_pending")
+                delivery_task = asyncio.create_task(
+                    _deliver_wake_stt_with_direct_fallback(
+                        room_id=room_id,
+                        body=body_for_delivery,
+                        direct_enabled=bool(route_readback["direct_enabled"]),
+                        diagnostic_enabled=bool(body.direct_diagnostic_enabled),
+                        await_diagnostic=bool(body.direct_await_diagnostic),
+                        timing=timing,
+                        conversation_key=conversation_key,
                     )
                 )
         elif exact_code_response:
