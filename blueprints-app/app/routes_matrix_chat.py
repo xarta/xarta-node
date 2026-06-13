@@ -3318,7 +3318,7 @@ def _matrix_minutes_summary_body(summary: dict[str, Any]) -> str:
     action = _safe_str(summary.get("assistant_action_summary")).strip()
     result = _safe_str(summary.get("result_summary")).strip()
     question = _safe_str(summary.get("open_question")).strip()
-    parts = ["STT/TTS Minutes"]
+    parts = ["Hermes Minutes"]
     if intent:
         parts.append(f"Intent: {intent}")
     if action:
@@ -3328,7 +3328,7 @@ def _matrix_minutes_summary_body(summary: dict[str, Any]) -> str:
     if question:
         parts.append(f"Open question: {question}")
     body = "\n".join(parts).strip()
-    return body[:4000] if body else "STT/TTS Minutes"
+    return body[:4000] if body else "Hermes Minutes"
 
 
 def _matrix_minutes_summary_content(summary: dict[str, Any]) -> dict[str, Any]:
@@ -3337,8 +3337,8 @@ def _matrix_minutes_summary_content(summary: dict[str, Any]) -> dict[str, Any]:
     content.update(
         {
             "msgtype": "m.notice",
-            "xarta_source": "wake_stt_minutes",
-            "xarta_capture_mode": "wake_to_talk",
+            "xarta_source": "hermes_minutes",
+            "xarta_capture_mode": "hermes_minutes",
             "xarta_suppress_speech": True,
             "suppress_speech": True,
             "org.xarta.hermes.minutes": summary,
@@ -3390,7 +3390,7 @@ async def _post_wake_stt_minutes_summary_message(summary: dict[str, Any]) -> dic
                 expected=(200,),
             )
             sent = {"room_id": room_id, "event_id": data.get("event_id")}
-        sent.update({"ok": True, "server_id": server_id, "xarta_source": "wake_stt_minutes"})
+        sent.update({"ok": True, "server_id": server_id, "xarta_source": "hermes_minutes"})
         return sent
     finally:
         _CURRENT_MATRIX_SERVER.reset(token)
@@ -4417,6 +4417,8 @@ def _payload_has_visible_updates(payload: dict[str, Any], *, snapshot: bool = Fa
 _sync_worker_tasks: dict[str, asyncio.Task[None]] = {}
 _sync_worker_lock = asyncio.Lock()
 _sync_worker_status: dict[str, dict[str, Any]] = {}
+_BRIDGE_MINUTES_SEEN_EVENT_IDS: dict[str, float] = {}
+_BRIDGE_MINUTES_SEEN_EVENT_LIMIT = 2000
 
 
 def _set_worker_status(server_id: str, **updates: Any) -> None:
@@ -4458,6 +4460,157 @@ async def _publish_worker_payload(payload: dict[str, Any], *, snapshot: bool) ->
     )
 
 
+def _prune_bridge_minutes_seen_event_ids() -> None:
+    overflow = len(_BRIDGE_MINUTES_SEEN_EVENT_IDS) - _BRIDGE_MINUTES_SEEN_EVENT_LIMIT
+    if overflow <= 0:
+        return
+    for event_id, _seen_at in sorted(
+        _BRIDGE_MINUTES_SEEN_EVENT_IDS.items(), key=lambda item: item[1]
+    )[:overflow]:
+        _BRIDGE_MINUTES_SEEN_EVENT_IDS.pop(event_id, None)
+
+
+def _bridge_minutes_speaker_role(settings: dict[str, str], sender: str) -> str:
+    clean_sender = _safe_str(sender)
+    hermes_user = _safe_str(settings.get("hermes_user_id"))
+    operator_users = {
+        _safe_str(settings.get("user_id")),
+        _safe_str(settings.get("operator_user_id")),
+        _safe_str(settings.get("admin_user_id")),
+    }
+    if clean_sender and clean_sender == hermes_user:
+        return "hermes"
+    if clean_sender and clean_sender in operator_users:
+        return "operator"
+    sender_lower = clean_sender.lower()
+    if "hermes" in sender_lower:
+        return "hermes"
+    if "davros" in sender_lower or "operator" in sender_lower:
+        return "operator"
+    return "participant"
+
+
+def _bridge_minutes_message_should_record(
+    *,
+    settings: dict[str, str],
+    room_id: str,
+    message: dict[str, Any],
+) -> bool:
+    if room_id != _safe_str(settings.get("smoke_room_id")):
+        return False
+    minutes_room_id = _safe_str(hermes_minutes.read_minutes_config().get("room_id"))
+    if minutes_room_id and room_id == minutes_room_id:
+        return False
+    event_id = _safe_str(message.get("event_id"))
+    if not event_id or event_id in _BRIDGE_MINUTES_SEEN_EVENT_IDS:
+        return False
+    body = _safe_str(message.get("body")).strip()
+    if not body or body == "[encrypted event]":
+        return False
+    if isinstance(message.get("system_message"), dict):
+        return False
+    msgtype = _safe_str(message.get("msgtype")) or "m.text"
+    if msgtype not in {"m.text", "m.notice"}:
+        return False
+    return True
+
+
+def _append_matrix_bridge_message_minutes(
+    *,
+    settings: dict[str, str],
+    room_id: str,
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    event_id = _safe_str(message.get("event_id"))
+    sender = _safe_str(message.get("sender"))
+    body = _safe_str(message.get("body")).strip()
+    role = _bridge_minutes_speaker_role(settings, sender)
+    prefix = {
+        "operator": "Operator Bridge message",
+        "hermes": "Hermes Bridge message",
+        "participant": "Matrix Bridge message",
+    }.get(role, "Matrix Bridge message")
+    route_profile = f"matrix-bridge-{role}"
+    conversation_key = f"matrix-bridge:{settings.get('server_id', 'tb1')}:room={room_id}"
+    delivery = {
+        "source": "matrix_chat_sync_worker",
+        "server_id": settings.get("server_id", "tb1"),
+        "room_id": room_id,
+        "event_id": event_id,
+        "sender": sender,
+        "sender_role": role,
+        "origin_server_ts": message.get("origin_server_ts"),
+        "msgtype": message.get("msgtype"),
+    }
+    if role == "hermes":
+        result = hermes_minutes.append_turn_summary(
+            conversation_key=conversation_key,
+            operator_text="",
+            source_room_id=room_id,
+            route="matrix_bridge",
+            route_status="message_received",
+            route_profile=route_profile,
+            assistant_speech=body,
+            matrix_detail=f"{prefix} from {sender}: {body}",
+            delivery=delivery,
+        )
+    else:
+        result = hermes_minutes.append_turn_summary(
+            conversation_key=conversation_key,
+            operator_text=body,
+            source_room_id=room_id,
+            route="matrix_bridge",
+            route_status="message_received",
+            route_profile=route_profile,
+            assistant_speech="",
+            matrix_detail=f"{prefix} from {sender}: {body}",
+            delivery=delivery,
+        )
+    _BRIDGE_MINUTES_SEEN_EVENT_IDS[event_id] = time.time()
+    _prune_bridge_minutes_seen_event_ids()
+    return result
+
+
+def _record_matrix_bridge_minutes_from_payload(
+    *,
+    settings: dict[str, str],
+    payload: dict[str, Any],
+    snapshot: bool,
+) -> dict[str, Any]:
+    if snapshot:
+        return {"recorded": 0, "skipped": True, "reason": "snapshot"}
+    recorded = 0
+    posted = 0
+    errors: list[str] = []
+    for update in payload.get("room_updates") or []:
+        if not isinstance(update, dict):
+            continue
+        room_id = _safe_str(update.get("room_id"))
+        for message in update.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            if not _bridge_minutes_message_should_record(
+                settings=settings,
+                room_id=room_id,
+                message=message,
+            ):
+                continue
+            result = _append_matrix_bridge_message_minutes(
+                settings=settings,
+                room_id=room_id,
+                message=message,
+            )
+            if not result.get("ok"):
+                errors.append(_safe_str(result.get("error") or result.get("reason"))[:160])
+                continue
+            recorded += 1
+            summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+            if summary:
+                asyncio.create_task(_post_wake_stt_minutes_summary_safely(summary))
+                posted += 1
+    return {"recorded": recorded, "matrix_post_scheduled": posted, "errors": errors[:5]}
+
+
 async def _matrix_chat_sync_worker(server_id: str) -> None:
     token = _CURRENT_MATRIX_SERVER.set(server_id)
     next_batch: str | None = None
@@ -4475,6 +4628,13 @@ async def _matrix_chat_sync_worker(server_id: str) -> None:
                 payload = await _matrix_chat_sync_payload(settings, sync, e2ee_client)
                 next_batch = payload.get("next_batch") or next_batch
                 if _payload_has_visible_updates(payload, snapshot=snapshot):
+                    minutes_record = _record_matrix_bridge_minutes_from_payload(
+                        settings=settings,
+                        payload=payload,
+                        snapshot=snapshot,
+                    )
+                    if minutes_record.get("recorded") or minutes_record.get("errors"):
+                        log.info("Matrix Bridge Minutes record: %s", minutes_record)
                     await _publish_worker_payload(payload, snapshot=snapshot)
                 _set_worker_status(
                     server_id,

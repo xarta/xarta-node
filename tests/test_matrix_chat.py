@@ -2477,6 +2477,100 @@ def test_matrix_chat_wake_stt_direct_writes_minutes_and_schedules_post(monkeypat
     ]
 
 
+def test_matrix_chat_sync_records_bridge_messages_to_minutes(monkeypatch, tmp_path):
+    matrix_chat._BRIDGE_MINUTES_SEEN_EVENT_IDS.clear()
+    minutes_file = tmp_path / "minutes.jsonl"
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    monkeypatch.setenv("HERMES_MINUTES_ROOM_ID", "!minutes:test.example")
+    captured_posts: list[dict[str, object]] = []
+
+    async def fake_minutes_post(summary):
+        captured_posts.append(summary)
+        return {"ok": True, "room_id": "!minutes:test.example", "event_id": "$minutes"}
+
+    monkeypatch.setattr(matrix_chat, "_post_wake_stt_minutes_summary_safely", fake_minutes_post)
+    settings = {
+        "server_id": "tb1",
+        "server_label": "TB1",
+        "smoke_room_id": "!bridge:test.example",
+        "user_id": "@davros-proxy-tb1:test.example",
+        "operator_user_id": "",
+        "admin_user_id": "",
+        "hermes_user_id": "@hermes-local-20260518:test.example",
+    }
+    payload = {
+        "server_id": "tb1",
+        "room_updates": [
+            {
+                "room_id": "!bridge:test.example",
+                "messages": [
+                    {
+                        "event_id": "$operator-1",
+                        "room_id": "!bridge:test.example",
+                        "sender": "@davros-proxy-tb1:test.example",
+                        "origin_server_ts": 1781347040000,
+                        "msgtype": "m.text",
+                        "body": ("THE CLEAR THING IS TO PAY ATTENTION TO THE ORDER OF TURNS"),
+                    },
+                    {
+                        "event_id": "$hermes-1",
+                        "room_id": "!bridge:test.example",
+                        "sender": "@hermes-local-20260518:test.example",
+                        "origin_server_ts": 1781347050000,
+                        "msgtype": "m.text",
+                        "body": "I understand; I should preserve the prior turn order.",
+                    },
+                ],
+            },
+            {
+                "room_id": "!minutes:test.example",
+                "messages": [
+                    {
+                        "event_id": "$minutes-loop",
+                        "room_id": "!minutes:test.example",
+                        "sender": "@davros-proxy-tb1:test.example",
+                        "origin_server_ts": 1781347060000,
+                        "msgtype": "m.notice",
+                        "body": "Hermes Minutes",
+                    }
+                ],
+            },
+        ],
+    }
+
+    async def run_record():
+        first = matrix_chat._record_matrix_bridge_minutes_from_payload(
+            settings=settings,
+            payload=payload,
+            snapshot=False,
+        )
+        duplicate = matrix_chat._record_matrix_bridge_minutes_from_payload(
+            settings=settings,
+            payload=payload,
+            snapshot=False,
+        )
+        await asyncio.sleep(0)
+        return first, duplicate
+
+    first, duplicate = asyncio.run(run_record())
+
+    assert first["recorded"] == 2
+    assert first["matrix_post_scheduled"] == 2
+    assert duplicate["recorded"] == 0
+    assert len(captured_posts) == 2
+    entries = [
+        json.loads(line)
+        for line in minutes_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 2
+    assert entries[0]["conversation_key"] == "matrix-bridge:tb1:room=!bridge:test.example"
+    assert entries[0]["payload"]["route_profile"] == "matrix-bridge-operator"
+    assert "ORDER OF TURNS" in entries[0]["payload"]["operator_intent_summary"]
+    assert entries[1]["payload"]["route_profile"] == "matrix-bridge-hermes"
+    assert "prior turn order" in entries[1]["payload"]["result_summary"]
+
+
 def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch, tmp_path):
     bridge_id = "!bridge:test.example"
     minutes_id = "!minutes:test.example"
