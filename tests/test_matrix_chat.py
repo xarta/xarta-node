@@ -2696,6 +2696,122 @@ def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch,
     assert minutes["encrypted"] is True
 
 
+def test_minutes_config_reads_matrix_targets(tmp_path, monkeypatch):
+    config_path = tmp_path / "minutes.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema": matrix_chat.hermes_minutes.MINUTES_CONFIG_SCHEMA,
+                "enabled": True,
+                "local_enabled": True,
+                "matrix_targets": {
+                    "tb1": {
+                        "server_id": "tb1",
+                        "room_id": "!tb1-minutes:test.example",
+                        "require_e2ee": True,
+                    },
+                    "vps": {
+                        "server_id": "vps",
+                        "room_id": "!vps-minutes:test.example",
+                        "room_name": "Minutes",
+                        "require_e2ee": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MINUTES_CONFIG_FILE", str(config_path))
+
+    config = matrix_chat.hermes_minutes.read_minutes_config()
+
+    assert config["matrix_post_enabled"] is True
+    assert config["matrix_targets"]["tb1"]["room_id"] == "!tb1-minutes:test.example"
+    assert config["matrix_targets"]["vps"] == {
+        "server_id": "vps",
+        "room_id": "!vps-minutes:test.example",
+        "room_name": "Minutes",
+        "matrix_post_enabled": True,
+        "require_e2ee": True,
+    }
+
+
+def test_matrix_chat_minutes_post_routes_vps_summary_to_vps_target(monkeypatch):
+    captured = {}
+    config = {
+        "enabled": True,
+        "matrix_post_enabled": True,
+        "server_id": "tb1",
+        "room_id": "!tb1-minutes:test.example",
+        "require_e2ee": True,
+        "matrix_targets": {
+            "vps": {
+                "server_id": "vps",
+                "room_id": "!vps-minutes:test.example",
+                "room_name": "Minutes",
+                "matrix_post_enabled": True,
+                "require_e2ee": True,
+            }
+        },
+    }
+
+    monkeypatch.setattr(matrix_chat.hermes_minutes, "read_minutes_config", lambda: config)
+
+    async def fake_room_is_encrypted(room_id):
+        captured["encrypted_room_id"] = room_id
+        captured["encrypted_server"] = matrix_chat._CURRENT_MATRIX_SERVER.get()
+        return True
+
+    async def fake_get_e2ee_client():
+        return None
+
+    async def fake_matrix_request(method, path, *, json_body=None, expected=None, **_kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = json_body
+        captured["expected"] = expected
+        captured["send_server"] = matrix_chat._CURRENT_MATRIX_SERVER.get()
+        return {"event_id": "$vps-minutes"}
+
+    monkeypatch.setattr(matrix_chat, "_matrix_room_is_encrypted", fake_room_is_encrypted)
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+    monkeypatch.setattr(matrix_chat, "_matrix_request", fake_matrix_request)
+
+    result = asyncio.run(
+        matrix_chat._post_wake_stt_minutes_summary_message(
+            {
+                "schema": matrix_chat.hermes_minutes.MINUTES_SUMMARY_SCHEMA,
+                "conversation_key": "wake-stt:vps:room=!shared:test.example",
+                "time": "2026-06-13T00:00:00Z",
+                "route": "direct_vps",
+                "route_status": "delivered",
+                "route_profile": "vps-direct-profile",
+                "operator_intent_summary": "Operator asked for a VPS check.",
+                "assistant_action_summary": "Hermes VPS answered.",
+                "result_summary": "The VPS route responded.",
+                "open_question": "",
+                "entities": [],
+                "problems": [],
+                "followup_affordances": [],
+                "source_pointers": {},
+                "delivery": {"server_id": "vps"},
+                "confidence": 0.8,
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["server_id"] == "vps"
+    assert result["room_id"] == "!vps-minutes:test.example"
+    assert result["target_key"] == "vps"
+    assert captured["encrypted_room_id"] == "!vps-minutes:test.example"
+    assert captured["encrypted_server"] == "vps"
+    assert captured["send_server"] == "vps"
+    assert captured["method"] == "PUT"
+    assert "%21vps-minutes%3Atest.example" in captured["path"]
+    assert captured["json_body"]["org.xarta.system_message"]["kind"] == "hermes_minutes_summary"
+
+
 def test_matrix_chat_wake_stt_handoff_assignment_is_info_only_and_speech_suppressed():
     body = matrix_chat._wake_stt_handoff_assignment_body(
         {

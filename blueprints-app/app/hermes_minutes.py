@@ -502,6 +502,30 @@ def read_minutes_config(environ: dict[str, str] | None = None) -> dict[str, Any]
         parsed = loaded if isinstance(loaded, dict) else {}
     except (OSError, ValueError, TypeError):
         parsed = {}
+    matrix_targets = (
+        parsed.get("matrix_targets") if isinstance(parsed.get("matrix_targets"), dict) else {}
+    )
+    require_e2ee = _truthy(
+        env.get("HERMES_MINUTES_REQUIRE_E2EE"),
+        default=_truthy(parsed.get("require_e2ee"), default=True),
+    )
+    targets: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_target in matrix_targets.items():
+        key = _clip_text(raw_key, 40).strip().lower()
+        if not key or not isinstance(raw_target, dict):
+            continue
+        default_server = key if key in {"tb1", "vps"} else parsed.get("server_id") or "tb1"
+        target_room_id = _clip_text(raw_target.get("room_id") or "", 260)
+        targets[key] = {
+            "server_id": _clip_text(raw_target.get("server_id") or default_server, 40),
+            "room_id": target_room_id,
+            "room_name": _clip_text(raw_target.get("room_name") or "Minutes", 120),
+            "matrix_post_enabled": _truthy(
+                raw_target.get("matrix_post_enabled"),
+                default=bool(target_room_id),
+            ),
+            "require_e2ee": _truthy(raw_target.get("require_e2ee"), default=require_e2ee),
+        }
     return {
         "schema": parsed.get("schema") or MINUTES_CONFIG_SCHEMA,
         "enabled": _truthy(
@@ -513,7 +537,10 @@ def read_minutes_config(environ: dict[str, str] | None = None) -> dict[str, Any]
         ),
         "matrix_post_enabled": _truthy(
             env.get("HERMES_MINUTES_MATRIX_POST_ENABLED"),
-            default=_truthy(parsed.get("matrix_post_enabled"), default=bool(parsed.get("room_id"))),
+            default=_truthy(
+                parsed.get("matrix_post_enabled"),
+                default=bool(parsed.get("room_id") or targets),
+            ),
         ),
         "server_id": _clip_text(
             env.get("HERMES_MINUTES_MATRIX_SERVER") or parsed.get("server_id") or "tb1", 40
@@ -524,10 +551,8 @@ def read_minutes_config(environ: dict[str, str] | None = None) -> dict[str, Any]
         "room_name": _clip_text(
             env.get("HERMES_MINUTES_ROOM_NAME") or parsed.get("room_name") or "Minutes", 120
         ),
-        "require_e2ee": _truthy(
-            env.get("HERMES_MINUTES_REQUIRE_E2EE"),
-            default=_truthy(parsed.get("require_e2ee"), default=True),
-        ),
+        "require_e2ee": require_e2ee,
+        "matrix_targets": targets,
         "local_index_path": _clip_text(
             env.get("HERMES_MINUTES_LOCAL_INDEX_PATH")
             or parsed.get("local_index_path")

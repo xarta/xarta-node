@@ -3430,17 +3430,68 @@ async def _matrix_room_is_encrypted(room_id: str) -> bool:
     return False
 
 
-async def _post_wake_stt_minutes_summary_message(summary: dict[str, Any]) -> dict[str, Any]:
+def _minutes_matrix_target_key(summary: dict[str, Any]) -> str:
+    conversation_key = _safe_str(summary.get("conversation_key")).strip().lower()
+    route = _safe_str(summary.get("route")).strip().lower()
+    delivery = summary.get("delivery") if isinstance(summary.get("delivery"), dict) else {}
+    delivery_server = _safe_str(delivery.get("server_id")).strip().lower()
+    wake_instance = (
+        _safe_str(delivery.get("xarta_wake_instance") or delivery.get("instance")).strip().lower()
+    )
+    if conversation_key.startswith(("wake-stt:vps", "matrix-bridge:vps")):
+        return "vps"
+    if route == "direct_vps" or delivery_server == "vps" or wake_instance == "vps":
+        return "vps"
+    if conversation_key.startswith(("wake-stt:local", "matrix-bridge:tb1")):
+        return "tb1"
+    if route == "direct_local" or delivery_server == "tb1" or wake_instance == "local":
+        return "tb1"
+    return ""
+
+
+def _minutes_matrix_post_target(summary: dict[str, Any]) -> dict[str, Any]:
     config = hermes_minutes.read_minutes_config()
     if not config.get("enabled") or not config.get("matrix_post_enabled"):
-        return {"ok": True, "skipped": True, "reason": "minutes_matrix_disabled"}
-    room_id = _safe_str(config.get("room_id")).strip()
+        return {"enabled": False, "reason": "minutes_matrix_disabled"}
+    target_key = _minutes_matrix_target_key(summary)
+    targets = config.get("matrix_targets") if isinstance(config.get("matrix_targets"), dict) else {}
+    target = targets.get(target_key) if target_key else None
+    if isinstance(target, dict):
+        if not target.get("matrix_post_enabled"):
+            return {
+                "enabled": False,
+                "reason": "minutes_matrix_target_disabled",
+                "target_key": target_key,
+            }
+        return {
+            "enabled": True,
+            "target_key": target_key,
+            "server_id": _safe_str(
+                target.get("server_id") or target_key or config.get("server_id")
+            ),
+            "room_id": _safe_str(target.get("room_id")),
+            "require_e2ee": bool(target.get("require_e2ee")),
+        }
+    return {
+        "enabled": True,
+        "target_key": target_key or "default",
+        "server_id": _safe_str(config.get("server_id")) or "tb1",
+        "room_id": _safe_str(config.get("room_id")),
+        "require_e2ee": bool(config.get("require_e2ee")),
+    }
+
+
+async def _post_wake_stt_minutes_summary_message(summary: dict[str, Any]) -> dict[str, Any]:
+    target = _minutes_matrix_post_target(summary)
+    if not target.get("enabled"):
+        return {"ok": True, "skipped": True, "reason": target.get("reason")}
+    room_id = _safe_str(target.get("room_id")).strip()
     if not room_id:
         return {"ok": False, "skipped": True, "reason": "minutes_room_not_configured"}
-    server_id = _normalize_server_id(_safe_str(config.get("server_id")) or "tb1")
+    server_id = _normalize_server_id(_safe_str(target.get("server_id")) or "tb1")
     token = _CURRENT_MATRIX_SERVER.set(server_id)
     try:
-        if bool(config.get("require_e2ee")) and not await _matrix_room_is_encrypted(room_id):
+        if bool(target.get("require_e2ee")) and not await _matrix_room_is_encrypted(room_id):
             return {"ok": False, "skipped": True, "reason": "minutes_room_not_encrypted"}
         content = _matrix_minutes_summary_content(summary)
         e2ee_client = await _get_e2ee_client()
@@ -3457,7 +3508,14 @@ async def _post_wake_stt_minutes_summary_message(summary: dict[str, Any]) -> dic
                 expected=(200,),
             )
             sent = {"room_id": room_id, "event_id": data.get("event_id")}
-        sent.update({"ok": True, "server_id": server_id, "xarta_source": "hermes_minutes"})
+        sent.update(
+            {
+                "ok": True,
+                "server_id": server_id,
+                "target_key": target.get("target_key") or "default",
+                "xarta_source": "hermes_minutes",
+            }
+        )
         return sent
     finally:
         _CURRENT_MATRIX_SERVER.reset(token)
