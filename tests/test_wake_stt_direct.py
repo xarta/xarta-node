@@ -12,6 +12,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 from app import hermes_minutes, wake_stt_direct
 
 
+def append_minutes_summary_fixture(
+    minutes_file: Path,
+    *,
+    conversation_key: str,
+    operator: str,
+    action: str = "The system answered the operator.",
+    result: str = "The turn completed.",
+    route: str = "direct_local",
+    route_status: str = "delivered",
+    route_profile: str = "hermes-stt-local",
+    source_room_id: str = "!bridge:test.example",
+    followups: list[str] | None = None,
+) -> None:
+    summary = {
+        "schema": hermes_minutes.MINUTES_SUMMARY_SCHEMA,
+        "conversation_key": conversation_key,
+        "time": "2026-06-13T00:00:00Z",
+        "route": route,
+        "route_status": route_status,
+        "route_profile": route_profile,
+        "operator_intent_summary": operator,
+        "assistant_action_summary": action,
+        "result_summary": result,
+        "open_question": "",
+        "entities": [],
+        "problems": [],
+        "followup_affordances": followups or [],
+        "source_pointers": {
+            "source_room_id": source_room_id,
+            "matrix_event_ids": ["$fixture-source"],
+            "tts_utterance_ids": [],
+        },
+        "source_detail_available": True,
+        "source_detail_policy": (
+            "Minutes are model-written compact routing context, not source copies. "
+            "Use source_pointers only when a later bounded source-check decision needs originals."
+        ),
+        "delivery": {},
+        "confidence": 0.8,
+    }
+    result_write = hermes_minutes.append_minutes_event(
+        event_kind="turn_summary",
+        conversation_key=conversation_key,
+        payload=summary,
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+    assert result_write["ok"] is True
+
+
 def test_command_code_config_limits_and_sanitizes_public_ids():
     config = [
         {"id": "alpha/unsafe", "aliases": ["alpha one seven"]},
@@ -1182,16 +1231,13 @@ def test_minutes_context_adds_fallible_timeliness_prior(tmp_path):
         instance="local",
     )
 
-    hermes_minutes.append_turn_summary(
+    append_minutes_summary_fixture(
+        minutes_file,
         conversation_key=conversation_key,
-        operator_text="why do we have Dockge and DOCKGE folders?",
-        source_room_id="!bridge:test.example",
-        route="direct_local",
-        route_status="delivered",
+        operator="Operator asked why there are Dockge and DOCKGE folders.",
+        result="The answer discussed related local documentation folders.",
         route_profile="hermes-stt-local",
-        assistant_speech="They look like related local documentation folders.",
-        matrix_detail="Local docs answer about Dockge folder naming.",
-        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+        followups=["Safe local-docs follow-ups may refer to Dockge folder naming."],
     )
 
     context = hermes_minutes.recent_conversation_context(
@@ -1215,6 +1261,201 @@ def test_minutes_context_adds_fallible_timeliness_prior(tmp_path):
     )
 
 
+def test_minutes_summary_omits_long_source_detail_but_keeps_pointer(tmp_path):
+    long_research_detail = (
+        "Web Research found that Ronnie Barker worked with Ronnie Corbett as The Two Ronnies. "
+        "## Research: Ronnie Barker Ronnie Corbett ## Query Plan - Q1: Ronnie Barker "
+        "Q2: Ronnie Corbett Q3: Peter Kay follow-up choice Q4: detailed source extracts "
+        + "source extract "
+        * 80
+    )
+
+    packet = hermes_minutes.build_turn_packet(
+        conversation_key="wake-stt:local:room=!bridge:test.example",
+        operator_text="Peter K work with him as well then",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
+        assistant_speech="Ronnie Barker and Ronnie Corbett were The Two Ronnies.",
+        matrix_detail=long_research_detail,
+        delivery={"event_id": "$source-event"},
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(tmp_path / "minutes.jsonl")},
+    )
+    copied_model_output = {
+        "operator_intent_summary": "Peter K work with him as well then",
+        "assistant_action_summary": "Web research returned detail.",
+        "result_summary": (
+            "Web Research found that Ronnie Barker worked with Ronnie Corbett as The Two "
+            "Ronnies. ## Research: Ronnie Barker Ronnie Corbett ## Query Plan - Q1: Ronnie "
+            "Barker Q2: Ronnie Corbett Q3: Peter Kay follow-up choice Q4: detailed source "
+            "extracts source extract source extract source extract source extract source "
+            "extract source extract source extract source extract source extract source "
+            "extract source extract source extract"
+        ),
+        "open_question": "",
+        "entities": [],
+        "problems": [],
+        "followup_affordances": [],
+        "confidence": 0.8,
+    }
+
+    rejected, reason = hermes_minutes.validate_minutes_summary_json(
+        json.dumps(copied_model_output),
+        packet,
+    )
+
+    assert rejected is None
+    assert "copied source text" in reason
+
+    compact_model_output = {
+        "operator_intent_summary": (
+            "The operator asked a contextual follow-up about whether Peter Kay worked "
+            "with the previously discussed comedian."
+        ),
+        "assistant_action_summary": "The system had just completed bounded public research.",
+        "result_summary": "Prior research concerned Ronnie Barker and Ronnie Corbett.",
+        "open_question": "Which previously discussed person does 'him' refer to?",
+        "entities": [{"name": "Peter Kay", "kind": "person", "aliases": ["Peter K"]}],
+        "problems": [],
+        "followup_affordances": [
+            "A later Peter Kay question may need bounded source lookup through source_pointers."
+        ],
+        "confidence": 0.82,
+    }
+
+    summary, reason = hermes_minutes.validate_minutes_summary_json(
+        json.dumps(compact_model_output),
+        packet,
+    )
+
+    assert reason == ""
+    assert "## Query Plan" not in summary["result_summary"]
+    assert "source extract source extract" not in summary["result_summary"]
+    assert len(summary["result_summary"]) <= hermes_minutes.RESULT_SUMMARY_LIMIT
+    assert summary["source_detail_available"] is True
+    assert "not source copies" in summary["source_detail_policy"]
+    assert summary["source_pointers"]["matrix_event_ids"] == ["$source-event"]
+
+
+def test_minutes_summary_accepts_model_written_short_topic_context(tmp_path):
+    packet = hermes_minutes.build_turn_packet(
+        conversation_key="wake-stt:local:room=!bridge:test.example",
+        operator_text="why have we got two Dockge entries in our documents?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile="hermes-stt-local",
+        assistant_speech="One looks like the maintained docs entry and one looks legacy.",
+        matrix_detail=(
+            "Local docs answer: top-level Dockge and DOCKGE entries both refer to Dockge; "
+            "one is probably a legacy capitalization variant."
+        ),
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(tmp_path / "minutes.jsonl")},
+    )
+    model_output = {
+        "operator_intent_summary": (
+            "The operator asked why the documents contain both Dockge and DOCKGE entries."
+        ),
+        "assistant_action_summary": "The system answered from local documentation context.",
+        "result_summary": (
+            "Dockge and DOCKGE appear to be related entries, possibly a capitalization variant."
+        ),
+        "open_question": "",
+        "entities": [{"name": "Dockge", "kind": "software", "aliases": ["DOCKGE"]}],
+        "problems": [],
+        "followup_affordances": ["Safe local-docs follow-ups may continue this Dockge thread."],
+        "confidence": 0.86,
+    }
+
+    summary, reason = hermes_minutes.validate_minutes_summary_json(json.dumps(model_output), packet)
+
+    assert "Dockge and DOCKGE" in summary["result_summary"]
+    assert reason == ""
+
+
+def test_append_turn_summary_without_model_key_does_not_write_substitute(tmp_path):
+    minutes_file = tmp_path / "minutes.jsonl"
+
+    result = hermes_minutes.append_turn_summary(
+        conversation_key="wake-stt:local:room=!bridge:test.example",
+        operator_text="what did we just discuss?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile="hermes-stt-local",
+        assistant_speech="A short answer.",
+        matrix_detail="Detailed source text that must not become pretend Minutes.",
+        environ={
+            "HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file),
+            "HERMES_MINUTES_MODEL_ALIAS": "PRIMARY-LOCAL-TEST",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["skipped"] is True
+    assert "API key" in result["reason"]
+    assert not minutes_file.exists()
+
+
+def test_append_turn_summary_persists_model_written_summary(tmp_path, monkeypatch):
+    minutes_file = tmp_path / "minutes.jsonl"
+
+    def fake_summarizer(packet, **_kwargs):
+        return (
+            {
+                "schema": hermes_minutes.MINUTES_SUMMARY_SCHEMA,
+                "conversation_key": packet["conversation_key"],
+                "time": "2026-06-13T00:00:00Z",
+                "route": packet["route"],
+                "route_status": packet["route_status"],
+                "route_profile": packet["route_profile"],
+                "operator_intent_summary": "The operator asked about a prior topic.",
+                "assistant_action_summary": "The system answered from recent context.",
+                "result_summary": "The answer was compact and model-written.",
+                "open_question": "",
+                "entities": [],
+                "problems": [],
+                "followup_affordances": ["A follow-up may refer to the prior topic."],
+                "source_pointers": packet["source_pointers"],
+                "source_detail_available": True,
+                "source_detail_policy": (
+                    "Minutes are model-written compact routing context, not source copies. "
+                    "Use source_pointers only when a later bounded source-check decision needs originals."
+                ),
+                "delivery": {},
+                "confidence": 0.84,
+            },
+            "",
+        )
+
+    monkeypatch.setattr(hermes_minutes, "summarize_turn_packet_with_model", fake_summarizer)
+
+    result = hermes_minutes.append_turn_summary(
+        conversation_key="wake-stt:local:room=!bridge:test.example",
+        operator_text="what did we just discuss?",
+        source_room_id="!bridge:test.example",
+        route="direct_local",
+        route_status="delivered",
+        route_profile="hermes-stt-local",
+        assistant_speech="A short answer.",
+        matrix_detail="Detailed source text for the model, not stored as a copied summary.",
+        delivery={"event_id": "$source-event"},
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    assert result["ok"] is True
+    entries = [
+        json.loads(line)
+        for line in minutes_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 1
+    assert entries[0]["event_kind"] == "turn_summary"
+    assert entries[0]["payload"]["result_summary"] == "The answer was compact and model-written."
+    assert entries[0]["payload"]["source_pointers"]["matrix_event_ids"] == ["$source-event"]
+
+
 def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
     tmp_path,
 ):
@@ -1234,19 +1475,14 @@ def test_classify_wake_stt_profile_uses_bounded_sources_for_followup(
         room_id="!bridge:test.example",
         instance="local",
     )
-    hermes_minutes.append_turn_summary(
+    append_minutes_summary_fixture(
+        minutes_file,
         conversation_key=conversation_key,
-        operator_text="do some research on Ronnie Barker and Ronnie Corbett",
-        source_room_id="!bridge:test.example",
-        route="direct_local",
-        route_status="delivered",
+        operator="Operator requested public research on Ronnie Barker and Ronnie Corbett.",
+        action="The system completed bounded NullClaw public research.",
+        result="Prior research concerned Ronnie Barker and Ronnie Corbett as The Two Ronnies.",
         route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
-        assistant_speech="Ronnie Barker and Ronnie Corbett were The Two Ronnies.",
-        matrix_detail=(
-            "NullClaw web research found that Ronnie Barker worked with Ronnie Corbett "
-            "as The Two Ronnies."
-        ),
-        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+        followups=["Safe public-research follow-ups may continue the Ronnie thread."],
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
@@ -1383,16 +1619,14 @@ def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):
         room_id="!bridge:test.example",
         instance="local",
     )
-    hermes_minutes.append_turn_summary(
+    append_minutes_summary_fixture(
+        minutes_file,
         conversation_key=conversation_key,
-        operator_text="what is Ronnie Corbett known for?",
-        source_room_id="!bridge:test.example",
-        route="direct_local",
-        route_status="delivered",
+        operator="Operator asked what Ronnie Corbett is known for.",
+        action="The system completed bounded public research.",
+        result="Prior research concerned Ronnie Corbett as a British comedian.",
         route_profile=wake_stt_direct.WAKE_STT_NULLCLAW_PROFILE,
-        assistant_speech="Ronnie Corbett was a British comedian.",
-        matrix_detail="Public research answer about Ronnie Corbett.",
-        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+        followups=["Safe public-research follow-ups may continue the Ronnie Corbett thread."],
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
@@ -1507,18 +1741,17 @@ def test_submit_wake_stt_to_hermes_includes_recent_minutes_for_answers(tmp_path,
         room_id="!bridge:test.example",
         instance="local",
     )
-    hermes_minutes.append_turn_summary(
+    append_minutes_summary_fixture(
+        minutes_file,
         conversation_key=conversation_key,
-        operator_text="why have we got two Dockge entries in our documents?",
-        source_room_id="!bridge:test.example",
-        route="direct_local",
-        route_status="delivered",
-        route_profile="hermes-stt-local",
-        assistant_speech="One looks like the maintained docs entry and one looks legacy.",
-        matrix_detail=(
-            "Local docs answer: top-level Dockge and DOCKGE entries both refer to Dockge; "
-            "one is probably a legacy capitalization variant."
+        operator="Operator asked why there are two Dockge entries in documents.",
+        action="The system answered from local documentation context.",
+        result=(
+            "Dockge and DOCKGE appear to be related document entries, possibly a "
+            "capitalization variant."
         ),
+        route_profile="hermes-stt-local",
+        followups=["Safe local-docs follow-ups may continue this Dockge thread."],
     )
     captured: dict[str, object] = {}
 
