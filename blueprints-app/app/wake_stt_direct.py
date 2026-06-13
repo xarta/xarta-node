@@ -1600,6 +1600,13 @@ def _minutes_context_for_prompt(
                 "tts_utterance_source_available": tts_utterance_source_available,
                 "wake_route_record_source_available": wake_route_source_available,
             },
+            "source_support": _wake_stt_minutes_source_support(
+                conversation_key=conversation_key,
+                bounded_nullclaw_research_context_available=research_context_available,
+                matrix_room_source_available=matrix_source_available,
+                tts_utterance_source_available=tts_utterance_source_available,
+                wake_route_record_source_available=wake_route_source_available,
+            ),
         }
     return context
 
@@ -3445,6 +3452,188 @@ def _current_turn_source_scope_tokens(source_scope: str) -> set[str]:
     return tokens or {"none"}
 
 
+def _wake_stt_instance_from_conversation_key(conversation_key: str) -> str:
+    match = re.match(r"^wake-stt:([^:]+)", _clean_wake_stt_conversation_key(conversation_key))
+    if not match:
+        return "local"
+    return _clean_wake_instance_id(match.group(1))
+
+
+def _source_support_item(
+    *,
+    status: str,
+    owner: str,
+    reason: str,
+    available: bool | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "status": status,
+        "owner": owner,
+        "reason": _clip_text(reason, 260),
+    }
+    if available is not None:
+        item["available"] = bool(available)
+    return item
+
+
+def _wake_stt_minutes_source_support(
+    *,
+    conversation_key: str,
+    bounded_nullclaw_research_context_available: bool,
+    matrix_room_source_available: bool,
+    tts_utterance_source_available: bool,
+    wake_route_record_source_available: bool,
+) -> dict[str, Any]:
+    instance = _wake_stt_instance_from_conversation_key(conversation_key)
+    if instance == "vps":
+        return {
+            "schema": "xarta.wake-stt.minutes-source-support.v1",
+            "instance": instance,
+            "policy": (
+                "Source support is deployment metadata, not an instruction to fetch. "
+                "Unsupported and needs_design sources must fail visibly and compactly."
+            ),
+            "sources": {
+                "matrix_source_pointer": _source_support_item(
+                    status="needs_design",
+                    owner="hermes_vps_default_matrix",
+                    available=matrix_room_source_available,
+                    reason=(
+                        "VPS Matrix source pointers need explicit server, identity, "
+                        "allowed-room, and E2EE policy before fetching."
+                    ),
+                ),
+                "tts_utterance_pointer": _source_support_item(
+                    status="supported_by_tb1" if tts_utterance_source_available else "unavailable",
+                    owner="tb1_blueprints",
+                    available=tts_utterance_source_available,
+                    reason=(
+                        "Blueprints may own browser-directed TTS records for direct_vps turns; "
+                        "Hermes VPS itself does not own the TB1 TTS event store."
+                    ),
+                ),
+                "wake_route_record": _source_support_item(
+                    status=(
+                        "supported_by_tb1" if wake_route_record_source_available else "unavailable"
+                    ),
+                    owner="tb1_blueprints",
+                    available=wake_route_record_source_available,
+                    reason=(
+                        "Wake route timing and bounded action records are created by "
+                        "the local Blueprints process, not by the VPS container."
+                    ),
+                ),
+                "profile_session": _source_support_item(
+                    status="needs_design",
+                    owner="hermes_vps_stt",
+                    reason=(
+                        "VPS profile sessions live under VPS persistent state and need a "
+                        "bounded read helper plus commissioning guard before use."
+                    ),
+                ),
+                "nullclaw_research_context": _source_support_item(
+                    status="unsupported",
+                    owner="tb1_nullclaw",
+                    available=bounded_nullclaw_research_context_available,
+                    reason=(
+                        "The current bounded NullClaw research context is TB1-local; no "
+                        "VPS research source pointer has been designed."
+                    ),
+                ),
+                "vps_health_task_record": _source_support_item(
+                    status="needs_design",
+                    owner="hermes_vps_stt",
+                    reason=(
+                        "VPS health records should become a read-only compact pointer "
+                        "schema before they are used as source material."
+                    ),
+                ),
+            },
+        }
+    return {
+        "schema": "xarta.wake-stt.minutes-source-support.v1",
+        "instance": instance,
+        "policy": (
+            "Source support is deployment metadata, not an instruction to fetch. "
+            "Unsupported and needs_design sources must fail visibly and compactly."
+        ),
+        "sources": {
+            "matrix_source_pointer": _source_support_item(
+                status="supported" if matrix_room_source_available else "unavailable",
+                owner="tb1_blueprints_matrix",
+                available=matrix_room_source_available,
+                reason="TB1 Blueprints owns the local Matrix source-event helper.",
+            ),
+            "tts_utterance_pointer": _source_support_item(
+                status="supported" if tts_utterance_source_available else "unavailable",
+                owner="tb1_blueprints_tts",
+                available=tts_utterance_source_available,
+                reason="TB1 Blueprints owns recent browser-directed TTS records.",
+            ),
+            "wake_route_record": _source_support_item(
+                status="supported" if wake_route_record_source_available else "unavailable",
+                owner="tb1_blueprints",
+                available=wake_route_record_source_available,
+                reason="TB1 Blueprints owns local Wake route timing and bounded action records.",
+            ),
+            "profile_session": _source_support_item(
+                status="supported",
+                owner="hermes_local_profile",
+                reason="Local Hermes STT profile session paths are available to Blueprints.",
+            ),
+            "nullclaw_research_context": _source_support_item(
+                status=(
+                    "supported" if bounded_nullclaw_research_context_available else "unavailable"
+                ),
+                owner="tb1_nullclaw",
+                available=bounded_nullclaw_research_context_available,
+                reason="TB1 owns the bounded NullClaw research context file.",
+            ),
+        },
+    }
+
+
+def _source_support_for_type(
+    minutes_context: dict[str, Any],
+    source_type: str,
+) -> dict[str, Any]:
+    current_check = (
+        minutes_context.get("current_turn_source_check")
+        if isinstance(minutes_context.get("current_turn_source_check"), dict)
+        else {}
+    )
+    support = (
+        current_check.get("source_support")
+        if isinstance(current_check.get("source_support"), dict)
+        else {}
+    )
+    sources = support.get("sources") if isinstance(support.get("sources"), dict) else {}
+    item = sources.get(source_type) if isinstance(sources.get(source_type), dict) else {}
+    return item if isinstance(item, dict) else {}
+
+
+def _source_support_allows_fetch(minutes_context: dict[str, Any], source_type: str) -> bool:
+    support = _source_support_for_type(minutes_context, source_type)
+    if not support:
+        return True
+    return str(support.get("status") or "").strip() in {"supported", "supported_by_tb1"}
+
+
+def _unsupported_source_support_context(
+    minutes_context: dict[str, Any],
+    source_type: str,
+) -> dict[str, Any]:
+    support = _source_support_for_type(minutes_context, source_type)
+    status = _clip_text(support.get("status") or "unsupported", 80)
+    return {
+        "status": status,
+        "source": source_type,
+        "owner": _clip_text(support.get("owner"), 120),
+        "reason": _clip_text(support.get("reason"), 260),
+        "available": bool(support.get("available")),
+    }
+
+
 def _minutes_pointer_entries(minutes_context: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for key in ("entries", "nearby_entries"):
@@ -3761,34 +3950,69 @@ async def _bounded_current_turn_source_material(
         ),
     }
     sources_checked: list[str] = []
-    if wants_session and source_config is not None:
-        profile_session = _read_hermes_stt_profile_session_source_context(source_config)
-        if profile_session:
-            source_context["profile_session"] = profile_session
-            sources_checked.append("profile_session")
-    if wants_research:
-        research_context = _current_turn_research_source_context(environ)
-        if research_context:
-            source_context["nullclaw_research_context"] = research_context
-            sources_checked.append("nullclaw_research_context")
     pointer_context = minutes_context if isinstance(minutes_context, dict) else {}
+    if wants_session:
+        if not _source_support_allows_fetch(pointer_context, "profile_session"):
+            source_context["profile_session"] = _unsupported_source_support_context(
+                pointer_context,
+                "profile_session",
+            )
+            sources_checked.append("profile_session")
+        elif source_config is not None:
+            profile_session = _read_hermes_stt_profile_session_source_context(source_config)
+            if profile_session:
+                source_context["profile_session"] = profile_session
+                sources_checked.append("profile_session")
+    if wants_research:
+        if _source_support_allows_fetch(pointer_context, "nullclaw_research_context"):
+            research_context = _current_turn_research_source_context(environ)
+            if research_context:
+                source_context["nullclaw_research_context"] = research_context
+                sources_checked.append("nullclaw_research_context")
+        else:
+            source_context["nullclaw_research_context"] = _unsupported_source_support_context(
+                pointer_context,
+                "nullclaw_research_context",
+            )
+            sources_checked.append("nullclaw_research_context")
     if wants_matrix and pointer_context:
-        matrix_context = await _bounded_matrix_pointer_source_context(pointer_context)
-        if matrix_context:
-            source_context["matrix_source_pointer"] = matrix_context
+        if _source_support_allows_fetch(pointer_context, "matrix_source_pointer"):
+            matrix_context = await _bounded_matrix_pointer_source_context(pointer_context)
+            if matrix_context:
+                source_context["matrix_source_pointer"] = matrix_context
+                sources_checked.append("matrix_source_pointer")
+        else:
+            source_context["matrix_source_pointer"] = _unsupported_source_support_context(
+                pointer_context,
+                "matrix_source_pointer",
+            )
             sources_checked.append("matrix_source_pointer")
     if wants_tts and pointer_context:
-        tts_context = _bounded_tts_utterance_pointer_source_context(pointer_context)
-        if tts_context:
-            source_context["tts_utterance_pointer"] = tts_context
+        if _source_support_allows_fetch(pointer_context, "tts_utterance_pointer"):
+            tts_context = _bounded_tts_utterance_pointer_source_context(pointer_context)
+            if tts_context:
+                source_context["tts_utterance_pointer"] = tts_context
+                sources_checked.append("tts_utterance_pointer")
+        else:
+            source_context["tts_utterance_pointer"] = _unsupported_source_support_context(
+                pointer_context,
+                "tts_utterance_pointer",
+            )
             sources_checked.append("tts_utterance_pointer")
     if wants_route and pointer_context:
-        route_context = _bounded_wake_route_pointer_source_context(
-            pointer_context,
-            environ=environ,
-        )
-        if route_context:
-            source_context["wake_route_record"] = route_context
+        if _source_support_allows_fetch(pointer_context, "wake_route_record"):
+            route_context = _bounded_wake_route_pointer_source_context(
+                pointer_context,
+                environ=environ,
+            )
+            if route_context:
+                source_context["wake_route_record"] = route_context
+                sources_checked.append("wake_route_record")
+        else:
+            source_context["wake_route_record"] = _unsupported_source_support_context(
+                pointer_context,
+                "wake_route_record",
+            )
             sources_checked.append("wake_route_record")
     if not sources_checked:
         return WakeSttSourceMaterial()

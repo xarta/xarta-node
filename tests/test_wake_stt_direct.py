@@ -1857,6 +1857,80 @@ def test_bounded_minutes_source_pointer_fetches_tts_and_wake_route_records(
     )
 
 
+def test_vps_minutes_context_advertises_source_support_statuses(tmp_path):
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="vps",
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator asked Hermes VPS to open the shared bridge room.",
+        action="VPS Wake STT routed bounded navigation and queued TTS.",
+        result="The route used the direct_vps path.",
+        route="direct_vps",
+        route_profile=wake_stt_direct.WAKE_STT_BLUEPRINTS_NAV_PROFILE,
+        source_event_ids=["$vps-source-event"],
+        tts_utterance_ids=["wake-stt-vps-tts"],
+        wake_route_record_ids=["wake-route-vps"],
+        followups=["Safe direct_vps repairs may refer to the bounded route."],
+    )
+
+    context = wake_stt_direct._minutes_context_for_prompt(
+        request_text="did that open the right shared bridge room then",
+        conversation_key=conversation_key,
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    support = context["current_turn_source_check"]["source_support"]
+    assert support["instance"] == "vps"
+    sources = support["sources"]
+    assert sources["matrix_source_pointer"]["status"] == "needs_design"
+    assert sources["profile_session"]["status"] == "needs_design"
+    assert sources["nullclaw_research_context"]["status"] == "unsupported"
+    assert sources["tts_utterance_pointer"]["status"] == "supported_by_tb1"
+    assert sources["wake_route_record"]["status"] == "supported_by_tb1"
+
+
+def test_vps_needs_design_matrix_source_pointer_returns_compact_status(tmp_path):
+    minutes_file = tmp_path / "minutes.jsonl"
+    conversation_key = wake_stt_direct.wake_stt_conversation_key(
+        room_id="!bridge:test.example",
+        instance="vps",
+    )
+    append_minutes_summary_fixture(
+        minutes_file,
+        conversation_key=conversation_key,
+        operator="Operator asked Hermes VPS to research a shared bridge topic.",
+        action="Hermes VPS answered in Shared Bridge.",
+        result="The compact Minutes know the topic but not the source detail.",
+        route="direct_vps",
+        source_event_ids=["$vps-source-event"],
+        followups=["Follow-ups may need the original VPS Matrix source event."],
+    )
+    context = wake_stt_direct._minutes_context_for_prompt(
+        request_text="what did it say about him then",
+        conversation_key=conversation_key,
+        environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+    )
+
+    material = asyncio.run(
+        wake_stt_direct._bounded_current_turn_source_material(
+            source_scope="matrix_source_pointer",
+            minutes_context=context,
+            environ={"HERMES_MINUTES_LOCAL_INDEX_PATH": str(minutes_file)},
+        )
+    )
+
+    assert material.has_context is True
+    assert material.sources_checked == ("matrix_source_pointer",)
+    matrix_context = material.source_context["matrix_source_pointer"]
+    assert matrix_context["status"] == "needs_design"
+    assert matrix_context["source"] == "matrix_source_pointer"
+    assert "messages" not in matrix_context
+
+
 def test_lexical_earlier_cues_do_not_force_source_lookup(tmp_path):
     examples = tmp_path / "profile-routing-examples.json"
     examples.write_text(
