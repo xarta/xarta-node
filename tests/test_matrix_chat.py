@@ -10,6 +10,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 from app import routes_matrix_chat as matrix_chat
 
 
+def model_minutes_summary_for_packet(packet, *, result=None):
+    operator = str(packet.get("operator_text") or "").strip()
+    speech = str(packet.get("assistant_speech") or "").strip()
+    pointers = (
+        packet.get("source_pointers") if isinstance(packet.get("source_pointers"), dict) else {}
+    )
+    return {
+        "schema": matrix_chat.hermes_minutes.MINUTES_SUMMARY_SCHEMA,
+        "conversation_key": packet.get("conversation_key"),
+        "time": "2026-06-13T00:00:00Z",
+        "route": packet.get("route"),
+        "route_status": packet.get("route_status"),
+        "route_profile": packet.get("route_profile"),
+        "operator_intent_summary": (
+            f"Operator asked: {operator}" if operator else "Hermes sent a Bridge response."
+        ),
+        "assistant_action_summary": (
+            "The system delivered a response."
+            if speech
+            else "The system recorded the operator turn."
+        ),
+        "result_summary": result or speech or "The Matrix Bridge message was recorded.",
+        "open_question": "",
+        "entities": [],
+        "problems": [],
+        "followup_affordances": [],
+        "source_pointers": {
+            "source_room_id": pointers.get("source_room_id") or "",
+            "matrix_event_ids": pointers.get("matrix_event_ids") or [],
+            "tts_utterance_ids": pointers.get("tts_utterance_ids") or [],
+        },
+        "source_detail_available": bool(
+            (packet.get("source_material") or {}).get("matrix_detail_excerpt_for_model_only")
+        ),
+        "source_detail_policy": (
+            "Minutes are model-written compact routing context, not source copies. "
+            "Use source_pointers only when a later bounded source-check decision needs originals."
+        ),
+        "delivery": packet.get("delivery") if isinstance(packet.get("delivery"), dict) else {},
+        "confidence": 0.82,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _default_wake_stt_profile_classifier(monkeypatch):
     async def fake_classifier(*_args, **_kwargs):
@@ -2448,6 +2491,11 @@ def test_matrix_chat_wake_stt_direct_writes_minutes_and_schedules_post(monkeypat
     monkeypatch.setattr(matrix_chat, "_publish_tts_utterance_payload", fake_publish)
     monkeypatch.setattr(matrix_chat, "_send_wake_stt_direct_response_report_safely", fake_report)
     monkeypatch.setattr(matrix_chat, "_post_wake_stt_minutes_summary_safely", fake_minutes_post)
+    monkeypatch.setattr(
+        matrix_chat.hermes_minutes,
+        "summarize_turn_packet_with_model",
+        lambda packet, **_kwargs: (model_minutes_summary_for_packet(packet), ""),
+    )
 
     result = asyncio.run(
         matrix_chat.matrix_chat_send_wake_stt(
@@ -2489,6 +2537,21 @@ def test_matrix_chat_sync_records_bridge_messages_to_minutes(monkeypatch, tmp_pa
         return {"ok": True, "room_id": "!minutes:test.example", "event_id": "$minutes"}
 
     monkeypatch.setattr(matrix_chat, "_post_wake_stt_minutes_summary_safely", fake_minutes_post)
+    monkeypatch.setattr(
+        matrix_chat.hermes_minutes,
+        "summarize_turn_packet_with_model",
+        lambda packet, **_kwargs: (
+            model_minutes_summary_for_packet(
+                packet,
+                result=(
+                    "Hermes said it should preserve the prior turn order."
+                    if packet.get("route_profile") == "matrix-bridge-hermes"
+                    else "The operator emphasized paying attention to turn order."
+                ),
+            ),
+            "",
+        ),
+    )
     settings = {
         "server_id": "tb1",
         "server_label": "TB1",
