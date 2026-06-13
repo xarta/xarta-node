@@ -2562,6 +2562,73 @@ async def _load_room_messages_for_redaction(
     return messages[-target:], at_start
 
 
+async def fetch_bounded_minutes_source_events(
+    *,
+    room_id: str,
+    event_ids: list[str],
+    limit: int = 3,
+    max_body_chars: int = 900,
+) -> dict[str, Any]:
+    """Fetch specific Matrix source events referenced by compact Minutes pointers."""
+
+    clean_room_id = _safe_str(room_id)
+    clean_event_ids: list[str] = []
+    for event_id in event_ids:
+        text = _safe_str(event_id)
+        if text and text not in clean_event_ids:
+            clean_event_ids.append(text)
+        if len(clean_event_ids) >= max(1, min(limit, 8)):
+            break
+    if not clean_room_id or not clean_event_ids:
+        return {"ok": False, "status": "missing_pointer", "messages": []}
+
+    messages: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    encoded_room = quote(clean_room_id, safe="")
+    for event_id in clean_event_ids:
+        encoded_event = quote(event_id, safe="")
+        try:
+            raw = await _matrix_request("GET", f"/rooms/{encoded_room}/event/{encoded_event}")
+            e2ee_client = await _get_e2ee_client()
+            if e2ee_client:
+                decoded = await e2ee_client.messages_from_raw_events(clean_room_id, [raw])
+            else:
+                message = _message_from_event(raw, clean_room_id)
+                decoded = [message] if message else []
+        except Exception as exc:  # pragma: no cover - homeserver/E2EE failures vary.
+            errors.append({"event_id": event_id[:80], "error": str(exc)[:160]})
+            continue
+        for message in decoded:
+            if not isinstance(message, dict):
+                continue
+            clean_body = _safe_str(message.get("body"))[: max(1, min(max_body_chars, 2000))]
+            if not clean_body:
+                continue
+            messages.append(
+                {
+                    "event_id": _safe_str(message.get("event_id")),
+                    "room_id": clean_room_id,
+                    "sender": _safe_str(message.get("sender")),
+                    "origin_server_ts": message.get("origin_server_ts"),
+                    "msgtype": _safe_str(message.get("msgtype")),
+                    "body": clean_body,
+                    "encrypted": bool(message.get("encrypted")),
+                    "decrypted": bool(message.get("decrypted")),
+                }
+            )
+            if len(messages) >= max(1, min(limit, 8)):
+                break
+        if len(messages) >= max(1, min(limit, 8)):
+            break
+    return {
+        "ok": bool(messages),
+        "status": "loaded" if messages else "not_found",
+        "message_count": len(messages),
+        "messages": messages,
+        "errors": errors[:4],
+    }
+
+
 async def _synapse_admin_request(
     method: str,
     path: str,
