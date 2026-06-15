@@ -13,6 +13,7 @@ import contextvars
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -91,6 +92,7 @@ _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
+_MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_REDACTION_SCAN_LIMIT = 20_000
 _REDACTION_MAX_RETRIES = 6
 _REDACTION_RETRY_FLOOR_SECONDS = 5.0
@@ -2265,6 +2267,9 @@ class _MatrixChatE2EEClient:
             if isinstance(source_content, dict)
             else None
         )
+        media = (
+            _media_fields_from_content(source_content) if isinstance(source_content, dict) else None
+        )
         return _message_from_parts(
             event_id=str(getattr(event, "event_id", "") or ""),
             room_id=room_id,
@@ -2274,6 +2279,7 @@ class _MatrixChatE2EEClient:
             body=body,
             relates_to=relates_to if isinstance(relates_to, dict) else None,
             system_message=system_message if isinstance(system_message, dict) else None,
+            media=media,
             encrypted=encrypted,
             decrypted=encrypted,
         )
@@ -3430,6 +3436,88 @@ async def _matrix_room_is_encrypted(room_id: str) -> bool:
     return False
 
 
+async def _matrix_media_event_content(
+    *,
+    room_id: str,
+    content: bytes,
+    filename: str,
+    mimetype: str,
+    duration_ms: int | None = None,
+) -> tuple[dict[str, Any], str, bool, bool]:
+    encrypted_room = await _matrix_room_is_encrypted(room_id)
+    upload_content = content
+    upload_mimetype = mimetype
+    encrypted_file: dict[str, Any] | None = None
+    if encrypted_room:
+        if await _get_e2ee_client() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Matrix E2EE client is required to send attachments into this encrypted room",
+            )
+        try:
+            from mautrix.crypto.attachments import encrypt_attachment
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Matrix encrypted attachment support is not available",
+            ) from exc
+        try:
+            upload_content, encrypted = encrypt_attachment(content)
+            encrypted_file = encrypted.serialize()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Matrix encrypted attachment preparation failed",
+            ) from exc
+        upload_mimetype = "application/octet-stream"
+    content_uri = await _matrix_upload_media(
+        content=upload_content,
+        filename=filename,
+        mimetype=upload_mimetype,
+    )
+    if encrypted_file is not None:
+        encrypted_file["url"] = content_uri
+    return (
+        _media_message_content(
+            content_uri=content_uri,
+            filename=filename,
+            mimetype=mimetype,
+            size=len(content),
+            encrypted_file=encrypted_file,
+            duration_ms=duration_ms,
+        ),
+        content_uri,
+        encrypted_room,
+        encrypted_file is not None,
+    )
+
+
+async def _send_room_message_content(
+    *,
+    room_id: str,
+    content: dict[str, Any],
+    txn_prefix: str,
+) -> dict[str, Any]:
+    e2ee_client = await _get_e2ee_client()
+    if e2ee_client:
+        return await e2ee_client.send_message_content(room_id, content)
+    if await _matrix_room_is_encrypted(room_id):
+        raise HTTPException(
+            status_code=503,
+            detail="Matrix E2EE client is required to send into this encrypted room",
+        )
+    encoded_room = quote(room_id, safe="")
+    txn_id = f"{txn_prefix}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+    encoded_txn = quote(txn_id, safe="")
+    data = await _matrix_request(
+        "PUT",
+        f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
+        json_body=content,
+        expected=(200,),
+    )
+    return {"room_id": room_id, "event_id": data.get("event_id")}
+
+
 def _minutes_matrix_target_key(summary: dict[str, Any]) -> str:
     conversation_key = _safe_str(summary.get("conversation_key")).strip().lower()
     route = _safe_str(summary.get("route")).strip().lower()
@@ -3788,9 +3876,19 @@ def _safe_media_filename(filename: str | None, default: str = "voice-message.web
     return clean[:160] or default
 
 
+def _guess_media_mimetype(filename: str, content_type: str | None) -> str:
+    explicit = (content_type or "").split(";", 1)[0].strip().lower()
+    guessed, _ = mimetypes.guess_type(filename)
+    if explicit and explicit not in {"application/octet-stream", "binary/octet-stream"}:
+        return explicit
+    if guessed:
+        return guessed.lower()
+    return explicit or "application/octet-stream"
+
+
 def _guess_audio_mimetype(filename: str, content_type: str | None) -> str:
-    mimetype = (content_type or "").strip().lower()
-    if mimetype:
+    mimetype = (content_type or "").split(";", 1)[0].strip().lower()
+    if mimetype and mimetype not in {"application/octet-stream", "binary/octet-stream"}:
         return mimetype
     suffix = Path(filename).suffix.lower()
     return {
@@ -3802,7 +3900,44 @@ def _guess_audio_mimetype(filename: str, content_type: str | None) -> str:
         ".oga": "audio/ogg",
         ".webm": "audio/webm",
         ".flac": "audio/flac",
-    }.get(suffix, "application/octet-stream")
+    }.get(suffix, _guess_media_mimetype(filename, content_type))
+
+
+def _media_msgtype_for_mimetype(mimetype: str) -> str:
+    clean = (mimetype or "").split(";", 1)[0].strip().lower()
+    if clean.startswith("image/"):
+        return "m.image"
+    if clean.startswith("audio/"):
+        return "m.audio"
+    if clean.startswith("video/"):
+        return "m.video"
+    return "m.file"
+
+
+def _media_message_content(
+    *,
+    content_uri: str,
+    filename: str,
+    mimetype: str,
+    size: int,
+    encrypted_file: dict[str, Any] | None = None,
+    duration_ms: int | None = None,
+) -> dict[str, Any]:
+    msgtype = _media_msgtype_for_mimetype(mimetype)
+    info: dict[str, Any] = {"mimetype": mimetype, "size": size}
+    if isinstance(duration_ms, int) and duration_ms >= 0 and msgtype == "m.audio":
+        info["duration"] = duration_ms
+    content: dict[str, Any] = {
+        "msgtype": msgtype,
+        "body": filename,
+        "filename": filename,
+        "info": info,
+    }
+    if isinstance(encrypted_file, dict):
+        content["file"] = encrypted_file
+    else:
+        content["url"] = content_uri
+    return content
 
 
 def _audio_message_content(
@@ -3813,16 +3948,13 @@ def _audio_message_content(
     size: int,
     duration_ms: int | None = None,
 ) -> dict[str, Any]:
-    info: dict[str, Any] = {"mimetype": mimetype, "size": size}
-    if isinstance(duration_ms, int) and duration_ms >= 0:
-        info["duration"] = duration_ms
-    return {
-        "msgtype": "m.audio",
-        "body": filename,
-        "filename": filename,
-        "url": content_uri,
-        "info": info,
-    }
+    return _media_message_content(
+        content_uri=content_uri,
+        filename=filename,
+        mimetype=mimetype,
+        size=size,
+        duration_ms=duration_ms,
+    )
 
 
 def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
@@ -4067,6 +4199,7 @@ def _message_from_parts(
     body: str,
     relates_to: dict[str, Any] | None = None,
     system_message: dict[str, Any] | None = None,
+    media: dict[str, Any] | None = None,
     encrypted: bool = False,
     decrypted: bool = False,
 ) -> dict[str, Any]:
@@ -4079,9 +4212,32 @@ def _message_from_parts(
         "body": body,
         "relates_to": relates_to if isinstance(relates_to, dict) else None,
         "system_message": system_message if isinstance(system_message, dict) else None,
+        "media": media if isinstance(media, dict) else None,
         "encrypted": encrypted,
         "decrypted": decrypted,
     }
+
+
+def _media_fields_from_content(content: dict[str, Any]) -> dict[str, Any] | None:
+    msgtype = content.get("msgtype")
+    if msgtype not in {"m.image", "m.audio", "m.video", "m.file"}:
+        return None
+    info = content.get("info") if isinstance(content.get("info"), dict) else {}
+    encrypted_file = content.get("file") if isinstance(content.get("file"), dict) else {}
+    direct_uri = content.get("url") if isinstance(content.get("url"), str) else ""
+    encrypted_uri = encrypted_file.get("url") if isinstance(encrypted_file.get("url"), str) else ""
+    filename = _safe_str(content.get("filename")) or _safe_str(content.get("body"))
+    media = {
+        "msgtype": _safe_str(msgtype),
+        "filename": filename,
+        "mimetype": _safe_str(info.get("mimetype")),
+        "size": _safe_int(info.get("size")),
+        "content_uri": direct_uri or encrypted_uri,
+        "encrypted_file": bool(encrypted_file),
+    }
+    if "duration" in info:
+        media["duration"] = _safe_int(info.get("duration"))
+    return media
 
 
 def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] | None:
@@ -4089,6 +4245,7 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         return None
     event_type = event.get("type")
     content = _event_content(event)
+    media = None
     if event_type == "m.room.encrypted":
         body = "[encrypted event]"
         msgtype = "m.encrypted"
@@ -4097,6 +4254,7 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         msgtype = content.get("msgtype") or "m.text"
         if not isinstance(body, str):
             return None
+        media = _media_fields_from_content(content)
     else:
         return None
 
@@ -4111,6 +4269,7 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         body=body,
         relates_to=relates_to if isinstance(relates_to, dict) else None,
         system_message=system_message if isinstance(system_message, dict) else None,
+        media=media,
         encrypted=event_type == "m.room.encrypted",
         decrypted=False,
     )
@@ -5781,38 +5940,75 @@ async def matrix_chat_send_audio(
     if len(content) > _MAX_AUDIO_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Audio upload is too large")
 
-    content_uri = await _matrix_upload_media(
+    (
+        message_content,
+        content_uri,
+        encrypted_room,
+        encrypted_attachment,
+    ) = await _matrix_media_event_content(
+        room_id=room_id,
         content=content,
         filename=filename,
         mimetype=mimetype,
-    )
-    message_content = _audio_message_content(
-        content_uri=content_uri,
-        filename=filename,
-        mimetype=mimetype,
-        size=len(content),
         duration_ms=duration_ms,
     )
-    e2ee_client = await _get_e2ee_client()
-    if e2ee_client:
-        sent = await e2ee_client.send_message_content(room_id, message_content)
-    else:
-        encoded_room = quote(room_id, safe="")
-        txn_id = f"bp-audio-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
-        encoded_txn = quote(txn_id, safe="")
-        data = await _matrix_request(
-            "PUT",
-            f"/rooms/{encoded_room}/send/m.room.message/{encoded_txn}",
-            json_body=message_content,
-            expected=(200,),
-        )
-        sent = {"room_id": room_id, "event_id": data.get("event_id")}
+    sent = await _send_room_message_content(
+        room_id=room_id,
+        content=message_content,
+        txn_prefix="bp-audio",
+    )
     sent.update(
         {
             "content_uri": content_uri,
             "filename": filename,
             "mimetype": mimetype,
             "size": len(content),
+            "msgtype": message_content.get("msgtype"),
+            "encrypted_room": encrypted_room,
+            "encrypted_attachment": encrypted_attachment,
+        }
+    )
+    return sent
+
+
+@router.post("/rooms/{room_id}/attachments")
+async def matrix_chat_send_attachment(
+    room_id: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    filename = _safe_media_filename(file.filename, default="attachment")
+    mimetype = _guess_media_mimetype(filename, file.content_type)
+    content = await file.read(_MAX_MEDIA_UPLOAD_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="Attachment upload is empty")
+    if len(content) > _MAX_MEDIA_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Attachment upload is too large")
+
+    (
+        message_content,
+        content_uri,
+        encrypted_room,
+        encrypted_attachment,
+    ) = await _matrix_media_event_content(
+        room_id=room_id,
+        content=content,
+        filename=filename,
+        mimetype=mimetype,
+    )
+    sent = await _send_room_message_content(
+        room_id=room_id,
+        content=message_content,
+        txn_prefix="bp-attachment",
+    )
+    sent.update(
+        {
+            "content_uri": content_uri,
+            "filename": filename,
+            "mimetype": mimetype,
+            "size": len(content),
+            "msgtype": message_content.get("msgtype"),
+            "encrypted_room": encrypted_room,
+            "encrypted_attachment": encrypted_attachment,
         }
     )
     return sent
