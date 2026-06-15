@@ -4253,6 +4253,41 @@ def test_matrix_chat_media_fields_reduce_attachment_metadata():
     assert "iv" not in media
 
 
+def test_matrix_chat_attachment_download_route_returns_plain_bytes(monkeypatch):
+    class FakeE2EEClient:
+        async def download_attachment_event(self, room_id, event_id):
+            return {
+                "data": b"plain image bytes",
+                "room_id": room_id,
+                "event_id": event_id,
+                "content_uri": "mxc://example.org/encrypted123",
+                "filename": "proof.png",
+                "mimetype": "image/png",
+                "size": 17,
+                "msgtype": "m.image",
+                "encrypted_event": True,
+                "encrypted_attachment": True,
+            }
+
+    async def fake_get_e2ee_client(*_args, **_kwargs):
+        return FakeE2EEClient()
+
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+
+    response = asyncio.run(
+        matrix_chat.matrix_chat_download_attachment("!room:test.example", "$event:test.example")
+    )
+
+    assert response.body == b"plain image bytes"
+    assert response.media_type == "image/png"
+    assert response.headers["x-matrix-media-mxc"] == "mxc://example.org/encrypted123"
+    assert response.headers["x-matrix-encrypted-event"] == "true"
+    assert response.headers["x-matrix-encrypted-attachment"] == "true"
+    assert "key" not in response.headers
+    assert "iv" not in response.headers
+    assert "hash" not in response.headers
+
+
 def test_matrix_chat_audio_filename_and_mimetype_are_normalized():
     assert matrix_chat._safe_media_filename("../../voice?.mp3") == "voice_.mp3"
     assert matrix_chat._safe_media_filename("") == "voice-message.webm"

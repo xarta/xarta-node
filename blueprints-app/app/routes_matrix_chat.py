@@ -34,6 +34,7 @@ import websockets
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket
 from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
+from starlette.responses import Response
 from starlette.websockets import WebSocketDisconnect
 
 from . import hermes_minutes, pve_fast_health, wake_stt_direct
@@ -93,6 +94,7 @@ _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
+_MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
 _MAX_REDACTION_SCAN_LIMIT = 20_000
 _REDACTION_MAX_RETRIES = 6
 _REDACTION_RETRY_FLOOR_SECONDS = 5.0
@@ -2232,6 +2234,88 @@ class _MatrixChatE2EEClient:
         _secure_crypto_store(self._store_dir)
         return {"room_id": room_id, "event_id": str(event_id)}
 
+    async def download_attachment_event(self, room_id: str, event_id: str) -> dict[str, Any]:
+        from mautrix.crypto.attachments import decrypt_attachment
+        from mautrix.types import EventID, EventType, RoomID
+
+        await self.ensure_started()
+        event = await self._client.get_event(RoomID(room_id), EventID(event_id))
+        encrypted_event = str(getattr(event, "type", "")) == str(EventType.ROOM_ENCRYPTED)
+        if encrypted_event:
+            try:
+                event = await self._client.crypto.decrypt_megolm_event(event)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Matrix event could not be decrypted by the Blueprints service device",
+                ) from exc
+
+        if str(getattr(event, "type", "")) != str(EventType.ROOM_MESSAGE):
+            raise HTTPException(status_code=400, detail="Matrix event is not a room message")
+        content = getattr(event, "content", None)
+        source_content = content.serialize() if hasattr(content, "serialize") else {}
+        media = (
+            _media_fields_from_content(source_content) if isinstance(source_content, dict) else None
+        )
+        if not media:
+            raise HTTPException(status_code=400, detail="Matrix event does not contain media")
+
+        encrypted_file = (
+            source_content.get("file")
+            if isinstance(source_content, dict) and isinstance(source_content.get("file"), dict)
+            else {}
+        )
+        content_uri = str(media.get("content_uri") or "").strip()
+        if not content_uri.startswith("mxc://"):
+            raise HTTPException(status_code=400, detail="Matrix event media URI is not MXC")
+        try:
+            downloaded = await self._client.download_media(content_uri, timeout_ms=30_000)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Matrix media download failed") from exc
+        if len(downloaded) > _MAX_MEDIA_DOWNLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Matrix media download is too large")
+
+        encrypted_attachment = bool(encrypted_file)
+        data = downloaded
+        if encrypted_attachment:
+            try:
+                key = (
+                    encrypted_file.get("key") if isinstance(encrypted_file.get("key"), dict) else {}
+                )
+                hashes = (
+                    encrypted_file.get("hashes")
+                    if isinstance(encrypted_file.get("hashes"), dict)
+                    else {}
+                )
+                data = decrypt_attachment(
+                    downloaded,
+                    str(key.get("k") or ""),
+                    str(hashes.get("sha256") or ""),
+                    str(encrypted_file.get("iv") or ""),
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Matrix encrypted attachment bytes could not be decrypted",
+                ) from exc
+        if len(data) > _MAX_MEDIA_DOWNLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Matrix attachment is too large")
+
+        return {
+            "data": data,
+            "room_id": room_id,
+            "event_id": event_id,
+            "content_uri": content_uri,
+            "filename": _safe_media_filename(
+                str(media.get("filename") or ""), default="attachment"
+            ),
+            "mimetype": str(media.get("mimetype") or "application/octet-stream"),
+            "size": len(data),
+            "msgtype": str(media.get("msgtype") or ""),
+            "encrypted_event": encrypted_event,
+            "encrypted_attachment": encrypted_attachment,
+        }
+
     async def message_from_event(self, event: Any, room_id: str) -> dict[str, Any] | None:
         from mautrix.types import EventType
 
@@ -3955,6 +4039,20 @@ def _audio_message_content(
         size=size,
         duration_ms=duration_ms,
     )
+
+
+def _attachment_response_headers(payload: dict[str, Any]) -> dict[str, str]:
+    filename = _safe_media_filename(str(payload.get("filename") or ""), default="attachment")
+    encoded_filename = quote(filename, safe="")
+    return {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+        "X-Matrix-Room-Id": str(payload.get("room_id") or ""),
+        "X-Matrix-Event-Id": str(payload.get("event_id") or ""),
+        "X-Matrix-Msgtype": str(payload.get("msgtype") or ""),
+        "X-Matrix-Media-Mxc": str(payload.get("content_uri") or ""),
+        "X-Matrix-Encrypted-Event": "true" if payload.get("encrypted_event") else "false",
+        "X-Matrix-Encrypted-Attachment": "true" if payload.get("encrypted_attachment") else "false",
+    }
 
 
 def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
@@ -6012,6 +6110,30 @@ async def matrix_chat_send_attachment(
         }
     )
     return sent
+
+
+@router.get("/rooms/{room_id}/attachments/{event_id}/download")
+async def matrix_chat_download_attachment(
+    room_id: str,
+    event_id: str,
+) -> Response:
+    e2ee_client = await _get_e2ee_client()
+    if not e2ee_client:
+        if await _matrix_room_is_encrypted(room_id):
+            raise HTTPException(
+                status_code=503,
+                detail="Matrix E2EE client is required to download encrypted attachments",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail="Matrix attachment download requires the Blueprints Matrix client",
+        )
+    payload = await e2ee_client.download_attachment_event(room_id, event_id)
+    return Response(
+        content=payload["data"],
+        media_type=str(payload.get("mimetype") or "application/octet-stream"),
+        headers=_attachment_response_headers(payload),
+    )
 
 
 @router.websocket("/rooms/{room_id}/stt/ws")
