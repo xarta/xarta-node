@@ -4190,6 +4190,69 @@ def test_matrix_chat_audio_message_content_uses_matrix_audio_shape():
     }
 
 
+def test_matrix_chat_media_message_content_uses_encrypted_file_shape():
+    encrypted_file = {
+        "v": "v2",
+        "url": "mxc://example.org/encrypted123",
+        "key": {"kty": "oct", "k": "not-a-real-key"},
+        "hashes": {"sha256": "not-a-real-hash"},
+        "iv": "not-a-real-iv",
+    }
+
+    content = matrix_chat._media_message_content(
+        content_uri="mxc://example.org/encrypted123",
+        filename="proof.png",
+        mimetype="image/png",
+        size=67,
+        encrypted_file=encrypted_file,
+    )
+
+    assert content == {
+        "msgtype": "m.image",
+        "body": "proof.png",
+        "filename": "proof.png",
+        "file": encrypted_file,
+        "info": {
+            "mimetype": "image/png",
+            "size": 67,
+        },
+    }
+    assert "url" not in content
+
+
+def test_matrix_chat_media_fields_reduce_attachment_metadata():
+    content = {
+        "msgtype": "m.image",
+        "body": "proof.png",
+        "filename": "proof.png",
+        "file": {
+            "v": "v2",
+            "url": "mxc://example.org/encrypted123",
+            "key": {"kty": "oct", "k": "not-a-real-key"},
+            "hashes": {"sha256": "not-a-real-hash"},
+            "iv": "not-a-real-iv",
+        },
+        "info": {
+            "mimetype": "image/png",
+            "size": 67,
+        },
+    }
+
+    media = matrix_chat._media_fields_from_content(content)
+
+    assert media == {
+        "msgtype": "m.image",
+        "filename": "proof.png",
+        "mimetype": "image/png",
+        "size": 67,
+        "content_uri": "mxc://example.org/encrypted123",
+        "encrypted_file": True,
+    }
+    assert "key" not in media
+    assert "hashes" not in media
+    assert "iv" not in media
+
+
 def test_matrix_chat_audio_filename_and_mimetype_are_normalized():
     assert matrix_chat._safe_media_filename("../../voice?.mp3") == "voice_.mp3"
     assert matrix_chat._safe_media_filename("") == "voice-message.webm"
