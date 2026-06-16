@@ -195,7 +195,17 @@ def _restart_command_parts() -> list[str]:
         and parts[1] == "restart"
         and "--no-block" not in parts
     ):
-        return ["systemctl", "--no-block", "restart", *parts[2:]]
+        unit = f"blueprints-app-self-restart-{os.getpid()}-{int(time.time() * 1000)}"
+        return [
+            "systemd-run",
+            "--unit",
+            unit,
+            "--on-active=1",
+            "--collect",
+            "/bin/systemctl",
+            "restart",
+            *parts[2:],
+        ]
     return parts
 
 
