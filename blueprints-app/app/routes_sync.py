@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import ssl
 import time
@@ -85,16 +86,56 @@ _ALLOWED_TABLES = {
 
 # Action types that trigger local execution rather than a DB write
 _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
+_GIT_PULL_SCOPE_ORDER = ("outer", "non_root", "inner")
+_GIT_PULL_LOCK = asyncio.Lock()
 
 
 # ── Git pull helpers ──────────────────────────────────────────────────────────
 
 
-async def _git_pull_and_restart(repo_path: str, label: str, restart_service: bool = True) -> None:
-    """Run git pull on a repo, then restart the service."""
+def _repo_pull_targets() -> dict[str, tuple[str, bool]]:
+    return {
+        "outer": (cfg.REPO_OUTER_PATH, True),
+        "inner": (cfg.REPO_INNER_PATH, True),
+        "non_root": (cfg.REPO_NON_ROOT_PATH, False),
+    }
+
+
+def _ordered_git_scopes(scopes) -> list[str]:
+    wanted = {scope for scope in scopes if scope in _GIT_PULL_SCOPE_ORDER}
+    return [scope for scope in _GIT_PULL_SCOPE_ORDER if scope in wanted]
+
+
+def _scope_for_system_action(action_type: str) -> str | None:
+    prefix = "sync_git_"
+    if action_type.startswith(prefix):
+        return action_type[len(prefix) :]
+    return None
+
+
+async def _git_head(repo_path: str, label: str) -> str | None:
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        repo_path,
+        "rev-parse",
+        "HEAD",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        log.warning("git head [%s] failed: %s", label, stderr.decode().strip())
+        return None
+    return stdout.decode().strip()
+
+
+async def _git_pull(repo_path: str, label: str) -> bool:
+    """Run git pull for one repo and return whether HEAD changed."""
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         log.info("git pull [%s] skipped: no repo at %r", label, repo_path)
-        return
+        return False
+    before = await _git_head(repo_path, label)
     proc = await asyncio.create_subprocess_exec(
         "git",
         "-C",
@@ -107,11 +148,55 @@ async def _git_pull_and_restart(repo_path: str, label: str, restart_service: boo
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
         result = stdout.decode().strip()
-        log.info("git pull [%s]: %s", label, result)
-        if restart_service and cfg.SERVICE_RESTART_CMD:
-            await _restart_service()
-    else:
-        log.warning("git pull [%s] failed: %s", label, stderr.decode().strip())
+        after = await _git_head(repo_path, label)
+        changed = before is not None and after is not None and before != after
+        if before is None or after is None:
+            changed = "Already up to date." not in result
+        log.info("git pull [%s]: %s (%s)", label, result, "changed" if changed else "unchanged")
+        return changed
+    log.warning("git pull [%s] failed: %s", label, stderr.decode().strip())
+    return False
+
+
+async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> None:
+    """Run a coalesced git-pull batch and restart once if runtime code changed."""
+    ordered_scopes = _ordered_git_scopes(scopes)
+    if not ordered_scopes:
+        return
+    source_label = f" {source}" if source else ""
+    targets = _repo_pull_targets()
+    restart_needed = False
+    async with _GIT_PULL_LOCK:
+        log.info("git pull batch%s: scopes=%s", source_label, ",".join(ordered_scopes))
+        for scope in ordered_scopes:
+            repo_path, restart_service = targets[scope]
+            changed = await _git_pull(repo_path, scope)
+            restart_needed = restart_needed or (changed and restart_service)
+        if restart_needed:
+            if cfg.SERVICE_RESTART_CMD:
+                await _restart_service()
+            else:
+                log.warning(
+                    "git pull batch%s changed runtime code but SERVICE_RESTART_CMD is unset",
+                    source_label,
+                )
+        else:
+            log.info(
+                "git pull batch%s completed with no runtime repo changes; restart skipped",
+                source_label,
+            )
+
+
+def _restart_command_parts() -> list[str]:
+    parts = shlex.split(cfg.SERVICE_RESTART_CMD)
+    if (
+        len(parts) >= 3
+        and parts[0] == "systemctl"
+        and parts[1] == "restart"
+        and "--no-block" not in parts
+    ):
+        return ["systemctl", "--no-block", "restart", *parts[2:]]
+    return parts
 
 
 async def _restart_service() -> None:
@@ -125,7 +210,10 @@ async def _restart_service() -> None:
         log.info("closing %d SSE subscriber(s) before restart", subscriber_count)
         await events_bus.close_all()
     await asyncio.sleep(1)
-    parts = cfg.SERVICE_RESTART_CMD.split()
+    parts = _restart_command_parts()
+    if not parts:
+        return
+    log.info("service restart requested: %s", " ".join(parts))
     proc = await asyncio.create_subprocess_exec(
         *parts,
         stdout=asyncio.subprocess.PIPE,
@@ -309,20 +397,21 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
     system_actions = [a for a in payload.actions if a.action_type in _SYSTEM_ACTION_TYPES]
     db_actions = [a for a in payload.actions if a.action_type not in _SYSTEM_ACTION_TYPES]
 
-    # Schedule system actions immediately — always accepted regardless of
-    # commit age so a newer node can tell an older one to git-pull.
-    for action in system_actions:
-        if action.action_type == "sync_git_outer":
-            asyncio.create_task(_git_pull_and_restart(cfg.REPO_OUTER_PATH, "outer"))
-            log.info("scheduled git pull [outer] from %s", payload.source_node_id)
-        elif action.action_type == "sync_git_inner":
-            asyncio.create_task(_git_pull_and_restart(cfg.REPO_INNER_PATH, "inner"))
-            log.info("scheduled git pull [inner] from %s", payload.source_node_id)
-        elif action.action_type == "sync_git_non_root":
-            asyncio.create_task(
-                _git_pull_and_restart(cfg.REPO_NON_ROOT_PATH, "non_root", restart_service=False)
+    # Schedule system actions as one ordered batch — always accepted regardless
+    # of commit age so a newer node can tell an older one to git-pull.
+    system_scopes = _ordered_git_scopes(
+        _scope_for_system_action(action.action_type) for action in system_actions
+    )
+    if system_scopes:
+        asyncio.create_task(
+            _git_pull_scopes_and_maybe_restart(
+                system_scopes,
+                source=f"from {payload.source_node_id}",
             )
-            log.info("scheduled git pull [non_root] from %s", payload.source_node_id)
+        )
+        log.info(
+            "scheduled git pull scopes %s from %s", ",".join(system_scopes), payload.source_node_id
+        )
 
     if not db_actions:
         return Response(status_code=204)
@@ -430,22 +519,14 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
     else:
         scopes = [payload.scope]
 
-    repo_map = {
-        "outer": (cfg.REPO_OUTER_PATH, True),
-        "inner": (cfg.REPO_INNER_PATH, True),
-        "non_root": (cfg.REPO_NON_ROOT_PATH, False),
-    }
-
     with get_conn() as conn:
         gen = get_gen(conn)
         for scope in scopes:
             action_type = f"sync_git_{scope}"
             enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
 
-    for scope in scopes:
-        repo, restart_service = repo_map[scope]
-        asyncio.create_task(_git_pull_and_restart(repo, scope, restart_service=restart_service))
-        log.info("triggered git pull [%s] locally + queued for all peers", scope)
+    asyncio.create_task(_git_pull_scopes_and_maybe_restart(scopes, source="local trigger"))
+    log.info("triggered git pull scopes %s locally + queued for all peers", ",".join(scopes))
 
     return Response(status_code=204)
 
