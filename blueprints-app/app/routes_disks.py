@@ -61,6 +61,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         r"^(mirror|raidz\\d*|draid\\d*|spare|spares|logs?|cache|special|dedup|replacing)(-|$)"
     )
     DEVICE_SLOT_RE = re.compile(r"^(ide|sata|scsi|virtio|efidisk|tpmstate)\\d+$")
+    NUMBER_RE = re.compile(r"(-?\\d+)")
 
 
     def run(cmd, timeout=8):
@@ -228,6 +229,136 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         return rows if isinstance(rows, list) else []
 
 
+    def annotate_mount_rows(rows):
+        annotated = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source") or "").strip()
+            clone = dict(row)
+            if source.startswith("/dev/"):
+                clone["resolved_source"] = os.path.realpath(source)
+            children = row.get("children")
+            if isinstance(children, list):
+                clone["children"] = annotate_mount_rows(children)
+            annotated.append(clone)
+        return annotated
+
+
+    def iter_lsblk_nodes(nodes):
+        for node in nodes if isinstance(nodes, list) else []:
+            if not isinstance(node, dict):
+                continue
+            yield node
+            children = node.get("children")
+            if isinstance(children, list):
+                yield from iter_lsblk_nodes(children)
+
+
+    def parse_first_int(text):
+        match = NUMBER_RE.search(str(text or ""))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+
+    def probe_ext_usage(path):
+        result = run(["tune2fs", "-l", path], timeout=3)
+        if not result["ok"]:
+            return None
+        fields = {}
+        for raw in result["stdout"].splitlines():
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            fields[key.strip().lower()] = parse_first_int(value)
+        block_count = fields.get("block count")
+        free_blocks = fields.get("free blocks")
+        block_size = fields.get("block size")
+        if None in {block_count, free_blocks, block_size}:
+            return None
+        total_bytes = int(block_count * block_size)
+        used_bytes = int(max(0, block_count - free_blocks) * block_size)
+        return {
+            "strategy": "tune2fs",
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+        }
+
+
+    def probe_ntfs_usage(path):
+        result = run(["ntfsinfo", "-m", path], timeout=3)
+        if not result["ok"]:
+            return None
+        fields = {}
+        for raw in result["stdout"].splitlines():
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            fields[key.strip().lower()] = parse_first_int(value)
+        cluster_size = fields.get("cluster size")
+        total_clusters = fields.get("volume size in clusters")
+        free_clusters = fields.get("free clusters")
+        if None in {cluster_size, total_clusters, free_clusters}:
+            return None
+        total_bytes = int(total_clusters * cluster_size)
+        used_bytes = int(max(0, total_clusters - free_clusters) * cluster_size)
+        return {
+            "strategy": "ntfsinfo",
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+        }
+
+
+    def collect_filesystem_usage_probes(blockdevices, mounts):
+        mounted_sources = set()
+
+        def walk_mounts(rows):
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("source", "resolved_source"):
+                    value = str(row.get(key) or "").strip()
+                    if value:
+                        mounted_sources.add(value)
+                children = row.get("children")
+                if isinstance(children, list):
+                    walk_mounts(children)
+
+        walk_mounts(mounts)
+        probes = {}
+        for node in iter_lsblk_nodes(blockdevices):
+            path = str(node.get("path") or "").strip()
+            if not path:
+                continue
+            fstype = str(node.get("fstype") or "").strip().lower()
+            if not fstype or fstype in {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}:
+                continue
+            if path in mounted_sources:
+                continue
+            resolved_path = os.path.realpath(path)
+            if resolved_path and resolved_path in mounted_sources:
+                continue
+            probe = None
+            if fstype in {"ext2", "ext3", "ext4"}:
+                probe = probe_ext_usage(path)
+            elif fstype in {"ntfs", "ntfs3"}:
+                probe = probe_ntfs_usage(path)
+            if not isinstance(probe, dict):
+                continue
+            probes[path] = {
+                "path": path,
+                "fstype": fstype,
+                "total_bytes": probe.get("total_bytes"),
+                "used_bytes": probe.get("used_bytes"),
+                "strategy": probe.get("strategy"),
+            }
+        return probes
+
+
     def parse_guest_disk_assignments():
         assignments = []
         for path in sorted(glob.glob("/etc/pve/qemu-server/*.conf")):
@@ -299,10 +430,17 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         timeout=10,
     )
 
+    mount_rows = annotate_mount_rows(parse_findmnt(findmnt["stdout"])) if findmnt["ok"] else []
+    lsblk_payload = (
+        json.loads(lsblk["stdout"]) if lsblk["ok"] and lsblk["stdout"].strip() else {"blockdevices": []}
+    )
+    blockdevices = lsblk_payload.get("blockdevices") if isinstance(lsblk_payload, dict) else []
+
     payload = {
         "host": socket.gethostname(),
-        "lsblk": json.loads(lsblk["stdout"]) if lsblk["ok"] and lsblk["stdout"].strip() else {"blockdevices": []},
-        "mounts": parse_findmnt(findmnt["stdout"]) if findmnt["ok"] else [],
+        "lsblk": lsblk_payload,
+        "mounts": mount_rows,
+        "filesystem_usage_probes": collect_filesystem_usage_probes(blockdevices, mount_rows),
         "zpool_list": parse_zpool_list(zpool_list["stdout"]) if zpool_list["ok"] else [],
         "zpool_members": parse_zpool_members(zpool_status["stdout"]) if zpool_status["ok"] else {},
         "zpool_status_text": zpool_status["stdout"] if zpool_status["ok"] else "",
@@ -556,12 +694,20 @@ def _flatten_block_devices(
 
 def _mount_index(mounts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
-    for mount in mounts:
-        if not isinstance(mount, dict):
-            continue
-        source = str(mount.get("source") or "").strip()
-        if source:
-            index[source] = mount
+
+    def walk(rows: list[dict[str, Any]]) -> None:
+        for mount in rows:
+            if not isinstance(mount, dict):
+                continue
+            for key in ("source", "resolved_source"):
+                source = str(mount.get(key) or "").strip()
+                if source:
+                    index[source] = mount
+            children = mount.get("children")
+            if isinstance(children, list):
+                walk(children)
+
+    walk(mounts)
     return index
 
 
@@ -610,6 +756,17 @@ def _pool_member_used_bytes(pool_row: dict[str, Any], member_size: int | None) -
     return int(round(member_size * (allocated / total)))
 
 
+def _filesystem_probe_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = snapshot.get("filesystem_usage_probes")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(path): probe
+        for path, probe in raw.items()
+        if isinstance(path, str) and isinstance(probe, dict)
+    }
+
+
 def _smart_payload(host: str, device_path: str | None) -> dict[str, str] | None:
     if not device_path:
         return None
@@ -649,7 +806,23 @@ def _guest_assignment_display(row: dict[str, Any]) -> str:
     return f"{target} via {slot}" if slot else target
 
 
-def _guest_assignment_note(assignments: list[dict[str, Any]], *, scope: str = "drive") -> str:
+def _probe_strategy_label(probe: dict[str, Any] | None) -> str:
+    if not isinstance(probe, dict):
+        return ""
+    strategy = str(probe.get("strategy") or "").strip().lower()
+    if strategy == "tune2fs":
+        return "read-only ext filesystem metadata"
+    if strategy == "ntfsinfo":
+        return "read-only NTFS metadata"
+    return "read-only filesystem metadata"
+
+
+def _guest_assignment_note(
+    assignments: list[dict[str, Any]],
+    *,
+    scope: str = "drive",
+    usage_probe: dict[str, Any] | None = None,
+) -> str:
     if not assignments:
         return ""
     labels = [_guest_assignment_display(item) for item in assignments if isinstance(item, dict)]
@@ -657,6 +830,12 @@ def _guest_assignment_note(assignments: list[dict[str, Any]], *, scope: str = "d
         labels = ["a guest"]
     unique_labels = list(dict.fromkeys(labels))
     joined = ", ".join(unique_labels)
+    probe_label = _probe_strategy_label(usage_probe)
+    if probe_label:
+        return (
+            f"This {scope} is assigned directly to {joined}. "
+            f"Usage is estimated from {probe_label} on the host at refresh time."
+        )
     return (
         f"This {scope} is assigned directly to {joined}. "
         "Usage inside the guest is not measured in this host view."
@@ -1015,6 +1194,7 @@ def _partition_used_bytes(
     pool_rows: dict[str, dict[str, Any]],
     partition_pools: dict[str, list[str]],
     mount_by_source: dict[str, dict[str, Any]],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
 ) -> int | None:
     path = str(part.get("path") or "").strip()
     mount = mount_by_source.get(path)
@@ -1022,6 +1202,10 @@ def _partition_used_bytes(
         used = _to_int(mount.get("used"))
         if used is not None:
             return used
+    probe = filesystem_probe_by_path.get(path) or {}
+    probed_used = _to_int(probe.get("used_bytes"))
+    if probed_used is not None:
+        return probed_used
     pools = partition_pools.get(path) or []
     if len(pools) == 1:
         size = _to_int(part.get("size"))
@@ -1038,13 +1222,14 @@ def _build_drive_nodes(
     pool_rows: dict[str, dict[str, Any]],
     partition_pools: dict[str, list[str]],
     mount_by_source: dict[str, dict[str, Any]],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
     guest_assignment_lookup: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[dict[str, Any]], dict[str, int | bool]]:
     drive_nodes: list[dict[str, Any]] = []
     rollup = {
         "known_used_bytes": 0,
         "guest_assigned_bytes": 0,
-        "has_guest_assigned_usage": False,
+        "guest_assigned_unknown_bytes": 0,
     }
 
     for disk in top_disks:
@@ -1052,8 +1237,10 @@ def _build_drive_nodes(
         disk_name = str(disk.get("name") or disk_path or "disk")
         disk_total = _to_int(disk.get("size"))
         disk_assignments = guest_assignment_lookup.get(disk_path) or []
+        disk_probe = filesystem_probe_by_path.get(disk_path) or {}
         partition_nodes: list[dict[str, Any]] = []
-        guest_partition_bytes = 0
+        guest_partition_total_bytes = 0
+        guest_partition_unknown_bytes = 0
         has_guest_partition = False
         children = disk.get("children") if isinstance(disk.get("children"), list) else []
         for part in children:
@@ -1062,6 +1249,7 @@ def _build_drive_nodes(
             part_path = str(part.get("path") or "").strip()
             part_total = _to_int(part.get("size"))
             part_assignments = guest_assignment_lookup.get(part_path) or []
+            part_probe = filesystem_probe_by_path.get(part_path) or {}
             pools = partition_pools.get(part_path) or []
             mount = mount_by_source.get(part_path) or {}
             used = _partition_used_bytes(
@@ -1069,11 +1257,21 @@ def _build_drive_nodes(
                 pool_rows=pool_rows,
                 partition_pools=partition_pools,
                 mount_by_source=mount_by_source,
+                filesystem_probe_by_path=filesystem_probe_by_path,
             )
+            part_note = ""
             if part_assignments:
-                used = None
                 has_guest_partition = True
-                guest_partition_bytes += part_total or 0
+                guest_partition_total_bytes += part_total or 0
+                if used is None:
+                    guest_partition_unknown_bytes += part_total or 0
+                    part_note = _guest_assignment_note(part_assignments, scope="partition")
+                else:
+                    part_note = _guest_assignment_note(
+                        part_assignments,
+                        scope="partition",
+                        usage_probe=part_probe,
+                    )
             facts = _non_null_facts(
                 _fact("Path", part_path),
                 _fact("Filesystem", part.get("fstype")),
@@ -1107,14 +1305,14 @@ def _build_drive_nodes(
                     str(part.get("name") or part_path),
                     subtitle=str(part.get("mountpoint") or mount.get("target") or "").strip(),
                     status="warn" if part_assignments else "info",
-                    note=_guest_assignment_note(part_assignments, scope="partition"),
+                    note=part_note,
                     group="Partitions",
                     facts=facts,
                     children=pool_children,
                     total_bytes=part_total,
                     used_bytes=used,
                     usage_text=_partial_usage_text(part_total, guest_assigned_bytes=part_total)
-                    if part_assignments
+                    if part_assignments and used is None
                     else "",
                 )
             )
@@ -1122,33 +1320,43 @@ def _build_drive_nodes(
         used = None
         usage_text = ""
         status = "warn" if disk_assignments or has_guest_partition else "info"
-        note = _guest_assignment_note(disk_assignments, scope="drive") if disk_assignments else ""
+        note = ""
         if partition_nodes:
             part_used = [
                 node.get("used_bytes")
                 for node in partition_nodes
                 if node.get("used_bytes") is not None
             ]
-            if has_guest_partition:
+            if guest_partition_unknown_bytes:
                 known_used = int(sum(part_used)) if part_used else None
                 usage_text = _partial_usage_text(
                     disk_total,
                     known_used_bytes=known_used,
-                    guest_assigned_bytes=guest_partition_bytes or None,
+                    guest_assigned_bytes=guest_partition_unknown_bytes or None,
                 )
             elif part_used:
                 used = int(sum(part_used))
         elif mount_by_source.get(disk_path):
             used = _to_int(mount_by_source[disk_path].get("used"))
+        else:
+            used = _to_int(disk_probe.get("used_bytes"))
         if disk_assignments:
-            used = None
-            usage_text = _partial_usage_text(disk_total, guest_assigned_bytes=disk_total)
-        if disk_assignments or has_guest_partition:
-            rollup["has_guest_assigned_usage"] = True
-            rollup["guest_assigned_bytes"] += (
-                (disk_total or 0) if disk_assignments else guest_partition_bytes
-            )
-        elif used is not None:
+            rollup["guest_assigned_bytes"] += disk_total or 0
+            if used is None:
+                rollup["guest_assigned_unknown_bytes"] += disk_total or 0
+                usage_text = _partial_usage_text(disk_total, guest_assigned_bytes=disk_total)
+                note = _guest_assignment_note(disk_assignments, scope="drive")
+            else:
+                note = _guest_assignment_note(
+                    disk_assignments,
+                    scope="drive",
+                    usage_probe=disk_probe,
+                )
+        elif has_guest_partition:
+            rollup["guest_assigned_bytes"] += guest_partition_total_bytes
+            if guest_partition_unknown_bytes:
+                rollup["guest_assigned_unknown_bytes"] += guest_partition_unknown_bytes
+        if used is not None:
             rollup["known_used_bytes"] += used
 
         transport = str(disk.get("tran") or "").strip()
@@ -1178,9 +1386,10 @@ def _build_drive_nodes(
                     ),
                 }
             )
-            note = (
-                "One or more partitions are assigned directly to a guest. "
-                "Usage inside those guests is not measured in this host view."
+            note = "One or more partitions are assigned directly to a guest. " + (
+                "Usage on some of that capacity is still unknown in this host view."
+                if guest_partition_unknown_bytes
+                else "Usage is estimated from read-only filesystem metadata where possible."
             )
         drive_nodes.append(
             _node(
@@ -1229,6 +1438,7 @@ def _build_host_node(
     mount_by_source = _mount_index(
         snapshot.get("mounts") if isinstance(snapshot.get("mounts"), list) else []
     )
+    filesystem_probe_by_path = _filesystem_probe_index(snapshot)
     member_lookup = _build_pool_member_lookup(snapshot)
     guest_assignment_lookup = _build_guest_assignment_lookup(snapshot)
     partition_pools: dict[str, list[str]] = {}
@@ -1261,6 +1471,7 @@ def _build_host_node(
         pool_rows=pool_rows,
         partition_pools=partition_pools,
         mount_by_source=mount_by_source,
+        filesystem_probe_by_path=filesystem_probe_by_path,
         guest_assignment_lookup=guest_assignment_lookup,
     )
 
@@ -1275,12 +1486,12 @@ def _build_host_node(
     usage_text = ""
     if drive_nodes:
         total = int(sum(node.get("total_bytes") or 0 for node in drive_nodes)) or None
-        if drive_rollup.get("has_guest_assigned_usage"):
+        if drive_rollup.get("guest_assigned_unknown_bytes"):
             used = None
             usage_text = _partial_usage_text(
                 total,
                 known_used_bytes=drive_rollup.get("known_used_bytes") or None,
-                guest_assigned_bytes=drive_rollup.get("guest_assigned_bytes") or None,
+                guest_assigned_bytes=drive_rollup.get("guest_assigned_unknown_bytes") or None,
             )
         elif any(node.get("used_bytes") is not None for node in drive_nodes):
             used = int(sum(node.get("used_bytes") or 0 for node in drive_nodes))
@@ -1301,8 +1512,8 @@ def _build_host_node(
     note = "Refreshes only on page open and manual refresh."
     if _NESTED_GUEST_PARENT and host == _NESTED_GUEST_PARENT:
         note = "Host view combines a live SSH storage snapshot with the existing AI Control overlay for nested guest context."
-    if drive_rollup.get("has_guest_assigned_usage"):
-        note = f"{note} One or more drives are assigned directly to a guest, so usage on that capacity is shown as partial here."
+    if drive_rollup.get("guest_assigned_unknown_bytes"):
+        note = f"{note} One or more drives are assigned directly to a guest, so usage on some of that capacity is still partial here."
 
     facts = [{"label": "Source", "value": "Live SSH snapshot"}]
     guest_assigned_total = drive_rollup.get("guest_assigned_bytes") or 0
@@ -1323,6 +1534,8 @@ def _build_host_node(
         usage_text=usage_text,
         meta={
             "guest_assigned_bytes": int(guest_assigned_total) or None,
+            "guest_assigned_unknown_bytes": drive_rollup.get("guest_assigned_unknown_bytes")
+            or None,
             "known_used_bytes": drive_rollup.get("known_used_bytes") or None,
         },
     )
@@ -1350,18 +1563,18 @@ def _build_topology(
     usage_text = ""
     if host_nodes and any(node.get("total_bytes") is not None for node in host_nodes):
         total = int(sum(node.get("total_bytes") or 0 for node in host_nodes)) or None
-        guest_assigned_total = (
-            int(sum(node.get("guest_assigned_bytes") or 0 for node in host_nodes)) or None
+        guest_assigned_unknown_total = (
+            int(sum(node.get("guest_assigned_unknown_bytes") or 0 for node in host_nodes)) or None
         )
         known_used_total = (
             int(sum(node.get("known_used_bytes") or 0 for node in host_nodes)) or None
         )
-        if guest_assigned_total:
+        if guest_assigned_unknown_total:
             used = None
             usage_text = _partial_usage_text(
                 total,
                 known_used_bytes=known_used_total,
-                guest_assigned_bytes=guest_assigned_total,
+                guest_assigned_bytes=guest_assigned_unknown_total,
             )
         else:
             used = (
