@@ -90,6 +90,7 @@ def test_git_pull_batch_restarts_once_when_runtime_repo_changes(monkeypatch):
 
     async def fake_restart():
         restarts.append("restart")
+        return True
 
     monkeypatch.setattr(routes_sync, "_git_pull", fake_git_pull)
     monkeypatch.setattr(routes_sync, "_restart_service", fake_restart)
@@ -108,6 +109,26 @@ def test_git_pull_batch_restarts_once_when_runtime_repo_changes(monkeypatch):
 
     assert calls == ["outer", "non_root", "inner"]
     assert restarts == ["restart"]
+
+
+def test_git_pull_batch_skips_when_restart_is_pending(monkeypatch):
+    calls = []
+
+    async def fake_git_pull(repo_path, label):
+        calls.append(label)
+        return False
+
+    monkeypatch.setattr(routes_sync, "_RESTART_PENDING", True)
+    monkeypatch.setattr(routes_sync, "_git_pull", fake_git_pull)
+    monkeypatch.setattr(
+        routes_sync,
+        "_repo_pull_targets",
+        lambda: {"outer": ("/repo/outer", True)},
+    )
+
+    asyncio.run(routes_sync._git_pull_scopes_and_maybe_restart(["outer"]))
+
+    assert calls == []
 
 
 def test_git_pull_batch_does_not_restart_for_non_root_only(monkeypatch):

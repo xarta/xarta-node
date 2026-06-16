@@ -88,6 +88,7 @@ _ALLOWED_TABLES = {
 _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
 _GIT_PULL_SCOPE_ORDER = ("outer", "non_root", "inner")
 _GIT_PULL_LOCK = asyncio.Lock()
+_RESTART_PENDING = False
 
 
 # ── Git pull helpers ──────────────────────────────────────────────────────────
@@ -160,6 +161,7 @@ async def _git_pull(repo_path: str, label: str) -> bool:
 
 async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> None:
     """Run a coalesced git-pull batch and restart once if runtime code changed."""
+    global _RESTART_PENDING
     ordered_scopes = _ordered_git_scopes(scopes)
     if not ordered_scopes:
         return
@@ -167,6 +169,9 @@ async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> Non
     targets = _repo_pull_targets()
     restart_needed = False
     async with _GIT_PULL_LOCK:
+        if _RESTART_PENDING:
+            log.info("git pull batch%s skipped: service restart already pending", source_label)
+            return
         log.info("git pull batch%s: scopes=%s", source_label, ",".join(ordered_scopes))
         for scope in ordered_scopes:
             repo_path, restart_service = targets[scope]
@@ -174,7 +179,9 @@ async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> Non
             restart_needed = restart_needed or (changed and restart_service)
         if restart_needed:
             if cfg.SERVICE_RESTART_CMD:
-                await _restart_service()
+                _RESTART_PENDING = True
+                if not await _restart_service():
+                    _RESTART_PENDING = False
             else:
                 log.warning(
                     "git pull batch%s changed runtime code but SERVICE_RESTART_CMD is unset",
@@ -209,7 +216,7 @@ def _restart_command_parts() -> list[str]:
     return parts
 
 
-async def _restart_service() -> None:
+async def _restart_service() -> bool:
     """Run SERVICE_RESTART_CMD, logging the outcome.
 
     Sleep briefly first so the HTTP response that triggered this call
@@ -222,7 +229,7 @@ async def _restart_service() -> None:
     await asyncio.sleep(1)
     parts = _restart_command_parts()
     if not parts:
-        return
+        return False
     log.info("service restart requested: %s", " ".join(parts))
     proc = await asyncio.create_subprocess_exec(
         *parts,
@@ -232,8 +239,10 @@ async def _restart_service() -> None:
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0:
         log.info("service restart: %s", stdout.decode().strip() or "ok")
+        return True
     else:
         log.warning("service restart failed: %s", stderr.decode().strip())
+        return False
 
 
 # ── Internal helper: apply one sync action ────────────────────────────────────
