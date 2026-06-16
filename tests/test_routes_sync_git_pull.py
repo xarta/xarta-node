@@ -133,12 +133,18 @@ def test_git_pull_batch_does_not_restart_for_non_root_only(monkeypatch):
     assert restarts == []
 
 
-def test_systemctl_restart_command_is_non_blocking(monkeypatch):
+def test_systemctl_restart_command_uses_transient_unit(monkeypatch):
     monkeypatch.setattr(routes_sync.cfg, "SERVICE_RESTART_CMD", "systemctl restart blueprints-app")
+    monkeypatch.setattr(routes_sync.os, "getpid", lambda: 1234)
+    monkeypatch.setattr(routes_sync.time, "time", lambda: 4567.89)
 
     assert routes_sync._restart_command_parts() == [
-        "systemctl",
-        "--no-block",
+        "systemd-run",
+        "--unit",
+        "blueprints-app-self-restart-1234-4567890",
+        "--on-active=1",
+        "--collect",
+        "/bin/systemctl",
         "restart",
         "blueprints-app",
     ]
