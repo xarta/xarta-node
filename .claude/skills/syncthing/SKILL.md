@@ -12,6 +12,7 @@ Scope note:
 - For docs-folder ingestion workflows (including select local Obsidian folders on this LXC), use the node-local Dockge docs as the planning source:
     - `/xarta-node/.lone-wolf/docs/dockge/README.md`
     - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+    - `/xarta-node/.lone-wolf/docs/fleet-working-model/LONE-WOLF-GIT-POLICY.md`
     If node-local docs are unavailable on the current LXC/workspace, continue with this skill for Syncthing operations.
 
 For large status reviews, use `cost-efficient-subagents` to analyze one
@@ -108,6 +109,7 @@ on as the only instructions here.
 Relevant node-local docs for cross-tool document workflows:
 - `/xarta-node/.lone-wolf/docs/dockge/README.md`
 - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
+- `/xarta-node/.lone-wolf/docs/fleet-working-model/LONE-WOLF-GIT-POLICY.md`
 
 These references are optional and may not exist in standalone/public-only environments.
 
