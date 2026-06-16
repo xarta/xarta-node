@@ -5,7 +5,8 @@
 #   1. Installs Syncthing from the official apt repository + python3-bcrypt.
 #   2. Ensures managed share paths exist with Syncthing .stfolder markers:
 #      gui-fallback/assets/icons/, sounds/, fonts/, .lone-wolf/docs/,
-#      and .lone-wolf/syncthing/tts/voices/.
+#      .lone-wolf/syncthing/tts/voices/, and each
+#      .lone-wolf/interests/<category>/ wiki/vault root.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
 #   4. Temporarily starts syncthing@xarta.service so Syncthing generates its
 #      device certificate, then reads the device ID from the local REST API.
@@ -79,6 +80,8 @@ BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-/xarta-node/gui-fall
 BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-/xarta-node/gui-fallback/assets}"
 BLUEPRINTS_DOCS_DIR="${BLUEPRINTS_DOCS_DIR:-/xarta-node/.lone-wolf/docs}"
 BLUEPRINTS_TTS_VOICES_DIR="${BLUEPRINTS_TTS_VOICES_DIR:-/xarta-node/.lone-wolf/syncthing/tts/voices}"
+BLUEPRINTS_INTERESTS_DIR="${BLUEPRINTS_INTERESTS_DIR:-/xarta-node/.lone-wolf/interests}"
+BLUEPRINTS_INTERESTS_CATEGORIES_JSON="${BLUEPRINTS_INTERESTS_CATEGORIES_JSON:-[\"ai-developments\",\"software\",\"politics\",\"hardware\",\"science\",\"games\",\"media\",\"personal\",\"testing\",\"uncategorized\"]}"
 SYNCTHING_HOSTNAME="${SYNCTHING_HOSTNAME:?SYNCTHING_HOSTNAME not set — add to .env (e.g. sync.<your-domain>)}"
 SYNCTHING_GUI_USER="${SYNCTHING_GUI_USER:-admin}"
 SYNCTHING_GUI_PASSWORD="${SYNCTHING_GUI_PASSWORD:?SYNCTHING_GUI_PASSWORD not set — add a strong password to .env before running}"
@@ -122,6 +125,23 @@ chown_like() {
     fi
 }
 
+interest_stignore_text() {
+    local category="$1"
+    cat <<EOF
+# Syncthing ignore rules for the ${category} interests wiki root.
+#
+# The category root itself is the Obsidian/LLM-wiki vault. Keep source and
+# operator-visible flow directories synced: inbox/, raw/, media/, extracted/,
+# results/, entities/, concepts/, comparisons/, queries/, wiki/, minutes/.
+# Keep worker coordination and generated indexes local to each node.
+jobs/
+db/
+review/
+*.tmp.*
+*.lock
+EOF
+}
+
 echo "=== Syncthing setup ==="
 echo "Node         : $NODE_ID"
 echo "Config dir   : $SYNCTHING_HOME"
@@ -130,6 +150,7 @@ echo "Repo path    : $REPO_OUTER_PATH"
 echo "Assets path  : $BLUEPRINTS_ASSETS_DIR"
 echo "Docs path    : $BLUEPRINTS_DOCS_DIR"
 echo "TTS voices   : $BLUEPRINTS_TTS_VOICES_DIR"
+echo "Interests    : $BLUEPRINTS_INTERESTS_DIR"
 echo ""
 
 # ── Step 1 — Install Syncthing from official apt repository ──────────────────
@@ -168,7 +189,32 @@ SOUNDS_DIR="$BLUEPRINTS_ASSETS_DIR/sounds"
 FONTS_DIR="$BLUEPRINTS_ASSETS_DIR/fonts"
 DOCS_DIR="$BLUEPRINTS_DOCS_DIR"
 TTS_VOICES_DIR="$BLUEPRINTS_TTS_VOICES_DIR"
-mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR" "$TTS_VOICES_DIR"
+INTERESTS_DIR="$BLUEPRINTS_INTERESTS_DIR"
+INTEREST_CATEGORIES_TEXT="$(
+    BLUEPRINTS_INTERESTS_CATEGORIES_JSON="$BLUEPRINTS_INTERESTS_CATEGORIES_JSON" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+raw = os.environ.get("BLUEPRINTS_INTERESTS_CATEGORIES_JSON", "[]")
+try:
+    categories = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"ERROR: BLUEPRINTS_INTERESTS_CATEGORIES_JSON is invalid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(categories, list):
+    print("ERROR: BLUEPRINTS_INTERESTS_CATEGORIES_JSON must be a JSON array", file=sys.stderr)
+    sys.exit(1)
+for category in categories:
+    if not isinstance(category, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", category):
+        print(f"ERROR: invalid interests category name: {category!r}", file=sys.stderr)
+        sys.exit(1)
+    print(category)
+PY
+)"
+mapfile -t INTEREST_CATEGORIES <<< "$INTEREST_CATEGORIES_TEXT"
+mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR" "$TTS_VOICES_DIR" "$INTERESTS_DIR"
 chown_like "$(dirname "$BLUEPRINTS_ASSETS_DIR")" "$BLUEPRINTS_ASSETS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$SOUNDS_DIR"
@@ -198,6 +244,21 @@ chown -R xarta:xarta "$DOCS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $DOCS_DIR"
 chown -R xarta:xarta "$TTS_VOICES_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $TTS_VOICES_DIR"
+for category in "${INTEREST_CATEGORIES[@]}"; do
+    category_dir="$INTERESTS_DIR/$category"
+    marker_dir="$category_dir/.stfolder"
+    ignore_file="$category_dir/.stignore"
+    mkdir -p "$category_dir" "$marker_dir"
+    chmod 2770 "$category_dir" "$marker_dir"
+    chown_like "$INTERESTS_DIR" "$category_dir"
+    chown_like "$category_dir" "$marker_dir"
+    if [[ ! -f "$ignore_file" ]]; then
+        interest_stignore_text "$category" > "$ignore_file"
+    fi
+    chmod 660 "$ignore_file"
+    chown_like "$category_dir" "$ignore_file"
+done
+echo -e "    ${GREEN}ok${NC}: $INTERESTS_DIR (${#INTEREST_CATEGORIES[@]} category wiki roots)"
 
 if [[ -f "$ASSETS_OWNER_FIX_SCRIPT" ]]; then
     chmod 755 "$ASSETS_OWNER_FIX_SCRIPT"
@@ -367,21 +428,25 @@ Args (positional):
     assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
     docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
     tts_voices_dir  — shared TTS voices root (e.g. /xarta-node/.lone-wolf/syncthing/tts/voices)
+    interests_dir   — shared interests root whose category dirs are wiki/vault roots
+    interest_categories_json — JSON array of category directory names
     extra_devices_json — JSON array of external/non-fleet Syncthing devices
     extra_folder_device_ids_json — JSON object: folder_id -> [device_id,...]
 """
 import sys
 import json
+import re
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 13:
+if len(sys.argv) != 15:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <extra_devices_json> <extra_folder_device_ids_json>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <interests_dir> <interest_categories_json> <extra_devices_json> <extra_folder_device_ids_json>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
  gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir,
+ interests_dir, interest_categories_json,
  extra_devices_json, extra_folder_device_ids_json) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
@@ -402,6 +467,24 @@ except json.JSONDecodeError as exc:
 
 if not isinstance(extra_devices, list):
     print("ERROR: SYNCTHING_EXTRA_DEVICES_JSON must be a JSON array", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    interest_categories = (
+        json.loads(interest_categories_json) if interest_categories_json.strip() else []
+    )
+except json.JSONDecodeError as exc:
+    print(f"ERROR: BLUEPRINTS_INTERESTS_CATEGORIES_JSON is invalid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(interest_categories, list) or not all(
+    isinstance(category, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]*", category)
+    for category in interest_categories
+):
+    print(
+        "ERROR: BLUEPRINTS_INTERESTS_CATEGORIES_JSON must be a JSON array of safe category names",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 try:
@@ -575,7 +658,16 @@ for item in extra_devices:
 # ── Shared Folders ────────────────────────────────────────────────────────────
 # Remove all known managed folders plus the Syncthing default folder (which
 # points to a path that may not exist on this node) and rebuild from scratch.
-for fid in ('xarta-icons', 'xarta-sounds', 'xarta-fonts', 'xarta-node-docs', 'xarta-tts-voices', 'default'):
+managed_folder_ids = [
+    'xarta-icons',
+    'xarta-sounds',
+    'xarta-fonts',
+    'xarta-node-docs',
+    'xarta-tts-voices',
+    'default',
+]
+managed_folder_ids.extend(f'xarta-interest-{category}' for category in interest_categories)
+for fid in managed_folder_ids:
     for f in list(root.findall(f'folder[@id="{fid}"]')):
         root.remove(f)
 
@@ -654,6 +746,10 @@ add_folder('xarta-node-docs', 'xarta-node-docs',
 add_folder('xarta-tts-voices', 'tts-voices',
            tts_voices_dir,
            folder_extra_ids('xarta-tts-voices'))
+for category in interest_categories:
+    add_folder(f'xarta-interest-{category}', f'interests-{category}',
+               interests_dir.rstrip('/') + '/' + category,
+               folder_extra_ids(f'xarta-interest-{category}'))
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 ET.indent(tree, space='    ')
@@ -688,6 +784,8 @@ python3 "$TMPPY" \
     "$BLUEPRINTS_ASSETS_DIR" \
     "$BLUEPRINTS_DOCS_DIR" \
     "$BLUEPRINTS_TTS_VOICES_DIR" \
+    "$BLUEPRINTS_INTERESTS_DIR" \
+    "$BLUEPRINTS_INTERESTS_CATEGORIES_JSON" \
     "$SYNCTHING_EXTRA_DEVICES_JSON" \
     "$SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON"
 echo ""
