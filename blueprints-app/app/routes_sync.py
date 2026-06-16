@@ -207,7 +207,6 @@ def _restart_command_parts() -> list[str]:
             "systemd-run",
             "--unit",
             unit,
-            "--on-active=1",
             "--collect",
             "/bin/systemctl",
             "restart",

@@ -163,7 +163,6 @@ def test_systemctl_restart_command_uses_transient_unit(monkeypatch):
         "systemd-run",
         "--unit",
         "blueprints-app-self-restart-1234-4567890",
-        "--on-active=1",
         "--collect",
         "/bin/systemctl",
         "restart",
