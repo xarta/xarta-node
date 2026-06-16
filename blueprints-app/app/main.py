@@ -52,6 +52,7 @@ from .routes_embed_menu_items import router as embed_menu_items_router
 from .routes_events import router as events_router
 from .routes_firewall import router as firewall_router
 from .routes_form_controls import router as form_controls_router
+from .routes_gpu_monitor import router as gpu_monitor_router
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_help import router as help_router
@@ -392,6 +393,7 @@ def create_app() -> FastAPI:
     application.include_router(keys_router, prefix="/api/v1")
     application.include_router(certs_router, prefix="/api/v1")
     application.include_router(gui_sync_router, prefix="/api/v1")
+    application.include_router(gpu_monitor_router, prefix="/api/v1")
     application.include_router(assumptions_router, prefix="/api/v1")
     application.include_router(todo_router, prefix="/api/v1")
     application.include_router(docs_router, prefix="/api/v1")
