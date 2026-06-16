@@ -10,6 +10,7 @@ ENV_FILE="$SCRIPT_DIR/.env"
 VENV_DIR="/opt/blueprints/venv"
 SEEKDB_CONFIG_FILE="/etc/seekdb/seekdb.cnf"
 SEEKDB_DATA_ROOT="/var/lib/oceanbase"
+SEEKDB_RECOVERY_GUARD="$SCRIPT_DIR/blueprints-app/scripts/install-seekdb-recovery-guard.sh"
 OCEANBASE_KEY_URL="http://mirrors.oceanbase.com/oceanbase/oceanbase_deb.pub"
 OCEANBASE_KEYRING="/usr/share/keyrings/oceanbase-archive-keyring.gpg"
 OCEANBASE_LIST_FILE="/etc/apt/sources.list.d/oceanbase.list"
@@ -69,6 +70,31 @@ upsert_cfg_key() {
         sed -i "s|^${key}=.*|${key}=${value}|" "$SEEKDB_CONFIG_FILE"
     else
         printf '%s=%s\n' "$key" "$value" >> "$SEEKDB_CONFIG_FILE"
+    fi
+}
+
+install_seekdb_systemd_policy() {
+    install -d -m 0755 /etc/systemd/system/seekdb.service.d
+    cat > /etc/systemd/system/seekdb.service.d/xarta-hardening.conf <<'EOF'
+[Unit]
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Environment=FORCE_START_WITH_ARGS=1
+ExecStartPre=/bin/sleep 15
+KillMode=control-group
+RestartSec=10
+TimeoutStopSec=30
+EOF
+
+    if [[ -x "$SEEKDB_RECOVERY_GUARD" ]]; then
+        "$SEEKDB_RECOVERY_GUARD"
+    else
+        echo "WARNING: recovery guard installer missing or not executable: $SEEKDB_RECOVERY_GUARD"
+        systemctl daemon-reload
     fi
 }
 
@@ -142,9 +168,13 @@ fi
 echo "    seekdb package present: $(dpkg -s seekdb | awk '/^Version:/{print $2}')"
 
 echo "--- aligning $SEEKDB_CONFIG_FILE with local policy ..."
+upsert_cfg_key "base-dir" "$SEEKDB_DATA_ROOT"
 upsert_cfg_key "port" "$SEEKDB_PORT"
 upsert_cfg_key "data-dir" "$SEEKDB_DATA_ROOT/store"
 upsert_cfg_key "redo-dir" "$SEEKDB_DATA_ROOT/store/redo"
+
+echo "--- installing seekdb systemd hardening and recovery guard ..."
+install_seekdb_systemd_policy
 
 echo "--- enabling + restarting seekdb ..."
 systemctl enable seekdb >/dev/null 2>&1 || true
