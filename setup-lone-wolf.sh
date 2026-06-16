@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-lone-wolf.sh — run after .env is loaded on any fleet node
-# Manages .lone-wolf/.gitignore docs entry and cron backup.
+# Manages .lone-wolf/.gitignore docs/syncthing entries and cron backup.
 # DOCS_ROOT is set in .env; no symlink needed (Option B).
 
 set -euo pipefail
@@ -41,6 +41,40 @@ STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
 STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
 STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT"
 
+commit_gitignore_change() {
+    local message="$1"
+    git -C "$LONE_WOLF" add .gitignore
+    git -C "$LONE_WOLF" commit --only .gitignore -m "$message" || true
+}
+
+ensure_gitignore_line() {
+    local line="$1"
+    local message="$2"
+    local label="$3"
+
+    if ! grep -qxF "$line" "$GITIGNORE" 2>/dev/null; then
+        printf '%s\n' "$line" >> "$GITIGNORE"
+        commit_gitignore_change "$message"
+        echo "  gitignore: added '$line' entry ($label)"
+    else
+        echo "  gitignore: '$line' already present — OK ($label)"
+    fi
+}
+
+remove_gitignore_line() {
+    local line="$1"
+    local message="$2"
+    local label="$3"
+
+    if grep -qxF "$line" "$GITIGNORE" 2>/dev/null; then
+        sed -i "\|^${line}$|d" "$GITIGNORE"
+        commit_gitignore_change "$message"
+        echo "  gitignore: removed '$line' entry ($label)"
+    else
+        echo "  gitignore: '$line' not present — OK ($label)"
+    fi
+}
+
 if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
     echo "# $OWNER_CRON_MARKER" > "$OWNER_CRON_FILE"
     echo "$OWNER_CRON_LINE" >> "$OWNER_CRON_FILE"
@@ -60,15 +94,10 @@ else
 fi
 
 if [[ "$DOCS_BACKUP" == "true" ]]; then
-    # Backup node: docs/ must NOT be gitignored
-    if grep -qx 'docs' "$GITIGNORE" 2>/dev/null; then
-        sed -i '/^docs$/d' "$GITIGNORE"
-        git -C "$LONE_WOLF" add .gitignore
-        git -C "$LONE_WOLF" commit -m "Unignore docs — this is the designated backup node" || true
-        echo "  gitignore: removed 'docs' entry (backup node)"
-    else
-        echo "  gitignore: 'docs' not present — OK (backup node)"
-    fi
+    # Backup node: docs must be tracked and syncthing is intentionally selectable.
+    remove_gitignore_line 'docs' "Unignore docs — this is the designated backup node" "backup node"
+    remove_gitignore_line 'syncthing/' "Unignore syncthing — this is the designated backup node" "backup node"
+
     # Install cron entry if not already present
     if ! grep -q "$CRON_MARKER" /etc/cron.d/lone-wolf-docs 2>/dev/null; then
         echo "# $CRON_MARKER" > /etc/cron.d/lone-wolf-docs
@@ -79,15 +108,10 @@ if [[ "$DOCS_BACKUP" == "true" ]]; then
         echo "  cron: already installed — OK (backup node)"
     fi
 else
-    # Non-backup node: docs must be gitignored
-    if ! grep -qx 'docs' "$GITIGNORE" 2>/dev/null; then
-        echo 'docs' >> "$GITIGNORE"
-        git -C "$LONE_WOLF" add .gitignore
-        git -C "$LONE_WOLF" commit -m "Gitignore docs — distributed via Syncthing, not git-tracked here" || true
-        echo "  gitignore: added 'docs' entry (non-backup node)"
-    else
-        echo "  gitignore: 'docs' already present — OK (non-backup node)"
-    fi
+    # Non-backup node: shared docs and syncthing payloads must not be committed here.
+    ensure_gitignore_line 'docs' "Gitignore docs — distributed via Syncthing, not git-tracked here" "non-backup node"
+    ensure_gitignore_line 'syncthing/' "Gitignore syncthing — distributed payloads are not git-tracked here" "non-backup node"
+
     # Remove cron entry if present (non-backup node must not commit docs)
     if [[ -f /etc/cron.d/lone-wolf-docs ]]; then
         rm -f /etc/cron.d/lone-wolf-docs
