@@ -4220,6 +4220,143 @@ def test_matrix_chat_media_message_content_uses_encrypted_file_shape():
     assert "url" not in content
 
 
+def test_matrix_chat_send_attachment_route_returns_upload_contract(monkeypatch):
+    captured = {}
+
+    class FakeUpload:
+        filename = "proof.png"
+        content_type = "image/png"
+
+        async def read(self, _limit):
+            return b"plain-image-bytes"
+
+    async def fake_media_event_content(**kwargs):
+        captured["media"] = kwargs
+        filename = kwargs["filename"]
+        mimetype = kwargs["mimetype"]
+        return (
+            {
+                "msgtype": "m.image",
+                "body": filename,
+                "filename": filename,
+                "file": {
+                    "v": "v2",
+                    "url": "mxc://example.org/encrypted-image",
+                },
+                "info": {
+                    "mimetype": mimetype,
+                    "size": len(kwargs["content"]),
+                },
+            },
+            "mxc://example.org/encrypted-image",
+            True,
+            True,
+        )
+
+    async def fake_send_room_message_content(**kwargs):
+        captured["send"] = kwargs
+        return {
+            "room_id": kwargs["room_id"],
+            "event_id": "$image-event:test.example",
+        }
+
+    monkeypatch.setattr(matrix_chat, "_matrix_media_event_content", fake_media_event_content)
+    monkeypatch.setattr(matrix_chat, "_send_room_message_content", fake_send_room_message_content)
+
+    response = asyncio.run(
+        matrix_chat.matrix_chat_send_attachment("!room:test.example", FakeUpload())
+    )
+
+    assert captured["media"] == {
+        "room_id": "!room:test.example",
+        "content": b"plain-image-bytes",
+        "filename": "proof.png",
+        "mimetype": "image/png",
+    }
+    assert captured["send"]["txn_prefix"] == "bp-attachment"
+    assert captured["send"]["content"]["file"]["url"] == "mxc://example.org/encrypted-image"
+    assert response == {
+        "room_id": "!room:test.example",
+        "event_id": "$image-event:test.example",
+        "content_uri": "mxc://example.org/encrypted-image",
+        "filename": "proof.png",
+        "mimetype": "image/png",
+        "size": len(b"plain-image-bytes"),
+        "msgtype": "m.image",
+        "encrypted_room": True,
+        "encrypted_attachment": True,
+    }
+
+
+def test_matrix_chat_send_audio_route_returns_duration_upload_contract(monkeypatch):
+    captured = {}
+
+    class FakeUpload:
+        filename = "voice-note.wav"
+        content_type = "audio/wav"
+
+        async def read(self, _limit):
+            return b"RIFF-audio-bytes"
+
+    async def fake_media_event_content(**kwargs):
+        captured["media"] = kwargs
+        return (
+            {
+                "msgtype": "m.audio",
+                "body": kwargs["filename"],
+                "filename": kwargs["filename"],
+                "url": "mxc://example.org/audio",
+                "info": {
+                    "mimetype": kwargs["mimetype"],
+                    "size": len(kwargs["content"]),
+                    "duration": kwargs["duration_ms"],
+                },
+            },
+            "mxc://example.org/audio",
+            False,
+            False,
+        )
+
+    async def fake_send_room_message_content(**kwargs):
+        captured["send"] = kwargs
+        return {
+            "room_id": kwargs["room_id"],
+            "event_id": "$audio-event:test.example",
+        }
+
+    monkeypatch.setattr(matrix_chat, "_matrix_media_event_content", fake_media_event_content)
+    monkeypatch.setattr(matrix_chat, "_send_room_message_content", fake_send_room_message_content)
+
+    response = asyncio.run(
+        matrix_chat.matrix_chat_send_audio(
+            "!room:test.example",
+            FakeUpload(),
+            duration_ms=1234,
+        )
+    )
+
+    assert captured["media"] == {
+        "room_id": "!room:test.example",
+        "content": b"RIFF-audio-bytes",
+        "filename": "voice-note.wav",
+        "mimetype": "audio/wav",
+        "duration_ms": 1234,
+    }
+    assert captured["send"]["txn_prefix"] == "bp-audio"
+    assert captured["send"]["content"]["url"] == "mxc://example.org/audio"
+    assert response == {
+        "room_id": "!room:test.example",
+        "event_id": "$audio-event:test.example",
+        "content_uri": "mxc://example.org/audio",
+        "filename": "voice-note.wav",
+        "mimetype": "audio/wav",
+        "size": len(b"RIFF-audio-bytes"),
+        "msgtype": "m.audio",
+        "encrypted_room": False,
+        "encrypted_attachment": False,
+    }
+
+
 def test_matrix_chat_media_fields_reduce_attachment_metadata():
     content = {
         "msgtype": "m.image",
