@@ -91,6 +91,48 @@ repair_path() {
     [[ "$VERBOSE" == "1" ]] && echo "FIXED: $label $path owner=$owner${mode:+ mode=$mode}"
 }
 
+repair_path_self() {
+    local path="$1"
+    local owner="$2"
+    local label="$3"
+    local mode="${4:-}"
+
+    [[ -e "$path" ]] || return 0
+
+    local owner_drift=0
+    local mode_drift=0
+    local uid="${owner%:*}"
+    local gid="${owner#*:}"
+
+    if [[ "$(stat -c '%u:%g' "$path")" != "$uid:$gid" ]]; then
+        owner_drift=1
+    fi
+
+    if [[ -n "$mode" && "$(stat -c '%a' "$path")" != "$mode" ]]; then
+        mode_drift=1
+    fi
+
+    if [[ "$owner_drift" == "0" && "$mode_drift" == "0" ]]; then
+        [[ "$VERBOSE" == "1" ]] && echo "OK: $label $path owner=$owner${mode:+ mode=$mode}"
+        return 0
+    fi
+
+    drift=$((drift + 1))
+    if [[ "$MODE" == "check" ]]; then
+        echo "DRIFT: $label $path expected_owner=$owner${mode:+ expected_mode=$mode}"
+        return 0
+    fi
+
+    if [[ "$owner_drift" == "1" ]]; then
+        chown "$owner" "$path"
+    fi
+    if [[ "$mode_drift" == "1" ]]; then
+        chmod "$mode" "$path"
+    fi
+    changed=$((changed + 1))
+    [[ "$VERBOSE" == "1" ]] && echo "FIXED: $label $path owner=$owner${mode:+ mode=$mode}"
+}
+
 for compose in "$STACKS_DIR"/*/compose.yaml; do
     [[ -f "$compose" ]] || continue
     stack_dir="$(dirname "$compose")"
@@ -145,10 +187,18 @@ for compose in "$STACKS_DIR"/*/compose.yaml; do
         if grep -Eq '\./data:/data' "$compose"; then
             synapse_config="$stack_dir/data/homeserver.yaml"
             repair_path "$synapse_config" "991:991" "$stack_name synapse-config" "600"
+            media_store_path=""
             signing_key_path=""
             if [[ -r "$synapse_config" ]]; then
+                media_store_path="$(sed -nE 's/^[[:space:]]*media_store_path:[[:space:]]*"?([^"#]+)"?[[:space:]]*(#.*)?$/\1/p' "$synapse_config" | head -n 1)"
+                media_store_path="${media_store_path%\"}"
                 signing_key_path="$(sed -nE 's/^[[:space:]]*signing_key_path:[[:space:]]*"?([^"#]+)"?[[:space:]]*(#.*)?$/\1/p' "$synapse_config" | head -n 1)"
                 signing_key_path="${signing_key_path%\"}"
+            fi
+            if [[ "$media_store_path" == /data/* ]]; then
+                repair_path_self "$stack_dir/data/${media_store_path#/data/}" "991:991" "$stack_name synapse-media-store" "750"
+            else
+                repair_path_self "$stack_dir/data/media_store" "991:991" "$stack_name synapse-media-store" "750"
             fi
             if [[ "$signing_key_path" == /data/* ]]; then
                 repair_path "$stack_dir/data/${signing_key_path#/data/}" "991:991" "$stack_name synapse-signing-key" "600"
