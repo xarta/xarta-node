@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS sync_seen_guids (
     received_at INTEGER NOT NULL       -- unix epoch; purged after 3 days
 );
 
+CREATE TABLE IF NOT EXISTS disks_notes (
+    node_id    TEXT PRIMARY KEY,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS pfsense_dns (
     dns_entry_id  TEXT PRIMARY KEY,
     ip_address    TEXT NOT NULL,
@@ -1097,7 +1104,9 @@ def _backfill_manual_link_category_item_parents(conn: sqlite3.Connection) -> Non
                 "UPDATE manual_link_category_items SET parent_mapping_id=? WHERE mapping_id=?",
                 (parent[0], row[0]),
             )
-    conn.execute("INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, datetime('now'))", (marker,))
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, datetime('now'))", (marker,)
+    )
 
 
 def _backfill_visit_events(conn: sqlite3.Connection) -> None:
@@ -1403,7 +1412,9 @@ def _seed_manual_link_categories_from_groups(conn: sqlite3.Connection) -> None:
         )
     for row in rows:
         link_id, label, _sort_order = row
-        parent = conn.execute("SELECT parent_id FROM manual_links WHERE link_id=?", (link_id,)).fetchone()
+        parent = conn.execute(
+            "SELECT parent_id FROM manual_links WHERE link_id=?", (link_id,)
+        ).fetchone()
         if not parent or not parent[0]:
             continue
         category_id = _manual_link_category_id(label)

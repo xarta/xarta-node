@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import os
 import re
+import secrets
 import subprocess
 import textwrap
 import threading
@@ -24,6 +25,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from . import db
 from .ssh import SshKeyMissing, resolve_env_key
 
 router = APIRouter(prefix="/disks", tags=["disks"])
@@ -36,6 +38,27 @@ class DisksFilesystemTreeBody(BaseModel):
     source_path: str | None = Field(default=None, max_length=2000)
     path: str | None = Field(default=None, max_length=4000)
     limit: int = Field(default=400, ge=1, le=1000)
+
+
+class DisksNoteBody(BaseModel):
+    node_id: str = Field(min_length=1, max_length=255)
+    note: str = Field(default="", max_length=4000)
+
+
+class DisksOfflineBrowseOpenBody(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    guest_id: str = Field(min_length=1, max_length=32)
+    guest_name: str | None = Field(default=None, max_length=255)
+    volume_ref: str = Field(min_length=1, max_length=1024)
+    volume_label: str | None = Field(default=None, max_length=255)
+
+
+class DisksOfflineBrowseHeartbeatBody(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+
+
+class DisksOfflineBrowseCloseBody(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
 
 
 def _env_list(name: str, fallback: str = "") -> tuple[str, ...]:
@@ -67,6 +90,7 @@ _SSH_SMART_TIMEOUT = int(os.environ.get("DISKS_SSH_SMART_TIMEOUT_SECONDS", "24")
 _BROWSE_MOUNT_PREFIXES = ("/tmp/disks-browse-", "/run/disks-browse-")
 _SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_./:-]+$")
+_SAFE_VOLUME_REF_RE = re.compile(r"^[A-Za-z0-9_./:@+-]+$")
 _FILESYSTEM_MEMBER_TYPES = {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}
 _GENERIC_PARTLABELS = {"basic data partition", "microsoft reserved partition", "primary"}
 _STANDALONE_LOGICAL_MIN_BYTES = 2 * 1024**3
@@ -86,6 +110,22 @@ _DISKS_LAYOUT_HINTS_PATH = Path(
         "/xarta-node/.lone-wolf/config/disks-layout-hints.json",
     )
 ).expanduser()
+_DISKS_NOTES_MAX_LENGTH = int(os.environ.get("DISKS_NOTES_MAX_LENGTH", "4000"))
+_DISKS_OFFLINE_BROWSE_STATE_PATH = Path(
+    os.environ.get(
+        "DISKS_OFFLINE_BROWSE_STATE_PATH",
+        "/xarta-node/.lone-wolf/runtime/disks-offline-browse-sessions.json",
+    )
+).expanduser()
+_DISKS_OFFLINE_BROWSE_TIMEOUT_SECONDS = max(
+    10,
+    int(os.environ.get("DISKS_OFFLINE_BROWSE_TIMEOUT_SECONDS", "20")),
+)
+_DISKS_OFFLINE_BROWSE_REAPER_INTERVAL_SECONDS = max(
+    3,
+    int(os.environ.get("DISKS_OFFLINE_BROWSE_REAPER_INTERVAL_SECONDS", "5")),
+)
+_DISKS_OFFLINE_BROWSE_LOCK = threading.Lock()
 _DISKS_INVENTORY_MEMORY_GROUPS = ("Physical drives", "Logical systems")
 _DISKS_INVENTORY_MEMORY_LOCK = threading.Lock()
 
@@ -104,6 +144,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         r"^(mirror|raidz\\d*|draid\\d*|spare|spares|logs?|cache|special|dedup|replacing)(-|$)"
     )
     DEVICE_SLOT_RE = re.compile(r"^(ide|sata|scsi|virtio|efidisk|tpmstate)\\d+$")
+    BROWSEABLE_VOLUME_SLOT_RE = re.compile(r"^(ide|sata|scsi|virtio)\\d+$")
     HOSTPCI_SLOT_RE = re.compile(r"^hostpci\\d+$")
     NUMBER_RE = re.compile(r"(-?\\d+)")
 
@@ -130,6 +171,9 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                     key = key.strip()
                     value = value.strip()
                     if key == "name":
+                        name = value
+                        continue
+                    if guest_type == "ct" and key == "hostname" and not name:
                         name = value
                         continue
                     if guest_type == "vm" and key == "template":
@@ -584,6 +628,65 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         return assignments
 
 
+    def parse_guest_volume_assignments():
+        assignments = []
+        for path in sorted(glob.glob("/etc/pve/qemu-server/*.conf")):
+            vmid = os.path.basename(path).split(".", 1)[0]
+            name = ""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except Exception:
+                continue
+
+            pending = []
+            for raw in lines:
+                line = raw.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "name":
+                    name = value
+                    continue
+                if not BROWSEABLE_VOLUME_SLOT_RE.match(key):
+                    continue
+                source = value.split(",", 1)[0].strip()
+                if not source or source.startswith("/dev/"):
+                    continue
+                lower_source = source.lower()
+                lower_value = value.lower()
+                if source in {"none", "cdrom"}:
+                    continue
+                if "media=cdrom" in lower_value or lower_source.endswith(".iso"):
+                    continue
+                storage = ""
+                volume_name = ""
+                if ":" in source and not source.startswith("/"):
+                    storage, volume_name = source.split(":", 1)
+                else:
+                    volume_name = os.path.basename(source)
+                pending.append(
+                    {
+                        "vmid": vmid,
+                        "name": name,
+                        "guest_type": "vm",
+                        "slot": key,
+                        "volume_ref": source,
+                        "storage": storage,
+                        "volume_name": volume_name,
+                        "volume_leaf": os.path.basename(volume_name.rstrip("/")) or volume_name,
+                    }
+                )
+
+            if pending and not name:
+                for entry in pending:
+                    entry["name"] = f"vm-{vmid}"
+            assignments.extend(pending)
+        return assignments
+
+
     def parse_hostpci_assignments():
         assignments = []
         for path in sorted(glob.glob("/etc/pve/qemu-server/*.conf")):
@@ -628,6 +731,78 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         return assignments
 
 
+    def parse_storage_cfg_pbs():
+        try:
+            with open("/etc/pve/storage.cfg", "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except Exception:
+            return []
+
+        rows = []
+        current = None
+        for raw in lines:
+            line = raw.rstrip("\\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not line[:1].isspace():
+                kind, _, name = stripped.partition(":")
+                kind = kind.strip().lower()
+                name = name.strip()
+                current = {"type": kind, "name": name} if kind and name else None
+                if current and kind == "pbs":
+                    rows.append(current)
+                continue
+            if not current or current.get("type") != "pbs":
+                continue
+            key, _, value = stripped.partition(" ")
+            key = key.strip().lower()
+            value = value.strip()
+            if key:
+                current[key] = value
+        return rows
+
+
+    def parse_pvesm_status(text):
+        rows = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.lower().startswith("name "):
+                continue
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            name, storage_type, status = parts[:3]
+            total, used, avail = parts[3:6]
+            pct = parts[6]
+
+            def to_int(value):
+                try:
+                    return int(value)
+                except Exception:
+                    return None
+
+            def to_float(value):
+                text = str(value or "").strip().rstrip("%")
+                try:
+                    return float(text)
+                except Exception:
+                    return None
+
+            rows.append(
+                {
+                    "name": name,
+                    "type": storage_type,
+                    "status": status,
+                    "total_kib": to_int(total),
+                    "used_kib": to_int(used),
+                    "available_kib": to_int(avail),
+                    "pct": to_float(pct),
+                }
+            )
+        return rows
+
+
     lsblk = run(
         [
             "lsblk",
@@ -654,6 +829,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         ],
         timeout=10,
     )
+    pvesm_status = run(["pvesm", "status", "--enabled", "1"], timeout=8)
 
     mount_rows = annotate_mount_rows(parse_findmnt(findmnt["stdout"])) if findmnt["ok"] else []
     lsblk_payload = (
@@ -672,13 +848,17 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         "zfs_list": parse_zfs_list(zfs_list["stdout"]) if zfs_list["ok"] else [],
         "guest_identities": parse_guest_identities(),
         "guest_disk_assignments": parse_guest_disk_assignments(),
+        "guest_volume_assignments": parse_guest_volume_assignments(),
         "hostpci_assignments": parse_hostpci_assignments(),
+        "pbs_storages": parse_storage_cfg_pbs(),
+        "pvesm_status": parse_pvesm_status(pvesm_status["stdout"]) if pvesm_status["ok"] else [],
         "commands": {
             "lsblk": lsblk,
             "findmnt": findmnt,
             "zpool_list": zpool_list,
             "zpool_status": zpool_status,
             "zfs_list": zfs_list,
+            "pvesm_status": pvesm_status,
         },
     }
     print(json.dumps(payload))
@@ -1028,6 +1208,387 @@ _REMOTE_FILESYSTEM_TREE_SCRIPT = textwrap.dedent(
     """
 ).strip()
 
+_REMOTE_OFFLINE_VM_PREPARE_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    PATH_ENV = {"PATH": "/usr/sbin:/sbin:/usr/bin:/bin"}
+
+
+    def run(cmd, timeout=12):
+        exe = cmd[0]
+        if shutil.which(exe) is None:
+            return {
+                "ok": False,
+                "rc": 127,
+                "stdout": "",
+                "stderr": f"{exe} not found",
+            }
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=PATH_ENV,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "rc": proc.returncode,
+                "stdout": proc.stdout or "",
+                "stderr": proc.stderr or "",
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "rc": 124,
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or f"timed out after {timeout}s",
+            }
+
+
+    def fail(message):
+        print(json.dumps({"ok": False, "error": str(message)}))
+        raise SystemExit(0)
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Offline browse payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Offline browse payload is invalid: {exc}")
+        if not isinstance(payload, dict):
+            fail("Offline browse payload is invalid")
+        return payload
+
+
+    def next_free_nbd():
+        for idx in range(32):
+            name = f"nbd{idx}"
+            if not os.path.exists(f"/sys/class/block/{name}"):
+                continue
+            if os.path.exists(f"/sys/class/block/{name}/pid"):
+                continue
+            return f"/dev/{name}"
+        return ""
+
+
+    payload = decode_payload(sys.argv[1] if len(sys.argv) > 1 else "")
+    guest_id = str(payload.get("guest_id") or "").strip()
+    volume_ref = str(payload.get("volume_ref") or "").strip()
+    if not guest_id.isdigit():
+        fail("guest_id must be numeric")
+    if not volume_ref:
+        fail("volume_ref is required")
+
+    status = run(["qm", "status", guest_id], timeout=8)
+    status_text = (status.get("stdout") or "").strip()
+    if not status["ok"]:
+        detail = (status.get("stderr") or "").strip() or status_text or "qm status failed"
+        fail(f"Could not inspect VM {guest_id}: {detail}")
+    if "status: stopped" not in status_text.lower():
+        fail(f"VM {guest_id} must be stopped before offline browse")
+
+    if volume_ref.startswith("/"):
+        resolved_path = volume_ref
+    else:
+        path_result = run(["pvesm", "path", volume_ref], timeout=12)
+        if not path_result["ok"]:
+            detail = (path_result.get("stderr") or "").strip() or (path_result.get("stdout") or "").strip()
+            fail(f"Could not resolve {volume_ref}: {detail or 'pvesm path failed'}")
+        resolved_path = (path_result.get("stdout") or "").strip()
+
+    if not resolved_path or not os.path.exists(resolved_path):
+        fail(f"Resolved volume path does not exist: {resolved_path or volume_ref}")
+
+    modprobe = run(["modprobe", "nbd", "max_part=16"], timeout=8)
+    if not modprobe["ok"]:
+        detail = (modprobe.get("stderr") or "").strip() or (modprobe.get("stdout") or "").strip()
+        fail(f"Could not load nbd module: {detail or 'modprobe failed'}")
+
+    nbd_device = next_free_nbd()
+    if not nbd_device:
+        fail("No free /dev/nbd device is available on the host")
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "guest_id": guest_id,
+                "volume_ref": volume_ref,
+                "resolved_path": resolved_path,
+                "nbd_device": nbd_device,
+                "vm_status": status_text,
+            }
+        )
+    )
+    """
+).strip()
+
+_REMOTE_OFFLINE_VM_ATTACH_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import time
+
+    PATH_ENV = {"PATH": "/usr/sbin:/sbin:/usr/bin:/bin"}
+    MEMBER_TYPES = {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}
+
+
+    def run(cmd, timeout=12):
+        exe = cmd[0]
+        if shutil.which(exe) is None:
+            return {
+                "ok": False,
+                "rc": 127,
+                "stdout": "",
+                "stderr": f"{exe} not found",
+            }
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=PATH_ENV,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "rc": proc.returncode,
+                "stdout": proc.stdout or "",
+                "stderr": proc.stderr or "",
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "rc": 124,
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or f"timed out after {timeout}s",
+            }
+
+
+    def fail(message):
+        print(json.dumps({"ok": False, "error": str(message)}))
+        raise SystemExit(0)
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Offline browse payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Offline browse payload is invalid: {exc}")
+        if not isinstance(payload, dict):
+            fail("Offline browse payload is invalid")
+        return payload
+
+
+    def cleanup(device):
+        if not device:
+            return
+        disconnect = run(["qemu-nbd", "--disconnect", device], timeout=10)
+        if not disconnect["ok"] and "not connected" not in (disconnect.get("stderr") or "").lower():
+            pass
+
+
+    def iter_nodes(nodes):
+        for node in nodes if isinstance(nodes, list) else []:
+            if not isinstance(node, dict):
+                continue
+            yield node
+            children = node.get("children")
+            if isinstance(children, list):
+                yield from iter_nodes(children)
+
+
+    payload = decode_payload(sys.argv[1] if len(sys.argv) > 1 else "")
+    resolved_path = str(payload.get("resolved_path") or "").strip()
+    nbd_device = str(payload.get("nbd_device") or "").strip()
+    if not resolved_path or not os.path.exists(resolved_path):
+        fail("Resolved volume path is missing")
+    if not nbd_device.startswith("/dev/nbd"):
+        fail("nbd_device is invalid")
+    if os.path.exists(f"/sys/class/block/{os.path.basename(nbd_device)}/pid"):
+        fail(f"{nbd_device} is already in use")
+
+    try:
+        connect = run(["qemu-nbd", "--read-only", "--connect", nbd_device, resolved_path], timeout=16)
+        if not connect["ok"]:
+            detail = (connect.get("stderr") or "").strip() or (connect.get("stdout") or "").strip()
+            fail(f"Could not attach {resolved_path}: {detail or 'qemu-nbd failed'}")
+
+        settle = run(["udevadm", "settle"], timeout=8)
+        if not settle["ok"]:
+            time.sleep(1.0)
+
+        lsblk = run(
+            [
+                "lsblk",
+                "--json",
+                "-b",
+                "-o",
+                "NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT",
+                nbd_device,
+            ],
+            timeout=10,
+        )
+        if not lsblk["ok"] or not (lsblk.get("stdout") or "").strip():
+            detail = (lsblk.get("stderr") or "").strip() or (lsblk.get("stdout") or "").strip()
+            fail(f"Could not inspect attached disk: {detail or 'lsblk failed'}")
+        try:
+            payload = json.loads(lsblk["stdout"])
+        except Exception as exc:
+            fail(f"Attached disk inventory was invalid JSON: {exc}")
+
+        blockdevices = payload.get("blockdevices") if isinstance(payload, dict) else []
+        sources = []
+        for node in iter_nodes(blockdevices):
+            node_type = str(node.get("type") or "").strip().lower()
+            device_path = str(node.get("path") or "").strip()
+            fstype = str(node.get("fstype") or "").strip().lower()
+            if node_type not in {"disk", "part"} or not device_path or not fstype or fstype in MEMBER_TYPES:
+                continue
+            label = (
+                str(node.get("label") or "").strip()
+                or str(node.get("partlabel") or "").strip()
+                or os.path.basename(device_path)
+            )
+            sources.append(
+                {
+                    "path": device_path,
+                    "label": label,
+                    "filesystem": fstype,
+                    "volume_label": str(node.get("label") or "").strip(),
+                    "part_label": str(node.get("partlabel") or "").strip(),
+                    "uuid": str(node.get("uuid") or "").strip(),
+                    "size_bytes": int(node.get("size")) if str(node.get("size") or "").strip().isdigit() else None,
+                    "default": node_type == "part",
+                }
+            )
+        if not sources:
+            fail("No mountable filesystem was detected on this offline VM disk")
+        if len(sources) == 1:
+            sources[0]["default"] = True
+        print(json.dumps({"ok": True, "nbd_device": nbd_device, "sources": sources}))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        cleanup(nbd_device)
+        fail(str(exc))
+    """
+).strip()
+
+_REMOTE_OFFLINE_VM_CLEANUP_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    PATH_ENV = {"PATH": "/usr/sbin:/sbin:/usr/bin:/bin"}
+
+
+    def run(cmd, timeout=12):
+        exe = cmd[0]
+        if shutil.which(exe) is None:
+            return {
+                "ok": False,
+                "rc": 127,
+                "stdout": "",
+                "stderr": f"{exe} not found",
+            }
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=PATH_ENV,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "rc": proc.returncode,
+                "stdout": proc.stdout or "",
+                "stderr": proc.stderr or "",
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "rc": 124,
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or f"timed out after {timeout}s",
+            }
+
+
+    def decode_payload(value):
+        padding = "=" * (-len(value) % 4)
+        raw = base64.urlsafe_b64decode((value + padding).encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+
+    payload = decode_payload(sys.argv[1] if len(sys.argv) > 1 else "")
+    nbd_device = str(payload.get("nbd_device") or "").strip()
+    prefixes = payload.get("mount_prefixes")
+    prefixes = tuple(item for item in prefixes if isinstance(item, str) and item) if isinstance(prefixes, list) else ()
+    cleaned = []
+
+    if nbd_device.startswith("/dev/nbd"):
+        lsblk = run(["lsblk", "-nr", "-o", "PATH", nbd_device], timeout=8)
+        devices = []
+        for raw in (lsblk.get("stdout") or "").splitlines():
+            path = raw.strip()
+            if path.startswith("/dev/"):
+                devices.append(path)
+        if nbd_device not in devices:
+            devices.insert(0, nbd_device)
+        for device in devices:
+            mounts = run(["findmnt", "-rn", "-S", device, "-o", "TARGET"], timeout=8)
+            for raw_target in (mounts.get("stdout") or "").splitlines():
+                target = raw_target.strip()
+                if not target or (prefixes and not any(target.startswith(prefix) for prefix in prefixes)):
+                    continue
+                lazy = run(["umount", target], timeout=10)
+                if not lazy["ok"]:
+                    run(["umount", "-lf", target], timeout=10)
+                cleaned.append(target)
+        disconnect = run(["qemu-nbd", "--disconnect", nbd_device], timeout=10)
+        detail = (disconnect.get("stderr") or "").strip() or (disconnect.get("stdout") or "").strip()
+        print(
+            json.dumps(
+                {
+                    "ok": disconnect["ok"] or "not connected" in detail.lower(),
+                    "nbd_device": nbd_device,
+                    "cleaned_mounts": cleaned,
+                    "detail": detail,
+                }
+            )
+        )
+    else:
+        print(json.dumps({"ok": True, "nbd_device": nbd_device, "cleaned_mounts": cleaned}))
+    """
+).strip()
+
 
 def _safe_host(host: str) -> str:
     value = str(host or "").strip()
@@ -1040,6 +1601,13 @@ def _safe_device_path(device_path: str) -> str:
     value = str(device_path or "").strip()
     if not value or not _SAFE_DEVICE_RE.fullmatch(value):
         raise HTTPException(400, "invalid device path")
+    return value
+
+
+def _safe_volume_ref(volume_ref: str) -> str:
+    value = str(volume_ref or "").strip()
+    if not value or not _SAFE_VOLUME_REF_RE.fullmatch(value):
+        raise HTTPException(400, "invalid volume ref")
     return value
 
 
@@ -1147,6 +1715,146 @@ def _inventory_memory_write_unlocked(payload: dict[str, Any]) -> None:
     temp_path = _DISKS_INVENTORY_MEMORY_PATH.with_suffix(".tmp")
     temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(temp_path, _DISKS_INVENTORY_MEMORY_PATH)
+
+
+def _utcnow_iso() -> str:
+    return dt.datetime.now(dt.UTC).isoformat()
+
+
+def _disks_notes_lookup() -> dict[str, str]:
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT node_id, note FROM disks_notes").fetchall()
+    return {
+        str(row["node_id"]): str(row["note"] or "")
+        for row in rows
+        if str(row["node_id"] or "").strip() and str(row["note"] or "").strip()
+    }
+
+
+def _persist_disks_note(node_id: str, note: str) -> None:
+    clean_node_id = _safe_node_id(node_id)
+    clean_note = str(note or "").strip()
+    if len(clean_note) > _DISKS_NOTES_MAX_LENGTH:
+        raise HTTPException(400, f"Note exceeds {_DISKS_NOTES_MAX_LENGTH} characters")
+    with db.get_conn() as conn:
+        if clean_note:
+            conn.execute(
+                """
+                INSERT INTO disks_notes (node_id, note, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(node_id) DO UPDATE SET
+                    note = excluded.note,
+                    updated_at = datetime('now')
+                """,
+                (clean_node_id, clean_note),
+            )
+        else:
+            conn.execute("DELETE FROM disks_notes WHERE node_id = ?", (clean_node_id,))
+        conn.commit()
+
+
+def _apply_disks_notes(node: dict[str, Any], notes_by_id: dict[str, str]) -> None:
+    node_id = str(node.get("id") or "").strip()
+    note = notes_by_id.get(node_id, "").strip()
+    if note:
+        node["user_note"] = note
+    else:
+        node.pop("user_note", None)
+    for child in node.get("children") or []:
+        if isinstance(child, dict):
+            _apply_disks_notes(child, notes_by_id)
+
+
+def _offline_browse_state_empty() -> dict[str, Any]:
+    return {"version": 1, "sessions": {}}
+
+
+def _offline_browse_state_read_unlocked() -> dict[str, Any]:
+    try:
+        raw = _DISKS_OFFLINE_BROWSE_STATE_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _offline_browse_state_empty()
+    except Exception:
+        return _offline_browse_state_empty()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return _offline_browse_state_empty()
+    if not isinstance(payload, dict):
+        return _offline_browse_state_empty()
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, dict):
+        payload["sessions"] = {}
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _offline_browse_state_write_unlocked(payload: dict[str, Any]) -> None:
+    _DISKS_OFFLINE_BROWSE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _DISKS_OFFLINE_BROWSE_STATE_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp_path, _DISKS_OFFLINE_BROWSE_STATE_PATH)
+
+
+def _offline_browse_upsert_session(session: dict[str, Any]) -> None:
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        raise ValueError("offline browse session_id is required")
+    with _DISKS_OFFLINE_BROWSE_LOCK:
+        payload = _offline_browse_state_read_unlocked()
+        sessions = payload.setdefault("sessions", {})
+        sessions[session_id] = session
+        _offline_browse_state_write_unlocked(payload)
+
+
+def _offline_browse_get_session(session_id: str) -> dict[str, Any] | None:
+    clean_session_id = str(session_id or "").strip()
+    if not clean_session_id:
+        return None
+    with _DISKS_OFFLINE_BROWSE_LOCK:
+        payload = _offline_browse_state_read_unlocked()
+        session = payload.get("sessions", {}).get(clean_session_id)
+        return copy.deepcopy(session) if isinstance(session, dict) else None
+
+
+def _offline_browse_delete_session(session_id: str) -> dict[str, Any] | None:
+    clean_session_id = str(session_id or "").strip()
+    if not clean_session_id:
+        return None
+    with _DISKS_OFFLINE_BROWSE_LOCK:
+        payload = _offline_browse_state_read_unlocked()
+        sessions = payload.setdefault("sessions", {})
+        session = sessions.pop(clean_session_id, None)
+        _offline_browse_state_write_unlocked(payload)
+        return session if isinstance(session, dict) else None
+
+
+def _offline_browse_update_session(
+    session_id: str,
+    updater,
+) -> dict[str, Any]:
+    clean_session_id = str(session_id or "").strip()
+    if not clean_session_id:
+        raise HTTPException(400, "session_id is required")
+    with _DISKS_OFFLINE_BROWSE_LOCK:
+        payload = _offline_browse_state_read_unlocked()
+        sessions = payload.setdefault("sessions", {})
+        session = sessions.get(clean_session_id)
+        if not isinstance(session, dict):
+            raise HTTPException(404, "offline browse session not found")
+        updated = updater(copy.deepcopy(session))
+        if not isinstance(updated, dict):
+            raise HTTPException(500, "offline browse session update failed")
+        sessions[clean_session_id] = updated
+        _offline_browse_state_write_unlocked(payload)
+        return copy.deepcopy(updated)
+
+
+def _offline_browse_all_sessions() -> list[dict[str, Any]]:
+    with _DISKS_OFFLINE_BROWSE_LOCK:
+        payload = _offline_browse_state_read_unlocked()
+        sessions = payload.get("sessions", {})
+        return [copy.deepcopy(value) for value in sessions.values() if isinstance(value, dict)]
 
 
 def _layout_hints_payload() -> dict[str, Any]:
@@ -1402,6 +2110,263 @@ async def _filesystem_tree_host(
     )
 
 
+def _payload_arg(payload: dict[str, Any]) -> str:
+    text = json.dumps(payload, separators=(",", ":"))
+    encoded = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def _run_offline_vm_prepare(
+    host: str,
+    *,
+    guest_id: str,
+    volume_ref: str,
+) -> dict[str, Any]:
+    command = _ssh_base_command(host) + [
+        "python3",
+        "-",
+        _payload_arg({"guest_id": guest_id, "volume_ref": volume_ref}),
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_OFFLINE_VM_PREPARE_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=_SSH_INVENTORY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"offline browse prepare timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    try:
+        payload = json.loads(stdout) if stdout else None
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("ok"):
+            return {"ok": True, "host": host, "error": "", "data": payload}
+        return {
+            "ok": False,
+            "host": host,
+            "error": str(payload.get("error") or stderr or "offline browse prepare failed"),
+            "data": None,
+        }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+async def _offline_vm_prepare_host(
+    host: str,
+    *,
+    guest_id: str,
+    volume_ref: str,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _run_offline_vm_prepare,
+        host,
+        guest_id=guest_id,
+        volume_ref=volume_ref,
+    )
+
+
+def _run_offline_vm_attach(
+    host: str,
+    *,
+    resolved_path: str,
+    nbd_device: str,
+) -> dict[str, Any]:
+    payload_arg = _payload_arg({"resolved_path": resolved_path, "nbd_device": nbd_device})
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_OFFLINE_VM_ATTACH_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=_SSH_SMART_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"offline browse attach timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    try:
+        payload = json.loads(stdout) if stdout else None
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("ok"):
+            return {"ok": True, "host": host, "error": "", "data": payload}
+        return {
+            "ok": False,
+            "host": host,
+            "error": str(payload.get("error") or stderr or "offline browse attach failed"),
+            "data": None,
+        }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+async def _offline_vm_attach_host(
+    host: str,
+    *,
+    resolved_path: str,
+    nbd_device: str,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _run_offline_vm_attach,
+        host,
+        resolved_path=resolved_path,
+        nbd_device=nbd_device,
+    )
+
+
+def _run_offline_vm_cleanup(host: str, *, nbd_device: str) -> dict[str, Any]:
+    payload_arg = _payload_arg(
+        {"nbd_device": nbd_device, "mount_prefixes": list(_BROWSE_MOUNT_PREFIXES)}
+    )
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_OFFLINE_VM_CLEANUP_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=_SSH_INVENTORY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"offline browse cleanup timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    try:
+        payload = json.loads(stdout) if stdout else None
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("ok"):
+            return {"ok": True, "host": host, "error": "", "data": payload}
+        return {
+            "ok": False,
+            "host": host,
+            "error": str(payload.get("detail") or stderr or "offline browse cleanup failed"),
+            "data": payload,
+        }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+def _offline_browse_parse_iso(value: Any) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def _offline_browse_public_session(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "session_id": str(session.get("session_id") or "").strip(),
+        "state": str(session.get("state") or "").strip(),
+        "host": str(session.get("host") or "").strip(),
+        "guest_id": str(session.get("guest_id") or "").strip(),
+        "guest_name": str(session.get("guest_name") or "").strip(),
+        "volume_ref": str(session.get("volume_ref") or "").strip(),
+        "volume_label": str(session.get("volume_label") or "").strip(),
+        "nbd_device": str(session.get("nbd_device") or "").strip(),
+        "sources": copy.deepcopy(session.get("sources") or []),
+        "opened_at": str(session.get("opened_at") or "").strip(),
+        "last_heartbeat_at": str(session.get("last_heartbeat_at") or "").strip(),
+        "timeout_seconds": int(
+            session.get("timeout_seconds") or _DISKS_OFFLINE_BROWSE_TIMEOUT_SECONDS
+        ),
+    }
+
+
+async def _offline_browse_cleanup_session(session: dict[str, Any]) -> dict[str, Any]:
+    host = str(session.get("host") or "").strip()
+    nbd_device = str(session.get("nbd_device") or "").strip()
+    if not host or not nbd_device:
+        return {"ok": True, "host": host, "error": "", "data": None}
+    return await asyncio.to_thread(_run_offline_vm_cleanup, host, nbd_device=nbd_device)
+
+
+def _offline_browse_session_is_stale(
+    session: dict[str, Any],
+    *,
+    now: dt.datetime,
+) -> bool:
+    last_seen = _offline_browse_parse_iso(
+        session.get("last_heartbeat_at")
+    ) or _offline_browse_parse_iso(session.get("opened_at"))
+    if last_seen is None:
+        return True
+    timeout_seconds = max(
+        10,
+        int(session.get("timeout_seconds") or _DISKS_OFFLINE_BROWSE_TIMEOUT_SECONDS),
+    )
+    return (now - last_seen).total_seconds() > timeout_seconds
+
+
+async def _reap_stale_offline_browse_sessions() -> None:
+    now = dt.datetime.now(dt.UTC)
+    stale_sessions = [
+        session
+        for session in _offline_browse_all_sessions()
+        if _offline_browse_session_is_stale(session, now=now)
+    ]
+    for session in stale_sessions:
+        session_id = str(session.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        try:
+            _offline_browse_update_session(
+                session_id,
+                lambda current: {
+                    **current,
+                    "state": "closing",
+                    "close_reason": "timeout",
+                    "closed_at": _utcnow_iso(),
+                },
+            )
+        except HTTPException:
+            continue
+        await _offline_browse_cleanup_session(session)
+        _offline_browse_delete_session(session_id)
+
+
+async def run_disks_offline_browse_reaper() -> None:
+    await _reap_stale_offline_browse_sessions()
+    while True:
+        await asyncio.sleep(_DISKS_OFFLINE_BROWSE_REAPER_INTERVAL_SECONDS)
+        await _reap_stale_offline_browse_sessions()
+
+
 def _run_smart_snapshot(host: str, device_path: str) -> dict[str, Any]:
     command = _ssh_base_command(host) + ["smartctl", "-a", "-j", device_path]
     try:
@@ -1564,7 +2529,11 @@ def _guest_display_label(guest_id: str, guest_kind: str, guest_name: str = "") -
 
 def _guest_button_label(guest_id: str, guest_kind: str, guest_name: str = "") -> str:
     clean_name = str(guest_name or "").strip()
-    if clean_name and len(clean_name) <= 18:
+    if clean_name and clean_name.lower() not in {
+        f"vm-{guest_id}".lower(),
+        f"ct-{guest_id}".lower(),
+        f"template-{guest_id}".lower(),
+    }:
         return clean_name
     return f"{_guest_kind_label(guest_kind)} {guest_id}".strip()
 
@@ -1772,6 +2741,187 @@ def _build_guest_assignment_lookup(snapshot: dict[str, Any]) -> dict[str, list[d
     return lookup
 
 
+def _guest_volume_assignments(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = snapshot.get("guest_volume_assignments")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _match_guest_volume_assignment(
+    snapshot: dict[str, Any],
+    *,
+    guest_id: str,
+    dataset_name: str,
+    label: str,
+) -> dict[str, Any] | None:
+    clean_guest_id = str(guest_id or "").strip()
+    clean_dataset_name = str(dataset_name or "").strip()
+    clean_label = str(label or "").strip()
+    if not clean_guest_id or not (clean_dataset_name or clean_label):
+        return None
+    candidates = {
+        clean_dataset_name,
+        clean_label,
+        clean_dataset_name.split("/")[-1] if clean_dataset_name else "",
+    }
+    candidates = {item for item in candidates if item}
+    for row in _guest_volume_assignments(snapshot):
+        if str(row.get("vmid") or "").strip() != clean_guest_id:
+            continue
+        volume_ref = str(row.get("volume_ref") or "").strip()
+        volume_name = str(row.get("volume_name") or "").strip()
+        volume_leaf = str(row.get("volume_leaf") or "").strip()
+        if (
+            volume_ref in candidates
+            or volume_name in candidates
+            or volume_leaf in candidates
+            or any(
+                clean_dataset_name.endswith(f"/{item}")
+                for item in (volume_name, volume_leaf)
+                if item
+            )
+        ):
+            return row
+    return None
+
+
+def _offline_browser_meta_from_assignment(host: str, assignment: dict[str, Any]) -> dict[str, Any]:
+    guest_id = str(assignment.get("vmid") or "").strip()
+    guest_name = str(assignment.get("name") or "").strip()
+    volume_ref = str(assignment.get("volume_ref") or "").strip()
+    volume_label = (
+        str(assignment.get("volume_leaf") or "").strip()
+        or str(assignment.get("volume_name") or "").strip()
+        or volume_ref
+    )
+    if not host or not guest_id or not volume_ref:
+        return {}
+    return {
+        "offline_browser": {
+            "host": host,
+            "guest_id": guest_id,
+            "guest_name": guest_name,
+            "volume_ref": volume_ref,
+            "volume_label": volume_label,
+            "slot": str(assignment.get("slot") or "").strip(),
+        }
+    }
+
+
+def _normalize_backup_guest_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    head = text.split(".", 1)[0].split("/", 1)[0]
+    match = re.match(r"^(pbs\d+)", head)
+    if match:
+        return match.group(1)
+    match = re.match(r"^(rusty-backups|pbs[a-z0-9-]+)", head)
+    return match.group(1) if match else ""
+
+
+def _pbs_guest_usage_lookup(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    storages = {
+        str(row.get("name") or "").strip(): row
+        for row in (snapshot.get("pbs_storages") or [])
+        if isinstance(row, dict) and str(row.get("name") or "").strip()
+    }
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in snapshot.get("pvesm_status") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("type") or "").strip().lower() != "pbs":
+            continue
+        name = str(row.get("name") or "").strip()
+        storage = storages.get(name, {})
+        guest_name = _normalize_backup_guest_name(
+            storage.get("server") or name or storage.get("datastore")
+        )
+        if not guest_name:
+            continue
+        total_kib = _to_int(row.get("total_kib"))
+        used_kib = _to_int(row.get("used_kib"))
+        available_kib = _to_int(row.get("available_kib"))
+        total_bytes = total_kib * 1024 if total_kib is not None else None
+        used_bytes = used_kib * 1024 if used_kib is not None else None
+        available_bytes = available_kib * 1024 if available_kib is not None else None
+        if total_bytes in (None, 0):
+            continue
+        signature = (
+            total_bytes,
+            used_bytes,
+            available_bytes,
+            str(storage.get("datastore") or "").strip(),
+            guest_name,
+        )
+        record = grouped.get(guest_name)
+        if record and record.get("signature") == signature:
+            names = record.setdefault("storage_names", [])
+            if name and name not in names:
+                names.append(name)
+            continue
+        candidate = {
+            "guest_name": guest_name,
+            "server": str(storage.get("server") or "").strip(),
+            "datastore": str(storage.get("datastore") or "").strip(),
+            "storage_names": [name] if name else [],
+            "status": str(row.get("status") or "").strip(),
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+            "available_bytes": available_bytes,
+            "usage_pct": _pct(used_bytes, total_bytes),
+            "signature": signature,
+        }
+        if not record or (candidate.get("total_bytes") or 0) > (record.get("total_bytes") or 0):
+            grouped[guest_name] = candidate
+    for record in grouped.values():
+        record.pop("signature", None)
+    return grouped
+
+
+def _guest_assignment_name_counts(snapshot: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    seen: set[tuple[str, str]] = set()
+    for row in snapshot.get("guest_disk_assignments") or []:
+        if not isinstance(row, dict):
+            continue
+        guest_name = _normalize_backup_guest_name(row.get("name"))
+        source_key = str(row.get("resolved_path") or row.get("source_path") or "").strip()
+        if not guest_name or not source_key:
+            continue
+        identity = (guest_name, source_key)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        counts[guest_name] = counts.get(guest_name, 0) + 1
+    return counts
+
+
+def _pbs_usage_for_assignments(
+    snapshot: dict[str, Any],
+    assignments: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not assignments:
+        return None
+    usage_lookup = _pbs_guest_usage_lookup(snapshot)
+    if not usage_lookup:
+        return None
+    assignment_counts = _guest_assignment_name_counts(snapshot)
+    names = []
+    for row in assignments:
+        guest_name = _normalize_backup_guest_name(row.get("name"))
+        if guest_name and guest_name not in names:
+            names.append(guest_name)
+    for guest_name in names:
+        if assignment_counts.get(guest_name) != 1:
+            continue
+        usage = usage_lookup.get(guest_name)
+        if usage:
+            return usage
+    return None
+
+
 def _guest_assignment_target(row: dict[str, Any]) -> str:
     vmid = str(row.get("vmid") or "").strip()
     name = str(row.get("name") or "").strip()
@@ -1866,6 +3016,7 @@ def _guest_assignment_note(
     *,
     scope: str = "drive",
     usage_probe: dict[str, Any] | None = None,
+    guest_usage: dict[str, Any] | None = None,
 ) -> str:
     if not assignments:
         return ""
@@ -1874,6 +3025,13 @@ def _guest_assignment_note(
         labels = ["a guest"]
     unique_labels = list(dict.fromkeys(labels))
     joined = ", ".join(unique_labels)
+    if isinstance(guest_usage, dict) and guest_usage.get("total_bytes"):
+        datastore = str(guest_usage.get("datastore") or "").strip()
+        source_label = datastore or "the guest datastore"
+        return (
+            f"This {scope} is assigned directly to {joined}. "
+            f"Usage is measured from {source_label} over the configured PBS storage path."
+        )
     probe_label = _probe_strategy_label(usage_probe)
     if probe_label:
         return (
@@ -1905,6 +3063,25 @@ def _guest_assignment_facts(assignments: list[dict[str, Any]]) -> list[dict[str,
         _fact("Assigned to", ", ".join(targets)),
         _fact("Guest slot", ", ".join(slots)),
         _fact("Assignment", "Raw disk passthrough"),
+    )
+
+
+def _guest_usage_facts(guest_usage: dict[str, Any] | None) -> list[dict[str, str]]:
+    if not isinstance(guest_usage, dict) or not guest_usage.get("total_bytes"):
+        return []
+    datastore = str(guest_usage.get("datastore") or "").strip()
+    names = (
+        guest_usage.get("storage_names")
+        if isinstance(guest_usage.get("storage_names"), list)
+        else []
+    )
+    return _non_null_facts(
+        _fact("Guest store", f"PBS {datastore}" if datastore else "Proxmox Backup"),
+        _fact("Guest free", _format_bytes(_to_int(guest_usage.get("available_bytes")))),
+        _fact(
+            "Guest usage source",
+            ", ".join(str(name).strip() for name in names if str(name).strip()),
+        ),
     )
 
 
@@ -2614,6 +3791,7 @@ def _build_thunderbolt_overlay(thunderbolt_payload: dict[str, Any]) -> dict[str,
 def _build_dataset_tree(
     host: str,
     pool_name: str,
+    snapshot: dict[str, Any],
     datasets: list[dict[str, Any]],
     *,
     dataset_roles: dict[str, list[dict[str, Any]]],
@@ -2674,6 +3852,7 @@ def _build_dataset_tree(
             if isinstance(guest_meta.get("guest_identity"), dict)
             else {}
         )
+        offline_browser_meta = {}
         if guest_identity:
             facts.append(
                 {
@@ -2681,6 +3860,15 @@ def _build_dataset_tree(
                     "value": str(guest_identity.get("guest_display") or "").strip(),
                 }
             )
+            if str(guest_identity.get("guest_kind") or "").strip().lower() == "vm":
+                assignment = _match_guest_volume_assignment(
+                    snapshot,
+                    guest_id=str(guest_identity.get("guest_id") or "").strip(),
+                    dataset_name=name,
+                    label=name.split("/")[-1],
+                )
+                if assignment:
+                    offline_browser_meta = _offline_browser_meta_from_assignment(host, assignment)
         node = _node(
             f"{host}:dataset:{name}",
             "dataset" if ds_type == "filesystem" else "volume",
@@ -2692,7 +3880,7 @@ def _build_dataset_tree(
             children=child_nodes,
             total_bytes=total,
             used_bytes=used,
-            meta={**(browse_meta or {}), **guest_meta},
+            meta={**(browse_meta or {}), **guest_meta, **offline_browser_meta},
         )
         return node
 
@@ -2779,6 +3967,7 @@ def _build_pool_nodes(
         dataset_nodes = _build_dataset_tree(
             host,
             pool_name,
+            snapshot,
             dataset_lookup.get(pool_name) or [],
             dataset_roles=dataset_roles,
             guest_identity_lookup=guest_identity_lookup,
@@ -3172,6 +4361,7 @@ def _build_nested_passthrough_nodes(
 
 def _build_drive_nodes(
     host: str,
+    snapshot: dict[str, Any],
     top_disks: list[dict[str, Any]],
     *,
     by_path: dict[str, dict[str, Any]],
@@ -3187,6 +4377,8 @@ def _build_drive_nodes(
     rollup = {
         "known_used_bytes": 0,
         "guest_assigned_bytes": 0,
+        "guest_assigned_known_total_bytes": 0,
+        "guest_assigned_known_used_bytes": 0,
         "guest_assigned_unknown_bytes": 0,
     }
 
@@ -3200,6 +4392,7 @@ def _build_drive_nodes(
             if disk_assignments
             else {}
         )
+        disk_guest_usage = _pbs_usage_for_assignments(snapshot, disk_assignments)
         disk_probe = filesystem_probe_by_path.get(disk_path) or {}
         partition_nodes: list[dict[str, Any]] = []
         guest_partition_total_bytes = 0
@@ -3309,7 +4502,25 @@ def _build_drive_nodes(
             used = _to_int(disk_probe.get("used_bytes"))
         if disk_assignments:
             rollup["guest_assigned_bytes"] += disk_total or 0
-            if used is None:
+            guest_total = _to_int(disk_guest_usage.get("total_bytes")) if disk_guest_usage else None
+            guest_used = _to_int(disk_guest_usage.get("used_bytes")) if disk_guest_usage else None
+            if guest_total:
+                rollup["guest_assigned_known_total_bytes"] += guest_total
+                if guest_used is not None:
+                    rollup["guest_assigned_known_used_bytes"] += guest_used
+                datastore = (
+                    str(disk_guest_usage.get("datastore") or "").strip() if disk_guest_usage else ""
+                )
+                scope_label = f"PBS {datastore}" if datastore else "the guest datastore"
+                usage_text = (
+                    f"{_format_bytes(guest_used)} / {_format_bytes(guest_total)} in {scope_label}"
+                )
+                note = _guest_assignment_note(
+                    disk_assignments,
+                    scope="drive",
+                    guest_usage=disk_guest_usage,
+                )
+            elif used is None:
                 rollup["guest_assigned_unknown_bytes"] += disk_total or 0
                 usage_text = _partial_usage_text(disk_total, guest_assigned_bytes=disk_total)
                 note = _guest_assignment_note(disk_assignments, scope="drive")
@@ -3361,6 +4572,7 @@ def _build_drive_nodes(
             _fact("Rotational", "yes" if _to_int(disk.get("rota")) == 1 else "no"),
         )
         facts.extend(_guest_assignment_facts(disk_assignments))
+        facts.extend(_guest_usage_facts(disk_guest_usage))
         if has_guest_partition and not disk_assignments:
             facts.append(
                 {
@@ -3390,7 +4602,16 @@ def _build_drive_nodes(
                 total_bytes=disk_total,
                 used_bytes=used,
                 usage_text=usage_text,
-                meta=disk_guest_meta or None,
+                meta={
+                    **disk_guest_meta,
+                    **(
+                        {"usage_pct": disk_guest_usage.get("usage_pct")}
+                        if isinstance(disk_guest_usage, dict)
+                        and disk_guest_usage.get("total_bytes")
+                        else {}
+                    ),
+                }
+                or None,
             )
         )
 
@@ -3463,6 +4684,7 @@ def _build_host_node(
     logical_nodes = pool_nodes + standalone_logical_nodes
     drive_nodes, drive_rollup = _build_drive_nodes(
         host,
+        snapshot,
         top_disks,
         by_path=by_path,
         pool_rows=pool_rows,
@@ -3509,33 +4731,44 @@ def _build_host_node(
     guest_assigned_total = int(drive_rollup.get("guest_assigned_bytes") or 0) + int(
         nested_passthrough.get("guest_assigned_bytes") or 0
     )
+    guest_assigned_known_total = int(drive_rollup.get("guest_assigned_known_total_bytes") or 0)
+    guest_assigned_known_used = int(drive_rollup.get("guest_assigned_known_used_bytes") or 0)
     guest_assigned_unknown = int(drive_rollup.get("guest_assigned_unknown_bytes") or 0)
     total = None
     used = None
     usage_text = ""
     if logical_nodes:
-        total = known_total
+        total = ((known_total or 0) + guest_assigned_known_total) or None
+        known_visible_used = ((known_used or 0) + guest_assigned_known_used) or None
         if guest_assigned_unknown:
             used = None
             usage_text = _partial_usage_text(
-                (known_total or 0) + guest_assigned_unknown or None,
-                known_used_bytes=known_used,
+                ((known_total or 0) + guest_assigned_known_total + guest_assigned_unknown) or None,
+                known_used_bytes=known_visible_used,
                 guest_assigned_bytes=guest_assigned_unknown or None,
             )
-            total = ((known_total or 0) + guest_assigned_unknown) or None
+            total = (
+                (known_total or 0) + guest_assigned_known_total + guest_assigned_unknown
+            ) or None
         else:
-            used = known_used
+            used = known_visible_used
     elif drive_nodes:
         total = installed_total
         if guest_assigned_unknown:
             used = None
             usage_text = _partial_usage_text(
                 total,
-                known_used_bytes=drive_rollup.get("known_used_bytes") or None,
+                known_used_bytes=(
+                    (drive_rollup.get("known_used_bytes") or 0) + guest_assigned_known_used
+                )
+                or None,
                 guest_assigned_bytes=guest_assigned_unknown or None,
             )
         elif any(node.get("used_bytes") is not None for node in drive_nodes):
-            used = int(sum(node.get("used_bytes") or 0 for node in drive_nodes)) or None
+            used = (
+                int(sum(node.get("used_bytes") or 0 for node in drive_nodes))
+                + guest_assigned_known_used
+            ) or None
 
     subtitle_bits = []
     if drive_nodes:
@@ -3556,6 +4789,13 @@ def _build_host_node(
     facts = [{"label": "Source", "value": "Live SSH snapshot"}]
     if guest_assigned_total:
         facts.append({"label": "Guest-assigned", "value": _format_bytes(int(guest_assigned_total))})
+    if guest_assigned_known_total:
+        facts.append(
+            {
+                "label": "Guest-known",
+                "value": _format_bytes(int(guest_assigned_known_total)),
+            }
+        )
 
     return _node(
         f"host:{host}",
@@ -3573,6 +4813,8 @@ def _build_host_node(
             "installed_total_bytes": installed_total,
             "known_total_bytes": known_total,
             "guest_assigned_bytes": int(guest_assigned_total) or None,
+            "guest_assigned_known_total_bytes": guest_assigned_known_total or None,
+            "guest_assigned_known_used_bytes": guest_assigned_known_used or None,
             "guest_assigned_unknown_bytes": guest_assigned_unknown or None,
             "known_used_bytes": known_used,
             "layout_hints": copy.deepcopy(layout_hints)
@@ -3629,6 +4871,12 @@ def _build_topology(
         )
         or None
     )
+    guest_assigned_known_total = (
+        int(sum(node.get("guest_assigned_known_total_bytes") or 0 for node in host_nodes)) or None
+    )
+    guest_assigned_known_used = (
+        int(sum(node.get("guest_assigned_known_used_bytes") or 0 for node in host_nodes)) or None
+    )
     guest_assigned_unknown_total = None
     known_used_total = None
     if host_nodes and any(node.get("total_bytes") is not None for node in host_nodes):
@@ -3637,7 +4885,11 @@ def _build_topology(
             int(sum(node.get("guest_assigned_unknown_bytes") or 0 for node in host_nodes)) or None
         )
         known_used_total = (
-            int(sum(node.get("known_used_bytes") or 0 for node in host_nodes)) or None
+            int(
+                sum(node.get("known_used_bytes") or 0 for node in host_nodes)
+                + sum(node.get("guest_assigned_known_used_bytes") or 0 for node in host_nodes)
+            )
+            or None
         )
         if guest_assigned_unknown_total:
             used = None
@@ -3679,6 +4931,8 @@ def _build_topology(
         meta={
             "installed_total_bytes": installed_total,
             "known_total_bytes": known_total,
+            "guest_assigned_known_total_bytes": guest_assigned_known_total,
+            "guest_assigned_known_used_bytes": guest_assigned_known_used,
             "known_used_bytes": known_used_total,
             "guest_assigned_unknown_bytes": guest_assigned_unknown_total,
         },
@@ -3735,8 +4989,9 @@ async def disks_topology() -> dict[str, Any]:
         thunderbolt_result.get("data") if thunderbolt_result.get("ok") else None,
         nested_guest_snapshot=nested_guest_snapshot,
     )
+    _apply_disks_notes(root, _disks_notes_lookup())
     return {
-        "generated_at": dt.datetime.now(dt.UTC).isoformat(),
+        "generated_at": _utcnow_iso(),
         "root": root,
         "sources": {
             "hosts": inventories,
@@ -3763,6 +5018,122 @@ async def disks_memory_forget(
     if not removed:
         raise HTTPException(404, "cached inventory item not found")
     return {"ok": True, "host": clean_host, "node_id": clean_node_id}
+
+
+@router.post("/note")
+async def disks_note(body: DisksNoteBody) -> dict[str, Any]:
+    _persist_disks_note(body.node_id, body.note)
+    return {
+        "ok": True,
+        "node_id": _safe_node_id(body.node_id),
+        "note": str(body.note or "").strip(),
+    }
+
+
+@router.post("/offline-browse/open")
+async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[str, Any]:
+    clean_host = _safe_browse_host(body.host)
+    clean_guest_id = str(body.guest_id or "").strip()
+    if not clean_guest_id.isdigit():
+        raise HTTPException(400, "guest_id must be numeric")
+    clean_volume_ref = _safe_volume_ref(body.volume_ref)
+    guest_name = str(body.guest_name or "").strip()
+    volume_label = str(body.volume_label or "").strip() or clean_volume_ref
+
+    prepare = await _offline_vm_prepare_host(
+        clean_host,
+        guest_id=clean_guest_id,
+        volume_ref=clean_volume_ref,
+    )
+    if not prepare.get("ok") or not isinstance(prepare.get("data"), dict):
+        detail = str(prepare.get("error") or "offline browse prepare failed").strip()
+        lowered = detail.lower()
+        if "must be stopped" in lowered:
+            raise HTTPException(409, detail)
+        raise HTTPException(502, detail)
+
+    prepared = prepare["data"]
+    session_id = secrets.token_hex(16)
+    now_iso = _utcnow_iso()
+    session = {
+        "session_id": session_id,
+        "state": "intent",
+        "host": clean_host,
+        "guest_id": clean_guest_id,
+        "guest_name": guest_name,
+        "volume_ref": clean_volume_ref,
+        "volume_label": volume_label,
+        "resolved_path": str(prepared.get("resolved_path") or "").strip(),
+        "nbd_device": str(prepared.get("nbd_device") or "").strip(),
+        "opened_at": now_iso,
+        "last_heartbeat_at": now_iso,
+        "timeout_seconds": _DISKS_OFFLINE_BROWSE_TIMEOUT_SECONDS,
+    }
+    _offline_browse_upsert_session(session)
+
+    attach = await _offline_vm_attach_host(
+        clean_host,
+        resolved_path=str(prepared.get("resolved_path") or "").strip(),
+        nbd_device=str(prepared.get("nbd_device") or "").strip(),
+    )
+    if not attach.get("ok") or not isinstance(attach.get("data"), dict):
+        await _offline_browse_cleanup_session(session)
+        _offline_browse_delete_session(session_id)
+        detail = str(attach.get("error") or "offline browse attach failed").strip()
+        lowered = detail.lower()
+        if "no mountable filesystem" in lowered:
+            raise HTTPException(400, detail)
+        raise HTTPException(502, detail)
+
+    attached = attach["data"]
+    active_session = _offline_browse_update_session(
+        session_id,
+        lambda current: {
+            **current,
+            "state": "active",
+            "sources": copy.deepcopy(attached.get("sources") or []),
+            "last_heartbeat_at": _utcnow_iso(),
+        },
+    )
+    return {"ok": True, **_offline_browse_public_session(active_session)}
+
+
+@router.post("/offline-browse/heartbeat")
+async def disks_offline_browse_heartbeat(body: DisksOfflineBrowseHeartbeatBody) -> dict[str, Any]:
+    session = _offline_browse_update_session(
+        body.session_id,
+        lambda current: {**current, "last_heartbeat_at": _utcnow_iso()},
+    )
+    return {"ok": True, **_offline_browse_public_session(session)}
+
+
+@router.post("/offline-browse/close")
+async def disks_offline_browse_close(body: DisksOfflineBrowseCloseBody) -> dict[str, Any]:
+    session = _offline_browse_get_session(body.session_id)
+    if not isinstance(session, dict):
+        return {
+            "ok": True,
+            "already_closed": True,
+            "session_id": str(body.session_id or "").strip(),
+        }
+    _offline_browse_update_session(
+        body.session_id,
+        lambda current: {
+            **current,
+            "state": "closing",
+            "closed_at": _utcnow_iso(),
+            "close_reason": "client_closed",
+        },
+    )
+    cleanup = await _offline_browse_cleanup_session(session)
+    _offline_browse_delete_session(body.session_id)
+    if not cleanup.get("ok"):
+        raise HTTPException(502, str(cleanup.get("error") or "offline browse cleanup failed"))
+    return {
+        "ok": True,
+        "session_id": str(body.session_id or "").strip(),
+        "cleanup": cleanup.get("data") if isinstance(cleanup.get("data"), dict) else {},
+    }
 
 
 @router.post("/filesystem/tree")
