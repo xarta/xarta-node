@@ -70,6 +70,10 @@ _SAFE_DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_./:-]+$")
 _FILESYSTEM_MEMBER_TYPES = {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}
 _GENERIC_PARTLABELS = {"basic data partition", "microsoft reserved partition", "primary"}
 _STANDALONE_LOGICAL_MIN_BYTES = 2 * 1024**3
+_GUEST_VOLUME_LABEL_RE = re.compile(
+    r"^(?P<prefix>vm|base|subvol)-(?P<guest_id>\d+)-(?P<suffix>.+)$",
+    re.IGNORECASE,
+)
 _DISKS_INVENTORY_MEMORY_PATH = Path(
     os.environ.get(
         "DISKS_INVENTORY_MEMORY_PATH",
@@ -102,6 +106,48 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
     DEVICE_SLOT_RE = re.compile(r"^(ide|sata|scsi|virtio|efidisk|tpmstate)\\d+$")
     HOSTPCI_SLOT_RE = re.compile(r"^hostpci\\d+$")
     NUMBER_RE = re.compile(r"(-?\\d+)")
+
+
+    def parse_guest_identities():
+        identities = []
+
+        def collect(pattern, guest_type):
+            for path in sorted(glob.glob(pattern)):
+                guest_id = os.path.basename(path).split(".", 1)[0]
+                name = ""
+                template = False
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                        lines = handle.readlines()
+                except Exception:
+                    continue
+
+                for raw in lines:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "name":
+                        name = value
+                        continue
+                    if guest_type == "vm" and key == "template":
+                        template = value.lower() in {"1", "yes", "true", "on"}
+
+                if not name:
+                    name = f"{guest_type}-{guest_id}"
+                identities.append(
+                    {
+                        "vmid": guest_id,
+                        "name": name,
+                        "guest_type": "template" if guest_type == "vm" and template else guest_type,
+                    }
+                )
+
+        collect("/etc/pve/qemu-server/*.conf", "vm")
+        collect("/etc/pve/lxc/*.conf", "ct")
+        return identities
 
 
     def run(cmd, timeout=8):
@@ -524,6 +570,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                     {
                         "vmid": vmid,
                         "name": name,
+                        "guest_type": "vm",
                         "slot": key,
                         "source_path": source,
                         "resolved_path": os.path.realpath(source),
@@ -623,6 +670,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         "zpool_members": parse_zpool_members(zpool_status["stdout"]) if zpool_status["ok"] else {},
         "zpool_status_text": zpool_status["stdout"] if zpool_status["ok"] else "",
         "zfs_list": parse_zfs_list(zfs_list["stdout"]) if zfs_list["ok"] else [],
+        "guest_identities": parse_guest_identities(),
         "guest_disk_assignments": parse_guest_disk_assignments(),
         "hostpci_assignments": parse_hostpci_assignments(),
         "commands": {
@@ -1476,6 +1524,124 @@ def _hostpci_assignments(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
+
+
+def _guest_identity_lookup(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = snapshot.get("guest_identities")
+    if not isinstance(rows, list):
+        return {}
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        guest_id = str(row.get("vmid") or "").strip()
+        if not guest_id:
+            continue
+        lookup[guest_id] = row
+    return lookup
+
+
+def _guest_kind_label(kind: str) -> str:
+    clean = str(kind or "").strip().lower()
+    if clean == "ct":
+        return "CT"
+    if clean == "template":
+        return "Template"
+    return "VM"
+
+
+def _guest_display_label(guest_id: str, guest_kind: str, guest_name: str = "") -> str:
+    base = f"{_guest_kind_label(guest_kind)} {guest_id}".strip()
+    clean_name = str(guest_name or "").strip()
+    if clean_name and clean_name.lower() not in {
+        f"vm-{guest_id}".lower(),
+        f"ct-{guest_id}".lower(),
+        f"template-{guest_id}".lower(),
+    }:
+        return f"{base} ({clean_name})"
+    return base
+
+
+def _guest_button_label(guest_id: str, guest_kind: str, guest_name: str = "") -> str:
+    clean_name = str(guest_name or "").strip()
+    if clean_name and len(clean_name) <= 18:
+        return clean_name
+    return f"{_guest_kind_label(guest_kind)} {guest_id}".strip()
+
+
+def _guest_identity_meta(
+    host: str,
+    *,
+    guest_id: str,
+    guest_kind: str,
+    guest_name: str = "",
+) -> dict[str, Any]:
+    clean_host = str(host or "").strip()
+    clean_guest_id = str(guest_id or "").strip()
+    clean_guest_kind = str(guest_kind or "").strip().lower() or "vm"
+    if not clean_host or not clean_guest_id:
+        return {}
+    clean_name = str(guest_name or "").strip()
+    return {
+        "guest_identity": {
+            "host": clean_host,
+            "guest_id": clean_guest_id,
+            "guest_kind": clean_guest_kind,
+            "guest_kind_label": _guest_kind_label(clean_guest_kind),
+            "guest_key": f"{clean_guest_kind}:{clean_guest_id}",
+            "guest_name": clean_name,
+            "guest_display": _guest_display_label(
+                clean_guest_id,
+                clean_guest_kind,
+                clean_name,
+            ),
+            "guest_summary_label": clean_name
+            or f"{_guest_kind_label(clean_guest_kind)} {clean_guest_id}",
+            "guest_button_label": _guest_button_label(
+                clean_guest_id,
+                clean_guest_kind,
+                clean_name,
+            ),
+        }
+    }
+
+
+def _guest_identity_meta_from_label(
+    host: str,
+    label: str,
+    guest_identity_lookup: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    match = _GUEST_VOLUME_LABEL_RE.match(str(label or "").strip())
+    if not match:
+        return {}
+    guest_id = str(match.group("guest_id") or "").strip()
+    prefix = str(match.group("prefix") or "").strip().lower()
+    row = guest_identity_lookup.get(guest_id) or {}
+    guest_kind = "ct" if prefix == "subvol" else "template" if prefix == "base" else "vm"
+    row_kind = str(row.get("guest_type") or "").strip().lower()
+    if prefix == "vm" and row_kind in {"vm", "template"}:
+        guest_kind = row_kind
+    guest_name = str(row.get("name") or "").strip()
+    return _guest_identity_meta(
+        host,
+        guest_id=guest_id,
+        guest_kind=guest_kind,
+        guest_name=guest_name,
+    )
+
+
+def _guest_identity_meta_from_assignment(host: str, row: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    guest_id = str(row.get("vmid") or "").strip()
+    guest_kind = str(row.get("guest_type") or "").strip().lower() or "vm"
+    guest_name = str(row.get("name") or "").strip()
+    return _guest_identity_meta(
+        host,
+        guest_id=guest_id,
+        guest_kind=guest_kind,
+        guest_name=guest_name,
+    )
 
 
 def _dataset_total_bytes(row: dict[str, Any] | None) -> int | None:
@@ -2451,6 +2617,7 @@ def _build_dataset_tree(
     datasets: list[dict[str, Any]],
     *,
     dataset_roles: dict[str, list[dict[str, Any]]],
+    guest_identity_lookup: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     children_by_parent: dict[str, list[str]] = {}
     entries: dict[str, dict[str, Any]] = {}
@@ -2497,6 +2664,23 @@ def _build_dataset_tree(
             source_path=row.get("mountpoint"),
             dataset_name=name,
         )
+        guest_meta = _guest_identity_meta_from_label(
+            host,
+            name.split("/")[-1],
+            guest_identity_lookup,
+        )
+        guest_identity = (
+            guest_meta.get("guest_identity")
+            if isinstance(guest_meta.get("guest_identity"), dict)
+            else {}
+        )
+        if guest_identity:
+            facts.append(
+                {
+                    "label": "Assigned to",
+                    "value": str(guest_identity.get("guest_display") or "").strip(),
+                }
+            )
         node = _node(
             f"{host}:dataset:{name}",
             "dataset" if ds_type == "filesystem" else "volume",
@@ -2508,7 +2692,7 @@ def _build_dataset_tree(
             children=child_nodes,
             total_bytes=total,
             used_bytes=used,
-            meta=browse_meta,
+            meta={**(browse_meta or {}), **guest_meta},
         )
         return node
 
@@ -2530,6 +2714,7 @@ def _build_pool_nodes(
     dataset_lookup = _datasets_by_pool(
         snapshot.get("zfs_list") if isinstance(snapshot.get("zfs_list"), list) else []
     )
+    guest_identity_lookup = _guest_identity_lookup(snapshot)
     member_lookup = _build_pool_member_lookup(snapshot)
     pool_nodes: list[dict[str, Any]] = []
 
@@ -2596,6 +2781,7 @@ def _build_pool_nodes(
             pool_name,
             dataset_lookup.get(pool_name) or [],
             dataset_roles=dataset_roles,
+            guest_identity_lookup=guest_identity_lookup,
         )
         guest_refs = (
             tb.get("guest_references") if isinstance(tb.get("guest_references"), list) else []
@@ -2838,6 +3024,16 @@ def _build_nested_passthrough_nodes(
     drive_nodes: list[dict[str, Any]] = []
     logical_nodes: list[dict[str, Any]] = []
     guest_assigned_bytes = 0
+    nested_guest_meta = (
+        _guest_identity_meta(
+            parent_host,
+            guest_id=parent_vmid,
+            guest_kind="vm",
+            guest_name=_NESTED_GUEST_HOST,
+        )
+        if parent_vmid and _NESTED_GUEST_HOST
+        else {}
+    )
 
     for role in role_records:
         if not isinstance(role, dict):
@@ -2922,6 +3118,7 @@ def _build_nested_passthrough_nodes(
                 smart=smart,
                 total_bytes=total,
                 used_bytes=used,
+                meta=nested_guest_meta or None,
             )
         )
 
@@ -2950,12 +3147,18 @@ def _build_nested_passthrough_nodes(
                 ),
                 total_bytes=total,
                 used_bytes=used,
-                meta=_filesystem_browser_meta(
-                    host=source_host,
-                    root_path=filesystem_meta.get("mount_path") or mount_path,
-                    filesystem=filesystem_meta.get("fstype"),
-                    source_path=filesystem_meta.get("path") or local_device.get("path"),
-                ),
+                meta={
+                    **(
+                        _filesystem_browser_meta(
+                            host=source_host,
+                            root_path=filesystem_meta.get("mount_path") or mount_path,
+                            filesystem=filesystem_meta.get("fstype"),
+                            source_path=filesystem_meta.get("path") or local_device.get("path"),
+                        )
+                        or {}
+                    ),
+                    **nested_guest_meta,
+                },
             )
         )
         guest_assigned_bytes += total or 0
@@ -2992,6 +3195,11 @@ def _build_drive_nodes(
         disk_name = str(disk.get("name") or disk_path or "disk")
         disk_total = _to_int(disk.get("size"))
         disk_assignments = guest_assignment_lookup.get(disk_path) or []
+        disk_guest_meta = (
+            _guest_identity_meta_from_assignment(host, disk_assignments[0])
+            if disk_assignments
+            else {}
+        )
         disk_probe = filesystem_probe_by_path.get(disk_path) or {}
         partition_nodes: list[dict[str, Any]] = []
         guest_partition_total_bytes = 0
@@ -3070,6 +3278,9 @@ def _build_drive_nodes(
                     usage_text=_partial_usage_text(part_total, guest_assigned_bytes=part_total)
                     if part_assignments and used is None
                     else "",
+                    meta=_guest_identity_meta_from_assignment(host, part_assignments[0])
+                    if part_assignments
+                    else None,
                 )
             )
 
@@ -3179,6 +3390,7 @@ def _build_drive_nodes(
                 total_bytes=disk_total,
                 used_bytes=used,
                 usage_text=usage_text,
+                meta=disk_guest_meta or None,
             )
         )
 
