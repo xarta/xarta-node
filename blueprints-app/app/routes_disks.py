@@ -618,6 +618,79 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
     """
 ).strip()
 
+_REMOTE_NESTED_GUEST_FS_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import shutil
+    import subprocess
+
+    PATH_ENV = {"PATH": "/usr/sbin:/sbin:/usr/bin:/bin"}
+
+
+    def run(cmd, timeout=8):
+        exe = cmd[0]
+        if shutil.which(exe) is None:
+            return {
+                "ok": False,
+                "missing": True,
+                "timeout": False,
+                "rc": 127,
+                "stdout": "",
+                "stderr": f"{exe} not found",
+            }
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=PATH_ENV,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "missing": False,
+                "timeout": False,
+                "rc": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "missing": False,
+                "timeout": True,
+                "rc": 124,
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or "command timed out",
+            }
+
+
+    lsblk = run(
+        [
+            "lsblk",
+            "--json",
+            "-b",
+            "-o",
+            "NAME,PKNAME,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT,PATH",
+        ],
+        timeout=8,
+    )
+    lsblk_payload = (
+        json.loads(lsblk["stdout"])
+        if lsblk["ok"] and lsblk["stdout"].strip()
+        else {"blockdevices": []}
+    )
+    print(
+        json.dumps(
+            {
+                "lsblk": lsblk_payload,
+                "commands": {"lsblk": lsblk},
+            }
+        )
+    )
+    """
+).strip()
+
 
 def _safe_host(host: str) -> str:
     value = str(host or "").strip()
@@ -851,6 +924,48 @@ def _run_inventory_snapshot(host: str) -> dict[str, Any]:
 
 async def _inventory_host(host: str) -> dict[str, Any]:
     return await asyncio.to_thread(_run_inventory_snapshot, host)
+
+
+def _run_nested_guest_filesystem_snapshot(host: str) -> dict[str, Any]:
+    command = _ssh_base_command(host) + ["python3", "-"]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_NESTED_GUEST_FS_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=_SSH_INVENTORY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"nested filesystem probe timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stderr or stdout or f"ssh exited {proc.returncode}"
+        return {"ok": False, "host": host, "error": detail[:400], "data": None}
+
+    try:
+        data = json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"invalid nested filesystem json: {exc}",
+            "data": None,
+        }
+    return {"ok": True, "host": host, "error": "", "data": data}
+
+
+async def _nested_guest_filesystem_host(host: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_run_nested_guest_filesystem_snapshot, host)
 
 
 def _run_smart_snapshot(host: str, device_path: str) -> dict[str, Any]:
@@ -1481,6 +1596,131 @@ def _mount_leaf(path: Any) -> str:
     return text.rsplit("/", 1)[-1].strip()
 
 
+def _needs_nested_guest_filesystem_snapshot(storage_payload: dict[str, Any] | None) -> bool:
+    if not _NESTED_GUEST_HOST or not isinstance(storage_payload, dict):
+        return False
+    disks = storage_payload.get("disks")
+    if not isinstance(disks, list):
+        return False
+    for item in disks:
+        if not isinstance(item, dict):
+            continue
+        detail = item.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get("source_host") or "").strip() != _NESTED_GUEST_HOST:
+            continue
+        local_device = (
+            detail.get("local_device") if isinstance(detail.get("local_device"), dict) else {}
+        )
+        if not (
+            str(detail.get("mount_path") or "").strip()
+            or str(local_device.get("path") or "").strip()
+        ):
+            continue
+        if all(str(local_device.get(key) or "").strip() for key in ("fstype", "label", "uuid")):
+            continue
+        return True
+    return False
+
+
+def _nested_guest_filesystem_lookup(
+    snapshot: dict[str, Any] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    if not isinstance(snapshot, dict):
+        return {"by_path": {}, "mount_by_target": {}}
+    lsblk = snapshot.get("lsblk")
+    blockdevices = lsblk.get("blockdevices") if isinstance(lsblk, dict) else None
+    if not isinstance(blockdevices, list):
+        return {"by_path": {}, "mount_by_target": {}}
+    _, by_path = _flatten_block_devices(blockdevices)
+    mount_by_target: dict[str, dict[str, Any]] = {}
+    for node in by_path.values():
+        if not isinstance(node, dict):
+            continue
+        mount_target = str(node.get("mountpoint") or "").strip()
+        if mount_target and mount_target not in mount_by_target:
+            mount_by_target[mount_target] = node
+    return {"by_path": by_path, "mount_by_target": mount_by_target}
+
+
+def _nested_guest_filesystem_meta(
+    detail: dict[str, Any],
+    local_device: dict[str, Any],
+    lookup: dict[str, dict[str, dict[str, Any]]] | None,
+) -> dict[str, str]:
+    local_path = str(local_device.get("path") or "").strip()
+    mount_path = str(detail.get("mount_path") or "").strip()
+    meta = {
+        "path": local_path,
+        "mount_path": mount_path,
+        "fstype": str(local_device.get("fstype") or "").strip(),
+        "volume_label": str(local_device.get("label") or "").strip(),
+        "uuid": str(local_device.get("uuid") or "").strip(),
+        "part_label": _meaningful_part_label(local_device.get("partlabel")),
+    }
+    if not isinstance(lookup, dict):
+        return meta
+
+    by_path = lookup.get("by_path") if isinstance(lookup.get("by_path"), dict) else {}
+    mount_by_target = (
+        lookup.get("mount_by_target") if isinstance(lookup.get("mount_by_target"), dict) else {}
+    )
+    candidates: dict[str, dict[str, Any]] = {}
+    if mount_path:
+        mount_node = mount_by_target.get(mount_path)
+        if isinstance(mount_node, dict):
+            candidates[str(mount_node.get("path") or mount_path)] = mount_node
+    if local_path:
+        exact = by_path.get(local_path)
+        if isinstance(exact, dict):
+            candidates[str(exact.get("path") or local_path)] = exact
+        for node in by_path.values():
+            if not isinstance(node, dict):
+                continue
+            node_path = str(node.get("path") or "").strip()
+            if not node_path:
+                continue
+            if str(node.get("_root_disk_path") or "").strip() == local_path:
+                candidates[node_path] = node
+            elif str(node.get("_parent_path") or "").strip() == local_path:
+                candidates[node_path] = node
+
+    if not candidates:
+        return meta
+
+    def score(node: dict[str, Any]) -> tuple[int, int]:
+        node_path = str(node.get("path") or "").strip()
+        node_mount = str(node.get("mountpoint") or "").strip()
+        node_type = str(node.get("type") or "").strip().lower()
+        node_root = str(node.get("_root_disk_path") or "").strip()
+        rank = 0
+        if mount_path and node_mount == mount_path:
+            rank += 100
+        if local_path and node_path == local_path:
+            rank += 40
+        if local_path and node_root == local_path and node_path != local_path:
+            rank += 70
+        if str(node.get("fstype") or "").strip():
+            rank += 25
+        if str(node.get("label") or "").strip():
+            rank += 12
+        if str(node.get("uuid") or "").strip():
+            rank += 8
+        if node_type in {"part", "crypt", "lvm"}:
+            rank += 6
+        return rank, -len(node_path)
+
+    selected = max(candidates.values(), key=score)
+    meta["path"] = str(selected.get("path") or "").strip() or meta["path"]
+    meta["mount_path"] = str(selected.get("mountpoint") or "").strip() or meta["mount_path"]
+    meta["fstype"] = str(selected.get("fstype") or "").strip() or meta["fstype"]
+    meta["volume_label"] = str(selected.get("label") or "").strip() or meta["volume_label"]
+    meta["uuid"] = str(selected.get("uuid") or "").strip() or meta["uuid"]
+    meta["part_label"] = _meaningful_part_label(selected.get("partlabel")) or meta["part_label"]
+    return meta
+
+
 def _local_device_transport(local_device: dict[str, Any] | None, *, fallback: str = "") -> str:
     if not isinstance(local_device, dict):
         return str(fallback or "").strip().lower()
@@ -1577,13 +1817,18 @@ def _root_dataset_row(
     return None
 
 
-def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any] | None:
+def _build_guest_overlay_nodes(
+    storage_payload: dict[str, Any],
+    *,
+    nested_guest_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not _NESTED_GUEST_HOST:
         return None
     disks = storage_payload.get("disks")
     if not isinstance(disks, list):
         return None
 
+    nested_lookup = _nested_guest_filesystem_lookup(nested_guest_snapshot)
     role_nodes: list[dict[str, Any]] = []
     role_records: list[dict[str, Any]] = []
     dataset_roles: dict[str, list[dict[str, Any]]] = {}
@@ -1611,6 +1856,7 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
         local_device = (
             detail.get("local_device") if isinstance(detail.get("local_device"), dict) else {}
         )
+        filesystem_meta = _nested_guest_filesystem_meta(detail, local_device, nested_lookup)
         local_model = str(local_device.get("model") or "").strip()
         local_path = str(local_device.get("path") or "").strip()
         local_name = str(local_device.get("name") or "").strip()
@@ -1620,9 +1866,14 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
 
         facts = _non_null_facts(
             _fact("Guest host", source_host),
-            _fact("Mount", detail.get("mount_path")),
+            _fact("Filesystem", filesystem_meta.get("fstype")),
+            _fact("Mount", filesystem_meta.get("mount_path")),
+            _fact("Path", filesystem_meta.get("path")),
+            _fact("Volume label", filesystem_meta.get("volume_label")),
+            _fact("UUID", filesystem_meta.get("uuid")),
             _fact("Guest pool", detail.get("local_pool")),
             _fact("Guest vdev", detail.get("local_vdev")),
+            _fact("Part label", filesystem_meta.get("part_label")),
             _fact("Device", local_name or local_path),
             _fact("Model", local_model),
         )
@@ -1664,6 +1915,7 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
                 "total_bytes": total,
                 "used_bytes": used,
                 "smart": smart,
+                "filesystem_meta": filesystem_meta,
             }
         )
 
@@ -2125,6 +2377,9 @@ def _build_nested_passthrough_nodes(
             assigned_to = source_host
 
         smart = role.get("smart") if isinstance(role.get("smart"), dict) else None
+        filesystem_meta = (
+            role.get("filesystem_meta") if isinstance(role.get("filesystem_meta"), dict) else {}
+        )
         usage_note = (
             f"Whole-controller passthrough. Usage is measured from {source_host} at refresh time."
         )
@@ -2140,6 +2395,10 @@ def _build_nested_passthrough_nodes(
                 note=usage_note,
                 group="Physical drives",
                 facts=_non_null_facts(
+                    _fact("Filesystem", filesystem_meta.get("fstype")),
+                    _fact("Mount", filesystem_meta.get("mount_path")),
+                    _fact("Volume label", filesystem_meta.get("volume_label")),
+                    _fact("UUID", filesystem_meta.get("uuid")),
                     _fact("Model", local_model),
                     _fact("Serial", serial),
                     _fact("Transport", transport_label),
@@ -2168,7 +2427,11 @@ def _build_nested_passthrough_nodes(
                 note=usage_note,
                 group="Logical systems",
                 facts=_non_null_facts(
-                    _fact("Mount", mount_path),
+                    _fact("Filesystem", filesystem_meta.get("fstype")),
+                    _fact("Mount", filesystem_meta.get("mount_path") or mount_path),
+                    _fact("Path", filesystem_meta.get("path")),
+                    _fact("Volume label", filesystem_meta.get("volume_label")),
+                    _fact("UUID", filesystem_meta.get("uuid")),
                     _fact("Assigned to", assigned_to),
                     _fact("Model", local_model),
                     _fact("Serial", serial),
@@ -2597,8 +2860,12 @@ def _build_topology(
     inventories: list[dict[str, Any]],
     storage_payload: dict[str, Any] | None,
     thunderbolt_payload: dict[str, Any] | None,
+    nested_guest_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    guest_overlay = _build_guest_overlay_nodes(storage_payload or {})
+    guest_overlay = _build_guest_overlay_nodes(
+        storage_payload or {},
+        nested_guest_snapshot=nested_guest_snapshot,
+    )
     thunderbolt_pools = _build_thunderbolt_overlay(thunderbolt_payload or {})
     layout_hints = _layout_hints_payload()
     host_nodes = [
@@ -2716,10 +2983,31 @@ async def disks_topology() -> dict[str, Any]:
         storage_result = {"ok": False, "error": "DISKS_AI_CONTROL_BASE_URL is not configured"}
         thunderbolt_result = {"ok": False, "error": "DISKS_AI_CONTROL_BASE_URL is not configured"}
 
+    nested_guest_snapshot = None
+    if _NESTED_GUEST_HOST:
+        for inventory in inventories:
+            if (
+                isinstance(inventory, dict)
+                and inventory.get("ok")
+                and str(inventory.get("host") or "").strip() == _NESTED_GUEST_HOST
+                and isinstance(inventory.get("data"), dict)
+            ):
+                nested_guest_snapshot = inventory.get("data")
+                break
+        if (
+            nested_guest_snapshot is None
+            and storage_result.get("ok")
+            and _needs_nested_guest_filesystem_snapshot(storage_result.get("data"))
+        ):
+            nested_guest_result = await _nested_guest_filesystem_host(_NESTED_GUEST_HOST)
+            if nested_guest_result.get("ok") and isinstance(nested_guest_result.get("data"), dict):
+                nested_guest_snapshot = nested_guest_result.get("data")
+
     root = _build_topology(
         inventories,
         storage_result.get("data") if storage_result.get("ok") else None,
         thunderbolt_result.get("data") if thunderbolt_result.get("ok") else None,
+        nested_guest_snapshot=nested_guest_snapshot,
     )
     return {
         "generated_at": dt.datetime.now(dt.UTC).isoformat(),
