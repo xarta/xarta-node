@@ -8,6 +8,7 @@ the existing AI Control storage feeds where they add nested-guest context.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import datetime as dt
 import json
@@ -31,6 +32,8 @@ router = APIRouter(prefix="/disks", tags=["disks"])
 class DisksFilesystemTreeBody(BaseModel):
     host: str = Field(min_length=1, max_length=255)
     root_path: str = Field(min_length=1, max_length=2000)
+    browse_mode: str | None = Field(default=None, max_length=32)
+    source_path: str | None = Field(default=None, max_length=2000)
     path: str | None = Field(default=None, max_length=4000)
     limit: int = Field(default=400, ge=1, le=1000)
 
@@ -61,6 +64,7 @@ _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=4.0)
 _SSH_CONNECT_TIMEOUT = int(os.environ.get("DISKS_SSH_CONNECT_TIMEOUT_SECONDS", "5"))
 _SSH_INVENTORY_TIMEOUT = int(os.environ.get("DISKS_SSH_INVENTORY_TIMEOUT_SECONDS", "18"))
 _SSH_SMART_TIMEOUT = int(os.environ.get("DISKS_SSH_SMART_TIMEOUT_SECONDS", "24"))
+_BROWSE_MOUNT_PREFIXES = ("/tmp/disks-browse-", "/run/disks-browse-")
 _SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_./:-]+$")
 _FILESYSTEM_MEMBER_TYPES = {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}
@@ -708,20 +712,41 @@ _REMOTE_NESTED_GUEST_FS_SCRIPT = textwrap.dedent(
 
 _REMOTE_FILESYSTEM_TREE_SCRIPT = textwrap.dedent(
     """
+    import base64
     import datetime as dt
     import json
     import os
     from pathlib import Path
+    import subprocess
     import sys
+    import tempfile
 
-    ROOT_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
-    REL_ARG = (sys.argv[2] if len(sys.argv) > 2 else "").strip()
-    LIMIT_ARG = (sys.argv[3] if len(sys.argv) > 3 else "").strip()
+    PAYLOAD_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
 
 
     def fail(message, code=1):
         print(json.dumps({"ok": False, "error": message}))
         raise SystemExit(code)
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Filesystem tree payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Filesystem tree payload is invalid: {exc}")
+        if not isinstance(body, dict):
+            fail("Filesystem tree payload is invalid")
+        return body
+
+
+    def normalize_mode(value):
+        text = str(value or "").strip().lower()
+        return "device_ro" if text == "device_ro" else "mounted"
 
 
     def normalize_relative(path):
@@ -765,141 +790,193 @@ _REMOTE_FILESYSTEM_TREE_SCRIPT = textwrap.dedent(
         return items
 
 
-    if not ROOT_ARG.startswith("/"):
-        fail("Filesystem root must be an absolute path")
+    def display_absolute(root_display, relative_path):
+        if relative_path == ".":
+            return root_display
+        if root_display == "/":
+            return f"/{relative_path}"
+        return f"{root_display.rstrip('/')}/{relative_path}"
+
+
+    payload = decode_payload(PAYLOAD_ARG)
+    mode = normalize_mode(payload.get("browse_mode"))
+    SOURCE_ARG = str(payload.get("source_path") or "").strip()
+    ROOT_ARG = str(payload.get("root_path") or "").strip()
+    REL_ARG = str(payload.get("relative_path") or "").strip()
 
     try:
-        limit = int(LIMIT_ARG)
+        limit = int(payload.get("limit"))
     except Exception:
         limit = 400
     limit = max(1, min(limit, 1000))
 
-    root_input = ROOT_ARG.rstrip("/") or "/"
-    root = Path(root_input).resolve()
-    if not root.exists():
-        fail(f"Filesystem root does not exist: {ROOT_ARG}")
-    if not root.is_dir():
-        fail(f"Filesystem root is not a directory: {ROOT_ARG}")
-    if not os.path.ismount(root):
-        fail(f"Filesystem root is not a mounted path: {ROOT_ARG}")
-
     relative_path = normalize_relative(REL_ARG)
-    current = root if relative_path == "." else (root / relative_path).resolve()
-    if not within_root(current, root):
-        fail("Path escapes filesystem root")
-    if not current.exists():
-        fail(f"Folder does not exist: {relative_path}")
-    if not current.is_dir():
-        fail(f"Not a directory: {relative_path}")
+    mount_root = None
+    mounted = False
 
-    entries = []
-    total_entries = 0
-    with os.scandir(current) as iterator:
-        for entry in iterator:
-            total_entries += 1
-            if len(entries) >= limit:
-                continue
-            lexical_path = current / entry.name
-            entry_rel = rel_path(root, lexical_path)
-            try:
-                is_symlink = entry.is_symlink()
-            except OSError:
-                is_symlink = False
-            try:
-                entry_type = "other"
-                browseable = False
-                symlink_target = ""
-                stat_obj = None
-                if is_symlink:
-                    resolved = lexical_path.resolve()
-                    if within_root(resolved, root):
-                        symlink_target = rel_path(root, resolved)
-                        if resolved.is_dir():
-                            entry_type = "folder"
-                            browseable = True
-                        elif resolved.is_file():
-                            entry_type = "file"
+    try:
+        if mode == "device_ro":
+            if not SOURCE_ARG.startswith("/dev/"):
+                fail("Filesystem source must be a device path")
+            mount_root = Path(tempfile.mkdtemp(prefix="disks-browse-"))
+            mount_proc = subprocess.run(
+                ["mount", "-o", "ro", SOURCE_ARG, str(mount_root)],
+                capture_output=True,
+                text=True,
+            )
+            if mount_proc.returncode != 0:
+                detail = (
+                    (mount_proc.stderr or "").strip()
+                    or (mount_proc.stdout or "").strip()
+                    or f"mount exited {mount_proc.returncode}"
+                )
+                fail(f"Could not mount filesystem read-only: {detail}")
+            mounted = True
+            root_input = "/"
+            root_display = "/"
+            root = mount_root.resolve()
+        else:
+            if not ROOT_ARG.startswith("/"):
+                fail("Filesystem root must be an absolute path")
+            root_input = ROOT_ARG.rstrip("/") or "/"
+            root_display = root_input
+            root = Path(root_input).resolve()
+            if not root.exists():
+                fail(f"Filesystem root does not exist: {ROOT_ARG}")
+            if not root.is_dir():
+                fail(f"Filesystem root is not a directory: {ROOT_ARG}")
+            if not os.path.ismount(root):
+                fail(f"Filesystem root is not a mounted path: {ROOT_ARG}")
+
+        current = root if relative_path == "." else (root / relative_path).resolve()
+        if not within_root(current, root):
+            fail("Path escapes filesystem root")
+        if not current.exists():
+            fail(f"Folder does not exist: {relative_path}")
+        if not current.is_dir():
+            fail(f"Not a directory: {relative_path}")
+
+        entries = []
+        total_entries = 0
+        with os.scandir(current) as iterator:
+            for entry in iterator:
+                total_entries += 1
+                if len(entries) >= limit:
+                    continue
+                lexical_path = current / entry.name
+                entry_rel = rel_path(root, lexical_path)
+                try:
+                    is_symlink = entry.is_symlink()
+                except OSError:
+                    is_symlink = False
+                try:
+                    entry_type = "other"
+                    browseable = False
+                    symlink_target = ""
+                    stat_obj = None
+                    if is_symlink:
+                        resolved = lexical_path.resolve()
+                        if within_root(resolved, root):
+                            symlink_target = rel_path(root, resolved)
+                            if resolved.is_dir():
+                                entry_type = "folder"
+                                browseable = True
+                            elif resolved.is_file():
+                                entry_type = "file"
+                            else:
+                                entry_type = "link"
                         else:
                             entry_type = "link"
+                        stat_obj = entry.stat(follow_symlinks=True)
+                    elif entry.is_dir(follow_symlinks=False):
+                        entry_type = "folder"
+                        browseable = True
+                        stat_obj = entry.stat(follow_symlinks=False)
+                    elif entry.is_file(follow_symlinks=False):
+                        entry_type = "file"
+                        stat_obj = entry.stat(follow_symlinks=False)
                     else:
-                        entry_type = "link"
-                    stat_obj = entry.stat(follow_symlinks=True)
-                elif entry.is_dir(follow_symlinks=False):
-                    entry_type = "folder"
-                    browseable = True
-                    stat_obj = entry.stat(follow_symlinks=False)
-                elif entry.is_file(follow_symlinks=False):
-                    entry_type = "file"
-                    stat_obj = entry.stat(follow_symlinks=False)
-                else:
-                    stat_obj = entry.stat(follow_symlinks=False)
-                entries.append(
-                    {
-                        "name": entry.name,
-                        "path": entry_rel,
-                        "type": entry_type,
-                        "browseable": browseable,
-                        "symlink": is_symlink,
-                        "symlink_target": symlink_target,
-                        "size_bytes": (
-                            int(stat_obj.st_size) if stat_obj and entry_type == "file" else None
-                        ),
-                        "modified_at": (
-                            dt.datetime.fromtimestamp(
-                                stat_obj.st_mtime,
-                                dt.timezone.utc,
-                            ).isoformat()
-                            if stat_obj
-                            else ""
-                        ),
-                    }
-                )
-            except OSError as exc:
-                entries.append(
-                    {
-                        "name": entry.name,
-                        "path": entry_rel,
-                        "type": "other",
-                        "browseable": False,
-                        "symlink": is_symlink,
-                        "symlink_target": "",
-                        "size_bytes": None,
-                        "modified_at": "",
-                        "error": str(exc),
-                    }
-                )
+                        stat_obj = entry.stat(follow_symlinks=False)
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "path": entry_rel,
+                            "type": entry_type,
+                            "browseable": browseable,
+                            "symlink": is_symlink,
+                            "symlink_target": symlink_target,
+                            "size_bytes": (
+                                int(stat_obj.st_size) if stat_obj and entry_type == "file" else None
+                            ),
+                            "modified_at": (
+                                dt.datetime.fromtimestamp(
+                                    stat_obj.st_mtime,
+                                    dt.timezone.utc,
+                                ).isoformat()
+                                if stat_obj
+                                else ""
+                            ),
+                        }
+                    )
+                except OSError as exc:
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "path": entry_rel,
+                            "type": "other",
+                            "browseable": False,
+                            "symlink": is_symlink,
+                            "symlink_target": "",
+                            "size_bytes": None,
+                            "modified_at": "",
+                            "error": str(exc),
+                        }
+                    )
 
-    entries.sort(
-        key=lambda item: (
-            0
-            if item["type"] == "folder"
-            else 1
-            if item["type"] == "file"
-            else 2,
-            item["name"].lower(),
+        entries.sort(
+            key=lambda item: (
+                0
+                if item["type"] == "folder"
+                else 1
+                if item["type"] == "file"
+                else 2,
+                item["name"].lower(),
+            )
         )
-    )
-    parent_path = None
-    if relative_path != ".":
-        parent = Path(relative_path).parent.as_posix()
-        parent_path = "." if parent in {"", "."} else parent
+        parent_path = None
+        if relative_path != ".":
+            parent = Path(relative_path).parent.as_posix()
+            parent_path = "." if parent in {"", "."} else parent
 
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "root_path": root_input,
-                "current_path": relative_path,
-                "current_absolute_path": str(current),
-                "parent_path": parent_path,
-                "breadcrumbs": breadcrumbs(relative_path),
-                "entries": entries,
-                "entry_count": total_entries,
-                "returned_count": len(entries),
-                "truncated": total_entries > len(entries),
-            }
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "root_path": root_input,
+                    "current_path": relative_path,
+                    "current_absolute_path": display_absolute(root_display, relative_path),
+                    "parent_path": parent_path,
+                    "breadcrumbs": breadcrumbs(relative_path),
+                    "entries": entries,
+                    "entry_count": total_entries,
+                    "returned_count": len(entries),
+                    "truncated": total_entries > len(entries),
+                }
+            )
         )
-    )
+    finally:
+        if mounted and mount_root is not None:
+            subprocess.run(
+                ["umount", str(mount_root)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        if mount_root is not None:
+            try:
+                mount_root.rmdir()
+            except OSError:
+                pass
     """
 ).strip()
 
@@ -916,6 +993,17 @@ def _safe_device_path(device_path: str) -> str:
     if not value or not _SAFE_DEVICE_RE.fullmatch(value):
         raise HTTPException(400, "invalid device path")
     return value
+
+
+def _normalize_browser_mode(mode: Any) -> str:
+    return "device_ro" if str(mode or "").strip().lower() == "device_ro" else "mounted"
+
+
+def _visible_mount_target(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return "" if text.startswith(_BROWSE_MOUNT_PREFIXES) else text
 
 
 def _safe_node_id(node_id: str) -> str:
@@ -1183,11 +1271,22 @@ async def _nested_guest_filesystem_host(host: str) -> dict[str, Any]:
 def _run_filesystem_tree_snapshot(
     host: str,
     *,
+    browse_mode: str,
+    source_path: str,
     root_path: str,
     relative_path: str,
     limit: int,
 ) -> dict[str, Any]:
-    command = _ssh_base_command(host) + ["python3", "-", root_path, relative_path, str(limit)]
+    payload = {
+        "browse_mode": browse_mode,
+        "source_path": source_path,
+        "root_path": root_path,
+        "relative_path": relative_path,
+        "limit": int(limit),
+    }
+    payload_arg = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    payload_arg = payload_arg.rstrip("=")
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
     try:
         proc = subprocess.run(
             command,
@@ -1238,6 +1337,8 @@ def _run_filesystem_tree_snapshot(
 async def _filesystem_tree_host(
     host: str,
     *,
+    browse_mode: str,
+    source_path: str,
     root_path: str,
     relative_path: str,
     limit: int,
@@ -1245,6 +1346,8 @@ async def _filesystem_tree_host(
     return await asyncio.to_thread(
         _run_filesystem_tree_snapshot,
         host,
+        browse_mode=browse_mode,
+        source_path=source_path,
         root_path=root_path,
         relative_path=relative_path,
         limit=limit,
@@ -1284,6 +1387,12 @@ def _flatten_block_devices(
 
     def walk(node: dict[str, Any], *, parent_path: str = "", root_disk_path: str = "") -> None:
         path = str(node.get("path") or "").strip()
+        node["mountpoint"] = _visible_mount_target(node.get("mountpoint"))
+        mountpoints = node.get("mountpoints")
+        if isinstance(mountpoints, list):
+            node["mountpoints"] = [
+                point for point in (_visible_mount_target(item) for item in mountpoints) if point
+            ]
         node["_parent_path"] = parent_path
         node["_root_disk_path"] = root_disk_path or path
         by_path[path] = node
@@ -1317,6 +1426,7 @@ def _mount_index(mounts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         for mount in rows:
             if not isinstance(mount, dict):
                 continue
+            mount["target"] = _visible_mount_target(mount.get("target"))
             for key in ("source", "resolved_source"):
                 source = str(mount.get(key) or "").strip()
                 if source:
@@ -1899,10 +2009,8 @@ def _filesystem_browser_meta(
     filesystem: Any = "",
     source_path: Any = "",
     dataset_name: Any = "",
+    allow_device_fallback: bool = False,
 ) -> dict[str, Any] | None:
-    clean_root = _browseable_mount_path(root_path)
-    if not clean_root:
-        return None
     try:
         clean_host = _safe_host(host)
     except HTTPException:
@@ -1910,12 +2018,29 @@ def _filesystem_browser_meta(
     filesystem_name = str(filesystem or "").strip().lower()
     if filesystem_name and filesystem_name != "zfs" and not _is_data_filesystem(filesystem_name):
         return None
+    clean_root = _browseable_mount_path(root_path)
+    browse_mode = "mounted"
+    root_value = clean_root
+    root_display = clean_root
+    clean_source = str(source_path or "").strip()
+    if not clean_root:
+        if not allow_device_fallback:
+            return None
+        try:
+            clean_source = _safe_device_path(clean_source)
+        except HTTPException:
+            return None
+        browse_mode = "device_ro"
+        root_value = "/"
+        root_display = clean_source
     return {
         "filesystem_browser": {
             "host": clean_host,
-            "root_path": clean_root,
+            "root_path": root_value,
+            "root_display": root_display,
+            "browse_mode": browse_mode,
             "filesystem": filesystem_name or "filesystem",
-            "source_path": str(source_path or "").strip(),
+            "source_path": clean_source,
             "dataset_name": str(dataset_name or "").strip(),
             "download_available": False,
         }
@@ -2634,6 +2759,7 @@ def _build_standalone_logical_nodes(
                         root_path=mount_target,
                         filesystem=fstype,
                         source_path=path,
+                        allow_device_fallback=True,
                     ),
                 )
             )
@@ -3430,10 +3556,14 @@ async def disks_memory_forget(
 @router.post("/filesystem/tree")
 async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]:
     clean_host = _safe_browse_host(body.host)
+    browse_mode = _normalize_browser_mode(body.browse_mode)
+    clean_source = _safe_device_path(body.source_path or "") if browse_mode == "device_ro" else ""
     clean_root = _normalize_browser_root_path(body.root_path)
     clean_path = _normalize_browser_relative_path(body.path)
     result = await _filesystem_tree_host(
         clean_host,
+        browse_mode=browse_mode,
+        source_path=clean_source,
         root_path=clean_root,
         relative_path=clean_path,
         limit=int(body.limit),
@@ -3442,6 +3572,9 @@ async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]
         payload = result["data"]
         payload["host"] = clean_host
         payload["root_path"] = clean_root
+        payload["browse_mode"] = browse_mode
+        if clean_source:
+            payload["source_path"] = clean_source
         return payload
     detail = str(result.get("error") or "Filesystem tree unavailable").strip()
     lowered = detail.lower()
