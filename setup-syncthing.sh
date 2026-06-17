@@ -134,7 +134,9 @@ interest_stignore_text() {
 #
 # The category root itself is the Obsidian/LLM-wiki vault. Keep source and
 # operator-visible flow directories synced: inbox/, raw/, media/, extracted/,
-# results/, entities/, concepts/, comparisons/, queries/, wiki/, minutes/.
+# results/, entities/, concepts/, comparisons/, queries/.
+# Interests ingestion posts human-facing Minutes to the existing Matrix Minutes
+# room; category-local Minutes staging is not part of this vault shape.
 # Keep worker coordination and generated indexes local to each node.
 jobs/
 db/
