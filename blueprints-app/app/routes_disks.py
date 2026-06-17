@@ -8,12 +8,15 @@ the existing AI Control storage feeds where they add nested-guest context.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import json
 import os
 import re
 import subprocess
 import textwrap
+import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -45,6 +48,23 @@ _SSH_INVENTORY_TIMEOUT = int(os.environ.get("DISKS_SSH_INVENTORY_TIMEOUT_SECONDS
 _SSH_SMART_TIMEOUT = int(os.environ.get("DISKS_SSH_SMART_TIMEOUT_SECONDS", "24"))
 _SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_DEVICE_RE = re.compile(r"^/dev/[A-Za-z0-9_./:-]+$")
+_FILESYSTEM_MEMBER_TYPES = {"swap", "zfs_member", "linux_raid_member", "lvm2_member", "crypto_luks"}
+_GENERIC_PARTLABELS = {"basic data partition", "microsoft reserved partition", "primary"}
+_STANDALONE_LOGICAL_MIN_BYTES = 2 * 1024**3
+_DISKS_INVENTORY_MEMORY_PATH = Path(
+    os.environ.get(
+        "DISKS_INVENTORY_MEMORY_PATH",
+        "/xarta-node/.lone-wolf/runtime/disks-inventory-memory.json",
+    )
+).expanduser()
+_DISKS_LAYOUT_HINTS_PATH = Path(
+    os.environ.get(
+        "DISKS_LAYOUT_HINTS_PATH",
+        "/xarta-node/.lone-wolf/config/disks-layout-hints.json",
+    )
+).expanduser()
+_DISKS_INVENTORY_MEMORY_GROUPS = ("Physical drives", "Logical systems")
+_DISKS_INVENTORY_MEMORY_LOCK = threading.Lock()
 
 _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
     """
@@ -61,6 +81,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         r"^(mirror|raidz\\d*|draid\\d*|spare|spares|logs?|cache|special|dedup|replacing)(-|$)"
     )
     DEVICE_SLOT_RE = re.compile(r"^(ide|sata|scsi|virtio|efidisk|tpmstate)\\d+$")
+    HOSTPCI_SLOT_RE = re.compile(r"^hostpci\\d+$")
     NUMBER_RE = re.compile(r"(-?\\d+)")
 
 
@@ -265,6 +286,68 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
             return None
 
 
+    def normalize_pci_base(value):
+        token = str(value or "").strip()
+        if not token:
+            return ""
+        token = token.split(",", 1)[0].split(";", 1)[0].strip()
+        if token.startswith("host="):
+            token = token[5:].strip()
+        if not token:
+            return ""
+        if token.count(":") == 1:
+            token = f"0000:{token}"
+        elif token.count(":") == 2 and not token.startswith("0000:"):
+            token = f"0000:{token}"
+        if "." in token:
+            token = token.rsplit(".", 1)[0]
+        return token
+
+
+    def pci_attr(bdf, attr):
+        path = f"/sys/bus/pci/devices/{bdf}/{attr}"
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                return handle.read().strip().removeprefix("0x")
+        except Exception:
+            return ""
+
+
+    def pci_identity(base):
+        bdf = f"{base}.0"
+        if not os.path.isdir(f"/sys/bus/pci/devices/{bdf}"):
+            return {
+                "pci_base": base,
+                "pci_bdf": bdf,
+                "vendor_id": "",
+                "device_id": "",
+                "class_id": "",
+                "subsystem_vendor_id": "",
+                "subsystem_device_id": "",
+                "driver": "",
+                "description": "",
+            }
+        driver = ""
+        driver_link = f"/sys/bus/pci/devices/{bdf}/driver"
+        if os.path.islink(driver_link):
+            driver = os.path.basename(os.path.realpath(driver_link))
+        description = ""
+        lspci = run(["lspci", "-nnD", "-s", base], timeout=3)
+        if lspci["ok"]:
+            description = (lspci["stdout"].splitlines() or [""])[0].strip()
+        return {
+            "pci_base": base,
+            "pci_bdf": bdf,
+            "vendor_id": pci_attr(bdf, "vendor"),
+            "device_id": pci_attr(bdf, "device"),
+            "class_id": pci_attr(bdf, "class"),
+            "subsystem_vendor_id": pci_attr(bdf, "subsystem_vendor"),
+            "subsystem_device_id": pci_attr(bdf, "subsystem_device"),
+            "driver": driver,
+            "description": description,
+        }
+
+
     def probe_ext_usage(path):
         result = run(["tune2fs", "-l", path], timeout=3)
         if not result["ok"]:
@@ -313,6 +396,35 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         }
 
 
+    def probe_exfat_usage(path):
+        result = run(["dump.exfat", path], timeout=3)
+        if not result["ok"]:
+            return None
+        fields = {}
+        volume_label = ""
+        for raw in result["stdout"].splitlines():
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            key_name = key.strip().lower()
+            fields[key_name] = parse_first_int(value)
+            if key_name == "volume label":
+                volume_label = value.strip()
+        cluster_size = fields.get("cluster size")
+        total_clusters = fields.get("total clusters")
+        free_clusters = fields.get("free clusters")
+        if None in {cluster_size, total_clusters, free_clusters}:
+            return None
+        total_bytes = int(total_clusters * cluster_size)
+        used_bytes = int(max(0, total_clusters - free_clusters) * cluster_size)
+        return {
+            "strategy": "dump.exfat",
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+            "volume_label": volume_label,
+        }
+
+
     def collect_filesystem_usage_probes(blockdevices, mounts):
         mounted_sources = set()
 
@@ -347,6 +459,8 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                 probe = probe_ext_usage(path)
             elif fstype in {"ntfs", "ntfs3"}:
                 probe = probe_ntfs_usage(path)
+            elif fstype == "exfat":
+                probe = probe_exfat_usage(path)
             if not isinstance(probe, dict):
                 continue
             probes[path] = {
@@ -355,6 +469,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                 "total_bytes": probe.get("total_bytes"),
                 "used_bytes": probe.get("used_bytes"),
                 "strategy": probe.get("strategy"),
+                "volume_label": probe.get("volume_label"),
             }
         return probes
 
@@ -393,6 +508,50 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                         "slot": key,
                         "source_path": source,
                         "resolved_path": os.path.realpath(source),
+                    }
+                )
+
+            if pending and not name:
+                for entry in pending:
+                    entry["name"] = f"vm-{vmid}"
+            assignments.extend(pending)
+        return assignments
+
+
+    def parse_hostpci_assignments():
+        assignments = []
+        for path in sorted(glob.glob("/etc/pve/qemu-server/*.conf")):
+            vmid = os.path.basename(path).split(".", 1)[0]
+            name = ""
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle.readlines()
+            except Exception:
+                continue
+
+            pending = []
+            for raw in lines:
+                line = raw.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "name":
+                    name = value
+                    continue
+                if not HOSTPCI_SLOT_RE.match(key):
+                    continue
+                base = normalize_pci_base(value)
+                if not base:
+                    continue
+                pending.append(
+                    {
+                        "vmid": vmid,
+                        "name": name,
+                        "slot": key,
+                        "raw": value,
+                        **pci_identity(base),
                     }
                 )
 
@@ -446,6 +605,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         "zpool_status_text": zpool_status["stdout"] if zpool_status["ok"] else "",
         "zfs_list": parse_zfs_list(zfs_list["stdout"]) if zfs_list["ok"] else [],
         "guest_disk_assignments": parse_guest_disk_assignments(),
+        "hostpci_assignments": parse_hostpci_assignments(),
         "commands": {
             "lsblk": lsblk,
             "findmnt": findmnt,
@@ -470,6 +630,13 @@ def _safe_device_path(device_path: str) -> str:
     value = str(device_path or "").strip()
     if not value or not _SAFE_DEVICE_RE.fullmatch(value):
         raise HTTPException(400, "invalid device path")
+    return value
+
+
+def _safe_node_id(node_id: str) -> str:
+    value = str(node_id or "").strip()
+    if not value or len(value) > 400:
+        raise HTTPException(400, "invalid node id")
     return value
 
 
@@ -528,6 +695,59 @@ def _usage_fields(total_bytes: int | None, used_bytes: int | None) -> dict[str, 
         "free_bytes": free_bytes,
         "usage_pct": _pct(used_bytes, total_bytes),
     }
+
+
+def _inventory_memory_empty() -> dict[str, Any]:
+    return {"version": 1, "hosts": {}}
+
+
+def _inventory_memory_read_unlocked() -> dict[str, Any]:
+    try:
+        raw = _DISKS_INVENTORY_MEMORY_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _inventory_memory_empty()
+    except Exception:
+        return _inventory_memory_empty()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return _inventory_memory_empty()
+    if not isinstance(payload, dict):
+        return _inventory_memory_empty()
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, dict):
+        payload["hosts"] = {}
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _inventory_memory_write_unlocked(payload: dict[str, Any]) -> None:
+    _DISKS_INVENTORY_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _DISKS_INVENTORY_MEMORY_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temp_path, _DISKS_INVENTORY_MEMORY_PATH)
+
+
+def _layout_hints_payload() -> dict[str, Any]:
+    try:
+        raw = _DISKS_LAYOUT_HINTS_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _layout_hints_for_host(payload: dict[str, Any], host: str) -> dict[str, Any]:
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, dict):
+        return {}
+    hints = hosts.get(host)
+    return copy.deepcopy(hints) if isinstance(hints, dict) else {}
 
 
 def _node(
@@ -647,14 +867,14 @@ def _run_smart_snapshot(host: str, device_path: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"S.M.A.R.T. probe failed: {exc}") from exc
 
-    if proc.returncode not in {0, 4}:
-        detail = (proc.stderr or proc.stdout or "").strip()[:500]
-        raise HTTPException(502, detail or f"smartctl exited {proc.returncode}")
-
     try:
         body = json.loads(proc.stdout or "{}")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"smartctl returned invalid json: {exc}") from exc
+    if proc.returncode not in {0, 4}:
+        detail = (proc.stderr or "").strip() or f"smartctl exited {proc.returncode}"
+        body.setdefault("_smartctl_exit_status", proc.returncode)
+        body.setdefault("_smartctl_error", detail[:500])
     return body
 
 
@@ -743,14 +963,101 @@ def _build_pool_member_lookup(snapshot: dict[str, Any]) -> dict[str, list[dict[s
     }
 
 
-def _pool_member_used_bytes(pool_row: dict[str, Any], member_size: int | None) -> int | None:
+def _hostpci_assignments(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = snapshot.get("hostpci_assignments")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _dataset_total_bytes(row: dict[str, Any] | None) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    volsize = _to_int(row.get("volsize_bytes"))
+    if volsize:
+        return volsize
+    used = _to_int(row.get("used_bytes"))
+    available = _to_int(row.get("available_bytes"))
+    if used is None or available is None:
+        return None
+    return max(0, used + available)
+
+
+def _transport_display(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    mapping = {
+        "nvme": "NVMe",
+        "usb": "USB",
+        "usb4": "USB4",
+        "sata": "SATA",
+        "sas": "SAS",
+        "scsi": "SCSI",
+        "ata": "ATA",
+        "pcie": "PCIe",
+        "hba": "HBA",
+        "thunderbolt": "Thunderbolt",
+    }
+    return mapping.get(text, text.upper() if len(text) <= 4 else text.title())
+
+
+def _transport_tags(*values: Any) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = str(value or "").strip().lower()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        tags.append(clean)
+    return tags
+
+
+def _thunderbolt_connection_tags(
+    pool_meta: dict[str, Any] | None, *, raw_transport: str = ""
+) -> list[str]:
+    if not isinstance(pool_meta, dict):
+        return []
+    text = " ".join(
+        str(pool_meta.get(key) or "").strip()
+        for key in ("hardware", "description", "label", "name")
+    ).lower()
+    if not text:
+        return []
+    tags: list[str] = []
+    raw = str(raw_transport or "").strip().lower()
+    if raw in {"sata", "sas"} and ("hb sata" in text or "sas" in text or "controller" in text):
+        tags.append("hba")
+    if "thunderbolt" in text:
+        tags.append("thunderbolt")
+    elif "usb4" in text:
+        tags.append("usb4")
+    return _transport_tags(*tags)
+
+
+def _transport_label(raw_transport: Any, *extra_tags: Any) -> str:
+    tags = _transport_tags(raw_transport, *extra_tags)
+    return " · ".join(part for part in (_transport_display(tag) for tag in tags) if part)
+
+
+def _pool_member_used_bytes(
+    pool_row: dict[str, Any],
+    member_size: int | None,
+    *,
+    member_count: int | None = None,
+) -> int | None:
+    allocated = _to_int(pool_row.get("allocated_bytes"))
+    total = _to_int(pool_row.get("size_bytes"))
+    if member_count == 1 and allocated is not None:
+        return max(0, allocated)
     if member_size is None:
         return None
+    if allocated is not None and total not in (None, 0):
+        return int(round(member_size * (allocated / total)))
     cap = _to_int(pool_row.get("capacity_pct"))
     if cap is not None:
         return int(round(member_size * (cap / 100.0)))
-    allocated = _to_int(pool_row.get("allocated_bytes"))
-    total = _to_int(pool_row.get("size_bytes"))
     if allocated is None or total in (None, 0):
         return None
     return int(round(member_size * (allocated / total)))
@@ -814,7 +1121,70 @@ def _probe_strategy_label(probe: dict[str, Any] | None) -> str:
         return "read-only ext filesystem metadata"
     if strategy == "ntfsinfo":
         return "read-only NTFS metadata"
+    if strategy == "dump.exfat":
+        return "read-only exFAT metadata"
     return "read-only filesystem metadata"
+
+
+def _meaningful_part_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower() in _GENERIC_PARTLABELS:
+        return ""
+    return text
+
+
+def _is_data_filesystem(fstype: Any) -> bool:
+    clean = str(fstype or "").strip().lower()
+    return bool(clean) and clean not in _FILESYSTEM_MEMBER_TYPES
+
+
+def _standalone_volume_label(
+    node: dict[str, Any],
+    *,
+    mount_target: str,
+    probe: dict[str, Any],
+) -> str:
+    volume_label = str(probe.get("volume_label") or "").strip()
+    if volume_label:
+        return volume_label
+    if mount_target and mount_target != "/":
+        base = mount_target.rstrip("/").rsplit("/", 1)[-1].strip()
+        if base:
+            return base
+    part_label = _meaningful_part_label(node.get("partlabel"))
+    if part_label:
+        return part_label
+    return str(node.get("name") or node.get("path") or "filesystem").strip() or "filesystem"
+
+
+def _should_surface_standalone_logical(
+    *,
+    total_bytes: int | None,
+    used_bytes: int | None,
+    mount_target: str,
+) -> bool:
+    if mount_target:
+        return True
+    if used_bytes not in (None, 0):
+        return True
+    return total_bytes is not None and total_bytes >= _STANDALONE_LOGICAL_MIN_BYTES
+
+
+def _standalone_logical_note(
+    *,
+    mount_target: str,
+    probe: dict[str, Any],
+    used_bytes: int | None,
+) -> str:
+    if used_bytes is None:
+        return "Filesystem detected, but usage could not be measured in the current host snapshot."
+    if mount_target:
+        return ""
+    if probe:
+        return f"Usage estimated from {_probe_strategy_label(probe)}."
+    return ""
 
 
 def _guest_assignment_note(
@@ -888,6 +1258,325 @@ def _partial_usage_text(
     return " · ".join(parts) if parts else "Usage unavailable"
 
 
+def _display_count(items: list[dict[str, Any]], *, group: str) -> int:
+    return sum(
+        1 for item in items if isinstance(item, dict) and str(item.get("group") or "") == group
+    )
+
+
+def _refresh_host_subtitle(host_node: dict[str, Any]) -> None:
+    children = host_node.get("children")
+    if not isinstance(children, list):
+        return
+    physical_count = _display_count(children, group="Physical drives")
+    logical_count = _display_count(children, group="Logical systems")
+    subtitle_bits: list[str] = []
+    if physical_count:
+        subtitle_bits.append(f"{physical_count} physical drive{'s' if physical_count != 1 else ''}")
+    if logical_count:
+        subtitle_bits.append(f"{logical_count} logical system{'s' if logical_count != 1 else ''}")
+    host_node["subtitle"] = " · ".join(subtitle_bits)
+
+
+def _cacheable_host_child(node: dict[str, Any]) -> bool:
+    if not isinstance(node, dict):
+        return False
+    node_id = str(node.get("id") or "").strip()
+    group = str(node.get("group") or "").strip()
+    return bool(node_id) and group in _DISKS_INVENTORY_MEMORY_GROUPS
+
+
+def _snapshot_cacheable_node(node: dict[str, Any]) -> dict[str, Any]:
+    snapshot = copy.deepcopy(node)
+    for key in (
+        "cached_missing",
+        "cached_missing_ancestor",
+        "cache_host",
+        "cache_last_seen_at",
+        "excluded_from_totals",
+    ):
+        snapshot.pop(key, None)
+    return snapshot
+
+
+def _mark_cached_missing_subtree(
+    node: dict[str, Any],
+    *,
+    host: str,
+    last_seen_at: str,
+    is_root: bool,
+) -> dict[str, Any]:
+    cached = copy.deepcopy(node)
+    cached["status"] = "stale"
+    cached["smart"] = None
+    if is_root:
+        cached["cached_missing"] = True
+        cached["cache_host"] = host
+        cached["cache_last_seen_at"] = last_seen_at
+        cached["excluded_from_totals"] = True
+        last_usage = ""
+        total = _to_int(cached.get("total_bytes"))
+        used = _to_int(cached.get("used_bytes"))
+        if total is not None:
+            if used is not None:
+                last_usage = f"Last seen {_format_bytes(used)} / {_format_bytes(total)}"
+            else:
+                last_usage = f"Last seen total {_format_bytes(total)}"
+        if last_usage:
+            cached["usage_text"] = last_usage
+        stale_note = "Cached from a previous inventory snapshot. Not seen in the latest refresh."
+        note = str(cached.get("note") or "").strip()
+        cached["note"] = f"{stale_note} {note}".strip() if note else stale_note
+    else:
+        cached["cached_missing_ancestor"] = True
+    children = cached.get("children")
+    if isinstance(children, list):
+        cached["children"] = [
+            _mark_cached_missing_subtree(
+                child,
+                host=host,
+                last_seen_at=last_seen_at,
+                is_root=False,
+            )
+            if isinstance(child, dict)
+            else child
+            for child in children
+        ]
+    return cached
+
+
+def _inventory_record_sort_key(record: dict[str, Any]) -> tuple[int, str, str]:
+    snapshot = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else {}
+    return (
+        int(record.get("order") or 0),
+        str(snapshot.get("label") or "").lower(),
+        str(record.get("id") or ""),
+    )
+
+
+def _merge_inventory_memory(host_nodes: list[dict[str, Any]]) -> None:
+    now_iso = dt.datetime.now(dt.UTC).isoformat()
+    with _DISKS_INVENTORY_MEMORY_LOCK:
+        memory = _inventory_memory_read_unlocked()
+        hosts_store = memory.setdefault("hosts", {})
+        changed = False
+
+        for host_node in host_nodes:
+            if not isinstance(host_node, dict) or str(host_node.get("kind") or "") != "host":
+                continue
+            host = str(host_node.get("label") or "").strip()
+            if not host:
+                continue
+
+            host_store = hosts_store.setdefault(host, {})
+            node_store = host_store.setdefault("nodes", {})
+            if not isinstance(node_store, dict):
+                host_store["nodes"] = {}
+                node_store = host_store["nodes"]
+
+            live_children = host_node.get("children")
+            if not isinstance(live_children, list):
+                live_children = []
+
+            grouped_live: dict[str, list[dict[str, Any]]] = {
+                group: [] for group in _DISKS_INVENTORY_MEMORY_GROUPS
+            }
+            other_children: list[dict[str, Any]] = []
+            for child in live_children:
+                if _cacheable_host_child(child):
+                    grouped_live[str(child.get("group"))].append(child)
+                else:
+                    other_children.append(child)
+
+            for group_name in _DISKS_INVENTORY_MEMORY_GROUPS:
+                for order, child in enumerate(grouped_live[group_name]):
+                    record = {
+                        "id": str(child.get("id") or ""),
+                        "group": group_name,
+                        "order": order,
+                        "last_seen_at": now_iso,
+                        "snapshot": _snapshot_cacheable_node(child),
+                    }
+                    if node_store.get(record["id"]) != record:
+                        node_store[record["id"]] = record
+                        changed = True
+
+            merged_children: list[dict[str, Any]] = []
+            cached_missing_count = 0
+            for group_name in _DISKS_INVENTORY_MEMORY_GROUPS:
+                live_by_id = {
+                    str(child.get("id") or ""): child
+                    for child in grouped_live[group_name]
+                    if isinstance(child, dict)
+                }
+                records = [
+                    record
+                    for record in node_store.values()
+                    if isinstance(record, dict) and str(record.get("group") or "") == group_name
+                ]
+                records.sort(key=_inventory_record_sort_key)
+                seen_ids: set[str] = set()
+                for record in records:
+                    node_id = str(record.get("id") or "")
+                    if not node_id or node_id in seen_ids:
+                        continue
+                    seen_ids.add(node_id)
+                    live_node = live_by_id.get(node_id)
+                    if live_node is not None:
+                        merged_children.append(live_node)
+                        continue
+                    snapshot = record.get("snapshot")
+                    if not isinstance(snapshot, dict):
+                        continue
+                    cached_missing_count += 1
+                    merged_children.append(
+                        _mark_cached_missing_subtree(
+                            snapshot,
+                            host=host,
+                            last_seen_at=str(record.get("last_seen_at") or ""),
+                            is_root=True,
+                        )
+                    )
+                for node_id, live_node in live_by_id.items():
+                    if node_id in seen_ids:
+                        continue
+                    merged_children.append(live_node)
+
+            host_node["children"] = merged_children + other_children
+            _refresh_host_subtitle(host_node)
+            if cached_missing_count:
+                note = str(host_node.get("note") or "").strip()
+                addition = "Missing inventory cached from earlier refreshes is shown grey and excluded from totals."
+                if addition not in note:
+                    host_node["note"] = f"{note} {addition}".strip() if note else addition
+                host_node["cached_missing_count"] = cached_missing_count
+            else:
+                host_node.pop("cached_missing_count", None)
+
+        if changed:
+            _inventory_memory_write_unlocked(memory)
+
+
+def _inventory_memory_forget(host: str, node_id: str) -> bool:
+    with _DISKS_INVENTORY_MEMORY_LOCK:
+        memory = _inventory_memory_read_unlocked()
+        hosts_store = memory.setdefault("hosts", {})
+        host_store = hosts_store.get(host)
+        if not isinstance(host_store, dict):
+            return False
+        node_store = host_store.get("nodes")
+        if not isinstance(node_store, dict) or node_id not in node_store:
+            return False
+        del node_store[node_id]
+        _inventory_memory_write_unlocked(memory)
+        return True
+
+
+def _mount_leaf(path: Any) -> str:
+    text = str(path or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if "/" not in text:
+        return text
+    return text.rsplit("/", 1)[-1].strip()
+
+
+def _local_device_transport(local_device: dict[str, Any] | None, *, fallback: str = "") -> str:
+    if not isinstance(local_device, dict):
+        return str(fallback or "").strip().lower()
+    text = " ".join(
+        str(local_device.get(key) or "").strip()
+        for key in ("name", "path", "model", "serial", "size", "fstype")
+    ).lower()
+    if "nvme" in text:
+        return "nvme"
+    if "usb4" in text:
+        return "usb4"
+    if "thunderbolt" in text:
+        return "thunderbolt"
+    if re.search(r"\b(sata|ata)\b", text):
+        return "sata"
+    if "sas" in text:
+        return "sas"
+    if "scsi" in text:
+        return "scsi"
+    if "usb" in text or "portable" in text or "datatraveler" in text:
+        return "usb"
+    return str(fallback or "").strip().lower()
+
+
+def _local_device_rotational(local_device: dict[str, Any] | None, *, transport: str = "") -> str:
+    model = (
+        str(local_device.get("model") or "").strip().lower()
+        if isinstance(local_device, dict)
+        else ""
+    )
+    clean_transport = str(transport or "").strip().lower()
+    if clean_transport == "nvme" or "ssd" in model:
+        return "no"
+    return ""
+
+
+def _is_storage_hostpci_assignment(row: dict[str, Any]) -> bool:
+    class_id = str(row.get("class_id") or "").strip().lower().removeprefix("0x")
+    description = str(row.get("description") or "").strip().lower()
+    if class_id.startswith(("0108", "0106", "0104", "0107", "0100", "0101", "0102", "0180")):
+        return True
+    return any(
+        marker in description
+        for marker in (
+            "non-volatile memory controller",
+            "nvme",
+            "sata controller",
+            "raid bus controller",
+            "serial attached scsi",
+            "storage controller",
+            "mass storage",
+        )
+    )
+
+
+def _match_nested_hostpci_assignment(
+    assignments: list[dict[str, Any]],
+    local_device: dict[str, Any] | None,
+    *,
+    vmid: str = "",
+) -> dict[str, Any] | None:
+    candidates = [row for row in assignments if _is_storage_hostpci_assignment(row)]
+    if vmid:
+        vmid_matches = [row for row in candidates if str(row.get("vmid") or "").strip() == vmid]
+        if vmid_matches:
+            candidates = vmid_matches
+    if not candidates:
+        return None
+
+    transport = _local_device_transport(local_device)
+    if transport == "nvme":
+        nvme_matches = [
+            row
+            for row in candidates
+            if str(row.get("class_id") or "").strip().lower().removeprefix("0x").startswith("0108")
+            or "non-volatile memory controller" in str(row.get("description") or "").strip().lower()
+            or "nvme" in str(row.get("description") or "").strip().lower()
+        ]
+        if len(nvme_matches) == 1:
+            return nvme_matches[0]
+        if nvme_matches:
+            candidates = nvme_matches
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _root_dataset_row(
+    dataset_lookup: dict[str, list[dict[str, Any]]],
+    pool_name: str,
+) -> dict[str, Any] | None:
+    for row in dataset_lookup.get(pool_name) or []:
+        if str(row.get("name") or "").strip() == pool_name:
+            return row
+    return None
+
+
 def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any] | None:
     if not _NESTED_GUEST_HOST:
         return None
@@ -896,6 +1585,7 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
         return None
 
     role_nodes: list[dict[str, Any]] = []
+    role_records: list[dict[str, Any]] = []
     dataset_roles: dict[str, list[dict[str, Any]]] = {}
     total_bytes = 0
     used_bytes = 0
@@ -964,6 +1654,18 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
         role_nodes.append(node)
         if dataset_name:
             dataset_roles.setdefault(dataset_name, []).append(node)
+        role_records.append(
+            {
+                "name": label,
+                "detail": detail,
+                "local_device": local_device,
+                "parent_detail": parent_detail,
+                "dataset_name": dataset_name,
+                "total_bytes": total,
+                "used_bytes": used,
+                "smart": smart,
+            }
+        )
 
     if not role_nodes:
         return None
@@ -981,7 +1683,7 @@ def _build_guest_overlay_nodes(storage_payload: dict[str, Any]) -> dict[str, Any
         total_bytes=total_bytes or None,
         used_bytes=used_bytes or None,
     )
-    return {"guest_node": guest_node, "dataset_roles": dataset_roles}
+    return {"guest_node": guest_node, "dataset_roles": dataset_roles, "roles": role_records}
 
 
 def _build_thunderbolt_overlay(thunderbolt_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1085,9 +1787,15 @@ def _build_pool_nodes(
         if not pool_name:
             continue
 
-        used = _to_int(row.get("allocated_bytes"))
-        total = _to_int(row.get("size_bytes"))
+        root_dataset = _root_dataset_row(dataset_lookup, pool_name)
+        used = _to_int(root_dataset.get("used_bytes")) if isinstance(root_dataset, dict) else None
+        total = _dataset_total_bytes(root_dataset)
+        if total is None:
+            total = _to_int(row.get("size_bytes"))
+        if used is None:
+            used = _to_int(row.get("allocated_bytes"))
         members = member_lookup.get(pool_name) or []
+        member_count = sum(1 for member in members if isinstance(member, dict))
         member_nodes: list[dict[str, Any]] = []
         for member in members:
             if not isinstance(member, dict):
@@ -1100,7 +1808,11 @@ def _build_pool_nodes(
             else:
                 disk = None
             member_size = _to_int(part.get("size")) if part else None
-            member_used = _pool_member_used_bytes(row, member_size)
+            member_used = _pool_member_used_bytes(
+                row,
+                member_size,
+                member_count=member_count,
+            )
             disk_path = str(disk.get("path") or "").strip() if isinstance(disk, dict) else ""
             member_nodes.append(
                 _node(
@@ -1188,10 +1900,118 @@ def _build_pool_nodes(
     return pool_nodes
 
 
+def _build_standalone_logical_nodes(
+    host: str,
+    top_disks: list[dict[str, Any]],
+    *,
+    pool_rows: dict[str, dict[str, Any]],
+    member_lookup: dict[str, list[dict[str, Any]]],
+    partition_pools: dict[str, list[str]],
+    mount_by_source: dict[str, dict[str, Any]],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
+    guest_assignment_lookup: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    logical_nodes: list[dict[str, Any]] = []
+
+    for disk in top_disks:
+        if not isinstance(disk, dict):
+            continue
+        disk_path = str(disk.get("path") or "").strip()
+        if guest_assignment_lookup.get(disk_path):
+            continue
+        disk_name = str(disk.get("name") or disk_path or "disk").strip() or "disk"
+        disk_model = str(disk.get("model") or "").strip()
+        disk_transport = str(disk.get("tran") or "").strip()
+        children = [child for child in (disk.get("children") or []) if isinstance(child, dict)]
+        candidates = children if children else [disk]
+
+        for node in candidates:
+            path = str(node.get("path") or "").strip()
+            if not path or guest_assignment_lookup.get(path):
+                continue
+            if node is not disk and (partition_pools.get(path) or []):
+                continue
+            fstype = str(node.get("fstype") or "").strip().lower()
+            if not _is_data_filesystem(fstype):
+                continue
+
+            mount = mount_by_source.get(path) or {}
+            probe = filesystem_probe_by_path.get(path) or {}
+            mount_target = str(node.get("mountpoint") or mount.get("target") or "").strip()
+            if node is disk:
+                used = _to_int(mount.get("used"))
+                if used is None:
+                    used = _to_int(probe.get("used_bytes"))
+            else:
+                used = _partition_used_bytes(
+                    node,
+                    pool_rows=pool_rows,
+                    member_lookup=member_lookup,
+                    partition_pools=partition_pools,
+                    mount_by_source=mount_by_source,
+                    filesystem_probe_by_path=filesystem_probe_by_path,
+                )
+            total = _to_int(node.get("size"))
+            if not _should_surface_standalone_logical(
+                total_bytes=total,
+                used_bytes=used,
+                mount_target=mount_target,
+            ):
+                continue
+
+            part_label = _meaningful_part_label(node.get("partlabel"))
+            label = _standalone_volume_label(
+                node,
+                mount_target=mount_target,
+                probe=probe,
+            )
+            subtitle_bits = [f"{fstype.upper()} filesystem"]
+            if mount_target:
+                subtitle_bits.append(mount_target)
+            elif disk_model:
+                subtitle_bits.append(disk_model)
+
+            logical_nodes.append(
+                _node(
+                    f"{host}:logical-fs:{path}",
+                    "volume",
+                    label,
+                    subtitle=" · ".join(bit for bit in subtitle_bits if bit),
+                    status="warn" if used is None else "ok",
+                    note=_standalone_logical_note(
+                        mount_target=mount_target,
+                        probe=probe,
+                        used_bytes=used,
+                    ),
+                    group="Logical systems",
+                    facts=_non_null_facts(
+                        _fact("Filesystem", fstype),
+                        _fact("Mount", mount_target),
+                        _fact("Path", path),
+                        _fact("Volume label", probe.get("volume_label")),
+                        _fact("UUID", node.get("uuid")),
+                        _fact("Part label", part_label),
+                        _fact("Backing drive", disk_name),
+                        _fact("Drive model", disk_model),
+                        _fact("Transport", disk_transport),
+                        _fact(
+                            "Source",
+                            "Mounted filesystem" if mount_target else _probe_strategy_label(probe),
+                        ),
+                    ),
+                    total_bytes=total,
+                    used_bytes=used,
+                )
+            )
+
+    return logical_nodes
+
+
 def _partition_used_bytes(
     part: dict[str, Any],
     *,
     pool_rows: dict[str, dict[str, Any]],
+    member_lookup: dict[str, list[dict[str, Any]]],
     partition_pools: dict[str, list[str]],
     mount_by_source: dict[str, dict[str, Any]],
     filesystem_probe_by_path: dict[str, dict[str, Any]],
@@ -1209,9 +2029,165 @@ def _partition_used_bytes(
     pools = partition_pools.get(path) or []
     if len(pools) == 1:
         size = _to_int(part.get("size"))
-        pool_row = pool_rows.get(pools[0]) or {}
-        return _pool_member_used_bytes(pool_row, size)
+        pool_name = pools[0]
+        pool_row = pool_rows.get(pool_name) or {}
+        member_count = sum(
+            1 for member in member_lookup.get(pool_name) or [] if isinstance(member, dict)
+        )
+        return _pool_member_used_bytes(
+            pool_row,
+            size,
+            member_count=member_count or None,
+        )
     return None
+
+
+def _build_nested_passthrough_nodes(
+    parent_host: str,
+    snapshot: dict[str, Any],
+    guest_overlay: dict[str, Any] | None,
+    *,
+    top_disks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not _NESTED_GUEST_PARENT or parent_host != _NESTED_GUEST_PARENT:
+        return {"drive_nodes": [], "logical_nodes": [], "guest_assigned_bytes": 0}
+    if not isinstance(guest_overlay, dict):
+        return {"drive_nodes": [], "logical_nodes": [], "guest_assigned_bytes": 0}
+
+    role_records = guest_overlay.get("roles")
+    if not isinstance(role_records, list):
+        return {"drive_nodes": [], "logical_nodes": [], "guest_assigned_bytes": 0}
+
+    parent_vmids = {
+        str(parent_detail.get("vmid") or "").strip()
+        for role in role_records
+        if isinstance(role, dict)
+        for parent_detail in [role.get("parent_detail")]
+        if isinstance(parent_detail, dict)
+        and str(parent_detail.get("host") or "").strip() == parent_host
+        and str(parent_detail.get("vmid") or "").strip()
+    }
+    parent_vmid = next(iter(parent_vmids)) if len(parent_vmids) == 1 else ""
+    hostpci_assignments = _hostpci_assignments(snapshot)
+    existing_serials = {
+        str(disk.get("serial") or "").strip().upper()
+        for disk in top_disks
+        if isinstance(disk, dict) and str(disk.get("serial") or "").strip()
+    }
+
+    drive_nodes: list[dict[str, Any]] = []
+    logical_nodes: list[dict[str, Any]] = []
+    guest_assigned_bytes = 0
+
+    for role in role_records:
+        if not isinstance(role, dict):
+            continue
+        detail = role.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        source_host = str(detail.get("source_host") or "").strip()
+        if not source_host or source_host != _NESTED_GUEST_HOST:
+            continue
+        parent_detail = role.get("parent_detail")
+        if isinstance(parent_detail, dict) and parent_detail:
+            continue
+
+        local_device = role.get("local_device")
+        if not isinstance(local_device, dict):
+            continue
+        local_model = str(local_device.get("model") or "").strip()
+        if not local_model or "QEMU" in local_model.upper():
+            continue
+
+        serial = str(local_device.get("serial") or "").strip()
+        if serial and serial.upper() in existing_serials:
+            continue
+
+        total = _to_int(role.get("total_bytes"))
+        used = _to_int(role.get("used_bytes"))
+        mount_path = str(detail.get("mount_path") or "").strip()
+        role_name = str(role.get("name") or "storage").strip() or "storage"
+        mount_leaf = _mount_leaf(mount_path)
+        logical_label = mount_leaf or role_name
+        physical_label = f"{source_host}-{logical_label}"
+        raw_transport = _local_device_transport(local_device)
+        transport_label = _transport_label(raw_transport)
+        rotational = _local_device_rotational(local_device, transport=raw_transport)
+        assignment = _match_nested_hostpci_assignment(
+            hostpci_assignments,
+            local_device,
+            vmid=parent_vmid,
+        )
+        assigned_to = ""
+        if parent_vmid:
+            assigned_to = f"VM {parent_vmid} ({source_host})"
+        elif source_host:
+            assigned_to = source_host
+
+        smart = role.get("smart") if isinstance(role.get("smart"), dict) else None
+        usage_note = (
+            f"Whole-controller passthrough. Usage is measured from {source_host} at refresh time."
+        )
+        transport_bits = [bit for bit in [transport_label, local_model] if bit]
+
+        drive_nodes.append(
+            _node(
+                f"{parent_host}:drive:nested:{source_host}:{logical_label}",
+                "drive",
+                physical_label,
+                subtitle=" · ".join(transport_bits),
+                status="info" if used is not None else "warn",
+                note=usage_note,
+                group="Physical drives",
+                facts=_non_null_facts(
+                    _fact("Model", local_model),
+                    _fact("Serial", serial),
+                    _fact("Transport", transport_label),
+                    _fact("Rotational", rotational),
+                    _fact("Assigned to", assigned_to),
+                    _fact("Assignment", "PCIe / whole-controller passthrough"),
+                    _fact("Guest host", source_host),
+                    _fact("Guest path", local_device.get("path")),
+                    _fact("Parent PCI", assignment.get("pci_base") if assignment else ""),
+                    _fact("Parent slot", assignment.get("slot") if assignment else ""),
+                    _fact("PCI device", assignment.get("description") if assignment else ""),
+                ),
+                smart=smart,
+                total_bytes=total,
+                used_bytes=used,
+            )
+        )
+
+        logical_nodes.append(
+            _node(
+                f"{parent_host}:logical:nested:{source_host}:{logical_label}",
+                "volume",
+                logical_label,
+                subtitle=f"Nested guest filesystem · {source_host}",
+                status="ok" if used is not None else "warn",
+                note=usage_note,
+                group="Logical systems",
+                facts=_non_null_facts(
+                    _fact("Mount", mount_path),
+                    _fact("Assigned to", assigned_to),
+                    _fact("Model", local_model),
+                    _fact("Serial", serial),
+                    _fact("Transport", transport_label),
+                    _fact("Guest path", local_device.get("path")),
+                    _fact("Parent PCI", assignment.get("pci_base") if assignment else ""),
+                    _fact("Source", f"Measured from {source_host}"),
+                ),
+                total_bytes=total,
+                used_bytes=used,
+            )
+        )
+        guest_assigned_bytes += total or 0
+
+    return {
+        "drive_nodes": drive_nodes,
+        "logical_nodes": logical_nodes,
+        "guest_assigned_bytes": guest_assigned_bytes,
+    }
 
 
 def _build_drive_nodes(
@@ -1220,10 +2196,12 @@ def _build_drive_nodes(
     *,
     by_path: dict[str, dict[str, Any]],
     pool_rows: dict[str, dict[str, Any]],
+    member_lookup: dict[str, list[dict[str, Any]]],
     partition_pools: dict[str, list[str]],
     mount_by_source: dict[str, dict[str, Any]],
     filesystem_probe_by_path: dict[str, dict[str, Any]],
     guest_assignment_lookup: dict[str, list[dict[str, Any]]],
+    thunderbolt_pools: dict[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, int | bool]]:
     drive_nodes: list[dict[str, Any]] = []
     rollup = {
@@ -1255,6 +2233,7 @@ def _build_drive_nodes(
             used = _partition_used_bytes(
                 part,
                 pool_rows=pool_rows,
+                member_lookup=member_lookup,
                 partition_pools=partition_pools,
                 mount_by_source=mount_by_source,
                 filesystem_probe_by_path=filesystem_probe_by_path,
@@ -1360,10 +2339,27 @@ def _build_drive_nodes(
             rollup["known_used_bytes"] += used
 
         transport = str(disk.get("tran") or "").strip()
+        disk_pool_names = list(partition_pools.get(disk_path) or [])
+        for part in children:
+            if not isinstance(part, dict):
+                continue
+            part_path = str(part.get("path") or "").strip()
+            for pool_name in partition_pools.get(part_path) or []:
+                if pool_name not in disk_pool_names:
+                    disk_pool_names.append(pool_name)
+        transport_extras: list[str] = []
+        for pool_name in disk_pool_names:
+            transport_extras.extend(
+                _thunderbolt_connection_tags(
+                    thunderbolt_pools.get(pool_name),
+                    raw_transport=transport,
+                )
+            )
+        transport_label = _transport_label(transport, *transport_extras)
         subtitle_bits = [
             bit
             for bit in [
-                transport.upper() if transport else "",
+                transport_label,
                 str(disk.get("model") or "").strip(),
             ]
             if bit
@@ -1373,7 +2369,7 @@ def _build_drive_nodes(
             _fact("Model", disk.get("model")),
             _fact("Serial", disk.get("serial")),
             _fact("Vendor", disk.get("vendor")),
-            _fact("Transport", transport),
+            _fact("Transport", transport_label),
             _fact("Rotational", "yes" if _to_int(disk.get("rota")) == 1 else "no"),
         )
         facts.extend(_guest_assignment_facts(disk_assignments))
@@ -1418,6 +2414,7 @@ def _build_host_node(
     *,
     guest_overlay: dict[str, Any] | None,
     thunderbolt_pools: dict[str, dict[str, Any]],
+    layout_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not snapshot_result.get("ok"):
         return _node(
@@ -1464,59 +2461,110 @@ def _build_host_node(
         thunderbolt_pools=thunderbolt_pools,
         dataset_roles=dataset_roles,
     )
-    drive_nodes, drive_rollup = _build_drive_nodes(
+    standalone_logical_nodes = _build_standalone_logical_nodes(
         host,
         top_disks,
-        by_path=by_path,
         pool_rows=pool_rows,
+        member_lookup=member_lookup,
         partition_pools=partition_pools,
         mount_by_source=mount_by_source,
         filesystem_probe_by_path=filesystem_probe_by_path,
         guest_assignment_lookup=guest_assignment_lookup,
     )
+    logical_nodes = pool_nodes + standalone_logical_nodes
+    drive_nodes, drive_rollup = _build_drive_nodes(
+        host,
+        top_disks,
+        by_path=by_path,
+        pool_rows=pool_rows,
+        member_lookup=member_lookup,
+        partition_pools=partition_pools,
+        mount_by_source=mount_by_source,
+        filesystem_probe_by_path=filesystem_probe_by_path,
+        guest_assignment_lookup=guest_assignment_lookup,
+        thunderbolt_pools=thunderbolt_pools,
+    )
+    nested_passthrough = _build_nested_passthrough_nodes(
+        host,
+        snapshot,
+        guest_overlay,
+        top_disks=top_disks,
+    )
+    if nested_passthrough.get("drive_nodes"):
+        drive_nodes.extend(
+            node for node in nested_passthrough.get("drive_nodes") or [] if isinstance(node, dict)
+        )
+    if nested_passthrough.get("logical_nodes"):
+        logical_nodes.extend(
+            node for node in nested_passthrough.get("logical_nodes") or [] if isinstance(node, dict)
+        )
 
-    children = drive_nodes + pool_nodes
+    children = drive_nodes + logical_nodes
     if _NESTED_GUEST_PARENT and host == _NESTED_GUEST_PARENT and isinstance(guest_overlay, dict):
         guest_node = guest_overlay.get("guest_node")
         if isinstance(guest_node, dict):
             children.append(guest_node)
 
+    installed_total = int(sum(node.get("total_bytes") or 0 for node in drive_nodes)) or None
+    known_total = int(sum(node.get("total_bytes") or 0 for node in logical_nodes)) or None
+    known_used = (
+        int(
+            sum(
+                node.get("used_bytes") or 0
+                for node in logical_nodes
+                if node.get("used_bytes") is not None
+            )
+        )
+        or None
+    )
+    guest_assigned_total = int(drive_rollup.get("guest_assigned_bytes") or 0) + int(
+        nested_passthrough.get("guest_assigned_bytes") or 0
+    )
+    guest_assigned_unknown = int(drive_rollup.get("guest_assigned_unknown_bytes") or 0)
     total = None
     used = None
     usage_text = ""
-    if drive_nodes:
-        total = int(sum(node.get("total_bytes") or 0 for node in drive_nodes)) or None
-        if drive_rollup.get("guest_assigned_unknown_bytes"):
+    if logical_nodes:
+        total = known_total
+        if guest_assigned_unknown:
+            used = None
+            usage_text = _partial_usage_text(
+                (known_total or 0) + guest_assigned_unknown or None,
+                known_used_bytes=known_used,
+                guest_assigned_bytes=guest_assigned_unknown or None,
+            )
+            total = ((known_total or 0) + guest_assigned_unknown) or None
+        else:
+            used = known_used
+    elif drive_nodes:
+        total = installed_total
+        if guest_assigned_unknown:
             used = None
             usage_text = _partial_usage_text(
                 total,
                 known_used_bytes=drive_rollup.get("known_used_bytes") or None,
-                guest_assigned_bytes=drive_rollup.get("guest_assigned_unknown_bytes") or None,
+                guest_assigned_bytes=guest_assigned_unknown or None,
             )
         elif any(node.get("used_bytes") is not None for node in drive_nodes):
-            used = int(sum(node.get("used_bytes") or 0 for node in drive_nodes))
-    elif pool_nodes:
-        total = int(sum(node.get("total_bytes") or 0 for node in pool_nodes)) or None
-        used = int(sum(node.get("used_bytes") or 0 for node in pool_nodes)) or None
+            used = int(sum(node.get("used_bytes") or 0 for node in drive_nodes)) or None
 
     subtitle_bits = []
     if drive_nodes:
         subtitle_bits.append(
             f"{len(drive_nodes)} physical drive{'s' if len(drive_nodes) != 1 else ''}"
         )
-    if pool_nodes:
+    if logical_nodes:
         subtitle_bits.append(
-            f"{len(pool_nodes)} logical system{'s' if len(pool_nodes) != 1 else ''}"
+            f"{len(logical_nodes)} logical system{'s' if len(logical_nodes) != 1 else ''}"
         )
 
     note = "Refreshes only on page open and manual refresh."
     if _NESTED_GUEST_PARENT and host == _NESTED_GUEST_PARENT:
         note = "Host view combines a live SSH storage snapshot with the existing AI Control overlay for nested guest context."
-    if drive_rollup.get("guest_assigned_unknown_bytes"):
+    if guest_assigned_unknown:
         note = f"{note} One or more drives are assigned directly to a guest, so usage on some of that capacity is still partial here."
 
     facts = [{"label": "Source", "value": "Live SSH snapshot"}]
-    guest_assigned_total = drive_rollup.get("guest_assigned_bytes") or 0
     if guest_assigned_total:
         facts.append({"label": "Guest-assigned", "value": _format_bytes(int(guest_assigned_total))})
 
@@ -1533,10 +2581,14 @@ def _build_host_node(
         used_bytes=used,
         usage_text=usage_text,
         meta={
+            "installed_total_bytes": installed_total,
+            "known_total_bytes": known_total,
             "guest_assigned_bytes": int(guest_assigned_total) or None,
-            "guest_assigned_unknown_bytes": drive_rollup.get("guest_assigned_unknown_bytes")
-            or None,
-            "known_used_bytes": drive_rollup.get("known_used_bytes") or None,
+            "guest_assigned_unknown_bytes": guest_assigned_unknown or None,
+            "known_used_bytes": known_used,
+            "layout_hints": copy.deepcopy(layout_hints)
+            if isinstance(layout_hints, dict) and layout_hints
+            else None,
         },
     )
 
@@ -1548,19 +2600,44 @@ def _build_topology(
 ) -> dict[str, Any]:
     guest_overlay = _build_guest_overlay_nodes(storage_payload or {})
     thunderbolt_pools = _build_thunderbolt_overlay(thunderbolt_payload or {})
+    layout_hints = _layout_hints_payload()
     host_nodes = [
         _build_host_node(
             snapshot_result.get("host") or "host",
             snapshot_result,
             guest_overlay=guest_overlay,
             thunderbolt_pools=thunderbolt_pools,
+            layout_hints=_layout_hints_for_host(
+                layout_hints,
+                str(snapshot_result.get("host") or "host"),
+            ),
         )
         for snapshot_result in inventories
     ]
+    _merge_inventory_memory(host_nodes)
 
     total = None
     used = None
     usage_text = ""
+    installed_total = (
+        int(
+            sum(
+                node.get("installed_total_bytes") or node.get("total_bytes") or 0
+                for node in host_nodes
+            )
+        )
+        or None
+    )
+    known_total = (
+        int(
+            sum(
+                node.get("known_total_bytes") or node.get("total_bytes") or 0 for node in host_nodes
+            )
+        )
+        or None
+    )
+    guest_assigned_unknown_total = None
+    known_used_total = None
     if host_nodes and any(node.get("total_bytes") is not None for node in host_nodes):
         total = int(sum(node.get("total_bytes") or 0 for node in host_nodes)) or None
         guest_assigned_unknown_total = (
@@ -1606,6 +2683,12 @@ def _build_topology(
         total_bytes=total,
         used_bytes=used,
         usage_text=usage_text,
+        meta={
+            "installed_total_bytes": installed_total,
+            "known_total_bytes": known_total,
+            "known_used_bytes": known_used_total,
+            "guest_assigned_unknown_bytes": guest_assigned_unknown_total,
+        },
     )
     return root
 
@@ -1653,6 +2736,19 @@ async def disks_topology() -> dict[str, Any]:
             },
         },
     }
+
+
+@router.post("/memory/forget")
+async def disks_memory_forget(
+    host: str = Query(..., description="Host label"),
+    node_id: str = Query(..., description="Cached node id"),
+) -> dict[str, Any]:
+    clean_host = _safe_host(host)
+    clean_node_id = _safe_node_id(node_id)
+    removed = await asyncio.to_thread(_inventory_memory_forget, clean_host, clean_node_id)
+    if not removed:
+        raise HTTPException(404, "cached inventory item not found")
+    return {"ok": True, "host": clean_host, "node_id": clean_node_id}
 
 
 @router.get("/smart")
