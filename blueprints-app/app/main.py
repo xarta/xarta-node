@@ -45,6 +45,7 @@ from .routes_certs import router as certs_router
 from .routes_crawl4ai import router as crawl4ai_router
 from .routes_dashboard_auth import router as dashboard_auth_router
 from .routes_disks import router as disks_router
+from .routes_disks import run_disks_offline_browse_reaper
 from .routes_doc_groups import router as doc_groups_router
 from .routes_doc_images import router as doc_images_router
 from .routes_dockge_stacks import router as dockge_stacks_router
@@ -137,6 +138,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     memory_monitor_task: asyncio.Task | None = None
     terminal_reaper_task: asyncio.Task | None = None
     alarm_scheduler_task: asyncio.Task | None = None
+    disks_offline_browse_reaper_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -178,6 +180,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Sweep terminal child processes that survive websocket disconnect paths.
     terminal_reaper_task = asyncio.create_task(run_terminal_process_reaper())
 
+    # Clean up stale offline VM disk browse sessions after crashes/tab loss.
+    disks_offline_browse_reaper_task = asyncio.create_task(run_disks_offline_browse_reaper())
+
     # Server-side alarms publish browser SSE ring events when due.
     alarm_scheduler_task = asyncio.create_task(run_alarm_scheduler())
 
@@ -196,6 +201,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(seeded_vlans_task, "enqueue_seeded_vlans")
     await _cancel_background_task(memory_monitor_task, "memory_monitor")
     await _cancel_background_task(terminal_reaper_task, "terminal_process_reaper")
+    await _cancel_background_task(disks_offline_browse_reaper_task, "disks_offline_browse_reaper")
     await _cancel_background_task(alarm_scheduler_task, "alarm_scheduler")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
