@@ -21,10 +21,18 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from .ssh import SshKeyMissing, resolve_env_key
 
 router = APIRouter(prefix="/disks", tags=["disks"])
+
+
+class DisksFilesystemTreeBody(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    root_path: str = Field(min_length=1, max_length=2000)
+    path: str | None = Field(default=None, max_length=4000)
+    limit: int = Field(default=400, ge=1, le=1000)
 
 
 def _env_list(name: str, fallback: str = "") -> tuple[str, ...]:
@@ -42,6 +50,13 @@ _DISK_HOSTS = _env_list("DISKS_HOSTS")
 _SMART_HOSTS = set(_env_list("DISKS_SMART_HOSTS")) or set(_DISK_HOSTS)
 _NESTED_GUEST_HOST = os.environ.get("DISKS_NESTED_GUEST_HOST", "").strip()
 _NESTED_GUEST_PARENT = os.environ.get("DISKS_NESTED_GUEST_PARENT", "").strip()
+_BROWSE_HOSTS = frozenset(
+    {
+        host
+        for host in (*_DISK_HOSTS, *_SMART_HOSTS, _NESTED_GUEST_HOST, _NESTED_GUEST_PARENT)
+        if host
+    }
+)
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=4.0)
 _SSH_CONNECT_TIMEOUT = int(os.environ.get("DISKS_SSH_CONNECT_TIMEOUT_SECONDS", "5"))
 _SSH_INVENTORY_TIMEOUT = int(os.environ.get("DISKS_SSH_INVENTORY_TIMEOUT_SECONDS", "18"))
@@ -691,6 +706,203 @@ _REMOTE_NESTED_GUEST_FS_SCRIPT = textwrap.dedent(
     """
 ).strip()
 
+_REMOTE_FILESYSTEM_TREE_SCRIPT = textwrap.dedent(
+    """
+    import datetime as dt
+    import json
+    import os
+    from pathlib import Path
+    import sys
+
+    ROOT_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+    REL_ARG = (sys.argv[2] if len(sys.argv) > 2 else "").strip()
+    LIMIT_ARG = (sys.argv[3] if len(sys.argv) > 3 else "").strip()
+
+
+    def fail(message, code=1):
+        print(json.dumps({"ok": False, "error": message}))
+        raise SystemExit(code)
+
+
+    def normalize_relative(path):
+        text = str(path or "").strip().replace("\\\\", "/")
+        if not text or text == ".":
+            return "."
+        if text.startswith("/"):
+            fail("Path must be relative to the filesystem root")
+        parts = []
+        for part in text.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                fail("Path escapes filesystem root")
+            parts.append(part)
+        return "/".join(parts) if parts else "."
+
+
+    def within_root(candidate, root):
+        try:
+            candidate.relative_to(root)
+            return True
+        except Exception:
+            return False
+
+
+    def rel_path(root, target):
+        if target == root:
+            return "."
+        return target.relative_to(root).as_posix()
+
+
+    def breadcrumbs(relative_path):
+        items = [{"label": "root", "path": "."}]
+        if relative_path == ".":
+            return items
+        running = []
+        for part in Path(relative_path).parts:
+            running.append(part)
+            items.append({"label": part, "path": "/".join(running)})
+        return items
+
+
+    if not ROOT_ARG.startswith("/"):
+        fail("Filesystem root must be an absolute path")
+
+    try:
+        limit = int(LIMIT_ARG)
+    except Exception:
+        limit = 400
+    limit = max(1, min(limit, 1000))
+
+    root_input = ROOT_ARG.rstrip("/") or "/"
+    root = Path(root_input).resolve()
+    if not root.exists():
+        fail(f"Filesystem root does not exist: {ROOT_ARG}")
+    if not root.is_dir():
+        fail(f"Filesystem root is not a directory: {ROOT_ARG}")
+    if not os.path.ismount(root):
+        fail(f"Filesystem root is not a mounted path: {ROOT_ARG}")
+
+    relative_path = normalize_relative(REL_ARG)
+    current = root if relative_path == "." else (root / relative_path).resolve()
+    if not within_root(current, root):
+        fail("Path escapes filesystem root")
+    if not current.exists():
+        fail(f"Folder does not exist: {relative_path}")
+    if not current.is_dir():
+        fail(f"Not a directory: {relative_path}")
+
+    entries = []
+    total_entries = 0
+    with os.scandir(current) as iterator:
+        for entry in iterator:
+            total_entries += 1
+            if len(entries) >= limit:
+                continue
+            lexical_path = current / entry.name
+            entry_rel = rel_path(root, lexical_path)
+            try:
+                is_symlink = entry.is_symlink()
+            except OSError:
+                is_symlink = False
+            try:
+                entry_type = "other"
+                browseable = False
+                symlink_target = ""
+                stat_obj = None
+                if is_symlink:
+                    resolved = lexical_path.resolve()
+                    if within_root(resolved, root):
+                        symlink_target = rel_path(root, resolved)
+                        if resolved.is_dir():
+                            entry_type = "folder"
+                            browseable = True
+                        elif resolved.is_file():
+                            entry_type = "file"
+                        else:
+                            entry_type = "link"
+                    else:
+                        entry_type = "link"
+                    stat_obj = entry.stat(follow_symlinks=True)
+                elif entry.is_dir(follow_symlinks=False):
+                    entry_type = "folder"
+                    browseable = True
+                    stat_obj = entry.stat(follow_symlinks=False)
+                elif entry.is_file(follow_symlinks=False):
+                    entry_type = "file"
+                    stat_obj = entry.stat(follow_symlinks=False)
+                else:
+                    stat_obj = entry.stat(follow_symlinks=False)
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "path": entry_rel,
+                        "type": entry_type,
+                        "browseable": browseable,
+                        "symlink": is_symlink,
+                        "symlink_target": symlink_target,
+                        "size_bytes": (
+                            int(stat_obj.st_size) if stat_obj and entry_type == "file" else None
+                        ),
+                        "modified_at": (
+                            dt.datetime.fromtimestamp(
+                                stat_obj.st_mtime,
+                                dt.timezone.utc,
+                            ).isoformat()
+                            if stat_obj
+                            else ""
+                        ),
+                    }
+                )
+            except OSError as exc:
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "path": entry_rel,
+                        "type": "other",
+                        "browseable": False,
+                        "symlink": is_symlink,
+                        "symlink_target": "",
+                        "size_bytes": None,
+                        "modified_at": "",
+                        "error": str(exc),
+                    }
+                )
+
+    entries.sort(
+        key=lambda item: (
+            0
+            if item["type"] == "folder"
+            else 1
+            if item["type"] == "file"
+            else 2,
+            item["name"].lower(),
+        )
+    )
+    parent_path = None
+    if relative_path != ".":
+        parent = Path(relative_path).parent.as_posix()
+        parent_path = "." if parent in {"", "."} else parent
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "root_path": root_input,
+                "current_path": relative_path,
+                "current_absolute_path": str(current),
+                "parent_path": parent_path,
+                "breadcrumbs": breadcrumbs(relative_path),
+                "entries": entries,
+                "entry_count": total_entries,
+                "returned_count": len(entries),
+                "truncated": total_entries > len(entries),
+            }
+        )
+    )
+    """
+).strip()
+
 
 def _safe_host(host: str) -> str:
     value = str(host or "").strip()
@@ -966,6 +1178,77 @@ def _run_nested_guest_filesystem_snapshot(host: str) -> dict[str, Any]:
 
 async def _nested_guest_filesystem_host(host: str) -> dict[str, Any]:
     return await asyncio.to_thread(_run_nested_guest_filesystem_snapshot, host)
+
+
+def _run_filesystem_tree_snapshot(
+    host: str,
+    *,
+    root_path: str,
+    relative_path: str,
+    limit: int,
+) -> dict[str, Any]:
+    command = _ssh_base_command(host) + ["python3", "-", root_path, relative_path, str(limit)]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_FILESYSTEM_TREE_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=_SSH_INVENTORY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"filesystem tree probe timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            if payload.get("ok"):
+                return {"ok": True, "host": host, "error": "", "data": payload}
+            detail = str(payload.get("error") or "").strip()
+            return {
+                "ok": False,
+                "host": host,
+                "error": detail or stderr or f"ssh exited {proc.returncode}",
+                "data": None,
+            }
+
+    if proc.returncode != 0:
+        detail = stderr or stdout or f"ssh exited {proc.returncode}"
+        return {"ok": False, "host": host, "error": detail[:500], "data": None}
+    return {
+        "ok": False,
+        "host": host,
+        "error": "filesystem tree probe returned no JSON payload",
+        "data": None,
+    }
+
+
+async def _filesystem_tree_host(
+    host: str,
+    *,
+    root_path: str,
+    relative_path: str,
+    limit: int,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _run_filesystem_tree_snapshot,
+        host,
+        root_path=root_path,
+        relative_path=relative_path,
+        limit=limit,
+    )
 
 
 def _run_smart_snapshot(host: str, device_path: str) -> dict[str, Any]:
@@ -1596,6 +1879,83 @@ def _mount_leaf(path: Any) -> str:
     return text.rsplit("/", 1)[-1].strip()
 
 
+def _browseable_mount_path(path: Any) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    if text.lower() in {"-", "none", "legacy"}:
+        return ""
+    if not text.startswith("/"):
+        return ""
+    clean = re.sub(r"/{2,}", "/", text)
+    clean = clean.rstrip("/") or "/"
+    return clean if clean.startswith("/") else ""
+
+
+def _filesystem_browser_meta(
+    *,
+    host: str,
+    root_path: Any,
+    filesystem: Any = "",
+    source_path: Any = "",
+    dataset_name: Any = "",
+) -> dict[str, Any] | None:
+    clean_root = _browseable_mount_path(root_path)
+    if not clean_root:
+        return None
+    try:
+        clean_host = _safe_host(host)
+    except HTTPException:
+        return None
+    filesystem_name = str(filesystem or "").strip().lower()
+    if filesystem_name and filesystem_name != "zfs" and not _is_data_filesystem(filesystem_name):
+        return None
+    return {
+        "filesystem_browser": {
+            "host": clean_host,
+            "root_path": clean_root,
+            "filesystem": filesystem_name or "filesystem",
+            "source_path": str(source_path or "").strip(),
+            "dataset_name": str(dataset_name or "").strip(),
+            "download_available": False,
+        }
+    }
+
+
+def _safe_browse_host(host: str) -> str:
+    clean_host = _safe_host(host)
+    if _BROWSE_HOSTS and clean_host not in _BROWSE_HOSTS:
+        raise HTTPException(400, f"Host is not enabled for filesystem browsing: {clean_host}")
+    return clean_host
+
+
+def _normalize_browser_root_path(path: str) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    if not text.startswith("/"):
+        raise HTTPException(400, "Filesystem root must be an absolute path")
+    clean = re.sub(r"/{2,}", "/", text)
+    clean = clean.rstrip("/") or "/"
+    if not clean.startswith("/"):
+        raise HTTPException(400, "Filesystem root must be an absolute path")
+    return clean
+
+
+def _normalize_browser_relative_path(path: str | None) -> str:
+    text = str(path or "").strip().replace("\\", "/")
+    if not text or text == ".":
+        return "."
+    if text.startswith("/"):
+        raise HTTPException(400, "Path must be relative to the filesystem root")
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise HTTPException(400, "Path escapes filesystem root")
+        parts.append(part)
+    return "/".join(parts) if parts else "."
+
+
 def _needs_nested_guest_filesystem_snapshot(storage_payload: dict[str, Any] | None) -> bool:
     if not _NESTED_GUEST_HOST or not isinstance(storage_payload, dict):
         return False
@@ -1889,6 +2249,13 @@ def _build_guest_overlay_nodes(
         dataset_name = str(dataset.get("name") or "").strip()
         if dataset_name:
             facts.append({"label": "Backed by", "value": dataset_name})
+        browse_meta = _filesystem_browser_meta(
+            host=source_host,
+            root_path=filesystem_meta.get("mount_path"),
+            filesystem=filesystem_meta.get("fstype"),
+            source_path=filesystem_meta.get("path") or local_path,
+            dataset_name=dataset_name,
+        )
 
         node = _node(
             f"guest:{_NESTED_GUEST_HOST}:{label}",
@@ -1901,6 +2268,7 @@ def _build_guest_overlay_nodes(
             smart=smart,
             total_bytes=total,
             used_bytes=used,
+            meta=browse_meta,
         )
         role_nodes.append(node)
         if dataset_name:
@@ -1997,6 +2365,13 @@ def _build_dataset_tree(
             )
         child_names = sorted(children_by_parent.get(name, []))
         child_nodes = [make_dataset_node(child_name) for child_name in child_names]
+        browse_meta = _filesystem_browser_meta(
+            host=host,
+            root_path=row.get("mountpoint"),
+            filesystem="zfs" if ds_type == "filesystem" else ds_type,
+            source_path=row.get("mountpoint"),
+            dataset_name=name,
+        )
         node = _node(
             f"{host}:dataset:{name}",
             "dataset" if ds_type == "filesystem" else "volume",
@@ -2008,6 +2383,7 @@ def _build_dataset_tree(
             children=child_nodes,
             total_bytes=total,
             used_bytes=used,
+            meta=browse_meta,
         )
         return node
 
@@ -2253,6 +2629,12 @@ def _build_standalone_logical_nodes(
                     ),
                     total_bytes=total,
                     used_bytes=used,
+                    meta=_filesystem_browser_meta(
+                        host=host,
+                        root_path=mount_target,
+                        filesystem=fstype,
+                        source_path=path,
+                    ),
                 )
             )
 
@@ -2442,6 +2824,12 @@ def _build_nested_passthrough_nodes(
                 ),
                 total_bytes=total,
                 used_bytes=used,
+                meta=_filesystem_browser_meta(
+                    host=source_host,
+                    root_path=filesystem_meta.get("mount_path") or mount_path,
+                    filesystem=filesystem_meta.get("fstype"),
+                    source_path=filesystem_meta.get("path") or local_device.get("path"),
+                ),
             )
         )
         guest_assigned_bytes += total or 0
@@ -3037,6 +3425,40 @@ async def disks_memory_forget(
     if not removed:
         raise HTTPException(404, "cached inventory item not found")
     return {"ok": True, "host": clean_host, "node_id": clean_node_id}
+
+
+@router.post("/filesystem/tree")
+async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]:
+    clean_host = _safe_browse_host(body.host)
+    clean_root = _normalize_browser_root_path(body.root_path)
+    clean_path = _normalize_browser_relative_path(body.path)
+    result = await _filesystem_tree_host(
+        clean_host,
+        root_path=clean_root,
+        relative_path=clean_path,
+        limit=int(body.limit),
+    )
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        payload = result["data"]
+        payload["host"] = clean_host
+        payload["root_path"] = clean_root
+        return payload
+    detail = str(result.get("error") or "Filesystem tree unavailable").strip()
+    lowered = detail.lower()
+    if "timed out" in lowered:
+        raise HTTPException(504, detail)
+    if any(
+        marker in lowered
+        for marker in (
+            "filesystem root",
+            "path escapes filesystem root",
+            "path must be relative",
+            "folder does not exist",
+            "not a directory",
+        )
+    ):
+        raise HTTPException(400, detail)
+    raise HTTPException(502, detail)
 
 
 @router.get("/smart")
