@@ -525,6 +525,11 @@ def _clean_active_browser_command_id(value: str | None = None) -> str:
     return clean or f"active-browser-{uuid.uuid4().hex}"
 
 
+def _clean_existing_active_browser_command_id(value: str | None = None) -> str:
+    raw = str(value or "").strip()
+    return "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ":", "."})[:100]
+
+
 def _clean_dev_command_mode(value: str | None) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
@@ -1925,13 +1930,36 @@ def _clean_active_browser_calendar(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_todo(raw: Any) -> dict[str, Any]:
+    todo = raw if isinstance(raw, dict) else {}
+    return {
+        "loaded": bool(todo.get("loaded")),
+        "loading": bool(todo.get("loading")),
+        "status": _clean_string(todo.get("status"), "", 40),
+        "mode": _clean_string(todo.get("mode"), "", 40),
+        "task_count": _clean_browser_page_int(todo.get("task_count"), maximum=1000),
+        "total_count": _clean_browser_page_int(todo.get("total_count"), maximum=1000),
+        "open_count": _clean_browser_page_int(todo.get("open_count"), maximum=1000),
+        "blocked_count": _clean_browser_page_int(todo.get("blocked_count"), maximum=1000),
+        "done_count": _clean_browser_page_int(todo.get("done_count"), maximum=1000),
+        "source_counts": _bounded_json(
+            todo.get("source_counts") if isinstance(todo.get("source_counts"), dict) else {},
+            2000,
+        ),
+        "selection_status": _clean_string(todo.get("selection_status"), "", 40),
+        "selection_label": _clean_string(todo.get("selection_label"), "", 120),
+        "last_write_task_id": _clean_string(todo.get("last_write_task_id"), "", 180),
+        "error": _clean_string(todo.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
         automation.get("last_command") if isinstance(automation.get("last_command"), dict) else {}
     )
     last_command = {
-        "command_id": _clean_active_browser_command_id(last_command_raw.get("command_id")),
+        "command_id": _clean_existing_active_browser_command_id(last_command_raw.get("command_id")),
         "action": _clean_active_browser_command_action(last_command_raw.get("action")),
         "modal_id": _clean_active_browser_modal_id(last_command_raw.get("modal_id")),
         "group": _clean_active_browser_group(last_command_raw.get("group")),
@@ -1982,6 +2010,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         "surfaces": {
             "diary_day": _clean_active_browser_diary_day(surfaces.get("diary_day")),
             "calendar": _clean_active_browser_calendar(surfaces.get("calendar")),
+            "todo": _clean_active_browser_todo(surfaces.get("todo")),
             "imports_dashboard": _clean_active_browser_imports_dashboard(
                 surfaces.get("imports_dashboard")
             ),
