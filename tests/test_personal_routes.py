@@ -143,6 +143,33 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE personal_time_tasks (
+            task_id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL DEFAULT 'manual-task',
+            source_ref TEXT,
+            source_hash TEXT,
+            title TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            mode TEXT NOT NULL DEFAULT 'personal',
+            priority TEXT,
+            due_at TEXT,
+            local_date TEXT,
+            timezone TEXT,
+            privacy_level TEXT NOT NULL DEFAULT 'normal',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            related_work_items_json TEXT NOT NULL DEFAULT '[]',
+            related_tasks_json TEXT NOT NULL DEFAULT '[]',
+            related_import_batches_json TEXT NOT NULL DEFAULT '[]',
+            file_refs_json TEXT NOT NULL DEFAULT '[]',
+            db_refs_json TEXT NOT NULL DEFAULT '[]',
+            event_id TEXT,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            completed_at TEXT,
+            archived_at TEXT,
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE personal_sources (
             source_id TEXT PRIMARY KEY,
             source_type TEXT NOT NULL,
@@ -743,6 +770,178 @@ def test_calendar_event_rejects_end_before_start(monkeypatch):
         assert "end time" in exc.detail
     else:
         raise AssertionError("calendar event with end before start must fail")
+
+
+def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+
+    created = asyncio.run(
+        routes_personal.create_personal_task(
+            routes_personal.PersonalTaskUpsertRequest(
+                title="Step 15 backend task",
+                body="Prove task write path",
+                mode="personal",
+                due_date="2026-06-18",
+                due_time="16:45",
+                timezone="Europe/London",
+                priority="high",
+                tags=["proof"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-create-test",
+            )
+        )
+    )
+
+    task = created["task"]
+    event = created["event"]
+    assert created["ok"] is True
+    assert task["source"]["type"] == "manual-task"
+    assert task["status"] == "open"
+    assert task["mode"] == "personal"
+    assert task["due_at"] == "2026-06-18T15:45:00Z"
+    assert event["kind"] == "task"
+    assert event["source"]["ref"] == f"personal_time_tasks:{task['task_id']}"
+    assert event["related"]["tasks"][0] == task["task_id"]
+    assert "todo" in task["tags"]
+    assert "proof" in task["tags"]
+    assert (tmp_path / task["file_refs"][0]).exists()
+    assert (tmp_path / task["file_refs"][1]).exists()
+    assert "xarta.todo.task.v1" in (tmp_path / task["file_refs"][0]).read_text(encoding="utf-8")
+
+    calendar_visible = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            kind="task",
+            limit=20,
+            offset=0,
+        )
+    )
+    assert [item["event_id"] for item in calendar_visible["items"]] == [task["event_id"]]
+
+    updated = asyncio.run(
+        routes_personal.update_personal_task(
+            task["task_id"],
+            routes_personal.PersonalTaskUpsertRequest(
+                title="Step 15 backend task updated",
+                body="Edited task body",
+                mode="work",
+                due_date="2026-06-18",
+                due_time="17:05",
+                timezone="Europe/London",
+                priority="medium",
+                related_work_items=["work:item-1"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-update-test",
+            ),
+        )
+    )
+    assert updated["task"]["title"] == "Step 15 backend task updated"
+    assert updated["task"]["mode"] == "work"
+    assert updated["task"]["related"]["work_items"] == ["work:item-1"]
+    assert updated["event"]["start_at"] == "2026-06-18T16:05:00Z"
+
+    work_list = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=20, offset=0))
+    assert [item["task_id"] for item in work_list["items"]] == [task["task_id"]]
+
+    completed = asyncio.run(
+        routes_personal.complete_personal_task(
+            task["task_id"],
+            routes_personal.PersonalTaskActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-complete-test",
+            ),
+        )
+    )
+    assert completed["task"]["status"] == "done"
+    assert completed["task"]["completed_at"]
+
+    archived = asyncio.run(
+        routes_personal.archive_personal_task(
+            task["task_id"],
+            routes_personal.PersonalTaskActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-archive-test",
+            ),
+        )
+    )
+    assert archived["task"]["status"] == "archived"
+    assert archived["task"]["archived_at"]
+    assert (
+        conn.execute("SELECT COUNT(*) AS count FROM personal_time_tasks").fetchone()["count"] == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE source_type='manual-task'"
+        ).fetchone()["count"]
+        == 1
+    )
+    assert {
+        row["action"]
+        for row in conn.execute("SELECT action FROM personal_time_audit").fetchall()
+        if row["action"].endswith("_task") or row["action"] == "create_task"
+    } == {"create_task", "update_task", "complete_task", "archive_task"}
+
+
+def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, local_date, timezone, status,
+            tags_json, related_work_items_json, provenance_state
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-reminder",
+            "hermes-minutes",
+            "reminder",
+            "Review projected reminder",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["todo", "review"]),
+            json.dumps([]),
+            "linked",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, local_date, timezone, status,
+            tags_json, related_work_items_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-work",
+            "work-management",
+            "todo",
+            "Work source task",
+            "2026-06-18",
+            "Europe/London",
+            "blocked",
+            json.dumps(["todo", "work"]),
+            json.dumps(["work:item-9"]),
+        ),
+    )
+
+    personal = asyncio.run(routes_personal.list_personal_tasks(mode="personal", limit=20, offset=0))
+    work = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=20, offset=0))
+    blocked = asyncio.run(routes_personal.list_personal_tasks(mode="blocked", limit=20, offset=0))
+
+    assert [item["task_id"] for item in personal["items"]] == ["evt-reminder"]
+    assert personal["items"][0]["source"]["authority"] == "event"
+    assert [item["task_id"] for item in work["items"]] == ["evt-work"]
+    assert [item["task_id"] for item in blocked["items"]] == ["evt-work"]
 
 
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):

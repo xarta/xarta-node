@@ -289,6 +289,40 @@ CREATE INDEX IF NOT EXISTS idx_personal_events_status
 CREATE INDEX IF NOT EXISTS idx_personal_events_privacy
     ON personal_events(privacy_level);
 
+CREATE TABLE IF NOT EXISTS personal_time_tasks (
+    task_id                       TEXT PRIMARY KEY,
+    source_type                   TEXT NOT NULL DEFAULT 'manual-task',
+    source_ref                    TEXT,
+    source_hash                   TEXT,
+    title                         TEXT NOT NULL DEFAULT '',
+    body_excerpt                  TEXT,
+    status                        TEXT NOT NULL DEFAULT 'open',
+    mode                          TEXT NOT NULL DEFAULT 'personal',
+    priority                      TEXT,
+    due_at                        TEXT,
+    local_date                    TEXT,
+    timezone                      TEXT,
+    privacy_level                 TEXT NOT NULL DEFAULT 'normal',
+    tags_json                     TEXT NOT NULL DEFAULT '[]',
+    related_work_items_json       TEXT NOT NULL DEFAULT '[]',
+    related_tasks_json            TEXT NOT NULL DEFAULT '[]',
+    related_import_batches_json   TEXT NOT NULL DEFAULT '[]',
+    file_refs_json                TEXT NOT NULL DEFAULT '[]',
+    db_refs_json                  TEXT NOT NULL DEFAULT '[]',
+    event_id                      TEXT,
+    provenance_json               TEXT NOT NULL DEFAULT '{}',
+    completed_at                  TEXT,
+    archived_at                   TEXT,
+    created_at                    TEXT DEFAULT (datetime('now')),
+    updated_at                    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_status
+    ON personal_time_tasks(status, mode);
+CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_due
+    ON personal_time_tasks(local_date, due_at);
+CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_source
+    ON personal_time_tasks(source_type, source_ref);
+
 CREATE TABLE IF NOT EXISTS personal_sources (
     source_id        TEXT PRIMARY KEY,
     source_type      TEXT NOT NULL,
