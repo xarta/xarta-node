@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -274,3 +275,106 @@ def test_personal_rehydrate_reads_file_ref(monkeypatch, tmp_path):
     assert result["rehydrated"] is True
     assert result["event"]["projection_state"] == "hot"
     assert "Rehydrated body" in result["event"]["content_projection"]
+
+
+def test_imports_dashboard_parses_interests_and_git(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    lone_wolf = tmp_path / "lone-wolf"
+    dashboard = lone_wolf / "docs" / "interests" / "HERMES-INTERESTS-INGESTION-DASHBOARD.md"
+    dashboard.parent.mkdir(parents=True)
+    dashboard.write_text(
+        """---
+source_snapshot_at: 2026-06-18T12:00:00Z
+source_digest: sha256:testdigest
+---
+
+# Hermes Interests Ingestion Dashboard
+
+Overall: **OK**
+
+- Source snapshot: `2026-06-18T12:00:00Z`
+- Source digest: `sha256:testdigest`
+- Pending review: `0`
+- Actionable backlog: `0`
+
+## Category Summary
+
+| Category | Raw | Media | Extracted | Results | Wiki pages | Completed | Source unavailable | Pending | Latest proof artifact |
+|---|---|---|---|---|---|---|---|---|---|
+| `testing` | 1 | 2 | 3 | 4 | 5 | 6 | 0 | 0 | [proof.json](../../interests/testing/results/proof.json) |
+
+## Input Health
+
+| Input | State | Note | Generated | Evidence |
+|---|---|---|---|---|
+| Backlog | OK: no_actionable_dispatch_backlog | actionable=0 | 2026-06-18T12:00:00Z | [backlog.json](../../health/backlog.json) |
+
+## Recent Completed Work
+
+| When | Category | Work type | Status | Artifact |
+|---|---|---|---|---|
+| 2026-06-18T12:00:00Z | `testing` | `wiki_update` | `completed` | [proof](../../proof.json) |
+
+## Source-Unavailable
+
+| When | Category | Work type | Artifact |
+|---|---|---|---|
+
+## Pending And Blockers
+
+No pending-review items.
+
+No actionable backlog samples.
+
+## Completion Blockers
+
+- None reported by the latest final acceptance report.
+
+## Rerun Status
+
+The dashboard generator writes only when the source digest changes.
+""",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, stdout=subprocess.PIPE)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "Initial"], check=True, stdout=subprocess.PIPE
+    )
+
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", lone_wolf)
+    monkeypatch.setattr(
+        routes_personal,
+        "DEFAULT_PERSONAL_GIT_REPOS",
+        (("test-repo", str(repo), "Test repo"),),
+    )
+
+    result = asyncio.run(routes_personal.get_imports_dashboard())
+
+    assert result["status"] == "ok"
+    assert result["interests"]["source_digest"] == "sha256:testdigest"
+    assert result["interests"]["pending_review"] == 0
+    assert result["interests"]["category_summary"][0]["Category"] == "testing"
+    assert result["proof_links"][0]["label"] == "Hermes Interests Ingestion Dashboard"
+    assert result["git_activity"]["status"] == "ok"
+    assert result["git_activity"]["watched_repos"][0]["repo_id"] == "test-repo"
+    assert result["git_activity"]["watched_repos"][0]["dirty_count"] == 0
+    assert result["git_activity"]["latest_commits"][0]["subject"] == "Initial"
+    assert result["source_digest"].startswith("sha256:")
+
+    (repo / "README.md").write_text("hello again\n", encoding="utf-8")
+    dirty = asyncio.run(routes_personal.get_imports_dashboard())
+
+    assert dirty["status"] == "needs_review"
+    assert dirty["git_activity"]["status"] == "needs_review"
+    assert dirty["git_activity"]["watched_repos"][0]["dirty_count"] == 1
+    assert dirty["git_activity"]["actionable_repos"][0]["repo_id"] == "test-repo"

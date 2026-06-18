@@ -1861,6 +1861,23 @@ def _clean_active_browser_selector_capability(item: Any) -> dict[str, Any] | Non
     }
 
 
+def _clean_active_browser_imports_dashboard(raw: Any) -> dict[str, Any]:
+    dashboard = raw if isinstance(raw, dict) else {}
+    return {
+        "loaded": bool(dashboard.get("loaded")),
+        "loading": bool(dashboard.get("loading")),
+        "status": _clean_string(dashboard.get("status"), "", 40),
+        "source_digest": _clean_string(dashboard.get("source_digest"), "", 96),
+        "interests_status": _clean_string(dashboard.get("interests_status"), "", 40),
+        "git_status": _clean_string(dashboard.get("git_status"), "", 40),
+        "watched_repo_count": _clean_browser_page_int(
+            dashboard.get("watched_repo_count"), maximum=200
+        ),
+        "blocker_count": _clean_browser_page_int(dashboard.get("blocker_count"), maximum=200),
+        "error": _clean_string(dashboard.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
@@ -1907,6 +1924,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         )
         if clean
     ][:80]
+    surfaces = automation.get("surfaces") if isinstance(automation.get("surfaces"), dict) else {}
     return {
         "current_group": _clean_active_browser_group(automation.get("current_group")),
         "current_page_id": _clean_active_browser_page_id(automation.get("current_page_id")),
@@ -1914,6 +1932,11 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         "current_menu": current_menu,
         "selector_actions": selector_actions,
         "last_command": last_command,
+        "surfaces": {
+            "imports_dashboard": _clean_active_browser_imports_dashboard(
+                surfaces.get("imports_dashboard")
+            ),
+        },
     }
 
 
