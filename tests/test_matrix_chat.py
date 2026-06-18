@@ -1,6 +1,8 @@
 import asyncio
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -4372,6 +4374,8 @@ def test_matrix_chat_media_fields_reduce_attachment_metadata():
         "info": {
             "mimetype": "image/png",
             "size": 67,
+            "w": 640,
+            "h": 480,
         },
     }
 
@@ -4384,10 +4388,90 @@ def test_matrix_chat_media_fields_reduce_attachment_metadata():
         "size": 67,
         "content_uri": "mxc://example.org/encrypted123",
         "encrypted_file": True,
+        "width": 640,
+        "height": 480,
     }
     assert "key" not in media
     assert "hashes" not in media
     assert "iv" not in media
+
+
+def _minimal_docx(text: str) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                "<w:body><w:p><w:r><w:t>" + text + "</w:t></w:r></w:p></w:body></w:document>"
+            ),
+        )
+    return output.getvalue()
+
+
+def _minimal_xlsx(values):
+    output = io.BytesIO()
+    shared = "".join(f"<si><t>{value}</t></si>" for value in values)
+    with zipfile.ZipFile(output, "w") as zf:
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            (
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                + shared
+                + "</sst>"
+            ),
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c></row></sheetData>'
+                "</worksheet>"
+            ),
+        )
+    return output.getvalue()
+
+
+def test_matrix_chat_attachment_preview_payload_handles_text_and_office_formats():
+    text_payload = {
+        "data": b"# Attachment\n\nReadable text",
+        "room_id": "!room:test.example",
+        "event_id": "$text:test.example",
+        "filename": "note.md",
+        "mimetype": "text/markdown",
+        "size": 26,
+        "msgtype": "m.file",
+    }
+    docx_payload = {
+        **text_payload,
+        "data": _minimal_docx("Docx extracted text"),
+        "event_id": "$docx:test.example",
+        "filename": "note.docx",
+        "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    xlsx_payload = {
+        **text_payload,
+        "data": _minimal_xlsx(["Header", "Value"]),
+        "event_id": "$xlsx:test.example",
+        "filename": "sheet.xlsx",
+        "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+
+    markdown_preview = matrix_chat._attachment_preview_payload(text_payload)
+    docx_preview = matrix_chat._attachment_preview_payload(docx_payload)
+    xlsx_preview = matrix_chat._attachment_preview_payload(xlsx_payload)
+
+    assert markdown_preview["preview_kind"] == "markdown"
+    assert markdown_preview["text"].startswith("# Attachment")
+    assert docx_preview["preview_kind"] == "text"
+    assert "Docx extracted text" in docx_preview["text"]
+    assert xlsx_preview["preview_kind"] == "markdown"
+    assert "Header | Value" in xlsx_preview["text"]
+    for preview in (markdown_preview, docx_preview, xlsx_preview):
+        assert preview["download"] == {"kind": "decrypted_attachment", "available": True}
+        assert "key" not in preview
+        assert "iv" not in preview
+        assert "hash" not in preview
 
 
 def test_matrix_chat_attachment_download_route_returns_plain_bytes(monkeypatch):
@@ -4423,6 +4507,38 @@ def test_matrix_chat_attachment_download_route_returns_plain_bytes(monkeypatch):
     assert "key" not in response.headers
     assert "iv" not in response.headers
     assert "hash" not in response.headers
+
+
+def test_matrix_chat_attachment_preview_route_returns_reduced_plaintext_preview(monkeypatch):
+    class FakeE2EEClient:
+        async def download_attachment_event(self, room_id, event_id):
+            return {
+                "data": b"plain preview text",
+                "room_id": room_id,
+                "event_id": event_id,
+                "content_uri": "mxc://example.org/text123",
+                "filename": "proof.txt",
+                "mimetype": "text/plain",
+                "size": 18,
+                "msgtype": "m.file",
+                "encrypted_event": True,
+                "encrypted_attachment": True,
+            }
+
+    async def fake_get_e2ee_client(*_args, **_kwargs):
+        return FakeE2EEClient()
+
+    monkeypatch.setattr(matrix_chat, "_get_e2ee_client", fake_get_e2ee_client)
+
+    response = asyncio.run(
+        matrix_chat.matrix_chat_preview_attachment("!room:test.example", "$event:test.example")
+    )
+
+    assert response["preview_kind"] == "text"
+    assert response["text"] == "plain preview text"
+    assert response["download"]["kind"] == "decrypted_attachment"
+    assert response["encrypted_event"] is True
+    assert "content_uri" not in response
 
 
 def test_matrix_chat_audio_filename_and_mimetype_are_normalized():

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import io
 import json
 import logging
 import mimetypes
@@ -22,12 +23,14 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable
 from urllib.parse import quote
+from xml.etree import ElementTree
 
 import httpx
 import websockets
@@ -95,6 +98,8 @@ _MAX_MESSAGE_LIMIT = 100
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
+_MAX_ATTACHMENT_PREVIEW_BYTES = 2 * 1024 * 1024
+_MAX_ATTACHMENT_PREVIEW_CHARS = 60_000
 _MAX_REDACTION_SCAN_LIMIT = 20_000
 _REDACTION_MAX_RETRIES = 6
 _REDACTION_RETRY_FLOOR_SECONDS = 5.0
@@ -4041,11 +4046,16 @@ def _audio_message_content(
     )
 
 
-def _attachment_response_headers(payload: dict[str, Any]) -> dict[str, str]:
+def _attachment_response_headers(
+    payload: dict[str, Any],
+    *,
+    disposition: str = "attachment",
+) -> dict[str, str]:
     filename = _safe_media_filename(str(payload.get("filename") or ""), default="attachment")
     encoded_filename = quote(filename, safe="")
+    disposition_type = "inline" if disposition == "inline" else "attachment"
     return {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+        "Content-Disposition": f"{disposition_type}; filename*=UTF-8''{encoded_filename}",
         "X-Matrix-Room-Id": str(payload.get("room_id") or ""),
         "X-Matrix-Event-Id": str(payload.get("event_id") or ""),
         "X-Matrix-Msgtype": str(payload.get("msgtype") or ""),
@@ -4053,6 +4063,253 @@ def _attachment_response_headers(payload: dict[str, Any]) -> dict[str, str]:
         "X-Matrix-Encrypted-Event": "true" if payload.get("encrypted_event") else "false",
         "X-Matrix-Encrypted-Attachment": "true" if payload.get("encrypted_attachment") else "false",
     }
+
+
+def _attachment_preview_kind(filename: str, mimetype: str, msgtype: str) -> str:
+    clean = (mimetype or "").split(";", 1)[0].strip().lower()
+    suffix = Path(filename or "").suffix.lower()
+    if clean.startswith("image/") or msgtype == "m.image":
+        return "image"
+    if clean.startswith("audio/") or msgtype == "m.audio":
+        return "audio"
+    if clean.startswith("video/") or msgtype == "m.video":
+        return "video"
+    if clean == "application/pdf" or suffix == ".pdf":
+        return "pdf"
+    if clean in {"text/markdown", "text/x-markdown"} or suffix in {".md", ".markdown"}:
+        return "markdown"
+    if clean.startswith("text/") or suffix in {".txt", ".log", ".csv", ".json", ".yaml", ".yml"}:
+        return "text"
+    if (
+        suffix == ".docx"
+        or clean == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ):
+        return "docx"
+    if (
+        suffix == ".xlsx"
+        or clean == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ):
+        return "xlsx"
+    return "unsupported"
+
+
+def _decode_attachment_text(data: bytes) -> tuple[str, str]:
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"):
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace"), "latin-1"
+
+
+def _truncate_preview_text(text: str) -> tuple[str, bool]:
+    if len(text) <= _MAX_ATTACHMENT_PREVIEW_CHARS:
+        return text, False
+    return text[:_MAX_ATTACHMENT_PREVIEW_CHARS], True
+
+
+def _zip_member_bytes(zf: zipfile.ZipFile, name: str, *, max_bytes: int = 2_000_000) -> bytes:
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        return b""
+    if info.file_size > max_bytes:
+        raise ValueError(f"zip member too large: {name}")
+    return zf.read(name)
+
+
+def _extract_docx_text(data: bytes) -> tuple[str, str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            document_xml = _zip_member_bytes(zf, "word/document.xml")
+    except (zipfile.BadZipFile, ValueError, OSError) as exc:
+        return "", f"docx_extract_failed:{type(exc).__name__}"
+    if not document_xml:
+        return "", "docx_document_xml_missing"
+    try:
+        root = ElementTree.fromstring(document_xml)
+    except ElementTree.ParseError as exc:
+        return "", f"docx_xml_parse_failed:{type(exc).__name__}"
+    paragraphs: list[str] = []
+    for paragraph in root.iter():
+        if not str(paragraph.tag).endswith("}p") and paragraph.tag != "p":
+            continue
+        text = "".join(
+            node.text or ""
+            for node in paragraph.iter()
+            if str(node.tag).endswith("}t") or node.tag == "t"
+        ).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n\n".join(paragraphs), "ok" if paragraphs else "docx_text_empty"
+
+
+def _extract_xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    data = _zip_member_bytes(zf, "xl/sharedStrings.xml")
+    if not data:
+        return []
+    root = ElementTree.fromstring(data)
+    values: list[str] = []
+    for item in root.iter():
+        if not str(item.tag).endswith("}si") and item.tag != "si":
+            continue
+        values.append(
+            "".join(
+                node.text or ""
+                for node in item.iter()
+                if str(node.tag).endswith("}t") or node.tag == "t"
+            )
+        )
+    return values
+
+
+def _extract_xlsx_text(data: bytes) -> tuple[str, str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            shared_strings = _extract_xlsx_shared_strings(zf)
+            worksheet_names = sorted(
+                name
+                for name in zf.namelist()
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            )[:12]
+            rows: list[str] = []
+            for worksheet_name in worksheet_names:
+                worksheet_xml = _zip_member_bytes(zf, worksheet_name)
+                if not worksheet_xml:
+                    continue
+                root = ElementTree.fromstring(worksheet_xml)
+                sheet_rows: list[str] = []
+                for row in root.iter():
+                    if not str(row.tag).endswith("}row") and row.tag != "row":
+                        continue
+                    cells: list[str] = []
+                    for cell in row:
+                        if not str(cell.tag).endswith("}c") and cell.tag != "c":
+                            continue
+                        value_node = next(
+                            (
+                                child
+                                for child in cell
+                                if str(child.tag).endswith("}v") or child.tag == "v"
+                            ),
+                            None,
+                        )
+                        inline_node = next(
+                            (
+                                child
+                                for child in cell.iter()
+                                if str(child.tag).endswith("}t") or child.tag == "t"
+                            ),
+                            None,
+                        )
+                        if inline_node is not None and inline_node.text:
+                            cells.append(inline_node.text)
+                            continue
+                        if value_node is None or value_node.text is None:
+                            continue
+                        raw = value_node.text
+                        if cell.attrib.get("t") == "s":
+                            try:
+                                cells.append(shared_strings[int(raw)])
+                            except (ValueError, IndexError):
+                                cells.append(raw)
+                        else:
+                            cells.append(raw)
+                    if cells:
+                        sheet_rows.append(" | ".join(cells))
+                if sheet_rows:
+                    rows.append(f"## {Path(worksheet_name).stem}\n" + "\n".join(sheet_rows))
+    except (zipfile.BadZipFile, ElementTree.ParseError, ValueError, OSError) as exc:
+        return "", f"xlsx_extract_failed:{type(exc).__name__}"
+    return "\n\n".join(rows), "ok" if rows else "xlsx_text_empty"
+
+
+def _attachment_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), bytes) else b""
+    filename = _safe_media_filename(str(payload.get("filename") or ""), default="attachment")
+    mimetype = str(payload.get("mimetype") or "application/octet-stream")
+    msgtype = str(payload.get("msgtype") or "")
+    preview_kind = _attachment_preview_kind(filename, mimetype, msgtype)
+    result: dict[str, Any] = {
+        "ok": True,
+        "room_id": str(payload.get("room_id") or ""),
+        "event_id": str(payload.get("event_id") or ""),
+        "filename": filename,
+        "mimetype": mimetype,
+        "size": int(payload.get("size") or len(data)),
+        "msgtype": msgtype,
+        "preview_kind": preview_kind,
+        "encrypted_event": bool(payload.get("encrypted_event")),
+        "encrypted_attachment": bool(payload.get("encrypted_attachment")),
+        "download": {
+            "kind": "decrypted_attachment",
+            "available": True,
+        },
+    }
+    if len(data) > _MAX_ATTACHMENT_PREVIEW_BYTES and preview_kind in {
+        "text",
+        "markdown",
+        "docx",
+        "xlsx",
+    }:
+        result.update(
+            {
+                "preview_kind": "unsupported",
+                "preview_status": "too_large_for_text_preview",
+                "fallback": "download_available",
+            }
+        )
+        return result
+
+    if preview_kind in {"text", "markdown"}:
+        text, encoding = _decode_attachment_text(data)
+        text, truncated = _truncate_preview_text(text)
+        result.update(
+            {
+                "text": text,
+                "text_encoding": encoding,
+                "text_truncated": truncated,
+                "preview_status": "ok",
+            }
+        )
+        return result
+
+    if preview_kind == "docx":
+        text, status = _extract_docx_text(data)
+        text, truncated = _truncate_preview_text(text)
+        result.update(
+            {
+                "preview_kind": "text" if text else "unsupported",
+                "source_format": "docx",
+                "text": text,
+                "text_truncated": truncated,
+                "preview_status": status,
+                "fallback": "" if text else "download_available",
+            }
+        )
+        return result
+
+    if preview_kind == "xlsx":
+        text, status = _extract_xlsx_text(data)
+        text, truncated = _truncate_preview_text(text)
+        result.update(
+            {
+                "preview_kind": "markdown" if text else "unsupported",
+                "source_format": "xlsx",
+                "text": text,
+                "text_truncated": truncated,
+                "preview_status": status,
+                "fallback": "" if text else "download_available",
+            }
+        )
+        return result
+
+    result["preview_status"] = (
+        "renderer_available" if preview_kind != "unsupported" else "download_available"
+    )
+    if preview_kind == "unsupported":
+        result["fallback"] = "download_available"
+    return result
 
 
 def _room_member_user_ids_from_state(events: list[dict[str, Any]]) -> set[str]:
@@ -4335,6 +4592,10 @@ def _media_fields_from_content(content: dict[str, Any]) -> dict[str, Any] | None
     }
     if "duration" in info:
         media["duration"] = _safe_int(info.get("duration"))
+    if "w" in info:
+        media["width"] = _safe_int(info.get("w"))
+    if "h" in info:
+        media["height"] = _safe_int(info.get("h"))
     return media
 
 
@@ -6112,11 +6373,7 @@ async def matrix_chat_send_attachment(
     return sent
 
 
-@router.get("/rooms/{room_id}/attachments/{event_id}/download")
-async def matrix_chat_download_attachment(
-    room_id: str,
-    event_id: str,
-) -> Response:
+async def _download_attachment_payload(room_id: str, event_id: str) -> dict[str, Any]:
     e2ee_client = await _get_e2ee_client()
     if not e2ee_client:
         if await _matrix_room_is_encrypted(room_id):
@@ -6128,12 +6385,27 @@ async def matrix_chat_download_attachment(
             status_code=503,
             detail="Matrix attachment download requires the Blueprints Matrix client",
         )
-    payload = await e2ee_client.download_attachment_event(room_id, event_id)
+    return await e2ee_client.download_attachment_event(room_id, event_id)
+
+
+@router.get("/rooms/{room_id}/attachments/{event_id}/download")
+async def matrix_chat_download_attachment(
+    room_id: str,
+    event_id: str,
+    disposition: str = Query("attachment", pattern="^(attachment|inline)$"),
+) -> Response:
+    payload = await _download_attachment_payload(room_id, event_id)
     return Response(
         content=payload["data"],
         media_type=str(payload.get("mimetype") or "application/octet-stream"),
-        headers=_attachment_response_headers(payload),
+        headers=_attachment_response_headers(payload, disposition=disposition),
     )
+
+
+@router.get("/rooms/{room_id}/attachments/{event_id}/preview")
+async def matrix_chat_preview_attachment(room_id: str, event_id: str) -> dict[str, Any]:
+    payload = await _download_attachment_payload(room_id, event_id)
+    return _attachment_preview_payload(payload)
 
 
 @router.websocket("/rooms/{room_id}/stt/ws")
