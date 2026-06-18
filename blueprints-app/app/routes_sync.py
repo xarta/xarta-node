@@ -87,6 +87,15 @@ _ALLOWED_TABLES = {
     "personal_sources",
     "personal_import_batches",
     "personal_time_audit",
+    "work_item_states",
+    "work_item_priorities",
+    "work_items",
+    "work_item_links",
+    "work_issues",
+    "work_todos",
+    "work_blockers",
+    "work_discussions",
+    "work_audit_log",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -327,6 +336,15 @@ def _pk_for_table(table: str) -> str:
         "personal_sources": "source_id",
         "personal_import_batches": "import_batch_id",
         "personal_time_audit": "audit_id",
+        "work_item_states": "state_id",
+        "work_item_priorities": "priority_id",
+        "work_items": "item_id",
+        "work_item_links": "link_id",
+        "work_issues": "issue_id",
+        "work_todos": "todo_id",
+        "work_blockers": "blocker_id",
+        "work_discussions": "discussion_id",
+        "work_audit_log": "audit_id",
     }
     return pk_map.get(table, "id")
 
