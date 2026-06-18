@@ -218,6 +218,7 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "open_settings",
     "selector_action",
     "set_body_shade",
+    "diagnostic_snapshot",
 }
 _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "refresh": "hard_refresh",
@@ -250,6 +251,18 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "shade": "set_body_shade",
     "shade_up": "set_body_shade",
     "shade up": "set_body_shade",
+    "diagnostic": "diagnostic_snapshot",
+    "diagnostics": "diagnostic_snapshot",
+    "diagnostics_snapshot": "diagnostic_snapshot",
+    "request_diagnostics": "diagnostic_snapshot",
+    "runtime_snapshot": "diagnostic_snapshot",
+    "debug_snapshot": "diagnostic_snapshot",
+}
+_ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound"}
+_ACTIVE_BROWSER_DIAGNOSTIC_ALIASES = {
+    "gpu": "gpu_activity_sound",
+    "gpu_activity": "gpu_activity_sound",
+    "gpu_sfx": "gpu_activity_sound",
 }
 _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
     "": "click",
@@ -365,6 +378,9 @@ class ActiveBrowserCommandBody(BaseModel):
     event_kind: str | None = None
     body_shade: str | None = None
     shade: str | None = None
+    diagnostics: list[str] | str | None = None
+    diagnostic_sources: list[str] | str | None = None
+    include: list[str] | str | None = None
     instant: bool | None = None
     target_active_browser: bool = True
     max_age_seconds: int = Field(default=60, ge=5, le=300)
@@ -388,6 +404,7 @@ class BrowserViewBody(BaseModel):
     docs: dict[str, Any] | None = None
     body_shade: dict[str, Any] | None = None
     tts: dict[str, Any] | None = None
+    diagnostics: dict[str, Any] | None = None
     client_now_ms: float | None = None
 
 
@@ -524,6 +541,27 @@ def _clean_dev_command_action(value: str | None) -> str:
 def _clean_active_browser_command_action(value: str | None) -> str:
     action = _clean_dev_command_action(value)
     return _ACTIVE_BROWSER_COMMAND_ALIASES.get(action, action)
+
+
+def _clean_active_browser_diagnostic_source(value: Any) -> str:
+    raw = _clean_dev_command_action(value)
+    source = _ACTIVE_BROWSER_DIAGNOSTIC_ALIASES.get(raw, raw)
+    return source if source in _ACTIVE_BROWSER_DIAGNOSTIC_SOURCES else ""
+
+
+def _clean_active_browser_diagnostic_sources(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = value.replace(",", " ").split()
+    else:
+        raw_items = []
+    sources: list[str] = []
+    for item in raw_items:
+        source = _clean_active_browser_diagnostic_source(item)
+        if source and source not in sources:
+            sources.append(source)
+    return sources or ["gpu_activity_sound"]
 
 
 def _clean_active_browser_event_kind(value: str | None) -> str:
@@ -1894,6 +1932,11 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     docs = _bounded_json(body.docs if isinstance(body.docs, dict) else {}, 4000)
     if not isinstance(docs, dict):
         docs = {}
+    diagnostics = _bounded_json(
+        body.diagnostics if isinstance(body.diagnostics, dict) else {}, 30000
+    )
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
     modals: list[dict[str, Any]] = []
     for modal in body.modals or []:
         if not isinstance(modal, dict):
@@ -1929,7 +1972,7 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "service_worker_state": _clean_string(frontend.get("service_worker_state"), "", 40),
     }
 
-    return {
+    report = {
         "browser_id": _clean_browser_id(body.browser_id),
         "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
         "tab_id": _clean_string(body.tab_id, "", 120),
@@ -1969,6 +2012,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,
     }
+    if diagnostics:
+        report["diagnostics"] = diagnostics
+    return report
 
 
 def _browser_view_key(report: dict[str, Any]) -> str:
@@ -2199,7 +2245,11 @@ def _store_browser_view_report_unlocked(
     state: dict[str, Any], report: dict[str, Any], now: float
 ) -> bool:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
-    reports[_browser_view_key(report)] = report
+    report_key = _browser_view_key(report)
+    prior_report = reports.get(report_key) if isinstance(reports.get(report_key), dict) else {}
+    if "diagnostics" not in report and isinstance(prior_report.get("diagnostics"), dict):
+        report["diagnostics"] = prior_report["diagnostics"]
+    reports[report_key] = report
     sorted_items = sorted(
         reports.items(),
         key=lambda item: (
@@ -3050,6 +3100,9 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
     doc_id = _clean_string(body.doc_id, "", 120)
     doc_path = _clean_string(body.path or body.doc_path, "", 300)
     body_shade = _clean_active_browser_body_shade(body.body_shade or body.shade)
+    diagnostic_sources = _clean_active_browser_diagnostic_sources(
+        body.diagnostics or body.diagnostic_sources or body.include
+    )
     highlight_terms = [
         term
         for term in (_clean_string(item, "", 80) for item in (body.highlight_terms or []))
@@ -3096,6 +3149,8 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload["body_shade"] = body_shade or "up"
     elif body_shade:
         payload["body_shade"] = body_shade
+    if action == "diagnostic_snapshot":
+        payload["diagnostics"] = diagnostic_sources
     if body.instant is not None:
         payload["instant"] = bool(body.instant)
     event = AppEvent.create(
