@@ -1649,6 +1649,45 @@ def _visible_mount_target(value: Any) -> str:
     return "" if text.startswith(_BROWSE_MOUNT_PREFIXES) else text
 
 
+def _is_transient_nbd_path(value: Any) -> bool:
+    return bool(re.fullmatch(r"/dev/nbd\d+(p\d+)?", str(value or "").strip()))
+
+
+def _is_transient_nbd_name(value: Any) -> bool:
+    return bool(re.fullmatch(r"nbd\d+(p\d+)?", str(value or "").strip().lower()))
+
+
+def _node_fact_value(node: dict[str, Any] | None, label: str) -> str:
+    if not isinstance(node, dict):
+        return ""
+    clean_label = str(label or "").strip().lower()
+    for fact in node.get("facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        if str(fact.get("label") or "").strip().lower() != clean_label:
+            continue
+        return str(fact.get("value") or "").strip()
+    return ""
+
+
+def _inventory_node_is_transient(node: dict[str, Any] | None) -> bool:
+    if not isinstance(node, dict):
+        return False
+    node_id = str(node.get("id") or "").strip()
+    if "/dev/nbd" in node_id:
+        return True
+    for value in (
+        node.get("label"),
+        node.get("source_path"),
+        node.get("root_display"),
+        _node_fact_value(node, "Path"),
+        _node_fact_value(node, "Guest path"),
+    ):
+        if _is_transient_nbd_name(value) or _is_transient_nbd_path(value):
+            return True
+    return False
+
+
 def _safe_node_id(node_id: str) -> str:
     value = str(node_id or "").strip()
     if not value or len(value) > 400:
@@ -2450,8 +2489,11 @@ def _flatten_block_devices(
             continue
         if str(node.get("type") or "").strip() != "disk":
             continue
-        name = str(node.get("name") or "")
+        name = str(node.get("name") or "").strip()
+        path = str(node.get("path") or "").strip()
         if name.startswith(("loop", "ram", "zram", "sr", "zd", "dm-")):
+            continue
+        if _is_transient_nbd_name(name) or _is_transient_nbd_path(path):
             continue
         top_disks.append(node)
         walk(node)
@@ -3176,7 +3218,11 @@ def _cacheable_host_child(node: dict[str, Any]) -> bool:
         return False
     node_id = str(node.get("id") or "").strip()
     group = str(node.get("group") or "").strip()
-    return bool(node_id) and group in _DISKS_INVENTORY_MEMORY_GROUPS
+    return (
+        bool(node_id)
+        and group in _DISKS_INVENTORY_MEMORY_GROUPS
+        and not _inventory_node_is_transient(node)
+    )
 
 
 def _snapshot_cacheable_node(node: dict[str, Any]) -> dict[str, Any]:
@@ -3266,6 +3312,16 @@ def _merge_inventory_memory(host_nodes: list[dict[str, Any]]) -> None:
             if not isinstance(node_store, dict):
                 host_store["nodes"] = {}
                 node_store = host_store["nodes"]
+            else:
+                for record_id, record in list(node_store.items()):
+                    if not isinstance(record, dict):
+                        continue
+                    snapshot = (
+                        record.get("snapshot") if isinstance(record.get("snapshot"), dict) else {}
+                    )
+                    if _inventory_node_is_transient(snapshot) or "/dev/nbd" in str(record_id):
+                        node_store.pop(record_id, None)
+                        changed = True
 
             live_children = host_node.get("children")
             if not isinstance(live_children, list):
@@ -4098,6 +4154,8 @@ def _build_standalone_logical_nodes(
         for node in candidates:
             path = str(node.get("path") or "").strip()
             if not path or guest_assignment_lookup.get(path):
+                continue
+            if _is_transient_nbd_path(path):
                 continue
             if node is not disk and (partition_pools.get(path) or []):
                 continue
