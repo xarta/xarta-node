@@ -634,6 +634,117 @@ def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
     assert audit["actor"] == "codex-test"
 
 
+def test_calendar_event_create_and_edit_use_shared_events(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+
+    created = asyncio.run(
+        routes_personal.create_calendar_event(
+            routes_personal.CalendarEventUpsertRequest(
+                title="Dentist",
+                body="Bring form",
+                local_date="2026-06-18",
+                start_time="09:30",
+                end_time="10:15",
+                timezone="Europe/London",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="calendar-create-test",
+            )
+        )
+    )
+
+    event = created["event"]
+    assert created["ok"] is True
+    assert event["source"]["type"] == "manual-calendar"
+    assert event["kind"] == "calendar-event"
+    assert event["title"] == "Dentist"
+    assert event["body_excerpt"] == "Bring form"
+    assert event["start_at"] == "2026-06-18T08:30:00Z"
+    assert event["end_at"] == "2026-06-18T09:15:00Z"
+    assert "calendar" in event["tags"]
+    assert "timed" in event["tags"]
+    assert event["provenance"]["calendar"]["local_start_time"] == "09:30"
+
+    listed = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            source_type="manual-calendar",
+            limit=10,
+            offset=0,
+        )
+    )
+    assert [item["event_id"] for item in listed["items"]] == [event["event_id"]]
+
+    updated = asyncio.run(
+        routes_personal.update_calendar_event(
+            event["event_id"],
+            routes_personal.CalendarEventUpsertRequest(
+                title="Dentist moved",
+                body="Bring updated form",
+                local_date="2026-06-18",
+                start_time="11:00",
+                end_time="11:30",
+                timezone="Europe/London",
+                all_day=False,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="calendar-update-test",
+            ),
+        )
+    )
+
+    assert updated["event"]["event_id"] == event["event_id"]
+    assert updated["event"]["title"] == "Dentist moved"
+    assert updated["event"]["start_at"] == "2026-06-18T10:00:00Z"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE source_type='manual-calendar'"
+        ).fetchone()["count"]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='create_calendar_event'"
+        ).fetchone()["count"]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='update_calendar_event'"
+        ).fetchone()["count"]
+        == 1
+    )
+    source = conn.execute(
+        "SELECT * FROM personal_sources WHERE source_id='manual-calendar'"
+    ).fetchone()
+    assert source["status"] == "ok"
+
+
+def test_calendar_event_rejects_end_before_start(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+
+    try:
+        asyncio.run(
+            routes_personal.create_calendar_event(
+                routes_personal.CalendarEventUpsertRequest(
+                    title="Bad slot",
+                    local_date="2026-06-18",
+                    start_time="15:00",
+                    end_time="14:00",
+                    timezone="Europe/London",
+                )
+            )
+        )
+    except routes_personal.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "end time" in exc.detail
+    else:
+        raise AssertionError("calendar event with end before start must fail")
+
+
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
