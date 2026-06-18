@@ -1977,7 +1977,24 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "child_count": _clean_browser_page_int(kanban.get("child_count"), maximum=5000),
         "link_count": _clean_browser_page_int(kanban.get("link_count"), maximum=5000),
         "blocker_count": _clean_browser_page_int(kanban.get("blocker_count"), maximum=5000),
+        "scoped_open": bool(kanban.get("scoped_open")),
+        "scoped_kind": _clean_string(kanban.get("scoped_kind"), "", 40),
+        "scoped_scope": _clean_string(kanban.get("scoped_scope"), "", 40),
+        "scoped_view": _clean_string(kanban.get("scoped_view"), "", 40),
+        "scoped_item_id": _clean_string(kanban.get("scoped_item_id"), "", 180),
+        "scoped_count": _clean_browser_page_int(kanban.get("scoped_count"), maximum=5000),
+        "scoped_group_count": _clean_browser_page_int(
+            kanban.get("scoped_group_count"), maximum=5000
+        ),
         "last_write_item_id": _clean_string(kanban.get("last_write_item_id"), "", 180),
+        "last_write_issue_id": _clean_string(kanban.get("last_write_issue_id"), "", 180),
+        "last_write_todo_id": _clean_string(kanban.get("last_write_todo_id"), "", 180),
+        "last_promoted_issue_item_id": _clean_string(
+            kanban.get("last_promoted_issue_item_id"), "", 180
+        ),
+        "last_promoted_todo_item_id": _clean_string(
+            kanban.get("last_promoted_todo_item_id"), "", 180
+        ),
         "last_write_link_id": _clean_string(kanban.get("last_write_link_id"), "", 180),
         "last_write_blocker_id": _clean_string(kanban.get("last_write_blocker_id"), "", 180),
         "card_fsm": {
