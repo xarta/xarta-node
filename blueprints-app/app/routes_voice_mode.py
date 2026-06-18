@@ -1902,6 +1902,29 @@ def _clean_active_browser_diary_day(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_calendar(raw: Any) -> dict[str, Any]:
+    calendar = raw if isinstance(raw, dict) else {}
+    return {
+        "loaded": bool(calendar.get("loaded")),
+        "loading": bool(calendar.get("loading")),
+        "status": _clean_string(calendar.get("status"), "", 40),
+        "local_date": _clean_string(calendar.get("local_date"), "", 20),
+        "range_start": _clean_string(calendar.get("range_start"), "", 20),
+        "range_end": _clean_string(calendar.get("range_end"), "", 20),
+        "mode": _clean_string(calendar.get("mode"), "", 20),
+        "source_filter": _clean_string(calendar.get("source_filter"), "", 40),
+        "event_count": _clean_browser_page_int(calendar.get("event_count"), maximum=1000),
+        "total_count": _clean_browser_page_int(calendar.get("total_count"), maximum=1000),
+        "manual_calendar_count": _clean_browser_page_int(
+            calendar.get("manual_calendar_count"), maximum=1000
+        ),
+        "selection_type": _clean_string(calendar.get("selection_type"), "", 40),
+        "selection_label": _clean_string(calendar.get("selection_label"), "", 120),
+        "last_write_event_id": _clean_string(calendar.get("last_write_event_id"), "", 180),
+        "error": _clean_string(calendar.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
@@ -1958,6 +1981,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         "last_command": last_command,
         "surfaces": {
             "diary_day": _clean_active_browser_diary_day(surfaces.get("diary_day")),
+            "calendar": _clean_active_browser_calendar(surfaces.get("calendar")),
             "imports_dashboard": _clean_active_browser_imports_dashboard(
                 surfaces.get("imports_dashboard")
             ),

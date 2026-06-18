@@ -562,6 +562,26 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             "selector_actions": [
                 {"action": "settings", "label": "Settings", "bridge_group": "settings"}
             ],
+            "surfaces": {
+                "calendar": {
+                    "loaded": True,
+                    "loading": False,
+                    "status": "ready",
+                    "local_date": "2026-06-18",
+                    "range_start": "2026-06-16",
+                    "range_end": "2026-06-22",
+                    "mode": "week",
+                    "source_filter": "calendar",
+                    "event_count": 3,
+                    "total_count": 8,
+                    "manual_calendar_count": 2,
+                    "selection_type": "event",
+                    "selection_label": "Planning block",
+                    "last_write_event_id": "calendar-2026-06-18-proof",
+                    "error": "",
+                    "ignored": {"nested": "raw"},
+                }
+            },
         },
     )
     report = voice_mode._clean_browser_view_report(body, 20)
@@ -589,6 +609,23 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert view["automation"]["menus"][0]["pages"][0]["id"] == "matrix-chat"
     assert view["automation"]["menus"][0]["function_items"][0]["fn"] == "chat.vadDev"
     assert view["automation"]["selector_actions"][0]["action"] == "settings"
+    assert view["automation"]["surfaces"]["calendar"] == {
+        "loaded": True,
+        "loading": False,
+        "status": "ready",
+        "local_date": "2026-06-18",
+        "range_start": "2026-06-16",
+        "range_end": "2026-06-22",
+        "mode": "week",
+        "source_filter": "calendar",
+        "event_count": 3,
+        "total_count": 8,
+        "manual_calendar_count": 2,
+        "selection_type": "event",
+        "selection_label": "Planning block",
+        "last_write_event_id": "calendar-2026-06-18-proof",
+        "error": "",
+    }
     assert view["body_shade"] == {
         "available": True,
         "is_up": True,
