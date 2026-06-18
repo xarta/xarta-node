@@ -136,6 +136,34 @@ class CalendarEventUpsertRequest(BaseModel):
     run_id: str | None = None
 
 
+class PersonalTaskUpsertRequest(BaseModel):
+    task_id: str | None = None
+    title: str
+    body: str | None = None
+    mode: str = "personal"
+    status: str = "open"
+    priority: str | None = None
+    due_date: str | None = None
+    due_time: str | None = None
+    timezone: str | None = None
+    privacy_level: str = "normal"
+    tags: list[str] = []
+    related_work_items: list[str] = []
+    related_tasks: list[str] = []
+    related_import_batches: list[str] = []
+    actor: str = "blueprints-ui"
+    source_surface: str = "todo-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class PersonalTaskActionRequest(BaseModel):
+    actor: str = "blueprints-ui"
+    source_surface: str = "todo-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class DiaryMinutesProjectRequest(BaseModel):
     local_date: str | None = None
     timezone: str | None = None
@@ -236,6 +264,83 @@ def _row_to_source(row: Any) -> dict[str, Any]:
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_task(row: Any) -> dict[str, Any]:
+    return {
+        "task_id": row["task_id"],
+        "event_id": row["event_id"],
+        "kind": "task",
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "mode": row["mode"],
+        "priority": row["priority"],
+        "due_at": row["due_at"],
+        "local_date": row["local_date"],
+        "timezone": row["timezone"],
+        "privacy_level": row["privacy_level"],
+        "tags": _json_value(row["tags_json"], []),
+        "source": {
+            "type": row["source_type"],
+            "ref": row["source_ref"],
+            "hash": row["source_hash"],
+            "authority": "task",
+        },
+        "related": {
+            "work_items": _json_value(row["related_work_items_json"], []),
+            "tasks": _json_value(row["related_tasks_json"], []),
+            "import_batches": _json_value(row["related_import_batches_json"], []),
+        },
+        "file_refs": _json_value(row["file_refs_json"], []),
+        "db_refs": _json_value(row["db_refs_json"], []),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "completed_at": row["completed_at"],
+        "archived_at": row["archived_at"],
+    }
+
+
+def _event_to_task(row: Any) -> dict[str, Any]:
+    event = _row_to_event(row)
+    tags = event.get("tags") if isinstance(event.get("tags"), list) else []
+    related = event.get("related") if isinstance(event.get("related"), dict) else {}
+    related_work = related.get("work_items") if isinstance(related.get("work_items"), list) else []
+    mode = "work" if event["source"]["type"] == "work-management" or related_work else "personal"
+    if event["status"] == "blocked":
+        mode = "blocked"
+    elif event["status"] == "pending_review" or "review" in tags:
+        mode = "review"
+    elif event["status"] in {"done", "completed", "archived"}:
+        mode = "done"
+    return {
+        "task_id": event["event_id"],
+        "event_id": event["event_id"],
+        "kind": event["kind"],
+        "title": event["title"],
+        "body_excerpt": event["body_excerpt"],
+        "status": event["status"],
+        "mode": mode,
+        "priority": event["priority"],
+        "due_at": event["start_at"],
+        "local_date": event["local_date"],
+        "timezone": event["timezone"],
+        "privacy_level": event["privacy_level"],
+        "tags": tags,
+        "source": {
+            **event["source"],
+            "authority": "event",
+        },
+        "related": related,
+        "file_refs": event["file_refs"],
+        "db_refs": event["db_refs"],
+        "provenance": event["provenance"],
+        "created_at": event["created_at"],
+        "updated_at": event["updated_at"],
+        "completed_at": event["updated_at"] if event["status"] in {"done", "completed"} else None,
+        "archived_at": event["updated_at"] if event["status"] == "archived" else None,
     }
 
 
@@ -373,6 +478,36 @@ def _upsert_calendar_source(conn: Any, now: str) -> Any:
     return conn.execute(
         "SELECT * FROM personal_sources WHERE source_id='manual-calendar'"
     ).fetchone()
+
+
+def _upsert_task_source(conn: Any, now: str) -> Any:
+    conn.execute(
+        """
+        INSERT INTO personal_sources (
+            source_id, source_type, label, status, last_seen_at, health_json, provenance_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            status=excluded.status,
+            last_seen_at=excluded.last_seen_at,
+            health_json=excluded.health_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            "manual-task",
+            "manual-task",
+            "Manual Tasks",
+            "ok",
+            now,
+            json.dumps({"write_path": "personal_time_tasks"}),
+            json.dumps({"tasks_table": "personal_time_tasks", "events_table": "personal_events"}),
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_sources WHERE source_id='manual-task'").fetchone()
 
 
 def _write_personal_audit(
@@ -698,6 +833,206 @@ async def list_personal_import_batches(
     }
 
 
+@router.get("/tasks")
+async def list_personal_tasks(
+    date_start: str | None = None,
+    date_end: str | None = None,
+    status: str | None = None,
+    privacy_level: str | None = None,
+    tag: str | None = None,
+    related_work_item: str | None = None,
+    import_batch: str | None = None,
+    mode: str | None = None,
+    source_type: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    task_where, task_params = _task_mode_where(mode)
+    event_where, event_params = _event_task_where(mode)
+    if date_start:
+        task_where.append("local_date >= ?")
+        task_params.append(date_start)
+        event_where.append("local_date >= ?")
+        event_params.append(date_start)
+    if date_end:
+        task_where.append("local_date <= ?")
+        task_params.append(date_end)
+        event_where.append("local_date <= ?")
+        event_params.append(date_end)
+    if status:
+        task_where.append("status = ?")
+        task_params.append(status)
+        event_where.append("status = ?")
+        event_params.append(status)
+    if privacy_level:
+        task_where.append("privacy_level = ?")
+        task_params.append(privacy_level)
+        event_where.append("privacy_level = ?")
+        event_params.append(privacy_level)
+    if source_type:
+        task_where.append("source_type = ?")
+        task_params.append(source_type)
+        event_where.append("source_type = ?")
+        event_params.append(source_type)
+    if tag:
+        _add_json_array_filter(task_where, task_params, "tags_json", tag)
+        _add_json_array_filter(event_where, event_params, "tags_json", tag)
+    if related_work_item:
+        _add_json_array_filter(
+            task_where, task_params, "related_work_items_json", related_work_item
+        )
+        _add_json_array_filter(
+            event_where, event_params, "related_work_items_json", related_work_item
+        )
+    if import_batch:
+        _add_json_array_filter(task_where, task_params, "related_import_batches_json", import_batch)
+        _add_json_array_filter(
+            event_where, event_params, "related_import_batches_json", import_batch
+        )
+
+    task_clause = f"WHERE {' AND '.join(task_where)}" if task_where else ""
+    event_clause = f"WHERE {' AND '.join(event_where)}" if event_where else ""
+    fetch_limit = max(limit + offset, 200)
+    with get_conn() as conn:
+        task_rows = conn.execute(
+            f"""
+            SELECT * FROM personal_time_tasks
+            {task_clause}
+            ORDER BY COALESCE(due_at, local_date, created_at) ASC, task_id ASC
+            LIMIT ?
+            """,
+            (*task_params, fetch_limit),
+        ).fetchall()
+        event_rows = conn.execute(
+            f"""
+            SELECT * FROM personal_events
+            {event_clause}
+            ORDER BY COALESCE(start_at, local_date, created_at) ASC, event_id ASC
+            LIMIT ?
+            """,
+            (*event_params, fetch_limit),
+        ).fetchall()
+        counts = _task_counts(conn)
+
+    items = [_row_to_task(row) for row in task_rows]
+    items.extend(_event_to_task(row) for row in event_rows)
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        deduped.setdefault(item["task_id"], item)
+    items = sorted(
+        deduped.values(),
+        key=lambda item: (
+            item.get("due_at") or item.get("local_date") or item.get("created_at") or "",
+            item.get("task_id") or "",
+        ),
+    )
+    source_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for item in items:
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        source_type_value = str(source.get("type") or "unknown")
+        source_counts[source_type_value] = source_counts.get(source_type_value, 0) + 1
+        item_status = str(item.get("status") or "unknown")
+        status_counts[item_status] = status_counts.get(item_status, 0) + 1
+    page = items[offset : offset + limit]
+    return {
+        "items": page,
+        "pagination": _pagination(limit, offset, len(page)),
+        "counts": {
+            "modes": counts,
+            "sources": source_counts,
+            "status": status_counts,
+            "total": len(items),
+        },
+        "filters": {
+            "date_start": date_start,
+            "date_end": date_end,
+            "status": status,
+            "privacy_level": privacy_level,
+            "tag": tag,
+            "related_work_item": related_work_item,
+            "import_batch": import_batch,
+            "mode": mode,
+            "source_type": source_type,
+        },
+    }
+
+
+@router.post("/tasks")
+async def create_personal_task(body: PersonalTaskUpsertRequest) -> dict[str, Any]:
+    return _upsert_personal_task(body, action="create_task")
+
+
+def _task_request_from_row(
+    row: Any,
+    action: PersonalTaskActionRequest,
+    *,
+    status: str | None = None,
+) -> PersonalTaskUpsertRequest:
+    provenance = _json_value(row["provenance_json"], {})
+    task_meta = provenance.get("task") if isinstance(provenance, dict) else {}
+    return PersonalTaskUpsertRequest(
+        task_id=row["task_id"],
+        title=row["title"],
+        body=row["body_excerpt"] or "",
+        mode=row["mode"],
+        status=status or row["status"],
+        priority=row["priority"],
+        due_date=row["local_date"] if row["due_at"] else None,
+        due_time=task_meta.get("due_time", "") if isinstance(task_meta, dict) else "",
+        timezone=row["timezone"],
+        privacy_level=row["privacy_level"],
+        tags=_json_value(row["tags_json"], []),
+        related_work_items=_json_value(row["related_work_items_json"], []),
+        related_tasks=_json_value(row["related_tasks_json"], []),
+        related_import_batches=_json_value(row["related_import_batches_json"], []),
+        actor=action.actor,
+        source_surface=action.source_surface,
+        request_id=action.request_id,
+        run_id=action.run_id,
+    )
+
+
+@router.patch("/tasks/{task_id}")
+async def update_personal_task(task_id: str, body: PersonalTaskUpsertRequest) -> dict[str, Any]:
+    clean_task_id = _task_id(task_id, _validate_local_date(body.due_date))
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT task_id FROM personal_time_tasks WHERE task_id=?", (clean_task_id,)
+        ).fetchone()
+    if not existing:
+        raise HTTPException(404, "task not found")
+    return _upsert_personal_task(body, task_id=clean_task_id, action="update_task")
+
+
+@router.post("/tasks/{task_id}/complete")
+async def complete_personal_task(task_id: str, body: PersonalTaskActionRequest) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "task not found")
+    request = _task_request_from_row(row, body, status="done")
+    return _upsert_personal_task(
+        request, task_id=task_id, action="complete_task", status_override="done"
+    )
+
+
+@router.post("/tasks/{task_id}/archive")
+async def archive_personal_task(task_id: str, body: PersonalTaskActionRequest) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "task not found")
+    request = _task_request_from_row(row, body, status="archived")
+    return _upsert_personal_task(
+        request, task_id=task_id, action="archive_task", status_override="archived"
+    )
+
+
 def _validate_timezone_name(value: str | None) -> str:
     timezone_name = _clean_short_text(
         value or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
@@ -718,6 +1053,13 @@ def _calendar_event_id(value: str | None, local_date: str) -> str:
     return f"calendar-{local_date}-{uuid.uuid4().hex[:12]}"
 
 
+def _task_id(value: str | None, local_date: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(value or "").strip()).strip("-")
+    if clean:
+        return clean[:180]
+    return f"task-{local_date}-{uuid.uuid4().hex[:12]}"
+
+
 def _calendar_utc_iso(local_date: str, local_time: str | None, timezone_name: str) -> str:
     time_text = local_time or "00:00"
     local_dt = datetime.strptime(f"{local_date} {time_text}", "%Y-%m-%d %H:%M").replace(
@@ -735,6 +1077,473 @@ def _clean_event_list(values: list[str], *, limit: int = 24) -> list[str]:
         if text and text not in cleaned:
             cleaned.append(text)
     return cleaned
+
+
+def _task_status(value: str | None) -> str:
+    status = _clean_short_text(value, "open", limit=40)
+    if status == "completed":
+        return "done"
+    if status not in {"open", "blocked", "pending_review", "done", "archived"}:
+        raise HTTPException(400, "task status is invalid")
+    return status
+
+
+def _task_mode(value: str | None, related_work_items: list[str]) -> str:
+    mode = _clean_short_text(value, "personal", limit=40)
+    if mode == "today":
+        mode = "personal"
+    if related_work_items and mode == "personal":
+        mode = "work"
+    if mode not in {"personal", "work", "review"}:
+        raise HTTPException(400, "task mode is invalid")
+    return mode
+
+
+def _task_file_dir(local_date: str) -> Path:
+    year, month, day = local_date.split("-")
+    return DIARY_ROOT / "tasks" / year / month / day
+
+
+def _task_file_slug(task_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.:-]+", "-", task_id).strip("-")[:180] or "task"
+
+
+def _write_task_files(payload: dict[str, Any], now: str) -> list[str]:
+    task_dir = _task_file_dir(payload["local_date"])
+    task_dir.mkdir(parents=True, exist_ok=True)
+    slug = _task_file_slug(payload["task_id"])
+    json_path = task_dir / f"{slug}.json"
+    md_path = task_dir / f"{slug}.md"
+    file_payload = {
+        "schema": "xarta.todo.task.v1",
+        "task_id": payload["task_id"],
+        "event_id": payload["event_id"],
+        "title": payload["title"],
+        "body": payload["body_excerpt"],
+        "status": payload["status"],
+        "mode": payload["mode"],
+        "priority": payload["priority"],
+        "due_at": payload["due_at"],
+        "local_date": payload["local_date"],
+        "timezone": payload["timezone"],
+        "privacy_level": payload["privacy_level"],
+        "tags": payload["tags"],
+        "related_work_items": payload["related_work_items"],
+        "related_tasks": payload["related_tasks"],
+        "related_import_batches": payload["related_import_batches"],
+        "source_hash": payload["source_hash"],
+        "provenance": payload["provenance"],
+        "updated_at": now,
+    }
+    json_path.write_text(
+        json.dumps(file_payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    md_path.write_text(
+        "\n".join(
+            [
+                "---",
+                "schema: xarta.todo.task.v1",
+                f"task_id: {payload['task_id']}",
+                f"event_id: {payload['event_id']}",
+                f"status: {payload['status']}",
+                f"mode: {payload['mode']}",
+                f"local_date: {payload['local_date']}",
+                "---",
+                "",
+                f"# {payload['title']}",
+                "",
+                payload["body_excerpt"],
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return [_diary_relative_path(json_path), _diary_relative_path(md_path)]
+
+
+def _task_payload(
+    body: PersonalTaskUpsertRequest,
+    *,
+    task_id: str | None = None,
+    status_override: str | None = None,
+) -> dict[str, Any]:
+    local_date = _validate_local_date(body.due_date)
+    timezone_name = _validate_timezone_name(body.timezone)
+    due_time = _validate_local_time(body.due_time)
+    due_at = _calendar_utc_iso(local_date, due_time, timezone_name) if body.due_date else None
+    title = _clean_short_text(body.title, "", limit=180)
+    if not title:
+        raise HTTPException(400, "task title is required")
+    related_work_items = _clean_event_list(body.related_work_items)
+    status = _task_status(status_override or body.status)
+    mode = _task_mode(body.mode, related_work_items)
+    tags = _clean_event_list(body.tags)
+    for required in ("todo", "task", mode):
+        if required not in tags:
+            tags.append(required)
+    if due_at and "due" not in tags:
+        tags.append("due")
+    if related_work_items and "work" not in tags:
+        tags.append("work")
+    clean_task_id = _task_id(task_id or body.task_id, local_date)
+    provenance = {
+        "task": {
+            "mode": mode,
+            "due_time": due_time or "",
+            "timezone": timezone_name,
+        },
+        "actor": _clean_short_text(body.actor, "blueprints-ui"),
+        "source_surface": _clean_short_text(body.source_surface, "todo-page"),
+        "request_id": _clean_short_text(
+            body.request_id, f"todo-task-{uuid.uuid4().hex[:12]}", limit=160
+        ),
+        "run_id": _clean_short_text(
+            body.run_id or body.request_id,
+            body.request_id or f"todo-run-{uuid.uuid4().hex[:12]}",
+            limit=160,
+        ),
+    }
+    payload = {
+        "task_id": clean_task_id,
+        "event_id": clean_task_id,
+        "source_type": "manual-task",
+        "source_ref": f"personal_time_tasks:{clean_task_id}",
+        "title": title,
+        "body_excerpt": _body_excerpt(body.body or "", limit=2000),
+        "status": status,
+        "mode": mode,
+        "priority": _clean_short_text(body.priority, "", limit=40) or None,
+        "due_at": due_at,
+        "local_date": local_date,
+        "timezone": timezone_name,
+        "privacy_level": _clean_short_text(body.privacy_level, "normal", limit=40),
+        "tags": tags,
+        "related_work_items": related_work_items,
+        "related_tasks": _clean_event_list(body.related_tasks),
+        "related_import_batches": _clean_event_list(body.related_import_batches),
+        "provenance": provenance,
+    }
+    payload["source_hash"] = _hash_json_payload(payload)
+    return payload
+
+
+def _upsert_task_event(
+    conn: Any,
+    payload: dict[str, Any],
+    *,
+    file_refs: list[str],
+    audit_id: str,
+    now: str,
+    created_at: str,
+) -> Any:
+    event_provenance = {
+        **payload["provenance"],
+        "task": {
+            **payload["provenance"]["task"],
+            "task_id": payload["task_id"],
+            "task_table": "personal_time_tasks",
+        },
+    }
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, end_at, local_date, timezone, status, priority,
+            privacy_level, tags_json, related_work_items_json, related_tasks_json,
+            related_import_batches_json, file_refs_json, db_refs_json, provenance_json,
+            projection_state, provenance_state, last_rendered_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            source_type=excluded.source_type,
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            kind=excluded.kind,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            content_projection=excluded.content_projection,
+            start_at=excluded.start_at,
+            local_date=excluded.local_date,
+            timezone=excluded.timezone,
+            status=excluded.status,
+            priority=excluded.priority,
+            privacy_level=excluded.privacy_level,
+            tags_json=excluded.tags_json,
+            related_work_items_json=excluded.related_work_items_json,
+            related_tasks_json=excluded.related_tasks_json,
+            related_import_batches_json=excluded.related_import_batches_json,
+            file_refs_json=excluded.file_refs_json,
+            db_refs_json=excluded.db_refs_json,
+            provenance_json=excluded.provenance_json,
+            projection_state=excluded.projection_state,
+            provenance_state=excluded.provenance_state,
+            last_rendered_at=excluded.last_rendered_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            payload["event_id"],
+            payload["source_type"],
+            payload["source_ref"],
+            payload["source_hash"],
+            "task",
+            payload["title"],
+            payload["body_excerpt"],
+            payload["body_excerpt"],
+            payload["due_at"],
+            None,
+            payload["local_date"],
+            payload["timezone"],
+            payload["status"],
+            payload["priority"],
+            payload["privacy_level"],
+            json.dumps(payload["tags"], ensure_ascii=True),
+            json.dumps(payload["related_work_items"], ensure_ascii=True),
+            json.dumps([payload["task_id"], *payload["related_tasks"]], ensure_ascii=True),
+            json.dumps(payload["related_import_batches"], ensure_ascii=True),
+            json.dumps(file_refs, ensure_ascii=True),
+            json.dumps(
+                [f"personal_time_tasks:{payload['task_id']}", f"personal_time_audit:{audit_id}"],
+                ensure_ascii=True,
+            ),
+            json.dumps(event_provenance, ensure_ascii=True, sort_keys=True),
+            "hot",
+            "linked",
+            now,
+            created_at,
+            now,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM personal_events WHERE event_id=?", (payload["event_id"],)
+    ).fetchone()
+
+
+def _upsert_personal_task(
+    body: PersonalTaskUpsertRequest,
+    *,
+    task_id: str | None = None,
+    action: str,
+    status_override: str | None = None,
+) -> dict[str, Any]:
+    payload = _task_payload(body, task_id=task_id, status_override=status_override)
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    actor = payload["provenance"]["actor"]
+    source_surface = payload["provenance"]["source_surface"]
+    request_id = payload["provenance"]["request_id"]
+    run_id = payload["provenance"]["run_id"]
+    file_refs = _write_task_files(payload, now)
+    completed_at = now if payload["status"] == "done" else None
+    archived_at = now if payload["status"] == "archived" else None
+    with get_conn() as conn:
+        source_row = _upsert_task_source(conn, now)
+        previous = conn.execute(
+            "SELECT created_at, completed_at, archived_at FROM personal_time_tasks WHERE task_id=?",
+            (payload["task_id"],),
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        if previous and previous["completed_at"] and payload["status"] == "done":
+            completed_at = previous["completed_at"]
+        if previous and previous["archived_at"] and payload["status"] == "archived":
+            archived_at = previous["archived_at"]
+        conn.execute(
+            """
+            INSERT INTO personal_time_tasks (
+                task_id, source_type, source_ref, source_hash, title, body_excerpt,
+                status, mode, priority, due_at, local_date, timezone, privacy_level,
+                tags_json, related_work_items_json, related_tasks_json,
+                related_import_batches_json, file_refs_json, db_refs_json, event_id,
+                provenance_json, completed_at, archived_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                source_type=excluded.source_type,
+                source_ref=excluded.source_ref,
+                source_hash=excluded.source_hash,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                status=excluded.status,
+                mode=excluded.mode,
+                priority=excluded.priority,
+                due_at=excluded.due_at,
+                local_date=excluded.local_date,
+                timezone=excluded.timezone,
+                privacy_level=excluded.privacy_level,
+                tags_json=excluded.tags_json,
+                related_work_items_json=excluded.related_work_items_json,
+                related_tasks_json=excluded.related_tasks_json,
+                related_import_batches_json=excluded.related_import_batches_json,
+                file_refs_json=excluded.file_refs_json,
+                db_refs_json=excluded.db_refs_json,
+                event_id=excluded.event_id,
+                provenance_json=excluded.provenance_json,
+                completed_at=excluded.completed_at,
+                archived_at=excluded.archived_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["task_id"],
+                payload["source_type"],
+                payload["source_ref"],
+                payload["source_hash"],
+                payload["title"],
+                payload["body_excerpt"],
+                payload["status"],
+                payload["mode"],
+                payload["priority"],
+                payload["due_at"],
+                payload["local_date"],
+                payload["timezone"],
+                payload["privacy_level"],
+                json.dumps(payload["tags"], ensure_ascii=True),
+                json.dumps(payload["related_work_items"], ensure_ascii=True),
+                json.dumps(payload["related_tasks"], ensure_ascii=True),
+                json.dumps(payload["related_import_batches"], ensure_ascii=True),
+                json.dumps(file_refs, ensure_ascii=True),
+                json.dumps(
+                    [
+                        f"personal_events:{payload['event_id']}",
+                        f"personal_time_audit:{audit_id}",
+                    ],
+                    ensure_ascii=True,
+                ),
+                payload["event_id"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                completed_at,
+                archived_at,
+                created_at,
+                now,
+            ),
+        )
+        task_row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (payload["task_id"],)
+        ).fetchone()
+        event_row = _upsert_task_event(
+            conn,
+            payload,
+            file_refs=file_refs,
+            audit_id=audit_id,
+            now=now,
+            created_at=created_at,
+        )
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action=action,
+            target_ref=f"personal_time_tasks:{payload['task_id']}",
+            file_ref=file_refs[0],
+            db_ref=f"personal_time_tasks:{payload['task_id']}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=payload["source_hash"],
+            metadata={
+                "task_id": payload["task_id"],
+                "event_id": payload["event_id"],
+                "status": payload["status"],
+                "mode": payload["mode"],
+            },
+        )
+        gen = increment_gen(conn, "personal-task")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_sources", "manual-task", dict(source_row), gen
+        )
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_time_tasks", payload["task_id"], dict(task_row), gen
+        )
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_events", payload["event_id"], dict(event_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "task": _row_to_task(task_row),
+        "event": _row_to_event(event_row),
+        "audit": {"audit_id": audit_id, "result": "ok", "action": action},
+        "write": {"file_refs": file_refs},
+    }
+
+
+def _task_mode_where(mode: str | None) -> tuple[list[str], list[Any]]:
+    if not mode:
+        return [], []
+    if mode not in {"today", "personal", "work", "blocked", "review", "done"}:
+        raise HTTPException(400, f"unknown task mode: {mode}")
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    if mode == "today":
+        return ["local_date = ?", "status IN ('open', 'blocked', 'pending_review')"], [today]
+    if mode == "personal":
+        return ["mode = 'personal'", "status NOT IN ('done', 'archived')"], []
+    if mode == "work":
+        return ["(mode = 'work' OR json_array_length(related_work_items_json) > 0)"], []
+    if mode == "blocked":
+        return ["status = 'blocked'"], []
+    if mode == "review":
+        return ["(mode = 'review' OR status = 'pending_review')"], []
+    return ["status IN ('done', 'archived')"], []
+
+
+def _event_task_where(mode: str | None) -> tuple[list[str], list[Any]]:
+    where = [
+        "source_type != 'manual-task'",
+        "(kind IN ('todo', 'task', 'action', 'reminder') "
+        "OR EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value IN ('todo', 'follow-up')))",
+    ]
+    params: list[Any] = []
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    if mode == "today":
+        where.extend(["local_date = ?", "status IN ('open', 'blocked', 'pending_review')"])
+        params.append(today)
+    elif mode == "personal":
+        where.append(
+            "source_type IN ('manual', 'diary-file', 'manual-calendar', 'hermes-minutes', 'browser-links')"
+        )
+        where.append("json_array_length(related_work_items_json) = 0")
+        where.append("status NOT IN ('done', 'archived')")
+    elif mode == "work":
+        where.append(
+            "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
+        )
+    elif mode == "blocked":
+        where.append("status = 'blocked'")
+    elif mode == "review":
+        where.append("(status = 'pending_review' OR provenance_state = 'needs_review')")
+    elif mode == "done":
+        where.append("status IN ('done', 'completed', 'archived')")
+    elif mode:
+        raise HTTPException(400, f"unknown task mode: {mode}")
+    return where, params
+
+
+def _task_counts(conn: Any) -> dict[str, int]:
+    counts = {"today": 0, "personal": 0, "work": 0, "blocked": 0, "review": 0, "done": 0}
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    today_row = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM personal_time_tasks
+        WHERE local_date=? AND status IN ('open', 'blocked', 'pending_review')
+        """,
+        (today,),
+    ).fetchone()
+    counts["today"] = int(today_row["count"] if today_row else 0)
+    rows = conn.execute(
+        "SELECT status, mode, COUNT(*) AS count FROM personal_time_tasks GROUP BY status, mode"
+    ).fetchall()
+    for row in rows:
+        status = row["status"]
+        mode = row["mode"]
+        count = int(row["count"])
+        if mode in {"personal", "work", "review"} and status not in {"done", "archived"}:
+            counts[mode] += count
+        if status == "blocked":
+            counts["blocked"] += count
+        if status in {"done", "archived"}:
+            counts["done"] += count
+    return counts
 
 
 def _calendar_event_payload(
