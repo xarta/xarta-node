@@ -218,6 +218,16 @@ class WorkItemActionRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkItemLinkCreateRequest(BaseModel):
+    target_item_id: str
+    link_type: str = "related"
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkIssueUpsertRequest(BaseModel):
     item_id: str
     issue_id: str | None = None
@@ -242,6 +252,19 @@ class WorkTodoUpsertRequest(BaseModel):
     priority_id: str = "medium"
     due_at: str | None = None
     related_task_id: str | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkBlockerUpsertRequest(BaseModel):
+    item_id: str
+    blocker_id: str | None = None
+    title: str
+    body: str | None = None
+    status: str = "open"
+    blocked_by_ref: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -2042,6 +2065,24 @@ def _work_scope_item_ids(conn: Any, item_id: str | None) -> list[str]:
     return [row["item_id"] for row in rows]
 
 
+def _work_breadcrumbs(conn: Any, item_id: str | None) -> list[dict[str, Any]]:
+    current = _clean_short_text(item_id, "", limit=180)
+    if not current:
+        return []
+    rows: list[Any] = []
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            raise HTTPException(400, "work item parent cycle detected")
+        seen.add(current)
+        row = _work_item_or_404(conn, current)
+        rows.append(row)
+        current = row["parent_item_id"]
+        if len(rows) > WORK_DEPTH_LIMIT + 2:
+            raise HTTPException(400, "work item parent cycle detected")
+    return [_row_to_work_item(row) for row in reversed(rows)]
+
+
 def _work_rollup(conn: Any, item_id: str | None = None) -> dict[str, Any]:
     item_ids = _work_scope_item_ids(conn, item_id)
     if not item_ids:
@@ -2094,6 +2135,10 @@ def _work_rollup(conn: Any, item_id: str | None = None) -> dict[str, Any]:
 def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[str, Any]:
     parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
     parent = _work_item_or_404(conn, parent_id) if parent_id else None
+    breadcrumbs = _work_breadcrumbs(conn, parent_id)
+    remaining_depth = (
+        max(0, WORK_DEPTH_LIMIT - int(parent["depth"])) if parent is not None else WORK_DEPTH_LIMIT
+    )
     states = conn.execute("SELECT * FROM work_item_states ORDER BY sort_order, state_id").fetchall()
     if parent_id:
         rows = conn.execute(
@@ -2120,6 +2165,8 @@ def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[st
         "board": {
             "parent": _row_to_work_item(parent) if parent else None,
             "depth_limit": WORK_DEPTH_LIMIT,
+            "remaining_depth": remaining_depth,
+            "breadcrumbs": breadcrumbs,
             "columns": [
                 {"state": _row_to_work_state(state), "items": items_by_state[state["state_id"]]}
                 for state in states
@@ -2349,6 +2396,9 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "item": _row_to_work_item(item),
+            "breadcrumbs": _work_breadcrumbs(conn, item_id),
+            "depth_limit": WORK_DEPTH_LIMIT,
+            "remaining_depth": max(0, WORK_DEPTH_LIMIT - int(item["depth"])),
             "children": [_row_to_work_item(row) for row in children],
             "issues": [_row_to_work_issue(row) for row in issues],
             "todos": [_row_to_work_todo(row) for row in todos],
@@ -2378,6 +2428,15 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 for row in audit
             ],
             "rollup": _work_rollup(conn, item_id),
+            "counts": {
+                "children": len(children),
+                "issues": len(issues),
+                "todos": len(todos),
+                "blockers": len(blockers),
+                "links": len(links),
+                "audit": len(audit),
+                "discussions": len(discussions),
+            },
         }
 
 
@@ -2652,6 +2711,103 @@ async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
         return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
 
 
+def _clean_work_link_type(value: str | None) -> str:
+    link_type = _clean_short_text(value, "related", limit=60)
+    if link_type not in {
+        "related",
+        "depends_on",
+        "blocks",
+        "duplicates",
+        "references",
+        "split_from",
+    }:
+        raise HTTPException(400, "work item link type is invalid")
+    return link_type
+
+
+@router.post("/work/items/{item_id}/links")
+async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    source_item_id = _clean_short_text(item_id, "", limit=180)
+    target_item_id = _clean_short_text(body.target_item_id, "", limit=180)
+    if not source_item_id or not target_item_id:
+        raise HTTPException(400, "source and target work item ids are required")
+    if source_item_id == target_item_id:
+        raise HTTPException(400, "work item link target must be a different item")
+    link_type = _clean_work_link_type(body.link_type)
+    metadata = body.metadata if isinstance(body.metadata, dict) else {}
+    link_id = _clean_work_id(
+        metadata.get("link_id") if isinstance(metadata.get("link_id"), str) else None,
+        "work-link",
+    )
+    row = {
+        "link_id": link_id,
+        "source_item_id": source_item_id,
+        "target_item_id": target_item_id,
+        "link_type": link_type,
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+        "created_at": now,
+        "updated_at": now,
+    }
+    source_hash = _hash_json_payload(row)
+    with get_conn() as conn:
+        source = _work_item_or_404(conn, source_item_id)
+        _work_item_or_404(conn, target_item_id)
+        conn.execute(
+            """
+            INSERT INTO work_item_links (
+                link_id, source_item_id, target_item_id, link_type, metadata_json,
+                created_at, updated_at
+            )
+            VALUES (
+                :link_id, :source_item_id, :target_item_id, :link_type,
+                :metadata_json, :created_at, :updated_at
+            )
+            """,
+            row,
+        )
+        link_row = conn.execute(
+            "SELECT * FROM work_item_links WHERE link_id=?", (link_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="create_work_item_link",
+            target_ref=f"work_item_links:{link_id}",
+            item_id=source_item_id,
+            parent_item_id=source["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "target_item_id": target_item_id,
+                "link_type": link_type,
+            },
+        )
+        gen = increment_gen(conn, "work-item-link")
+        enqueue_for_all_peers(conn, "UPDATE", "work_item_links", link_id, dict(link_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "link": {
+            "link_id": link_row["link_id"],
+            "source_item_id": link_row["source_item_id"],
+            "target_item_id": link_row["target_item_id"],
+            "link_type": link_row["link_type"],
+            "metadata": _json_value(link_row["metadata_json"], {}),
+            "created_at": link_row["created_at"],
+            "updated_at": link_row["updated_at"],
+        },
+        "audit": {"audit_id": audit_id, "action": "create_work_item_link", "result": "ok"},
+    }
+
+
 def _clean_work_leaf_status(value: str | None, *, default: str = "open") -> str:
     status = _clean_short_text(value, default, limit=40)
     if status not in {
@@ -2662,6 +2818,7 @@ def _clean_work_leaf_status(value: str | None, *, default: str = "open") -> str:
         "closed",
         "archived",
         "promoted",
+        "resolved",
     }:
         raise HTTPException(400, "work leaf status is invalid")
     return status
@@ -2910,6 +3067,126 @@ async def create_work_todo(body: WorkTodoUpsertRequest) -> dict[str, Any]:
 @router.patch("/work/todos/{todo_id}")
 async def update_work_todo(todo_id: str, body: WorkTodoUpsertRequest) -> dict[str, Any]:
     return _upsert_work_todo(body, todo_id=todo_id, action="update_work_todo")
+
+
+def _upsert_work_blocker(
+    body: WorkBlockerUpsertRequest,
+    *,
+    blocker_id: str | None = None,
+    action: str,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_blocker_id = _clean_work_id(blocker_id or body.blocker_id, "blocker")
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, body.item_id)
+        title = _clean_short_text(body.title, "", limit=180)
+        if not title:
+            raise HTTPException(400, "work blocker title is required")
+        body_excerpt = _body_excerpt(body.body or "", limit=4000)
+        blocked_by_ref = _clean_short_text(body.blocked_by_ref, "", limit=220)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_blockers",
+            row_id=clean_blocker_id,
+            kind="blocker",
+            title=title,
+            body=body_excerpt,
+            related_refs=[blocked_by_ref] if blocked_by_ref else [],
+        )
+        provenance = {"blocker": {"item_id": body.item_id}, **meta}
+        source_hash = _hash_json_payload(
+            {
+                "blocker_id": clean_blocker_id,
+                "item_id": body.item_id,
+                "title": title,
+                "body": body_excerpt,
+                "status": body.status,
+                "blocked_by_ref": blocked_by_ref,
+            }
+        )
+        previous = conn.execute(
+            "SELECT created_at FROM work_blockers WHERE blocker_id=?", (clean_blocker_id,)
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO work_blockers (
+                blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+                search_text, search_metadata_json, embedding_ref, embedding_model,
+                embedding_updated_at, vector_index_key, provenance_json, created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+            ON CONFLICT(blocker_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                status=excluded.status,
+                blocked_by_ref=excluded.blocked_by_ref,
+                search_text=excluded.search_text,
+                search_metadata_json=excluded.search_metadata_json,
+                vector_index_key=excluded.vector_index_key,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                clean_blocker_id,
+                body.item_id,
+                title,
+                body_excerpt,
+                _clean_work_leaf_status(body.status),
+                blocked_by_ref,
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                now,
+            ),
+        )
+        blocker_row = conn.execute(
+            "SELECT * FROM work_blockers WHERE blocker_id=?", (clean_blocker_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action=action,
+            target_ref=f"work_blockers:{clean_blocker_id}",
+            item_id=body.item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "status": blocker_row["status"],
+                "blocked_by_ref": blocker_row["blocked_by_ref"],
+            },
+        )
+        gen = increment_gen(conn, "work-blocker")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "work_blockers", clean_blocker_id, dict(blocker_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "blocker": _row_to_work_blocker(blocker_row),
+        "audit": {"audit_id": audit_id, "action": action, "result": "ok"},
+    }
+
+
+@router.post("/work/blockers")
+async def create_work_blocker(body: WorkBlockerUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_blocker(body, action="create_work_blocker")
+
+
+@router.patch("/work/blockers/{blocker_id}")
+async def update_work_blocker(blocker_id: str, body: WorkBlockerUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_blocker(body, blocker_id=blocker_id, action="update_work_blocker")
 
 
 def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:

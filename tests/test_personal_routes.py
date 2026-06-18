@@ -1282,10 +1282,55 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         == "promoted"
     )
 
+    child_board = asyncio.run(routes_personal.get_work_child_board("work-root"))
+    assert child_board["board"]["parent"]["item_id"] == "work-root"
+    assert [item["item_id"] for item in child_board["board"]["breadcrumbs"]] == ["work-root"]
+    assert child_board["board"]["remaining_depth"] == 12
+
+    link = asyncio.run(
+        routes_personal.create_work_item_link(
+            "work-root",
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id=promoted["item_id"],
+                link_type="related",
+                metadata={"proof_step": 18},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="link-create",
+            ),
+        )
+    )["link"]
+    assert link["source_item_id"] == "work-root"
+    assert link["target_item_id"] == promoted["item_id"]
+    assert link["metadata"]["proof_step"] == 18
+
+    blocker = asyncio.run(
+        routes_personal.create_work_blocker(
+            routes_personal.WorkBlockerUpsertRequest(
+                blocker_id="blocker-step18",
+                item_id="work-root",
+                title="Step 18 blocker",
+                body="Blocker proof",
+                blocked_by_ref=f"work_items:{promoted['item_id']}",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="blocker-create",
+            )
+        )
+    )["blocker"]
+    assert blocker["vector"]["index_key"] == "work_blockers:blocker-step18"
+    assert blocker["blocked_by_ref"] == f"work_items:{promoted['item_id']}"
+
     detail = asyncio.run(routes_personal.get_work_item_detail("work-root"))
     assert detail["rollup"]["items"]["total"] >= 2
+    assert [item["item_id"] for item in detail["breadcrumbs"]] == ["work-root"]
+    assert detail["remaining_depth"] == 12
     assert detail["issues"][0]["issue_id"] == "issue-step16"
     assert detail["todos"][0]["todo_id"] == "todo-step16"
+    assert detail["links"][0]["link_id"] == link["link_id"]
+    assert detail["blockers"][0]["blocker_id"] == "blocker-step18"
+    assert detail["counts"]["links"] == 1
+    assert detail["counts"]["blockers"] == 1
 
     audit_actions = {
         row["action"] for row in conn.execute("SELECT action FROM work_audit_log").fetchall()
@@ -1296,11 +1341,20 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         "create_work_issue",
         "create_work_todo",
         "promote_work_item",
+        "create_work_item_link",
+        "create_work_blocker",
     }.issubset(audit_actions)
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
-    assert {"work_items", "work_issues", "work_todos", "work_audit_log"}.issubset(sync_tables)
+    assert {
+        "work_items",
+        "work_item_links",
+        "work_issues",
+        "work_todos",
+        "work_blockers",
+        "work_audit_log",
+    }.issubset(sync_tables)
 
 
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):

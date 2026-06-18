@@ -1956,16 +1956,30 @@ def _clean_active_browser_todo(raw: Any) -> dict[str, Any]:
 def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
     kanban = raw if isinstance(raw, dict) else {}
     card_fsm = kanban.get("card_fsm") if isinstance(kanban.get("card_fsm"), dict) else {}
+    breadcrumb_labels = kanban.get("breadcrumb_labels")
+    if not isinstance(breadcrumb_labels, list):
+        breadcrumb_labels = []
     return {
         "loaded": bool(kanban.get("loaded")),
         "loading": bool(kanban.get("loading")),
         "status": _clean_string(kanban.get("status"), "", 40),
         "current_parent_id": _clean_string(kanban.get("current_parent_id"), "", 180),
+        "breadcrumb_depth": _clean_browser_page_int(kanban.get("breadcrumb_depth"), maximum=14),
+        "breadcrumb_labels": [_clean_string(label, "", 120) for label in breadcrumb_labels[:14]],
         "column_count": _clean_browser_page_int(kanban.get("column_count"), maximum=100),
         "item_count": _clean_browser_page_int(kanban.get("item_count"), maximum=5000),
         "selected_item_id": _clean_string(kanban.get("selected_item_id"), "", 180),
         "selected_state": _clean_string(kanban.get("selected_state"), "", 80),
+        "detail_open": bool(kanban.get("detail_open")),
+        "detail_item_id": _clean_string(kanban.get("detail_item_id"), "", 180),
+        "detail_state": _clean_string(kanban.get("detail_state"), "", 80),
+        "depth_remaining": _clean_browser_page_int(kanban.get("depth_remaining"), maximum=12),
+        "child_count": _clean_browser_page_int(kanban.get("child_count"), maximum=5000),
+        "link_count": _clean_browser_page_int(kanban.get("link_count"), maximum=5000),
+        "blocker_count": _clean_browser_page_int(kanban.get("blocker_count"), maximum=5000),
         "last_write_item_id": _clean_string(kanban.get("last_write_item_id"), "", 180),
+        "last_write_link_id": _clean_string(kanban.get("last_write_link_id"), "", 180),
+        "last_write_blocker_id": _clean_string(kanban.get("last_write_blocker_id"), "", 180),
         "card_fsm": {
             "state": _clean_string(card_fsm.get("state"), "", 80),
             "lastEvent": _clean_string(card_fsm.get("lastEvent"), "", 120),
