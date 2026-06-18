@@ -5,6 +5,7 @@ GET    /api/v1/embed-menu-items?context=<ctx>      → filtered list
 GET    /api/v1/embed-menu-items/config?context=<ctx> → sanitized selector pages payload
 GET    /api/v1/embed-menu-items/{item_id}          → EmbedMenuItemOut
 PUT    /api/v1/embed-menu-items/{item_id}          → EmbedMenuItemOut
+DELETE /api/v1/embed-menu-items/{item_id}          → 204
 POST   /api/v1/embed-menu-items/seed              → idempotent seed from defaults
 
 menu_context values: 'embed' | 'fallback-ui' | 'db' | 'pockettts'
@@ -23,6 +24,7 @@ All data writes call enqueue_for_all_peers() for fleet sync.
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
+from starlette.responses import Response
 
 from .db import get_conn, increment_gen
 from .models import EmbedMenuItemOut, EmbedMenuItemUpdate
@@ -30,7 +32,7 @@ from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/embed-menu-items", tags=["embed-menu-items"])
 
-_VALID_CONTEXTS = {'embed', 'fallback-ui', 'db', 'pockettts'}
+_VALID_CONTEXTS = {"embed", "fallback-ui", "db", "pockettts"}
 
 _DEFAULT_SEED = [
     # ── context: embed ──────────────────────────────────────────────────────
@@ -159,22 +161,12 @@ _DEFAULT_SEED = [
         "menu_context": "fallback-ui",
     },
     {
-        "item_key": "diag-chip",
-        "label": "Toggle Diagnostics Chip",
-        "icon_emoji": "⎍",
-        "icon_asset": "icons/ui/monitor-gold.svg",
-        "page_index": 0,
-        "sort_order": 3,
-        "enabled": 1,
-        "menu_context": "fallback-ui",
-    },
-    {
         "item_key": "hard-refresh",
         "label": "Hard Refresh App Assets",
         "icon_emoji": "⟳",
         "icon_asset": "icons/hieroglyphs/rope-coil-gold.svg",
-        "page_index": 0,
-        "sort_order": 4,
+        "page_index": 1,
+        "sort_order": 0,
         "enabled": 1,
         "menu_context": "fallback-ui",
     },
@@ -304,7 +296,9 @@ def _row_to_out(row) -> EmbedMenuItemOut:
     item_id = row["item_id"] if row["item_id"] else str(uuid.uuid4())
     item_key = row["item_key"] if row["item_key"] is not None else ""
     label = row["label"] if row["label"] is not None else ""
-    menu_context = row["menu_context"] if "menu_context" in row.keys() and row["menu_context"] else "embed"
+    menu_context = (
+        row["menu_context"] if "menu_context" in row.keys() and row["menu_context"] else "embed"
+    )
     return EmbedMenuItemOut(
         item_id=item_id,
         item_key=item_key,
@@ -340,7 +334,9 @@ def _row_to_dict(row) -> dict:
 
 @router.get("", response_model=list[EmbedMenuItemOut])
 async def list_embed_menu_items(
-    context: str = Query(default=None, description="Filter by menu_context (embed/fallback-ui/db/pockettts)")
+    context: str = Query(
+        default=None, description="Filter by menu_context (embed/fallback-ui/db/pockettts)"
+    ),
 ) -> list[EmbedMenuItemOut]:
     with get_conn() as conn:
         if context and context in _VALID_CONTEXTS:
@@ -364,7 +360,9 @@ async def list_embed_menu_items(
 
 @router.get("/config")
 async def get_embed_menu_config(
-    context: str = Query(default="embed", description="menu_context: embed / fallback-ui / db / pockettts"),
+    context: str = Query(
+        default="embed", description="menu_context: embed / fallback-ui / db / pockettts"
+    ),
 ) -> dict:
     """Return sanitized selector pages payload with icon/label/sound metadata.
 
@@ -389,14 +387,18 @@ async def get_embed_menu_config(
         # Always also fetch 'embed' context rows (shared controls such as
         # embed-menu, api-key, etc.) and append them after context-specific pages.
         # When context IS 'embed' the extra query returns nothing new.
-        embed_rows = conn.execute(
-            """
+        embed_rows = (
+            conn.execute(
+                """
             SELECT item_key, icon_asset, label, sound_asset, page_index, sort_order, updated_at
             FROM embed_menu_items
             WHERE enabled=1 AND menu_context='embed'
             ORDER BY page_index, sort_order, item_key
             """,
-        ).fetchall() if context != "embed" else []
+            ).fetchall()
+            if context != "embed"
+            else []
+        )
 
     _PLACEHOLDER_ITEM: dict = {"key": "placeholder-circle"}
 
@@ -441,8 +443,10 @@ async def get_embed_menu_config(
     next_page = (max(ctx_pages_map.keys()) + 1) if ctx_pages_map else 0
     # Collect keys already present so embed rows don't duplicate them.
     ctx_keys: set[str] = {
-        item["key"] for page in ctx_pages_map.values()
-        for item in page if item.get("key") != "placeholder-circle"
+        item["key"]
+        for page in ctx_pages_map.values()
+        for item in page
+        if item.get("key") != "placeholder-circle"
     }
 
     embed_pages_map, embed_updated = {}, ""
@@ -474,7 +478,9 @@ async def get_embed_menu_config(
             new_pidx = next_page + orig_pidx
             slot_map = raw_embed_sparse[orig_pidx]
             max_sort = max(slot_map.keys())
-            embed_pages_map[new_pidx] = [slot_map.get(i, _PLACEHOLDER_ITEM) for i in range(max_sort + 1)]
+            embed_pages_map[new_pidx] = [
+                slot_map.get(i, _PLACEHOLDER_ITEM) for i in range(max_sort + 1)
+            ]
 
     combined = {**ctx_pages_map, **embed_pages_map}
     last_updated = max(ctx_updated, embed_updated)
@@ -554,6 +560,21 @@ async def update_embed_menu_item(item_id: str, body: EmbedMenuItemUpdate) -> Emb
     return _row_to_out(row)
 
 
+@router.delete("/{item_id}", status_code=204)
+async def delete_embed_menu_item(item_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM embed_menu_items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "embed menu item not found")
+        conn.execute("DELETE FROM embed_menu_items WHERE item_id=?", (item_id,))
+        gen = increment_gen(conn, "human")
+        enqueue_for_all_peers(conn, "DELETE", "embed_menu_items", item_id, {}, gen)
+    return Response(status_code=204)
+
+
 @router.post("/seed")
 async def seed_embed_menu_items() -> dict:
     inserted = 0
@@ -595,6 +616,8 @@ async def seed_embed_menu_items() -> dict:
                 "SELECT * FROM embed_menu_items WHERE item_id=?",
                 (item_id,),
             ).fetchone()
-            enqueue_for_all_peers(conn, "INSERT", "embed_menu_items", item_id, _row_to_dict(row), gen)
+            enqueue_for_all_peers(
+                conn, "INSERT", "embed_menu_items", item_id, _row_to_dict(row), gen
+            )
             inserted += 1
     return {"inserted": inserted, "skipped": skipped}
