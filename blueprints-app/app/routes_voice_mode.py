@@ -1953,6 +1953,31 @@ def _clean_active_browser_todo(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
+    kanban = raw if isinstance(raw, dict) else {}
+    card_fsm = kanban.get("card_fsm") if isinstance(kanban.get("card_fsm"), dict) else {}
+    return {
+        "loaded": bool(kanban.get("loaded")),
+        "loading": bool(kanban.get("loading")),
+        "status": _clean_string(kanban.get("status"), "", 40),
+        "current_parent_id": _clean_string(kanban.get("current_parent_id"), "", 180),
+        "column_count": _clean_browser_page_int(kanban.get("column_count"), maximum=100),
+        "item_count": _clean_browser_page_int(kanban.get("item_count"), maximum=5000),
+        "selected_item_id": _clean_string(kanban.get("selected_item_id"), "", 180),
+        "selected_state": _clean_string(kanban.get("selected_state"), "", 80),
+        "last_write_item_id": _clean_string(kanban.get("last_write_item_id"), "", 180),
+        "card_fsm": {
+            "state": _clean_string(card_fsm.get("state"), "", 80),
+            "lastEvent": _clean_string(card_fsm.get("lastEvent"), "", 120),
+            "itemId": _clean_string(card_fsm.get("itemId"), "", 180),
+        },
+        "rollup_total": _clean_browser_page_int(kanban.get("rollup_total"), maximum=5000),
+        "issue_count": _clean_browser_page_int(kanban.get("issue_count"), maximum=5000),
+        "todo_count": _clean_browser_page_int(kanban.get("todo_count"), maximum=5000),
+        "error": _clean_string(kanban.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
@@ -2011,6 +2036,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
             "diary_day": _clean_active_browser_diary_day(surfaces.get("diary_day")),
             "calendar": _clean_active_browser_calendar(surfaces.get("calendar")),
             "todo": _clean_active_browser_todo(surfaces.get("todo")),
+            "kanban": _clean_active_browser_kanban(surfaces.get("kanban")),
             "imports_dashboard": _clean_active_browser_imports_dashboard(
                 surfaces.get("imports_dashboard")
             ),
