@@ -8,13 +8,15 @@ import json
 import os
 import posixpath
 import re
+import sqlite3
 import subprocess
 import sys
 import uuid
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
@@ -111,6 +113,16 @@ class DiaryMinutesProjectRequest(BaseModel):
     source_owner: str = ""
     actor: str = "blueprints-api"
     source_surface: str = "minutes-projection"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class DiaryBrowserLinksProjectRequest(BaseModel):
+    local_date: str | None = None
+    timezone: str | None = None
+    limit: int = 1000
+    actor: str = "blueprints-api"
+    source_surface: str = "browser-links-projection"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -792,6 +804,11 @@ async def project_diary_day_minutes(body: DiaryMinutesProjectRequest) -> dict[st
     return _project_hermes_minutes(body)
 
 
+@router.post("/diary-day/browser-links-project")
+async def project_diary_day_browser_links(body: DiaryBrowserLinksProjectRequest) -> dict[str, Any]:
+    return await _project_browser_links(body)
+
+
 def _update_source_ledger(
     module: Any,
     *,
@@ -845,6 +862,8 @@ STRUCTURED_MARKER_START = "<!-- xarta-diary:structured-files:start -->"
 STRUCTURED_MARKER_END = "<!-- xarta-diary:structured-files:end -->"
 HERMES_MINUTES_FILE = "hermes-minutes.json"
 HERMES_MINUTES_SCHEMA = "xarta.diary.hermes_minutes_projection.v1"
+BROWSER_LINKS_FILE = "browser-links-visits.json"
+BROWSER_LINKS_SCHEMA = "xarta.diary.browser_links.v1"
 
 
 def _hash_json_payload(value: Any) -> str:
@@ -1067,12 +1086,19 @@ def _select_minutes_entries(
     return "ok", source_path, source_hash, ordered
 
 
-def _upsert_index_structured_file(module: Any, day_dir: Path, owner: Any) -> None:
+def _upsert_index_structured_file(
+    module: Any,
+    day_dir: Path,
+    owner: Any,
+    *,
+    filename: str = HERMES_MINUTES_FILE,
+    label: str = "Hermes Minutes projection",
+) -> None:
     index_path = day_dir / "events-index.md"
     if not index_path.exists():
         return
     text = index_path.read_text(encoding="utf-8")
-    line = f"- `{HERMES_MINUTES_FILE}` - Hermes Minutes projection"
+    line = f"- `{filename}` - {label}"
     if line in text:
         return
     if STRUCTURED_MARKER_START in text and STRUCTURED_MARKER_END in text:
@@ -1557,6 +1583,1194 @@ def _project_hermes_minutes(
             "exists": source_path.exists(),
             "content_hash": source_index_hash,
         },
+        "audit": {"audit_id": audit_id, "result": source_status},
+        "day": _build_diary_day_payload(local_date),
+    }
+
+
+def _browser_date_candidates(local_date: str) -> list[str]:
+    base = datetime.strptime(local_date, "%Y-%m-%d")
+    return sorted({(base + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (-1, 0, 1)})
+
+
+def _parse_browser_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    with suppress(ValueError):
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        with suppress(ValueError):
+            parsed = datetime.strptime(text, fmt)
+            return parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _browser_local_datetime(value: Any, timezone_name: str) -> datetime | None:
+    parsed = _parse_browser_datetime(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(ZoneInfo(timezone_name))
+
+
+def _browser_domain(url: str) -> str:
+    with suppress(Exception):
+        return urlparse(url).netloc.lower()
+    return ""
+
+
+def _browser_tags(raw: Any) -> list[str]:
+    parsed = _json_value(str(raw or "[]"), [])
+    if not isinstance(parsed, list):
+        return []
+    tags = []
+    for item in parsed[:24]:
+        text = _compact_text(item, 80)
+        if text and text not in tags:
+            tags.append(text)
+    return tags
+
+
+def _browser_url_hash(value: Any) -> str:
+    text = _compact_text(value, 2000)
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}" if text else ""
+
+
+def _row_get(row: Any, key: str, default: Any = "") -> Any:
+    with suppress(Exception):
+        value = row[key]
+        return default if value is None else value
+    return default
+
+
+def _select_browser_link_entries(
+    conn: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    limit: int,
+) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 1000), 5000))
+    date_candidates = _browser_date_candidates(local_date)
+    placeholders = ",".join("?" for _ in date_candidates)
+    try:
+        bookmark_count = int(conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0])
+        visit_count = int(conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0])
+        visit_event_count = int(conn.execute("SELECT COUNT(*) FROM visit_events").fetchone()[0])
+        event_rows = conn.execute(
+            f"""
+            SELECT
+                e.event_id AS visit_event_id,
+                e.normalized_url AS event_normalized_url,
+                e.visited_at AS event_visited_at,
+                e.dwell_seconds AS event_dwell_seconds,
+                v.visit_id,
+                v.url,
+                v.normalized_url,
+                v.domain,
+                v.title,
+                v.source,
+                v.dwell_seconds AS visit_dwell_seconds,
+                v.bookmark_id,
+                v.visited_at AS visit_last_seen_at,
+                v.visit_count
+            FROM visit_events e
+            LEFT JOIN visits v ON v.normalized_url = e.normalized_url
+            WHERE substr(e.visited_at, 1, 10) IN ({placeholders})
+            ORDER BY e.visited_at ASC, e.event_id ASC
+            LIMIT ?
+            """,
+            (*date_candidates, safe_limit),
+        ).fetchall()
+        bookmark_rows = conn.execute(
+            f"""
+            SELECT bookmark_id, url, normalized_url, title, tags_json, folder, source,
+                   archived, created_at, updated_at
+            FROM bookmarks
+            WHERE substr(created_at, 1, 10) IN ({placeholders})
+            ORDER BY created_at ASC, bookmark_id ASC
+            LIMIT ?
+            """,
+            (*date_candidates, safe_limit),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return {
+            "status": "source_unavailable",
+            "health": {
+                "status": "source_unavailable",
+                "sqlite": "error",
+                "sqlite_error": _compact_text(exc, 180),
+                "bookmark_count": 0,
+                "visit_count": 0,
+                "visit_event_count": 0,
+            },
+            "visits": [],
+            "bookmarks": [],
+            "initiation": {},
+            "limited": False,
+        }
+
+    visits_by_url: dict[str, dict[str, Any]] = {}
+    for row in event_rows:
+        local_moment = _browser_local_datetime(_row_get(row, "event_visited_at"), timezone_name)
+        if local_moment is None or local_moment.strftime("%Y-%m-%d") != local_date:
+            continue
+        normalized_url = _compact_text(
+            _row_get(row, "normalized_url") or _row_get(row, "event_normalized_url"), 2000
+        )
+        if not normalized_url:
+            continue
+        url = _compact_text(_row_get(row, "url") or normalized_url, 2000)
+        bucket = visits_by_url.setdefault(
+            normalized_url,
+            {
+                "normalized_url": normalized_url,
+                "url": url,
+                "url_hash": _browser_url_hash(normalized_url),
+                "domain": _compact_text(_row_get(row, "domain") or _browser_domain(url), 180),
+                "title": _compact_text(_row_get(row, "title"), 180),
+                "source": _compact_text(_row_get(row, "source") or "visit-recorder", 80),
+                "visit_ids": [],
+                "visit_event_ids": [],
+                "bookmark_ids": [],
+                "visited_at_values": [],
+                "local_times": [],
+                "dwell_seconds_total": 0,
+                "source_hashes": [],
+            },
+        )
+        visit_id = _compact_text(_row_get(row, "visit_id"), 120)
+        if visit_id and visit_id not in bucket["visit_ids"]:
+            bucket["visit_ids"].append(visit_id)
+        visit_event_id = _compact_text(_row_get(row, "visit_event_id"), 120)
+        if visit_event_id and visit_event_id not in bucket["visit_event_ids"]:
+            bucket["visit_event_ids"].append(visit_event_id)
+        bookmark_id = _compact_text(_row_get(row, "bookmark_id"), 120)
+        if bookmark_id and bookmark_id not in bucket["bookmark_ids"]:
+            bucket["bookmark_ids"].append(bookmark_id)
+        visited_at = local_moment.astimezone(timezone.utc).replace(microsecond=0)
+        visited_at_text = visited_at.isoformat().replace("+00:00", "Z")
+        bucket["visited_at_values"].append(visited_at_text)
+        bucket["local_times"].append(local_moment.strftime("%H:%M"))
+        dwell = _row_get(row, "event_dwell_seconds")
+        if isinstance(dwell, int):
+            bucket["dwell_seconds_total"] += max(0, dwell)
+        elif str(dwell or "").isdigit():
+            bucket["dwell_seconds_total"] += int(dwell)
+        event_hash = _hash_json_payload(
+            {
+                "visit_event_id": visit_event_id,
+                "normalized_url": normalized_url,
+                "visited_at": visited_at_text,
+                "dwell_seconds": dwell,
+            }
+        )
+        bucket["source_hashes"].append(event_hash)
+
+    visits: list[dict[str, Any]] = []
+    for bucket in visits_by_url.values():
+        source_record_hash = _hash_json_payload(
+            {
+                "normalized_url": bucket["normalized_url"],
+                "visit_event_ids": bucket["visit_event_ids"],
+                "source_hashes": bucket["source_hashes"],
+            }
+        )
+        digest = source_record_hash.removeprefix("sha256:")[:20]
+        first_at = min(bucket["visited_at_values"]) if bucket["visited_at_values"] else ""
+        last_at = max(bucket["visited_at_values"]) if bucket["visited_at_values"] else ""
+        visits.append(
+            {
+                "visit_projection_id": f"browser-links-visit-{local_date}-{digest}",
+                "source_record_hash": source_record_hash,
+                "url": bucket["url"],
+                "normalized_url": bucket["normalized_url"],
+                "url_hash": bucket["url_hash"],
+                "domain": bucket["domain"],
+                "title": bucket["title"],
+                "source": bucket["source"],
+                "visit_count": len(bucket["visit_event_ids"]),
+                "first_visited_at": first_at,
+                "last_visited_at": last_at,
+                "first_local_time": min(bucket["local_times"]) if bucket["local_times"] else "",
+                "last_local_time": max(bucket["local_times"]) if bucket["local_times"] else "",
+                "dwell_seconds_total": bucket["dwell_seconds_total"],
+                "visit_ids": bucket["visit_ids"][:24],
+                "visit_event_ids": bucket["visit_event_ids"][:80],
+                "bookmark_ids": bucket["bookmark_ids"][:12],
+                "source_hashes": bucket["source_hashes"][:80],
+            }
+        )
+    visits.sort(key=lambda item: (item["first_visited_at"], item["domain"], item["url_hash"]))
+
+    bookmarks: list[dict[str, Any]] = []
+    for row in bookmark_rows:
+        local_moment = _browser_local_datetime(_row_get(row, "created_at"), timezone_name)
+        if local_moment is None or local_moment.strftime("%Y-%m-%d") != local_date:
+            continue
+        normalized_url = _compact_text(
+            _row_get(row, "normalized_url") or _row_get(row, "url"), 2000
+        )
+        bookmark_id = _compact_text(_row_get(row, "bookmark_id"), 120)
+        tags = _browser_tags(_row_get(row, "tags_json"))
+        source_record_hash = _hash_json_payload(
+            {
+                "bookmark_id": bookmark_id,
+                "normalized_url": normalized_url,
+                "created_at": _row_get(row, "created_at"),
+                "updated_at": _row_get(row, "updated_at"),
+                "tags": tags,
+                "folder": _row_get(row, "folder"),
+                "source": _row_get(row, "source"),
+            }
+        )
+        digest = source_record_hash.removeprefix("sha256:")[:20]
+        bookmarks.append(
+            {
+                "bookmark_projection_id": f"browser-links-bookmark-{local_date}-{digest}",
+                "source_record_hash": source_record_hash,
+                "bookmark_id": bookmark_id,
+                "url": _compact_text(_row_get(row, "url") or normalized_url, 2000),
+                "normalized_url": normalized_url,
+                "url_hash": _browser_url_hash(normalized_url),
+                "domain": _browser_domain(_row_get(row, "url") or normalized_url),
+                "title": _compact_text(_row_get(row, "title"), 180),
+                "folder": _compact_text(_row_get(row, "folder"), 180),
+                "tags": tags,
+                "source": _compact_text(_row_get(row, "source") or "manual", 80),
+                "archived": bool(_row_get(row, "archived", 0)),
+                "created_at": local_moment.astimezone(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "local_time": local_moment.strftime("%H:%M"),
+                "updated_at": _compact_text(_row_get(row, "updated_at"), 80),
+            }
+        )
+
+    initiation = _browser_links_initiation_summary(conn, local_date=local_date, now=_utc_now_iso())
+    return {
+        "status": "ok",
+        "health": {
+            "status": "ok",
+            "sqlite": "ok",
+            "bookmark_count": bookmark_count,
+            "visit_count": visit_count,
+            "visit_event_count": visit_event_count,
+        },
+        "visits": visits,
+        "bookmarks": bookmarks,
+        "initiation": initiation,
+        "limited": len(event_rows) >= safe_limit or len(bookmark_rows) >= safe_limit,
+    }
+
+
+def _browser_links_initiation_summary(conn: Any, *, local_date: str, now: str) -> dict[str, Any]:
+    try:
+        bookmark_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM bookmarks WHERE substr(created_at, 1, 10) < ?",
+                (local_date,),
+            ).fetchone()[0]
+        )
+        visit_event_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM visit_events WHERE substr(visited_at, 1, 10) < ?",
+                (local_date,),
+            ).fetchone()[0]
+        )
+        bookmark_range = conn.execute(
+            """
+            SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at
+            FROM bookmarks
+            WHERE substr(created_at, 1, 10) < ?
+            """,
+            (local_date,),
+        ).fetchone()
+        visit_range = conn.execute(
+            """
+            SELECT MIN(visited_at) AS first_at, MAX(visited_at) AS last_at
+            FROM visit_events
+            WHERE substr(visited_at, 1, 10) < ?
+            """,
+            (local_date,),
+        ).fetchone()
+        domain_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(v.domain, ''), 'unknown') AS domain, COUNT(*) AS count
+            FROM visit_events e
+            LEFT JOIN visits v ON v.normalized_url = e.normalized_url
+            WHERE substr(e.visited_at, 1, 10) < ?
+            GROUP BY domain
+            ORDER BY count DESC, domain ASC
+            LIMIT 20
+            """,
+            (local_date,),
+        ).fetchall()
+        bookmark_samples = conn.execute(
+            """
+            SELECT bookmark_id, normalized_url, created_at, updated_at
+            FROM bookmarks
+            WHERE substr(created_at, 1, 10) < ?
+            ORDER BY created_at DESC, bookmark_id ASC
+            LIMIT 40
+            """,
+            (local_date,),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    samples = []
+    for row in bookmark_samples:
+        bookmark_id = _compact_text(_row_get(row, "bookmark_id"), 120)
+        normalized_url = _compact_text(_row_get(row, "normalized_url"), 2000)
+        samples.append(
+            {
+                "bookmark_id": bookmark_id,
+                "url_hash": _browser_url_hash(normalized_url),
+                "created_at": _compact_text(_row_get(row, "created_at"), 80),
+                "updated_at": _compact_text(_row_get(row, "updated_at"), 80),
+                "source_record_hash": _hash_json_payload(
+                    {
+                        "bookmark_id": bookmark_id,
+                        "normalized_url": normalized_url,
+                        "created_at": _row_get(row, "created_at"),
+                        "updated_at": _row_get(row, "updated_at"),
+                    }
+                ),
+            }
+        )
+    return {
+        "schema": "xarta.diary.browser_links_initiation_summary.v1",
+        "generated_at_utc": now,
+        "run_date": local_date,
+        "source": "browser-links",
+        "policy": (
+            "Historical Browser Links records stay under _initiation with original source "
+            "timestamps; normal diary days only receive records whose source timestamp maps "
+            "to that day."
+        ),
+        "bookmarks_existing_count": bookmark_count,
+        "visit_events_existing_count": visit_event_count,
+        "bookmark_source_range": {
+            "first_at": _compact_text(_row_get(bookmark_range, "first_at"), 80),
+            "last_at": _compact_text(_row_get(bookmark_range, "last_at"), 80),
+        },
+        "visit_source_range": {
+            "first_at": _compact_text(_row_get(visit_range, "first_at"), 80),
+            "last_at": _compact_text(_row_get(visit_range, "last_at"), 80),
+        },
+        "top_visit_domains": [
+            {"domain": _compact_text(_row_get(row, "domain"), 180), "count": int(row["count"])}
+            for row in domain_rows
+        ],
+        "bookmark_source_samples": samples,
+    }
+
+
+async def _browser_links_search_health(sqlite_health: dict[str, Any]) -> dict[str, Any]:
+    health = dict(sqlite_health)
+    seekdb_ok = "ok"
+    seekdb_err = ""
+    seekdb_indexed = 0
+    visits_indexed = 0
+    try:
+        from .seekdb import seekdb_counts_async
+
+        counts = await seekdb_counts_async(timeout=2.0)
+        seekdb_indexed = int(counts.get("bookmarks_indexed") or 0)
+        visits_indexed = int(counts.get("visits_indexed") or 0)
+    except Exception as exc:
+        from .seekdb import short_seekdb_error
+
+        seekdb_ok = "error"
+        seekdb_err = short_seekdb_error(exc)
+
+    emb_ok = "ok"
+    emb_err = ""
+    try:
+        from .ai_client import embed
+
+        vec = await embed("browser-links", ["health check"])
+        if not vec or len(vec[0]) != 2048:
+            emb_ok = "error"
+            emb_err = "unexpected embedding dimensions"
+    except Exception as exc:
+        from .seekdb import short_seekdb_error
+
+        emb_ok = "error"
+        emb_err = short_seekdb_error(exc)
+
+    bookmark_count = int(health.get("bookmark_count") or 0)
+    visit_count = int(health.get("visit_count") or 0)
+    health.update(
+        {
+            "seekdb": seekdb_ok,
+            "seekdb_error": seekdb_err,
+            "embedding": emb_ok,
+            "embedding_error": emb_err,
+            "seekdb_indexed": seekdb_indexed,
+            "seekdb_stale": max(0, bookmark_count - seekdb_indexed),
+            "seekdb_visits_indexed": visits_indexed,
+            "seekdb_visits_stale": max(0, visit_count - visits_indexed),
+        }
+    )
+    health["status"] = "ok" if seekdb_ok == "ok" and emb_ok == "ok" else "degraded"
+    return health
+
+
+def _browser_links_summary(
+    visits: list[dict[str, Any]], bookmarks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    domain_counts: dict[str, int] = {}
+    for visit in visits:
+        domain = _compact_text(visit.get("domain") or "unknown", 180)
+        domain_counts[domain] = domain_counts.get(domain, 0) + int(visit.get("visit_count") or 0)
+    top_domains = [
+        {"domain": domain, "visit_count": count}
+        for domain, count in sorted(domain_counts.items(), key=lambda item: (-item[1], item[0]))[
+            :12
+        ]
+    ]
+    return {
+        "visit_event_count": sum(int(visit.get("visit_count") or 0) for visit in visits),
+        "visited_page_count": len(visits),
+        "visited_domain_count": len(domain_counts),
+        "bookmark_count": len(bookmarks),
+        "top_domains": top_domains,
+        "first_visit_at": min(
+            (visit.get("first_visited_at") or "" for visit in visits), default=""
+        ),
+        "last_visit_at": max((visit.get("last_visited_at") or "" for visit in visits), default=""),
+        "first_bookmark_at": min((item.get("created_at") or "" for item in bookmarks), default=""),
+        "last_bookmark_at": max((item.get("created_at") or "" for item in bookmarks), default=""),
+    }
+
+
+def _ensure_owned_dir(path: Path, owner: Any) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    with suppress(OSError):
+        path.chmod(0o750)
+    if getattr(owner, "enabled", False):
+        with suppress(OSError):
+            os.chown(path, owner.uid, owner.gid)
+
+
+def _write_browser_links_initiation_files(
+    module: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    initiation: dict[str, Any],
+    now: str,
+    owner: Any,
+) -> dict[str, Any]:
+    if not initiation:
+        return {}
+    initiation_dir = DIARY_ROOT / "_initiation" / local_date / "browser-links"
+    _ensure_owned_dir(initiation_dir, owner)
+    common = {
+        "generated_at_utc": now,
+        "run_date": local_date,
+        "timezone": timezone_name,
+        "source": "browser-links",
+        "policy": initiation["policy"],
+    }
+    visits_path = initiation_dir / "visits-existing-summary.json"
+    bookmarks_path = initiation_dir / "bookmarks-existing.json"
+    index_path = initiation_dir / "initiation-index.md"
+    module.atomic_write_json(
+        visits_path,
+        {
+            **common,
+            "schema": "xarta.diary.browser_links_initiation_visits.v1",
+            "visit_events_existing_count": initiation["visit_events_existing_count"],
+            "visit_source_range": initiation["visit_source_range"],
+            "top_visit_domains": initiation["top_visit_domains"],
+        },
+        owner,
+    )
+    module.atomic_write_json(
+        bookmarks_path,
+        {
+            **common,
+            "schema": "xarta.diary.browser_links_initiation_bookmarks.v1",
+            "bookmarks_existing_count": initiation["bookmarks_existing_count"],
+            "bookmark_source_range": initiation["bookmark_source_range"],
+            "bookmark_source_samples": initiation["bookmark_source_samples"],
+        },
+        owner,
+    )
+    index = (
+        "---\n"
+        "schema: xarta.diary.browser_links_initiation_index.v1\n"
+        f"run_date: {local_date}\n"
+        f"timezone: {timezone_name}\n"
+        "source: browser-links\n"
+        "---\n\n"
+        "# Browser Links Initiation Backfill\n\n"
+        f"{initiation['policy']}\n\n"
+        "## Files\n\n"
+        "- `visits-existing-summary.json` - compact historical visit counts and source ranges\n"
+        "- `bookmarks-existing.json` - compact historical bookmark ids and source hashes\n"
+    )
+    module.atomic_write_text(index_path, index, owner)
+    return {
+        "initiation_dir": _diary_relative_path(initiation_dir),
+        "files": [
+            _diary_relative_path(index_path),
+            _diary_relative_path(visits_path),
+            _diary_relative_path(bookmarks_path),
+        ],
+    }
+
+
+def _update_browser_links_source_ledger(
+    module: Any,
+    *,
+    day_dir: Path,
+    file_ref: str,
+    source_status: str,
+    health: dict[str, Any],
+    visits: list[dict[str, Any]],
+    bookmarks: list[dict[str, Any]],
+    now: str,
+) -> list[str]:
+    ledger_path = day_dir / "source-ledger.json"
+    owner = module.resolve_owner("xarta", "xarta")
+    payload = _read_json_file(ledger_path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    sources = [
+        item
+        for item in sources
+        if not isinstance(item, dict)
+        or not str(item.get("ledger_entry_id") or "").startswith("browser-links:")
+    ]
+    ledger_refs: list[str] = []
+    if source_status == "source_unavailable":
+        entry = {
+            "ledger_entry_id": "browser-links:source-unavailable",
+            "source_type": "browser-links",
+            "source_status": source_status,
+            "file_ref": file_ref,
+            "created_at_utc": now,
+            "health": health,
+            "provenance_state": "missing_source",
+        }
+        sources.append(entry)
+        ledger_refs.append(entry["ledger_entry_id"])
+    for visit in visits:
+        ledger_id = f"browser-links:visit:{visit['visit_projection_id']}"
+        sources.append(
+            {
+                "ledger_entry_id": ledger_id,
+                "source_type": "browser-links",
+                "source_ref": visit.get("normalized_url") or "",
+                "source_hash": visit["source_record_hash"],
+                "url_hash": visit.get("url_hash") or "",
+                "domain": visit.get("domain") or "",
+                "visit_ids": visit.get("visit_ids") or [],
+                "visit_event_ids": visit.get("visit_event_ids") or [],
+                "bookmark_ids": visit.get("bookmark_ids") or [],
+                "file_ref": file_ref,
+                "db_ref": f"personal_events:browser-links-{visit['visit_projection_id']}",
+                "created_at_utc": now,
+                "source_created_at": visit.get("first_visited_at") or "",
+            }
+        )
+        ledger_refs.append(ledger_id)
+    for bookmark in bookmarks:
+        ledger_id = f"browser-links:bookmark:{bookmark['bookmark_projection_id']}"
+        sources.append(
+            {
+                "ledger_entry_id": ledger_id,
+                "source_type": "browser-links",
+                "source_ref": bookmark.get("bookmark_id") or "",
+                "source_hash": bookmark["source_record_hash"],
+                "url_hash": bookmark.get("url_hash") or "",
+                "bookmark_id": bookmark.get("bookmark_id") or "",
+                "file_ref": file_ref,
+                "db_ref": f"personal_events:browser-links-{bookmark['bookmark_projection_id']}",
+                "created_at_utc": now,
+                "source_created_at": bookmark.get("created_at") or "",
+            }
+        )
+        ledger_refs.append(ledger_id)
+    payload.update(
+        {
+            "schema": payload.get("schema") or "xarta.diary.source_ledger.v1",
+            "updated_at_utc": now,
+            "generated_by": "blueprints-personal-api",
+            "sources": sources,
+        }
+    )
+    module.atomic_write_json(ledger_path, payload, owner)
+    return ledger_refs
+
+
+def _write_browser_links_projection_artifacts(
+    module: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    source_status: str,
+    health: dict[str, Any],
+    visits: list[dict[str, Any]],
+    bookmarks: list[dict[str, Any]],
+    initiation: dict[str, Any],
+    limited: bool,
+    now: str,
+) -> dict[str, Any]:
+    owner = module.resolve_owner("xarta", "xarta")
+    day = module.diary_day(root=DIARY_ROOT, local_date=local_date, timezone_name=timezone_name)
+    module.init_day(
+        root=DIARY_ROOT, local_date=local_date, timezone_name=timezone_name, owner=owner
+    )
+    projection_path = day.day_dir / BROWSER_LINKS_FILE
+    summary = _browser_links_summary(visits, bookmarks)
+    initiation_refs = _write_browser_links_initiation_files(
+        module,
+        local_date=local_date,
+        timezone_name=timezone_name,
+        initiation=initiation,
+        now=now,
+        owner=owner,
+    )
+    ledger_refs = _update_browser_links_source_ledger(
+        module,
+        day_dir=day.day_dir,
+        file_ref=_diary_relative_path(projection_path),
+        source_status=source_status,
+        health=health,
+        visits=visits,
+        bookmarks=bookmarks,
+        now=now,
+    )
+    payload = module.browser_links_template(day, generated_by="blueprints-personal-api")
+    payload.update(
+        {
+            "updated_at_utc": now,
+            "status": source_status,
+            "source_health": health,
+            "limited": limited,
+            "summary": summary,
+            "visits": visits,
+            "bookmarks": bookmarks,
+            "initiation_backfill": {
+                "policy": initiation.get("policy", ""),
+                "run_date": local_date,
+                "refs": initiation_refs,
+                "bookmarks_existing_count": initiation.get("bookmarks_existing_count", 0),
+                "visit_events_existing_count": initiation.get("visit_events_existing_count", 0),
+            },
+            "source_ledger_refs": ledger_refs,
+            "projected_event_ids": [
+                event_id
+                for event_id in (
+                    f"browser-links-{local_date}-visits" if visits else "",
+                    f"browser-links-{local_date}-bookmarks" if bookmarks else "",
+                    f"browser-links-{local_date}-source-status"
+                    if source_status in {"degraded", "source_unavailable"}
+                    else "",
+                )
+                if event_id
+            ],
+        }
+    )
+    module.atomic_write_json(projection_path, payload, owner)
+    _upsert_index_structured_file(
+        module,
+        day.day_dir,
+        owner,
+        filename=BROWSER_LINKS_FILE,
+        label="Browser Links projection",
+    )
+    module.write_manifest(day, owner)
+    return {
+        "day": day,
+        "projection_path": projection_path,
+        "file_ref": _diary_relative_path(projection_path),
+        "source_hash": module.sha256_file(projection_path),
+        "summary": summary,
+        "projected_event_ids": payload["projected_event_ids"],
+        "initiation_backfill": payload["initiation_backfill"],
+    }
+
+
+def _upsert_browser_links_source(
+    conn: Any,
+    *,
+    source_status: str,
+    health: dict[str, Any],
+    local_date: str,
+    summary: dict[str, Any],
+    now: str,
+) -> Any:
+    conn.execute(
+        """
+        INSERT INTO personal_sources (
+            source_id, source_type, label, status, last_seen_at, health_json,
+            provenance_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            status=excluded.status,
+            last_seen_at=excluded.last_seen_at,
+            health_json=excluded.health_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            "browser-links",
+            "browser-links",
+            "Browser Links",
+            source_status,
+            now,
+            json.dumps(
+                {
+                    **health,
+                    "local_date": local_date,
+                    "day_summary": summary,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            json.dumps(
+                {
+                    "source_tables": ["bookmarks", "visits", "visit_events"],
+                    "projection_file": BROWSER_LINKS_FILE,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_sources WHERE source_id='browser-links'").fetchone()
+
+
+def _upsert_browser_links_status_event(
+    conn: Any,
+    *,
+    source_status: str,
+    local_date: str,
+    timezone_name: str,
+    file_ref: str,
+    health: dict[str, Any],
+    now: str,
+) -> Any:
+    event_id = f"browser-links-{local_date}-source-status"
+    title = (
+        "Browser Links source unavailable"
+        if source_status == "source_unavailable"
+        else "Browser Links health degraded"
+    )
+    status = "source_unavailable" if source_status == "source_unavailable" else "pending_review"
+    state = "missing_source" if source_status == "source_unavailable" else "needs_review"
+    body = (
+        "Browser Links SQLite tables were unavailable during projection."
+        if source_status == "source_unavailable"
+        else "Browser Links projected SQLite data, but search/index health reported degraded status."
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, local_date, timezone, status, privacy_level,
+            tags_json, file_refs_json, db_refs_json, provenance_json, projection_state,
+            provenance_state, last_rendered_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            content_projection=excluded.content_projection,
+            start_at=excluded.start_at,
+            status=excluded.status,
+            file_refs_json=excluded.file_refs_json,
+            provenance_json=excluded.provenance_json,
+            projection_state=excluded.projection_state,
+            provenance_state=excluded.provenance_state,
+            last_rendered_at=excluded.last_rendered_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            event_id,
+            "browser-links",
+            file_ref,
+            _hash_json_payload(health),
+            "source-status",
+            title,
+            body,
+            json.dumps({"source_status": source_status, "health": health}, ensure_ascii=True),
+            now,
+            local_date,
+            timezone_name,
+            status,
+            "normal",
+            json.dumps(["diary", "browser-links", "source-status"], ensure_ascii=True),
+            json.dumps([file_ref], ensure_ascii=True),
+            json.dumps([], ensure_ascii=True),
+            json.dumps(
+                {
+                    "projection_file": file_ref,
+                    "source_status": source_status,
+                    "health": health,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "hot",
+            state,
+            now,
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+
+
+def _browser_links_event_projection(
+    *,
+    file_ref: str,
+    summary: dict[str, Any],
+    visits: list[dict[str, Any]],
+    bookmarks: list[dict[str, Any]],
+    kind: str,
+) -> dict[str, Any]:
+    if kind == "browser-links-visits":
+        return {
+            "schema": BROWSER_LINKS_SCHEMA,
+            "projection_file": file_ref,
+            "kind": kind,
+            "summary": summary,
+            "top_visits": [
+                {
+                    "visit_projection_id": visit["visit_projection_id"],
+                    "url_hash": visit["url_hash"],
+                    "domain": visit["domain"],
+                    "title": visit["title"],
+                    "visit_count": visit["visit_count"],
+                    "first_visited_at": visit["first_visited_at"],
+                    "last_visited_at": visit["last_visited_at"],
+                }
+                for visit in sorted(
+                    visits, key=lambda item: (-int(item.get("visit_count") or 0), item["domain"])
+                )[:12]
+            ],
+        }
+    return {
+        "schema": BROWSER_LINKS_SCHEMA,
+        "projection_file": file_ref,
+        "kind": kind,
+        "summary": summary,
+        "bookmarks": [
+            {
+                "bookmark_projection_id": item["bookmark_projection_id"],
+                "bookmark_id": item["bookmark_id"],
+                "url_hash": item["url_hash"],
+                "domain": item["domain"],
+                "title": item["title"],
+                "created_at": item["created_at"],
+            }
+            for item in bookmarks[:24]
+        ],
+    }
+
+
+def _upsert_browser_links_aggregate_event(
+    conn: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    file_ref: str,
+    source_hash: str,
+    summary: dict[str, Any],
+    visits: list[dict[str, Any]],
+    bookmarks: list[dict[str, Any]],
+    kind: str,
+    now: str,
+) -> Any:
+    event_id = (
+        f"browser-links-{local_date}-{'visits' if kind == 'browser-links-visits' else 'bookmarks'}"
+    )
+    projection = _browser_links_event_projection(
+        file_ref=file_ref, summary=summary, visits=visits, bookmarks=bookmarks, kind=kind
+    )
+    if kind == "browser-links-visits":
+        title = (
+            f"Browser activity: {summary['visit_event_count']} visit events "
+            f"across {summary['visited_domain_count']} domains"
+        )
+        top_domains = ", ".join(
+            item["domain"] for item in summary.get("top_domains", [])[:4] if item.get("domain")
+        )
+        body = f"{summary['visited_page_count']} pages visited" + (
+            f"; top domains: {top_domains}" if top_domains else ""
+        )
+        start_at = summary.get("first_visit_at") or now
+        end_at = summary.get("last_visit_at") or None
+        db_refs = [
+            f"visit_events:{event_id}"
+            for visit in visits
+            for event_id in visit.get("visit_event_ids", [])[:8]
+        ][:80]
+    else:
+        title = f"Browser bookmarks saved: {summary['bookmark_count']}"
+        body = f"{summary['bookmark_count']} Browser Links bookmarks saved on {local_date}."
+        start_at = summary.get("first_bookmark_at") or now
+        end_at = summary.get("last_bookmark_at") or None
+        db_refs = [f"bookmarks:{item['bookmark_id']}" for item in bookmarks[:80]]
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, end_at, local_date, timezone, status, privacy_level,
+            tags_json, file_refs_json, db_refs_json, provenance_json, projection_state,
+            provenance_state, last_rendered_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            kind=excluded.kind,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            content_projection=excluded.content_projection,
+            start_at=excluded.start_at,
+            end_at=excluded.end_at,
+            local_date=excluded.local_date,
+            timezone=excluded.timezone,
+            status=excluded.status,
+            privacy_level=excluded.privacy_level,
+            tags_json=excluded.tags_json,
+            file_refs_json=excluded.file_refs_json,
+            db_refs_json=excluded.db_refs_json,
+            provenance_json=excluded.provenance_json,
+            projection_state=excluded.projection_state,
+            provenance_state=excluded.provenance_state,
+            last_rendered_at=excluded.last_rendered_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            event_id,
+            "browser-links",
+            file_ref,
+            source_hash,
+            kind,
+            title,
+            body[:500],
+            json.dumps(projection, ensure_ascii=True, sort_keys=True),
+            start_at,
+            end_at,
+            local_date,
+            timezone_name,
+            "open",
+            "normal",
+            json.dumps(["diary", "browser-links", kind], ensure_ascii=True),
+            json.dumps([file_ref], ensure_ascii=True),
+            json.dumps(db_refs, ensure_ascii=True),
+            json.dumps(
+                {
+                    "projection_file": file_ref,
+                    "source_detail_policy": "Use Browser Links source IDs and URL hashes; do not duplicate page bodies.",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "hot",
+            "linked",
+            now,
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+
+
+async def _project_browser_links(body: DiaryBrowserLinksProjectRequest) -> dict[str, Any]:
+    local_date = _validate_local_date(body.local_date)
+    timezone_name = _clean_short_text(
+        body.timezone or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+        "Europe/London",
+        limit=80,
+    )
+    try:
+        ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise HTTPException(400, "timezone is invalid") from exc
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        selected = _select_browser_link_entries(
+            conn,
+            local_date=local_date,
+            timezone_name=timezone_name,
+            limit=body.limit,
+        )
+    if selected["status"] == "source_unavailable":
+        source_status = "source_unavailable"
+        health = selected["health"]
+    else:
+        health = await _browser_links_search_health(selected["health"])
+        source_status = "ok" if health.get("status") == "ok" else "degraded"
+    module = _load_xarta_diary_module()
+    artifacts = _write_browser_links_projection_artifacts(
+        module,
+        local_date=local_date,
+        timezone_name=timezone_name,
+        source_status=source_status,
+        health=health,
+        visits=selected["visits"],
+        bookmarks=selected["bookmarks"],
+        initiation=selected["initiation"],
+        limited=bool(selected.get("limited")),
+        now=now,
+    )
+    file_ref = artifacts["file_ref"]
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    actor = _clean_short_text(body.actor, "blueprints-api")
+    source_surface = _clean_short_text(body.source_surface, "browser-links-projection")
+    request_id = _clean_short_text(
+        body.request_id, f"browser-links-project-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    projected_event_ids = set(artifacts["projected_event_ids"])
+    with get_conn() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT event_id FROM personal_events
+            WHERE local_date=? AND source_type='browser-links'
+            """,
+            (local_date,),
+        ).fetchall()
+        previously_present = {row["event_id"] for row in existing_rows}
+        source_row = _upsert_browser_links_source(
+            conn,
+            source_status=source_status,
+            health=health,
+            local_date=local_date,
+            summary=artifacts["summary"],
+            now=now,
+        )
+        event_rows = []
+        if source_status in {"degraded", "source_unavailable"}:
+            event_rows.append(
+                _upsert_browser_links_status_event(
+                    conn,
+                    source_status=source_status,
+                    local_date=local_date,
+                    timezone_name=timezone_name,
+                    file_ref=file_ref,
+                    health=health,
+                    now=now,
+                )
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM personal_events
+                WHERE event_id=? AND source_type='browser-links'
+                """,
+                (f"browser-links-{local_date}-source-status",),
+            )
+        if source_status != "source_unavailable":
+            if selected["visits"]:
+                event_rows.append(
+                    _upsert_browser_links_aggregate_event(
+                        conn,
+                        local_date=local_date,
+                        timezone_name=timezone_name,
+                        file_ref=file_ref,
+                        source_hash=artifacts["source_hash"],
+                        summary=artifacts["summary"],
+                        visits=selected["visits"],
+                        bookmarks=selected["bookmarks"],
+                        kind="browser-links-visits",
+                        now=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM personal_events WHERE event_id=? AND source_type='browser-links'",
+                    (f"browser-links-{local_date}-visits",),
+                )
+            if selected["bookmarks"]:
+                event_rows.append(
+                    _upsert_browser_links_aggregate_event(
+                        conn,
+                        local_date=local_date,
+                        timezone_name=timezone_name,
+                        file_ref=file_ref,
+                        source_hash=artifacts["source_hash"],
+                        summary=artifacts["summary"],
+                        visits=selected["visits"],
+                        bookmarks=selected["bookmarks"],
+                        kind="browser-links-bookmarks",
+                        now=now,
+                    )
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM personal_events WHERE event_id=? AND source_type='browser-links'",
+                    (f"browser-links-{local_date}-bookmarks",),
+                )
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="project_browser_links",
+            target_ref=f"diary-day:{local_date}",
+            file_ref=file_ref,
+            db_ref="personal_sources:browser-links",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result=source_status,
+            source_hash=artifacts["source_hash"],
+            metadata={
+                "local_date": local_date,
+                "visit_event_count": artifacts["summary"]["visit_event_count"],
+                "visited_page_count": artifacts["summary"]["visited_page_count"],
+                "bookmark_count": artifacts["summary"]["bookmark_count"],
+                "skipped_existing_event_count": len(projected_event_ids & previously_present),
+                "source_status": source_status,
+            },
+        )
+        gen = increment_gen(conn, "personal-browser-links-projection")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_sources", "browser-links", dict(source_row), gen
+        )
+        for event_row in event_rows:
+            enqueue_for_all_peers(
+                conn, "UPDATE", "personal_events", event_row["event_id"], dict(event_row), gen
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "source_available": source_status != "source_unavailable",
+        "status": source_status,
+        "local_date": local_date,
+        "timezone": timezone_name,
+        "projection": {
+            "file_ref": file_ref,
+            "source_hash": artifacts["source_hash"],
+            "visit_event_count": artifacts["summary"]["visit_event_count"],
+            "visited_page_count": artifacts["summary"]["visited_page_count"],
+            "bookmark_count": artifacts["summary"]["bookmark_count"],
+            "projected_event_ids": artifacts["projected_event_ids"],
+            "skipped_existing_event_count": len(projected_event_ids & previously_present),
+            "initiation_backfill": artifacts["initiation_backfill"],
+        },
+        "source_health": health,
         "audit": {"audit_id": audit_id, "result": source_status},
         "day": _build_diary_day_payload(local_date),
     }

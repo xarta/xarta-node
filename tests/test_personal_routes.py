@@ -185,6 +185,42 @@ def _make_conn() -> sqlite3.Connection:
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE bookmarks (
+            bookmark_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            normalized_url TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            folder TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            favicon_url TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE visits (
+            visit_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            normalized_url TEXT NOT NULL,
+            domain TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'visit-recorder',
+            dwell_seconds INTEGER,
+            bookmark_id TEXT,
+            visited_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            visit_count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE visit_events (
+            event_id TEXT PRIMARY KEY,
+            normalized_url TEXT NOT NULL,
+            visited_at TEXT NOT NULL DEFAULT (datetime('now')),
+            dwell_seconds INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         """
     )
     return conn
@@ -744,5 +780,268 @@ def test_minutes_projection_records_source_unavailable_status(monkeypatch, tmp_p
     assert event["status"] == "source_unavailable"
     source = conn.execute(
         "SELECT * FROM personal_sources WHERE source_id='hermes-minutes'"
+    ).fetchone()
+    assert source["status"] == "source_unavailable"
+
+
+def _insert_browser_link_fixture_rows(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        INSERT INTO visits (
+            visit_id, url, normalized_url, domain, title, source, dwell_seconds,
+            bookmark_id, visited_at, visit_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "visit-1",
+            "https://example.test/page",
+            "https://example.test/page",
+            "example.test",
+            "Example Page",
+            "visit-recorder",
+            30,
+            "bookmark-today",
+            "2026-06-18T10:05:00+00:00",
+            2,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO visits (
+            visit_id, url, normalized_url, domain, title, source, dwell_seconds,
+            bookmark_id, visited_at, visit_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "visit-2",
+            "https://docs.example.test/reference",
+            "https://docs.example.test/reference",
+            "docs.example.test",
+            "Docs Reference",
+            "visit-recorder",
+            45,
+            None,
+            "2026-06-18T11:20:00+00:00",
+            1,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO visits (
+            visit_id, url, normalized_url, domain, title, source, visited_at, visit_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "visit-old",
+            "https://old.example.test/history",
+            "https://old.example.test/history",
+            "old.example.test",
+            "Old History",
+            "visit-recorder",
+            "2026-06-17T08:00:00+00:00",
+            1,
+        ),
+    )
+    conn.executemany(
+        """
+        INSERT INTO visit_events (event_id, normalized_url, visited_at, dwell_seconds)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            ("ve-1", "https://example.test/page", "2026-06-18T10:05:00+00:00", 30),
+            ("ve-2", "https://example.test/page", "2026-06-18T10:30:00+00:00", 15),
+            ("ve-3", "https://docs.example.test/reference", "2026-06-18T11:20:00+00:00", 45),
+            ("ve-old", "https://old.example.test/history", "2026-06-17T08:00:00+00:00", 5),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO bookmarks (
+            bookmark_id, url, normalized_url, title, description, tags_json,
+            folder, notes, source, archived, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "bookmark-today",
+                "https://example.test/page",
+                "https://example.test/page",
+                "Example Page",
+                "description must stay out of browser projection",
+                json.dumps(["docs", "daily"]),
+                "research",
+                "notes must stay out of browser projection",
+                "manual",
+                0,
+                "2026-06-18T10:00:00+00:00",
+                "2026-06-18T10:01:00+00:00",
+            ),
+            (
+                "bookmark-old",
+                "https://old.example.test/history",
+                "https://old.example.test/history",
+                "Old History",
+                "old description",
+                json.dumps(["old"]),
+                "archive",
+                "old notes",
+                "manual",
+                0,
+                "2026-06-17T09:00:00+00:00",
+                "2026-06-17T09:01:00+00:00",
+            ),
+        ],
+    )
+
+
+def test_browser_links_projection_writes_day_file_events_ledger_and_initiation(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path / "diary")
+    _insert_browser_link_fixture_rows(conn)
+
+    async def ok_health(sqlite_health):
+        return {
+            **sqlite_health,
+            "status": "ok",
+            "seekdb": "ok",
+            "seekdb_error": "",
+            "embedding": "ok",
+            "embedding_error": "",
+            "seekdb_indexed": sqlite_health["bookmark_count"],
+            "seekdb_stale": 0,
+            "seekdb_visits_indexed": sqlite_health["visit_count"],
+            "seekdb_visits_stale": 0,
+        }
+
+    monkeypatch.setattr(routes_personal, "_browser_links_search_health", ok_health)
+
+    result = asyncio.run(
+        routes_personal.project_diary_day_browser_links(
+            routes_personal.DiaryBrowserLinksProjectRequest(
+                local_date="2026-06-18",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="browser-links-test",
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "ok"
+    assert result["source_available"] is True
+    assert result["projection"]["visit_event_count"] == 3
+    assert result["projection"]["visited_page_count"] == 2
+    assert result["projection"]["bookmark_count"] == 1
+    assert set(result["projection"]["projected_event_ids"]) == {
+        "browser-links-2026-06-18-visits",
+        "browser-links-2026-06-18-bookmarks",
+    }
+
+    projection_path = tmp_path / "diary" / result["projection"]["file_ref"]
+    projection_text = projection_path.read_text(encoding="utf-8")
+    projection = json.loads(projection_text)
+    assert projection["schema"] == "xarta.diary.browser_links.v1"
+    assert projection["summary"]["visit_event_count"] == 3
+    assert len(projection["visits"]) == 2
+    assert projection["bookmarks"][0]["bookmark_id"] == "bookmark-today"
+    assert projection["visits"][0]["url_hash"].startswith("sha256:")
+    assert "description must stay out" not in projection_text
+    assert "notes must stay out" not in projection_text
+    assert "old.example.test/history" not in projection_text
+    assert projection["initiation_backfill"]["bookmarks_existing_count"] == 1
+    assert projection["initiation_backfill"]["visit_events_existing_count"] == 1
+
+    initiation_dir = tmp_path / "diary" / "_initiation" / "2026-06-18" / "browser-links"
+    assert (initiation_dir / "initiation-index.md").exists()
+    assert (initiation_dir / "bookmarks-existing.json").exists()
+    assert (initiation_dir / "visits-existing-summary.json").exists()
+
+    event_rows = conn.execute(
+        "SELECT * FROM personal_events WHERE source_type='browser-links' ORDER BY event_id"
+    ).fetchall()
+    assert [row["event_id"] for row in event_rows] == [
+        "browser-links-2026-06-18-bookmarks",
+        "browser-links-2026-06-18-visits",
+    ]
+    assert all(row["status"] == "open" for row in event_rows)
+    assert "old.example.test" not in "\n".join(row["content_projection"] for row in event_rows)
+
+    ledger = json.loads(
+        (tmp_path / "diary" / "2026" / "06" / "18" / "source-ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    browser_ledger = [
+        item
+        for item in ledger["sources"]
+        if str(item.get("ledger_entry_id", "")).startswith("browser-links:")
+    ]
+    assert len(browser_ledger) == 3
+    assert all(item.get("url_hash", "").startswith("sha256:") for item in browser_ledger)
+    manifest = json.loads(
+        (tmp_path / "diary" / "2026" / "06" / "18" / "day-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "browser-links-visits.json" in {item["path"] for item in manifest["files"]}
+
+    rerun = asyncio.run(
+        routes_personal.project_diary_day_browser_links(
+            routes_personal.DiaryBrowserLinksProjectRequest(
+                local_date="2026-06-18",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="browser-links-test-rerun",
+            )
+        )
+    )
+    assert rerun["projection"]["skipped_existing_event_count"] == 2
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE source_type='browser-links'"
+        ).fetchone()["count"]
+        == 2
+    )
+
+
+def test_browser_links_projection_records_source_unavailable_status(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path / "diary")
+    conn.executescript("DROP TABLE bookmarks; DROP TABLE visits; DROP TABLE visit_events;")
+
+    result = asyncio.run(
+        routes_personal.project_diary_day_browser_links(
+            routes_personal.DiaryBrowserLinksProjectRequest(
+                local_date="2026-06-18",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="browser-links-missing-test",
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["source_available"] is False
+    assert result["status"] == "source_unavailable"
+    projection_path = tmp_path / "diary" / result["projection"]["file_ref"]
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    assert projection["status"] == "source_unavailable"
+    assert projection["visits"] == []
+    assert projection["bookmarks"] == []
+    event = conn.execute(
+        "SELECT * FROM personal_events WHERE source_type='browser-links'"
+    ).fetchone()
+    assert event["event_id"] == "browser-links-2026-06-18-source-status"
+    assert event["status"] == "source_unavailable"
+    source = conn.execute(
+        "SELECT * FROM personal_sources WHERE source_id='browser-links'"
     ).fetchone()
     assert source["status"] == "source_unavailable"
