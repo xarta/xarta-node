@@ -67,12 +67,21 @@ remove_gitignore_line() {
     local label="$3"
 
     if grep -qxF "$line" "$GITIGNORE" 2>/dev/null; then
-        sed -i "\|^${line}$|d" "$GITIGNORE"
+        local tmp
+        tmp="$(mktemp)"
+        grep -vxF "$line" "$GITIGNORE" > "$tmp" || true
+        mv "$tmp" "$GITIGNORE"
         commit_gitignore_change "$message"
         echo "  gitignore: removed '$line' entry ($label)"
     else
         echo "  gitignore: '$line' not present — OK ($label)"
     fi
+}
+
+remove_legacy_docs_issue_exceptions() {
+    remove_gitignore_line 'docs/*' "Drop legacy partial docs ignore rule" "legacy docs cleanup"
+    remove_gitignore_line '!docs/issues/' "Drop legacy docs/issues exception" "legacy docs cleanup"
+    remove_gitignore_line '!docs/issues/**' "Drop legacy docs/issues exception" "legacy docs cleanup"
 }
 
 if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
@@ -97,6 +106,7 @@ if [[ "$DOCS_BACKUP" == "true" ]]; then
     # Backup node: docs must be tracked and syncthing is intentionally selectable.
     remove_gitignore_line 'docs' "Unignore docs — this is the designated backup node" "backup node"
     remove_gitignore_line 'syncthing/' "Unignore syncthing — this is the designated backup node" "backup node"
+    remove_legacy_docs_issue_exceptions
 
     # Install cron entry if not already present
     if ! grep -q "$CRON_MARKER" /etc/cron.d/lone-wolf-docs 2>/dev/null; then
@@ -111,6 +121,7 @@ else
     # Non-backup node: shared docs and syncthing payloads must not be committed here.
     ensure_gitignore_line 'docs' "Gitignore docs — distributed via Syncthing, not git-tracked here" "non-backup node"
     ensure_gitignore_line 'syncthing/' "Gitignore syncthing — distributed payloads are not git-tracked here" "non-backup node"
+    remove_legacy_docs_issue_exceptions
 
     # Remove cron entry if present (non-backup node must not commit docs)
     if [[ -f /etc/cron.d/lone-wolf-docs ]]; then
