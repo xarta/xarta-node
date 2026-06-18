@@ -379,6 +379,12 @@ def test_active_browser_command_parameters_are_sanitized():
     assert len(voice_mode._clean_active_browser_fn_key("f" * 220)) == 160
 
 
+def test_active_browser_automation_does_not_fabricate_empty_last_command():
+    report = voice_mode._clean_active_browser_automation_report({"last_command": {}})
+
+    assert report["last_command"] == {}
+
+
 def test_active_browser_command_rejects_unsupported_actions():
     response = asyncio.run(
         voice_mode.active_browser_command(
@@ -580,7 +586,24 @@ def test_active_browser_view_report_updates_active_tab_and_page():
                     "last_write_event_id": "calendar-2026-06-18-proof",
                     "error": "",
                     "ignored": {"nested": "raw"},
-                }
+                },
+                "todo": {
+                    "loaded": True,
+                    "loading": False,
+                    "status": "ready",
+                    "mode": "work",
+                    "task_count": 4,
+                    "total_count": 6,
+                    "open_count": 2,
+                    "blocked_count": 1,
+                    "done_count": 1,
+                    "source_counts": {"manual-task": 3, "work-management": 1},
+                    "selection_status": "open",
+                    "selection_label": "Task proof",
+                    "last_write_task_id": "task-2026-06-18-proof",
+                    "error": "",
+                    "ignored": "raw",
+                },
             },
         },
     )
@@ -624,6 +647,22 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "selection_type": "event",
         "selection_label": "Planning block",
         "last_write_event_id": "calendar-2026-06-18-proof",
+        "error": "",
+    }
+    assert view["automation"]["surfaces"]["todo"] == {
+        "loaded": True,
+        "loading": False,
+        "status": "ready",
+        "mode": "work",
+        "task_count": 4,
+        "total_count": 6,
+        "open_count": 2,
+        "blocked_count": 1,
+        "done_count": 1,
+        "source_counts": {"manual-task": 3, "work-management": 1},
+        "selection_status": "open",
+        "selection_label": "Task proof",
+        "last_write_task_id": "task-2026-06-18-proof",
         "error": "",
     }
     assert view["body_shade"] == {
