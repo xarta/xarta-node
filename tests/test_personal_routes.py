@@ -1236,7 +1236,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
                 item_id="work-root",
                 title="Step 16 issue",
                 body="Issue proof",
-                priority_id="high",
+                severity_id="high",
                 source_ref="docs:step-16",
                 actor="codex-test",
                 source_surface="pytest",
@@ -1245,6 +1245,39 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         )
     )["issue"]
     assert issue["vector"]["index_key"] == "work_issues:issue-step16"
+    assert issue["severity_id"] == "high"
+
+    child_issue = asyncio.run(
+        routes_personal.create_work_issue(
+            routes_personal.WorkIssueUpsertRequest(
+                issue_id="issue-step19-child",
+                item_id="work-depth-2",
+                title="Step 19 child issue",
+                body="Scoped issue proof",
+                severity_id="critical",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="issue-step19-child-create",
+            )
+        )
+    )["issue"]
+    assert child_issue["severity_id"] == "critical"
+
+    grandchild_issue = asyncio.run(
+        routes_personal.create_work_issue(
+            routes_personal.WorkIssueUpsertRequest(
+                issue_id="issue-step19-grandchild",
+                item_id="work-depth-3",
+                title="Step 19 grandchild issue",
+                body="Two-level scoped issue proof",
+                severity_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="issue-step19-grandchild-create",
+            )
+        )
+    )["issue"]
+    assert grandchild_issue["item_id"] == "work-depth-3"
 
     todo = asyncio.run(
         routes_personal.create_work_todo(
@@ -1262,6 +1295,41 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         )
     )["todo"]
     assert todo["related_task_id"] == "task-step16"
+
+    scoped_todo = asyncio.run(
+        routes_personal.create_work_todo(
+            routes_personal.WorkTodoUpsertRequest(
+                todo_id="todo-step19-grandchild",
+                item_id="work-depth-3",
+                title="Step 19 grandchild todo",
+                body="Two-level scoped todo proof",
+                priority_id="high",
+                related_task_id="task-step19",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-step19-grandchild-create",
+            )
+        )
+    )["todo"]
+    assert scoped_todo["item_id"] == "work-depth-3"
+    scoped_todo = asyncio.run(
+        routes_personal.update_work_todo(
+            "todo-step19-grandchild",
+            routes_personal.WorkTodoUpsertRequest(
+                item_id="work-depth-3",
+                title="Step 19 grandchild todo",
+                body="Two-level scoped todo proof updated",
+                status="active",
+                priority_id="critical",
+                related_task_id="task-step19",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-step19-grandchild-update",
+            ),
+        )
+    )["todo"]
+    assert scoped_todo["status"] == "active"
+    assert scoped_todo["priority_id"] == "critical"
 
     promoted = asyncio.run(
         routes_personal.promote_work_item(
@@ -1281,6 +1349,57 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         conn.execute("SELECT status FROM work_todos WHERE todo_id='todo-step16'").fetchone()[0]
         == "promoted"
     )
+
+    promoted_issue = asyncio.run(
+        routes_personal.promote_work_item(
+            routes_personal.WorkPromoteRequest(
+                source_ref="work_issues:issue-step19-child",
+                title="Promoted Step 19 issue",
+                parent_item_id="work-depth-2",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="issue-promote",
+            )
+        )
+    )["item"]
+    assert promoted_issue["promoted_from_ref"] == "work_issues:issue-step19-child"
+    assert promoted_issue["related"]["issues"] == ["issue-step19-child"]
+    assert (
+        conn.execute(
+            "SELECT status FROM work_issues WHERE issue_id='issue-step19-child'"
+        ).fetchone()[0]
+        == "promoted"
+    )
+
+    local_issues = asyncio.run(
+        routes_personal.list_work_item_issues("work-root", scope="local", view="flat")
+    )
+    assert [row["issue_id"] for row in local_issues["items"]] == ["issue-step16"]
+    assert local_issues["counts"]["descendant_items"] == 0
+
+    descendant_issues = asyncio.run(
+        routes_personal.list_work_item_issues("work-child", scope="descendants", view="grouped")
+    )
+    descendant_issue_ids = {row["issue_id"] for row in descendant_issues["items"]}
+    assert {"issue-step19-child", "issue-step19-grandchild"}.issubset(descendant_issue_ids)
+    assert descendant_issues["counts"]["descendant_items"] >= 2
+    assert {group["scope"]["depth_offset"] for group in descendant_issues["groups"]}.issuperset(
+        {1, 2}
+    )
+
+    descendant_todos = asyncio.run(
+        routes_personal.list_work_item_todos("work-child", scope="descendants", view="tree")
+    )
+    assert [row["todo_id"] for row in descendant_todos["items"]] == ["todo-step19-grandchild"]
+    assert descendant_todos["groups"][0]["scope"]["relation"] == "self"
+
+    work_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=200))
+    work_task_refs = {
+        item["source"]["ref"]
+        for item in work_tasks["items"]
+        if item["source"]["type"] == "work-todo"
+    }
+    assert {"work_todos:todo-step16", "work_todos:todo-step19-grandchild"}.issubset(work_task_refs)
 
     child_board = asyncio.run(routes_personal.get_work_child_board("work-root"))
     assert child_board["board"]["parent"]["item_id"] == "work-root"

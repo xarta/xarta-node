@@ -235,6 +235,7 @@ class WorkIssueUpsertRequest(BaseModel):
     body: str | None = None
     status: str = "open"
     priority_id: str = "medium"
+    severity_id: str | None = None
     source_ref: str | None = None
     related_task_id: str | None = None
     actor: str = "blueprints-ui"
@@ -497,6 +498,7 @@ def _row_to_work_issue(row: Any) -> dict[str, Any]:
         "body_excerpt": row["body_excerpt"],
         "status": row["status"],
         "priority_id": row["priority_id"],
+        "severity_id": row["priority_id"],
         "source_ref": row["source_ref"],
         "related_task_id": row["related_task_id"],
         "search": {
@@ -538,6 +540,45 @@ def _row_to_work_todo(row: Any) -> dict[str, Any]:
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _work_todo_to_task(row: Any) -> dict[str, Any]:
+    due_at = row["due_at"] or ""
+    local_date = due_at[:10] if len(due_at) >= 10 else ""
+    related_task_id = row["related_task_id"] or ""
+    return {
+        "task_id": row["todo_id"],
+        "event_id": "",
+        "kind": "task",
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "mode": "work",
+        "priority": row["priority_id"],
+        "due_at": row["due_at"],
+        "local_date": local_date,
+        "timezone": "",
+        "privacy_level": "normal",
+        "tags": ["work", "todo"],
+        "source": {
+            "type": "work-todo",
+            "ref": f"work_todos:{row['todo_id']}",
+            "hash": "",
+            "authority": "work_todo",
+        },
+        "related": {
+            "work_items": [row["item_id"]] if row["item_id"] else [],
+            "tasks": [related_task_id] if related_task_id else [],
+            "import_batches": [],
+        },
+        "file_refs": [],
+        "db_refs": [f"work_todos:{row['todo_id']}", f"work_items:{row['item_id']}"],
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "completed_at": None,
+        "archived_at": row["updated_at"] if row["status"] == "archived" else None,
     }
 
 
@@ -1197,10 +1238,21 @@ async def list_personal_tasks(
             """,
             (*event_params, fetch_limit),
         ).fetchall()
+        work_todo_rows = _work_todo_task_page_rows(
+            conn,
+            mode=mode,
+            date_start=date_start,
+            date_end=date_end,
+            status=status,
+            source_type=source_type,
+            related_work_item=related_work_item,
+            fetch_limit=fetch_limit,
+        )
         counts = _task_counts(conn)
 
     items = [_row_to_task(row) for row in task_rows]
     items.extend(_event_to_task(row) for row in event_rows)
+    items.extend(_work_todo_to_task(row) for row in work_todo_rows)
     deduped: dict[str, dict[str, Any]] = {}
     for item in items:
         deduped.setdefault(item["task_id"], item)
@@ -1828,7 +1880,64 @@ def _task_counts(conn: Any) -> dict[str, int]:
             counts["blocked"] += count
         if status in {"done", "archived"}:
             counts["done"] += count
+    work_todo_rows = conn.execute(
+        "SELECT status, COUNT(*) AS count FROM work_todos GROUP BY status"
+    ).fetchall()
+    for row in work_todo_rows:
+        status = row["status"]
+        count = int(row["count"])
+        if status != "archived":
+            counts["work"] += count
+        if status == "blocked":
+            counts["blocked"] += count
+        if status in {"done", "archived", "promoted"}:
+            counts["done"] += count
     return counts
+
+
+def _work_todo_task_page_rows(
+    conn: Any,
+    *,
+    mode: str | None,
+    date_start: str | None,
+    date_end: str | None,
+    status: str | None,
+    source_type: str | None,
+    related_work_item: str | None,
+    fetch_limit: int,
+) -> list[Any]:
+    work_source_filters = {"work-todo", "work_todo", "work_todos", "work-management"}
+    include = mode == "work" or bool(related_work_item)
+    if source_type:
+        include = source_type in work_source_filters
+    if not include:
+        return []
+    where: list[str] = []
+    params: list[Any] = []
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    elif mode == "work":
+        where.append("status != 'archived'")
+    if related_work_item:
+        where.append("item_id = ?")
+        params.append(related_work_item)
+    if date_start:
+        where.append("COALESCE(substr(due_at, 1, 10), '') >= ?")
+        params.append(date_start)
+    if date_end:
+        where.append("COALESCE(substr(due_at, 1, 10), '') <= ?")
+        params.append(date_end)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    return conn.execute(
+        f"""
+        SELECT * FROM work_todos
+        {clause}
+        ORDER BY COALESCE(due_at, updated_at, created_at) ASC, todo_id ASC
+        LIMIT ?
+        """,
+        (*params, fetch_limit),
+    ).fetchall()
 
 
 def _clean_work_id(value: str | None, prefix: str) -> str:
@@ -2063,6 +2172,138 @@ def _work_scope_item_ids(conn: Any, item_id: str | None) -> list[str]:
         (item_id,),
     ).fetchall()
     return [row["item_id"] for row in rows]
+
+
+def _work_scope_item_rows(conn: Any, item_id: str, scope: str) -> list[Any]:
+    clean_scope = _clean_short_text(scope, "local", limit=40).replace("-", "_")
+    if clean_scope in {"local", "self"}:
+        return conn.execute(
+            "SELECT *, 0 AS rel_depth FROM work_items WHERE item_id=?",
+            (item_id,),
+        ).fetchall()
+    if clean_scope not in {"descendant", "descendants", "tree", "subtree"}:
+        raise HTTPException(400, "work scope is invalid")
+    _work_item_or_404(conn, item_id)
+    return conn.execute(
+        """
+        WITH RECURSIVE scoped(item_id, rel_depth) AS (
+            SELECT item_id, 0 FROM work_items WHERE item_id=?
+            UNION ALL
+            SELECT w.item_id, scoped.rel_depth + 1
+            FROM work_items w
+            JOIN scoped ON w.parent_item_id = scoped.item_id
+            WHERE w.status != 'archived'
+        )
+        SELECT w.*, scoped.rel_depth
+        FROM scoped
+        JOIN work_items w ON w.item_id = scoped.item_id
+        ORDER BY scoped.rel_depth, COALESCE(w.parent_item_id, ''), w.sort_order, w.updated_at DESC, w.item_id
+        """,
+        (item_id,),
+    ).fetchall()
+
+
+def _work_scoped_leaf_payload(
+    conn: Any,
+    *,
+    item_id: str,
+    kind: str,
+    scope: str,
+    view: str,
+) -> dict[str, Any]:
+    root = _work_item_or_404(conn, item_id)
+    clean_kind = _clean_short_text(kind, "", limit=40)
+    if clean_kind not in {"issues", "todos"}:
+        raise HTTPException(400, "work scoped leaf kind is invalid")
+    clean_view = _clean_short_text(view, "flat", limit=40).replace("-", "_")
+    if clean_view not in {"flat", "grouped", "tree"}:
+        raise HTTPException(400, "work scoped leaf view is invalid")
+    scope_rows = _work_scope_item_rows(conn, item_id, scope)
+    item_ids = [row["item_id"] for row in scope_rows]
+    scope_by_item_id = {
+        row["item_id"]: {
+            "item_id": row["item_id"],
+            "parent_item_id": row["parent_item_id"] or "",
+            "title": row["title"],
+            "depth": int(row["depth"]),
+            "depth_offset": int(row["rel_depth"]),
+            "relation": "self" if int(row["rel_depth"]) == 0 else "descendant",
+        }
+        for row in scope_rows
+    }
+    rows: list[Any] = []
+    if item_ids:
+        placeholders = ",".join("?" for _ in item_ids)
+        table = "work_issues" if clean_kind == "issues" else "work_todos"
+        order_expr = (
+            "updated_at DESC, issue_id"
+            if clean_kind == "issues"
+            else "COALESCE(due_at, updated_at), todo_id"
+        )
+        rows = conn.execute(
+            f"""
+            SELECT * FROM {table}
+            WHERE item_id IN ({placeholders})
+            ORDER BY {order_expr}
+            """,
+            item_ids,
+        ).fetchall()
+    row_mapper = _row_to_work_issue if clean_kind == "issues" else _row_to_work_todo
+    records: list[dict[str, Any]] = []
+    counts_by_status: dict[str, int] = {}
+    counts_by_item: dict[str, int] = {item_ref: 0 for item_ref in item_ids}
+    for row in rows:
+        record = row_mapper(row)
+        scope_info = scope_by_item_id.get(row["item_id"], {})
+        record["scope"] = scope_info
+        records.append(record)
+        counts_by_status[row["status"]] = counts_by_status.get(row["status"], 0) + 1
+        counts_by_item[row["item_id"]] = counts_by_item.get(row["item_id"], 0) + 1
+    groups: list[dict[str, Any]] = []
+    if clean_view in {"grouped", "tree"}:
+        records_by_item: dict[str, list[dict[str, Any]]] = {item_ref: [] for item_ref in item_ids}
+        for record in records:
+            records_by_item.setdefault(record["item_id"], []).append(record)
+        for row in scope_rows:
+            group = {
+                "item": _row_to_work_item(row),
+                "scope": scope_by_item_id[row["item_id"]],
+                "count": len(records_by_item.get(row["item_id"], [])),
+                clean_kind: records_by_item.get(row["item_id"], []),
+            }
+            if clean_view == "tree":
+                group["child_item_ids"] = [
+                    child["item_id"]
+                    for child in scope_rows
+                    if (child["parent_item_id"] or "") == row["item_id"]
+                ]
+            groups.append(group)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(root),
+        "breadcrumbs": _work_breadcrumbs(conn, item_id),
+        "kind": clean_kind,
+        "scope": "local"
+        if len(scope_rows) == 1 and scope_rows[0]["item_id"] == item_id
+        else "descendants",
+        "view": clean_view,
+        "items": records,
+        "groups": groups,
+        "scope_items": [
+            {
+                "item": _row_to_work_item(row),
+                "scope": scope_by_item_id[row["item_id"]],
+            }
+            for row in scope_rows
+        ],
+        "counts": {
+            "total": len(records),
+            "scope_items": len(scope_rows),
+            "descendant_items": sum(1 for row in scope_rows if int(row["rel_depth"]) > 0),
+            "by_status": counts_by_status,
+            "by_item": counts_by_item,
+        },
+    }
 
 
 def _work_breadcrumbs(conn: Any, item_id: str | None) -> list[dict[str, Any]]:
@@ -2711,6 +2952,30 @@ async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
         return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
 
 
+@router.get("/work/items/{item_id}/issues")
+async def list_work_item_issues(
+    item_id: str,
+    scope: str = "local",
+    view: str = "flat",
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_scoped_leaf_payload(
+            conn, item_id=item_id, kind="issues", scope=scope, view=view
+        )
+
+
+@router.get("/work/items/{item_id}/todos")
+async def list_work_item_todos(
+    item_id: str,
+    scope: str = "local",
+    view: str = "flat",
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_scoped_leaf_payload(
+            conn, item_id=item_id, kind="todos", scope=scope, view=view
+        )
+
+
 def _clean_work_link_type(value: str | None) -> str:
     link_type = _clean_short_text(value, "related", limit=60)
     if link_type not in {
@@ -2812,6 +3077,7 @@ def _clean_work_leaf_status(value: str | None, *, default: str = "open") -> str:
     status = _clean_short_text(value, default, limit=40)
     if status not in {
         "open",
+        "active",
         "blocked",
         "pending_review",
         "done",
@@ -2836,7 +3102,8 @@ def _upsert_work_issue(
     clean_issue_id = _clean_work_id(issue_id or body.issue_id, "issue")
     with get_conn() as conn:
         _work_item_or_404(conn, body.item_id)
-        priority = _require_work_priority(conn, body.priority_id)
+        severity_id = body.severity_id or body.priority_id
+        priority = _require_work_priority(conn, severity_id)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
             raise HTTPException(400, "work issue title is required")
@@ -2860,6 +3127,7 @@ def _upsert_work_issue(
                 "body": body_excerpt,
                 "status": body.status,
                 "priority_id": priority["priority_id"],
+                "severity_id": priority["priority_id"],
                 "source_ref": source_ref,
                 "related_task_id": related_task_id,
             }
@@ -2925,7 +3193,11 @@ def _upsert_work_issue(
             run_id=meta["run_id"],
             result="ok",
             source_hash=source_hash,
-            metadata={"status": issue_row["status"], "priority_id": issue_row["priority_id"]},
+            metadata={
+                "status": issue_row["status"],
+                "priority_id": issue_row["priority_id"],
+                "severity_id": issue_row["priority_id"],
+            },
         )
         gen = increment_gen(conn, "work-issue")
         enqueue_for_all_peers(conn, "UPDATE", "work_issues", clean_issue_id, dict(issue_row), gen)
@@ -3260,6 +3532,11 @@ async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
                 "UPDATE work_todos SET status='promoted', updated_at=? WHERE todo_id=?",
                 (now, source_ref.split(":", 1)[1]),
             )
+        if source_ref.startswith("work_issues:"):
+            conn.execute(
+                "UPDATE work_issues SET status='promoted', updated_at=? WHERE issue_id=?",
+                (now, source_ref.split(":", 1)[1]),
+            )
         gen = increment_gen(conn, "work-promote")
         enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
         if source_ref.startswith("work_todos:"):
@@ -3268,6 +3545,12 @@ async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
                 "SELECT * FROM work_todos WHERE todo_id=?", (todo_id,)
             ).fetchone()
             enqueue_for_all_peers(conn, "UPDATE", "work_todos", todo_id, dict(todo_row), gen)
+        if source_ref.startswith("work_issues:"):
+            issue_id = source_ref.split(":", 1)[1]
+            issue_row = conn.execute(
+                "SELECT * FROM work_issues WHERE issue_id=?", (issue_id,)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "work_issues", issue_id, dict(issue_row), gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
