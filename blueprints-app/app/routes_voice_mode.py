@@ -1881,6 +1881,27 @@ def _clean_active_browser_imports_dashboard(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_diary_day(raw: Any) -> dict[str, Any]:
+    diary = raw if isinstance(raw, dict) else {}
+    return {
+        "loaded": bool(diary.get("loaded")),
+        "loading": bool(diary.get("loading")),
+        "status": _clean_string(diary.get("status"), "", 40),
+        "local_date": _clean_string(diary.get("local_date"), "", 20),
+        "source_filter": _clean_string(diary.get("source_filter"), "", 40),
+        "moment_count": _clean_browser_page_int(diary.get("moment_count"), maximum=500),
+        "next_action_count": _clean_browser_page_int(diary.get("next_action_count"), maximum=500),
+        "pin_hidden_count": _clean_browser_page_int(diary.get("pin_hidden_count"), maximum=500),
+        "summary_state": _clean_string(diary.get("summary_state"), "", 40),
+        "ledger_exists": bool(diary.get("ledger_exists")),
+        "day_folder_exists": bool(diary.get("day_folder_exists")),
+        "selection_type": _clean_string(diary.get("selection_type"), "", 40),
+        "selection_label": _clean_string(diary.get("selection_label"), "", 120),
+        "last_write_file_ref": _clean_string(diary.get("last_write_file_ref"), "", 180),
+        "error": _clean_string(diary.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
@@ -1936,6 +1957,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
         "selector_actions": selector_actions,
         "last_command": last_command,
         "surfaces": {
+            "diary_day": _clean_active_browser_diary_day(surfaces.get("diary_day")),
             "imports_dashboard": _clean_active_browser_imports_dashboard(
                 surfaces.get("imports_dashboard")
             ),

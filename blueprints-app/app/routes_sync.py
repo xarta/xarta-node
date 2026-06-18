@@ -85,6 +85,7 @@ _ALLOWED_TABLES = {
     "personal_events",
     "personal_sources",
     "personal_import_batches",
+    "personal_time_audit",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -323,6 +324,7 @@ def _pk_for_table(table: str) -> str:
         "personal_events": "event_id",
         "personal_sources": "source_id",
         "personal_import_batches": "import_batch_id",
+        "personal_time_audit": "audit_id",
     }
     return pk_map.get(table, "id")
 

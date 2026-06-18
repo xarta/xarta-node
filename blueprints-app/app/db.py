@@ -324,6 +324,26 @@ CREATE INDEX IF NOT EXISTS idx_personal_import_batches_date
 CREATE INDEX IF NOT EXISTS idx_personal_import_batches_source
     ON personal_import_batches(source_type, status);
 
+CREATE TABLE IF NOT EXISTS personal_time_audit (
+    audit_id        TEXT PRIMARY KEY,
+    actor           TEXT NOT NULL DEFAULT '',
+    source_surface  TEXT NOT NULL DEFAULT '',
+    action          TEXT NOT NULL DEFAULT '',
+    target_ref      TEXT NOT NULL DEFAULT '',
+    file_ref        TEXT NOT NULL DEFAULT '',
+    db_ref          TEXT NOT NULL DEFAULT '',
+    created_at      TEXT DEFAULT (datetime('now')),
+    request_id      TEXT NOT NULL DEFAULT '',
+    run_id          TEXT NOT NULL DEFAULT '',
+    result          TEXT NOT NULL DEFAULT '',
+    source_hash     TEXT NOT NULL DEFAULT '',
+    metadata_json   TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_personal_time_audit_target
+    ON personal_time_audit(target_ref, created_at);
+CREATE INDEX IF NOT EXISTS idx_personal_time_audit_actor
+    ON personal_time_audit(actor, source_surface);
+
 CREATE TABLE IF NOT EXISTS pve_hosts (
     pve_id        TEXT PRIMARY KEY,   -- IP address — stable, no external config needed
     ip_address    TEXT NOT NULL,

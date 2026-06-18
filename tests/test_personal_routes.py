@@ -124,6 +124,21 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE personal_time_audit (
+            audit_id TEXT PRIMARY KEY,
+            actor TEXT NOT NULL DEFAULT '',
+            source_surface TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT '',
+            target_ref TEXT NOT NULL DEFAULT '',
+            file_ref TEXT NOT NULL DEFAULT '',
+            db_ref TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            request_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
         """
     )
     return conn
@@ -385,3 +400,153 @@ The dashboard generator writes only when the source digest changes.
     assert dirty["git_activity"]["status"] == "needs_review"
     assert dirty["git_activity"]["watched_repos"][0]["dirty_count"] == 1
     assert dirty["git_activity"]["actionable_repos"][0]["repo_id"] == "test-repo"
+
+
+def test_diary_day_read_model_hides_pin_events(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+    day_dir = tmp_path / "2026" / "06" / "18"
+    day_dir.mkdir(parents=True)
+    (day_dir / "events-index.md").write_text("# index\n", encoding="utf-8")
+    (day_dir / "source-ledger.json").write_text(
+        json.dumps({"sources": [{"source_type": "manual"}]}), encoding="utf-8"
+    )
+    (day_dir / "day-manifest.json").write_text(
+        json.dumps({"files": [{"path": "events-index.md"}]}), encoding="utf-8"
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, local_date, timezone, privacy_level, status
+        )
+        VALUES ('evt-visible', 'manual', 'personal-log', 'Visible', '2026-06-18', 'Europe/London', 'normal', 'open')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, local_date, timezone, privacy_level, status
+        )
+        VALUES ('evt-pin', 'manual', 'personal-log', 'Hidden', '2026-06-18', 'Europe/London', 'pin', 'open')
+        """
+    )
+
+    result = asyncio.run(routes_personal.get_diary_day(date="2026-06-18"))
+
+    assert result["status"] == "ready"
+    assert [item["event_id"] for item in result["events"]] == ["evt-visible"]
+    assert result["pin_hidden_count"] == 1
+    assert result["files"]["source_ledger"]["source_count"] == 1
+    assert result["summary"]["state"] == "summary_pending"
+
+
+def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+
+    created = asyncio.run(
+        routes_personal.create_diary_day_entry(
+            routes_personal.DiaryEntryCreateRequest(
+                body="A focused test entry",
+                local_date="2026-06-18",
+                local_time="10:20",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="req-test",
+            )
+        )
+    )
+
+    event = created["event"]
+    file_ref = created["write"]["file_ref"]
+    entry_path = tmp_path / file_ref
+    assert created["ok"] is True
+    assert entry_path.exists()
+    assert "xarta.diary.personal_log.v1" in entry_path.read_text(encoding="utf-8")
+    assert event["source"]["type"] == "manual"
+    assert event["file_refs"] == [file_ref]
+    assert created["audit"]["actor"] == "codex-test"
+    audit_rows = conn.execute("SELECT * FROM personal_time_audit").fetchall()
+    assert len(audit_rows) == 1
+    assert audit_rows[0]["source_surface"] == "pytest"
+    ledger = json.loads((tmp_path / "2026" / "06" / "18" / "source-ledger.json").read_text())
+    assert ledger["sources"][0]["event_id"] == event["event_id"]
+
+    conn.execute(
+        """
+        UPDATE personal_events
+        SET content_projection='', body_excerpt='', projection_state='slim'
+        WHERE event_id=?
+        """,
+        (event["event_id"],),
+    )
+    rehydrated = asyncio.run(
+        routes_personal.rehydrate_personal_projection(
+            routes_personal.PersonalRehydrateRequest(event_id=event["event_id"])
+        )
+    )
+    assert rehydrated["ok"] is True
+    assert rehydrated["rehydrated"] is True
+    assert "A focused test entry" in rehydrated["event"]["content_projection"]
+
+    linked = asyncio.run(
+        routes_personal.link_personal_event_work_item(
+            event["event_id"],
+            routes_personal.DiaryWorkLinkRequest(
+                work_item_ref="work:test-1",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="link-test",
+            ),
+        )
+    )
+    assert linked["ok"] is True
+    assert linked["event"]["related"]["work_items"] == ["work:test-1"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='link_work_item'"
+        ).fetchone()["count"]
+        == 1
+    )
+
+
+def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, kind, title, local_date, timezone,
+            privacy_level, status
+        )
+        VALUES ('evt-summary', 'manual', '2026/06/18/10-20-personal-log.md',
+                'personal-log', 'Summary entry', '2026-06-18', 'Europe/London',
+                'normal', 'open')
+        """
+    )
+
+    result = asyncio.run(
+        routes_personal.generate_diary_day_summary(
+            routes_personal.DiarySummaryGenerateRequest(
+                local_date="2026-06-18",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="summary-test",
+            )
+        )
+    )
+
+    summary_path = tmp_path / result["summary"]["file_ref"]
+    assert result["ok"] is True
+    assert summary_path.exists()
+    summary_text = summary_path.read_text(encoding="utf-8")
+    assert "xarta.diary.day_summary.v1" in summary_text
+    assert "evt-summary" in summary_text
+    assert result["day"]["summary"]["state"] == "ready"
+    audit = conn.execute(
+        "SELECT * FROM personal_time_audit WHERE action='generate_day_summary'"
+    ).fetchone()
+    assert audit["actor"] == "codex-test"

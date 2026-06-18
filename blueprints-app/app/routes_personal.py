@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import posixpath
 import re
 import subprocess
+import sys
+import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,8 +25,10 @@ from .sync.queue import enqueue_for_all_peers
 router = APIRouter(prefix="/personal", tags=["personal"])
 
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
+XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xarta/.agents/lib"))
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
+DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 DEFAULT_PERSONAL_GIT_REPOS: tuple[tuple[str, str, str], ...] = (
     ("p300", "/xarta-node", "Public non-root workspace"),
     ("p200", "/root/xarta-node", "Public root workspace"),
@@ -66,6 +71,34 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
 class PersonalRehydrateRequest(BaseModel):
     event_id: str
     force: bool = False
+
+
+class DiaryEntryCreateRequest(BaseModel):
+    body: str
+    local_date: str | None = None
+    local_time: str | None = None
+    timezone: str | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
+    tags: list[str] = []
+
+
+class DiarySummaryGenerateRequest(BaseModel):
+    local_date: str
+    actor: str = "blueprints-ui"
+    source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class DiaryWorkLinkRequest(BaseModel):
+    work_item_ref: str
+    actor: str = "blueprints-ui"
+    source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
 
 
 def _json_value(value: str | None, fallback: Any) -> Any:
@@ -151,6 +184,167 @@ def _row_to_source(row: Any) -> dict[str, Any]:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _validate_local_date(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now().astimezone().strftime("%Y-%m-%d")
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(400, "date must use YYYY-MM-DD") from exc
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _validate_local_time(value: str | None) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip()
+    if not re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", text):
+        raise HTTPException(400, "time must use HH:MM")
+    return text
+
+
+def _clean_short_text(value: str | None, default: str, *, limit: int = 120) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return (text or default)[:limit]
+
+
+def _diary_day_dir(local_date: str) -> Path:
+    year, month, day = local_date.split("-")
+    return DIARY_ROOT / year / month / day
+
+
+def _diary_relative_path(path: Path) -> str:
+    resolved = Path(path).resolve()
+    root = DIARY_ROOT.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("diary path is outside diary root")
+    return resolved.relative_to(root).as_posix()
+
+
+def _load_xarta_diary_module() -> Any:
+    if str(XARTA_AGENT_LIB) not in sys.path:
+        sys.path.insert(0, str(XARTA_AGENT_LIB))
+    try:
+        return importlib.import_module("xarta_diary")
+    except ImportError as exc:
+        raise HTTPException(503, "diary writer helper is unavailable") from exc
+
+
+def _read_json_file(path: Path, fallback: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+def _read_text_file(path: Path, limit: int = 6000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return text[:limit]
+
+
+def _entry_title(body: str, local_time: str | None) -> str:
+    first = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return first[:90] if first else f"Personal log {local_time or ''}".strip()
+
+
+def _body_excerpt(body: str, limit: int = 500) -> str:
+    return re.sub(r"\s+", " ", body.strip())[:limit]
+
+
+def _upsert_personal_source(conn: Any, now: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO personal_sources (
+            source_id, source_type, label, status, last_seen_at, health_json, provenance_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            status=excluded.status,
+            last_seen_at=excluded.last_seen_at,
+            health_json=excluded.health_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            "manual-diary",
+            "manual",
+            "Manual Diary",
+            "ok",
+            now,
+            json.dumps({"write_path": "file-first"}),
+            json.dumps({"diary_root": str(DIARY_ROOT)}),
+            now,
+            now,
+        ),
+    )
+
+
+def _write_personal_audit(
+    conn: Any,
+    *,
+    audit_id: str,
+    actor: str,
+    source_surface: str,
+    action: str,
+    target_ref: str,
+    file_ref: str,
+    db_ref: str,
+    request_id: str,
+    run_id: str,
+    result: str,
+    source_hash: str,
+    metadata: dict[str, Any],
+    created_at: str,
+) -> dict[str, Any]:
+    row = {
+        "audit_id": audit_id,
+        "actor": actor,
+        "source_surface": source_surface,
+        "action": action,
+        "target_ref": target_ref,
+        "file_ref": file_ref,
+        "db_ref": db_ref,
+        "created_at": created_at,
+        "request_id": request_id,
+        "run_id": run_id,
+        "result": result,
+        "source_hash": source_hash,
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+    }
+    conn.execute(
+        """
+        INSERT INTO personal_time_audit (
+            audit_id, actor, source_surface, action, target_ref, file_ref, db_ref,
+            created_at, request_id, run_id, result, source_hash, metadata_json
+        )
+        VALUES (
+            :audit_id, :actor, :source_surface, :action, :target_ref, :file_ref, :db_ref,
+            :created_at, :request_id, :run_id, :result, :source_hash, :metadata_json
+        )
+        ON CONFLICT(audit_id) DO UPDATE SET
+            actor=excluded.actor,
+            source_surface=excluded.source_surface,
+            action=excluded.action,
+            target_ref=excluded.target_ref,
+            file_ref=excluded.file_ref,
+            db_ref=excluded.db_ref,
+            created_at=excluded.created_at,
+            request_id=excluded.request_id,
+            run_id=excluded.run_id,
+            result=excluded.result,
+            source_hash=excluded.source_hash,
+            metadata_json=excluded.metadata_json
+        """,
+        row,
+    )
+    return row
 
 
 def _add_json_array_filter(where: list[str], params: list[Any], column: str, value: str) -> None:
@@ -276,6 +470,74 @@ async def get_personal_event(event_id: str) -> dict[str, Any]:
     return _row_to_event(row)
 
 
+@router.post("/events/{event_id}/work-links")
+async def link_personal_event_work_item(
+    event_id: str, body: DiaryWorkLinkRequest
+) -> dict[str, Any]:
+    work_ref = _clean_short_text(body.work_item_ref, "", limit=200)
+    if not work_ref:
+        raise HTTPException(400, "work item ref is required")
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "diary-page")
+    request_id = _clean_short_text(body.request_id, f"work-link-{uuid.uuid4().hex[:12]}", limit=160)
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "event not found")
+        work_items = _json_value(row["related_work_items_json"], [])
+        if not isinstance(work_items, list):
+            work_items = []
+        if work_ref not in work_items:
+            work_items.append(work_ref)
+        provenance = _json_value(row["provenance_json"], {})
+        links = provenance.get("work_link_audit") if isinstance(provenance, dict) else []
+        if not isinstance(links, list):
+            links = []
+        links.append({"work_item_ref": work_ref, "audit_id": audit_id, "created_at": now})
+        provenance["work_link_audit"] = links[-12:]
+        conn.execute(
+            """
+            UPDATE personal_events
+            SET related_work_items_json=?,
+                provenance_json=?,
+                updated_at=?
+            WHERE event_id=?
+            """,
+            (
+                json.dumps(work_items, ensure_ascii=True),
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                event_id,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="link_work_item",
+            target_ref=f"personal_events:{event_id}",
+            file_ref="",
+            db_ref=f"personal_events:{event_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=row["source_hash"] or "",
+            metadata={"work_item_ref": work_ref},
+        )
+        gen = increment_gen(conn, "personal-work-link")
+        enqueue_for_all_peers(conn, "UPDATE", "personal_events", event_id, dict(updated), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {"ok": True, "event": _row_to_event(updated), "audit": {"audit_id": audit_id}}
+
+
 @router.get("/sources")
 async def list_personal_sources() -> dict[str, Any]:
     with get_conn() as conn:
@@ -341,6 +603,517 @@ async def list_personal_import_batches(
             "status": status,
             "privacy_level": privacy_level,
         },
+    }
+
+
+def _visible_day_events(
+    local_date: str,
+    *,
+    source_filter: str = "all",
+    limit: int = 200,
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    where = ["local_date = ?", "privacy_level != 'pin'"]
+    params: list[Any] = [local_date]
+    if source_filter == "manual":
+        where.append("source_type IN ('manual', 'diary-file')")
+    elif source_filter == "sources":
+        where.append("source_type NOT IN ('manual', 'diary-file')")
+    elif source_filter == "git":
+        where.append("source_type = 'git'")
+    elif source_filter == "imports":
+        where.append("source_type IN ('interests-ingestion', 'git')")
+    elif source_filter == "work":
+        where.append(
+            "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
+        )
+    elif source_filter != "all":
+        raise HTTPException(400, f"unknown source filter: {source_filter}")
+
+    clause = f"WHERE {' AND '.join(where)}"
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM personal_events
+            {clause}
+            ORDER BY COALESCE(start_at, created_at) ASC, event_id ASC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        pin_hidden = conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE local_date=? AND privacy_level='pin'",
+            (local_date,),
+        ).fetchone()
+        source_rows = conn.execute(
+            """
+            SELECT source_type, COUNT(*) AS count
+            FROM personal_events
+            WHERE local_date=? AND privacy_level != 'pin'
+            GROUP BY source_type
+            """,
+            (local_date,),
+        ).fetchall()
+    return (
+        [_row_to_event(row) for row in rows],
+        int(pin_hidden["count"] if pin_hidden else 0),
+        {row["source_type"]: row["count"] for row in source_rows},
+    )
+
+
+def _summary_payload(day_dir: Path, events: list[dict[str, Any]]) -> dict[str, Any]:
+    path = day_dir / "day-summary.md"
+    exists = path.exists()
+    text = _read_text_file(path)
+    if exists:
+        state = "ready"
+    elif events:
+        state = "summary_pending"
+    else:
+        state = "empty"
+    return {
+        "state": state,
+        "exists": exists,
+        "path": str(path),
+        "file_ref": _diary_relative_path(path) if exists else "",
+        "excerpt": re.sub(r"\s+", " ", re.sub(r"(?s)^---.*?---", "", text).strip())[:500]
+        if text
+        else "",
+    }
+
+
+def _day_file_payload(day_dir: Path) -> dict[str, Any]:
+    manifest_path = day_dir / "day-manifest.json"
+    ledger_path = day_dir / "source-ledger.json"
+    index_path = day_dir / "events-index.md"
+    manifest = _read_json_file(manifest_path, {})
+    ledger = _read_json_file(ledger_path, {})
+    files = manifest.get("files") if isinstance(manifest, dict) else []
+    sources = ledger.get("sources") if isinstance(ledger, dict) else []
+    return {
+        "day_folder": {
+            "path": str(day_dir),
+            "exists": day_dir.exists(),
+        },
+        "manifest": {
+            "path": str(manifest_path),
+            "exists": manifest_path.exists(),
+            "file_count": len(files) if isinstance(files, list) else 0,
+            "updated_at": manifest.get("updated_at_utc", "") if isinstance(manifest, dict) else "",
+            "files": files if isinstance(files, list) else [],
+        },
+        "source_ledger": {
+            "path": str(ledger_path),
+            "exists": ledger_path.exists(),
+            "source_count": len(sources) if isinstance(sources, list) else 0,
+            "updated_at": ledger.get("updated_at_utc", "") if isinstance(ledger, dict) else "",
+            "sources": sources[:24] if isinstance(sources, list) else [],
+        },
+        "events_index": {
+            "path": str(index_path),
+            "exists": index_path.exists(),
+            "excerpt": _read_text_file(index_path, 1200),
+        },
+    }
+
+
+def _next_action_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    actions = []
+    for event in events:
+        status = event.get("status") or ""
+        kind = event.get("kind") or ""
+        tags = event.get("tags") if isinstance(event.get("tags"), list) else []
+        if status in {"blocked", "pending_review", "open"} and (
+            "todo" in tags or "follow-up" in tags or kind in {"todo", "task", "action", "reminder"}
+        ):
+            actions.append(event)
+    return actions[:12]
+
+
+def _build_diary_day_payload(local_date: str, source_filter: str = "all") -> dict[str, Any]:
+    clean_date = _validate_local_date(local_date)
+    events, pin_hidden, source_counts = _visible_day_events(clean_date, source_filter=source_filter)
+    day_dir = _diary_day_dir(clean_date)
+    files = _day_file_payload(day_dir)
+    status = "source_unavailable"
+    if DIARY_ROOT.exists():
+        status = "ready" if events or day_dir.exists() else "empty"
+    summary = _summary_payload(day_dir, events)
+    return {
+        "status": status,
+        "generated_at": _utc_now_iso(),
+        "local_date": clean_date,
+        "timezone": os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+        "source_filter": source_filter,
+        "source_counts": source_counts,
+        "pin_hidden_count": pin_hidden,
+        "summary": summary,
+        "events": events,
+        "source_moments": events,
+        "next_actions": _next_action_events(events),
+        "files": files,
+        "provenance": {
+            "diary_root": str(DIARY_ROOT),
+            "day_folder": files["day_folder"],
+            "source_ledger": files["source_ledger"],
+            "events_endpoint": f"/api/v1/personal/events?date_start={clean_date}&date_end={clean_date}",
+            "read_model": "/api/v1/personal/diary-day",
+        },
+        "filters": {
+            "available": ["all", "manual", "sources", "git", "imports", "work"],
+            "active": source_filter,
+        },
+    }
+
+
+@router.get("/diary-day")
+async def get_diary_day(
+    date: str | None = None,
+    source_filter: str = "all",
+) -> dict[str, Any]:
+    return _build_diary_day_payload(_validate_local_date(date), source_filter=source_filter)
+
+
+def _update_source_ledger(
+    module: Any,
+    *,
+    day_dir: Path,
+    event_id: str,
+    audit_id: str,
+    file_ref: str,
+    source_hash: str,
+    actor: str,
+    source_surface: str,
+    now: str,
+) -> None:
+    ledger_path = day_dir / "source-ledger.json"
+    owner = module.resolve_owner("xarta", "xarta")
+    payload = _read_json_file(ledger_path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    entry = {
+        "ledger_entry_id": f"manual-diary:{event_id}",
+        "source_type": "manual",
+        "source_ref": file_ref,
+        "source_hash": source_hash,
+        "event_id": event_id,
+        "audit_id": audit_id,
+        "file_ref": file_ref,
+        "db_ref": f"personal_events:{event_id}",
+        "audit_ref": f"personal_time_audit:{audit_id}",
+        "actor": actor,
+        "source_surface": source_surface,
+        "created_at_utc": now,
+    }
+    sources = [
+        item
+        for item in sources
+        if not isinstance(item, dict) or item.get("ledger_entry_id") != entry["ledger_entry_id"]
+    ]
+    sources.append(entry)
+    payload.update(
+        {
+            "schema": payload.get("schema") or "xarta.diary.source_ledger.v1",
+            "updated_at_utc": now,
+            "generated_by": "blueprints-personal-api",
+            "sources": sources,
+        }
+    )
+    module.atomic_write_json(ledger_path, payload, owner)
+
+
+def _project_personal_log_event(
+    *,
+    result: dict[str, Any],
+    body: str,
+    file_ref: str,
+    source_hash: str,
+    audit_id: str,
+    actor: str,
+    source_surface: str,
+    request_id: str,
+    run_id: str,
+    now: str,
+) -> dict[str, Any]:
+    local_date = result["local_date"]
+    filename = result["filename"]
+    event_id = f"diary-{local_date}-{Path(filename).stem}"
+    tags = ["diary", "personal-log", "quick-entry"]
+    provenance = {
+        "writer": "xarta_diary.create_personal_log",
+        "audit_id": audit_id,
+        "actor": actor,
+        "source_surface": source_surface,
+        "request_id": request_id,
+        "run_id": run_id,
+        "day_path": result.get("day_path", ""),
+        "schema": result.get("schema", ""),
+    }
+    with get_conn() as conn:
+        _upsert_personal_source(conn, now)
+        conn.execute(
+            """
+            INSERT INTO personal_events (
+                event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+                content_projection, start_at, local_date, timezone, status, privacy_level,
+                tags_json, file_refs_json, db_refs_json, provenance_json, projection_state,
+                provenance_state, last_rendered_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                source_type=excluded.source_type,
+                source_ref=excluded.source_ref,
+                source_hash=excluded.source_hash,
+                kind=excluded.kind,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                content_projection=excluded.content_projection,
+                start_at=excluded.start_at,
+                local_date=excluded.local_date,
+                timezone=excluded.timezone,
+                status=excluded.status,
+                privacy_level=excluded.privacy_level,
+                tags_json=excluded.tags_json,
+                file_refs_json=excluded.file_refs_json,
+                db_refs_json=excluded.db_refs_json,
+                provenance_json=excluded.provenance_json,
+                projection_state=excluded.projection_state,
+                provenance_state=excluded.provenance_state,
+                last_rendered_at=excluded.last_rendered_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                event_id,
+                "manual",
+                file_ref,
+                source_hash,
+                "personal-log",
+                _entry_title(body, result.get("local_time")),
+                _body_excerpt(body),
+                body.strip(),
+                now,
+                local_date,
+                result.get("timezone") or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+                "open",
+                "normal",
+                json.dumps(tags, ensure_ascii=True),
+                json.dumps([file_ref], ensure_ascii=True),
+                json.dumps([f"personal_time_audit:{audit_id}"], ensure_ascii=True),
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                "hot",
+                "linked",
+                now,
+                now,
+                now,
+            ),
+        )
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="create_diary_entry",
+            target_ref=f"personal_events:{event_id}",
+            file_ref=file_ref,
+            db_ref=f"personal_events:{event_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "local_date": local_date,
+                "kind": "personal-log",
+                "body_chars": len(body.strip()),
+            },
+        )
+        gen = increment_gen(conn, "personal-diary-write")
+        event_row = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        enqueue_for_all_peers(conn, "UPDATE", "personal_events", event_id, dict(event_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return _row_to_event(event_row)
+
+
+@router.post("/diary-day/entries")
+async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any]:
+    text = str(body.body or "").strip()
+    if not text:
+        raise HTTPException(400, "entry body is required")
+    if len(text) > 20000:
+        raise HTTPException(400, "entry body is too long")
+    local_date = _validate_local_date(body.local_date)
+    local_time = _validate_local_time(body.local_time)
+    module = _load_xarta_diary_module()
+    owner = module.resolve_owner("xarta", "xarta")
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "diary-page")
+    request_id = _clean_short_text(
+        body.request_id, f"diary-entry-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    tags = [str(tag).strip() for tag in body.tags if str(tag).strip()]
+    result = module.create_personal_log(
+        body=text,
+        root=DIARY_ROOT,
+        local_date=local_date,
+        local_time=local_time,
+        timezone_name=body.timezone or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+        author=actor,
+        source=source_surface,
+        tags=tags,
+        owner=owner,
+    )
+    source_path = Path(result["path"])
+    file_ref = _diary_relative_path(source_path)
+    source_hash = module.sha256_file(source_path)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    now = _utc_now_iso()
+    _update_source_ledger(
+        module,
+        day_dir=Path(result["day_path"]),
+        event_id=f"diary-{result['local_date']}-{Path(result['filename']).stem}",
+        audit_id=audit_id,
+        file_ref=file_ref,
+        source_hash=source_hash,
+        actor=actor,
+        source_surface=source_surface,
+        now=now,
+    )
+    day = module.diary_day(
+        root=DIARY_ROOT,
+        local_date=result["local_date"],
+        timezone_name=result.get("timezone")
+        or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+    )
+    module.write_manifest(day, owner)
+    event = _project_personal_log_event(
+        result=result,
+        body=text,
+        file_ref=file_ref,
+        source_hash=source_hash,
+        audit_id=audit_id,
+        actor=actor,
+        source_surface=source_surface,
+        request_id=request_id,
+        run_id=run_id,
+        now=now,
+    )
+    return {
+        "ok": True,
+        "write": {
+            "file_ref": file_ref,
+            "source_hash": source_hash,
+            "day_path": result["day_path"],
+            "schema": result["schema"],
+        },
+        "audit": {
+            "audit_id": audit_id,
+            "actor": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "result": "ok",
+        },
+        "event": event,
+        "day": _build_diary_day_payload(local_date),
+    }
+
+
+def _summary_markdown(local_date: str, events: list[dict[str, Any]], now: str) -> str:
+    lines = [
+        "---",
+        f"schema: {DAY_SUMMARY_SCHEMA}",
+        f"local_date: {local_date}",
+        f"generated_at_utc: {now}",
+        "generated_by: blueprints-personal-api",
+        "privacy: personal",
+        "privacy_level: normal",
+        "tags:",
+        "  - diary",
+        "  - day-summary",
+        "summary_of:",
+    ]
+    if events:
+        for event in events[:40]:
+            lines.append(f"  - {event['event_id']}")
+    else:
+        lines.append("  - no-visible-events")
+    lines.extend(["---", "", f"# Day Summary: {local_date}", ""])
+    if not events:
+        lines.append("No visible source moments are recorded for this day.")
+    else:
+        lines.append(f"{len(events)} visible source moment(s) are recorded for this day.")
+        lines.append("")
+        lines.append("## Source Moments")
+        lines.append("")
+        for event in events[:20]:
+            source = event.get("source", {})
+            ref = source.get("ref") or event.get("event_id")
+            title = event.get("title") or event.get("kind") or "event"
+            lines.append(
+                f"- `{event['event_id']}` - {title} ({source.get('type') or 'source'}: `{ref}`)"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+@router.post("/diary-day/summary")
+async def generate_diary_day_summary(body: DiarySummaryGenerateRequest) -> dict[str, Any]:
+    local_date = _validate_local_date(body.local_date)
+    events, _, _ = _visible_day_events(local_date, source_filter="all")
+    module = _load_xarta_diary_module()
+    owner = module.resolve_owner("xarta", "xarta")
+    day = module.diary_day(
+        root=DIARY_ROOT,
+        local_date=local_date,
+        timezone_name=os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+    )
+    module.init_day(
+        root=DIARY_ROOT, local_date=local_date, timezone_name=day.timezone_name, owner=owner
+    )
+    now = _utc_now_iso()
+    summary_path = day.day_dir / "day-summary.md"
+    content = _summary_markdown(local_date, events, now)
+    module.atomic_write_text(summary_path, content, owner)
+    module.write_manifest(day, owner)
+    file_ref = _diary_relative_path(summary_path)
+    source_hash = module.sha256_file(summary_path)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "diary-page")
+    request_id = _clean_short_text(
+        body.request_id, f"diary-summary-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    with get_conn() as conn:
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="generate_day_summary",
+            target_ref=f"diary-day:{local_date}",
+            file_ref=file_ref,
+            db_ref="",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={"local_date": local_date, "event_count": len(events)},
+        )
+        gen = increment_gen(conn, "personal-diary-summary")
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "summary": {
+            "file_ref": file_ref,
+            "source_hash": source_hash,
+            "event_count": len(events),
+        },
+        "audit": {"audit_id": audit_id, "result": "ok"},
+        "day": _build_diary_day_payload(local_date),
     }
 
 
