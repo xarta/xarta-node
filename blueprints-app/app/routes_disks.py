@@ -1439,50 +1439,77 @@ _REMOTE_OFFLINE_VM_ATTACH_SCRIPT = textwrap.dedent(
         if not settle["ok"]:
             time.sleep(1.0)
 
-        lsblk = run(
-            [
-                "lsblk",
-                "--json",
-                "-b",
-                "-o",
-                "NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT",
-                nbd_device,
-            ],
-            timeout=10,
-        )
-        if not lsblk["ok"] or not (lsblk.get("stdout") or "").strip():
-            detail = (lsblk.get("stderr") or "").strip() or (lsblk.get("stdout") or "").strip()
-            fail(f"Could not inspect attached disk: {detail or 'lsblk failed'}")
-        try:
-            payload = json.loads(lsblk["stdout"])
-        except Exception as exc:
-            fail(f"Attached disk inventory was invalid JSON: {exc}")
+        def collect_sources(blockdevices):
+            items = []
+            for node in iter_nodes(blockdevices):
+                node_type = str(node.get("type") or "").strip().lower()
+                device_path = str(node.get("path") or "").strip()
+                fstype = str(node.get("fstype") or "").strip().lower()
+                if (
+                    node_type not in {"disk", "part"}
+                    or not device_path
+                    or not fstype
+                    or fstype in MEMBER_TYPES
+                ):
+                    continue
+                label = (
+                    str(node.get("label") or "").strip()
+                    or str(node.get("partlabel") or "").strip()
+                    or os.path.basename(device_path)
+                )
+                items.append(
+                    {
+                        "path": device_path,
+                        "label": label,
+                        "filesystem": fstype,
+                        "volume_label": str(node.get("label") or "").strip(),
+                        "part_label": str(node.get("partlabel") or "").strip(),
+                        "uuid": str(node.get("uuid") or "").strip(),
+                        "size_bytes": (
+                            int(node.get("size"))
+                            if str(node.get("size") or "").strip().isdigit()
+                            else None
+                        ),
+                        "default": node_type == "part",
+                    }
+                )
+            return items
 
-        blockdevices = payload.get("blockdevices") if isinstance(payload, dict) else []
+        payload = {}
         sources = []
-        for node in iter_nodes(blockdevices):
-            node_type = str(node.get("type") or "").strip().lower()
-            device_path = str(node.get("path") or "").strip()
-            fstype = str(node.get("fstype") or "").strip().lower()
-            if node_type not in {"disk", "part"} or not device_path or not fstype or fstype in MEMBER_TYPES:
+        lsblk = None
+        for attempt in range(6):
+            lsblk = run(
+                [
+                    "lsblk",
+                    "--json",
+                    "-b",
+                    "-o",
+                    "NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT",
+                    nbd_device,
+                ],
+                timeout=10,
+            )
+            if not lsblk["ok"] or not (lsblk.get("stdout") or "").strip():
+                if attempt >= 5:
+                    detail = (lsblk.get("stderr") or "").strip() or (lsblk.get("stdout") or "").strip()
+                    fail(f"Could not inspect attached disk: {detail or 'lsblk failed'}")
+                time.sleep(1.0)
                 continue
-            label = (
-                str(node.get("label") or "").strip()
-                or str(node.get("partlabel") or "").strip()
-                or os.path.basename(device_path)
-            )
-            sources.append(
-                {
-                    "path": device_path,
-                    "label": label,
-                    "filesystem": fstype,
-                    "volume_label": str(node.get("label") or "").strip(),
-                    "part_label": str(node.get("partlabel") or "").strip(),
-                    "uuid": str(node.get("uuid") or "").strip(),
-                    "size_bytes": int(node.get("size")) if str(node.get("size") or "").strip().isdigit() else None,
-                    "default": node_type == "part",
-                }
-            )
+            try:
+                payload = json.loads(lsblk["stdout"])
+            except Exception as exc:
+                if attempt >= 5:
+                    fail(f"Attached disk inventory was invalid JSON: {exc}")
+                time.sleep(1.0)
+                continue
+
+            blockdevices = payload.get("blockdevices") if isinstance(payload, dict) else []
+            sources = collect_sources(blockdevices)
+            if sources:
+                break
+            if attempt < 5:
+                time.sleep(1.0)
         if not sources:
             fail("No mountable filesystem was detected on this offline VM disk")
         if len(sources) == 1:
@@ -2760,18 +2787,33 @@ def _match_guest_volume_assignment(
     clean_label = str(label or "").strip()
     if not clean_guest_id or not (clean_dataset_name or clean_label):
         return None
+    exact_storage = ""
+    exact_leaf = ""
+    exact_volume_ref = ""
+    if clean_dataset_name and "/" in clean_dataset_name:
+        parent_name, exact_leaf = clean_dataset_name.rsplit("/", 1)
+        exact_storage = parent_name.replace("/", "-")
+        if exact_storage and exact_leaf:
+            exact_volume_ref = f"{exact_storage}:{exact_leaf}"
     candidates = {
         clean_dataset_name,
         clean_label,
         clean_dataset_name.split("/")[-1] if clean_dataset_name else "",
     }
     candidates = {item for item in candidates if item}
+    fallback = None
     for row in _guest_volume_assignments(snapshot):
         if str(row.get("vmid") or "").strip() != clean_guest_id:
             continue
         volume_ref = str(row.get("volume_ref") or "").strip()
+        storage = str(row.get("storage") or "").strip()
         volume_name = str(row.get("volume_name") or "").strip()
         volume_leaf = str(row.get("volume_leaf") or "").strip()
+        if exact_volume_ref and volume_ref == exact_volume_ref:
+            return row
+        if exact_storage and exact_leaf and storage == exact_storage:
+            if volume_name == exact_leaf or volume_leaf == exact_leaf:
+                return row
         if (
             volume_ref in candidates
             or volume_name in candidates
@@ -2782,8 +2824,8 @@ def _match_guest_volume_assignment(
                 if item
             )
         ):
-            return row
-    return None
+            fallback = fallback or row
+    return fallback
 
 
 def _offline_browser_meta_from_assignment(host: str, assignment: dict[str, Any]) -> dict[str, Any]:
