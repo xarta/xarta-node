@@ -364,7 +364,14 @@ The dashboard generator writes only when the source digest changes.
     assert result["interests"]["source_digest"] == "sha256:testdigest"
     assert result["interests"]["pending_review"] == 0
     assert result["interests"]["category_summary"][0]["Category"] == "testing"
+    assert (
+        result["interests"]["category_summary"][0]["Latest proof artifact_path"]
+        == "interests/testing/results/proof.json"
+    )
     assert result["proof_links"][0]["label"] == "Hermes Interests Ingestion Dashboard"
+    assert "Personal Time Activity Step 8 proof" in [
+        link["label"] for link in result["proof_links"]
+    ]
     assert result["git_activity"]["status"] == "ok"
     assert result["git_activity"]["watched_repos"][0]["repo_id"] == "test-repo"
     assert result["git_activity"]["watched_repos"][0]["dirty_count"] == 0

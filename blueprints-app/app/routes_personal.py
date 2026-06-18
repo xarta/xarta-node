@@ -365,6 +365,22 @@ def _clean_markdown_cell(value: str) -> str:
     return code.group(1) if code else without_link
 
 
+def _dashboard_link_path(href: str) -> str:
+    clean = href.strip()
+    if clean.startswith(("http://", "https://", "/")):
+        return clean
+    if clean.startswith("docs/"):
+        return clean
+    return posixpath.normpath((INTERESTS_DASHBOARD_REL.parent / clean).as_posix())
+
+
+def _markdown_link(value: str) -> dict[str, str] | None:
+    match = re.search(r"\[([^\]]+)\]\(([^)]+)\)", value)
+    if not match:
+        return None
+    return {"label": match.group(1).strip(), "path": _dashboard_link_path(match.group(2))}
+
+
 def _markdown_table(text: str, heading: str, limit: int = 20) -> list[dict[str, str]]:
     pattern = rf"(?ms)^##\s+{re.escape(heading)}\s*\n\n(.+?)(?=\n##\s+|\Z)"
     match = re.search(pattern, text)
@@ -379,18 +395,16 @@ def _markdown_table(text: str, heading: str, limit: int = 20) -> list[dict[str, 
         values = [part.strip() for part in line.strip("|").split("|")]
         if len(values) < len(headers):
             values.extend([""] * (len(headers) - len(values)))
-        row = {headers[idx]: _clean_markdown_cell(values[idx]) for idx in range(len(headers))}
+        row = {}
+        for idx in range(len(headers)):
+            header = headers[idx]
+            value = values[idx]
+            row[header] = _clean_markdown_cell(value)
+            link = _markdown_link(value)
+            if link:
+                row[f"{header}_path"] = link["path"]
         rows.append(row)
     return rows
-
-
-def _dashboard_link_path(href: str) -> str:
-    clean = href.strip()
-    if clean.startswith(("http://", "https://", "/")):
-        return clean
-    if clean.startswith("docs/"):
-        return clean
-    return posixpath.normpath((INTERESTS_DASHBOARD_REL.parent / clean).as_posix())
 
 
 def _markdown_list_link(text: str, label: str) -> dict[str, str] | None:
@@ -684,6 +698,10 @@ async def get_imports_dashboard() -> dict[str, Any]:
         "blockers": blockers,
         "proof_links": [
             *interests.get("proof_links", []),
+            {
+                "label": "Personal Time Activity Step 8 proof",
+                "path": "docs/personal/time-activity-goal/PERSONAL-TIME-ACTIVITY-STEP-08-PROOF-2026-06-18.md",
+            },
             {
                 "label": "Personal projection API v1",
                 "path": "docs/personal/time-activity-goal/PERSONAL-TIME-ACTIVITY-PROJECTION-API-V1.md",

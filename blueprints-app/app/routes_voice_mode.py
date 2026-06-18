@@ -1874,6 +1874,9 @@ def _clean_active_browser_imports_dashboard(raw: Any) -> dict[str, Any]:
             dashboard.get("watched_repo_count"), maximum=200
         ),
         "blocker_count": _clean_browser_page_int(dashboard.get("blocker_count"), maximum=200),
+        "source_filter": _clean_string(dashboard.get("source_filter"), "", 40),
+        "selection_type": _clean_string(dashboard.get("selection_type"), "", 40),
+        "selection_label": _clean_string(dashboard.get("selection_label"), "", 120),
         "error": _clean_string(dashboard.get("error"), "", 180),
     }
 
