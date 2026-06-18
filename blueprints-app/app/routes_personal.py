@@ -15,10 +15,12 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from . import hermes_minutes
 from .db import get_conn, increment_gen
 from .sync.queue import enqueue_for_all_peers
 
@@ -97,6 +99,18 @@ class DiaryWorkLinkRequest(BaseModel):
     work_item_ref: str
     actor: str = "blueprints-ui"
     source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class DiaryMinutesProjectRequest(BaseModel):
+    local_date: str | None = None
+    timezone: str | None = None
+    limit: int = 200
+    ttl_seconds: float | None = None
+    source_owner: str = ""
+    actor: str = "blueprints-api"
+    source_surface: str = "minutes-projection"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -773,6 +787,11 @@ async def get_diary_day(
     return _build_diary_day_payload(_validate_local_date(date), source_filter=source_filter)
 
 
+@router.post("/diary-day/minutes-project")
+async def project_diary_day_minutes(body: DiaryMinutesProjectRequest) -> dict[str, Any]:
+    return _project_hermes_minutes(body)
+
+
 def _update_source_ledger(
     module: Any,
     *,
@@ -820,6 +839,727 @@ def _update_source_ledger(
         }
     )
     module.atomic_write_json(ledger_path, payload, owner)
+
+
+STRUCTURED_MARKER_START = "<!-- xarta-diary:structured-files:start -->"
+STRUCTURED_MARKER_END = "<!-- xarta-diary:structured-files:end -->"
+HERMES_MINUTES_FILE = "hermes-minutes.json"
+HERMES_MINUTES_SCHEMA = "xarta.diary.hermes_minutes_projection.v1"
+
+
+def _hash_json_payload(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+
+def _parse_minutes_datetime(value: Any, timezone_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+    return parsed.astimezone(timezone.utc)
+
+
+def _minutes_payload(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    return payload
+
+
+def _minutes_datetime(event: dict[str, Any], timezone_name: str) -> datetime:
+    payload = _minutes_payload(event)
+    return _parse_minutes_datetime(payload.get("time") or event.get("created_at"), timezone_name)
+
+
+def _minutes_local_date(event: dict[str, Any], timezone_name: str) -> str:
+    zone = ZoneInfo(timezone_name)
+    return _minutes_datetime(event, timezone_name).astimezone(zone).strftime("%Y-%m-%d")
+
+
+def _compact_text(value: Any, limit: int) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())[:limit]
+
+
+def _compact_list(value: Any, *, item_limit: int = 12, text_limit: int = 260) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    compact: list[Any] = []
+    for item in value[:item_limit]:
+        if isinstance(item, dict):
+            compact.append(
+                {
+                    str(key)[:80]: _compact_text(raw_value, text_limit)
+                    if isinstance(raw_value, str)
+                    else raw_value
+                    for key, raw_value in item.items()
+                    if key not in {"body", "raw_body", "transcript", "matrix_detail"}
+                }
+            )
+        else:
+            compact.append(_compact_text(item, text_limit))
+    return compact
+
+
+def _minutes_source_pointers(payload: dict[str, Any]) -> dict[str, Any]:
+    pointers = (
+        payload.get("source_pointers") if isinstance(payload.get("source_pointers"), dict) else {}
+    )
+
+    def list_field(key: str) -> list[str]:
+        raw = pointers.get(key)
+        if not isinstance(raw, list):
+            return []
+        values = []
+        for item in raw[:12]:
+            text = _compact_text(item, 260)
+            if text and text not in values:
+                values.append(text)
+        return values
+
+    return {
+        "source_room_id": _compact_text(pointers.get("source_room_id"), 260),
+        "matrix_event_ids": list_field("matrix_event_ids"),
+        "tts_utterance_ids": list_field("tts_utterance_ids"),
+        "wake_route_record_ids": list_field("wake_route_record_ids"),
+    }
+
+
+def _minutes_source_owner(payload: dict[str, Any], configured_owner: str) -> str:
+    delivery = payload.get("delivery") if isinstance(payload.get("delivery"), dict) else {}
+    return _compact_text(configured_owner or delivery.get("server_id") or "tb1", 40)
+
+
+def _minutes_source_support(
+    payload: dict[str, Any],
+    pointers: dict[str, Any],
+    source_owner: str,
+) -> dict[str, str]:
+    route = _compact_text(payload.get("route"), 80)
+    support: dict[str, str] = {"source_owner": source_owner}
+    if pointers.get("matrix_event_ids"):
+        support["matrix_source_pointer"] = (
+            "supported_by_tb1" if route == "direct_vps" and source_owner == "tb1" else "supported"
+        )
+    elif pointers.get("source_room_id"):
+        support["matrix_source_pointer"] = "needs_design"
+    else:
+        support["matrix_source_pointer"] = "unavailable"
+    support["tts_utterance_pointer"] = (
+        "supported" if pointers.get("tts_utterance_ids") else "unavailable"
+    )
+    support["wake_route_record_pointer"] = (
+        "supported" if pointers.get("wake_route_record_ids") else "unavailable"
+    )
+    return support
+
+
+def _minutes_title(payload: dict[str, Any]) -> str:
+    for key in ("operator_intent_summary", "assistant_action_summary", "result_summary"):
+        text = _compact_text(payload.get(key), 90)
+        if text:
+            return f"Minutes: {text}"[:120]
+    return "Hermes Minutes"
+
+
+def _minutes_excerpt(payload: dict[str, Any]) -> str:
+    parts = []
+    operator = _compact_text(payload.get("operator_intent_summary"), 180)
+    action = _compact_text(payload.get("assistant_action_summary"), 180)
+    result = _compact_text(payload.get("result_summary"), 220)
+    if operator:
+        parts.append(f"Operator: {operator}")
+    if action:
+        parts.append(f"Action: {action}")
+    if result:
+        parts.append(f"Result: {result}")
+    return " | ".join(parts)[:500] if parts else "Compact Hermes Minutes summary."
+
+
+def _minutes_projection_entry(
+    event: dict[str, Any],
+    *,
+    local_date: str,
+    timezone_name: str,
+    source_owner: str,
+) -> dict[str, Any]:
+    payload = _minutes_payload(event)
+    moment = _minutes_datetime(event, timezone_name)
+    local_moment = moment.astimezone(ZoneInfo(timezone_name))
+    record_hash = _hash_json_payload(
+        {
+            "schema": event.get("schema"),
+            "event_kind": event.get("event_kind"),
+            "conversation_key": event.get("conversation_key"),
+            "created_at": event.get("created_at"),
+            "payload": payload,
+        }
+    )
+    digest = record_hash.removeprefix("sha256:")[:20]
+    event_id = f"minutes-{local_date}-{digest}"
+    pointers = _minutes_source_pointers(payload)
+    owner = _minutes_source_owner(payload, source_owner)
+    return {
+        "event_id": event_id,
+        "minutes_id": event_id,
+        "source_record_hash": record_hash,
+        "time": moment.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "local_time": local_moment.strftime("%H:%M"),
+        "conversation_key": _compact_text(event.get("conversation_key"), 260),
+        "route": _compact_text(payload.get("route"), 80),
+        "route_status": _compact_text(payload.get("route_status"), 80),
+        "route_profile": _compact_text(payload.get("route_profile"), 120),
+        "operator_intent_summary": _compact_text(payload.get("operator_intent_summary"), 420),
+        "assistant_action_summary": _compact_text(payload.get("assistant_action_summary"), 320),
+        "result_summary": _compact_text(payload.get("result_summary"), 360),
+        "open_question": _compact_text(payload.get("open_question"), 240),
+        "entities": _compact_list(payload.get("entities"), item_limit=12, text_limit=180),
+        "problems": _compact_list(payload.get("problems"), item_limit=8, text_limit=220),
+        "followup_affordances": _compact_list(
+            payload.get("followup_affordances"), item_limit=8, text_limit=220
+        ),
+        "source_pointers": pointers,
+        "source_support": _minutes_source_support(payload, pointers, owner),
+        "source_owner": owner,
+        "source_detail_policy": _compact_text(payload.get("source_detail_policy"), 260),
+        "confidence": payload.get("confidence")
+        if isinstance(payload.get("confidence"), (int, float))
+        else None,
+    }
+
+
+def _select_minutes_entries(
+    *,
+    local_date: str,
+    timezone_name: str,
+    limit: int,
+    ttl_seconds: float | None,
+    source_owner: str,
+) -> tuple[str, Path, str, list[dict[str, Any]]]:
+    source_path = hermes_minutes.minutes_index_path()
+    if not source_path.exists():
+        return "source_unavailable", source_path, "", []
+    safe_limit = max(1, min(int(limit or 200), 500))
+    ttl = ttl_seconds if ttl_seconds is not None else 36 * 60 * 60
+    raw_events = hermes_minutes.read_recent_minutes(
+        event_kind="turn_summary",
+        limit=safe_limit,
+        ttl_seconds=ttl,
+    )
+    entries = [
+        _minutes_projection_entry(
+            event,
+            local_date=local_date,
+            timezone_name=timezone_name,
+            source_owner=source_owner,
+        )
+        for event in raw_events
+        if _minutes_local_date(event, timezone_name) == local_date
+    ]
+    deduped = {entry["source_record_hash"]: entry for entry in entries}
+    ordered = sorted(deduped.values(), key=lambda item: (item["time"], item["event_id"]))
+    source_hash = ""
+    with suppress(OSError):
+        source_hash = f"sha256:{hashlib.sha256(source_path.read_bytes()).hexdigest()}"
+    return "ok", source_path, source_hash, ordered
+
+
+def _upsert_index_structured_file(module: Any, day_dir: Path, owner: Any) -> None:
+    index_path = day_dir / "events-index.md"
+    if not index_path.exists():
+        return
+    text = index_path.read_text(encoding="utf-8")
+    line = f"- `{HERMES_MINUTES_FILE}` - Hermes Minutes projection"
+    if line in text:
+        return
+    if STRUCTURED_MARKER_START in text and STRUCTURED_MARKER_END in text:
+        insert_at = text.index(STRUCTURED_MARKER_END)
+        before = text[:insert_at]
+        after = text[insert_at:]
+        if before and not before.endswith("\n"):
+            before += "\n"
+        updated = before + line + "\n" + after
+    else:
+        updated = text.rstrip() + "\n\n" + line + "\n"
+    module.atomic_write_text(index_path, updated, owner)
+
+
+def _write_minutes_projection_artifacts(
+    module: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    source_status: str,
+    source_path: Path,
+    source_index_hash: str,
+    entries: list[dict[str, Any]],
+    source_owner: str,
+    now: str,
+) -> dict[str, Any]:
+    owner = module.resolve_owner("xarta", "xarta")
+    day = module.diary_day(root=DIARY_ROOT, local_date=local_date, timezone_name=timezone_name)
+    module.init_day(
+        root=DIARY_ROOT, local_date=local_date, timezone_name=timezone_name, owner=owner
+    )
+    projection_path = day.day_dir / HERMES_MINUTES_FILE
+    ledger_refs = [f"hermes-minutes:{entry['event_id']}" for entry in entries]
+    payload = module.hermes_minutes_projection_template(
+        day, source_owner=source_owner or "tb1", generated_by="blueprints-personal-api"
+    )
+    payload.update(
+        {
+            "updated_at_utc": now,
+            "status": source_status,
+            "source_index": {
+                "path": str(source_path),
+                "exists": source_path.exists(),
+                "content_hash": source_index_hash,
+            },
+            "entry_count": len(entries),
+            "entries": entries,
+            "source_ledger_refs": ledger_refs,
+            "projected_event_ids": [entry["event_id"] for entry in entries],
+        }
+    )
+    module.atomic_write_json(projection_path, payload, owner)
+    _upsert_index_structured_file(module, day.day_dir, owner)
+    _update_minutes_source_ledger(
+        module,
+        day_dir=day.day_dir,
+        file_ref=_diary_relative_path(projection_path),
+        source_path=source_path,
+        source_index_hash=source_index_hash,
+        source_status=source_status,
+        entries=entries,
+        now=now,
+    )
+    module.write_manifest(day, owner)
+    return {
+        "day": day,
+        "projection_path": projection_path,
+        "file_ref": _diary_relative_path(projection_path),
+        "source_hash": module.sha256_file(projection_path),
+    }
+
+
+def _update_minutes_source_ledger(
+    module: Any,
+    *,
+    day_dir: Path,
+    file_ref: str,
+    source_path: Path,
+    source_index_hash: str,
+    source_status: str,
+    entries: list[dict[str, Any]],
+    now: str,
+) -> None:
+    ledger_path = day_dir / "source-ledger.json"
+    owner = module.resolve_owner("xarta", "xarta")
+    payload = _read_json_file(ledger_path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+    sources = [
+        item
+        for item in sources
+        if not isinstance(item, dict)
+        or not str(item.get("ledger_entry_id") or "").startswith("hermes-minutes:")
+    ]
+    if source_status != "ok":
+        sources.append(
+            {
+                "ledger_entry_id": "hermes-minutes:source-unavailable",
+                "source_type": "hermes-minutes",
+                "source_ref": str(source_path),
+                "source_status": source_status,
+                "file_ref": file_ref,
+                "created_at_utc": now,
+                "provenance_state": "missing_source",
+            }
+        )
+    for entry in entries:
+        pointers = (
+            entry.get("source_pointers") if isinstance(entry.get("source_pointers"), dict) else {}
+        )
+        sources.append(
+            {
+                "ledger_entry_id": f"hermes-minutes:{entry['event_id']}",
+                "source_type": "hermes-minutes",
+                "source_ref": str(source_path),
+                "source_hash": entry["source_record_hash"],
+                "source_index_hash": source_index_hash,
+                "event_id": entry["event_id"],
+                "file_ref": file_ref,
+                "db_ref": f"personal_events:{entry['event_id']}",
+                "matrix_event_ids": pointers.get("matrix_event_ids") or [],
+                "tts_utterance_ids": pointers.get("tts_utterance_ids") or [],
+                "wake_route_record_ids": pointers.get("wake_route_record_ids") or [],
+                "conversation_key": entry.get("conversation_key") or "",
+                "route": entry.get("route") or "",
+                "route_profile": entry.get("route_profile") or "",
+                "source_owner": entry.get("source_owner") or "",
+                "source_support": entry.get("source_support") or {},
+                "created_at_utc": now,
+                "source_created_at": entry.get("time") or "",
+            }
+        )
+    payload.update(
+        {
+            "schema": payload.get("schema") or "xarta.diary.source_ledger.v1",
+            "updated_at_utc": now,
+            "generated_by": "blueprints-personal-api",
+            "sources": sources,
+        }
+    )
+    module.atomic_write_json(ledger_path, payload, owner)
+
+
+def _upsert_hermes_minutes_source(
+    conn: Any,
+    *,
+    source_status: str,
+    source_path: Path,
+    source_index_hash: str,
+    local_date: str,
+    entry_count: int,
+    now: str,
+) -> Any:
+    conn.execute(
+        """
+        INSERT INTO personal_sources (
+            source_id, source_type, label, status, last_seen_at, health_json,
+            provenance_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            status=excluded.status,
+            last_seen_at=excluded.last_seen_at,
+            health_json=excluded.health_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            "hermes-minutes",
+            "hermes-minutes",
+            "Hermes Minutes",
+            source_status,
+            now,
+            json.dumps(
+                {
+                    "source_index_path": str(source_path),
+                    "source_index_hash": source_index_hash,
+                    "local_date": local_date,
+                    "entry_count": entry_count,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            json.dumps({"reader": "hermes_minutes.read_recent_minutes"}, ensure_ascii=True),
+            now,
+            now,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM personal_sources WHERE source_id='hermes-minutes'"
+    ).fetchone()
+
+
+def _upsert_minutes_unavailable_event(
+    conn: Any,
+    *,
+    local_date: str,
+    timezone_name: str,
+    file_ref: str,
+    source_path: Path,
+    now: str,
+) -> Any:
+    event_id = f"minutes-{local_date}-source-unavailable"
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, local_date, timezone, status, privacy_level,
+            tags_json, file_refs_json, db_refs_json, provenance_json, projection_state,
+            provenance_state, last_rendered_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            source_ref=excluded.source_ref,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            content_projection=excluded.content_projection,
+            start_at=excluded.start_at,
+            status=excluded.status,
+            file_refs_json=excluded.file_refs_json,
+            provenance_json=excluded.provenance_json,
+            projection_state=excluded.projection_state,
+            provenance_state=excluded.provenance_state,
+            last_rendered_at=excluded.last_rendered_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            event_id,
+            "hermes-minutes",
+            str(source_path),
+            "",
+            "source-status",
+            "Hermes Minutes source unavailable",
+            "The configured compact Minutes index was unavailable during projection.",
+            "",
+            now,
+            local_date,
+            timezone_name,
+            "source_unavailable",
+            "normal",
+            json.dumps(["diary", "hermes-minutes", "source-unavailable"], ensure_ascii=True),
+            json.dumps([file_ref], ensure_ascii=True),
+            json.dumps([], ensure_ascii=True),
+            json.dumps(
+                {
+                    "source_index_path": str(source_path),
+                    "projection_file": file_ref,
+                    "source_status": "source_unavailable",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "hot",
+            "missing_source",
+            now,
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+
+
+def _upsert_minutes_event(
+    conn: Any,
+    *,
+    entry: dict[str, Any],
+    local_date: str,
+    timezone_name: str,
+    file_ref: str,
+    now: str,
+) -> Any:
+    event_id = entry["event_id"]
+    provenance = {
+        "projection_file": file_ref,
+        "source_pointers": entry.get("source_pointers") or {},
+        "source_support": entry.get("source_support") or {},
+        "source_owner": entry.get("source_owner") or "",
+        "conversation_key": entry.get("conversation_key") or "",
+        "route": entry.get("route") or "",
+        "route_status": entry.get("route_status") or "",
+        "route_profile": entry.get("route_profile") or "",
+        "source_detail_policy": entry.get("source_detail_policy") or "",
+    }
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, local_date, timezone, status, privacy_level,
+            tags_json, entities_json, file_refs_json, db_refs_json, provenance_json,
+            projection_state, provenance_state, last_rendered_at, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            kind=excluded.kind,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            content_projection=excluded.content_projection,
+            start_at=excluded.start_at,
+            local_date=excluded.local_date,
+            timezone=excluded.timezone,
+            status=excluded.status,
+            privacy_level=excluded.privacy_level,
+            tags_json=excluded.tags_json,
+            entities_json=excluded.entities_json,
+            file_refs_json=excluded.file_refs_json,
+            db_refs_json=excluded.db_refs_json,
+            provenance_json=excluded.provenance_json,
+            projection_state=excluded.projection_state,
+            provenance_state=excluded.provenance_state,
+            last_rendered_at=excluded.last_rendered_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            event_id,
+            "hermes-minutes",
+            entry["source_record_hash"],
+            entry["source_record_hash"],
+            "hermes-minutes",
+            _minutes_title(entry),
+            _minutes_excerpt(entry),
+            json.dumps(entry, ensure_ascii=True, sort_keys=True),
+            entry.get("time") or now,
+            local_date,
+            timezone_name,
+            "open",
+            "normal",
+            json.dumps(["diary", "hermes-minutes", "minutes-projection"], ensure_ascii=True),
+            json.dumps(entry.get("entities") or [], ensure_ascii=True),
+            json.dumps([file_ref], ensure_ascii=True),
+            json.dumps([], ensure_ascii=True),
+            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            "hot",
+            "linked",
+            now,
+            now,
+            now,
+        ),
+    )
+    return conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+
+
+def _project_hermes_minutes(
+    body: DiaryMinutesProjectRequest,
+) -> dict[str, Any]:
+    local_date = _validate_local_date(body.local_date)
+    timezone_name = _clean_short_text(
+        body.timezone or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+        "Europe/London",
+        limit=80,
+    )
+    try:
+        ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise HTTPException(400, "timezone is invalid") from exc
+    now = _utc_now_iso()
+    source_status, source_path, source_index_hash, entries = _select_minutes_entries(
+        local_date=local_date,
+        timezone_name=timezone_name,
+        limit=body.limit,
+        ttl_seconds=body.ttl_seconds,
+        source_owner=body.source_owner,
+    )
+    module = _load_xarta_diary_module()
+    artifacts = _write_minutes_projection_artifacts(
+        module,
+        local_date=local_date,
+        timezone_name=timezone_name,
+        source_status=source_status,
+        source_path=source_path,
+        source_index_hash=source_index_hash,
+        entries=entries,
+        source_owner=body.source_owner,
+        now=now,
+    )
+    file_ref = artifacts["file_ref"]
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    actor = _clean_short_text(body.actor, "blueprints-api")
+    source_surface = _clean_short_text(body.source_surface, "minutes-projection")
+    request_id = _clean_short_text(
+        body.request_id, f"minutes-project-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    existing_ids = {entry["event_id"] for entry in entries}
+    with get_conn() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT event_id FROM personal_events
+            WHERE local_date=? AND source_type='hermes-minutes'
+            """,
+            (local_date,),
+        ).fetchall()
+        previously_present = {row["event_id"] for row in existing_rows}
+        source_row = _upsert_hermes_minutes_source(
+            conn,
+            source_status=source_status,
+            source_path=source_path,
+            source_index_hash=source_index_hash,
+            local_date=local_date,
+            entry_count=len(entries),
+            now=now,
+        )
+        event_rows = []
+        if source_status != "ok":
+            event_rows.append(
+                _upsert_minutes_unavailable_event(
+                    conn,
+                    local_date=local_date,
+                    timezone_name=timezone_name,
+                    file_ref=file_ref,
+                    source_path=source_path,
+                    now=now,
+                )
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM personal_events
+                WHERE event_id=? AND source_type='hermes-minutes'
+                """,
+                (f"minutes-{local_date}-source-unavailable",),
+            )
+            for entry in entries:
+                event_rows.append(
+                    _upsert_minutes_event(
+                        conn,
+                        entry=entry,
+                        local_date=local_date,
+                        timezone_name=timezone_name,
+                        file_ref=file_ref,
+                        now=now,
+                    )
+                )
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="project_hermes_minutes",
+            target_ref=f"diary-day:{local_date}",
+            file_ref=file_ref,
+            db_ref="personal_sources:hermes-minutes",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result=source_status,
+            source_hash=artifacts["source_hash"],
+            metadata={
+                "local_date": local_date,
+                "source_index_path": str(source_path),
+                "source_index_hash": source_index_hash,
+                "projected_event_count": len(entries),
+                "skipped_existing_event_count": len(existing_ids & previously_present),
+            },
+        )
+        gen = increment_gen(conn, "personal-minutes-projection")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_sources", "hermes-minutes", dict(source_row), gen
+        )
+        for event_row in event_rows:
+            enqueue_for_all_peers(
+                conn, "UPDATE", "personal_events", event_row["event_id"], dict(event_row), gen
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "source_available": source_status == "ok",
+        "status": source_status,
+        "local_date": local_date,
+        "timezone": timezone_name,
+        "projection": {
+            "file_ref": file_ref,
+            "source_hash": artifacts["source_hash"],
+            "entry_count": len(entries),
+            "projected_event_ids": [entry["event_id"] for entry in entries],
+            "skipped_existing_event_count": len(existing_ids & previously_present),
+        },
+        "source": {
+            "path": str(source_path),
+            "exists": source_path.exists(),
+            "content_hash": source_index_hash,
+        },
+        "audit": {"audit_id": audit_id, "result": source_status},
+        "day": _build_diary_day_payload(local_date),
+    }
 
 
 def _project_personal_log_event(

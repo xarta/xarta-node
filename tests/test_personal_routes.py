@@ -46,6 +46,52 @@ os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 from app import routes_personal  # noqa: E402
 
 
+def _minutes_turn_event(
+    *,
+    created_at: str,
+    conversation_key: str = "matrix-bridge:tb1:room=!test:chat.example",
+    matrix_event_id: str = "$source-event",
+    raw_delivery_body: str = "RAW TRANSCRIPT BODY MUST NOT BE PROJECTED",
+) -> dict:
+    return {
+        "schema": "xarta.hermes.minutes.event.v1",
+        "event_kind": "turn_summary",
+        "conversation_key": conversation_key,
+        "created_at": created_at,
+        "created_at_epoch": 1781800000.0,
+        "payload": {
+            "schema": "xarta.hermes.minutes.summary.v1",
+            "conversation_key": conversation_key,
+            "time": created_at,
+            "route": "matrix_bridge",
+            "route_status": "message_received",
+            "route_profile": "matrix-bridge-operator",
+            "operator_intent_summary": "Asked for Step 12 compact Minutes projection.",
+            "assistant_action_summary": "Projected compact Minutes into diary provenance.",
+            "result_summary": "Diary can show compact Minutes context without source copies.",
+            "open_question": "",
+            "entities": [{"name": "Step 12", "kind": "goal_step", "aliases": []}],
+            "problems": [],
+            "followup_affordances": ["verify_diary_projection"],
+            "source_pointers": {
+                "source_room_id": "!test:chat.example",
+                "matrix_event_ids": [matrix_event_id],
+                "tts_utterance_ids": [],
+                "wake_route_record_ids": ["wake-route-test"],
+            },
+            "source_detail_available": True,
+            "source_detail_policy": "Use source pointers; do not copy raw source material.",
+            "delivery": {
+                "server_id": "tb1",
+                "room_id": "!test:chat.example",
+                "event_id": matrix_event_id,
+                "body": raw_delivery_body,
+            },
+            "confidence": 0.95,
+        },
+    }
+
+
 def _make_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -550,3 +596,153 @@ def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
         "SELECT * FROM personal_time_audit WHERE action='generate_day_summary'"
     ).fetchone()
     assert audit["actor"] == "codex-test"
+
+
+def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path / "diary")
+    minutes_file = tmp_path / "minutes" / "recent.jsonl"
+    minutes_file.parent.mkdir(parents=True)
+    raw_body = "RAW TRANSCRIPT BODY MUST NOT BE PROJECTED"
+    events = [
+        _minutes_turn_event(
+            created_at="2026-06-18T10:15:00Z",
+            matrix_event_id="$minutes-source-1",
+            raw_delivery_body=raw_body,
+        ),
+        _minutes_turn_event(
+            created_at="2026-06-17T10:15:00Z",
+            matrix_event_id="$minutes-source-previous-day",
+            raw_delivery_body="PREVIOUS DAY RAW BODY",
+        ),
+    ]
+    minutes_file.write_text(
+        "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(minutes_file))
+    monkeypatch.setenv("HERMES_MINUTES_CONFIG_FILE", str(tmp_path / "missing-config.json"))
+
+    result = asyncio.run(
+        routes_personal.project_diary_day_minutes(
+            routes_personal.DiaryMinutesProjectRequest(
+                local_date="2026-06-18",
+                ttl_seconds=10**12,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="minutes-test",
+            )
+        )
+    )
+
+    projection_path = tmp_path / "diary" / result["projection"]["file_ref"]
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    projection_text = projection_path.read_text(encoding="utf-8")
+    assert result["ok"] is True
+    assert result["source_available"] is True
+    assert result["status"] == "ok"
+    assert projection["schema"] == "xarta.diary.hermes_minutes_projection.v1"
+    assert projection["entry_count"] == 1
+    assert projection["entries"][0]["source_pointers"]["matrix_event_ids"] == ["$minutes-source-1"]
+    assert projection["entries"][0]["source_support"]["matrix_source_pointer"] == "supported"
+    assert raw_body not in projection_text
+    assert "PREVIOUS DAY RAW BODY" not in projection_text
+
+    event_rows = conn.execute(
+        "SELECT * FROM personal_events WHERE source_type='hermes-minutes'"
+    ).fetchall()
+    assert len(event_rows) == 1
+    assert event_rows[0]["status"] == "open"
+    assert event_rows[0]["kind"] == "hermes-minutes"
+    assert raw_body not in event_rows[0]["content_projection"]
+
+    ledger = json.loads(
+        (tmp_path / "diary" / "2026" / "06" / "18" / "source-ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    minutes_ledger = [
+        item
+        for item in ledger["sources"]
+        if str(item.get("ledger_entry_id", "")).startswith("hermes-minutes:")
+    ]
+    assert len(minutes_ledger) == 1
+    assert minutes_ledger[0]["matrix_event_ids"] == ["$minutes-source-1"]
+    manifest = json.loads(
+        (tmp_path / "diary" / "2026" / "06" / "18" / "day-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "hermes-minutes.json" in {item["path"] for item in manifest["files"]}
+
+    rerun = asyncio.run(
+        routes_personal.project_diary_day_minutes(
+            routes_personal.DiaryMinutesProjectRequest(
+                local_date="2026-06-18",
+                ttl_seconds=10**12,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="minutes-test-rerun",
+            )
+        )
+    )
+    assert rerun["projection"]["skipped_existing_event_count"] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE source_type='hermes-minutes'"
+        ).fetchone()["count"]
+        == 1
+    )
+    rerun_ledger = json.loads(
+        (tmp_path / "diary" / "2026" / "06" / "18" / "source-ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        len(
+            [
+                item
+                for item in rerun_ledger["sources"]
+                if str(item.get("ledger_entry_id", "")).startswith("hermes-minutes:")
+            ]
+        )
+        == 1
+    )
+
+
+def test_minutes_projection_records_source_unavailable_status(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path / "diary")
+    missing_minutes = tmp_path / "minutes" / "missing.jsonl"
+    monkeypatch.setenv("HERMES_MINUTES_LOCAL_INDEX_PATH", str(missing_minutes))
+    monkeypatch.setenv("HERMES_MINUTES_CONFIG_FILE", str(tmp_path / "missing-config.json"))
+
+    result = asyncio.run(
+        routes_personal.project_diary_day_minutes(
+            routes_personal.DiaryMinutesProjectRequest(
+                local_date="2026-06-18",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="minutes-missing-test",
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["source_available"] is False
+    assert result["status"] == "source_unavailable"
+    projection_path = tmp_path / "diary" / result["projection"]["file_ref"]
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    assert projection["status"] == "source_unavailable"
+    assert projection["entries"] == []
+    event = conn.execute(
+        "SELECT * FROM personal_events WHERE source_type='hermes-minutes'"
+    ).fetchone()
+    assert event["event_id"] == "minutes-2026-06-18-source-unavailable"
+    assert event["status"] == "source_unavailable"
+    source = conn.execute(
+        "SELECT * FROM personal_sources WHERE source_id='hermes-minutes'"
+    ).fetchone()
+    assert source["status"] == "source_unavailable"
