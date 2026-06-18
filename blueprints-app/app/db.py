@@ -248,6 +248,82 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at  TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS personal_events (
+    event_id                      TEXT PRIMARY KEY,
+    source_type                   TEXT NOT NULL DEFAULT 'manual',
+    source_ref                    TEXT,
+    source_hash                   TEXT,
+    kind                          TEXT NOT NULL DEFAULT 'event',
+    title                         TEXT NOT NULL DEFAULT '',
+    body_excerpt                  TEXT,
+    content_projection            TEXT,
+    start_at                      TEXT,
+    end_at                        TEXT,
+    local_date                    TEXT,
+    timezone                      TEXT,
+    status                        TEXT NOT NULL DEFAULT 'open',
+    priority                      TEXT,
+    privacy_level                 TEXT NOT NULL DEFAULT 'normal',
+    tags_json                     TEXT NOT NULL DEFAULT '[]',
+    entities_json                 TEXT NOT NULL DEFAULT '[]',
+    related_work_items_json       TEXT NOT NULL DEFAULT '[]',
+    related_tasks_json            TEXT NOT NULL DEFAULT '[]',
+    related_import_batches_json   TEXT NOT NULL DEFAULT '[]',
+    file_refs_json                TEXT NOT NULL DEFAULT '[]',
+    db_refs_json                  TEXT NOT NULL DEFAULT '[]',
+    provenance_json               TEXT NOT NULL DEFAULT '{}',
+    projection_state              TEXT NOT NULL DEFAULT 'hot',
+    provenance_state              TEXT NOT NULL DEFAULT 'linked',
+    last_rendered_at              TEXT,
+    projection_expires_at         TEXT,
+    retention_days                INTEGER DEFAULT 60,
+    created_at                    TEXT DEFAULT (datetime('now')),
+    updated_at                    TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_events_local_date
+    ON personal_events(local_date, start_at);
+CREATE INDEX IF NOT EXISTS idx_personal_events_source
+    ON personal_events(source_type, source_ref);
+CREATE INDEX IF NOT EXISTS idx_personal_events_status
+    ON personal_events(status, kind);
+CREATE INDEX IF NOT EXISTS idx_personal_events_privacy
+    ON personal_events(privacy_level);
+
+CREATE TABLE IF NOT EXISTS personal_sources (
+    source_id        TEXT PRIMARY KEY,
+    source_type      TEXT NOT NULL,
+    label            TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'unknown',
+    last_seen_at     TEXT,
+    health_json      TEXT NOT NULL DEFAULT '{}',
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_sources_type
+    ON personal_sources(source_type, status);
+
+CREATE TABLE IF NOT EXISTS personal_import_batches (
+    import_batch_id      TEXT PRIMARY KEY,
+    source_type          TEXT NOT NULL,
+    source_ref           TEXT,
+    title                TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'pending_review',
+    local_date           TEXT,
+    started_at           TEXT,
+    completed_at         TEXT,
+    privacy_level        TEXT NOT NULL DEFAULT 'normal',
+    artifact_refs_json   TEXT NOT NULL DEFAULT '[]',
+    blocker_refs_json    TEXT NOT NULL DEFAULT '[]',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_import_batches_date
+    ON personal_import_batches(local_date, started_at);
+CREATE INDEX IF NOT EXISTS idx_personal_import_batches_source
+    ON personal_import_batches(source_type, status);
+
 CREATE TABLE IF NOT EXISTS pve_hosts (
     pve_id        TEXT PRIMARY KEY,   -- IP address — stable, no external config needed
     ip_address    TEXT NOT NULL,

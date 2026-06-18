@@ -82,6 +82,9 @@ _ALLOWED_TABLES = {
     "pockettts_voice_meta",
     "pockettts_voice_tags",
     "pockettts_tag_order",
+    "personal_events",
+    "personal_sources",
+    "personal_import_batches",
 }
 
 # Action types that trigger local execution rather than a DB write
@@ -317,6 +320,9 @@ def _pk_for_table(table: str) -> str:
         "pockettts_voice_meta": "voice_id",
         "pockettts_voice_tags": "assignment_id",
         "pockettts_tag_order": "order_id",
+        "personal_events": "event_id",
+        "personal_sources": "source_id",
+        "personal_import_batches": "import_batch_id",
     }
     return pk_map.get(table, "id")
 
