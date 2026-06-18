@@ -78,6 +78,7 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
         "filters": {"source_type": "git"},
     },
 }
+WORK_DEPTH_LIMIT = 12
 
 
 class PersonalRehydrateRequest(BaseModel):
@@ -160,6 +161,103 @@ class PersonalTaskUpsertRequest(BaseModel):
 class PersonalTaskActionRequest(BaseModel):
     actor: str = "blueprints-ui"
     source_surface: str = "todo-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkItemCreateRequest(BaseModel):
+    item_id: str | None = None
+    parent_item_id: str | None = None
+    title: str
+    body: str | None = None
+    item_type: str = "work"
+    state_id: str = "todo"
+    priority_id: str = "medium"
+    sort_order: int = 0
+    tags: list[str] = []
+    related_event_ids: list[str] = []
+    related_task_ids: list[str] = []
+    related_issue_ids: list[str] = []
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkItemUpdateRequest(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    item_type: str | None = None
+    state_id: str | None = None
+    priority_id: str | None = None
+    sort_order: int | None = None
+    tags: list[str] | None = None
+    related_event_ids: list[str] | None = None
+    related_task_ids: list[str] | None = None
+    related_issue_ids: list[str] | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkItemMoveRequest(BaseModel):
+    parent_item_id: str | None = None
+    state_id: str | None = None
+    sort_order: int | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkItemActionRequest(BaseModel):
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkIssueUpsertRequest(BaseModel):
+    item_id: str
+    issue_id: str | None = None
+    title: str
+    body: str | None = None
+    status: str = "open"
+    priority_id: str = "medium"
+    source_ref: str | None = None
+    related_task_id: str | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkTodoUpsertRequest(BaseModel):
+    item_id: str
+    todo_id: str | None = None
+    title: str
+    body: str | None = None
+    status: str = "open"
+    priority_id: str = "medium"
+    due_at: str | None = None
+    related_task_id: str | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkPromoteRequest(BaseModel):
+    source_ref: str
+    title: str | None = None
+    body: str | None = None
+    parent_item_id: str | None = None
+    state_id: str = "todo"
+    priority_id: str = "medium"
+    tags: list[str] = []
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -300,6 +398,170 @@ def _row_to_task(row: Any) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "completed_at": row["completed_at"],
         "archived_at": row["archived_at"],
+    }
+
+
+def _row_to_work_state(row: Any) -> dict[str, Any]:
+    return {
+        "state_id": row["state_id"],
+        "label": row["label"],
+        "lane_key": row["lane_key"],
+        "status_category": row["status_category"],
+        "sort_order": row["sort_order"],
+        "is_terminal": bool(row["is_terminal"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_priority(row: Any) -> dict[str, Any]:
+    return {
+        "priority_id": row["priority_id"],
+        "label": row["label"],
+        "weight": row["weight"],
+        "sort_order": row["sort_order"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_item(row: Any) -> dict[str, Any]:
+    return {
+        "item_id": row["item_id"],
+        "parent_item_id": row["parent_item_id"],
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "item_type": row["item_type"],
+        "state_id": row["state_id"],
+        "priority_id": row["priority_id"],
+        "depth": row["depth"],
+        "sort_order": row["sort_order"],
+        "status": row["status"],
+        "archived_at": row["archived_at"],
+        "promoted_from_ref": row["promoted_from_ref"],
+        "source": {
+            "type": row["source_type"],
+            "ref": row["source_ref"],
+            "hash": row["source_hash"],
+        },
+        "tags": _json_value(row["tags_json"], []),
+        "related": {
+            "events": _json_value(row["related_event_ids_json"], []),
+            "tasks": _json_value(row["related_task_ids_json"], []),
+            "issues": _json_value(row["related_issue_ids_json"], []),
+        },
+        "search": {
+            "text": row["search_text"],
+            "metadata": _json_value(row["search_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+        },
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_issue(row: Any) -> dict[str, Any]:
+    return {
+        "issue_id": row["issue_id"],
+        "item_id": row["item_id"],
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "priority_id": row["priority_id"],
+        "source_ref": row["source_ref"],
+        "related_task_id": row["related_task_id"],
+        "search": {
+            "text": row["search_text"],
+            "metadata": _json_value(row["search_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+        },
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_todo(row: Any) -> dict[str, Any]:
+    return {
+        "todo_id": row["todo_id"],
+        "item_id": row["item_id"],
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "priority_id": row["priority_id"],
+        "due_at": row["due_at"],
+        "related_task_id": row["related_task_id"],
+        "search": {
+            "text": row["search_text"],
+            "metadata": _json_value(row["search_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+        },
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_blocker(row: Any) -> dict[str, Any]:
+    return {
+        "blocker_id": row["blocker_id"],
+        "item_id": row["item_id"],
+        "title": row["title"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "blocked_by_ref": row["blocked_by_ref"],
+        "search": {
+            "text": row["search_text"],
+            "metadata": _json_value(row["search_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+        },
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_discussion(row: Any) -> dict[str, Any]:
+    return {
+        "discussion_id": row["discussion_id"],
+        "item_id": row["item_id"],
+        "author": row["author"],
+        "body_excerpt": row["body_excerpt"],
+        "status": row["status"],
+        "search": {
+            "text": row["search_text"],
+            "metadata": _json_value(row["search_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+        },
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -1544,6 +1806,1197 @@ def _task_counts(conn: Any) -> dict[str, int]:
         if status in {"done", "archived"}:
             counts["done"] += count
     return counts
+
+
+def _clean_work_id(value: str | None, prefix: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(value or "").strip()).strip("-")
+    if clean:
+        return clean[:180]
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _work_request_meta(body: Any) -> dict[str, str]:
+    request_id = _clean_short_text(
+        getattr(body, "request_id", None), f"work-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(getattr(body, "run_id", None) or request_id, request_id, limit=160)
+    return {
+        "actor": _clean_short_text(getattr(body, "actor", None), "blueprints-ui"),
+        "source_surface": _clean_short_text(getattr(body, "source_surface", None), "kanban-api"),
+        "request_id": request_id,
+        "run_id": run_id,
+    }
+
+
+def _require_work_state(conn: Any, state_id: str | None) -> Any:
+    clean_state = _clean_short_text(state_id, "todo", limit=80)
+    row = conn.execute("SELECT * FROM work_item_states WHERE state_id=?", (clean_state,)).fetchone()
+    if not row:
+        raise HTTPException(400, "work item state is invalid")
+    return row
+
+
+def _require_work_priority(conn: Any, priority_id: str | None) -> Any:
+    clean_priority = _clean_short_text(priority_id, "medium", limit=80)
+    row = conn.execute(
+        "SELECT * FROM work_item_priorities WHERE priority_id=?", (clean_priority,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, "work item priority is invalid")
+    return row
+
+
+def _work_status_for_state(state_row: Any) -> str:
+    category = state_row["status_category"]
+    if category == "done":
+        return "done"
+    if category == "blocked":
+        return "blocked"
+    if category == "active":
+        return "active"
+    return "open"
+
+
+def _work_item_or_404(conn: Any, item_id: str) -> Any:
+    row = conn.execute("SELECT * FROM work_items WHERE item_id=?", (item_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "work item not found")
+    return row
+
+
+def _work_parent_depth(conn: Any, parent_item_id: str | None, *, moving_item_id: str = "") -> int:
+    parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
+    if not parent_id:
+        return 0
+    if moving_item_id and parent_id == moving_item_id:
+        raise HTTPException(400, "work item cannot be its own parent")
+    immediate_parent = conn.execute(
+        "SELECT item_id, parent_item_id, depth FROM work_items WHERE item_id=?", (parent_id,)
+    ).fetchone()
+    if not immediate_parent:
+        raise HTTPException(404, "parent work item not found")
+    current = parent_id
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            raise HTTPException(400, "work item parent cycle detected")
+        seen.add(current)
+        row = conn.execute(
+            "SELECT item_id, parent_item_id, depth FROM work_items WHERE item_id=?", (current,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "parent work item not found")
+        if moving_item_id and row["item_id"] == moving_item_id:
+            raise HTTPException(400, "work item cannot move under its descendant")
+        current = row["parent_item_id"]
+    depth = int(immediate_parent["depth"]) + 1
+    if depth > WORK_DEPTH_LIMIT:
+        raise HTTPException(400, "work item depth limit exceeded")
+    return depth
+
+
+def _work_subtree_max_relative_depth(conn: Any, item_id: str) -> int:
+    row = conn.execute(
+        """
+        WITH RECURSIVE descendants(item_id, rel_depth) AS (
+            SELECT item_id, 0 FROM work_items WHERE item_id=?
+            UNION ALL
+            SELECT w.item_id, descendants.rel_depth + 1
+            FROM work_items w
+            JOIN descendants ON w.parent_item_id = descendants.item_id
+        )
+        SELECT COALESCE(MAX(rel_depth), 0) AS max_depth FROM descendants
+        """,
+        (item_id,),
+    ).fetchone()
+    return int(row["max_depth"] if row else 0)
+
+
+def _recompute_work_child_depths(conn: Any, item_id: str, depth: int) -> None:
+    rows = conn.execute(
+        "SELECT item_id FROM work_items WHERE parent_item_id=?", (item_id,)
+    ).fetchall()
+    for row in rows:
+        child_depth = depth + 1
+        conn.execute(
+            "UPDATE work_items SET depth=?, updated_at=? WHERE item_id=?",
+            (child_depth, _utc_now_iso(), row["item_id"]),
+        )
+        _recompute_work_child_depths(conn, row["item_id"], child_depth)
+
+
+def _work_search_payload(
+    *,
+    table_name: str,
+    row_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    tags: list[str] | None = None,
+    related_refs: list[str] | None = None,
+) -> tuple[str, dict[str, Any], str]:
+    tag_values = tags or []
+    search_text = "\n".join(part for part in [title, body, " ".join(tag_values)] if part)
+    vector_key = f"{table_name}:{row_id}"
+    metadata = {
+        "schema": "xarta.work.search_metadata.v1",
+        "table": table_name,
+        "row_id": row_id,
+        "kind": kind,
+        "related_refs": related_refs or [],
+        "embedding": {
+            "state": "pending",
+            "ref": "",
+            "model": "",
+        },
+        "vector": {
+            "index": "work-management",
+            "key": vector_key,
+            "turbo_vec_ready": True,
+        },
+    }
+    return search_text, metadata, vector_key
+
+
+def _write_work_audit(
+    conn: Any,
+    *,
+    audit_id: str,
+    actor: str,
+    source_surface: str,
+    action: str,
+    target_ref: str,
+    item_id: str,
+    parent_item_id: str,
+    request_id: str,
+    run_id: str,
+    result: str,
+    source_hash: str,
+    metadata: dict[str, Any],
+    created_at: str,
+) -> dict[str, Any]:
+    row = {
+        "audit_id": audit_id,
+        "actor": actor,
+        "source_surface": source_surface,
+        "action": action,
+        "target_ref": target_ref,
+        "item_id": item_id,
+        "parent_item_id": parent_item_id,
+        "created_at": created_at,
+        "request_id": request_id,
+        "run_id": run_id,
+        "result": result,
+        "source_hash": source_hash,
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+    }
+    conn.execute(
+        """
+        INSERT INTO work_audit_log (
+            audit_id, actor, source_surface, action, target_ref, item_id, parent_item_id,
+            created_at, request_id, run_id, result, source_hash, metadata_json
+        )
+        VALUES (
+            :audit_id, :actor, :source_surface, :action, :target_ref, :item_id,
+            :parent_item_id, :created_at, :request_id, :run_id, :result,
+            :source_hash, :metadata_json
+        )
+        ON CONFLICT(audit_id) DO UPDATE SET
+            actor=excluded.actor,
+            source_surface=excluded.source_surface,
+            action=excluded.action,
+            target_ref=excluded.target_ref,
+            item_id=excluded.item_id,
+            parent_item_id=excluded.parent_item_id,
+            created_at=excluded.created_at,
+            request_id=excluded.request_id,
+            run_id=excluded.run_id,
+            result=excluded.result,
+            source_hash=excluded.source_hash,
+            metadata_json=excluded.metadata_json
+        """,
+        row,
+    )
+    return row
+
+
+def _work_scope_item_ids(conn: Any, item_id: str | None) -> list[str]:
+    if not item_id:
+        rows = conn.execute("SELECT item_id FROM work_items WHERE status != 'archived'").fetchall()
+        return [row["item_id"] for row in rows]
+    _work_item_or_404(conn, item_id)
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(item_id) AS (
+            SELECT item_id FROM work_items WHERE item_id=?
+            UNION ALL
+            SELECT w.item_id
+            FROM work_items w
+            JOIN descendants ON w.parent_item_id = descendants.item_id
+            WHERE w.status != 'archived'
+        )
+        SELECT item_id FROM descendants
+        """,
+        (item_id,),
+    ).fetchall()
+    return [row["item_id"] for row in rows]
+
+
+def _work_rollup(conn: Any, item_id: str | None = None) -> dict[str, Any]:
+    item_ids = _work_scope_item_ids(conn, item_id)
+    if not item_ids:
+        return {
+            "items": {"total": 0, "by_state": {}, "by_status": {}},
+            "issues": {"open": 0},
+            "todos": {"open": 0},
+            "blockers": {"open": 0},
+            "depth_limit": WORK_DEPTH_LIMIT,
+        }
+    placeholders = ",".join("?" for _ in item_ids)
+    state_rows = conn.execute(
+        f"SELECT state_id, COUNT(*) AS count FROM work_items WHERE item_id IN ({placeholders}) "
+        "GROUP BY state_id",
+        item_ids,
+    ).fetchall()
+    status_rows = conn.execute(
+        f"SELECT status, COUNT(*) AS count FROM work_items WHERE item_id IN ({placeholders}) "
+        "GROUP BY status",
+        item_ids,
+    ).fetchall()
+    issue_open = conn.execute(
+        f"SELECT COUNT(*) AS count FROM work_issues WHERE item_id IN ({placeholders}) "
+        "AND status != 'closed'",
+        item_ids,
+    ).fetchone()
+    todo_open = conn.execute(
+        f"SELECT COUNT(*) AS count FROM work_todos WHERE item_id IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived')",
+        item_ids,
+    ).fetchone()
+    blocker_open = conn.execute(
+        f"SELECT COUNT(*) AS count FROM work_blockers WHERE item_id IN ({placeholders}) "
+        "AND status NOT IN ('resolved', 'archived')",
+        item_ids,
+    ).fetchone()
+    return {
+        "items": {
+            "total": len(item_ids),
+            "by_state": {row["state_id"]: row["count"] for row in state_rows},
+            "by_status": {row["status"]: row["count"] for row in status_rows},
+        },
+        "issues": {"open": int(issue_open["count"] if issue_open else 0)},
+        "todos": {"open": int(todo_open["count"] if todo_open else 0)},
+        "blockers": {"open": int(blocker_open["count"] if blocker_open else 0)},
+        "depth_limit": WORK_DEPTH_LIMIT,
+    }
+
+
+def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[str, Any]:
+    parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
+    parent = _work_item_or_404(conn, parent_id) if parent_id else None
+    states = conn.execute("SELECT * FROM work_item_states ORDER BY sort_order, state_id").fetchall()
+    if parent_id:
+        rows = conn.execute(
+            """
+            SELECT * FROM work_items
+            WHERE parent_item_id=? AND status != 'archived'
+            ORDER BY state_id, sort_order, updated_at DESC, item_id
+            """,
+            (parent_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM work_items
+            WHERE parent_item_id IS NULL AND status != 'archived'
+            ORDER BY state_id, sort_order, updated_at DESC, item_id
+            """
+        ).fetchall()
+    items_by_state: dict[str, list[dict[str, Any]]] = {row["state_id"]: [] for row in states}
+    for row in rows:
+        items_by_state.setdefault(row["state_id"], []).append(_row_to_work_item(row))
+    return {
+        "ok": True,
+        "board": {
+            "parent": _row_to_work_item(parent) if parent else None,
+            "depth_limit": WORK_DEPTH_LIMIT,
+            "columns": [
+                {"state": _row_to_work_state(state), "items": items_by_state[state["state_id"]]}
+                for state in states
+            ],
+            "rollup": _work_rollup(conn, parent_id),
+        },
+    }
+
+
+def _work_item_payload(
+    conn: Any,
+    body: WorkItemCreateRequest,
+    *,
+    promoted_from_ref: str = "",
+) -> dict[str, Any]:
+    title = _clean_short_text(body.title, "", limit=180)
+    if not title:
+        raise HTTPException(400, "work item title is required")
+    state = _require_work_state(conn, body.state_id)
+    priority = _require_work_priority(conn, body.priority_id)
+    parent_id = _clean_short_text(body.parent_item_id, "", limit=180) or None
+    depth = _work_parent_depth(conn, parent_id)
+    item_id = _clean_work_id(body.item_id, "work")
+    tags = _clean_event_list(body.tags, limit=32)
+    if "work" not in tags:
+        tags.append("work")
+    item_type = _clean_short_text(body.item_type, "work", limit=80)
+    body_excerpt = _body_excerpt(body.body or "", limit=4000)
+    related_events = _clean_event_list(body.related_event_ids, limit=32)
+    related_tasks = _clean_event_list(body.related_task_ids, limit=32)
+    related_issues = _clean_event_list(body.related_issue_ids, limit=32)
+    related_refs = [
+        *[f"personal_events:{event_id}" for event_id in related_events],
+        *[f"personal_time_tasks:{task_id}" for task_id in related_tasks],
+        *[f"work_issues:{issue_id}" for issue_id in related_issues],
+    ]
+    search_text, search_metadata, vector_key = _work_search_payload(
+        table_name="work_items",
+        row_id=item_id,
+        kind=item_type,
+        title=title,
+        body=body_excerpt,
+        tags=tags,
+        related_refs=related_refs,
+    )
+    provenance = {
+        "work": {
+            "depth_limit": WORK_DEPTH_LIMIT,
+            "promoted_from_ref": promoted_from_ref,
+        },
+        **_work_request_meta(body),
+    }
+    payload = {
+        "item_id": item_id,
+        "parent_item_id": parent_id,
+        "title": title,
+        "body_excerpt": body_excerpt,
+        "item_type": item_type,
+        "state_id": state["state_id"],
+        "priority_id": priority["priority_id"],
+        "depth": depth,
+        "sort_order": int(body.sort_order),
+        "status": _work_status_for_state(state),
+        "promoted_from_ref": promoted_from_ref,
+        "source_type": "manual-work",
+        "source_ref": f"work_items:{item_id}",
+        "tags": tags,
+        "related_event_ids": related_events,
+        "related_task_ids": related_tasks,
+        "related_issue_ids": related_issues,
+        "search_text": search_text,
+        "search_metadata": search_metadata,
+        "vector_index_key": vector_key,
+        "provenance": provenance,
+    }
+    payload["source_hash"] = _hash_json_payload(payload)
+    return payload
+
+
+def _insert_work_item(
+    conn: Any,
+    payload: dict[str, Any],
+    *,
+    action: str,
+    audit_id: str,
+    now: str,
+) -> tuple[Any, dict[str, Any]]:
+    conn.execute(
+        """
+        INSERT INTO work_items (
+            item_id, parent_item_id, title, body_excerpt, item_type, state_id,
+            priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
+            source_type, source_ref, source_hash, tags_json, related_event_ids_json,
+            related_task_ids_json, related_issue_ids_json, search_text,
+            search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+            vector_index_key, provenance_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+                NULL, ?, ?, ?, ?)
+        """,
+        (
+            payload["item_id"],
+            payload["parent_item_id"],
+            payload["title"],
+            payload["body_excerpt"],
+            payload["item_type"],
+            payload["state_id"],
+            payload["priority_id"],
+            payload["depth"],
+            payload["sort_order"],
+            payload["status"],
+            payload["promoted_from_ref"],
+            payload["source_type"],
+            payload["source_ref"],
+            payload["source_hash"],
+            json.dumps(payload["tags"], ensure_ascii=True),
+            json.dumps(payload["related_event_ids"], ensure_ascii=True),
+            json.dumps(payload["related_task_ids"], ensure_ascii=True),
+            json.dumps(payload["related_issue_ids"], ensure_ascii=True),
+            payload["search_text"],
+            json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+            payload["vector_index_key"],
+            json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+            now,
+            now,
+        ),
+    )
+    item_row = _work_item_or_404(conn, payload["item_id"])
+    audit_row = _write_work_audit(
+        conn,
+        audit_id=audit_id,
+        actor=payload["provenance"]["actor"],
+        source_surface=payload["provenance"]["source_surface"],
+        action=action,
+        target_ref=f"work_items:{payload['item_id']}",
+        item_id=payload["item_id"],
+        parent_item_id=payload["parent_item_id"] or "",
+        created_at=now,
+        request_id=payload["provenance"]["request_id"],
+        run_id=payload["provenance"]["run_id"],
+        result="ok",
+        source_hash=payload["source_hash"],
+        metadata={
+            "state_id": payload["state_id"],
+            "priority_id": payload["priority_id"],
+            "depth": payload["depth"],
+            "promoted_from_ref": payload["promoted_from_ref"],
+        },
+    )
+    return item_row, audit_row
+
+
+@router.get("/work/config")
+async def get_work_config() -> dict[str, Any]:
+    with get_conn() as conn:
+        states = conn.execute(
+            "SELECT * FROM work_item_states ORDER BY sort_order, state_id"
+        ).fetchall()
+        priorities = conn.execute(
+            "SELECT * FROM work_item_priorities ORDER BY sort_order, priority_id"
+        ).fetchall()
+    return {
+        "ok": True,
+        "depth_limit": WORK_DEPTH_LIMIT,
+        "states": [_row_to_work_state(row) for row in states],
+        "priorities": [_row_to_work_priority(row) for row in priorities],
+    }
+
+
+@router.get("/work/board")
+async def get_work_root_board() -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_board_payload(conn)
+
+
+@router.get("/work/items/{item_id}/board")
+async def get_work_child_board(item_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_board_payload(conn, item_id)
+
+
+@router.get("/work/items/{item_id}")
+async def get_work_item_detail(item_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        children = conn.execute(
+            """
+            SELECT * FROM work_items
+            WHERE parent_item_id=? AND status != 'archived'
+            ORDER BY state_id, sort_order, updated_at DESC, item_id
+            """,
+            (item_id,),
+        ).fetchall()
+        issues = conn.execute(
+            "SELECT * FROM work_issues WHERE item_id=? ORDER BY updated_at DESC, issue_id",
+            (item_id,),
+        ).fetchall()
+        todos = conn.execute(
+            "SELECT * FROM work_todos WHERE item_id=? ORDER BY COALESCE(due_at, updated_at), todo_id",
+            (item_id,),
+        ).fetchall()
+        blockers = conn.execute(
+            "SELECT * FROM work_blockers WHERE item_id=? ORDER BY updated_at DESC, blocker_id",
+            (item_id,),
+        ).fetchall()
+        discussions = conn.execute(
+            "SELECT * FROM work_discussions WHERE item_id=? ORDER BY created_at DESC, discussion_id",
+            (item_id,),
+        ).fetchall()
+        links = conn.execute(
+            """
+            SELECT * FROM work_item_links
+            WHERE source_item_id=? OR target_item_id=?
+            ORDER BY link_type, updated_at DESC, link_id
+            """,
+            (item_id, item_id),
+        ).fetchall()
+        audit = conn.execute(
+            """
+            SELECT * FROM work_audit_log
+            WHERE item_id=?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (item_id,),
+        ).fetchall()
+        return {
+            "ok": True,
+            "item": _row_to_work_item(item),
+            "children": [_row_to_work_item(row) for row in children],
+            "issues": [_row_to_work_issue(row) for row in issues],
+            "todos": [_row_to_work_todo(row) for row in todos],
+            "blockers": [_row_to_work_blocker(row) for row in blockers],
+            "discussions": [_row_to_work_discussion(row) for row in discussions],
+            "links": [
+                {
+                    "link_id": row["link_id"],
+                    "source_item_id": row["source_item_id"],
+                    "target_item_id": row["target_item_id"],
+                    "link_type": row["link_type"],
+                    "metadata": _json_value(row["metadata_json"], {}),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in links
+            ],
+            "audit": [
+                {
+                    "audit_id": row["audit_id"],
+                    "action": row["action"],
+                    "actor": row["actor"],
+                    "source_surface": row["source_surface"],
+                    "created_at": row["created_at"],
+                    "metadata": _json_value(row["metadata_json"], {}),
+                }
+                for row in audit
+            ],
+            "rollup": _work_rollup(conn, item_id),
+        }
+
+
+@router.post("/work/items")
+async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        payload = _work_item_payload(conn, body)
+        item_row, audit_row = _insert_work_item(
+            conn, payload, action="create_work_item", audit_id=audit_id, now=now
+        )
+        gen = increment_gen(conn, "work-item")
+        enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "audit": {"audit_id": audit_id, "action": "create_work_item", "result": "ok"},
+    }
+
+
+@router.patch("/work/items/{item_id}")
+async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    with get_conn() as conn:
+        existing = _work_item_or_404(conn, item_id)
+        state = _require_work_state(conn, body.state_id or existing["state_id"])
+        priority = _require_work_priority(conn, body.priority_id or existing["priority_id"])
+        tags = (
+            _clean_event_list(body.tags, limit=32)
+            if body.tags is not None
+            else _json_value(existing["tags_json"], [])
+        )
+        related_events = (
+            _clean_event_list(body.related_event_ids, limit=32)
+            if body.related_event_ids is not None
+            else _json_value(existing["related_event_ids_json"], [])
+        )
+        related_tasks = (
+            _clean_event_list(body.related_task_ids, limit=32)
+            if body.related_task_ids is not None
+            else _json_value(existing["related_task_ids_json"], [])
+        )
+        related_issues = (
+            _clean_event_list(body.related_issue_ids, limit=32)
+            if body.related_issue_ids is not None
+            else _json_value(existing["related_issue_ids_json"], [])
+        )
+        title = _clean_short_text(body.title, existing["title"], limit=180)
+        if not title:
+            raise HTTPException(400, "work item title is required")
+        body_excerpt = (
+            _body_excerpt(body.body, limit=4000)
+            if body.body is not None
+            else existing["body_excerpt"]
+        )
+        item_type = _clean_short_text(body.item_type, existing["item_type"], limit=80)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_items",
+            row_id=item_id,
+            kind=item_type,
+            title=title,
+            body=body_excerpt,
+            tags=tags,
+            related_refs=[
+                *[f"personal_events:{event_id}" for event_id in related_events],
+                *[f"personal_time_tasks:{task_id}" for task_id in related_tasks],
+                *[f"work_issues:{issue_id}" for issue_id in related_issues],
+            ],
+        )
+        provenance = _json_value(existing["provenance_json"], {})
+        provenance["last_update"] = meta
+        payload = {
+            "item_id": item_id,
+            "title": title,
+            "body_excerpt": body_excerpt,
+            "item_type": item_type,
+            "state_id": state["state_id"],
+            "priority_id": priority["priority_id"],
+            "sort_order": int(
+                body.sort_order if body.sort_order is not None else existing["sort_order"]
+            ),
+            "status": _work_status_for_state(state),
+            "tags": tags,
+            "related_event_ids": related_events,
+            "related_task_ids": related_tasks,
+            "related_issue_ids": related_issues,
+            "search_text": search_text,
+            "search_metadata": search_metadata,
+            "vector_index_key": vector_key,
+            "provenance": provenance,
+        }
+        payload["source_hash"] = _hash_json_payload(payload)
+        conn.execute(
+            """
+            UPDATE work_items
+            SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
+                sort_order=?, status=?, source_hash=?, tags_json=?,
+                related_event_ids_json=?, related_task_ids_json=?,
+                related_issue_ids_json=?, search_text=?, search_metadata_json=?,
+                vector_index_key=?, provenance_json=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (
+                payload["title"],
+                payload["body_excerpt"],
+                payload["item_type"],
+                payload["state_id"],
+                payload["priority_id"],
+                payload["sort_order"],
+                payload["status"],
+                payload["source_hash"],
+                json.dumps(payload["tags"], ensure_ascii=True),
+                json.dumps(payload["related_event_ids"], ensure_ascii=True),
+                json.dumps(payload["related_task_ids"], ensure_ascii=True),
+                json.dumps(payload["related_issue_ids"], ensure_ascii=True),
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                now,
+                item_id,
+            ),
+        )
+        item_row = _work_item_or_404(conn, item_id)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_item",
+            target_ref=f"work_items:{item_id}",
+            item_id=item_id,
+            parent_item_id=item_row["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=payload["source_hash"],
+            metadata={"state_id": item_row["state_id"], "priority_id": item_row["priority_id"]},
+        )
+        gen = increment_gen(conn, "work-item")
+        enqueue_for_all_peers(conn, "UPDATE", "work_items", item_id, dict(item_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "audit": {"audit_id": audit_id, "action": "update_work_item", "result": "ok"},
+    }
+
+
+@router.post("/work/items/{item_id}/move")
+async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    with get_conn() as conn:
+        existing = _work_item_or_404(conn, item_id)
+        state = _require_work_state(conn, body.state_id or existing["state_id"])
+        new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
+        new_depth = _work_parent_depth(conn, new_parent, moving_item_id=item_id)
+        max_relative = _work_subtree_max_relative_depth(conn, item_id)
+        if new_depth + max_relative > WORK_DEPTH_LIMIT:
+            raise HTTPException(400, "work item depth limit exceeded")
+        conn.execute(
+            """
+            UPDATE work_items
+            SET parent_item_id=?, state_id=?, status=?, depth=?, sort_order=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (
+                new_parent,
+                state["state_id"],
+                _work_status_for_state(state),
+                new_depth,
+                int(body.sort_order if body.sort_order is not None else existing["sort_order"]),
+                now,
+                item_id,
+            ),
+        )
+        _recompute_work_child_depths(conn, item_id, new_depth)
+        moved_rows = conn.execute(
+            """
+            WITH RECURSIVE descendants(item_id) AS (
+                SELECT item_id FROM work_items WHERE item_id=?
+                UNION ALL
+                SELECT w.item_id
+                FROM work_items w
+                JOIN descendants ON w.parent_item_id = descendants.item_id
+            )
+            SELECT w.* FROM work_items w JOIN descendants ON descendants.item_id = w.item_id
+            """,
+            (item_id,),
+        ).fetchall()
+        item_row = next(row for row in moved_rows if row["item_id"] == item_id)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="move_work_item",
+            target_ref=f"work_items:{item_id}",
+            item_id=item_id,
+            parent_item_id=new_parent or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=item_row["source_hash"],
+            metadata={
+                "from_parent_item_id": existing["parent_item_id"],
+                "to_parent_item_id": new_parent,
+                "state_id": state["state_id"],
+                "depth": new_depth,
+            },
+        )
+        gen = increment_gen(conn, "work-item")
+        for row in moved_rows:
+            enqueue_for_all_peers(conn, "UPDATE", "work_items", row["item_id"], dict(row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "audit": {"audit_id": audit_id, "action": "move_work_item", "result": "ok"},
+    }
+
+
+@router.post("/work/items/{item_id}/archive")
+async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    with get_conn() as conn:
+        existing = _work_item_or_404(conn, item_id)
+        conn.execute(
+            "UPDATE work_items SET status='archived', archived_at=?, updated_at=? WHERE item_id=?",
+            (now, now, item_id),
+        )
+        item_row = _work_item_or_404(conn, item_id)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="archive_work_item",
+            target_ref=f"work_items:{item_id}",
+            item_id=item_id,
+            parent_item_id=existing["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=item_row["source_hash"],
+            metadata={"archived_at": now},
+        )
+        gen = increment_gen(conn, "work-item")
+        enqueue_for_all_peers(conn, "UPDATE", "work_items", item_id, dict(item_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "audit": {"audit_id": audit_id, "action": "archive_work_item", "result": "ok"},
+    }
+
+
+@router.get("/work/items/{item_id}/rollup")
+async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
+
+
+def _clean_work_leaf_status(value: str | None, *, default: str = "open") -> str:
+    status = _clean_short_text(value, default, limit=40)
+    if status not in {
+        "open",
+        "blocked",
+        "pending_review",
+        "done",
+        "closed",
+        "archived",
+        "promoted",
+    }:
+        raise HTTPException(400, "work leaf status is invalid")
+    return status
+
+
+def _upsert_work_issue(
+    body: WorkIssueUpsertRequest,
+    *,
+    issue_id: str | None = None,
+    action: str,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_issue_id = _clean_work_id(issue_id or body.issue_id, "issue")
+    with get_conn() as conn:
+        _work_item_or_404(conn, body.item_id)
+        priority = _require_work_priority(conn, body.priority_id)
+        title = _clean_short_text(body.title, "", limit=180)
+        if not title:
+            raise HTTPException(400, "work issue title is required")
+        body_excerpt = _body_excerpt(body.body or "", limit=4000)
+        source_ref = _clean_short_text(body.source_ref, "", limit=220)
+        related_task_id = _clean_short_text(body.related_task_id, "", limit=180)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_issues",
+            row_id=clean_issue_id,
+            kind="issue",
+            title=title,
+            body=body_excerpt,
+            related_refs=[ref for ref in [source_ref, related_task_id] if ref],
+        )
+        provenance = {"issue": {"item_id": body.item_id}, **meta}
+        source_hash = _hash_json_payload(
+            {
+                "issue_id": clean_issue_id,
+                "item_id": body.item_id,
+                "title": title,
+                "body": body_excerpt,
+                "status": body.status,
+                "priority_id": priority["priority_id"],
+                "source_ref": source_ref,
+                "related_task_id": related_task_id,
+            }
+        )
+        previous = conn.execute(
+            "SELECT created_at FROM work_issues WHERE issue_id=?", (clean_issue_id,)
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO work_issues (
+                issue_id, item_id, title, body_excerpt, status, priority_id,
+                source_ref, related_task_id, search_text, search_metadata_json,
+                embedding_ref, embedding_model, embedding_updated_at, vector_index_key,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+            ON CONFLICT(issue_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                status=excluded.status,
+                priority_id=excluded.priority_id,
+                source_ref=excluded.source_ref,
+                related_task_id=excluded.related_task_id,
+                search_text=excluded.search_text,
+                search_metadata_json=excluded.search_metadata_json,
+                vector_index_key=excluded.vector_index_key,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                clean_issue_id,
+                body.item_id,
+                title,
+                body_excerpt,
+                _clean_work_leaf_status(body.status),
+                priority["priority_id"],
+                source_ref,
+                related_task_id,
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                now,
+            ),
+        )
+        issue_row = conn.execute(
+            "SELECT * FROM work_issues WHERE issue_id=?", (clean_issue_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action=action,
+            target_ref=f"work_issues:{clean_issue_id}",
+            item_id=body.item_id,
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={"status": issue_row["status"], "priority_id": issue_row["priority_id"]},
+        )
+        gen = increment_gen(conn, "work-issue")
+        enqueue_for_all_peers(conn, "UPDATE", "work_issues", clean_issue_id, dict(issue_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "issue": _row_to_work_issue(issue_row),
+        "audit": {"audit_id": audit_id, "action": action, "result": "ok"},
+    }
+
+
+@router.post("/work/issues")
+async def create_work_issue(body: WorkIssueUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_issue(body, action="create_work_issue")
+
+
+@router.patch("/work/issues/{issue_id}")
+async def update_work_issue(issue_id: str, body: WorkIssueUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_issue(body, issue_id=issue_id, action="update_work_issue")
+
+
+def _upsert_work_todo(
+    body: WorkTodoUpsertRequest,
+    *,
+    todo_id: str | None = None,
+    action: str,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_todo_id = _clean_work_id(todo_id or body.todo_id, "work-todo")
+    with get_conn() as conn:
+        _work_item_or_404(conn, body.item_id)
+        priority = _require_work_priority(conn, body.priority_id)
+        title = _clean_short_text(body.title, "", limit=180)
+        if not title:
+            raise HTTPException(400, "work todo title is required")
+        body_excerpt = _body_excerpt(body.body or "", limit=4000)
+        related_task_id = _clean_short_text(body.related_task_id, "", limit=180)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_todos",
+            row_id=clean_todo_id,
+            kind="todo",
+            title=title,
+            body=body_excerpt,
+            related_refs=[related_task_id] if related_task_id else [],
+        )
+        provenance = {"todo": {"item_id": body.item_id}, **meta}
+        source_hash = _hash_json_payload(
+            {
+                "todo_id": clean_todo_id,
+                "item_id": body.item_id,
+                "title": title,
+                "body": body_excerpt,
+                "status": body.status,
+                "priority_id": priority["priority_id"],
+                "due_at": body.due_at,
+                "related_task_id": related_task_id,
+            }
+        )
+        previous = conn.execute(
+            "SELECT created_at FROM work_todos WHERE todo_id=?", (clean_todo_id,)
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO work_todos (
+                todo_id, item_id, title, body_excerpt, status, priority_id, due_at,
+                related_task_id, search_text, search_metadata_json, embedding_ref,
+                embedding_model, embedding_updated_at, vector_index_key,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+            ON CONFLICT(todo_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                status=excluded.status,
+                priority_id=excluded.priority_id,
+                due_at=excluded.due_at,
+                related_task_id=excluded.related_task_id,
+                search_text=excluded.search_text,
+                search_metadata_json=excluded.search_metadata_json,
+                vector_index_key=excluded.vector_index_key,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                clean_todo_id,
+                body.item_id,
+                title,
+                body_excerpt,
+                _clean_work_leaf_status(body.status),
+                priority["priority_id"],
+                _clean_short_text(body.due_at, "", limit=80) or None,
+                related_task_id,
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                now,
+            ),
+        )
+        todo_row = conn.execute(
+            "SELECT * FROM work_todos WHERE todo_id=?", (clean_todo_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action=action,
+            target_ref=f"work_todos:{clean_todo_id}",
+            item_id=body.item_id,
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={"status": todo_row["status"], "priority_id": todo_row["priority_id"]},
+        )
+        gen = increment_gen(conn, "work-todo")
+        enqueue_for_all_peers(conn, "UPDATE", "work_todos", clean_todo_id, dict(todo_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "todo": _row_to_work_todo(todo_row),
+        "audit": {"audit_id": audit_id, "action": action, "result": "ok"},
+    }
+
+
+@router.post("/work/todos")
+async def create_work_todo(body: WorkTodoUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_todo(body, action="create_work_todo")
+
+
+@router.patch("/work/todos/{todo_id}")
+async def update_work_todo(todo_id: str, body: WorkTodoUpsertRequest) -> dict[str, Any]:
+    return _upsert_work_todo(body, todo_id=todo_id, action="update_work_todo")
+
+
+def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
+    if source_ref.startswith("personal_time_tasks:"):
+        task_id = source_ref.split(":", 1)[1]
+        row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "promotion source task not found")
+        return {
+            "title": row["title"],
+            "body": row["body_excerpt"],
+            "related_task_ids": [task_id],
+            "tags": ["work", "task"],
+        }
+    if source_ref.startswith("work_todos:"):
+        todo_id = source_ref.split(":", 1)[1]
+        row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (todo_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "promotion source todo not found")
+        return {
+            "title": row["title"],
+            "body": row["body_excerpt"],
+            "related_task_ids": [row["related_task_id"]] if row["related_task_id"] else [],
+            "tags": ["work", "todo"],
+        }
+    if source_ref.startswith("work_issues:"):
+        issue_id = source_ref.split(":", 1)[1]
+        row = conn.execute("SELECT * FROM work_issues WHERE issue_id=?", (issue_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "promotion source issue not found")
+        return {
+            "title": row["title"],
+            "body": row["body_excerpt"],
+            "related_issue_ids": [issue_id],
+            "tags": ["work", "issue"],
+        }
+    raise HTTPException(400, "promotion source ref is invalid")
+
+
+@router.post("/work/promote")
+async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
+    source_ref = _clean_short_text(body.source_ref, "", limit=220)
+    if not source_ref:
+        raise HTTPException(400, "promotion source ref is required")
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        source = _promotion_source_payload(conn, source_ref)
+        item_body = WorkItemCreateRequest(
+            parent_item_id=body.parent_item_id,
+            title=body.title or source.get("title", ""),
+            body=body.body if body.body is not None else source.get("body", ""),
+            state_id=body.state_id,
+            priority_id=body.priority_id,
+            tags=_clean_event_list([*source.get("tags", []), *body.tags], limit=32),
+            related_task_ids=source.get("related_task_ids", []),
+            related_issue_ids=source.get("related_issue_ids", []),
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        )
+        payload = _work_item_payload(conn, item_body, promoted_from_ref=source_ref)
+        item_row, audit_row = _insert_work_item(
+            conn, payload, action="promote_work_item", audit_id=audit_id, now=now
+        )
+        if source_ref.startswith("work_todos:"):
+            conn.execute(
+                "UPDATE work_todos SET status='promoted', updated_at=? WHERE todo_id=?",
+                (now, source_ref.split(":", 1)[1]),
+            )
+        gen = increment_gen(conn, "work-promote")
+        enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
+        if source_ref.startswith("work_todos:"):
+            todo_id = source_ref.split(":", 1)[1]
+            todo_row = conn.execute(
+                "SELECT * FROM work_todos WHERE todo_id=?", (todo_id,)
+            ).fetchone()
+            enqueue_for_all_peers(conn, "UPDATE", "work_todos", todo_id, dict(todo_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "audit": {"audit_id": audit_id, "action": "promote_work_item", "result": "ok"},
+    }
 
 
 def _calendar_event_payload(

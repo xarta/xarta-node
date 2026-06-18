@@ -43,7 +43,7 @@ os.environ.setdefault("SEEKDB_DB", "blueprints_test")
 os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
-from app import routes_personal  # noqa: E402
+from app import routes_personal, routes_sync  # noqa: E402
 
 
 def _minutes_turn_event(
@@ -212,6 +212,164 @@ def _make_conn() -> sqlite3.Connection:
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE work_item_states (
+            state_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            lane_key TEXT NOT NULL,
+            status_category TEXT NOT NULL DEFAULT 'open',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            is_terminal INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_item_priorities (
+            priority_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_items (
+            item_id TEXT PRIMARY KEY,
+            parent_item_id TEXT,
+            title TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT NOT NULL DEFAULT '',
+            item_type TEXT NOT NULL DEFAULT 'work',
+            state_id TEXT NOT NULL DEFAULT 'todo',
+            priority_id TEXT NOT NULL DEFAULT 'medium',
+            depth INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            archived_at TEXT,
+            promoted_from_ref TEXT,
+            source_type TEXT NOT NULL DEFAULT 'manual-work',
+            source_ref TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            related_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            related_task_ids_json TEXT NOT NULL DEFAULT '[]',
+            related_issue_ids_json TEXT NOT NULL DEFAULT '[]',
+            search_text TEXT NOT NULL DEFAULT '',
+            search_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_item_links (
+            link_id TEXT PRIMARY KEY,
+            source_item_id TEXT NOT NULL,
+            target_item_id TEXT NOT NULL,
+            link_type TEXT NOT NULL DEFAULT 'related',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_issues (
+            issue_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            priority_id TEXT NOT NULL DEFAULT 'medium',
+            source_ref TEXT NOT NULL DEFAULT '',
+            related_task_id TEXT NOT NULL DEFAULT '',
+            search_text TEXT NOT NULL DEFAULT '',
+            search_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_todos (
+            todo_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            priority_id TEXT NOT NULL DEFAULT 'medium',
+            due_at TEXT,
+            related_task_id TEXT NOT NULL DEFAULT '',
+            search_text TEXT NOT NULL DEFAULT '',
+            search_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_blockers (
+            blocker_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            blocked_by_ref TEXT NOT NULL DEFAULT '',
+            search_text TEXT NOT NULL DEFAULT '',
+            search_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_discussions (
+            discussion_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT '',
+            body_excerpt TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            search_text TEXT NOT NULL DEFAULT '',
+            search_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_audit_log (
+            audit_id TEXT PRIMARY KEY,
+            actor TEXT NOT NULL DEFAULT '',
+            source_surface TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT '',
+            target_ref TEXT NOT NULL DEFAULT '',
+            item_id TEXT NOT NULL DEFAULT '',
+            parent_item_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            request_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO work_item_states (
+            state_id, label, lane_key, status_category, sort_order, is_terminal
+        ) VALUES
+            ('backlog', 'Backlog', 'backlog', 'open', 10, 0),
+            ('todo', 'To Do', 'todo', 'open', 20, 0),
+            ('doing', 'Doing', 'doing', 'active', 30, 0),
+            ('blocked', 'Blocked', 'blocked', 'blocked', 40, 0),
+            ('done', 'Done', 'done', 'done', 50, 1);
+        INSERT INTO work_item_priorities (
+            priority_id, label, weight, sort_order
+        ) VALUES
+            ('low', 'Low', 10, 10),
+            ('medium', 'Medium', 50, 20),
+            ('high', 'High', 80, 30),
+            ('critical', 'Critical', 100, 40);
         CREATE TABLE bookmarks (
             bookmark_id TEXT PRIMARY KEY,
             url TEXT NOT NULL,
@@ -942,6 +1100,207 @@ def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
     assert personal["items"][0]["source"]["authority"] == "event"
     assert [item["task_id"] for item in work["items"]] == ["evt-work"]
     assert [item["task_id"] for item in blocked["items"]] == ["evt-work"]
+
+
+def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    config = asyncio.run(routes_personal.get_work_config())
+    assert config["depth_limit"] == 12
+    assert [state["state_id"] for state in config["states"]] == [
+        "backlog",
+        "todo",
+        "doing",
+        "blocked",
+        "done",
+    ]
+    assert "work_items" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("work_items") == "item_id"
+
+    created = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-root",
+                title="Step 16 root board item",
+                body="Root board proof",
+                state_id="todo",
+                priority_id="high",
+                tags=["proof"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="work-root-create",
+            )
+        )
+    )
+    root = created["item"]
+    assert root["item_id"] == "work-root"
+    assert root["depth"] == 0
+    assert root["state_id"] == "todo"
+    assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
+    assert root["vector"]["index_key"] == "work_items:work-root"
+
+    board = asyncio.run(routes_personal.get_work_root_board())
+    todo_column = next(
+        column for column in board["board"]["columns"] if column["state"]["state_id"] == "todo"
+    )
+    assert [item["item_id"] for item in todo_column["items"]] == ["work-root"]
+
+    child = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-child",
+                parent_item_id="work-root",
+                title="Step 16 child card",
+                body="Child board proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="work-child-create",
+            )
+        )
+    )["item"]
+    assert child["depth"] == 1
+
+    parent_id = "work-child"
+    for depth in range(2, 13):
+        item = asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=f"work-depth-{depth}",
+                    parent_item_id=parent_id,
+                    title=f"Depth {depth}",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"work-depth-{depth}",
+                )
+            )
+        )["item"]
+        assert item["depth"] == depth
+        parent_id = item["item_id"]
+
+    try:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id="work-depth-too-far",
+                    parent_item_id=parent_id,
+                    title="Depth too far",
+                )
+            )
+        )
+    except routes_personal.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "depth" in exc.detail
+    else:
+        raise AssertionError("work item depth guard must reject depth 13")
+
+    try:
+        asyncio.run(
+            routes_personal.move_work_item(
+                "work-root",
+                routes_personal.WorkItemMoveRequest(parent_item_id="work-depth-12"),
+            )
+        )
+    except routes_personal.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "descendant" in exc.detail
+    else:
+        raise AssertionError("work item cycle guard must reject moving under a descendant")
+
+    moved = asyncio.run(
+        routes_personal.move_work_item(
+            "work-child",
+            routes_personal.WorkItemMoveRequest(
+                parent_item_id=None,
+                state_id="doing",
+                sort_order=4,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="work-child-move",
+            ),
+        )
+    )["item"]
+    assert moved["parent_item_id"] is None
+    assert moved["state_id"] == "doing"
+    assert moved["status"] == "active"
+    assert moved["depth"] == 0
+
+    issue = asyncio.run(
+        routes_personal.create_work_issue(
+            routes_personal.WorkIssueUpsertRequest(
+                issue_id="issue-step16",
+                item_id="work-root",
+                title="Step 16 issue",
+                body="Issue proof",
+                priority_id="high",
+                source_ref="docs:step-16",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="issue-create",
+            )
+        )
+    )["issue"]
+    assert issue["vector"]["index_key"] == "work_issues:issue-step16"
+
+    todo = asyncio.run(
+        routes_personal.create_work_todo(
+            routes_personal.WorkTodoUpsertRequest(
+                todo_id="todo-step16",
+                item_id="work-root",
+                title="Step 16 todo",
+                body="Todo proof",
+                priority_id="medium",
+                related_task_id="task-step16",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-create",
+            )
+        )
+    )["todo"]
+    assert todo["related_task_id"] == "task-step16"
+
+    promoted = asyncio.run(
+        routes_personal.promote_work_item(
+            routes_personal.WorkPromoteRequest(
+                source_ref="work_todos:todo-step16",
+                title="Promoted Step 16 todo",
+                parent_item_id="work-root",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-promote",
+            )
+        )
+    )["item"]
+    assert promoted["promoted_from_ref"] == "work_todos:todo-step16"
+    assert promoted["related"]["tasks"] == ["task-step16"]
+    assert (
+        conn.execute("SELECT status FROM work_todos WHERE todo_id='todo-step16'").fetchone()[0]
+        == "promoted"
+    )
+
+    detail = asyncio.run(routes_personal.get_work_item_detail("work-root"))
+    assert detail["rollup"]["items"]["total"] >= 2
+    assert detail["issues"][0]["issue_id"] == "issue-step16"
+    assert detail["todos"][0]["todo_id"] == "todo-step16"
+
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM work_audit_log").fetchall()
+    }
+    assert {
+        "create_work_item",
+        "move_work_item",
+        "create_work_issue",
+        "create_work_todo",
+        "promote_work_item",
+    }.issubset(audit_actions)
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {"work_items", "work_issues", "work_todos", "work_audit_log"}.issubset(sync_tables)
 
 
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):

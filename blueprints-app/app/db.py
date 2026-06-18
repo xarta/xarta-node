@@ -378,6 +378,196 @@ CREATE INDEX IF NOT EXISTS idx_personal_time_audit_target
 CREATE INDEX IF NOT EXISTS idx_personal_time_audit_actor
     ON personal_time_audit(actor, source_surface);
 
+CREATE TABLE IF NOT EXISTS work_item_states (
+    state_id        TEXT PRIMARY KEY,
+    label           TEXT NOT NULL,
+    lane_key        TEXT NOT NULL,
+    status_category TEXT NOT NULL DEFAULT 'open',
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    is_terminal     INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_states_order
+    ON work_item_states(sort_order, state_id);
+
+CREATE TABLE IF NOT EXISTS work_item_priorities (
+    priority_id TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    weight      INTEGER NOT NULL DEFAULT 0,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_priorities_order
+    ON work_item_priorities(sort_order, priority_id);
+
+CREATE TABLE IF NOT EXISTS work_items (
+    item_id                    TEXT PRIMARY KEY,
+    parent_item_id             TEXT,
+    title                      TEXT NOT NULL DEFAULT '',
+    body_excerpt               TEXT NOT NULL DEFAULT '',
+    item_type                  TEXT NOT NULL DEFAULT 'work',
+    state_id                   TEXT NOT NULL DEFAULT 'todo',
+    priority_id                TEXT NOT NULL DEFAULT 'medium',
+    depth                      INTEGER NOT NULL DEFAULT 0,
+    sort_order                 INTEGER NOT NULL DEFAULT 0,
+    status                     TEXT NOT NULL DEFAULT 'open',
+    archived_at                TEXT,
+    promoted_from_ref          TEXT,
+    source_type                TEXT NOT NULL DEFAULT 'manual-work',
+    source_ref                 TEXT NOT NULL DEFAULT '',
+    source_hash                TEXT NOT NULL DEFAULT '',
+    tags_json                  TEXT NOT NULL DEFAULT '[]',
+    related_event_ids_json     TEXT NOT NULL DEFAULT '[]',
+    related_task_ids_json      TEXT NOT NULL DEFAULT '[]',
+    related_issue_ids_json     TEXT NOT NULL DEFAULT '[]',
+    search_text                TEXT NOT NULL DEFAULT '',
+    search_metadata_json       TEXT NOT NULL DEFAULT '{}',
+    embedding_ref              TEXT NOT NULL DEFAULT '',
+    embedding_model            TEXT NOT NULL DEFAULT '',
+    embedding_updated_at       TEXT,
+    vector_index_key           TEXT NOT NULL DEFAULT '',
+    provenance_json            TEXT NOT NULL DEFAULT '{}',
+    created_at                 TEXT DEFAULT (datetime('now')),
+    updated_at                 TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_board
+    ON work_items(parent_item_id, state_id, sort_order, updated_at);
+CREATE INDEX IF NOT EXISTS idx_work_items_state
+    ON work_items(state_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_source
+    ON work_items(source_type, source_ref);
+CREATE INDEX IF NOT EXISTS idx_work_items_vector
+    ON work_items(vector_index_key);
+
+CREATE TABLE IF NOT EXISTS work_item_links (
+    link_id        TEXT PRIMARY KEY,
+    source_item_id TEXT NOT NULL,
+    target_item_id TEXT NOT NULL,
+    link_type      TEXT NOT NULL DEFAULT 'related',
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_links_source
+    ON work_item_links(source_item_id, link_type);
+CREATE INDEX IF NOT EXISTS idx_work_item_links_target
+    ON work_item_links(target_item_id, link_type);
+
+CREATE TABLE IF NOT EXISTS work_issues (
+    issue_id             TEXT PRIMARY KEY,
+    item_id              TEXT NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    body_excerpt         TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    priority_id          TEXT NOT NULL DEFAULT 'medium',
+    source_ref           TEXT NOT NULL DEFAULT '',
+    related_task_id      TEXT NOT NULL DEFAULT '',
+    search_text          TEXT NOT NULL DEFAULT '',
+    search_metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding_ref        TEXT NOT NULL DEFAULT '',
+    embedding_model      TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
+    vector_index_key     TEXT NOT NULL DEFAULT '',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_issues_item
+    ON work_issues(item_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_issues_vector
+    ON work_issues(vector_index_key);
+
+CREATE TABLE IF NOT EXISTS work_todos (
+    todo_id              TEXT PRIMARY KEY,
+    item_id              TEXT NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    body_excerpt         TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    priority_id          TEXT NOT NULL DEFAULT 'medium',
+    due_at               TEXT,
+    related_task_id      TEXT NOT NULL DEFAULT '',
+    search_text          TEXT NOT NULL DEFAULT '',
+    search_metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding_ref        TEXT NOT NULL DEFAULT '',
+    embedding_model      TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
+    vector_index_key     TEXT NOT NULL DEFAULT '',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_todos_item
+    ON work_todos(item_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_todos_due
+    ON work_todos(due_at, status);
+CREATE INDEX IF NOT EXISTS idx_work_todos_vector
+    ON work_todos(vector_index_key);
+
+CREATE TABLE IF NOT EXISTS work_blockers (
+    blocker_id           TEXT PRIMARY KEY,
+    item_id              TEXT NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    body_excerpt         TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    blocked_by_ref       TEXT NOT NULL DEFAULT '',
+    search_text          TEXT NOT NULL DEFAULT '',
+    search_metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding_ref        TEXT NOT NULL DEFAULT '',
+    embedding_model      TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
+    vector_index_key     TEXT NOT NULL DEFAULT '',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_blockers_item
+    ON work_blockers(item_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_blockers_vector
+    ON work_blockers(vector_index_key);
+
+CREATE TABLE IF NOT EXISTS work_discussions (
+    discussion_id        TEXT PRIMARY KEY,
+    item_id              TEXT NOT NULL,
+    author               TEXT NOT NULL DEFAULT '',
+    body_excerpt         TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'open',
+    search_text          TEXT NOT NULL DEFAULT '',
+    search_metadata_json TEXT NOT NULL DEFAULT '{}',
+    embedding_ref        TEXT NOT NULL DEFAULT '',
+    embedding_model      TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
+    vector_index_key     TEXT NOT NULL DEFAULT '',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_work_discussions_item
+    ON work_discussions(item_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_discussions_vector
+    ON work_discussions(vector_index_key);
+
+CREATE TABLE IF NOT EXISTS work_audit_log (
+    audit_id       TEXT PRIMARY KEY,
+    actor          TEXT NOT NULL DEFAULT '',
+    source_surface TEXT NOT NULL DEFAULT '',
+    action         TEXT NOT NULL DEFAULT '',
+    target_ref     TEXT NOT NULL DEFAULT '',
+    item_id        TEXT NOT NULL DEFAULT '',
+    parent_item_id TEXT NOT NULL DEFAULT '',
+    created_at     TEXT DEFAULT (datetime('now')),
+    request_id     TEXT NOT NULL DEFAULT '',
+    run_id         TEXT NOT NULL DEFAULT '',
+    result         TEXT NOT NULL DEFAULT '',
+    source_hash    TEXT NOT NULL DEFAULT '',
+    metadata_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_work_audit_log_target
+    ON work_audit_log(target_ref, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_audit_log_item
+    ON work_audit_log(item_id, created_at);
+
 CREATE TABLE IF NOT EXISTS pve_hosts (
     pve_id        TEXT PRIMARY KEY,   -- IP address — stable, no external config needed
     ip_address    TEXT NOT NULL,
@@ -1056,6 +1246,21 @@ INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.bm_fetch_li
 INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.sound_enabled', 'false', 'Enable sound playback on menu item clicks');
 """
 
+_WORK_ITEM_STATE_SEED = (
+    ("backlog", "Backlog", "backlog", "open", 10, 0),
+    ("todo", "To Do", "todo", "open", 20, 0),
+    ("doing", "Doing", "doing", "active", 30, 0),
+    ("blocked", "Blocked", "blocked", "blocked", 40, 0),
+    ("done", "Done", "done", "done", 50, 1),
+)
+
+_WORK_ITEM_PRIORITY_SEED = (
+    ("low", "Low", 10, 10),
+    ("medium", "Medium", 50, 20),
+    ("high", "High", 80, 30),
+    ("critical", "Critical", 100, 40),
+)
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -1417,6 +1622,40 @@ def _seed_table_layout_catalog(conn: sqlite3.Connection) -> None:
         )
 
 
+def _seed_work_management_config(conn: sqlite3.Connection) -> None:
+    """Ensure the recursive Kanban board has deterministic lane and priority config."""
+    for state_id, label, lane_key, category, sort_order, is_terminal in _WORK_ITEM_STATE_SEED:
+        conn.execute(
+            """
+            INSERT INTO work_item_states (
+                state_id, label, lane_key, status_category, sort_order, is_terminal
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(state_id) DO UPDATE SET
+                label=excluded.label,
+                lane_key=excluded.lane_key,
+                status_category=excluded.status_category,
+                sort_order=excluded.sort_order,
+                is_terminal=excluded.is_terminal,
+                updated_at=datetime('now')
+            """,
+            (state_id, label, lane_key, category, sort_order, is_terminal),
+        )
+    for priority_id, label, weight, sort_order in _WORK_ITEM_PRIORITY_SEED:
+        conn.execute(
+            """
+            INSERT INTO work_item_priorities (priority_id, label, weight, sort_order)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(priority_id) DO UPDATE SET
+                label=excluded.label,
+                weight=excluded.weight,
+                sort_order=excluded.sort_order,
+                updated_at=datetime('now')
+            """,
+            (priority_id, label, weight, sort_order),
+        )
+
+
 def _seed_manual_links_ai_assignment(conn: sqlite3.Connection) -> None:
     """Ensure Manual Links URL intake has a DB-backed local LLM assignment.
 
@@ -1579,6 +1818,7 @@ def init_db() -> None:
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
         _seed_table_layout_catalog(conn)
+        _seed_work_management_config(conn)
         _seed_manual_links_ai_assignment(conn)
         _seed_manual_link_categories_from_groups(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
