@@ -51,7 +51,15 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
     },
     "personal": {
         "label": "Personal",
-        "filters": {"source_type": ["manual", "diary-file", "hermes-minutes", "browser-links"]},
+        "filters": {
+            "source_type": [
+                "manual",
+                "diary-file",
+                "manual-calendar",
+                "hermes-minutes",
+                "browser-links",
+            ]
+        },
     },
     "blocked": {
         "label": "Blocked",
@@ -101,6 +109,29 @@ class DiaryWorkLinkRequest(BaseModel):
     work_item_ref: str
     actor: str = "blueprints-ui"
     source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class CalendarEventUpsertRequest(BaseModel):
+    event_id: str | None = None
+    title: str
+    body: str | None = None
+    local_date: str
+    start_time: str | None = None
+    end_time: str | None = None
+    timezone: str | None = None
+    all_day: bool = False
+    kind: str = "calendar-event"
+    status: str = "open"
+    priority: str | None = None
+    privacy_level: str = "normal"
+    tags: list[str] = []
+    related_work_items: list[str] = []
+    related_tasks: list[str] = []
+    related_import_batches: list[str] = []
+    actor: str = "blueprints-ui"
+    source_surface: str = "calendar-page"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -312,6 +343,38 @@ def _upsert_personal_source(conn: Any, now: str) -> None:
     )
 
 
+def _upsert_calendar_source(conn: Any, now: str) -> Any:
+    conn.execute(
+        """
+        INSERT INTO personal_sources (
+            source_id, source_type, label, status, last_seen_at, health_json, provenance_json,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            status=excluded.status,
+            last_seen_at=excluded.last_seen_at,
+            health_json=excluded.health_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            "manual-calendar",
+            "manual-calendar",
+            "Manual Calendar",
+            "ok",
+            now,
+            json.dumps({"write_path": "personal_events"}),
+            json.dumps({"events_table": "personal_events"}),
+            now,
+            now,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM personal_sources WHERE source_id='manual-calendar'"
+    ).fetchone()
+
+
 def _write_personal_audit(
     conn: Any,
     *,
@@ -392,7 +455,10 @@ def _apply_mode(where: list[str], params: list[Any], mode: str | None) -> None:
             "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
         )
     elif mode == "personal":
-        where.append("source_type IN ('manual', 'diary-file', 'hermes-minutes', 'browser-links')")
+        where.append(
+            "source_type IN ('manual', 'diary-file', 'manual-calendar', "
+            "'hermes-minutes', 'browser-links')"
+        )
     elif mode == "blocked":
         where.append("status = 'blocked'")
     elif mode == "review":
@@ -630,6 +696,259 @@ async def list_personal_import_batches(
             "privacy_level": privacy_level,
         },
     }
+
+
+def _validate_timezone_name(value: str | None) -> str:
+    timezone_name = _clean_short_text(
+        value or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+        "Europe/London",
+        limit=80,
+    )
+    try:
+        ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise HTTPException(400, "timezone is invalid") from exc
+    return timezone_name
+
+
+def _calendar_event_id(value: str | None, local_date: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(value or "").strip()).strip("-")
+    if clean:
+        return clean[:180]
+    return f"calendar-{local_date}-{uuid.uuid4().hex[:12]}"
+
+
+def _calendar_utc_iso(local_date: str, local_time: str | None, timezone_name: str) -> str:
+    time_text = local_time or "00:00"
+    local_dt = datetime.strptime(f"{local_date} {time_text}", "%Y-%m-%d %H:%M").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    return (
+        local_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+
+
+def _clean_event_list(values: list[str], *, limit: int = 24) -> list[str]:
+    cleaned: list[str] = []
+    for value in values[:limit]:
+        text = _clean_short_text(value, "", limit=220)
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return cleaned
+
+
+def _calendar_event_payload(
+    body: CalendarEventUpsertRequest,
+    *,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    local_date = _validate_local_date(body.local_date)
+    timezone_name = _validate_timezone_name(body.timezone)
+    start_time = None if body.all_day else _validate_local_time(body.start_time)
+    end_time = None if body.all_day else _validate_local_time(body.end_time)
+    start_at = _calendar_utc_iso(local_date, start_time, timezone_name)
+    end_at = _calendar_utc_iso(local_date, end_time, timezone_name) if end_time else None
+    if end_at and end_at < start_at:
+        raise HTTPException(400, "end time must not be before start time")
+    title = _clean_short_text(body.title, "", limit=180)
+    if not title:
+        raise HTTPException(400, "calendar event title is required")
+    kind = _clean_short_text(body.kind, "calendar-event", limit=80)
+    if kind not in {"calendar-event", "reminder", "todo", "task", "milestone"}:
+        raise HTTPException(400, "calendar event kind is invalid")
+    status = _clean_short_text(body.status, "open", limit=80)
+    privacy_level = _clean_short_text(body.privacy_level, "normal", limit=40)
+    tags = _clean_event_list(body.tags, limit=24)
+    for required in ("calendar", kind):
+        if required not in tags:
+            tags.append(required)
+    if body.all_day and "all-day" not in tags:
+        tags.append("all-day")
+    if not body.all_day and "timed" not in tags:
+        tags.append("timed")
+    content = _body_excerpt(body.body or "", limit=2000)
+    provenance = {
+        "calendar": {
+            "all_day": bool(body.all_day),
+            "local_start_time": start_time or "",
+            "local_end_time": end_time or "",
+            "timezone": timezone_name,
+        },
+        "actor": _clean_short_text(body.actor, "blueprints-ui"),
+        "source_surface": _clean_short_text(body.source_surface, "calendar-page"),
+        "request_id": _clean_short_text(
+            body.request_id, f"calendar-event-{uuid.uuid4().hex[:12]}", limit=160
+        ),
+        "run_id": _clean_short_text(
+            body.run_id or body.request_id,
+            body.request_id or f"calendar-run-{uuid.uuid4().hex[:12]}",
+            limit=160,
+        ),
+    }
+    event_payload = {
+        "event_id": _calendar_event_id(event_id or body.event_id, local_date),
+        "source_type": "manual-calendar",
+        "source_ref": "",
+        "kind": kind,
+        "title": title,
+        "body_excerpt": content,
+        "content_projection": content,
+        "start_at": start_at,
+        "end_at": end_at,
+        "local_date": local_date,
+        "timezone": timezone_name,
+        "status": status,
+        "priority": _clean_short_text(body.priority, "", limit=40) or None,
+        "privacy_level": privacy_level,
+        "tags": tags,
+        "related_work_items": _clean_event_list(body.related_work_items),
+        "related_tasks": _clean_event_list(body.related_tasks),
+        "related_import_batches": _clean_event_list(body.related_import_batches),
+        "provenance": provenance,
+    }
+    event_payload["source_ref"] = f"personal_events:{event_payload['event_id']}"
+    event_payload["source_hash"] = _hash_json_payload(event_payload)
+    return event_payload
+
+
+def _upsert_calendar_event(
+    body: CalendarEventUpsertRequest,
+    *,
+    event_id: str | None = None,
+    action: str,
+) -> dict[str, Any]:
+    payload = _calendar_event_payload(body, event_id=event_id)
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    actor = payload["provenance"]["actor"]
+    source_surface = payload["provenance"]["source_surface"]
+    request_id = payload["provenance"]["request_id"]
+    run_id = payload["provenance"]["run_id"]
+    with get_conn() as conn:
+        source_row = _upsert_calendar_source(conn, now)
+        previous = conn.execute(
+            "SELECT created_at FROM personal_events WHERE event_id=?", (payload["event_id"],)
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO personal_events (
+                event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+                content_projection, start_at, end_at, local_date, timezone, status, priority,
+                privacy_level, tags_json, related_work_items_json, related_tasks_json,
+                related_import_batches_json, file_refs_json, db_refs_json, provenance_json,
+                projection_state, provenance_state, last_rendered_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                source_type=excluded.source_type,
+                source_ref=excluded.source_ref,
+                source_hash=excluded.source_hash,
+                kind=excluded.kind,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                content_projection=excluded.content_projection,
+                start_at=excluded.start_at,
+                end_at=excluded.end_at,
+                local_date=excluded.local_date,
+                timezone=excluded.timezone,
+                status=excluded.status,
+                priority=excluded.priority,
+                privacy_level=excluded.privacy_level,
+                tags_json=excluded.tags_json,
+                related_work_items_json=excluded.related_work_items_json,
+                related_tasks_json=excluded.related_tasks_json,
+                related_import_batches_json=excluded.related_import_batches_json,
+                db_refs_json=excluded.db_refs_json,
+                provenance_json=excluded.provenance_json,
+                projection_state=excluded.projection_state,
+                provenance_state=excluded.provenance_state,
+                last_rendered_at=excluded.last_rendered_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["event_id"],
+                payload["source_type"],
+                payload["source_ref"],
+                payload["source_hash"],
+                payload["kind"],
+                payload["title"],
+                payload["body_excerpt"],
+                payload["content_projection"],
+                payload["start_at"],
+                payload["end_at"],
+                payload["local_date"],
+                payload["timezone"],
+                payload["status"],
+                payload["priority"],
+                payload["privacy_level"],
+                json.dumps(payload["tags"], ensure_ascii=True),
+                json.dumps(payload["related_work_items"], ensure_ascii=True),
+                json.dumps(payload["related_tasks"], ensure_ascii=True),
+                json.dumps(payload["related_import_batches"], ensure_ascii=True),
+                json.dumps([], ensure_ascii=True),
+                json.dumps([f"personal_time_audit:{audit_id}"], ensure_ascii=True),
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                "hot",
+                "linked",
+                now,
+                created_at,
+                now,
+            ),
+        )
+        event_row = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (payload["event_id"],)
+        ).fetchone()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action=action,
+            target_ref=f"personal_events:{payload['event_id']}",
+            file_ref="",
+            db_ref=f"personal_events:{payload['event_id']}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=payload["source_hash"],
+            metadata={
+                "local_date": payload["local_date"],
+                "kind": payload["kind"],
+                "all_day": bool(payload["provenance"]["calendar"]["all_day"]),
+            },
+        )
+        gen = increment_gen(conn, "personal-calendar-event")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_sources", "manual-calendar", dict(source_row), gen
+        )
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_events", payload["event_id"], dict(event_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "event": _row_to_event(event_row),
+        "audit": {"audit_id": audit_id, "result": "ok", "action": action},
+    }
+
+
+@router.post("/calendar/events")
+async def create_calendar_event(body: CalendarEventUpsertRequest) -> dict[str, Any]:
+    return _upsert_calendar_event(body, action="create_calendar_event")
+
+
+@router.patch("/calendar/events/{event_id}")
+async def update_calendar_event(event_id: str, body: CalendarEventUpsertRequest) -> dict[str, Any]:
+    clean_event_id = _calendar_event_id(event_id, _validate_local_date(body.local_date))
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT event_id FROM personal_events WHERE event_id=?", (clean_event_id,)
+        ).fetchone()
+    if not existing:
+        raise HTTPException(404, "calendar event not found")
+    return _upsert_calendar_event(body, event_id=clean_event_id, action="update_calendar_event")
 
 
 def _visible_day_events(
