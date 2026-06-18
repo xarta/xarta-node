@@ -13,6 +13,14 @@ Prefer shared GUI components over page-local duplication. If two pages need the 
 picker, modal body, or editor behavior, extract the shared part into one named module and keep
 page-specific behavior in small adapters or callbacks.
 
+Asset-store boundary: `/xarta-node/gui-fallback/assets/` is intentionally
+gitignored and Syncthing-managed. Treat icons, sounds, screenshots, generated
+images, and other media under that tree as node-local/private distribution
+state, not normal source files. Never use `git add -f` or otherwise force-add
+ignored GUI assets unless the operator explicitly asks after a privacy and
+copyright review. Code and DB rows may reference these asset paths; the asset
+bytes stay out of public repos by default.
+
 For broad GUI audits, use `cost-efficient-subagents` to review one file, diff,
 component, or tab behavior at a time with fresh context. Helpers can identify
 duplication, accessibility risks, layout regressions, or shared-component

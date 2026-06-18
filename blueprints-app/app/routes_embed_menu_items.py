@@ -170,6 +170,16 @@ _DEFAULT_SEED = [
         "enabled": 1,
         "menu_context": "fallback-ui",
     },
+    {
+        "item_key": "dave",
+        "label": "Dave",
+        "icon_emoji": "",
+        "icon_asset": "icons/hieroglyphs/cartouche-gold.svg",
+        "page_index": 1,
+        "sort_order": 1,
+        "enabled": 1,
+        "menu_context": "fallback-ui",
+    },
     # ── context: db ──────────────────────────────────────────────────────────
     # db context has no unique items — embed context rows are automatically
     # appended by /config. Nothing to seed here.
