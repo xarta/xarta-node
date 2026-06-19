@@ -734,6 +734,35 @@ def _clean_short_text(value: str | None, default: str, *, limit: int = 120) -> s
     return (text or default)[:limit]
 
 
+PERSONAL_PRIVACY_LEVELS = {"normal", "pin", "vault"}
+
+
+def _clean_privacy_level(value: str | None) -> str:
+    privacy_level = _clean_short_text(value, "normal", limit=40)
+    if privacy_level not in PERSONAL_PRIVACY_LEVELS:
+        raise HTTPException(400, "privacy level is invalid")
+    return privacy_level
+
+
+def _append_personal_privacy_list_filter(
+    where: list[str],
+    params: list[Any],
+    privacy_level: str | None,
+    *,
+    column: str = "privacy_level",
+) -> str | None:
+    if not privacy_level:
+        where.append(f"{column} != 'pin'")
+        return None
+    privacy_filter = _clean_privacy_level(privacy_level)
+    if privacy_filter == "pin":
+        where.append("1 = 0")
+        return privacy_filter
+    where.append(f"{column} = ?")
+    params.append(privacy_filter)
+    return privacy_filter
+
+
 def _diary_day_dir(local_date: str) -> Path:
     year, month, day = local_date.split("-")
     return DIARY_ROOT / year / month / day
@@ -2934,9 +2963,6 @@ async def list_personal_events(
     if status:
         where.append("status = ?")
         params.append(status)
-    if privacy_level:
-        where.append("privacy_level = ?")
-        params.append(privacy_level)
     if kind:
         where.append("kind = ?")
         params.append(kind)
@@ -2947,6 +2973,7 @@ async def list_personal_events(
     if import_batch:
         _add_json_array_filter(where, params, "related_import_batches_json", import_batch)
     _apply_mode(where, params, mode)
+    _append_personal_privacy_list_filter(where, params, privacy_level)
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     sql = f"""
@@ -3094,9 +3121,7 @@ async def list_personal_import_batches(
     if status:
         where.append("status = ?")
         params.append(status)
-    if privacy_level:
-        where.append("privacy_level = ?")
-        params.append(privacy_level)
+    _append_personal_privacy_list_filter(where, params, privacy_level)
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     sql = f"""
@@ -3151,11 +3176,8 @@ async def list_personal_tasks(
         task_params.append(status)
         event_where.append("status = ?")
         event_params.append(status)
-    if privacy_level:
-        task_where.append("privacy_level = ?")
-        task_params.append(privacy_level)
-        event_where.append("privacy_level = ?")
-        event_params.append(privacy_level)
+    _append_personal_privacy_list_filter(task_where, task_params, privacy_level)
+    _append_personal_privacy_list_filter(event_where, event_params, privacy_level)
     if source_type:
         task_where.append("source_type = ?")
         task_params.append(source_type)
@@ -3515,7 +3537,7 @@ def _task_payload(
         "due_at": due_at,
         "local_date": local_date,
         "timezone": timezone_name,
-        "privacy_level": _clean_short_text(body.privacy_level, "normal", limit=40),
+        "privacy_level": _clean_privacy_level(body.privacy_level),
         "tags": tags,
         "related_work_items": related_work_items,
         "related_tasks": _clean_event_list(body.related_tasks),
@@ -3824,12 +3846,18 @@ def _task_counts(conn: Any) -> dict[str, int]:
         """
         SELECT COUNT(*) AS count FROM personal_time_tasks
         WHERE local_date=? AND status IN ('open', 'blocked', 'pending_review')
+          AND privacy_level != 'pin'
         """,
         (today,),
     ).fetchone()
     counts["today"] = int(today_row["count"] if today_row else 0)
     rows = conn.execute(
-        "SELECT status, mode, COUNT(*) AS count FROM personal_time_tasks GROUP BY status, mode"
+        """
+        SELECT status, mode, COUNT(*) AS count
+        FROM personal_time_tasks
+        WHERE privacy_level != 'pin'
+        GROUP BY status, mode
+        """
     ).fetchall()
     for row in rows:
         status = row["status"]
@@ -5540,7 +5568,7 @@ def _calendar_event_payload(
     if kind not in {"calendar-event", "reminder", "todo", "task", "milestone"}:
         raise HTTPException(400, "calendar event kind is invalid")
     status = _clean_short_text(body.status, "open", limit=80)
-    privacy_level = _clean_short_text(body.privacy_level, "normal", limit=40)
+    privacy_level = _clean_privacy_level(body.privacy_level)
     tags = _clean_event_list(body.tags, limit=24)
     for required in ("calendar", kind):
         if required not in tags:

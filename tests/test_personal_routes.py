@@ -875,6 +875,91 @@ def test_diary_day_read_model_hides_pin_events(monkeypatch, tmp_path):
     assert result["files"]["source_ledger"]["source_count"] == 1
     assert result["summary"]["state"] == "summary_pending"
 
+    shared_events = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            limit=20,
+            offset=0,
+        )
+    )
+    pin_events = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            privacy_level="pin",
+            limit=20,
+            offset=0,
+        )
+    )
+
+    assert [item["event_id"] for item in shared_events["items"]] == ["evt-visible"]
+    assert pin_events["items"] == []
+
+
+def test_personal_list_routes_hide_pin_records_until_unlock(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute(
+        """
+        INSERT INTO personal_time_tasks (
+            task_id, source_type, title, status, mode, local_date, timezone, privacy_level
+        )
+        VALUES
+            ('task-visible', 'manual-task', 'Visible task', 'open', 'personal',
+             '2026-06-18', 'Europe/London', 'normal'),
+            ('task-pin', 'manual-task', 'Hidden task', 'open', 'personal',
+             '2026-06-18', 'Europe/London', 'pin')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_import_batches (
+            import_batch_id, source_type, source_ref, title, status, local_date,
+            privacy_level
+        )
+        VALUES
+            ('batch-visible', 'interests-ingestion', 'run-visible', 'Visible import',
+             'pending_review', '2026-06-18', 'normal'),
+            ('batch-pin', 'interests-ingestion', 'run-pin', 'Hidden import',
+             'pending_review', '2026-06-18', 'pin')
+        """
+    )
+
+    tasks = asyncio.run(routes_personal.list_personal_tasks(mode="personal", limit=20, offset=0))
+    pin_tasks = asyncio.run(
+        routes_personal.list_personal_tasks(
+            mode="personal",
+            privacy_level="pin",
+            limit=20,
+            offset=0,
+        )
+    )
+    imports = asyncio.run(
+        routes_personal.list_personal_import_batches(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            limit=20,
+            offset=0,
+        )
+    )
+    pin_imports = asyncio.run(
+        routes_personal.list_personal_import_batches(
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            privacy_level="pin",
+            limit=20,
+            offset=0,
+        )
+    )
+
+    assert [item["task_id"] for item in tasks["items"]] == ["task-visible"]
+    assert tasks["counts"]["modes"]["personal"] == 1
+    assert tasks["counts"]["total"] == 1
+    assert pin_tasks["items"] == []
+    assert [item["import_batch_id"] for item in imports["items"]] == ["batch-visible"]
+    assert pin_imports["items"] == []
+
 
 def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
     conn = _make_conn()
