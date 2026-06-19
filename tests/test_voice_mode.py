@@ -373,6 +373,10 @@ def test_active_browser_command_parameters_are_sanitized():
         voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>")
         == "nod.backupColumnsscript"
     )
+    assert voice_mode._clean_active_browser_diagnostic_sources("search gpu") == [
+        "personal_search",
+        "gpu_activity_sound",
+    ]
     assert len(voice_mode._clean_active_browser_group("A" * 200)) == 80
     assert len(voice_mode._clean_active_browser_page_id("p" * 220)) == 160
     assert len(voice_mode._clean_active_browser_menu_item_id("m" * 220)) == 160

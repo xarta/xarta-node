@@ -20,11 +20,13 @@ from . import config as cfg
 
 BOOKMARKS_COLLECTION = "bookmarks_index"
 VISITS_COLLECTION = "visits_index"
+PERSONAL_COLLECTION = "personal_time_activity_index"
 VECTOR_DIM = 2048
 
 _client: pyseekdb.Client | None = None
 _bookmarks_col = None
 _visits_col = None
+_personal_col = None
 _io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seekdb-io")
 _io_lock = threading.RLock()
 
@@ -46,11 +48,12 @@ def _client_instance() -> pyseekdb.Client:
 
 def reset_seekdb_cache() -> None:
     """Drop cached client/collections after connection-level failures."""
-    global _client, _bookmarks_col, _visits_col
+    global _client, _bookmarks_col, _visits_col, _personal_col
     with _io_lock:
         _client = None
         _bookmarks_col = None
         _visits_col = None
+        _personal_col = None
 
 
 def short_seekdb_error(exc: BaseException) -> str:
@@ -96,7 +99,7 @@ def _collection_config() -> Configuration:
 
 def init_seekdb() -> None:
     """Create/open required collections. Raises if SeekDB is not available."""
-    global _bookmarks_col, _visits_col
+    global _bookmarks_col, _visits_col, _personal_col
     client = _client_instance()
     if _bookmarks_col is None:
         _bookmarks_col = client.get_or_create_collection(
@@ -107,6 +110,12 @@ def init_seekdb() -> None:
     if _visits_col is None:
         _visits_col = client.get_or_create_collection(
             name=VISITS_COLLECTION,
+            embedding_function=None,
+            configuration=_collection_config(),
+        )
+    if _personal_col is None:
+        _personal_col = client.get_or_create_collection(
+            name=PERSONAL_COLLECTION,
             embedding_function=None,
             configuration=_collection_config(),
         )
@@ -124,6 +133,11 @@ def bookmarks_col():
 def visits_col():
     init_seekdb()
     return _visits_col
+
+
+def personal_col():
+    init_seekdb()
+    return _personal_col
 
 
 def _to_json(value: Any) -> str:
@@ -153,6 +167,18 @@ def visit_document(row: dict[str, Any]) -> str:
             row.get("title") or "",
             row.get("domain") or "",
             row.get("url") or "",
+        ]
+    ).strip()
+
+
+def personal_document(row: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            row.get("title") or "",
+            row.get("body") or "",
+            row.get("search_text") or "",
+            row.get("source_type") or "",
+            row.get("record_type") or "",
         ]
     ).strip()
 
@@ -215,12 +241,42 @@ def upsert_visit_index(row: dict[str, Any], embedding: list[float]) -> None:
     )
 
 
+def upsert_personal_index(row: dict[str, Any], embedding: list[float]) -> None:
+    metadata = {
+        "item_type": "personal_time_activity",
+        "document_id": row["document_id"],
+        "record_type": row.get("record_type") or "",
+        "record_table": row.get("record_table") or "",
+        "record_id": row.get("record_id") or "",
+        "source_type": row.get("source_type") or "",
+        "source_ref": row.get("source_ref") or "",
+        "local_date": row.get("local_date") or "",
+        "status": row.get("status") or "",
+        "mode": row.get("mode") or "",
+        "privacy_level": row.get("privacy_level") or "",
+        "title": row.get("title") or "",
+        "tags_json": row.get("tags_json") or "[]",
+        "page_ref_json": row.get("page_ref_json") or "{}",
+        "source_refs_json": row.get("source_refs_json") or "[]",
+    }
+    personal_col().upsert(
+        ids=[row["document_id"]],
+        embeddings=[embedding],
+        documents=[personal_document(row)],
+        metadatas=[metadata],
+    )
+
+
 def delete_bookmark_index(bookmark_id: str) -> None:
     bookmarks_col().delete(ids=[bookmark_id])
 
 
 def delete_visit_index(visit_id: str) -> None:
     visits_col().delete(ids=[visit_id])
+
+
+def delete_personal_index(document_id: str) -> None:
+    personal_col().delete(ids=[document_id])
 
 
 def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -293,6 +349,15 @@ def vector_search_visits(query_embedding: list[float], limit: int) -> list[dict[
     return _extract_rows(res)
 
 
+def vector_search_personal(query_embedding: list[float], limit: int) -> list[dict[str, Any]]:
+    res = personal_col().query(
+        query_embeddings=[query_embedding],
+        n_results=limit,
+        include=["documents", "metadatas", "distances"],
+    )
+    return _extract_rows(res)
+
+
 def bookmark_embedding_by_normalized_url(normalized_url: str) -> list[float] | None:
     res = bookmarks_col().get(
         where={"normalized_url": {"$eq": normalized_url}},
@@ -317,6 +382,7 @@ def seekdb_counts() -> dict[str, int]:
     return {
         "bookmarks_indexed": int(bookmarks_col().count()),
         "visits_indexed": int(visits_col().count()),
+        "personal_indexed": int(personal_col().count()),
     }
 
 
@@ -344,6 +410,13 @@ async def vector_search_visits_async(
     limit: int,
 ) -> list[dict[str, Any]]:
     return await run_seekdb_blocking_async(vector_search_visits, query_embedding, limit)
+
+
+async def vector_search_personal_async(
+    query_embedding: list[float],
+    limit: int,
+) -> list[dict[str, Any]]:
+    return await run_seekdb_blocking_async(vector_search_personal, query_embedding, limit)
 
 
 async def bookmark_embedding_by_normalized_url_async(normalized_url: str) -> list[float] | None:
@@ -375,12 +448,20 @@ async def upsert_visit_index_async(row: dict[str, Any], embedding: list[float]) 
     await run_seekdb_blocking_async(upsert_visit_index, row, embedding)
 
 
+async def upsert_personal_index_async(row: dict[str, Any], embedding: list[float]) -> None:
+    await run_seekdb_blocking_async(upsert_personal_index, row, embedding)
+
+
 async def delete_bookmark_index_async(bookmark_id: str) -> None:
     await run_seekdb_blocking_async(delete_bookmark_index, bookmark_id)
 
 
 async def delete_visit_index_async(visit_id: str) -> None:
     await run_seekdb_blocking_async(delete_visit_index, visit_id)
+
+
+async def delete_personal_index_async(document_id: str) -> None:
+    await run_seekdb_blocking_async(delete_personal_index, document_id)
 
 
 def _bookmark_index_metadata_sync() -> tuple[list[str], list[dict[str, Any]]]:
