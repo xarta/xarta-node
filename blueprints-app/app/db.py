@@ -322,6 +322,8 @@ CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_due
     ON personal_time_tasks(local_date, due_at);
 CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_source
     ON personal_time_tasks(source_type, source_ref);
+CREATE INDEX IF NOT EXISTS idx_personal_time_tasks_privacy
+    ON personal_time_tasks(privacy_level);
 
 CREATE TABLE IF NOT EXISTS personal_sources (
     source_id        TEXT PRIMARY KEY,
@@ -357,6 +359,8 @@ CREATE INDEX IF NOT EXISTS idx_personal_import_batches_date
     ON personal_import_batches(local_date, started_at);
 CREATE INDEX IF NOT EXISTS idx_personal_import_batches_source
     ON personal_import_batches(source_type, status);
+CREATE INDEX IF NOT EXISTS idx_personal_import_batches_privacy
+    ON personal_import_batches(privacy_level);
 
 CREATE TABLE IF NOT EXISTS personal_time_audit (
     audit_id        TEXT PRIMARY KEY,
