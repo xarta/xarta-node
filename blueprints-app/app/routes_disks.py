@@ -2332,9 +2332,7 @@ def _hash_disks_pin(pin: str, salt_hex: str) -> str:
 def _prune_disks_pin_tokens_unlocked(now: float | None = None) -> None:
     current = time.time() if now is None else now
     expired = [
-        token
-        for token, expires_at in _DISKS_PIN_UNLOCK_TOKENS.items()
-        if expires_at <= current
+        token for token, expires_at in _DISKS_PIN_UNLOCK_TOKENS.items() if expires_at <= current
     ]
     for token in expired:
         _DISKS_PIN_UNLOCK_TOKENS.pop(token, None)
@@ -2468,7 +2466,12 @@ def _run_filesystem_access_json(
             timeout=timeout or _SSH_INVENTORY_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
-        return {"ok": False, "host": host, "error": f"filesystem access timed out: {exc}", "data": None}
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"filesystem access timed out: {exc}",
+            "data": None,
+        }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "host": host, "error": str(exc), "data": None}
     stdout = (proc.stdout or "").strip()
@@ -4818,23 +4821,23 @@ def _build_dataset_tree(
                 total = zvol_probe_total
             probe_label = _probe_strategy_label(zvol_probe)
             zvol_usage_note = (
-                f"Usage is measured from {probe_label}. "
-                "ZFS reserved or allocated space is listed in the facts."
-            ) if probe_label else (
-                "Usage is measured from the guest filesystem. "
-                "ZFS reserved or allocated space is listed in the facts."
+                (
+                    f"Usage is measured from {probe_label}. "
+                    "ZFS reserved or allocated space is listed in the facts."
+                )
+                if probe_label
+                else (
+                    "Usage is measured from the guest filesystem. "
+                    "ZFS reserved or allocated space is listed in the facts."
+                )
             )
         child_names = sorted(children_by_parent.get(name, []))
         storage_aliases = storage_aliases_by_pool.get(name) or []
         has_child_accounting = (
-            ds_type == "filesystem"
-            and bool(child_names)
-            and used_by_children not in (None, 0)
+            ds_type == "filesystem" and bool(child_names) and used_by_children not in (None, 0)
         )
         usage_source = (
-            "ZFS subtree accounting"
-            if has_child_accounting
-            else _probe_strategy_label(zvol_probe)
+            "ZFS subtree accounting" if has_child_accounting else _probe_strategy_label(zvol_probe)
         )
         dataset_usage_text = ""
         dataset_note = ""
@@ -4855,7 +4858,10 @@ def _build_dataset_tree(
             _fact("Volume label", zvol_probe.get("volume_label")),
             _fact("Usage source", usage_source),
             _fact("Direct files", _format_bytes(used_by_dataset) if has_child_accounting else ""),
-            _fact("Child datasets/volumes", _format_bytes(used_by_children) if has_child_accounting else ""),
+            _fact(
+                "Child datasets/volumes",
+                _format_bytes(used_by_children) if has_child_accounting else "",
+            ),
             _fact(
                 "Child reservations",
                 _format_bytes(used_by_refreservation)
@@ -6299,7 +6305,9 @@ async def disks_filesystem_save(body: DisksFilesystemSaveBody) -> dict[str, Any]
     if _normalize_browser_mode(body.browse_mode) == "device_ro":
         raise HTTPException(400, "Offline device browsing is read-only")
     if len((body.content or "").encode("utf-8")) > _DISKS_FILE_EDIT_MAX_BYTES:
-        raise HTTPException(400, f"File exceeds editable limit of {_format_bytes(_DISKS_FILE_EDIT_MAX_BYTES)}")
+        raise HTTPException(
+            400, f"File exceeds editable limit of {_format_bytes(_DISKS_FILE_EDIT_MAX_BYTES)}"
+        )
     clean_host, meta_payload = _filesystem_access_payload(body, action="meta")
     meta_result = await _filesystem_access_json_host(clean_host, meta_payload)
     if not meta_result.get("ok") or not isinstance(meta_result.get("data"), dict):
