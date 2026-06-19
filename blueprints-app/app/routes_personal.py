@@ -228,6 +228,28 @@ class WorkItemLinkCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class PersonalGraphLinkCreateRequest(BaseModel):
+    source_ref: str
+    target_ref: str
+    link_type: str = "relates_to"
+    link_state: str = "declared"
+    risk_level: str = "normal"
+    title: str | None = None
+    metadata: dict[str, Any] = {}
+    provenance: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "personal-graph"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class PersonalGraphSyncRequest(BaseModel):
+    actor: str = "blueprints-api"
+    source_surface: str = "personal-graph-sync"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkIssueUpsertRequest(BaseModel):
     item_id: str
     issue_id: str | None = None
@@ -948,6 +970,630 @@ def _pagination(limit: int, offset: int, count: int) -> dict[str, Any]:
         "count": count,
         "has_more": count == limit,
     }
+
+
+PERSONAL_GRAPH_LINK_TYPES = {
+    "relates_to",
+    "source_for",
+    "summarizes",
+    "evidence_for",
+    "created_from",
+    "promoted_from",
+    "blocks",
+    "depends_on",
+    "documents",
+    "implements",
+    "same_day_as",
+}
+PERSONAL_GRAPH_LINK_TYPE_ALIASES = {
+    "related": "relates_to",
+    "references": "relates_to",
+    "duplicate": "relates_to",
+    "duplicates": "relates_to",
+    "split_from": "created_from",
+}
+PERSONAL_GRAPH_LINK_STATES = {"declared", "accepted", "needs_review", "inferred", "rejected"}
+PERSONAL_GRAPH_RISK_LEVELS = {"normal", "review", "sensitive", "blocked"}
+
+
+def _clean_graph_ref(value: Any, *, limit: int = 260) -> str:
+    return _clean_short_text(str(value or ""), "", limit=limit)
+
+
+def _clean_graph_link_type(value: Any) -> str:
+    link_type = _clean_short_text(str(value or ""), "relates_to", limit=60).replace("-", "_")
+    link_type = PERSONAL_GRAPH_LINK_TYPE_ALIASES.get(link_type, link_type)
+    if link_type not in PERSONAL_GRAPH_LINK_TYPES:
+        raise HTTPException(400, "personal graph link type is invalid")
+    return link_type
+
+
+def _clean_graph_link_state(value: Any, *, default: str = "declared") -> str:
+    state = _clean_short_text(str(value or ""), default, limit=40).replace("-", "_")
+    if state not in PERSONAL_GRAPH_LINK_STATES:
+        raise HTTPException(400, "personal graph link state is invalid")
+    return "needs_review" if state == "inferred" else state
+
+
+def _clean_graph_risk_level(value: Any) -> str:
+    risk = _clean_short_text(str(value or ""), "normal", limit=40).replace("-", "_")
+    return risk if risk in PERSONAL_GRAPH_RISK_LEVELS else "normal"
+
+
+def _graph_ref_parts(ref: str) -> tuple[str, str]:
+    clean = _clean_graph_ref(ref)
+    if ":" not in clean:
+        return "", clean
+    table, record_id = clean.split(":", 1)
+    table = {
+        "work": "work_items",
+        "work_item": "work_items",
+        "task": "personal_time_tasks",
+        "import": "personal_import_batches",
+        "doc": "docs",
+        "file": "files",
+        "browser_link": "browser_links",
+    }.get(table, table)
+    return table, record_id
+
+
+def _target_ref(default_table: str, value: Any) -> str:
+    clean = _clean_graph_ref(value)
+    if not clean:
+        return ""
+    if ":" in clean:
+        table, record_id = _graph_ref_parts(clean)
+        return f"{table}:{record_id}" if table else record_id
+    return f"{default_table}:{clean}" if default_table else clean
+
+
+def _graph_link_id(source_ref: str, link_type: str, target_ref: str) -> str:
+    digest = hashlib.sha256(f"{source_ref}\n{link_type}\n{target_ref}".encode()).hexdigest()
+    return f"graph-{digest[:24]}"
+
+
+def _graph_link_row_payload(
+    *,
+    source_ref: str,
+    target_ref: str,
+    link_type: str,
+    link_state: str = "accepted",
+    risk_level: str = "normal",
+    title: str = "",
+    metadata: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+    actor: str = "blueprints-api",
+    request_id: str = "",
+    now: str,
+) -> dict[str, Any]:
+    source_table, source_id = _graph_ref_parts(source_ref)
+    target_table, target_id = _graph_ref_parts(target_ref)
+    clean_type = _clean_graph_link_type(link_type)
+    clean_state = _clean_graph_link_state(link_state, default="accepted")
+    clean_risk = _clean_graph_risk_level(risk_level)
+    return {
+        "link_id": _graph_link_id(source_ref, clean_type, target_ref),
+        "source_ref": source_ref,
+        "source_table": source_table,
+        "source_id": source_id,
+        "target_ref": target_ref,
+        "target_table": target_table,
+        "target_id": target_id,
+        "link_type": clean_type,
+        "link_state": clean_state,
+        "risk_level": clean_risk,
+        "title": _clean_short_text(title, "", limit=240),
+        "metadata_json": json.dumps(metadata or {}, ensure_ascii=True, sort_keys=True),
+        "provenance_json": json.dumps(provenance or {}, ensure_ascii=True, sort_keys=True),
+        "created_by": _clean_short_text(actor, "blueprints-api", limit=120),
+        "request_id": _clean_short_text(request_id, "", limit=160),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _row_to_personal_graph_link(row: Any) -> dict[str, Any]:
+    return {
+        "link_id": row["link_id"],
+        "source_ref": row["source_ref"],
+        "source": {"table": row["source_table"], "id": row["source_id"]},
+        "target_ref": row["target_ref"],
+        "target": {"table": row["target_table"], "id": row["target_id"]},
+        "link_type": row["link_type"],
+        "link_state": row["link_state"],
+        "risk_level": row["risk_level"],
+        "title": row["title"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_by": row["created_by"],
+        "request_id": row["request_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _upsert_graph_link(conn: Any, payload: dict[str, Any]) -> str:
+    existing = conn.execute(
+        "SELECT * FROM personal_graph_links WHERE link_id=?", (payload["link_id"],)
+    ).fetchone()
+    if existing:
+        comparable = [
+            "source_ref",
+            "source_table",
+            "source_id",
+            "target_ref",
+            "target_table",
+            "target_id",
+            "link_type",
+            "link_state",
+            "risk_level",
+            "title",
+            "metadata_json",
+            "provenance_json",
+            "created_by",
+            "request_id",
+        ]
+        if all(str(existing[key] or "") == str(payload[key] or "") for key in comparable):
+            return "unchanged"
+        payload = {**payload, "created_at": existing["created_at"]}
+        result = "updated"
+    else:
+        result = "inserted"
+    conn.execute(
+        """
+        INSERT INTO personal_graph_links (
+            link_id, source_ref, source_table, source_id, target_ref, target_table,
+            target_id, link_type, link_state, risk_level, title, metadata_json,
+            provenance_json, created_by, request_id, created_at, updated_at
+        )
+        VALUES (
+            :link_id, :source_ref, :source_table, :source_id, :target_ref,
+            :target_table, :target_id, :link_type, :link_state, :risk_level,
+            :title, :metadata_json, :provenance_json, :created_by, :request_id,
+            :created_at, :updated_at
+        )
+        ON CONFLICT(link_id) DO UPDATE SET
+            source_ref=excluded.source_ref,
+            source_table=excluded.source_table,
+            source_id=excluded.source_id,
+            target_ref=excluded.target_ref,
+            target_table=excluded.target_table,
+            target_id=excluded.target_id,
+            link_type=excluded.link_type,
+            link_state=excluded.link_state,
+            risk_level=excluded.risk_level,
+            title=excluded.title,
+            metadata_json=excluded.metadata_json,
+            provenance_json=excluded.provenance_json,
+            created_by=excluded.created_by,
+            request_id=excluded.request_id,
+            updated_at=excluded.updated_at
+        """,
+        payload,
+    )
+    return result
+
+
+def _walk_json(value: Any):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key, item
+            yield from _walk_json(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_json(item)
+
+
+def _matrix_pointer_refs(provenance: Any) -> list[str]:
+    refs: list[str] = []
+    for key, value in _walk_json(provenance):
+        if key in {"matrix_event_id", "source_event_id"} and value:
+            refs.append(f"matrix_event:{value}")
+        elif key == "matrix_event_ids" and isinstance(value, list):
+            refs.extend(f"matrix_event:{item}" for item in value if item)
+        elif key == "conversation_key" and value:
+            refs.append(f"matrix_minutes:{value}")
+        elif key == "wake_route_record_ids" and isinstance(value, list):
+            refs.extend(f"wake_route:{item}" for item in value if item)
+        elif key == "tts_utterance_ids" and isinstance(value, list):
+            refs.extend(f"tts_utterance:{item}" for item in value if item)
+    deduped: list[str] = []
+    for ref in refs:
+        clean = _clean_graph_ref(ref)
+        if clean and clean not in deduped:
+            deduped.append(clean)
+    return deduped
+
+
+def _proof_doc_refs(provenance: Any) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    pending = [provenance]
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, dict):
+            if isinstance(value, list):
+                pending.extend(value)
+            continue
+        path = _clean_graph_ref(value.get("path") or value.get("doc_path") or value.get("file_ref"))
+        if path:
+            label = _clean_short_text(
+                value.get("label") or value.get("title") or path, path, limit=240
+            )
+            refs.append(
+                {"ref": f"docs:{path}" if path.endswith(".md") else f"files:{path}", "label": label}
+            )
+        pending.extend(value.values())
+    deduped: dict[str, dict[str, str]] = {}
+    for ref in refs:
+        deduped.setdefault(ref["ref"], ref)
+    return list(deduped.values())
+
+
+def _add_graph_candidate(
+    candidates: dict[str, dict[str, Any]],
+    *,
+    source_ref: str,
+    target_ref: str,
+    link_type: str,
+    title: str,
+    metadata: dict[str, Any],
+    provenance: dict[str, Any],
+    actor: str,
+    request_id: str,
+    now: str,
+    link_state: str = "accepted",
+    risk_level: str = "normal",
+) -> None:
+    source_ref = _clean_graph_ref(source_ref)
+    target_ref = _clean_graph_ref(target_ref)
+    if not source_ref or not target_ref or source_ref == target_ref:
+        return
+    payload = _graph_link_row_payload(
+        source_ref=source_ref,
+        target_ref=target_ref,
+        link_type=link_type,
+        link_state=link_state,
+        risk_level=risk_level,
+        title=title,
+        metadata=metadata,
+        provenance=provenance,
+        actor=actor,
+        request_id=request_id,
+        now=now,
+    )
+    candidates[payload["link_id"]] = payload
+
+
+def _personal_graph_candidates(
+    conn: Any,
+    *,
+    actor: str,
+    request_id: str,
+    now: str,
+) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+
+    for row in conn.execute("SELECT * FROM personal_events WHERE privacy_level != 'pin'"):
+        source_ref = f"personal_events:{row['event_id']}"
+        provenance = _json_value(row["provenance_json"], {})
+        base = {
+            "source_table": "personal_events",
+            "source_hash": row["source_hash"] or "",
+            "source_type": row["source_type"] or "",
+            "source_ref": row["source_ref"] or "",
+            "provenance_state": row["provenance_state"] or "",
+        }
+        for ref in _json_value(row["related_work_items_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("work_items", str(ref).removeprefix("work:")),
+                link_type="relates_to",
+                title="Diary event relates to work item",
+                metadata={"field": "related_work_items_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for ref in _json_value(row["related_tasks_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_time_tasks", ref),
+                link_type="relates_to",
+                title="Diary event relates to task",
+                metadata={"field": "related_tasks_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for ref in _json_value(row["related_import_batches_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_import_batches", ref),
+                link_type="created_from",
+                title="Diary event came from import batch",
+                metadata={"field": "related_import_batches_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for ref in _json_value(row["db_refs_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("", ref),
+                link_type="evidence_for",
+                title="Diary event keeps database evidence",
+                metadata={"field": "db_refs_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for ref in _json_value(row["file_refs_json"], []):
+            target = _target_ref("", ref) if ":" in str(ref) else f"files:{ref}"
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=target,
+                link_type="source_for",
+                title="Diary event keeps file evidence",
+                metadata={"field": "file_refs_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        if row["source_type"] == "git" and row["source_ref"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=f"git_commit:{row['source_ref']}",
+                link_type="source_for",
+                title="Diary event sourced from git commit",
+                metadata={"source_type": "git"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        if row["source_type"] == "browser-links":
+            browser_ref = row["source_ref"] or row["event_id"]
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=f"browser_links:{browser_ref}",
+                link_type="source_for",
+                title="Diary event sourced from Browser Links",
+                metadata={"source_type": "browser-links"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        if row["local_date"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=f"diary_day:{row['local_date']}",
+                link_type="same_day_as",
+                title="Diary event belongs to day",
+                metadata={"local_date": row["local_date"]},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for target_ref in _matrix_pointer_refs(provenance):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=target_ref,
+                link_type="source_for",
+                title="Diary event keeps Matrix Minutes pointer",
+                metadata={"field": "provenance_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    for row in conn.execute("SELECT * FROM personal_time_tasks WHERE privacy_level != 'pin'"):
+        source_ref = f"personal_time_tasks:{row['task_id']}"
+        base = {"source_table": "personal_time_tasks", "source_hash": row["source_hash"] or ""}
+        for ref in _json_value(row["related_work_items_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("work_items", str(ref).removeprefix("work:")),
+                link_type="relates_to",
+                title="Task relates to work item",
+                metadata={"field": "related_work_items_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    for row in conn.execute("SELECT * FROM work_items WHERE status != 'archived'"):
+        source_ref = f"work_items:{row['item_id']}"
+        base = {"source_table": "work_items", "source_hash": row["source_hash"] or ""}
+        for ref in _json_value(row["related_event_ids_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_events", ref),
+                link_type="evidence_for",
+                title="Work item links diary/work evidence",
+                metadata={"field": "related_event_ids_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for ref in _json_value(row["related_task_ids_json"], []):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_time_tasks", ref),
+                link_type="evidence_for",
+                title="Work item links task evidence",
+                metadata={"field": "related_task_ids_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        if row["promoted_from_ref"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("", row["promoted_from_ref"]),
+                link_type="promoted_from",
+                title="Work item promoted from source record",
+                metadata={"field": "promoted_from_ref"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    for row in conn.execute("SELECT * FROM work_item_links"):
+        _add_graph_candidate(
+            candidates,
+            source_ref=f"work_items:{row['source_item_id']}",
+            target_ref=f"work_items:{row['target_item_id']}",
+            link_type=PERSONAL_GRAPH_LINK_TYPE_ALIASES.get(row["link_type"], row["link_type"]),
+            title="Work item link",
+            metadata={"work_item_link_id": row["link_id"], **_json_value(row["metadata_json"], {})},
+            provenance={
+                "source_table": "work_item_links",
+                "db_ref": f"work_item_links:{row['link_id']}",
+            },
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+
+    for row in conn.execute("SELECT * FROM work_issues"):
+        source_ref = f"work_issues:{row['issue_id']}"
+        base = {"source_table": "work_issues", "db_ref": source_ref}
+        _add_graph_candidate(
+            candidates,
+            source_ref=source_ref,
+            target_ref=f"work_items:{row['item_id']}",
+            link_type="evidence_for",
+            title="Issue is evidence for work item",
+            metadata={"status": row["status"]},
+            provenance=base,
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+        if row["related_task_id"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_time_tasks", row["related_task_id"]),
+                link_type="relates_to",
+                title="Issue relates to task",
+                metadata={"field": "related_task_id"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    for row in conn.execute("SELECT * FROM work_todos"):
+        source_ref = f"work_todos:{row['todo_id']}"
+        base = {"source_table": "work_todos", "db_ref": source_ref}
+        _add_graph_candidate(
+            candidates,
+            source_ref=source_ref,
+            target_ref=f"work_items:{row['item_id']}",
+            link_type="evidence_for",
+            title="Work todo is evidence for work item",
+            metadata={"status": row["status"]},
+            provenance=base,
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+        if row["related_task_id"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=_target_ref("personal_time_tasks", row["related_task_id"]),
+                link_type="relates_to",
+                title="Work todo relates to task",
+                metadata={"field": "related_task_id"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    for row in conn.execute("SELECT * FROM work_blockers"):
+        if not row["blocked_by_ref"]:
+            continue
+        _add_graph_candidate(
+            candidates,
+            source_ref=f"work_blockers:{row['blocker_id']}",
+            target_ref=_target_ref("", row["blocked_by_ref"]),
+            link_type="blocks",
+            title="Blocker cites blocking source",
+            metadata={"status": row["status"]},
+            provenance={
+                "source_table": "work_blockers",
+                "db_ref": f"work_blockers:{row['blocker_id']}",
+            },
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+
+    for row in conn.execute("SELECT * FROM personal_import_batches WHERE privacy_level != 'pin'"):
+        source_ref = f"personal_import_batches:{row['import_batch_id']}"
+        provenance = _json_value(row["provenance_json"], {})
+        base = {
+            "source_table": "personal_import_batches",
+            "source_type": row["source_type"],
+            "source_ref": row["source_ref"] or "",
+        }
+        for ref in _json_value(row["artifact_refs_json"], []):
+            target = _target_ref("", ref) if ":" in str(ref) else f"files:{ref}"
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=target,
+                link_type="evidence_for",
+                title="Import batch links artifact",
+                metadata={"field": "artifact_refs_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+        for proof in _proof_doc_refs(provenance):
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=proof["ref"],
+                link_type="documents",
+                title=proof["label"],
+                metadata={"field": "provenance_json"},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
+
+    return candidates
 
 
 PERSONAL_SEARCH_PROJECT = "personal-time-activity"
@@ -2096,6 +2742,159 @@ async def search_personal_activity(
             "rerank": rerank_status,
             "sync": sync_summary,
         },
+    }
+
+
+@router.post("/graph/sync")
+async def sync_personal_graph_links(body: PersonalGraphSyncRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    request_id = _clean_short_text(
+        body.request_id,
+        "personal-graph-sync",
+        limit=160,
+    )
+    actor = _clean_short_text(body.actor, "blueprints-api", limit=120)
+    with get_conn() as conn:
+        candidates = _personal_graph_candidates(
+            conn,
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+        counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+        changed: list[dict[str, Any]] = []
+        for payload in candidates.values():
+            result = _upsert_graph_link(conn, payload)
+            counts[result] += 1
+            if result in {"inserted", "updated"}:
+                row = conn.execute(
+                    "SELECT * FROM personal_graph_links WHERE link_id=?",
+                    (payload["link_id"],),
+                ).fetchone()
+                if row:
+                    changed.append(dict(row))
+        if changed:
+            gen = increment_gen(conn, "personal-graph-links")
+            for row in changed:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "personal_graph_links",
+                    row["link_id"],
+                    row,
+                    gen,
+                )
+    return {
+        "ok": True,
+        "schema": "xarta.personal.graph.sync.v1",
+        "generated_at_utc": now,
+        "candidate_count": len(candidates),
+        "links": counts,
+    }
+
+
+@router.get("/graph/links")
+async def list_personal_graph_links(
+    source_ref: str | None = None,
+    target_ref: str | None = None,
+    link_type: str | None = None,
+    link_state: str | None = None,
+    sync: bool = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 80,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    sync_summary = None
+    if sync:
+        sync_summary = await sync_personal_graph_links(PersonalGraphSyncRequest())
+    where: list[str] = []
+    params: list[Any] = []
+    if source_ref:
+        where.append("source_ref = ?")
+        params.append(_clean_graph_ref(source_ref))
+    if target_ref:
+        where.append("target_ref = ?")
+        params.append(_clean_graph_ref(target_ref))
+    if link_type:
+        where.append("link_type = ?")
+        params.append(_clean_graph_link_type(link_type))
+    if link_state:
+        where.append("link_state = ?")
+        params.append(_clean_graph_link_state(link_state))
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM personal_graph_links
+            {clause}
+            ORDER BY updated_at DESC, link_type, link_id
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+    return {
+        "ok": True,
+        "schema": "xarta.personal.graph.links.v1",
+        "count": len(rows),
+        "links": [_row_to_personal_graph_link(row) for row in rows],
+        "pagination": _pagination(limit, offset, len(rows)),
+        "sync": sync_summary,
+    }
+
+
+@router.post("/graph/links")
+async def create_personal_graph_link(body: PersonalGraphLinkCreateRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    source_ref = _clean_graph_ref(body.source_ref)
+    target_ref = _clean_graph_ref(body.target_ref)
+    if not source_ref or not target_ref:
+        raise HTTPException(400, "source_ref and target_ref are required")
+    link_state = _clean_graph_link_state(body.link_state, default="declared")
+    request_id = _clean_short_text(
+        body.request_id,
+        f"personal-graph-link-{uuid.uuid4().hex[:12]}",
+        limit=160,
+    )
+    actor = _clean_short_text(body.actor, "blueprints-ui", limit=120)
+    provenance = body.provenance if isinstance(body.provenance, dict) else {}
+    provenance = {
+        **provenance,
+        "declared_by": actor,
+        "source_surface": _clean_short_text(body.source_surface, "personal-graph", limit=120),
+        "guard": "inferred input is stored as needs_review until explicitly accepted",
+    }
+    payload = _graph_link_row_payload(
+        source_ref=source_ref,
+        target_ref=target_ref,
+        link_type=body.link_type,
+        link_state=link_state,
+        risk_level=body.risk_level,
+        title=body.title or "",
+        metadata=body.metadata if isinstance(body.metadata, dict) else {},
+        provenance=provenance,
+        actor=actor,
+        request_id=request_id,
+        now=now,
+    )
+    with get_conn() as conn:
+        result = _upsert_graph_link(conn, payload)
+        row = conn.execute(
+            "SELECT * FROM personal_graph_links WHERE link_id=?",
+            (payload["link_id"],),
+        ).fetchone()
+        if result in {"inserted", "updated"} and row:
+            gen = increment_gen(conn, "personal-graph-link")
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "personal_graph_links",
+                row["link_id"],
+                dict(row),
+                gen,
+            )
+    return {
+        "ok": True,
+        "result": result,
+        "link": _row_to_personal_graph_link(row),
     }
 
 

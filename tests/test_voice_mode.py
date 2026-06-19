@@ -373,9 +373,10 @@ def test_active_browser_command_parameters_are_sanitized():
         voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>")
         == "nod.backupColumnsscript"
     )
-    assert voice_mode._clean_active_browser_diagnostic_sources("search gpu") == [
+    assert voice_mode._clean_active_browser_diagnostic_sources("search gpu provenance") == [
         "personal_search",
         "gpu_activity_sound",
+        "personal_graph",
     ]
     assert len(voice_mode._clean_active_browser_group("A" * 200)) == 80
     assert len(voice_mode._clean_active_browser_page_id("p" * 220)) == 160
@@ -387,6 +388,49 @@ def test_active_browser_automation_does_not_fabricate_empty_last_command():
     report = voice_mode._clean_active_browser_automation_report({"last_command": {}})
 
     assert report["last_command"] == {}
+
+
+def test_active_browser_automation_preserves_personal_search_graph_surfaces():
+    report = voice_mode._clean_active_browser_automation_report(
+        {
+            "surfaces": {
+                "personal_search": {
+                    "surfaces": {
+                        "diary": {
+                            "query": "step",
+                            "mode": "personal",
+                            "record_type": "diary",
+                            "loading": False,
+                            "error": "",
+                            "result_count": 8,
+                            "first_result": "personal_events:evt-proof",
+                            "subsystems": {"vector": {"status": "ok"}},
+                        }
+                    },
+                    "graph": {
+                        "open": True,
+                        "source_ref": "personal_events:evt-proof",
+                        "title": "Proof event",
+                        "link_count": 4,
+                        "first_link": "git_commit:abc123",
+                    },
+                },
+                "personal_graph": {
+                    "open": True,
+                    "source_ref": "personal_events:evt-proof",
+                    "title": "Proof event",
+                    "link_count": 4,
+                    "first_link": "git_commit:abc123",
+                },
+            }
+        }
+    )
+
+    personal_search = report["surfaces"]["personal_search"]
+    assert personal_search["surfaces"]["diary"]["result_count"] == 8
+    assert personal_search["surfaces"]["diary"]["subsystems"]["vector"]["status"] == "ok"
+    assert personal_search["graph"]["link_count"] == 4
+    assert report["surfaces"]["personal_graph"]["first_link"] == "git_commit:abc123"
 
 
 def test_active_browser_command_rejects_unsupported_actions():

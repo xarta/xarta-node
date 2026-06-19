@@ -428,6 +428,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS personal_search_fts USING fts5(
     tokenize='porter unicode61'
 );
 
+CREATE TABLE IF NOT EXISTS personal_graph_links (
+    link_id          TEXT PRIMARY KEY,
+    source_ref       TEXT NOT NULL,
+    source_table     TEXT NOT NULL DEFAULT '',
+    source_id        TEXT NOT NULL DEFAULT '',
+    target_ref       TEXT NOT NULL,
+    target_table     TEXT NOT NULL DEFAULT '',
+    target_id        TEXT NOT NULL DEFAULT '',
+    link_type        TEXT NOT NULL DEFAULT 'relates_to',
+    link_state       TEXT NOT NULL DEFAULT 'declared',
+    risk_level       TEXT NOT NULL DEFAULT 'normal',
+    title            TEXT NOT NULL DEFAULT '',
+    metadata_json    TEXT NOT NULL DEFAULT '{}',
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    created_by       TEXT NOT NULL DEFAULT '',
+    request_id       TEXT NOT NULL DEFAULT '',
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_graph_links_source
+    ON personal_graph_links(source_ref, link_type, link_state);
+CREATE INDEX IF NOT EXISTS idx_personal_graph_links_target
+    ON personal_graph_links(target_ref, link_type, link_state);
+CREATE INDEX IF NOT EXISTS idx_personal_graph_links_type
+    ON personal_graph_links(link_type, link_state, updated_at);
+
 CREATE TABLE IF NOT EXISTS work_item_states (
     state_id        TEXT PRIMARY KEY,
     label           TEXT NOT NULL,

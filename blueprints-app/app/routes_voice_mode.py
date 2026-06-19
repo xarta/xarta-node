@@ -258,7 +258,7 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "runtime_snapshot": "diagnostic_snapshot",
     "debug_snapshot": "diagnostic_snapshot",
 }
-_ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound", "personal_search"}
+_ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound", "personal_search", "personal_graph"}
 _ACTIVE_BROWSER_DIAGNOSTIC_ALIASES = {
     "gpu": "gpu_activity_sound",
     "gpu_activity": "gpu_activity_sound",
@@ -266,6 +266,9 @@ _ACTIVE_BROWSER_DIAGNOSTIC_ALIASES = {
     "search": "personal_search",
     "shared_search": "personal_search",
     "personal_shared_search": "personal_search",
+    "graph": "personal_graph",
+    "provenance": "personal_graph",
+    "personal_provenance": "personal_graph",
 }
 _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
     "": "click",
@@ -2093,6 +2096,47 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_personal_search(raw: Any) -> dict[str, Any]:
+    snapshot = raw if isinstance(raw, dict) else {}
+    surfaces_raw = snapshot.get("surfaces") if isinstance(snapshot.get("surfaces"), dict) else {}
+    surfaces: dict[str, Any] = {}
+    for key in ("diary", "calendar", "todo", "imports", "kanban"):
+        item = surfaces_raw.get(key) if isinstance(surfaces_raw.get(key), dict) else {}
+        surfaces[key] = {
+            "query": _clean_string(item.get("query"), "", 160),
+            "mode": _clean_string(item.get("mode"), "", 40),
+            "record_type": _clean_string(item.get("record_type"), "", 40),
+            "loading": bool(item.get("loading")),
+            "error": _clean_string(item.get("error"), "", 180),
+            "result_count": _clean_browser_page_int(item.get("result_count"), maximum=500),
+            "first_result": _clean_string(item.get("first_result"), "", 240),
+            "subsystems": _bounded_json(
+                item.get("subsystems") if isinstance(item.get("subsystems"), dict) else {},
+                3000,
+            ),
+        }
+    return {
+        "surfaces": surfaces,
+        "graph": _clean_active_browser_personal_graph(snapshot.get("graph")),
+    }
+
+
+def _clean_active_browser_personal_graph(raw: Any) -> dict[str, Any]:
+    graph = raw if isinstance(raw, dict) else {}
+    return {
+        "open": bool(graph.get("open")),
+        "source_ref": _clean_string(graph.get("source_ref"), "", 260),
+        "title": _clean_string(graph.get("title"), "", 240),
+        "loading": bool(graph.get("loading")),
+        "error": _clean_string(graph.get("error"), "", 180),
+        "link_count": _clean_browser_page_int(graph.get("link_count"), maximum=1000),
+        "first_link": _clean_string(graph.get("first_link"), "", 260),
+        "sync": _bounded_json(
+            graph.get("sync") if isinstance(graph.get("sync"), dict) else {}, 5000
+        ),
+    }
+
+
 def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
@@ -2155,6 +2199,10 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
             "imports_dashboard": _clean_active_browser_imports_dashboard(
                 surfaces.get("imports_dashboard")
             ),
+            "personal_search": _clean_active_browser_personal_search(
+                surfaces.get("personal_search")
+            ),
+            "personal_graph": _clean_active_browser_personal_graph(surfaces.get("personal_graph")),
         },
     }
 
