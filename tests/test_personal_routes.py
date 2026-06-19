@@ -212,6 +212,46 @@ def _make_conn() -> sqlite3.Connection:
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE personal_search_documents (
+            document_id TEXT PRIMARY KEY,
+            record_type TEXT NOT NULL DEFAULT '',
+            record_table TEXT NOT NULL DEFAULT '',
+            record_id TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT '',
+            source_ref TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            search_text TEXT NOT NULL DEFAULT '',
+            local_date TEXT,
+            status TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT '',
+            privacy_level TEXT NOT NULL DEFAULT 'normal',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            related_refs_json TEXT NOT NULL DEFAULT '[]',
+            page_ref_json TEXT NOT NULL DEFAULT '{}',
+            source_refs_json TEXT NOT NULL DEFAULT '[]',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            score_metadata_json TEXT NOT NULL DEFAULT '{}',
+            embedding_ref TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_updated_at TEXT,
+            vector_index_key TEXT NOT NULL DEFAULT '',
+            vector_index_status TEXT NOT NULL DEFAULT 'pending',
+            vector_index_updated_at TEXT,
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE VIRTUAL TABLE personal_search_fts USING fts5(
+            document_id UNINDEXED,
+            title,
+            body,
+            search_text,
+            tags,
+            source_type,
+            record_type,
+            tokenize='porter unicode61'
+        );
         CREATE TABLE work_item_states (
             state_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
@@ -419,6 +459,14 @@ def _conn_context(conn: sqlite3.Connection):
 
 def _patch_conn(monkeypatch, conn: sqlite3.Connection) -> None:
     monkeypatch.setattr(routes_personal, "get_conn", lambda: _conn_context(conn))
+
+
+def _disable_import_status_sync(monkeypatch) -> None:
+    monkeypatch.setattr(
+        routes_personal,
+        "_sync_personal_import_status_batches",
+        lambda conn, now: {"inserted": 0, "updated": 0, "unchanged": 0},
+    )
 
 
 def test_personal_events_filters_and_shape(monkeypatch):
@@ -1100,6 +1148,364 @@ def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
     assert personal["items"][0]["source"]["authority"] == "event"
     assert [item["task_id"] for item in work["items"]] == ["evt-work"]
     assert [item["task_id"] for item in blocked["items"]] == ["evt-work"]
+
+
+def test_personal_search_sync_exact_fts_and_filters(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _disable_import_status_sync(monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status,
+            tags_json, related_work_items_json, provenance_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-diary-search",
+            "manual",
+            "2026/06/18/10-20-personal-log.md",
+            "sha256:diary-search",
+            "personal-log",
+            "Morning source moment",
+            "Needle phrase visible in a diary body",
+            "Needle phrase visible in a diary body",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["diary", "proof"]),
+            json.dumps(["work-search"]),
+            json.dumps({"file_ref": "2026/06/18/10-20-personal-log.md"}),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_import_batches (
+            import_batch_id, source_type, source_ref, title, status, local_date,
+            artifact_refs_json, blocker_refs_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "batch-search",
+            "interests-ingestion",
+            "docs/interests/source.json",
+            "Interests import alpha",
+            "pending_review",
+            "2026-06-18",
+            json.dumps(["docs/interests/dashboard.md"]),
+            json.dumps(["missing source"]),
+        ),
+    )
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=False)
+        )
+    )
+    assert sync["documents"]["document_count"] == 2
+    assert sync["vector"]["status"] == "skipped"
+
+    needle = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="Needle",
+            date_start="2026-06-18",
+            date_end="2026-06-18",
+            include_vector=False,
+            rerank_results=False,
+            sync=False,
+            limit=10,
+        )
+    )
+    assert needle["subsystems"]["fts"]["candidate_count"] >= 1
+    assert needle["results"][0]["document_id"] == "personal_events:evt-diary-search"
+    assert {"exact", "fts_bm25"}.issubset(set(needle["results"][0]["score"]["score_sources"]))
+
+    imports = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="source",
+            mode="imports",
+            include_vector=False,
+            rerank_results=False,
+            sync=False,
+            limit=10,
+        )
+    )
+    assert [item["record_type"] for item in imports["results"]] == ["import"]
+    assert imports["results"][0]["page_ref"]["tab"] == "imports"
+
+
+def test_personal_search_sync_projects_import_status_rows(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_parse_interests_dashboard",
+        lambda: {
+            "status": "ok",
+            "doc_path": "docs/interests/dashboard.md",
+            "source_digest": "sha256:interests",
+            "snapshot_at": "2026-06-18T10:00:00Z",
+            "pending_review": 2,
+            "actionable_backlog": 1,
+            "blockers": [],
+            "proof_links": [
+                {
+                    "label": "Interests proof",
+                    "path": "docs/interests/proof.md",
+                }
+            ],
+        },
+    )
+
+    def fake_git_activity(counts: dict):
+        assert "import_batches" in counts
+        return {
+            "status": "needs_review",
+            "watched_repos": [
+                {
+                    "repo_id": "p300",
+                    "path": "/xarta-node",
+                    "head": "abc123",
+                    "dirty_count": 1,
+                    "untracked_count": 0,
+                    "error": "",
+                    "daily_commit_count": 2,
+                }
+            ],
+            "latest_commits": [
+                {
+                    "repo_id": "p300",
+                    "sha": "abcdef",
+                    "author_date": "2026-06-18T10:00:00Z",
+                    "subject": "Import dashboard proof",
+                }
+            ],
+            "errors": [],
+            "actionable_repos": [{"repo_id": "p300", "actions": ["review uncommitted changes"]}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_git_activity_dashboard", fake_git_activity)
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=False)
+        )
+    )
+
+    assert sync["documents"]["import_status"] == {
+        "inserted": 2,
+        "updated": 0,
+        "unchanged": 0,
+    }
+    assert sync["documents"]["document_count"] == 2
+    interests = conn.execute(
+        "SELECT * FROM personal_import_batches WHERE import_batch_id='status-interests-ingestion'"
+    ).fetchone()
+    assert interests["source_type"] == "interests-ingestion"
+    assert interests["status"] == "ok"
+
+    result = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="Hermes Interests",
+            mode="imports",
+            include_vector=False,
+            rerank_results=False,
+            sync=False,
+            limit=10,
+        )
+    )
+    assert result["count"] == 1
+    assert result["results"][0]["record_type"] == "import"
+    assert result["results"][0]["record_id"] == "status-interests-ingestion"
+
+    second_sync = asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=False)
+        )
+    )
+    assert second_sync["documents"]["import_status"] == {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 2,
+    }
+
+
+def test_personal_search_vector_sync_does_not_hold_sqlite_across_await(monkeypatch):
+    conn = _make_conn()
+    active_contexts = 0
+
+    @contextmanager
+    def tracked_conn():
+        nonlocal active_contexts
+        active_contexts += 1
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            active_contexts -= 1
+
+    monkeypatch.setattr(routes_personal, "get_conn", lambda: tracked_conn())
+    _disable_import_status_sync(monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status, tags_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-vector-sync",
+            "manual",
+            "2026/06/18/vector.md",
+            "sha256:vector-sync",
+            "personal-log",
+            "Vector sync proof",
+            "Async vector indexing should not hold SQLite open",
+            "Async vector indexing should not hold SQLite open",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["diary"]),
+        ),
+    )
+
+    from app import ai_client, seekdb
+
+    async def fake_embed(project_name: str, texts: list[str]):
+        assert project_name == "personal-time-activity"
+        assert active_contexts == 0
+        return [[0.11] * routes_personal.PERSONAL_SEARCH_VECTOR_DIM for _ in texts]
+
+    indexed = []
+
+    async def fake_upsert(row: dict, vector: list[float]):
+        assert active_contexts == 0
+        assert len(vector) == routes_personal.PERSONAL_SEARCH_VECTOR_DIM
+        indexed.append(row["document_id"])
+
+    monkeypatch.setattr(
+        ai_client, "_get_provider", lambda project, role: {"model_name": "test-emb"}
+    )
+    monkeypatch.setattr(ai_client, "embed", fake_embed)
+    monkeypatch.setattr(seekdb, "upsert_personal_index_async", fake_upsert)
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=True)
+        )
+    )
+
+    assert sync["vector"]["status"] == "ok"
+    assert sync["vector"]["indexed"] == 1
+    assert indexed == ["personal_events:evt-vector-sync"]
+    row = conn.execute(
+        "SELECT embedding_model, vector_index_status FROM personal_search_documents "
+        "WHERE document_id='personal_events:evt-vector-sync'"
+    ).fetchone()
+    assert row["embedding_model"] == "test-emb"
+    assert row["vector_index_status"] == "indexed"
+
+
+def test_personal_search_vector_only_candidate_and_reranker(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _disable_import_status_sync(monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status, tags_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-literal",
+            "manual",
+            "2026/06/18/literal.md",
+            "sha256:literal",
+            "personal-log",
+            "semantic query literal",
+            "literal keyword candidate",
+            "literal keyword candidate",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["diary"]),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_import_batches (
+            import_batch_id, source_type, source_ref, title, status, local_date,
+            artifact_refs_json, blocker_refs_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "batch-semantic",
+            "interests-ingestion",
+            "docs/interests/conceptual.json",
+            "Conceptual import row",
+            "pending_review",
+            "2026-06-18",
+            json.dumps(["docs/interests/conceptual-dashboard.md"]),
+            json.dumps([]),
+        ),
+    )
+    asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=False)
+        )
+    )
+
+    async def fake_vector_candidates(q: str, *, limit: int):
+        return (
+            [
+                {
+                    "id": "personal_import_batches:batch-semantic",
+                    "metadata": {"document_id": "personal_import_batches:batch-semantic"},
+                    "distance": 0.18,
+                }
+            ],
+            {"status": "ok", "error": "", "candidate_count": 1},
+        )
+
+    from app import ai_client
+
+    async def fake_rerank(
+        project_name: str, query: str, documents: list[str], top_n: int | None = None
+    ):
+        assert project_name == "personal-time-activity"
+        assert query == "semantic query"
+        assert len(documents) == 2
+        return [
+            {"index": 1, "relevance_score": 0.91, "document": {"text": documents[1]}},
+            {"index": 0, "relevance_score": 0.42, "document": {"text": documents[0]}},
+        ]
+
+    monkeypatch.setattr(routes_personal, "_personal_vector_candidates", fake_vector_candidates)
+    monkeypatch.setattr(ai_client, "rerank", fake_rerank)
+
+    result = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="semantic query",
+            include_vector=True,
+            rerank_results=True,
+            sync=False,
+            limit=10,
+        )
+    )
+    assert result["subsystems"]["vector"]["status"] == "ok"
+    assert result["subsystems"]["rerank"]["status"] == "ok"
+    assert result["results"][0]["document_id"] == "personal_import_batches:batch-semantic"
+    assert result["results"][0]["score"]["score_sources"] == ["vector"]
+    assert result["results"][0]["score"]["reranker_rank"] == 1
+    assert result["results"][0]["score"]["components"]["vector"]["cosine_distance"] == 0.18
 
 
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):

@@ -308,6 +308,12 @@ class DiaryBrowserLinksProjectRequest(BaseModel):
     run_id: str | None = None
 
 
+class PersonalSearchSyncRequest(BaseModel):
+    force_embeddings: bool = False
+    include_embeddings: bool = True
+    limit: int = 200
+
+
 def _json_value(value: str | None, fallback: Any) -> Any:
     if not value:
         return fallback
@@ -941,6 +947,1155 @@ def _pagination(limit: int, offset: int, count: int) -> dict[str, Any]:
         "offset": offset,
         "count": count,
         "has_more": count == limit,
+    }
+
+
+PERSONAL_SEARCH_PROJECT = "personal-time-activity"
+PERSONAL_SEARCH_VECTOR_DIM = 2048
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _search_document_id(record_table: str, record_id: str) -> str:
+    return f"{record_table}:{record_id}"
+
+
+def _search_hash(payload: dict[str, Any]) -> str:
+    return _hash_json_payload(payload)
+
+
+def _search_tags(row: Any) -> list[str]:
+    return [str(item) for item in _as_list(_json_value(row["tags_json"], [])) if str(item)]
+
+
+def _search_related_refs(*values: Any) -> list[str]:
+    refs: list[str] = []
+    for value in values:
+        for item in _as_list(value):
+            text = _clean_short_text(str(item), "", limit=240)
+            if text and text not in refs:
+                refs.append(text)
+    return refs
+
+
+def _event_search_record_type(row: Any) -> str:
+    source_type = str(row["source_type"] or "")
+    kind = str(row["kind"] or "")
+    if source_type == "manual-calendar" or kind.startswith("calendar"):
+        return "calendar"
+    if source_type == "git" or kind.startswith("git"):
+        return "git"
+    if source_type in {"manual", "diary-file"} or kind in {"entry", "personal-log"}:
+        return "diary"
+    if kind == "task":
+        return "task_event"
+    return "timeline"
+
+
+def _event_search_mode(row: Any, record_type: str) -> str:
+    if record_type == "calendar":
+        return "calendar"
+    if record_type == "git":
+        return "git_activity"
+    if record_type == "task_event":
+        return "work" if _json_value(row["related_work_items_json"], []) else "personal"
+    if row["status"] == "blocked":
+        return "blocked"
+    if row["status"] == "pending_review":
+        return "review"
+    return "personal"
+
+
+def _event_page_ref(row: Any, record_type: str) -> dict[str, Any]:
+    if record_type == "calendar":
+        return {"group": "dave", "tab": "calendar", "date": row["local_date"] or ""}
+    if record_type == "task_event":
+        return {"group": "dave", "tab": "todo", "date": row["local_date"] or ""}
+    return {"group": "dave", "tab": "diary", "date": row["local_date"] or ""}
+
+
+def _search_payload(
+    *,
+    record_type: str,
+    record_table: str,
+    record_id: str,
+    source_type: str,
+    source_ref: str,
+    title: str,
+    body: str,
+    local_date: str | None,
+    status: str,
+    mode: str,
+    privacy_level: str,
+    tags: list[str],
+    related_refs: list[str],
+    page_ref: dict[str, Any],
+    source_refs: list[str],
+    provenance: dict[str, Any],
+    source_hash: str = "",
+    updated_at: str | None = None,
+) -> dict[str, Any]:
+    clean_title = _clean_short_text(title, "", limit=240)
+    clean_body = _body_excerpt(body or "", limit=5000)
+    search_text = "\n".join(
+        part
+        for part in [
+            clean_title,
+            clean_body,
+            " ".join(tags),
+            source_type,
+            source_ref,
+            " ".join(related_refs),
+        ]
+        if part
+    )
+    document_id = _search_document_id(record_table, record_id)
+    hash_input = {
+        "record_type": record_type,
+        "record_table": record_table,
+        "record_id": record_id,
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "title": clean_title,
+        "body": clean_body,
+        "local_date": local_date,
+        "status": status,
+        "mode": mode,
+        "privacy_level": privacy_level,
+        "tags": tags,
+        "related_refs": related_refs,
+        "page_ref": page_ref,
+        "source_refs": source_refs,
+    }
+    return {
+        "document_id": document_id,
+        "record_type": record_type,
+        "record_table": record_table,
+        "record_id": record_id,
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "source_hash": source_hash or _search_hash(hash_input),
+        "title": clean_title,
+        "body": clean_body,
+        "search_text": search_text,
+        "local_date": local_date,
+        "status": status or "",
+        "mode": mode or "",
+        "privacy_level": privacy_level or "normal",
+        "tags_json": json.dumps(tags, ensure_ascii=True),
+        "related_refs_json": json.dumps(related_refs, ensure_ascii=True),
+        "page_ref_json": json.dumps(page_ref, ensure_ascii=True, sort_keys=True),
+        "source_refs_json": json.dumps(source_refs, ensure_ascii=True),
+        "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+        "score_metadata_json": json.dumps(
+            {
+                "schema": "xarta.personal.search.score_metadata.v1",
+                "project": PERSONAL_SEARCH_PROJECT,
+                "fts": {"engine": "sqlite-fts5", "rank": "bm25"},
+                "embedding": {"dimensions": PERSONAL_SEARCH_VECTOR_DIM},
+                "vector": {"engine": "seekdb", "collection": "personal_time_activity_index"},
+                "rerank": {"project": PERSONAL_SEARCH_PROJECT},
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "vector_index_key": document_id,
+        "updated_at": updated_at or _utc_now_iso(),
+    }
+
+
+def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    event_rows = conn.execute(
+        "SELECT * FROM personal_events WHERE privacy_level != 'pin'"
+    ).fetchall()
+    for row in event_rows:
+        record_type = _event_search_record_type(row)
+        tags = _search_tags(row)
+        related_refs = _search_related_refs(
+            _json_value(row["related_work_items_json"], []),
+            _json_value(row["related_tasks_json"], []),
+            _json_value(row["related_import_batches_json"], []),
+            _json_value(row["file_refs_json"], []),
+            _json_value(row["db_refs_json"], []),
+        )
+        docs.append(
+            _search_payload(
+                record_type=record_type,
+                record_table="personal_events",
+                record_id=row["event_id"],
+                source_type=row["source_type"] or "",
+                source_ref=row["source_ref"] or "",
+                source_hash=row["source_hash"] or "",
+                title=row["title"] or "",
+                body=row["content_projection"] or row["body_excerpt"] or "",
+                local_date=row["local_date"],
+                status=row["status"] or "",
+                mode=_event_search_mode(row, record_type),
+                privacy_level=row["privacy_level"] or "normal",
+                tags=tags,
+                related_refs=related_refs,
+                page_ref=_event_page_ref(row, record_type),
+                source_refs=[f"personal_events:{row['event_id']}", *related_refs],
+                provenance=_json_value(row["provenance_json"], {}),
+                updated_at=row["updated_at"],
+            )
+        )
+
+    task_rows = conn.execute(
+        "SELECT * FROM personal_time_tasks WHERE privacy_level != 'pin'"
+    ).fetchall()
+    for row in task_rows:
+        tags = _search_tags(row)
+        related_refs = _search_related_refs(
+            _json_value(row["related_work_items_json"], []),
+            _json_value(row["related_tasks_json"], []),
+            _json_value(row["related_import_batches_json"], []),
+            _json_value(row["file_refs_json"], []),
+            _json_value(row["db_refs_json"], []),
+        )
+        docs.append(
+            _search_payload(
+                record_type="task",
+                record_table="personal_time_tasks",
+                record_id=row["task_id"],
+                source_type=row["source_type"] or "",
+                source_ref=row["source_ref"] or "",
+                source_hash=row["source_hash"] or "",
+                title=row["title"] or "",
+                body=row["body_excerpt"] or "",
+                local_date=row["local_date"],
+                status=row["status"] or "",
+                mode=row["mode"] or "personal",
+                privacy_level=row["privacy_level"] or "normal",
+                tags=tags,
+                related_refs=related_refs,
+                page_ref={"group": "dave", "tab": "todo", "date": row["local_date"] or ""},
+                source_refs=[f"personal_time_tasks:{row['task_id']}", *related_refs],
+                provenance=_json_value(row["provenance_json"], {}),
+                updated_at=row["updated_at"],
+            )
+        )
+
+    import_rows = conn.execute(
+        "SELECT * FROM personal_import_batches WHERE privacy_level != 'pin'"
+    ).fetchall()
+    for row in import_rows:
+        artifact_refs = _as_list(_json_value(row["artifact_refs_json"], []))
+        blocker_refs = _as_list(_json_value(row["blocker_refs_json"], []))
+        related_refs = _search_related_refs(artifact_refs, blocker_refs)
+        docs.append(
+            _search_payload(
+                record_type="import",
+                record_table="personal_import_batches",
+                record_id=row["import_batch_id"],
+                source_type=row["source_type"] or "",
+                source_ref=row["source_ref"] or "",
+                title=row["title"] or "",
+                body=" ".join(str(item) for item in [*artifact_refs, *blocker_refs]),
+                local_date=row["local_date"],
+                status=row["status"] or "",
+                mode="imports",
+                privacy_level=row["privacy_level"] or "normal",
+                tags=["imports", row["source_type"] or ""],
+                related_refs=related_refs,
+                page_ref={"group": "dave", "tab": "imports", "date": row["local_date"] or ""},
+                source_refs=[f"personal_import_batches:{row['import_batch_id']}", *related_refs],
+                provenance=_json_value(row["provenance_json"], {}),
+                updated_at=row["updated_at"],
+            )
+        )
+
+    work_specs = [
+        ("work_items", "item_id", "work_item", "manual-work"),
+        ("work_issues", "issue_id", "work_issue", "work-management"),
+        ("work_todos", "todo_id", "work_todo", "work-management"),
+        ("work_blockers", "blocker_id", "work_blocker", "work-management"),
+        ("work_discussions", "discussion_id", "work_discussion", "work-management"),
+    ]
+    for table, id_col, record_type, default_source in work_specs:
+        for row in conn.execute(f"SELECT * FROM {table}").fetchall():
+            row_id = row[id_col]
+            tags = _json_value(row["tags_json"], []) if "tags_json" in row.keys() else []
+            related_refs = []
+            if table == "work_items":
+                related_refs = _search_related_refs(
+                    _json_value(row["related_event_ids_json"], []),
+                    _json_value(row["related_task_ids_json"], []),
+                    _json_value(row["related_issue_ids_json"], []),
+                )
+                source_type = row["source_type"] or default_source
+                source_ref = row["source_ref"] or f"{table}:{row_id}"
+                source_hash = row["source_hash"] or ""
+                item_id = row["item_id"]
+            else:
+                related_refs = _search_related_refs(
+                    [row["item_id"]] if "item_id" in row.keys() else [],
+                    [row["source_ref"]] if "source_ref" in row.keys() and row["source_ref"] else [],
+                    [row["related_task_id"]]
+                    if "related_task_id" in row.keys() and row["related_task_id"]
+                    else [],
+                    [row["blocked_by_ref"]]
+                    if "blocked_by_ref" in row.keys() and row["blocked_by_ref"]
+                    else [],
+                )
+                source_type = default_source
+                source_ref = f"{table}:{row_id}"
+                source_hash = _search_hash(dict(row))
+                item_id = row["item_id"] if "item_id" in row.keys() else ""
+            docs.append(
+                _search_payload(
+                    record_type=record_type,
+                    record_table=table,
+                    record_id=row_id,
+                    source_type=source_type,
+                    source_ref=source_ref,
+                    source_hash=source_hash,
+                    title=(row["title"] if "title" in row.keys() else row["author"]) or "",
+                    body=row["body_excerpt"] or "",
+                    local_date=(row["due_at"] or "")[:10]
+                    if "due_at" in row.keys() and row["due_at"]
+                    else None,
+                    status=row["status"] or "",
+                    mode="work",
+                    privacy_level="normal",
+                    tags=[str(item) for item in _as_list(tags) if str(item)],
+                    related_refs=related_refs,
+                    page_ref={"group": "kanban", "tab": "kanban", "item_id": item_id},
+                    source_refs=[f"{table}:{row_id}", *related_refs],
+                    provenance=_json_value(row["provenance_json"], {}),
+                    updated_at=row["updated_at"],
+                )
+            )
+    return docs
+
+
+def _upsert_personal_search_document(conn: Any, doc: dict[str, Any], now: str) -> str:
+    existing = conn.execute(
+        "SELECT source_hash, embedding_ref, embedding_model, embedding_updated_at, "
+        "vector_index_status, vector_index_updated_at "
+        "FROM personal_search_documents WHERE document_id=?",
+        (doc["document_id"],),
+    ).fetchone()
+    source_changed = not existing or existing["source_hash"] != doc["source_hash"]
+    embedding_ref = "" if source_changed else existing["embedding_ref"]
+    embedding_model = "" if source_changed else existing["embedding_model"]
+    embedding_updated_at = None if source_changed else existing["embedding_updated_at"]
+    vector_status = "pending" if source_changed else existing["vector_index_status"]
+    vector_updated_at = None if source_changed else existing["vector_index_updated_at"]
+    created_at = now
+    conn.execute(
+        """
+        INSERT INTO personal_search_documents (
+            document_id, record_type, record_table, record_id, source_type, source_ref,
+            source_hash, title, body, search_text, local_date, status, mode,
+            privacy_level, tags_json, related_refs_json, page_ref_json,
+            source_refs_json, provenance_json, score_metadata_json, embedding_ref,
+            embedding_model, embedding_updated_at, vector_index_key,
+            vector_index_status, vector_index_updated_at, created_at, updated_at
+        )
+        VALUES (
+            :document_id, :record_type, :record_table, :record_id, :source_type,
+            :source_ref, :source_hash, :title, :body, :search_text, :local_date,
+            :status, :mode, :privacy_level, :tags_json, :related_refs_json,
+            :page_ref_json, :source_refs_json, :provenance_json, :score_metadata_json,
+            :embedding_ref, :embedding_model, :embedding_updated_at, :vector_index_key,
+            :vector_index_status, :vector_index_updated_at, :created_at, :updated_at
+        )
+        ON CONFLICT(document_id) DO UPDATE SET
+            record_type=excluded.record_type,
+            record_table=excluded.record_table,
+            record_id=excluded.record_id,
+            source_type=excluded.source_type,
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            title=excluded.title,
+            body=excluded.body,
+            search_text=excluded.search_text,
+            local_date=excluded.local_date,
+            status=excluded.status,
+            mode=excluded.mode,
+            privacy_level=excluded.privacy_level,
+            tags_json=excluded.tags_json,
+            related_refs_json=excluded.related_refs_json,
+            page_ref_json=excluded.page_ref_json,
+            source_refs_json=excluded.source_refs_json,
+            provenance_json=excluded.provenance_json,
+            score_metadata_json=excluded.score_metadata_json,
+            embedding_ref=excluded.embedding_ref,
+            embedding_model=excluded.embedding_model,
+            embedding_updated_at=excluded.embedding_updated_at,
+            vector_index_key=excluded.vector_index_key,
+            vector_index_status=excluded.vector_index_status,
+            vector_index_updated_at=excluded.vector_index_updated_at,
+            updated_at=excluded.updated_at
+        """,
+        {
+            **doc,
+            "embedding_ref": embedding_ref,
+            "embedding_model": embedding_model,
+            "embedding_updated_at": embedding_updated_at,
+            "vector_index_status": vector_status,
+            "vector_index_updated_at": vector_updated_at,
+            "created_at": created_at,
+            "updated_at": doc["updated_at"] or now,
+        },
+    )
+    conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (doc["document_id"],))
+    tags = " ".join(str(item) for item in _as_list(_json_value(doc["tags_json"], [])))
+    conn.execute(
+        """
+        INSERT INTO personal_search_fts (
+            document_id, title, body, search_text, tags, source_type, record_type
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            doc["document_id"],
+            doc["title"],
+            doc["body"],
+            doc["search_text"],
+            tags,
+            doc["source_type"],
+            doc["record_type"],
+        ),
+    )
+    return "updated" if source_changed else "unchanged"
+
+
+def _sync_personal_search_documents(conn: Any, now: str) -> dict[str, Any]:
+    import_status = _sync_personal_import_status_batches(conn, now)
+    docs = _collect_personal_search_documents(conn)
+    seen = {doc["document_id"] for doc in docs}
+    updated = 0
+    unchanged = 0
+    for doc in docs:
+        status = _upsert_personal_search_document(conn, doc, now)
+        if status == "updated":
+            updated += 1
+        else:
+            unchanged += 1
+    stale_rows = conn.execute("SELECT document_id FROM personal_search_documents").fetchall()
+    deleted = 0
+    for row in stale_rows:
+        if row["document_id"] in seen:
+            continue
+        conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (row["document_id"],))
+        conn.execute(
+            "DELETE FROM personal_search_documents WHERE document_id=?", (row["document_id"],)
+        )
+        deleted += 1
+    return {
+        "document_count": len(docs),
+        "updated": updated,
+        "unchanged": unchanged,
+        "deleted": deleted,
+        "import_status": import_status,
+    }
+
+
+def _sync_personal_import_status_batches(conn: Any, now: str) -> dict[str, Any]:
+    counts = _personal_source_counts_from_conn(conn)
+    interests = _parse_interests_dashboard()
+    git_activity = _git_activity_dashboard(counts)
+    today = now[:10]
+
+    interest_artifacts = [
+        str(item.get("path") or item.get("label") or "")
+        for item in _as_list(interests.get("proof_links"))
+    ]
+    interest_artifacts = [item for item in interest_artifacts if item]
+    if interests.get("doc_path"):
+        interest_artifacts.insert(0, str(interests["doc_path"]))
+    interest_provenance = {
+        "schema": "xarta.personal.import_status.v1",
+        "source": "imports-dashboard",
+        "source_digest": interests.get("source_digest") or interests.get("content_digest") or "",
+        "snapshot_at": interests.get("snapshot_at") or "",
+        "pending_review": interests.get("pending_review"),
+        "actionable_backlog": interests.get("actionable_backlog"),
+    }
+    git_repos = _as_list(git_activity.get("watched_repos"))
+    git_artifacts = [
+        str(repo.get("path") or repo.get("repo_id") or "")
+        for repo in git_repos
+        if isinstance(repo, dict)
+    ]
+    git_blockers = [
+        json.dumps(item, sort_keys=True, ensure_ascii=True)
+        for item in [
+            *_as_list(git_activity.get("errors")),
+            *_as_list(git_activity.get("actionable_repos")),
+        ]
+    ]
+    git_digest_payload = {
+        "repos": [
+            {
+                "repo_id": repo.get("repo_id"),
+                "head": repo.get("head"),
+                "dirty_count": repo.get("dirty_count"),
+                "untracked_count": repo.get("untracked_count"),
+                "error": repo.get("error"),
+                "daily_commit_count": repo.get("daily_commit_count"),
+            }
+            for repo in git_repos
+            if isinstance(repo, dict)
+        ],
+        "latest_commits": [
+            {
+                "repo_id": commit.get("repo_id"),
+                "sha": commit.get("sha"),
+                "author_date": commit.get("author_date"),
+                "subject": commit.get("subject"),
+            }
+            for commit in _as_list(git_activity.get("latest_commits"))
+            if isinstance(commit, dict)
+        ],
+    }
+    git_snapshot_at = max(
+        (
+            str(commit.get("author_date") or "")
+            for commit in _as_list(git_activity.get("latest_commits"))
+            if isinstance(commit, dict) and commit.get("author_date")
+        ),
+        default="",
+    )
+    git_provenance = {
+        "schema": "xarta.personal.import_status.v1",
+        "source": "imports-dashboard",
+        "source_digest": _search_hash(git_digest_payload),
+        "snapshot_at": git_snapshot_at,
+        "watched_repo_count": len(git_repos),
+        "daily_commit_count": len(_as_list(git_activity.get("latest_commits"))),
+    }
+    rows = [
+        {
+            "import_batch_id": "status-interests-ingestion",
+            "source_type": "interests-ingestion",
+            "source_ref": str(interests.get("doc_path") or INTERESTS_DASHBOARD_REL),
+            "title": "Hermes Interests Ingestion Status",
+            "status": str(interests.get("status") or "unknown"),
+            "local_date": today,
+            "artifact_refs_json": json.dumps(interest_artifacts, ensure_ascii=True),
+            "blocker_refs_json": json.dumps(_as_list(interests.get("blockers")), ensure_ascii=True),
+            "provenance_json": json.dumps(interest_provenance, sort_keys=True, ensure_ascii=True),
+        },
+        {
+            "import_batch_id": "status-git-activity",
+            "source_type": "git",
+            "source_ref": "watched-git-repos",
+            "title": "Git Activity Import Status",
+            "status": str(git_activity.get("status") or "unknown"),
+            "local_date": today,
+            "artifact_refs_json": json.dumps(git_artifacts, ensure_ascii=True),
+            "blocker_refs_json": json.dumps(git_blockers, ensure_ascii=True),
+            "provenance_json": json.dumps(git_provenance, sort_keys=True, ensure_ascii=True),
+        },
+    ]
+
+    inserted = 0
+    updated = 0
+    unchanged = 0
+    content_cols = (
+        "source_type",
+        "source_ref",
+        "title",
+        "status",
+        "local_date",
+        "artifact_refs_json",
+        "blocker_refs_json",
+        "provenance_json",
+    )
+    for row in rows:
+        existing = conn.execute(
+            "SELECT * FROM personal_import_batches WHERE import_batch_id=?",
+            (row["import_batch_id"],),
+        ).fetchone()
+        if existing and all((existing[col] or "") == (row[col] or "") for col in content_cols):
+            unchanged += 1
+            continue
+        if existing:
+            conn.execute(
+                """
+                UPDATE personal_import_batches
+                SET source_type=:source_type,
+                    source_ref=:source_ref,
+                    title=:title,
+                    status=:status,
+                    local_date=:local_date,
+                    completed_at=:completed_at,
+                    privacy_level='normal',
+                    artifact_refs_json=:artifact_refs_json,
+                    blocker_refs_json=:blocker_refs_json,
+                    provenance_json=:provenance_json,
+                    updated_at=:updated_at
+                WHERE import_batch_id=:import_batch_id
+                """,
+                {
+                    **row,
+                    "completed_at": now if row["status"] == "ok" else None,
+                    "updated_at": now,
+                },
+            )
+            updated += 1
+            continue
+        conn.execute(
+            """
+            INSERT INTO personal_import_batches (
+                import_batch_id, source_type, source_ref, title, status, local_date,
+                started_at, completed_at, privacy_level, artifact_refs_json,
+                blocker_refs_json, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :import_batch_id, :source_type, :source_ref, :title, :status,
+                :local_date, :started_at, :completed_at, 'normal',
+                :artifact_refs_json, :blocker_refs_json, :provenance_json,
+                :created_at, :updated_at
+            )
+            """,
+            {
+                **row,
+                "started_at": now,
+                "completed_at": now if row["status"] == "ok" else None,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+        inserted += 1
+    return {"inserted": inserted, "updated": updated, "unchanged": unchanged}
+
+
+async def _sync_personal_search_vectors(
+    *,
+    force_embeddings: bool,
+    limit: int,
+    now: str,
+) -> dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 200), 1000))
+    if force_embeddings:
+        where = "search_text != ''"
+        params: tuple[Any, ...] = (safe_limit,)
+    else:
+        where = "search_text != '' AND vector_index_status != 'indexed'"
+        params = (safe_limit,)
+    with get_conn() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT * FROM personal_search_documents
+                WHERE {where}
+                ORDER BY updated_at DESC, document_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        ]
+    if not rows:
+        return {
+            "status": "ok",
+            "attempted": 0,
+            "indexed": 0,
+            "error": "",
+            "embedding_model": "",
+        }
+
+    try:
+        from .ai_client import _get_provider, embed
+        from .seekdb import short_seekdb_error, upsert_personal_index_async
+
+        provider = _get_provider(PERSONAL_SEARCH_PROJECT, "embedding")
+        embedding_model = str(provider.get("model_name") or PERSONAL_SEARCH_PROJECT)
+        vectors = await embed(PERSONAL_SEARCH_PROJECT, [row["search_text"] for row in rows])
+        if len(vectors) != len(rows) or any(
+            len(vector) != PERSONAL_SEARCH_VECTOR_DIM for vector in vectors
+        ):
+            raise RuntimeError("unexpected embedding dimensions")
+        updates = []
+        for row, vector in zip(rows, vectors, strict=True):
+            await upsert_personal_index_async(row, vector)
+            embedding_ref = _search_hash(
+                {
+                    "document_id": row["document_id"],
+                    "source_hash": row["source_hash"],
+                    "model": embedding_model,
+                    "dimensions": len(vector),
+                }
+            )
+            updates.append((embedding_ref, embedding_model, now, now, now, row["document_id"]))
+        with get_conn() as conn:
+            conn.executemany(
+                """
+                UPDATE personal_search_documents
+                SET embedding_ref=?,
+                    embedding_model=?,
+                    embedding_updated_at=?,
+                    vector_index_status='indexed',
+                    vector_index_updated_at=?,
+                    updated_at=?
+                WHERE document_id=?
+                """,
+                updates,
+            )
+        return {
+            "status": "ok",
+            "attempted": len(rows),
+            "indexed": len(updates),
+            "error": "",
+            "embedding_model": embedding_model,
+        }
+    except Exception as exc:
+        try:
+            err = short_seekdb_error(exc)  # type: ignore[name-defined]
+        except Exception:
+            err = str(exc).splitlines()[0][:180]
+        return {
+            "status": "error",
+            "attempted": len(rows),
+            "indexed": 0,
+            "error": err,
+            "embedding_model": "",
+        }
+
+
+async def _sync_personal_search_index(
+    *,
+    force_embeddings: bool = False,
+    include_embeddings: bool = True,
+    limit: int = 200,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        document_summary = _sync_personal_search_documents(conn, now)
+    vector_summary = {
+        "status": "skipped",
+        "attempted": 0,
+        "indexed": 0,
+        "error": "",
+        "embedding_model": "",
+    }
+    if include_embeddings:
+        vector_summary = await _sync_personal_search_vectors(
+            force_embeddings=force_embeddings,
+            limit=limit,
+            now=now,
+        )
+    return {
+        "ok": document_summary["document_count"] >= 0,
+        "schema": "xarta.personal.search.sync.v1",
+        "generated_at_utc": now,
+        "documents": document_summary,
+        "vector": vector_summary,
+    }
+
+
+def _fts_query(text: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_./:-]+", text.lower())[:12]
+    quoted = [f'"{token.replace(chr(34), chr(34) + chr(34))}"' for token in tokens if token]
+    return " OR ".join(quoted)
+
+
+def _personal_search_where(
+    *,
+    date_start: str | None,
+    date_end: str | None,
+    source_type: str | None,
+    status: str | None,
+    mode: str | None,
+    record_type: str | None,
+    tag: str | None,
+) -> tuple[list[str], list[Any]]:
+    where = ["d.privacy_level != 'pin'"]
+    params: list[Any] = []
+    if date_start:
+        where.append("d.local_date >= ?")
+        params.append(date_start)
+    if date_end:
+        where.append("d.local_date <= ?")
+        params.append(date_end)
+    if source_type:
+        where.append("d.source_type = ?")
+        params.append(source_type)
+    if status:
+        where.append("d.status = ?")
+        params.append(status)
+    if mode:
+        if mode not in {*PERSONAL_MODES.keys(), "calendar"}:
+            raise HTTPException(400, f"unknown mode: {mode}")
+        where.append("d.mode = ?")
+        params.append(mode)
+    if record_type:
+        where.append("d.record_type = ?")
+        params.append(record_type)
+    if tag:
+        where.append("EXISTS (SELECT 1 FROM json_each(d.tags_json) WHERE value = ?)")
+        params.append(tag)
+    return where, params
+
+
+def _personal_exact_candidates(
+    conn: Any,
+    q: str,
+    *,
+    where: list[str],
+    params: list[Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not q.strip():
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT d.*, 0 AS exact_rank
+                FROM personal_search_documents d
+                {clause}
+                ORDER BY COALESCE(d.local_date, d.updated_at) DESC, d.updated_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        ]
+    q_lower = q.lower().strip()
+    tokens = [token for token in re.findall(r"[a-z0-9_./:-]+", q_lower) if token][:8]
+    match_parts = [
+        "lower(d.document_id) = ?",
+        "lower(d.record_id) = ?",
+        "lower(d.source_ref) = ?",
+        "lower(d.title) LIKE ?",
+        "lower(d.search_text) LIKE ?",
+    ]
+    match_params: list[Any] = [q_lower, q_lower, q_lower, f"%{q_lower}%", f"%{q_lower}%"]
+    if tokens:
+        token_clause = " AND ".join("lower(d.search_text) LIKE ?" for _ in tokens)
+        match_parts.append(f"({token_clause})")
+        match_params.extend(f"%{token}%" for token in tokens)
+    exact_where = [*where, f"({' OR '.join(match_parts)})"]
+    exact_params = [*params, *match_params]
+    clause = f"WHERE {' AND '.join(exact_where)}"
+    rows = conn.execute(
+        f"""
+        SELECT d.*,
+               CASE
+                   WHEN lower(d.document_id) = ? OR lower(d.record_id) = ? THEN 0
+                   WHEN lower(d.title) LIKE ? THEN 1
+                   WHEN lower(d.source_ref) = ? THEN 2
+                   ELSE 3
+               END AS exact_rank
+        FROM personal_search_documents d
+        {clause}
+        ORDER BY exact_rank ASC, d.updated_at DESC, d.document_id
+        LIMIT ?
+        """,
+        (q_lower, q_lower, f"%{q_lower}%", q_lower, *exact_params, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _personal_fts_candidates(
+    conn: Any,
+    q: str,
+    *,
+    where: list[str],
+    params: list[Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    match = _fts_query(q)
+    if not match:
+        return []
+    clause = f"AND {' AND '.join(where)}" if where else ""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT d.*, bm25(personal_search_fts) AS bm25_score
+            FROM personal_search_fts
+            JOIN personal_search_documents d
+              ON d.document_id = personal_search_fts.document_id
+            WHERE personal_search_fts MATCH ?
+            {clause}
+            ORDER BY bm25_score ASC, d.updated_at DESC
+            LIMIT ?
+            """,
+            (match, *params, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(row) for row in rows]
+
+
+async def _personal_vector_candidates(
+    q: str, *, limit: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not q.strip():
+        return [], {"status": "skipped", "error": "", "candidate_count": 0}
+    try:
+        from .ai_client import embed
+        from .seekdb import short_seekdb_error, vector_search_personal_async
+
+        query_embedding = (await embed(PERSONAL_SEARCH_PROJECT, [q]))[0]
+        rows = await vector_search_personal_async(query_embedding, limit)
+        return rows, {"status": "ok", "error": "", "candidate_count": len(rows)}
+    except Exception as exc:
+        try:
+            err = short_seekdb_error(exc)  # type: ignore[name-defined]
+        except Exception:
+            err = str(exc).splitlines()[0][:180]
+        return [], {"status": "error", "error": err, "candidate_count": 0}
+
+
+def _row_to_search_result(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "document_id": row["document_id"],
+        "record_type": row["record_type"],
+        "record_table": row["record_table"],
+        "record_id": row["record_id"],
+        "title": row["title"],
+        "body_excerpt": _body_excerpt(row["body"] or row["search_text"], limit=360),
+        "local_date": row["local_date"],
+        "status": row["status"],
+        "mode": row["mode"],
+        "source": {
+            "type": row["source_type"],
+            "ref": row["source_ref"],
+            "hash": row["source_hash"],
+        },
+        "tags": _json_value(row["tags_json"], []),
+        "related_refs": _json_value(row["related_refs_json"], []),
+        "page_ref": _json_value(row["page_ref_json"], {}),
+        "source_refs": _json_value(row["source_refs_json"], []),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "search": {
+            "text": row["search_text"],
+            "score_metadata": _json_value(row["score_metadata_json"], {}),
+        },
+        "vector": {
+            "embedding_ref": row["embedding_ref"],
+            "embedding_model": row["embedding_model"],
+            "embedding_updated_at": row["embedding_updated_at"],
+            "index_key": row["vector_index_key"],
+            "index_status": row["vector_index_status"],
+            "index_updated_at": row["vector_index_updated_at"],
+        },
+        "updated_at": row["updated_at"],
+    }
+
+
+def _merge_personal_candidates(
+    *,
+    exact_rows: list[dict[str, Any]],
+    fts_rows: list[dict[str, Any]],
+    vector_rows: list[dict[str, Any]],
+    document_rows: dict[str, dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    rrf: dict[str, float] = {}
+    payload: dict[str, dict[str, Any]] = {}
+    k = 60
+
+    def accumulate(row: dict[str, Any], source: str, rank: int, component: dict[str, Any]) -> None:
+        doc_id = str(row.get("document_id") or row.get("id") or "")
+        if not doc_id:
+            return
+        source_row = document_rows.get(doc_id) or row
+        rrf[doc_id] = rrf.get(doc_id, 0.0) + (1.0 / (k + rank + 1))
+        if doc_id not in payload:
+            payload[doc_id] = _row_to_search_result(source_row)
+            payload[doc_id]["score"] = {
+                "rrf_score": 0.0,
+                "score_sources": [],
+                "components": {},
+            }
+        score = payload[doc_id]["score"]
+        if source not in score["score_sources"]:
+            score["score_sources"].append(source)
+        score["components"][source] = component
+
+    for rank, row in enumerate(exact_rows):
+        accumulate(row, "exact", rank, {"rank": rank + 1, "exact_rank": row.get("exact_rank")})
+    for rank, row in enumerate(fts_rows):
+        accumulate(row, "fts_bm25", rank, {"rank": rank + 1, "bm25": row.get("bm25_score")})
+    for rank, row in enumerate(vector_rows):
+        meta = row.get("metadata") or {}
+        doc_id = str(meta.get("document_id") or row.get("id") or "")
+        if doc_id not in document_rows:
+            continue
+        accumulate(
+            {"document_id": doc_id},
+            "vector",
+            rank,
+            {"rank": rank + 1, "cosine_distance": row.get("distance")},
+        )
+
+    for doc_id, result in payload.items():
+        result["score"]["rrf_score"] = rrf.get(doc_id, 0.0)
+    return sorted(
+        payload.values(),
+        key=lambda result: (
+            -float(result["score"]["rrf_score"]),
+            result.get("updated_at") or "",
+            result.get("document_id") or "",
+        ),
+        reverse=False,
+    )[:limit]
+
+
+async def _rerank_personal_results(
+    q: str,
+    results: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not q.strip() or len(results) < 2:
+        for index, result in enumerate(results, start=1):
+            result["score"]["reranker_rank"] = index
+        return results, {"status": "skipped", "error": "", "candidate_count": len(results)}
+    try:
+        from .ai_client import rerank
+        from .seekdb import short_seekdb_error
+
+        docs = [
+            " ".join(
+                part
+                for part in [
+                    result.get("title") or "",
+                    result.get("body_excerpt") or "",
+                    " ".join(result.get("tags") or []),
+                    " ".join(result.get("source_refs") or []),
+                ]
+                if part
+            )
+            for result in results
+        ]
+        ranked = await rerank(PERSONAL_SEARCH_PROJECT, q, docs, top_n=min(limit, len(docs)))
+        reranked: list[dict[str, Any]] = []
+        by_index = {idx: result for idx, result in enumerate(results)}
+        for pos, item in enumerate(ranked, start=1):
+            result = by_index.get(int(item.get("index", -1)))
+            if not result:
+                continue
+            result["score"]["reranker_rank"] = pos
+            result["score"]["reranker_score"] = item.get("relevance_score")
+            reranked.append(result)
+        seen = {result["document_id"] for result in reranked}
+        for result in results:
+            if result["document_id"] not in seen:
+                result["score"]["reranker_rank"] = len(reranked) + 1
+                reranked.append(result)
+        return reranked[:limit], {"status": "ok", "error": "", "candidate_count": len(results)}
+    except Exception as exc:
+        try:
+            err = short_seekdb_error(exc)  # type: ignore[name-defined]
+        except Exception:
+            err = str(exc).splitlines()[0][:180]
+        for index, result in enumerate(results, start=1):
+            result["score"]["reranker_rank"] = index
+        return results, {"status": "error", "error": err, "candidate_count": len(results)}
+
+
+@router.post("/search/sync")
+async def sync_personal_search(body: PersonalSearchSyncRequest) -> dict[str, Any]:
+    return await _sync_personal_search_index(
+        force_embeddings=body.force_embeddings,
+        include_embeddings=body.include_embeddings,
+        limit=body.limit,
+    )
+
+
+@router.get("/search")
+async def search_personal_activity(
+    q: str | None = "",
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_type: str | None = None,
+    status: str | None = None,
+    mode: str | None = None,
+    record_type: str | None = None,
+    tag: str | None = None,
+    include_vector: bool = True,
+    rerank_results: bool = True,
+    sync: bool = True,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> dict[str, Any]:
+    query = (q or "").strip()
+    sync_summary = None
+    if sync:
+        sync_summary = await _sync_personal_search_index(
+            include_embeddings=include_vector,
+            limit=max(limit * 4, 40),
+        )
+    where, params = _personal_search_where(
+        date_start=date_start,
+        date_end=date_end,
+        source_type=source_type,
+        status=status,
+        mode=mode,
+        record_type=record_type,
+        tag=tag,
+    )
+    window = max(limit * 4, 40)
+    with get_conn() as conn:
+        exact_rows = _personal_exact_candidates(
+            conn,
+            query,
+            where=where,
+            params=params,
+            limit=window,
+        )
+        fts_rows = _personal_fts_candidates(
+            conn,
+            query,
+            where=where,
+            params=params,
+            limit=window,
+        )
+        filtered_clause = f"WHERE {' AND '.join(where)}" if where else ""
+        all_doc_rows = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT d.* FROM personal_search_documents d {filtered_clause}",
+                params,
+            ).fetchall()
+        ]
+    document_rows = {row["document_id"]: row for row in all_doc_rows}
+    vector_rows: list[dict[str, Any]] = []
+    vector_status = {"status": "skipped", "error": "", "candidate_count": 0}
+    if include_vector:
+        vector_rows, vector_status = await _personal_vector_candidates(query, limit=window)
+    results = _merge_personal_candidates(
+        exact_rows=exact_rows,
+        fts_rows=fts_rows,
+        vector_rows=vector_rows,
+        document_rows=document_rows,
+        limit=window,
+    )
+    rerank_status = {"status": "skipped", "error": "", "candidate_count": len(results)}
+    if rerank_results:
+        results, rerank_status = await _rerank_personal_results(query, results, limit=limit)
+    else:
+        results = results[:limit]
+    return {
+        "schema": "xarta.personal.search.results.v1",
+        "query": query,
+        "count": len(results),
+        "results": results,
+        "filters": {
+            "date_start": date_start,
+            "date_end": date_end,
+            "source_type": source_type,
+            "status": status,
+            "mode": mode,
+            "record_type": record_type,
+            "tag": tag,
+        },
+        "subsystems": {
+            "exact": {"status": "ok", "candidate_count": len(exact_rows)},
+            "fts": {"status": "ok", "candidate_count": len(fts_rows), "rank": "bm25"},
+            "vector": vector_status,
+            "rerank": rerank_status,
+            "sync": sync_summary,
+        },
     }
 
 
@@ -6460,14 +7615,13 @@ def _git_repo_status(repo: dict[str, str]) -> dict[str, Any]:
     return base
 
 
-def _personal_source_counts() -> dict[str, Any]:
-    with get_conn() as conn:
-        event_rows = conn.execute(
-            "SELECT source_type, COUNT(*) AS count FROM personal_events GROUP BY source_type"
-        ).fetchall()
-        batch_rows = conn.execute(
-            "SELECT source_type, status, COUNT(*) AS count FROM personal_import_batches GROUP BY source_type, status"
-        ).fetchall()
+def _personal_source_counts_from_conn(conn: Any) -> dict[str, Any]:
+    event_rows = conn.execute(
+        "SELECT source_type, COUNT(*) AS count FROM personal_events GROUP BY source_type"
+    ).fetchall()
+    batch_rows = conn.execute(
+        "SELECT source_type, status, COUNT(*) AS count FROM personal_import_batches GROUP BY source_type, status"
+    ).fetchall()
     batch_counts: dict[str, dict[str, int]] = {}
     for row in batch_rows:
         batch_counts.setdefault(row["source_type"], {})[row["status"]] = row["count"]
@@ -6475,6 +7629,13 @@ def _personal_source_counts() -> dict[str, Any]:
         "events": {row["source_type"]: row["count"] for row in event_rows},
         "import_batches": batch_counts,
     }
+
+
+def _personal_source_counts() -> dict[str, Any]:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        _sync_personal_import_status_batches(conn, now)
+        return _personal_source_counts_from_conn(conn)
 
 
 def _git_activity_dashboard(counts: dict[str, Any]) -> dict[str, Any]:

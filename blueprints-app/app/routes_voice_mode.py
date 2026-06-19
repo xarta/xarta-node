@@ -258,11 +258,14 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "runtime_snapshot": "diagnostic_snapshot",
     "debug_snapshot": "diagnostic_snapshot",
 }
-_ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound"}
+_ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound", "personal_search"}
 _ACTIVE_BROWSER_DIAGNOSTIC_ALIASES = {
     "gpu": "gpu_activity_sound",
     "gpu_activity": "gpu_activity_sound",
     "gpu_sfx": "gpu_activity_sound",
+    "search": "personal_search",
+    "shared_search": "personal_search",
+    "personal_shared_search": "personal_search",
 }
 _ACTIVE_BROWSER_EVENT_KIND_ALIASES = {
     "": "click",

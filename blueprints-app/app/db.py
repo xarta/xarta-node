@@ -378,6 +378,56 @@ CREATE INDEX IF NOT EXISTS idx_personal_time_audit_target
 CREATE INDEX IF NOT EXISTS idx_personal_time_audit_actor
     ON personal_time_audit(actor, source_surface);
 
+CREATE TABLE IF NOT EXISTS personal_search_documents (
+    document_id             TEXT PRIMARY KEY,
+    record_type             TEXT NOT NULL DEFAULT '',
+    record_table            TEXT NOT NULL DEFAULT '',
+    record_id               TEXT NOT NULL DEFAULT '',
+    source_type             TEXT NOT NULL DEFAULT '',
+    source_ref              TEXT NOT NULL DEFAULT '',
+    source_hash             TEXT NOT NULL DEFAULT '',
+    title                   TEXT NOT NULL DEFAULT '',
+    body                    TEXT NOT NULL DEFAULT '',
+    search_text             TEXT NOT NULL DEFAULT '',
+    local_date              TEXT,
+    status                  TEXT NOT NULL DEFAULT '',
+    mode                    TEXT NOT NULL DEFAULT '',
+    privacy_level           TEXT NOT NULL DEFAULT 'normal',
+    tags_json               TEXT NOT NULL DEFAULT '[]',
+    related_refs_json       TEXT NOT NULL DEFAULT '[]',
+    page_ref_json           TEXT NOT NULL DEFAULT '{}',
+    source_refs_json        TEXT NOT NULL DEFAULT '[]',
+    provenance_json         TEXT NOT NULL DEFAULT '{}',
+    score_metadata_json     TEXT NOT NULL DEFAULT '{}',
+    embedding_ref           TEXT NOT NULL DEFAULT '',
+    embedding_model         TEXT NOT NULL DEFAULT '',
+    embedding_updated_at    TEXT,
+    vector_index_key        TEXT NOT NULL DEFAULT '',
+    vector_index_status     TEXT NOT NULL DEFAULT 'pending',
+    vector_index_updated_at TEXT,
+    created_at              TEXT DEFAULT (datetime('now')),
+    updated_at              TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_search_documents_filters
+    ON personal_search_documents(local_date, source_type, status, record_type);
+CREATE INDEX IF NOT EXISTS idx_personal_search_documents_mode
+    ON personal_search_documents(mode, status);
+CREATE INDEX IF NOT EXISTS idx_personal_search_documents_record
+    ON personal_search_documents(record_table, record_id);
+CREATE INDEX IF NOT EXISTS idx_personal_search_documents_vector
+    ON personal_search_documents(vector_index_key, vector_index_status);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS personal_search_fts USING fts5(
+    document_id UNINDEXED,
+    title,
+    body,
+    search_text,
+    tags,
+    source_type,
+    record_type,
+    tokenize='porter unicode61'
+);
+
 CREATE TABLE IF NOT EXISTS work_item_states (
     state_id        TEXT PRIMARY KEY,
     label           TEXT NOT NULL,
@@ -1697,6 +1747,48 @@ def _seed_manual_links_ai_assignment(conn: sqlite3.Connection) -> None:
     )
 
 
+def _seed_personal_search_ai_assignments(conn: sqlite3.Connection) -> None:
+    """Ensure Personal Time Activity search has DB-backed embedding/reranker routes."""
+    for role, model_name in (
+        ("embedding", "EMBEDDINGS-LOCAL"),
+        ("reranker", "RERANKER-LOCAL"),
+    ):
+        existing = conn.execute(
+            """
+            SELECT assignment_id
+            FROM ai_project_assignments
+            WHERE project_name='personal-time-activity'
+              AND role=?
+              AND enabled=1
+            LIMIT 1
+            """,
+            (role,),
+        ).fetchone()
+        if existing:
+            continue
+        provider = conn.execute(
+            """
+            SELECT provider_id
+            FROM ai_providers
+            WHERE model_name=?
+              AND model_type=?
+              AND enabled=1
+            LIMIT 1
+            """,
+            (model_name, role),
+        ).fetchone()
+        if not provider:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO ai_project_assignments
+                (assignment_id, project_name, provider_id, role, priority, enabled)
+            VALUES (?, 'personal-time-activity', ?, ?, 0, 1)
+            """,
+            (f"personal-time-activity-{role}-{model_name.lower()}", provider[0], role),
+        )
+
+
 def _manual_link_category_id(label: str) -> str:
     slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in label.strip())
     slug = "-".join(part for part in slug.split("-") if part)
@@ -1820,6 +1912,7 @@ def init_db() -> None:
         _seed_table_layout_catalog(conn)
         _seed_work_management_config(conn)
         _seed_manual_links_ai_assignment(conn)
+        _seed_personal_search_ai_assignments(conn)
         _seed_manual_link_categories_from_groups(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 
