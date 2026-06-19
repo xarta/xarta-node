@@ -252,6 +252,25 @@ def _make_conn() -> sqlite3.Connection:
             record_type,
             tokenize='porter unicode61'
         );
+        CREATE TABLE personal_graph_links (
+            link_id TEXT PRIMARY KEY,
+            source_ref TEXT NOT NULL,
+            source_table TEXT NOT NULL DEFAULT '',
+            source_id TEXT NOT NULL DEFAULT '',
+            target_ref TEXT NOT NULL,
+            target_table TEXT NOT NULL DEFAULT '',
+            target_id TEXT NOT NULL DEFAULT '',
+            link_type TEXT NOT NULL DEFAULT 'relates_to',
+            link_state TEXT NOT NULL DEFAULT 'declared',
+            risk_level TEXT NOT NULL DEFAULT 'normal',
+            title TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_by TEXT NOT NULL DEFAULT '',
+            request_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE work_item_states (
             state_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
@@ -1506,6 +1525,330 @@ def test_personal_search_vector_only_candidate_and_reranker(monkeypatch):
     assert result["results"][0]["score"]["score_sources"] == ["vector"]
     assert result["results"][0]["score"]["reranker_rank"] == 1
     assert result["results"][0]["score"]["components"]["vector"]["cosine_distance"] == 0.18
+
+
+def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status,
+            tags_json, related_work_items_json, related_tasks_json,
+            related_import_batches_json, file_refs_json, db_refs_json,
+            provenance_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-graph",
+            "git",
+            "abc123def456",
+            "sha256:event-graph",
+            "personal-log",
+            "Graph source moment",
+            "Graph source moment body",
+            "Graph source moment body",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["diary", "graph"]),
+            json.dumps(["work:work-graph"]),
+            json.dumps(["task:task-graph"]),
+            json.dumps(["import:batch-graph"]),
+            json.dumps(["browser_link:visit-graph"]),
+            json.dumps(["manual_links:manual-graph"]),
+            json.dumps(
+                {
+                    "source_pointers": {
+                        "conversation_key": "matrix-bridge:tb1:room=!test:chat.example",
+                        "matrix_event_ids": ["$matrix-graph"],
+                    }
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_time_tasks (
+            task_id, source_type, title, local_date, timezone, status,
+            related_work_items_json, event_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "task-graph",
+            "manual-task",
+            "Graph task",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            json.dumps(["work:work-graph"]),
+            "evt-graph",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_import_batches (
+            import_batch_id, source_type, source_ref, title, status, local_date,
+            artifact_refs_json, provenance_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "batch-graph",
+            "interests-ingestion",
+            "docs/interests/source.json",
+            "Graph import",
+            "pending_review",
+            "2026-06-18",
+            json.dumps(["docs/interests/artifact.json"]),
+            json.dumps(
+                {
+                    "proof_links": [
+                        {
+                            "label": "Import proof",
+                            "path": "docs/personal/time-activity-goal/import-proof.md",
+                        }
+                    ]
+                }
+            ),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_items (
+            item_id, title, state_id, status, promoted_from_ref,
+            related_event_ids_json, related_task_ids_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "work-graph",
+            "Graph work item",
+            "todo",
+            "open",
+            "personal_events:evt-graph",
+            json.dumps(["evt-graph"]),
+            json.dumps(["task-graph"]),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_items (item_id, title, state_id, status)
+        VALUES (?, ?, ?, ?)
+        """,
+        ("work-other", "Graph dependency", "todo", "open"),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_item_links (link_id, source_item_id, target_item_id, link_type)
+        VALUES (?, ?, ?, ?)
+        """,
+        ("wil-graph", "work-graph", "work-other", "depends_on"),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_issues (
+            issue_id, item_id, title, status, source_ref, related_task_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "issue-graph",
+            "work-graph",
+            "Graph issue",
+            "open",
+            "github:issue-123",
+            "task-graph",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_blockers (
+            blocker_id, item_id, title, status, blocked_by_ref
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "blocker-graph",
+            "work-graph",
+            "Graph blocker",
+            "open",
+            "personal_events:evt-graph",
+        ),
+    )
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="graph-sync-test",
+            )
+        )
+    )
+
+    assert sync["ok"] is True
+    assert sync["candidate_count"] >= 14
+    assert sync["links"]["inserted"] == sync["candidate_count"]
+
+    event_links = asyncio.run(
+        routes_personal.list_personal_graph_links(
+            source_ref="personal_events:evt-graph",
+            sync=False,
+            limit=80,
+        )
+    )
+    event_targets = {
+        (link["link_type"], link["target_ref"], link["link_state"]) for link in event_links["links"]
+    }
+    assert ("source_for", "git_commit:abc123def456", "accepted") in event_targets
+    assert ("source_for", "browser_links:visit-graph", "accepted") in event_targets
+    assert ("evidence_for", "manual_links:manual-graph", "accepted") in event_targets
+    assert ("relates_to", "work_items:work-graph", "accepted") in event_targets
+    assert ("relates_to", "personal_time_tasks:task-graph", "accepted") in event_targets
+    assert ("created_from", "personal_import_batches:batch-graph", "accepted") in event_targets
+    assert ("same_day_as", "diary_day:2026-06-18", "accepted") in event_targets
+    assert ("source_for", "matrix_event:$matrix-graph", "accepted") in event_targets
+    assert (
+        "source_for",
+        "matrix_minutes:matrix-bridge:tb1:room=!test:chat.example",
+        "accepted",
+    ) in event_targets
+    git_link = next(
+        link for link in event_links["links"] if link["target_ref"] == "git_commit:abc123def456"
+    )
+    assert git_link["provenance"]["source_hash"] == "sha256:event-graph"
+    assert git_link["provenance"]["provenance_state"] == "linked"
+
+    work_links = asyncio.run(
+        routes_personal.list_personal_graph_links(
+            source_ref="work_items:work-graph",
+            sync=False,
+            limit=80,
+        )
+    )
+    work_targets = {
+        (link["link_type"], link["target_ref"], link["link_state"]) for link in work_links["links"]
+    }
+    assert ("evidence_for", "personal_events:evt-graph", "accepted") in work_targets
+    assert ("evidence_for", "personal_time_tasks:task-graph", "accepted") in work_targets
+    assert ("promoted_from", "personal_events:evt-graph", "accepted") in work_targets
+    assert ("depends_on", "work_items:work-other", "accepted") in work_targets
+
+    import_links = asyncio.run(
+        routes_personal.list_personal_graph_links(
+            source_ref="personal_import_batches:batch-graph",
+            sync=False,
+            limit=80,
+        )
+    )
+    import_targets = {(link["link_type"], link["target_ref"]) for link in import_links["links"]}
+    assert ("evidence_for", "files:docs/interests/artifact.json") in import_targets
+    assert (
+        "documents",
+        "docs:docs/personal/time-activity-goal/import-proof.md",
+    ) in import_targets
+
+    second_sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="graph-sync-test",
+            )
+        )
+    )
+    assert second_sync["links"]["unchanged"] == sync["candidate_count"]
+
+
+def test_personal_graph_sync_default_request_id_is_stable(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-default-sync",
+            "git",
+            "feedface1234",
+            "sha256:default-sync",
+            "personal-log",
+            "Default graph sync",
+            "Default graph sync body",
+            "Default graph sync body",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+        ),
+    )
+
+    first_sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(actor="codex-test")
+        )
+    )
+    second_sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(actor="codex-test")
+        )
+    )
+
+    assert first_sync["ok"] is True
+    assert first_sync["candidate_count"] >= 2
+    assert first_sync["links"]["inserted"] == first_sync["candidate_count"]
+    assert second_sync["links"]["unchanged"] == first_sync["candidate_count"]
+    assert second_sync["links"]["updated"] == 0
+
+    listed = asyncio.run(
+        routes_personal.list_personal_graph_links(
+            source_ref="personal_events:evt-default-sync",
+            sync=False,
+            limit=20,
+        )
+    )
+    assert {link["request_id"] for link in listed["links"]} == {"personal-graph-sync"}
+
+
+def test_personal_graph_declared_link_keeps_inferred_under_review(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    created = asyncio.run(
+        routes_personal.create_personal_graph_link(
+            routes_personal.PersonalGraphLinkCreateRequest(
+                source_ref="personal_events:evt-declared",
+                target_ref="docs:docs/personal/proof.md",
+                link_type="documents",
+                link_state="inferred",
+                risk_level="review",
+                title="Declared proof link",
+                metadata={"origin": "pytest"},
+                provenance={"evidence": "explicit operator action"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="graph-create-test",
+            )
+        )
+    )
+
+    assert created["result"] == "inserted"
+    assert created["link"]["link_state"] == "needs_review"
+    assert created["link"]["risk_level"] == "review"
+    assert created["link"]["provenance"]["declared_by"] == "codex-test"
+    assert "inferred input" in created["link"]["provenance"]["guard"]
+    assert conn.execute("SELECT COUNT(*) AS count FROM sync_queue").fetchone()["count"] == 1
 
 
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
