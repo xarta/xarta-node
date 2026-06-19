@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import os
 import sqlite3
@@ -488,6 +489,15 @@ def _disable_import_status_sync(monkeypatch) -> None:
     )
 
 
+def _load_personal_automation_module():
+    script = APP_ROOT / "scripts" / "personal_activity_automation.py"
+    spec = importlib.util.spec_from_file_location("personal_activity_automation", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_personal_events_filters_and_shape(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -624,6 +634,97 @@ def test_personal_rehydrate_reads_file_ref(monkeypatch, tmp_path):
     assert result["rehydrated"] is True
     assert result["event"]["projection_state"] == "hot"
     assert "Rehydrated body" in result["event"]["content_projection"]
+
+
+def test_projection_maintenance_trims_hot_cache_and_rehydrates(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+    source = tmp_path / "2026" / "06" / "18" / "10-20-personal-log.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("Restored projection body\n", encoding="utf-8")
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, body_excerpt, content_projection,
+            local_date, timezone, file_refs_json, db_refs_json, projection_state,
+            provenance_json, last_rendered_at, projection_expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-hot-cache",
+            "diary-file",
+            "entry",
+            "Hot cache entry",
+            "Body excerpt survives trim",
+            "Bulky cached projection",
+            "2026-06-18",
+            "Europe/London",
+            json.dumps(["2026/06/18/10-20-personal-log.md"]),
+            json.dumps(["personal_events:evt-hot-cache"]),
+            "hot",
+            json.dumps({"projection_file": "2026/06/18/10-20-personal-log.md"}),
+            "2026-05-01T10:00:00Z",
+            "2026-05-15T10:00:00Z",
+        ),
+    )
+
+    dry_run = asyncio.run(
+        routes_personal.maintain_personal_projections(
+            routes_personal.PersonalProjectionMaintenanceRequest(
+                retention_days=7,
+                dry_run=True,
+                now="2026-06-18T12:00:00Z",
+            )
+        )
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["candidate_count"] == 1
+    assert dry_run["trimmed_count"] == 0
+    before = conn.execute(
+        "SELECT content_projection, projection_state FROM personal_events WHERE event_id='evt-hot-cache'"
+    ).fetchone()
+    assert before["content_projection"] == "Bulky cached projection"
+    assert before["projection_state"] == "hot"
+
+    applied = asyncio.run(
+        routes_personal.maintain_personal_projections(
+            routes_personal.PersonalProjectionMaintenanceRequest(
+                retention_days=7,
+                dry_run=False,
+                now="2026-06-18T12:00:00Z",
+            )
+        )
+    )
+
+    assert applied["trimmed_count"] == 1
+    trimmed = conn.execute(
+        """
+        SELECT content_projection, body_excerpt, file_refs_json, projection_state, provenance_json
+        FROM personal_events
+        WHERE event_id='evt-hot-cache'
+        """
+    ).fetchone()
+    assert trimmed["content_projection"] == ""
+    assert trimmed["body_excerpt"] == "Body excerpt survives trim"
+    assert json.loads(trimmed["file_refs_json"]) == ["2026/06/18/10-20-personal-log.md"]
+    assert trimmed["projection_state"] == "needs_rehydrate"
+    assert json.loads(trimmed["provenance_json"])["hot_cache_maintenance"][
+        "preserved_file_refs"
+    ] == ["2026/06/18/10-20-personal-log.md"]
+
+    rehydrated = asyncio.run(
+        routes_personal.rehydrate_personal_projection(
+            routes_personal.PersonalRehydrateRequest(event_id="evt-hot-cache")
+        )
+    )
+
+    assert rehydrated["ok"] is True
+    assert rehydrated["rehydrated"] is True
+    assert rehydrated["event"]["projection_state"] == "hot"
+    assert "Restored projection body" in rehydrated["event"]["content_projection"]
 
 
 def test_imports_dashboard_parses_interests_and_git(monkeypatch, tmp_path):
@@ -2636,3 +2737,100 @@ def test_browser_links_projection_records_source_unavailable_status(monkeypatch,
         "SELECT * FROM personal_sources WHERE source_id='browser-links'"
     ).fetchone()
     assert source["status"] == "source_unavailable"
+
+
+def test_personal_automation_signatures_and_skip_gate(monkeypatch, tmp_path):
+    automation = _load_personal_automation_module()
+    db_path = tmp_path / "blueprints.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE bookmarks (
+                bookmark_id TEXT PRIMARY KEY,
+                created_at TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE visits (
+                visit_id TEXT PRIMARY KEY,
+                visited_at TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE visit_events (
+                event_id TEXT PRIMARY KEY,
+                visited_at TEXT
+            );
+            CREATE TABLE personal_events (
+                event_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE personal_time_tasks (
+                task_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE work_items (
+                item_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE work_issues (
+                issue_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE work_todos (
+                todo_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE work_blockers (
+                blocker_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            CREATE TABLE work_discussions (
+                discussion_id TEXT PRIMARY KEY,
+                updated_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO visit_events (event_id, visited_at) VALUES (?, ?)",
+            ("ve-1", "2026-06-18T10:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO bookmarks (bookmark_id, created_at, updated_at) VALUES (?, ?, ?)",
+            ("bm-1", "2026-06-18T11:00:00Z", "2026-06-18T11:00:00Z"),
+        )
+
+    monkeypatch.setenv("BLUEPRINTS_DB_PATH", str(db_path))
+    signature_one = automation.source_signature(local_date="2026-06-18", kind="browser-links")
+    signature_two = automation.source_signature(local_date="2026-06-18", kind="browser-links")
+    assert signature_one == signature_two
+
+    state = {"schema": automation.STATE_SCHEMA, "jobs": {}}
+    automation.record_state(
+        state,
+        name="browser-links-rollup",
+        local_date="2026-06-18",
+        signature=signature_one,
+        status="ok",
+        summary={"status": "ok"},
+    )
+    assert automation.should_skip(
+        state,
+        name="browser-links-rollup",
+        local_date="2026-06-18",
+        signature=signature_one,
+        force=False,
+    )
+    assert not automation.should_skip(
+        state,
+        name="browser-links-rollup",
+        local_date="2026-06-18",
+        signature=signature_one,
+        force=True,
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO visit_events (event_id, visited_at) VALUES (?, ?)",
+            ("ve-2", "2026-06-18T12:00:00Z"),
+        )
+    signature_three = automation.source_signature(local_date="2026-06-18", kind="browser-links")
+    assert signature_three != signature_one

@@ -86,6 +86,13 @@ class PersonalRehydrateRequest(BaseModel):
     force: bool = False
 
 
+class PersonalProjectionMaintenanceRequest(BaseModel):
+    retention_days: int = 60
+    limit: int = 250
+    dry_run: bool = True
+    now: str | None = None
+
+
 class DiaryEntryCreateRequest(BaseModel):
     body: str
     local_date: str | None = None
@@ -8563,6 +8570,164 @@ def _first_file_ref(row: Any) -> Path:
             if isinstance(ref, dict) and ref.get("path"):
                 return _resolve_file_ref(str(ref["path"]))
     raise ValueError("event has no file ref")
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    with suppress(ValueError):
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    with suppress(ValueError):
+        parsed = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        return parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _projection_maintenance_candidates(
+    conn: Any,
+    *,
+    now: datetime,
+    retention_days: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    cutoff = now - timedelta(days=retention_days)
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM personal_events
+        WHERE projection_state='hot'
+          AND COALESCE(content_projection, '') != ''
+          AND COALESCE(file_refs_json, '[]') != '[]'
+        ORDER BY COALESCE(projection_expires_at, last_rendered_at, updated_at, created_at) ASC,
+                 event_id ASC
+        LIMIT ?
+        """,
+        (max(limit * 4, limit),),
+    ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        file_refs = _json_value(row["file_refs_json"], [])
+        if not isinstance(file_refs, list) or not file_refs:
+            continue
+        expires_at = _parse_utc_datetime(row["projection_expires_at"])
+        last_rendered_at = _parse_utc_datetime(row["last_rendered_at"])
+        updated_at = _parse_utc_datetime(row["updated_at"])
+        created_at = _parse_utc_datetime(row["created_at"])
+        reason = ""
+        stale_at: datetime | None = None
+        if expires_at and expires_at <= now:
+            reason = "projection_expired"
+            stale_at = expires_at
+        else:
+            rendered_or_updated = last_rendered_at or updated_at or created_at
+            if rendered_or_updated and rendered_or_updated <= cutoff:
+                reason = "retention_elapsed"
+                stale_at = rendered_or_updated
+        if not reason:
+            continue
+        content = row["content_projection"] or ""
+        candidates.append(
+            {
+                "event_id": row["event_id"],
+                "source_type": row["source_type"],
+                "kind": row["kind"],
+                "title": row["title"],
+                "local_date": row["local_date"],
+                "reason": reason,
+                "stale_at": stale_at.isoformat().replace("+00:00", "Z") if stale_at else "",
+                "projection_bytes": len(content.encode("utf-8")),
+                "file_refs": file_refs,
+                "db_refs": _json_value(row["db_refs_json"], []),
+                "row": row,
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+@router.post("/projections/maintenance")
+async def maintain_personal_projections(
+    body: PersonalProjectionMaintenanceRequest,
+) -> dict[str, Any]:
+    if body.retention_days < 0:
+        raise HTTPException(400, "retention_days must be non-negative")
+    if body.limit < 1 or body.limit > 1000:
+        raise HTTPException(400, "limit must be between 1 and 1000")
+    now_dt = _parse_utc_datetime(body.now) if body.now else None
+    if body.now and now_dt is None:
+        raise HTTPException(400, "now is invalid")
+    now_dt = now_dt or datetime.now(timezone.utc).replace(microsecond=0)
+    now_text = now_dt.isoformat().replace("+00:00", "Z")
+    with get_conn() as conn:
+        candidates = _projection_maintenance_candidates(
+            conn,
+            now=now_dt,
+            retention_days=body.retention_days,
+            limit=body.limit,
+        )
+        trimmed_rows = []
+        if candidates and not body.dry_run:
+            gen = increment_gen(conn, "personal-projection-maintenance")
+            for item in candidates:
+                row = item["row"]
+                provenance = _json_value(row["provenance_json"], {})
+                if not isinstance(provenance, dict):
+                    provenance = {}
+                provenance["hot_cache_maintenance"] = {
+                    "schema": "xarta.personal.hot_cache_maintenance.v1",
+                    "trimmed_at_utc": now_text,
+                    "reason": item["reason"],
+                    "retention_days": body.retention_days,
+                    "preserved_file_refs": item["file_refs"],
+                }
+                conn.execute(
+                    """
+                    UPDATE personal_events
+                    SET content_projection='',
+                        projection_state='needs_rehydrate',
+                        projection_expires_at=NULL,
+                        provenance_json=?,
+                        updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                        now_text,
+                        item["event_id"],
+                    ),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM personal_events WHERE event_id=?",
+                    (item["event_id"],),
+                ).fetchone()
+                if updated:
+                    trimmed_rows.append(updated)
+                    enqueue_for_all_peers(
+                        conn,
+                        "UPDATE",
+                        "personal_events",
+                        item["event_id"],
+                        dict(updated),
+                        gen,
+                    )
+        public_candidates = [
+            {key: value for key, value in item.items() if key != "row"} for item in candidates
+        ]
+    return {
+        "ok": True,
+        "schema": "xarta.personal.projection_maintenance.v1",
+        "generated_at_utc": now_text,
+        "dry_run": body.dry_run,
+        "retention_days": body.retention_days,
+        "candidate_count": len(public_candidates),
+        "trimmed_count": len(trimmed_rows),
+        "candidates": public_candidates,
+    }
 
 
 @router.post("/projections/rehydrate")
