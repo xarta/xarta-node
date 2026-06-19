@@ -403,6 +403,7 @@ class BrowserViewBody(BaseModel):
     automation: dict[str, Any] | None = None
     docs: dict[str, Any] | None = None
     body_shade: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
     tts: dict[str, Any] | None = None
     diagnostics: dict[str, Any] | None = None
     client_now_ms: float | None = None
@@ -1632,6 +1633,86 @@ def _clean_browser_viewport(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_layout_rect(raw: Any) -> dict[str, float] | None:
+    rect = raw if isinstance(raw, dict) else {}
+    if not rect:
+        return None
+    return {
+        "left": _clean_viewport_number(rect.get("left"), maximum=100000.0, decimals=2),
+        "top": _clean_viewport_number(rect.get("top"), maximum=100000.0, decimals=2),
+        "right": _clean_viewport_number(rect.get("right"), maximum=100000.0, decimals=2),
+        "bottom": _clean_viewport_number(rect.get("bottom"), maximum=100000.0, decimals=2),
+        "width": _clean_viewport_number(rect.get("width"), maximum=100000.0, decimals=2),
+        "height": _clean_viewport_number(rect.get("height"), maximum=100000.0, decimals=2),
+    }
+
+
+def _clean_active_browser_layout_delta(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(max(-100000.0, min(number, 100000.0)), 2)
+
+
+def _clean_active_browser_layout_report(raw: Any) -> dict[str, Any]:
+    layout = raw if isinstance(raw, dict) else {}
+    root = layout.get("root") if isinstance(layout.get("root"), dict) else {}
+    rects = layout.get("rects") if isinstance(layout.get("rects"), dict) else {}
+    shell = layout.get("shell") if isinstance(layout.get("shell"), dict) else {}
+    alignment = layout.get("alignment") if isinstance(layout.get("alignment"), dict) else {}
+    return {
+        "active_panel_id": _clean_string(layout.get("active_panel_id"), "", 120),
+        "root": {
+            "scroll_element": _clean_string(root.get("scroll_element"), "", 40),
+            "html_overflow_y": _clean_string(root.get("html_overflow_y"), "", 40),
+            "body_overflow_y": _clean_string(root.get("body_overflow_y"), "", 40),
+            "html_has_managed_scroll_tab": bool(root.get("html_has_managed_scroll_tab")),
+            "body_has_managed_scroll_tab": bool(root.get("body_has_managed_scroll_tab")),
+            "window_scroll_y": _clean_viewport_number(
+                root.get("window_scroll_y"),
+                maximum=100000.0,
+                decimals=2,
+            ),
+            "scroll_height": _clean_viewport_int(root.get("scroll_height"), maximum=100000),
+            "client_height": _clean_viewport_int(root.get("client_height"), maximum=100000),
+            "body_scroll_height": _clean_viewport_int(
+                root.get("body_scroll_height"),
+                maximum=100000,
+            ),
+            "html_scroll_height": _clean_viewport_int(
+                root.get("html_scroll_height"),
+                maximum=100000,
+            ),
+        },
+        "rects": {
+            "main": _clean_active_browser_layout_rect(rects.get("main")),
+            "menu_nav": _clean_active_browser_layout_rect(rects.get("menu_nav")),
+            "panel": _clean_active_browser_layout_rect(rects.get("panel")),
+            "handle": _clean_active_browser_layout_rect(rects.get("handle")),
+            "shell": _clean_active_browser_layout_rect(rects.get("shell")),
+        },
+        "shell": {
+            "overflow_y": _clean_string(shell.get("overflow_y"), "", 40),
+            "client_height": _clean_viewport_int(shell.get("client_height"), maximum=100000),
+            "scroll_height": _clean_viewport_int(shell.get("scroll_height"), maximum=100000),
+            "scrollbar_active": bool(shell.get("scrollbar_active")),
+        }
+        if shell
+        else None,
+        "alignment": {
+            "panel_left_delta_from_menu": _clean_active_browser_layout_delta(
+                alignment.get("panel_left_delta_from_menu")
+            ),
+            "panel_right_delta_from_menu": _clean_active_browser_layout_delta(
+                alignment.get("panel_right_delta_from_menu")
+            ),
+        },
+    }
+
+
 def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
     width = int(viewport.get("innerWidth") or 0)
     height = int(viewport.get("innerHeight") or 0)
@@ -2084,6 +2165,9 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     body_shade = _bounded_json(body.body_shade if isinstance(body.body_shade, dict) else {}, 1000)
     if not isinstance(body_shade, dict):
         body_shade = {}
+    layout = _bounded_json(body.layout if isinstance(body.layout, dict) else {}, 6000)
+    if not isinstance(layout, dict):
+        layout = {}
     viewport = _clean_browser_viewport(body.viewport)
     viewport_classification = _classify_browser_viewport(viewport)
     voice = _clean_browser_voice_state(body.voice)
@@ -2166,6 +2250,7 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
             "active_panel_id": _clean_string(body_shade.get("active_panel_id"), "", 120),
             "handle_present": bool(body_shade.get("handle_present")),
         },
+        "layout": _clean_active_browser_layout_report(layout),
         "tts": tts,
         "client_now_ms": float(body.client_now_ms or 0.0),
         "reported_at": now,

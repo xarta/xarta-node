@@ -503,6 +503,78 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             "active_panel_id": "tab-docs",
             "handle_present": True,
         },
+        layout={
+            "active_panel_id": "tab-diary",
+            "root": {
+                "scroll_element": "HTML",
+                "html_overflow_y": "hidden",
+                "body_overflow_y": "hidden",
+                "html_has_managed_scroll_tab": True,
+                "body_has_managed_scroll_tab": True,
+                "window_scroll_y": 0,
+                "scroll_height": 640,
+                "client_height": 640,
+                "body_scroll_height": 640,
+                "html_scroll_height": 640,
+                "ignored": "raw",
+            },
+            "rects": {
+                "main": {
+                    "left": 0,
+                    "top": 0,
+                    "right": 1024,
+                    "bottom": 640,
+                    "width": 1024,
+                    "height": 640,
+                },
+                "menu_nav": {
+                    "left": 16,
+                    "top": 77,
+                    "right": 1008,
+                    "bottom": 121,
+                    "width": 992,
+                    "height": 44,
+                },
+                "panel": {
+                    "left": 16,
+                    "top": 137,
+                    "right": 1008,
+                    "bottom": 640,
+                    "width": 992,
+                    "height": 503,
+                },
+                "handle": {
+                    "left": 0,
+                    "top": 566.25,
+                    "right": 1024,
+                    "bottom": 586.25,
+                    "width": 1024,
+                    "height": 20,
+                },
+                "shell": {
+                    "left": 16,
+                    "top": 586.25,
+                    "right": 1008,
+                    "bottom": 640,
+                    "width": 992,
+                    "height": 53.75,
+                },
+                "ignored": {"left": 1},
+            },
+            "shell": {
+                "overflow_y": "auto",
+                "client_height": 54,
+                "scroll_height": 480,
+                "scrollbar_active": True,
+                "ignored": "raw",
+            },
+            "alignment": {
+                "panel_left_delta_from_menu": 0,
+                "panel_right_delta_from_menu": 0,
+                "ignored": 99,
+            },
+            "ignored": {"raw": True},
+        },
         tts={
             "client_available": True,
             "client": {
@@ -757,6 +829,31 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "state": "up",
         "active_panel_id": "tab-docs",
         "handle_present": True,
+    }
+    assert view["layout"]["active_panel_id"] == "tab-diary"
+    assert view["layout"]["root"] == {
+        "scroll_element": "HTML",
+        "html_overflow_y": "hidden",
+        "body_overflow_y": "hidden",
+        "html_has_managed_scroll_tab": True,
+        "body_has_managed_scroll_tab": True,
+        "window_scroll_y": 0.0,
+        "scroll_height": 640,
+        "client_height": 640,
+        "body_scroll_height": 640,
+        "html_scroll_height": 640,
+    }
+    assert view["layout"]["rects"]["menu_nav"]["left"] == 16.0
+    assert view["layout"]["rects"]["panel"]["right"] == 1008.0
+    assert view["layout"]["shell"] == {
+        "overflow_y": "auto",
+        "client_height": 54,
+        "scroll_height": 480,
+        "scrollbar_active": True,
+    }
+    assert view["layout"]["alignment"] == {
+        "panel_left_delta_from_menu": 0.0,
+        "panel_right_delta_from_menu": 0.0,
     }
     assert view["tts"]["client_available"] is True
     assert view["tts"]["client"]["status"] == "playing"
