@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,8 @@ _LOCAL_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-local-dockge-ca
 _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION = "20260510-purpose-context-speech-v2"
 _LOCAL_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _LOCAL_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
+_LOCAL_DOCKGE_METRICS_MIN_INTERVAL = 0.9
+_LOCAL_DOCKGE_METRICS_PS_TTL = 10.0
 _LOCAL_DOCKGE_SOURCE_SUFFIXES = {
     ".caddyfile",
     ".conf",
@@ -64,6 +68,9 @@ _LOCAL_DOCKGE_SOURCE_SUFFIXES = {
     ".yml",
 }
 _COMPOSE_ENV_PATTERN = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<op>[^}]*)?\}")
+_LOCAL_DOCKGE_METRICS_LOCK = threading.Lock()
+_LOCAL_DOCKGE_METRICS_CACHE: dict[str, Any] = {"monotonic": 0.0, "payload": None}
+_LOCAL_DOCKGE_METRICS_PS_CACHE: dict[str, Any] = {"monotonic": 0.0, "rows": []}
 
 
 class LocalDockgeAction(BaseModel):
@@ -104,7 +111,9 @@ def _safe_stack_dir(stack_name: str) -> tuple[Path, Path]:
     return stack_dir, compose
 
 
-def _run_compose(stack_dir: Path, compose: Path, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def _run_compose(
+    stack_dir: Path, compose: Path, args: list[str], timeout: int = 30
+) -> subprocess.CompletedProcess[str]:
     cmd = ["docker", "compose", "-f", str(compose), "--project-directory", str(stack_dir)] + args
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -148,16 +157,20 @@ def _ports_from_publishers(item: dict) -> list[dict]:
     for publisher in item.get("Publishers") or item.get("publishers") or []:
         if not isinstance(publisher, dict):
             continue
-        published = _normalize_port(publisher.get("PublishedPort") or publisher.get("published_port"))
+        published = _normalize_port(
+            publisher.get("PublishedPort") or publisher.get("published_port")
+        )
         target = _normalize_port(publisher.get("TargetPort") or publisher.get("target_port"))
         if not published and not target:
             continue
-        ports.append({
-            "host_ip": str(publisher.get("URL") or publisher.get("url") or ""),
-            "published": published,
-            "target": target,
-            "protocol": str(publisher.get("Protocol") or publisher.get("protocol") or "tcp"),
-        })
+        ports.append(
+            {
+                "host_ip": str(publisher.get("URL") or publisher.get("url") or ""),
+                "published": published,
+                "target": target,
+                "protocol": str(publisher.get("Protocol") or publisher.get("protocol") or "tcp"),
+            }
+        )
     return ports
 
 
@@ -168,12 +181,14 @@ def _ports_from_string(value: str) -> list[dict]:
         r"(?P<published>\d+)->(?P<target>\d+)/(?P<protocol>\w+)"
     )
     for match in pattern.finditer(value or ""):
-        ports.append({
-            "host_ip": match.group("host_ip") or "",
-            "published": _normalize_port(match.group("published")),
-            "target": _normalize_port(match.group("target")),
-            "protocol": match.group("protocol") or "tcp",
-        })
+        ports.append(
+            {
+                "host_ip": match.group("host_ip") or "",
+                "published": _normalize_port(match.group("published")),
+                "target": _normalize_port(match.group("target")),
+                "protocol": match.group("protocol") or "tcp",
+            }
+        )
     return ports
 
 
@@ -185,12 +200,14 @@ def _ports_from_compose_service(service_config: dict) -> list[dict]:
             target = _normalize_port(item.get("target"))
             if not published and not target:
                 continue
-            ports.append({
-                "host_ip": str(item.get("host_ip") or ""),
-                "published": published,
-                "target": target,
-                "protocol": str(item.get("protocol") or "tcp"),
-            })
+            ports.append(
+                {
+                    "host_ip": str(item.get("host_ip") or ""),
+                    "published": published,
+                    "target": target,
+                    "protocol": str(item.get("protocol") or "tcp"),
+                }
+            )
             continue
         if isinstance(item, str):
             ports.extend(_ports_from_string(item))
@@ -223,7 +240,9 @@ def _parse_caddy_routes() -> list[dict]:
 
     site_re = re.compile(r"^(https?://[^\s{]+(?:\s+https?://[^\s{]+)*)\s*\{")
     handle_re = re.compile(r"^handle(?:_path)?\s+([^\s{]+)")
-    proxy_re = re.compile(r"reverse_proxy\s+(?:https?://)?(?:localhost|127\.0\.0\.1|\[::1\]):(?P<port>\d+)")
+    proxy_re = re.compile(
+        r"reverse_proxy\s+(?:https?://)?(?:localhost|127\.0\.0\.1|\[::1\]):(?P<port>\d+)"
+    )
 
     for raw_line in caddyfile.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.split("#", 1)[0].strip()
@@ -244,15 +263,17 @@ def _parse_caddy_routes() -> list[dict]:
             port = _normalize_port(proxy_match.group("port"))
             if port:
                 for host in current_hosts:
-                    routes.append({
-                        "host": urlparse(host).netloc or host,
-                        "site": host,
-                        "path": current_path,
-                        "url": _route_url(host, current_path),
-                        "upstream": f"localhost:{port}",
-                        "upstream_port": port,
-                        "source": "caddy",
-                    })
+                    routes.append(
+                        {
+                            "host": urlparse(host).netloc or host,
+                            "site": host,
+                            "path": current_path,
+                            "url": _route_url(host, current_path),
+                            "upstream": f"localhost:{port}",
+                            "upstream_port": port,
+                            "source": "caddy",
+                        }
+                    )
 
         opens = line.count("{")
         closes = line.count("}")
@@ -346,7 +367,9 @@ def _base_exposures(
     compose_services: dict,
     caddy_routes: list[dict],
 ) -> dict[str, dict]:
-    by_service = {container.get("service"): container for container in containers if container.get("service")}
+    by_service = {
+        container.get("service"): container for container in containers if container.get("service")
+    }
     exposures: dict[str, dict] = {}
     for service in services:
         container = by_service.get(service)
@@ -374,7 +397,9 @@ def _base_exposures(
     return exposures
 
 
-def _apply_manifest_exposures(exposures: dict[str, dict], manifest: dict) -> tuple[dict[str, dict], str | None]:
+def _apply_manifest_exposures(
+    exposures: dict[str, dict], manifest: dict
+) -> tuple[dict[str, dict], str | None]:
     if not manifest:
         return exposures, None
     manifest_error = manifest.get("_error")
@@ -382,25 +407,30 @@ def _apply_manifest_exposures(exposures: dict[str, dict], manifest: dict) -> tup
     for service, raw in services.items():
         if not isinstance(raw, dict):
             continue
-        base = exposures.setdefault(str(service), {
-            "service": str(service),
-            "label": str(service),
-            "kind": "internal",
-            "source": "manifest",
-            "url": None,
-            "open_url": None,
-            "ports": [],
-            "description": "",
-            "notes": "",
-            "tests_todo": "Service-specific tests can be added in xarta-service-exposure.yaml.",
-        })
+        base = exposures.setdefault(
+            str(service),
+            {
+                "service": str(service),
+                "label": str(service),
+                "kind": "internal",
+                "source": "manifest",
+                "url": None,
+                "open_url": None,
+                "ports": [],
+                "description": "",
+                "notes": "",
+                "tests_todo": "Service-specific tests can be added in xarta-service-exposure.yaml.",
+            },
+        )
         base_url = raw.get("url") or base.get("url") or ""
         for key in ("label", "kind", "description", "notes", "tests_todo"):
             if raw.get(key) is not None:
                 base[key] = raw.get(key)
         if raw.get("url") is not None:
             base["url"] = raw.get("url")
-        base["open_url"] = raw.get("open_url") or (base.get("url") if base.get("kind") in {"caddy-web", "caddy-api"} else None)
+        base["open_url"] = raw.get("open_url") or (
+            base.get("url") if base.get("kind") in {"caddy-web", "caddy-api"} else None
+        )
         base["docs_url"] = _url_with_path(base_url, raw.get("docs") or raw.get("docs_url"))
         base["openapi_url"] = _url_with_path(base_url, raw.get("openapi") or raw.get("openapi_url"))
         base["source"] = "manifest"
@@ -433,6 +463,272 @@ def _parse_compose_ps(stdout: str) -> list[dict]:
         if isinstance(parsed, dict):
             items.append(parsed)
     return items
+
+
+def _run_docker_json(args: list[str], timeout: int = 8) -> list[dict]:
+    result = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise HTTPException(
+            502, result.stderr.strip() or result.stdout.strip() or "docker command failed"
+        )
+    return _parse_compose_ps(result.stdout)
+
+
+def _parse_size_bytes(value: str) -> int:
+    match = re.match(r"^\s*(?P<num>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>[A-Za-z]+)?", value or "")
+    if not match:
+        return 0
+    number = float(match.group("num"))
+    unit = (match.group("unit") or "B").lower()
+    multipliers = {
+        "b": 1,
+        "kb": 1000,
+        "kib": 1024,
+        "mb": 1000**2,
+        "mib": 1024**2,
+        "gb": 1000**3,
+        "gib": 1024**3,
+        "tb": 1000**4,
+        "tib": 1024**4,
+    }
+    return int(number * multipliers.get(unit, 1))
+
+
+def _parse_percent(value: str) -> float:
+    try:
+        return float(str(value or "0").strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def _memory_usage_bytes(value: str) -> int:
+    return _parse_size_bytes(str(value or "").split("/", 1)[0].strip())
+
+
+def _read_cgroup_number(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _available_memory_bytes() -> int:
+    cgroup_limit = _read_cgroup_number(Path("/sys/fs/cgroup/memory.max"))
+    if cgroup_limit:
+        return cgroup_limit
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _parse_cpuset_count(value: str) -> int:
+    total = 0
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                total += max(0, int(end) - int(start) + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(part)
+            except ValueError:
+                continue
+            total += 1
+    return total
+
+
+def _available_cpu_units() -> float:
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    try:
+        quota_raw, period_raw, *_ = cpu_max.read_text(encoding="utf-8").strip().split()
+        if quota_raw != "max":
+            quota = float(quota_raw)
+            period = float(period_raw)
+            if quota > 0 and period > 0:
+                return max(0.01, quota / period)
+    except (OSError, ValueError):
+        pass
+
+    cpuset_path = Path("/sys/fs/cgroup/cpuset.cpus.effective")
+    try:
+        cpuset_count = _parse_cpuset_count(cpuset_path.read_text(encoding="utf-8").strip())
+        if cpuset_count:
+            return float(cpuset_count)
+    except OSError:
+        pass
+
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return float(len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+def _local_dockge_container_rows() -> list[dict]:
+    now = time.monotonic()
+    cached_at = float(_LOCAL_DOCKGE_METRICS_PS_CACHE.get("monotonic") or 0.0)
+    cached_rows = _LOCAL_DOCKGE_METRICS_PS_CACHE.get("rows") or []
+    if cached_rows and now - cached_at < _LOCAL_DOCKGE_METRICS_PS_TTL:
+        return cached_rows
+    rows = _run_docker_json(["ps", "--all", "--no-trunc", "--format", "json"], timeout=5)
+    _LOCAL_DOCKGE_METRICS_PS_CACHE["monotonic"] = now
+    _LOCAL_DOCKGE_METRICS_PS_CACHE["rows"] = rows
+    return rows
+
+
+def _local_dockge_stack_name_from_labels(labels: dict[str, str]) -> str:
+    working_dir = (labels.get("com.docker.compose.project.working_dir") or "").strip()
+    if working_dir:
+        try:
+            root = _stacks_root()
+            resolved = Path(working_dir).expanduser().resolve()
+            if resolved == root or root in resolved.parents:
+                return resolved.name
+        except OSError:
+            pass
+    return (labels.get("com.docker.compose.project") or "").strip()
+
+
+def _local_dockge_container_map() -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    by_ref: dict[str, dict] = {}
+    by_stack: dict[str, list[dict]] = {}
+    for row in _local_dockge_container_rows():
+        labels = _parse_labels(_field(row, "Labels", "labels"))
+        stack_name = _local_dockge_stack_name_from_labels(labels)
+        if not stack_name:
+            continue
+        container_id = _field(row, "ID", "Id", "id")
+        name = _field(row, "Names", "Name", "name")
+        state = _field(row, "State", "state").lower()
+        meta = {
+            "id": container_id,
+            "name": name,
+            "stack_name": stack_name,
+            "service": labels.get("com.docker.compose.service", ""),
+            "state": state,
+        }
+        if container_id:
+            by_ref[container_id] = meta
+            by_ref[container_id[:12]] = meta
+        if name:
+            by_ref[name] = meta
+        by_stack.setdefault(stack_name, []).append(meta)
+    return by_ref, by_stack
+
+
+def _local_dockge_metrics_sync() -> dict:
+    now = time.monotonic()
+    with _LOCAL_DOCKGE_METRICS_LOCK:
+        cached_at = float(_LOCAL_DOCKGE_METRICS_CACHE.get("monotonic") or 0.0)
+        cached_payload = _LOCAL_DOCKGE_METRICS_CACHE.get("payload")
+        if cached_payload and now - cached_at < _LOCAL_DOCKGE_METRICS_MIN_INTERVAL:
+            return {**cached_payload, "cache": "hit"}
+
+        by_ref, by_stack = _local_dockge_container_map()
+        running_ids = sorted(
+            {
+                meta["id"]
+                for meta in by_ref.values()
+                if meta.get("id") and meta.get("state") == "running"
+            }
+        )
+        stat_rows = []
+        if running_ids:
+            stat_rows = _run_docker_json(
+                ["stats", "--no-stream", "--format", "json", *running_ids], timeout=8
+            )
+
+        cpu_units = _available_cpu_units()
+        memory_total = _available_memory_bytes()
+        stacks: dict[str, dict] = {
+            stack_name: {
+                "stack_name": stack_name,
+                "cpu_percent": 0.0,
+                "cpu_docker_percent": 0.0,
+                "memory_percent": 0.0,
+                "memory_bytes": 0,
+                "containers": [],
+            }
+            for stack_name in by_stack
+        }
+
+        for row in stat_rows:
+            container_ref = _field(row, "Container", "ID", "Name", "Name")
+            name = _field(row, "Name", "Name")
+            meta = by_ref.get(container_ref) or by_ref.get(container_ref[:12]) or by_ref.get(name)
+            if not meta:
+                continue
+            stack_name = meta["stack_name"]
+            stack = stacks.setdefault(
+                stack_name,
+                {
+                    "stack_name": stack_name,
+                    "cpu_percent": 0.0,
+                    "cpu_docker_percent": 0.0,
+                    "memory_percent": 0.0,
+                    "memory_bytes": 0,
+                    "containers": [],
+                },
+            )
+            docker_cpu = _parse_percent(_field(row, "CPUPerc", "CPUPerc"))
+            memory_bytes = _memory_usage_bytes(_field(row, "MemUsage", "MemUsage"))
+            stack["cpu_docker_percent"] += docker_cpu
+            stack["memory_bytes"] += memory_bytes
+            stack["containers"].append(
+                {
+                    "id": meta.get("id", "")[:12],
+                    "name": meta.get("name") or name,
+                    "service": meta.get("service", ""),
+                    "cpu_docker_percent": round(docker_cpu, 3),
+                    "memory_bytes": memory_bytes,
+                }
+            )
+
+        for stack in stacks.values():
+            stack["cpu_percent"] = round(
+                min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3
+            )
+            stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+            stack["memory_percent"] = round(
+                min(100.0, (stack["memory_bytes"] / memory_total) * 100.0) if memory_total else 0.0,
+                3,
+            )
+
+        payload = {
+            "ok": True,
+            "source": "docker-stats",
+            "capacity": {
+                "cpu_units": round(cpu_units, 3),
+                "memory_bytes": memory_total,
+            },
+            "interval_seconds": 1,
+            "window_seconds": 10,
+            "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _LOCAL_DOCKGE_METRICS_CACHE["monotonic"] = time.monotonic()
+        _LOCAL_DOCKGE_METRICS_CACHE["payload"] = payload
+        return {**payload, "cache": "miss"}
 
 
 def _field(item: dict, *names: str) -> str:
@@ -484,19 +780,21 @@ def _normalize_stack(
             services.append(service)
         labels = _parse_labels(_field(item, "Labels", "labels"))
         ports = _ports_from_publishers(item) or _ports_from_string(_field(item, "Ports", "ports"))
-        containers.append({
-            "id": _field(item, "ID", "Id", "id"),
-            "name": _field(item, "Name", "Names", "name"),
-            "service": service,
-            "image": _field(item, "Image", "image"),
-            "state": _field(item, "State", "state").lower() or "unknown",
-            "status": _field(item, "Status", "status"),
-            "health": _field(item, "Health", "health").lower(),
-            "ports": _field(item, "Ports", "ports"),
-            "ports_structured": ports,
-            "labels": labels,
-            "exit_code": item.get("ExitCode", item.get("exit_code")),
-        })
+        containers.append(
+            {
+                "id": _field(item, "ID", "Id", "id"),
+                "name": _field(item, "Name", "Names", "name"),
+                "service": service,
+                "image": _field(item, "Image", "image"),
+                "state": _field(item, "State", "state").lower() or "unknown",
+                "status": _field(item, "Status", "status"),
+                "health": _field(item, "Health", "health").lower(),
+                "ports": _field(item, "Ports", "ports"),
+                "ports_structured": ports,
+                "labels": labels,
+                "exit_code": item.get("ExitCode", item.get("exit_code")),
+            }
+        )
 
     compose_services = _service_configs(compose_config or {})
     for service in compose_services:
@@ -505,7 +803,9 @@ def _normalize_stack(
 
     services_sorted = sorted(set(services))
     exposures = _base_exposures(services_sorted, containers, compose_services, caddy_routes or [])
-    exposures, manifest_error = _apply_manifest_exposures(exposures, _read_exposure_manifest(stack_dir))
+    exposures, manifest_error = _apply_manifest_exposures(
+        exposures, _read_exposure_manifest(stack_dir)
+    )
     status, health, running, total = _summarize_status(containers)
     stack = {
         "stack_name": stack_dir.name,
@@ -534,7 +834,9 @@ def _inspect_stack(stack_name: str) -> dict:
             f"docker compose ps failed for {stack_name}: {result.stderr.strip() or result.stdout.strip() or '(no output)'}",
         )
     compose_config, _ = _compose_config(stack_dir, compose)
-    return _normalize_stack(stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, _parse_caddy_routes())
+    return _normalize_stack(
+        stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, _parse_caddy_routes()
+    )
 
 
 def _compose_env_references(compose: Path) -> dict:
@@ -590,7 +892,9 @@ def _inspect_stack_lenient(stack_name: str) -> tuple[dict, Path, Path]:
     result = _run_compose(stack_dir, compose, ["ps", "--all", "--format", "json"], timeout=20)
     compose_config, config_error = _compose_config(stack_dir, compose)
     if result.returncode == 0:
-        stack = _normalize_stack(stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, caddy_routes)
+        stack = _normalize_stack(
+            stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, caddy_routes
+        )
         stack["env_requirements"] = _stack_env_requirements(stack_dir, compose)
         if config_error:
             stack["compose_config_error"] = config_error
@@ -599,7 +903,9 @@ def _inspect_stack_lenient(stack_name: str) -> tuple[dict, Path, Path]:
     compose_services = _service_configs(compose_config)
     services = sorted(compose_services)
     exposures = _base_exposures(services, [], compose_services, caddy_routes)
-    exposures, manifest_error = _apply_manifest_exposures(exposures, _read_exposure_manifest(stack_dir))
+    exposures, manifest_error = _apply_manifest_exposures(
+        exposures, _read_exposure_manifest(stack_dir)
+    )
     stack = {
         "stack_name": stack_dir.name,
         "path": str(stack_dir),
@@ -621,7 +927,9 @@ def _inspect_stack_lenient(stack_name: str) -> tuple[dict, Path, Path]:
     return stack, stack_dir, compose
 
 
-def _local_dockge_speech_env_int(name: str, default: int, minimum: int = 0, maximum: int = 1000000) -> int:
+def _local_dockge_speech_env_int(
+    name: str, default: int, minimum: int = 0, maximum: int = 1000000
+) -> int:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -655,11 +963,17 @@ def _local_dockge_speech_cache_meta_path(cache_path: Path) -> Path:
 
 def _new_local_dockge_speech_cache_path(stack_name: str) -> Path:
     cache_dir = _local_dockge_speech_cache_dir(stack_name)
-    base = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    base = (
+        cache_dir
+        / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    )
     if not base.exists():
         return base
     for index in range(1, 100):
-        candidate = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        candidate = (
+            cache_dir
+            / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        )
         if not candidate.exists():
             return candidate
     raise HTTPException(500, "Could not allocate a unique local Dockge narration cache path")
@@ -676,10 +990,16 @@ def _invalidate_local_dockge_speech_cache(stack_name: str) -> None:
             if meta_path.exists():
                 meta_path.unlink()
         except OSError as exc:
-            log.warning("local Dockge narration: could not remove stale cache metadata %s: %s", meta_path, exc)
+            log.warning(
+                "local Dockge narration: could not remove stale cache metadata %s: %s",
+                meta_path,
+                exc,
+            )
 
 
-def _read_local_dockge_source(path: Path, kind: str, source_items: list[dict], seen: set[Path]) -> None:
+def _read_local_dockge_source(
+    path: Path, kind: str, source_items: list[dict], seen: set[Path]
+) -> None:
     try:
         resolved = path.resolve()
     except OSError:
@@ -688,7 +1008,10 @@ def _read_local_dockge_source(path: Path, kind: str, source_items: list[dict], s
         return
     if resolved.name == ".env":
         return
-    if resolved.suffix.lower() not in _LOCAL_DOCKGE_SOURCE_SUFFIXES and resolved.name.lower() != "caddyfile":
+    if (
+        resolved.suffix.lower() not in _LOCAL_DOCKGE_SOURCE_SUFFIXES
+        and resolved.name.lower() != "caddyfile"
+    ):
         return
     try:
         stat = resolved.stat()
@@ -698,14 +1021,16 @@ def _read_local_dockge_source(path: Path, kind: str, source_items: list[dict], s
         return
     seen.add(resolved)
     clipped = len(text) > _LOCAL_DOCKGE_SPEECH_FILE_LIMIT
-    source_items.append({
-        "path": str(resolved),
-        "kind": kind,
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "clipped": clipped,
-        "text": text[:_LOCAL_DOCKGE_SPEECH_FILE_LIMIT],
-    })
+    source_items.append(
+        {
+            "path": str(resolved),
+            "kind": kind,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "clipped": clipped,
+            "text": text[:_LOCAL_DOCKGE_SPEECH_FILE_LIMIT],
+        }
+    )
 
 
 def _dockge_skill_roots() -> list[Path]:
@@ -724,7 +1049,9 @@ def _dockge_skill_roots() -> list[Path]:
     return roots
 
 
-def _gather_local_dockge_speech_sources(stack_name: str, stack_dir: Path, compose: Path) -> list[dict]:
+def _gather_local_dockge_speech_sources(
+    stack_name: str, stack_dir: Path, compose: Path
+) -> list[dict]:
     source_items: list[dict] = []
     seen: set[Path] = set()
     stack_l = stack_name.lower()
@@ -758,7 +1085,9 @@ def _gather_local_dockge_speech_sources(stack_name: str, stack_dir: Path, compos
                 _read_local_dockge_source(path, "node-local-dockge-doc", source_items, seen)
 
     for skill_root in _dockge_skill_roots():
-        for skill_dir in sorted((p for p in skill_root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+        for skill_dir in sorted(
+            (p for p in skill_root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()
+        ):
             name_l = skill_dir.name.lower()
             if "dockge" not in name_l and stack_l not in name_l:
                 continue
@@ -828,12 +1157,14 @@ def _local_dockge_source_markdown(stack: dict, source_items: list[dict]) -> str:
         "```",
     ]
     for item in source_items:
-        parts.extend([
-            "",
-            f"## Source: {item['kind']} — {item['path']}",
-            "",
-            item["text"],
-        ])
+        parts.extend(
+            [
+                "",
+                f"## Source: {item['kind']} — {item['path']}",
+                "",
+                item["text"],
+            ]
+        )
     return "\n".join(parts)
 
 
@@ -859,7 +1190,9 @@ Rules:
 """.strip()
 
 
-async def _generate_local_dockge_speech_markdown(stack: dict, source_items: list[dict]) -> tuple[str, dict[str, Any]]:
+async def _generate_local_dockge_speech_markdown(
+    stack: dict, source_items: list[dict]
+) -> tuple[str, dict[str, Any]]:
     source_limit = _local_dockge_speech_env_int(
         "LOCAL_DOCKGE_SPEECH_SOURCE_CHAR_LIMIT",
         _LOCAL_DOCKGE_SPEECH_SOURCE_LIMIT,
@@ -903,12 +1236,14 @@ async def _generate_local_dockge_speech_markdown(stack: dict, source_items: list
     speech = await _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty local Dockge narration")
-    generation_meta.update({
-        "speech_chars": len(speech),
-        "speech_words": len(speech.split()),
-        "source_count": len(source_items),
-        "prompt_version": _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION,
-    })
+    generation_meta.update(
+        {
+            "speech_chars": len(speech),
+            "speech_words": len(speech.split()),
+            "source_count": len(source_items),
+            "prompt_version": _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION,
+        }
+    )
     return speech, generation_meta
 
 
@@ -963,7 +1298,11 @@ def _summarize_openapi(spec: dict, url: str) -> dict:
     path_rows = []
     for path, methods in sorted(paths.items())[:80]:
         if isinstance(methods, dict):
-            method_list = [method.upper() for method in methods if method.lower() in {"get", "post", "put", "patch", "delete"}]
+            method_list = [
+                method.upper()
+                for method in methods
+                if method.lower() in {"get", "post", "put", "patch", "delete"}
+            ]
         else:
             method_list = []
         path_rows.append({"path": path, "methods": method_list})
@@ -982,6 +1321,11 @@ async def list_local_dockge_stacks() -> dict:
     return await asyncio.to_thread(_list_local_dockge_stacks_sync)
 
 
+@router.get("/metrics", status_code=200)
+async def local_dockge_metrics() -> dict:
+    return await asyncio.to_thread(_local_dockge_metrics_sync)
+
+
 def _list_local_dockge_stacks_sync() -> dict:
     root = _stacks_root()
     if not root.is_dir():
@@ -989,30 +1333,38 @@ def _list_local_dockge_stacks_sync() -> dict:
 
     caddy_routes = _parse_caddy_routes()
     stacks = []
-    for stack_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+    for stack_dir in sorted(
+        (p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()
+    ):
         compose = _compose_file(stack_dir)
         if not compose:
             continue
         result = _run_compose(stack_dir, compose, ["ps", "--all", "--format", "json"], timeout=20)
         compose_config, config_error = _compose_config(stack_dir, compose)
         if result.returncode != 0:
-            stacks.append({
-                "stack_name": stack_dir.name,
-                "path": str(stack_dir),
-                "compose_file": compose.name,
-                "status": "unknown",
-                "health": "unknown",
-                "running": 0,
-                "total": 0,
-                "services": [],
-                "service_exposures": {},
-                "containers": [],
-                "error": result.stderr.strip() or result.stdout.strip() or "docker compose ps failed",
-                "compose_config_error": config_error,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            stacks.append(
+                {
+                    "stack_name": stack_dir.name,
+                    "path": str(stack_dir),
+                    "compose_file": compose.name,
+                    "status": "unknown",
+                    "health": "unknown",
+                    "running": 0,
+                    "total": 0,
+                    "services": [],
+                    "service_exposures": {},
+                    "containers": [],
+                    "error": result.stderr.strip()
+                    or result.stdout.strip()
+                    or "docker compose ps failed",
+                    "compose_config_error": config_error,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             continue
-        stack = _normalize_stack(stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, caddy_routes)
+        stack = _normalize_stack(
+            stack_dir, compose, _parse_compose_ps(result.stdout), compose_config, caddy_routes
+        )
         if config_error:
             stack["compose_config_error"] = config_error
         stacks.append(stack)
@@ -1036,7 +1388,9 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
     if exposure.get("openapi_url"):
         openapi_candidates.append(exposure["openapi_url"])
     if base_url:
-        openapi_candidates.extend(_candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES)
+        openapi_candidates.extend(
+            _candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES
+        )
 
     docs_candidates = []
     if exposure.get("docs_url"):
@@ -1067,7 +1421,9 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(spec, dict) and "openapi" in spec:
-                    exposure["kind"] = "caddy-api" if exposure.get("kind") == "caddy-web" else exposure.get("kind")
+                    exposure["kind"] = (
+                        "caddy-api" if exposure.get("kind") == "caddy-web" else exposure.get("kind")
+                    )
                     openapi_summary = _summarize_openapi(spec, check["url"])
                     break
         for url in docs_candidates:
@@ -1093,7 +1449,9 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
 
 
 @router.post("/stacks/{stack_name}/speech", status_code=200)
-async def local_dockge_stack_speech(stack_name: str, body: LocalDockgeSpeechBody | None = None) -> dict:
+async def local_dockge_stack_speech(
+    stack_name: str, body: LocalDockgeSpeechBody | None = None
+) -> dict:
     force = bool(body.force) if body else False
     stack, stack_dir, compose = _inspect_stack_lenient(stack_name)
     source_items = _gather_local_dockge_speech_sources(stack["stack_name"], stack_dir, compose)
@@ -1112,7 +1470,9 @@ async def local_dockge_stack_speech(stack_name: str, body: LocalDockgeSpeechBody
             try:
                 speech_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                log.warning("local Dockge narration: could not read cache metadata %s: %s", meta_path, exc)
+                log.warning(
+                    "local Dockge narration: could not read cache metadata %s: %s", meta_path, exc
+                )
         return {
             "ok": True,
             "stack": stack["stack_name"],
