@@ -1046,6 +1046,14 @@ def proc_stat_cpu():
     return {"total": sum(values), "idle": idle}
 
 
+def interface_speed_mbps(name):
+    try:
+        value = int((Path("/sys/class/net") / name / "speed").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def proc_netdev():
     rows = []
     try:
@@ -1069,6 +1077,7 @@ def proc_netdev():
             "rx_bytes": int(parts[0]),
             "tx_bytes": int(parts[8]),
             "external": external,
+            "speed_mbps": interface_speed_mbps(name) if external else 0,
         })
     return rows
 
@@ -1209,16 +1218,20 @@ def build_payload(current, previous, refreshed, sample_elapsed_ms):
     interfaces = []
     total_rx_bps = 0.0
     total_tx_bps = 0.0
+    total_capacity_bps = 0.0
     for item in host.get("network_interfaces") or []:
         prev = previous_net.get(item.get("name"))
         rx_bps = 0.0
         tx_bps = 0.0
+        speed_mbps = max(0.0, float(item.get("speed_mbps") or 0))
+        capacity_bps = (speed_mbps * 1_000_000) / 8 if speed_mbps > 0 else 0.0
         if sample_ready and prev:
             rx_bps = max(0.0, (int(item.get("rx_bytes") or 0) - int(prev.get("rx_bytes") or 0)) / elapsed_seconds)
             tx_bps = max(0.0, (int(item.get("tx_bytes") or 0) - int(prev.get("tx_bytes") or 0)) / elapsed_seconds)
         if item.get("external"):
             total_rx_bps += rx_bps
             total_tx_bps += tx_bps
+            total_capacity_bps += capacity_bps
         interfaces.append({
             "name": item.get("name"),
             "rx_bytes": int(item.get("rx_bytes") or 0),
@@ -1226,6 +1239,8 @@ def build_payload(current, previous, refreshed, sample_elapsed_ms):
             "rx_bytes_per_second": round(rx_bps, 1),
             "tx_bytes_per_second": round(tx_bps, 1),
             "external": bool(item.get("external")),
+            "speed_mbps": round(speed_mbps, 3),
+            "capacity_bytes_per_second": round(capacity_bps, 1),
         })
 
     host_total = int(host_memory.get("total_bytes") or memory_total or 0)
@@ -1248,6 +1263,13 @@ def build_payload(current, previous, refreshed, sample_elapsed_ms):
             "memory_percent": round(min(100.0, (host_memory_used / host_total) * 100.0) if host_total else 0.0, 3),
             "network_external_rx_bytes_per_second": round(total_rx_bps, 1),
             "network_external_tx_bytes_per_second": round(total_tx_bps, 1),
+            "network_external_capacity_bytes_per_second": round(total_capacity_bps, 1),
+            "network_external_percent": round(
+                min(100.0, ((total_rx_bps + total_tx_bps) / total_capacity_bps) * 100.0)
+                if total_capacity_bps
+                else 0.0,
+                3,
+            ),
             "network_interfaces": interfaces,
         },
         "interval_seconds": 1,
