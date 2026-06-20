@@ -11,19 +11,24 @@ import asyncio
 import base64
 import copy
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import shlex
 import subprocess
 import textwrap
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 from . import db
 from .ssh import SshKeyMissing, resolve_env_key
@@ -37,7 +42,31 @@ class DisksFilesystemTreeBody(BaseModel):
     browse_mode: str | None = Field(default=None, max_length=32)
     source_path: str | None = Field(default=None, max_length=2000)
     path: str | None = Field(default=None, max_length=4000)
+    filesystem: str | None = Field(default=None, max_length=128)
+    dataset_name: str | None = Field(default=None, max_length=1024)
+    sensitive_hint: str | None = Field(default=None, max_length=2000)
+    pin_token: str | None = Field(default=None, max_length=128)
     limit: int = Field(default=400, ge=1, le=1000)
+
+
+class DisksFilesystemAccessBody(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    root_path: str = Field(min_length=1, max_length=2000)
+    browse_mode: str | None = Field(default=None, max_length=32)
+    source_path: str | None = Field(default=None, max_length=2000)
+    path: str | None = Field(default=None, max_length=4000)
+    filesystem: str | None = Field(default=None, max_length=128)
+    dataset_name: str | None = Field(default=None, max_length=1024)
+    sensitive_hint: str | None = Field(default=None, max_length=2000)
+    pin_token: str | None = Field(default=None, max_length=128)
+
+
+class DisksFilesystemSaveBody(DisksFilesystemAccessBody):
+    content: str = Field(default="", max_length=2_000_000)
+
+
+class DisksFilesystemPinUnlockBody(BaseModel):
+    pin: str = Field(min_length=6, max_length=6)
 
 
 class DisksNoteBody(BaseModel):
@@ -51,6 +80,8 @@ class DisksOfflineBrowseOpenBody(BaseModel):
     guest_name: str | None = Field(default=None, max_length=255)
     volume_ref: str = Field(min_length=1, max_length=1024)
     volume_label: str | None = Field(default=None, max_length=255)
+    sensitive_hint: str | None = Field(default=None, max_length=2000)
+    pin_token: str | None = Field(default=None, max_length=128)
 
 
 class DisksOfflineBrowseHeartbeatBody(BaseModel):
@@ -126,6 +157,19 @@ _DISKS_OFFLINE_BROWSE_REAPER_INTERVAL_SECONDS = max(
     int(os.environ.get("DISKS_OFFLINE_BROWSE_REAPER_INTERVAL_SECONDS", "5")),
 )
 _DISKS_OFFLINE_BROWSE_LOCK = threading.Lock()
+_DISKS_FILESYSTEM_PIN_SEED = os.environ.get("DISKS_FILESYSTEM_PIN", "").strip()
+_DISKS_PIN_TOKEN_TTL_SECONDS = max(60, int(os.environ.get("DISKS_PIN_TOKEN_TTL_SECONDS", "900")))
+_DISKS_PIN_HASH_ITERATIONS = 210_000
+_DISKS_PIN_LOCK = threading.Lock()
+_DISKS_PIN_UNLOCK_TOKENS: dict[str, float] = {}
+_DISKS_FILE_PREVIEW_MAX_BYTES = max(
+    16_384,
+    int(os.environ.get("DISKS_FILE_PREVIEW_MAX_BYTES", str(512 * 1024))),
+)
+_DISKS_FILE_EDIT_MAX_BYTES = max(
+    16_384,
+    int(os.environ.get("DISKS_FILE_EDIT_MAX_BYTES", str(1024 * 1024))),
+)
 _DISKS_INVENTORY_MEMORY_GROUPS = ("Physical drives", "Logical systems")
 _DISKS_INVENTORY_MEMORY_LOCK = threading.Lock()
 
@@ -270,7 +314,11 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
             if not line:
                 continue
             parts = line.split("\\t")
-            if len(parts) != 12:
+            if len(parts) == 12:
+                parts.extend(["", "", "", ""])
+            elif len(parts) == 13:
+                parts.extend(["", "", ""])
+            elif len(parts) != 16:
                 continue
             (
                 name,
@@ -285,6 +333,10 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                 encryptionroot,
                 logicalused,
                 usedbysnapshots,
+                refreservation,
+                usedbydataset,
+                usedbychildren,
+                usedbyrefreservation,
             ) = parts
 
             def to_int(value):
@@ -293,6 +345,8 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                 except Exception:
                     return None
 
+            zvol_path = f"/dev/zvol/{name}" if ds_type == "volume" else ""
+            zvol_resolved = os.path.realpath(zvol_path) if zvol_path and os.path.exists(zvol_path) else ""
             rows.append(
                 {
                     "name": name,
@@ -307,6 +361,12 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
                     "encryptionroot": encryptionroot,
                     "logical_used_bytes": to_int(logicalused),
                     "used_by_snapshots_bytes": to_int(usedbysnapshots),
+                    "refreservation_bytes": to_int(refreservation),
+                    "used_by_dataset_bytes": to_int(usedbydataset),
+                    "used_by_children_bytes": to_int(usedbychildren),
+                    "used_by_refreservation_bytes": to_int(usedbyrefreservation),
+                    "zvol_path": zvol_path,
+                    "zvol_resolved_path": zvol_resolved,
                 }
             )
         return rows
@@ -763,6 +823,38 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         return rows
 
 
+    def parse_storage_cfg_zfspool():
+        try:
+            with open("/etc/pve/storage.cfg", "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except Exception:
+            return []
+
+        rows = []
+        current = None
+        for raw in lines:
+            line = raw.rstrip("\\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not line[:1].isspace():
+                kind, _, name = stripped.partition(":")
+                kind = kind.strip().lower()
+                name = name.strip()
+                current = {"type": kind, "name": name} if kind and name else None
+                if current and kind == "zfspool":
+                    rows.append(current)
+                continue
+            if not current or current.get("type") != "zfspool":
+                continue
+            key, _, value = stripped.partition(" ")
+            key = key.strip().lower()
+            value = value.strip()
+            if key:
+                current[key] = value
+        return rows
+
+
     def parse_pvesm_status(text):
         rows = []
         for raw in text.splitlines():
@@ -825,7 +917,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
             "list",
             "-Hp",
             "-o",
-            "name,used,avail,refer,type,mountpoint,volsize,encryption,keystatus,encryptionroot,logicalused,usedbysnapshots",
+            "name,used,avail,refer,type,mountpoint,volsize,encryption,keystatus,encryptionroot,logicalused,usedbysnapshots,refreservation,usedbydataset,usedbychildren,usedbyrefreservation",
         ],
         timeout=10,
     )
@@ -851,6 +943,7 @@ _REMOTE_INVENTORY_SCRIPT = textwrap.dedent(
         "guest_volume_assignments": parse_guest_volume_assignments(),
         "hostpci_assignments": parse_hostpci_assignments(),
         "pbs_storages": parse_storage_cfg_pbs(),
+        "zfs_storage_aliases": parse_storage_cfg_zfspool(),
         "pvesm_status": parse_pvesm_status(pvesm_status["stdout"]) if pvesm_status["ok"] else [],
         "commands": {
             "lsblk": lsblk,
@@ -1205,6 +1298,374 @@ _REMOTE_FILESYSTEM_TREE_SCRIPT = textwrap.dedent(
                 mount_root.rmdir()
             except OSError:
                 pass
+    """
+).strip()
+
+_REMOTE_FILESYSTEM_ACCESS_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import datetime as dt
+    import json
+    import mimetypes
+    import os
+    from pathlib import Path
+    import re
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import tarfile
+
+    PAYLOAD_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Filesystem payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Filesystem payload is invalid: {exc}")
+        if not isinstance(body, dict):
+            fail("Filesystem payload is invalid")
+        return body
+
+
+    def action_name():
+        if not PAYLOAD_ARG:
+            return ""
+        try:
+            padding = "=" * (-len(PAYLOAD_ARG) % 4)
+            raw = base64.urlsafe_b64decode((PAYLOAD_ARG + padding).encode("ascii"))
+            body = json.loads(raw.decode("utf-8"))
+            return str(body.get("action") or "").strip().lower() if isinstance(body, dict) else ""
+        except Exception:
+            return ""
+
+
+    ACTION = action_name()
+
+
+    def fail(message, code=1):
+        if ACTION == "download":
+            print(str(message), file=sys.stderr)
+            raise SystemExit(code)
+        print(json.dumps({"ok": False, "error": str(message)}))
+        raise SystemExit(0)
+
+
+    def normalize_mode(value):
+        text = str(value or "").strip().lower()
+        return "device_ro" if text == "device_ro" else "mounted"
+
+
+    def normalize_relative(path):
+        text = str(path or "").strip().replace("\\\\", "/")
+        if not text or text == ".":
+            return "."
+        if text.startswith("/"):
+            fail("Path must be relative to the filesystem root")
+        parts = []
+        for part in text.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                fail("Path escapes filesystem root")
+            parts.append(part)
+        return "/".join(parts) if parts else "."
+
+
+    def clean_tag(value):
+        text = str(value or "").strip()
+        return text if re.match(r"^[A-Za-z0-9_-]{6,64}$", text) else ""
+
+
+    def run(cmd, timeout=8):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return {
+                "ok": proc.returncode == 0,
+                "stdout": proc.stdout or "",
+                "stderr": proc.stderr or "",
+                "rc": proc.returncode,
+            }
+        except Exception as exc:
+            return {"ok": False, "stdout": "", "stderr": str(exc), "rc": 1}
+
+
+    def within_root(candidate, root):
+        try:
+            candidate.relative_to(root)
+            return True
+        except Exception:
+            return False
+
+
+    def rel_display(root_display, relative_path):
+        if relative_path == ".":
+            return root_display
+        if root_display == "/":
+            return f"/{relative_path}"
+        return f"{root_display.rstrip('/')}/{relative_path}"
+
+
+    def findmnt_info(path, fallback_fstype=""):
+        result = run(["findmnt", "-T", str(path), "-n", "-o", "FSTYPE,SOURCE,TARGET"], timeout=8)
+        line = (result.get("stdout") or "").strip().splitlines()
+        if line:
+            parts = line[0].split(None, 2)
+            return {
+                "fstype": parts[0].strip().lower() if len(parts) > 0 else fallback_fstype,
+                "source": parts[1].strip() if len(parts) > 1 else "",
+                "target": parts[2].strip() if len(parts) > 2 else "",
+            }
+        return {"fstype": str(fallback_fstype or "").strip().lower(), "source": "", "target": ""}
+
+
+    def classify(target, root):
+        is_symlink = target.is_symlink()
+        resolved = target.resolve()
+        if not within_root(resolved, root):
+            fail("Path escapes filesystem root")
+        if not resolved.exists():
+            fail("Path does not exist")
+        stat_obj = resolved.stat()
+        if resolved.is_dir():
+            kind = "folder"
+        elif resolved.is_file():
+            kind = "file"
+        else:
+            kind = "other"
+        return resolved, stat_obj, kind, is_symlink
+
+
+    def safe_archive_name(name):
+        text = str(name or "").strip().replace("\\\\", "/").rstrip("/")
+        text = text.rsplit("/", 1)[-1] if text else "filesystem"
+        text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip(".-")
+        return text or "filesystem"
+
+
+    def text_kind(path, mime):
+        ext = path.suffix.lower()
+        if ext in {".md", ".markdown"}:
+            return "markdown"
+        if str(mime or "").startswith("text/"):
+            return "text"
+        if ext in {
+            ".cfg", ".conf", ".css", ".csv", ".env", ".ini", ".js", ".json",
+            ".log", ".py", ".sh", ".sql", ".svg", ".toml", ".ts", ".txt",
+            ".xml", ".yaml", ".yml",
+        }:
+            return "text"
+        return "file"
+
+
+    def metadata(payload, root, root_display, relative_path, target, stat_obj, kind, symlink):
+        mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        mount = findmnt_info(root, str(payload.get("filesystem") or "").strip())
+        abs_display = rel_display(root_display, relative_path)
+        dataset_name = str(payload.get("dataset_name") or "").strip()
+        fstype = str(mount.get("fstype") or payload.get("filesystem") or "").strip().lower()
+        private_text = " ".join(
+            [
+                abs_display,
+                relative_path,
+                str(payload.get("root_path") or ""),
+                str(payload.get("source_path") or ""),
+                dataset_name,
+            ]
+        ).lower()
+        return {
+            "ok": True,
+            "path": relative_path,
+            "absolute_path": abs_display,
+            "filename": target.name or safe_archive_name(root_display),
+            "type": kind,
+            "symlink": symlink,
+            "size_bytes": int(stat_obj.st_size) if kind == "file" else None,
+            "modified_at": dt.datetime.fromtimestamp(stat_obj.st_mtime, dt.timezone.utc).isoformat(),
+            "mime": mime,
+            "preview_kind": text_kind(target, mime),
+            "filesystem": fstype,
+            "mount_source": str(mount.get("source") or ""),
+            "mount_target": str(mount.get("target") or ""),
+            "dataset_name": dataset_name,
+            "sensitive": "private" in private_text,
+        }
+
+
+    def stream_tar_gz(target, root):
+        arcname = "." if target == root else target.relative_to(root).as_posix()
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tar:
+            tar.add(str(target), arcname=arcname, recursive=True)
+
+
+    payload = decode_payload(PAYLOAD_ARG)
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in {"meta", "preview", "save", "download"}:
+        fail("Unsupported filesystem action")
+    mode = normalize_mode(payload.get("browse_mode"))
+    source_arg = str(payload.get("source_path") or "").strip()
+    root_arg = str(payload.get("root_path") or "").strip()
+    relative_path = normalize_relative(payload.get("relative_path"))
+    mount_root = None
+    mounted = False
+
+    try:
+        if mode == "device_ro":
+            if not source_arg.startswith("/dev/"):
+                fail("Filesystem source must be a device path")
+            tag = clean_tag(payload.get("mount_tag"))
+            prefix = f"disks-browse-{tag}-" if tag else "disks-browse-"
+            mount_root = Path(tempfile.mkdtemp(prefix=prefix))
+            mount_proc = subprocess.run(
+                ["mount", "-o", "ro", source_arg, str(mount_root)],
+                capture_output=True,
+                text=True,
+            )
+            if mount_proc.returncode != 0:
+                detail = (
+                    (mount_proc.stderr or "").strip()
+                    or (mount_proc.stdout or "").strip()
+                    or f"mount exited {mount_proc.returncode}"
+                )
+                fail(f"Could not mount filesystem read-only: {detail}")
+            mounted = True
+            root = mount_root.resolve()
+            root_display = "/"
+        else:
+            if not root_arg.startswith("/"):
+                fail("Filesystem root must be an absolute path")
+            root_display = root_arg.rstrip("/") or "/"
+            root = Path(root_display).resolve()
+            if not root.exists():
+                fail(f"Filesystem root does not exist: {root_arg}")
+            if not root.is_dir():
+                fail(f"Filesystem root is not a directory: {root_arg}")
+            if not os.path.ismount(root):
+                fail(f"Filesystem root is not a mounted path: {root_arg}")
+
+        lexical_target = root if relative_path == "." else (root / relative_path)
+        resolved, stat_obj, kind, is_symlink = classify(lexical_target, root)
+        meta = metadata(payload, root, root_display, relative_path, resolved, stat_obj, kind, is_symlink)
+
+        if action == "meta":
+            print(json.dumps(meta))
+        elif action == "preview":
+            if kind != "file":
+                fail("Preview target is not a file")
+            try:
+                max_bytes = int(payload.get("max_bytes") or 524288)
+            except Exception:
+                max_bytes = 524288
+            max_bytes = max(16384, min(max_bytes, 2 * 1024 * 1024))
+            with open(resolved, "rb") as handle:
+                raw = handle.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            raw = raw[:max_bytes]
+            if b"\\x00" in raw[:4096]:
+                meta.update({"preview_kind": "file", "text": "", "text_truncated": truncated})
+            else:
+                text = raw.decode("utf-8", errors="replace")
+                if meta["preview_kind"] == "file":
+                    meta["preview_kind"] = "text"
+                meta.update({"text": text, "text_truncated": truncated})
+            print(json.dumps(meta))
+        elif action == "save":
+            if mode == "device_ro":
+                fail("Offline device browsing is read-only")
+            if kind != "file":
+                fail("Save target is not a file")
+            content = str(payload.get("content") or "")
+            token = clean_tag(payload.get("write_tag")) or "save"
+            raw = content.encode("utf-8")
+            tmp_path = resolved.with_name(f".{resolved.name}.disks-save-{token}.tmp")
+            try:
+                tmp_path.write_bytes(raw)
+                os.chmod(tmp_path, stat_obj.st_mode & 0o7777)
+                try:
+                    os.chown(tmp_path, stat_obj.st_uid, stat_obj.st_gid)
+                except PermissionError:
+                    pass
+                os.replace(tmp_path, resolved)
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+            new_stat = resolved.stat()
+            meta.update(
+                {
+                    "size_bytes": int(new_stat.st_size),
+                    "modified_at": dt.datetime.fromtimestamp(
+                        new_stat.st_mtime,
+                        dt.timezone.utc,
+                    ).isoformat(),
+                }
+            )
+            print(json.dumps(meta))
+        elif action == "download":
+            if kind == "folder":
+                stream_tar_gz(resolved, root)
+            elif kind == "file":
+                with open(resolved, "rb") as handle:
+                    shutil.copyfileobj(handle, sys.stdout.buffer, length=1024 * 1024)
+            else:
+                fail("Download target is not a file or directory")
+    finally:
+        if mounted and mount_root is not None:
+            subprocess.run(["umount", str(mount_root)], capture_output=True, text=True, check=False)
+        if mount_root is not None:
+            try:
+                mount_root.rmdir()
+            except OSError:
+                pass
+    """
+).strip()
+
+_REMOTE_FILESYSTEM_CLEANUP_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import glob
+    import json
+    import os
+    import re
+    import subprocess
+    import sys
+
+    def decode_payload(value):
+        padding = "=" * (-len(value) % 4)
+        raw = base64.urlsafe_b64decode((value + padding).encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def run(cmd, timeout=8):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+
+    payload = decode_payload(sys.argv[1] if len(sys.argv) > 1 else "")
+    tag = str(payload.get("mount_tag") or "").strip()
+    cleaned = []
+    if re.match(r"^[A-Za-z0-9_-]{6,64}$", tag):
+        for path in glob.glob(f"/tmp/disks-browse-{tag}-*") + glob.glob(f"/run/disks-browse-{tag}-*"):
+            if not os.path.isdir(path):
+                continue
+            run(["umount", path], timeout=8)
+            if os.path.ismount(path):
+                run(["umount", "-lf", path], timeout=8)
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+            cleaned.append(path)
+    print(json.dumps({"ok": True, "mount_tag": tag, "cleaned": cleaned}))
     """
 ).strip()
 
@@ -1649,6 +2110,45 @@ def _visible_mount_target(value: Any) -> str:
     return "" if text.startswith(_BROWSE_MOUNT_PREFIXES) else text
 
 
+def _is_transient_nbd_path(value: Any) -> bool:
+    return bool(re.fullmatch(r"/dev/nbd\d+(p\d+)?", str(value or "").strip()))
+
+
+def _is_transient_nbd_name(value: Any) -> bool:
+    return bool(re.fullmatch(r"nbd\d+(p\d+)?", str(value or "").strip().lower()))
+
+
+def _node_fact_value(node: dict[str, Any] | None, label: str) -> str:
+    if not isinstance(node, dict):
+        return ""
+    clean_label = str(label or "").strip().lower()
+    for fact in node.get("facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        if str(fact.get("label") or "").strip().lower() != clean_label:
+            continue
+        return str(fact.get("value") or "").strip()
+    return ""
+
+
+def _inventory_node_is_transient(node: dict[str, Any] | None) -> bool:
+    if not isinstance(node, dict):
+        return False
+    node_id = str(node.get("id") or "").strip()
+    if "/dev/nbd" in node_id:
+        return True
+    for value in (
+        node.get("label"),
+        node.get("source_path"),
+        node.get("root_display"),
+        _node_fact_value(node, "Path"),
+        _node_fact_value(node, "Guest path"),
+    ):
+        if _is_transient_nbd_name(value) or _is_transient_nbd_path(value):
+            return True
+    return False
+
+
 def _safe_node_id(node_id: str) -> str:
     value = str(node_id or "").strip()
     if not value or len(value) > 400:
@@ -1778,6 +2278,352 @@ def _persist_disks_note(node_id: str, note: str) -> None:
         else:
             conn.execute("DELETE FROM disks_notes WHERE node_id = ?", (clean_node_id,))
         conn.commit()
+
+
+def _ensure_disks_security_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS disks_security (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL DEFAULT '',
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+
+def _disks_security_get(conn, key: str) -> str:
+    _ensure_disks_security_table(conn)
+    row = conn.execute("SELECT value FROM disks_security WHERE key=?", (key,)).fetchone()
+    return str(row["value"] or "") if row else ""
+
+
+def _disks_security_set(conn, key: str, value: str) -> None:
+    _ensure_disks_security_table(conn)
+    conn.execute(
+        """
+        INSERT INTO disks_security (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = datetime('now')
+        """,
+        (key, value),
+    )
+
+
+def _clean_disks_pin(pin: str) -> str:
+    clean = str(pin or "").strip()
+    if not re.fullmatch(r"\d{6}", clean):
+        raise HTTPException(400, "PIN must be exactly 6 digits")
+    return clean
+
+
+def _hash_disks_pin(pin: str, salt_hex: str) -> str:
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        pin.encode("utf-8"),
+        bytes.fromhex(salt_hex),
+        _DISKS_PIN_HASH_ITERATIONS,
+    )
+    return digest.hex()
+
+
+def _prune_disks_pin_tokens_unlocked(now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    expired = [
+        token for token, expires_at in _DISKS_PIN_UNLOCK_TOKENS.items() if expires_at <= current
+    ]
+    for token in expired:
+        _DISKS_PIN_UNLOCK_TOKENS.pop(token, None)
+
+
+def _issue_disks_pin_token_unlocked() -> tuple[str, float]:
+    _prune_disks_pin_tokens_unlocked()
+    token = secrets.token_urlsafe(32)
+    expires_at = time.time() + _DISKS_PIN_TOKEN_TTL_SECONDS
+    _DISKS_PIN_UNLOCK_TOKENS[token] = expires_at
+    return token, expires_at
+
+
+def _verify_disks_pin_token(token: str | None) -> bool:
+    clean = str(token or "").strip()
+    if not clean:
+        return False
+    with _DISKS_PIN_LOCK:
+        _prune_disks_pin_tokens_unlocked()
+        return _DISKS_PIN_UNLOCK_TOKENS.get(clean, 0) > time.time()
+
+
+def _unlock_disks_pin(pin: str) -> dict[str, Any]:
+    clean_pin = _clean_disks_pin(pin)
+    with _DISKS_PIN_LOCK:
+        with db.get_conn() as conn:
+            salt = _disks_security_get(conn, "filesystem_pin_salt")
+            stored_hash = _disks_security_get(conn, "filesystem_pin_hash")
+            initialized = False
+            if not salt or not stored_hash:
+                if not re.fullmatch(r"\d{6}", _DISKS_FILESYSTEM_PIN_SEED):
+                    raise HTTPException(503, "Filesystem PIN is not configured on this node")
+                salt = secrets.token_hex(16)
+                stored_hash = _hash_disks_pin(_DISKS_FILESYSTEM_PIN_SEED, salt)
+                _disks_security_set(conn, "filesystem_pin_salt", salt)
+                _disks_security_set(conn, "filesystem_pin_hash", stored_hash)
+                initialized = True
+            if not hmac.compare_digest(stored_hash, _hash_disks_pin(clean_pin, salt)):
+                raise HTTPException(403, "PIN was not accepted")
+            token, expires_at = _issue_disks_pin_token_unlocked()
+    return {
+        "ok": True,
+        "token": token,
+        "expires_at": dt.datetime.fromtimestamp(expires_at, dt.UTC).isoformat(),
+        "ttl_seconds": _DISKS_PIN_TOKEN_TTL_SECONDS,
+        "initialized": initialized,
+    }
+
+
+def _access_text_contains_private(*values: Any) -> bool:
+    return any("private" in str(value or "").lower() for value in values)
+
+
+def _filesystem_access_payload(
+    body: DisksFilesystemAccessBody | DisksFilesystemTreeBody,
+    *,
+    action: str,
+    mount_tag: str | None = None,
+    write_tag: str | None = None,
+    content: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    clean_host = _safe_browse_host(body.host)
+    browse_mode = _normalize_browser_mode(body.browse_mode)
+    clean_source = _safe_device_path(body.source_path or "") if browse_mode == "device_ro" else ""
+    clean_root = _normalize_browser_root_path(body.root_path)
+    clean_path = _normalize_browser_relative_path(body.path)
+    payload = {
+        "action": action,
+        "browse_mode": browse_mode,
+        "source_path": clean_source,
+        "root_path": clean_root,
+        "relative_path": clean_path,
+        "filesystem": str(body.filesystem or "").strip().lower(),
+        "dataset_name": str(body.dataset_name or "").strip(),
+        "sensitive_hint": str(body.sensitive_hint or "").strip(),
+    }
+    if mount_tag:
+        payload["mount_tag"] = mount_tag
+    if write_tag:
+        payload["write_tag"] = write_tag
+    if content is not None:
+        payload["content"] = content
+    return clean_host, payload
+
+
+def _filesystem_access_is_sensitive(
+    body: DisksFilesystemAccessBody | DisksFilesystemTreeBody,
+    meta: dict[str, Any] | None = None,
+) -> bool:
+    meta = meta or {}
+    return bool(
+        meta.get("sensitive")
+        or _access_text_contains_private(
+            body.root_path,
+            body.source_path,
+            body.path,
+            body.dataset_name,
+            body.sensitive_hint,
+            meta.get("absolute_path"),
+            meta.get("mount_source"),
+            meta.get("mount_target"),
+            meta.get("sensitive_hint"),
+        )
+    )
+
+
+def _require_disks_pin_if_sensitive(
+    body: DisksFilesystemAccessBody | DisksFilesystemTreeBody,
+    meta: dict[str, Any] | None = None,
+) -> bool:
+    sensitive = _filesystem_access_is_sensitive(body, meta)
+    if sensitive and not _verify_disks_pin_token(body.pin_token):
+        raise HTTPException(423, "PIN required for this filesystem location")
+    return sensitive
+
+
+def _run_filesystem_access_json(
+    host: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    payload_arg = _payload_arg(payload)
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_FILESYSTEM_ACCESS_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=timeout or _SSH_INVENTORY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"filesystem access timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        try:
+            body = json.loads(stdout)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            if body.get("ok"):
+                return {"ok": True, "host": host, "error": "", "data": body}
+            return {
+                "ok": False,
+                "host": host,
+                "error": str(body.get("error") or stderr or f"ssh exited {proc.returncode}"),
+                "data": None,
+            }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+async def _filesystem_access_json_host(
+    host: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_run_filesystem_access_json, host, payload, timeout=timeout)
+
+
+def _filesystem_access_stream_process(host: str, payload: dict[str, Any]) -> subprocess.Popen:
+    payload_arg = _payload_arg(payload)
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=False,
+    )
+
+
+def _filesystem_scp_stream_process(host: str, remote_path: str) -> subprocess.Popen:
+    try:
+        key_path = resolve_env_key("PROXMOX_SSH_KEY")
+    except SshKeyMissing as exc:
+        raise RuntimeError(f"PROXMOX_SSH_KEY unavailable: {exc}") from exc
+    remote_spec = f"root@{host}:{shlex.quote(remote_path)}"
+    return subprocess.Popen(
+        [
+            "scp",
+            "-O",
+            "-q",
+            "-i",
+            key_path,
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"ConnectTimeout={_SSH_CONNECT_TIMEOUT}",
+            remote_spec,
+            "/dev/stdout",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=False,
+    )
+
+
+def _cleanup_filesystem_mount_tag(host: str, mount_tag: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", str(mount_tag or "")):
+        return
+    payload_arg = _payload_arg({"mount_tag": mount_tag})
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    try:
+        subprocess.run(
+            command,
+            input=_REMOTE_FILESYSTEM_CLEANUP_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    except Exception:
+        pass
+
+
+def _iter_process_stdout(proc: subprocess.Popen) -> Iterator[bytes]:
+    try:
+        if not proc.stdout:
+            return
+        while True:
+            chunk = proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            yield chunk
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
+def _iter_filesystem_script_stream(
+    proc: subprocess.Popen,
+    *,
+    host: str,
+    mount_tag: str,
+) -> Iterator[bytes]:
+    try:
+        if proc.stdin:
+            proc.stdin.write(_REMOTE_FILESYSTEM_ACCESS_SCRIPT.encode("utf-8"))
+            proc.stdin.close()
+        yield from _iter_process_stdout(proc)
+    finally:
+        _cleanup_filesystem_mount_tag(host, mount_tag)
+
+
+def _safe_download_filename(name: Any, fallback: str = "filesystem") -> str:
+    text = str(name or "").strip().replace("\\", "/")
+    text = text.rsplit("/", 1)[-1] if text else fallback
+    text = re.sub(r"[^A-Za-z0-9._ -]+", "-", text).strip(" .-")
+    return text or fallback
+
+
+def _filesystem_error_to_http(detail: str) -> HTTPException:
+    lowered = detail.lower()
+    if "timed out" in lowered:
+        return HTTPException(504, detail)
+    if any(
+        marker in lowered
+        for marker in (
+            "filesystem root",
+            "path escapes filesystem root",
+            "path must be relative",
+            "path does not exist",
+            "not a directory",
+            "not a file",
+            "target is not",
+        )
+    ):
+        return HTTPException(400, detail)
+    return HTTPException(502, detail)
 
 
 def _apply_disks_notes(node: dict[str, Any], notes_by_id: dict[str, str]) -> None:
@@ -2325,6 +3171,7 @@ def _offline_browse_public_session(session: dict[str, Any]) -> dict[str, Any]:
         "guest_name": str(session.get("guest_name") or "").strip(),
         "volume_ref": str(session.get("volume_ref") or "").strip(),
         "volume_label": str(session.get("volume_label") or "").strip(),
+        "sensitive_hint": str(session.get("sensitive_hint") or "").strip(),
         "nbd_device": str(session.get("nbd_device") or "").strip(),
         "sources": copy.deepcopy(session.get("sources") or []),
         "opened_at": str(session.get("opened_at") or "").strip(),
@@ -2450,8 +3297,11 @@ def _flatten_block_devices(
             continue
         if str(node.get("type") or "").strip() != "disk":
             continue
-        name = str(node.get("name") or "")
+        name = str(node.get("name") or "").strip()
+        path = str(node.get("path") or "").strip()
         if name.startswith(("loop", "ram", "zram", "sr", "zd", "dm-")):
+            continue
+        if _is_transient_nbd_name(name) or _is_transient_nbd_path(path):
             continue
         top_disks.append(node)
         walk(node)
@@ -2744,6 +3594,78 @@ def _filesystem_probe_index(snapshot: dict[str, Any]) -> dict[str, dict[str, Any
     }
 
 
+def _iter_block_device_nodes(blockdevices: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    stack = [node for node in reversed(blockdevices) if isinstance(node, dict)]
+    while stack:
+        node = stack.pop()
+        yield node
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(child for child in reversed(children) if isinstance(child, dict))
+
+
+def _zvol_filesystem_probe(
+    row: dict[str, Any],
+    snapshot: dict[str, Any],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if str(row.get("type") or "").strip() != "volume":
+        return {}
+    zvol_paths = {
+        str(row.get("zvol_path") or "").strip(),
+        str(row.get("zvol_resolved_path") or "").strip(),
+    }
+    zvol_paths.discard("")
+    if not zvol_paths:
+        return {}
+
+    blockdevices = snapshot.get("lsblk", {}).get("blockdevices")
+    if not isinstance(blockdevices, list):
+        return {}
+
+    candidates: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for node in _iter_block_device_nodes(blockdevices):
+        if str(node.get("path") or "").strip() not in zvol_paths:
+            continue
+        children = node.get("children")
+        search_nodes = children if isinstance(children, list) and children else [node]
+        for child in search_nodes:
+            if not isinstance(child, dict):
+                continue
+            path = str(child.get("path") or "").strip()
+            probe = filesystem_probe_by_path.get(path) or {}
+            fstype = probe.get("fstype") or child.get("fstype")
+            if not probe or not _is_data_filesystem(fstype):
+                continue
+            size = _to_int(probe.get("total_bytes")) or _to_int(child.get("size")) or 0
+            candidates.append((size, child, probe))
+
+    if not candidates:
+        return {}
+    _, child, probe = max(candidates, key=lambda item: item[0])
+    return {
+        **probe,
+        "partition_path": str(child.get("path") or "").strip(),
+        "partlabel": str(child.get("partlabel") or "").strip(),
+    }
+
+
+def _zfs_storage_aliases_by_pool(snapshot: dict[str, Any]) -> dict[str, list[str]]:
+    raw = snapshot.get("zfs_storage_aliases")
+    if not isinstance(raw, list):
+        return {}
+    aliases: dict[str, list[str]] = {}
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        pool = str(row.get("pool") or "").strip()
+        if not name or not pool:
+            continue
+        aliases.setdefault(pool, []).append(name)
+    return aliases
+
+
 def _smart_payload(host: str, device_path: str | None) -> dict[str, str] | None:
     if not device_path:
         return None
@@ -2828,7 +3750,12 @@ def _match_guest_volume_assignment(
     return fallback
 
 
-def _offline_browser_meta_from_assignment(host: str, assignment: dict[str, Any]) -> dict[str, Any]:
+def _offline_browser_meta_from_assignment(
+    host: str,
+    assignment: dict[str, Any],
+    *,
+    sensitive_hint: str = "",
+) -> dict[str, Any]:
     guest_id = str(assignment.get("vmid") or "").strip()
     guest_name = str(assignment.get("name") or "").strip()
     volume_ref = str(assignment.get("volume_ref") or "").strip()
@@ -2847,6 +3774,7 @@ def _offline_browser_meta_from_assignment(host: str, assignment: dict[str, Any])
             "volume_ref": volume_ref,
             "volume_label": volume_label,
             "slot": str(assignment.get("slot") or "").strip(),
+            "sensitive_hint": str(sensitive_hint or "").strip(),
         }
     }
 
@@ -3176,7 +4104,11 @@ def _cacheable_host_child(node: dict[str, Any]) -> bool:
         return False
     node_id = str(node.get("id") or "").strip()
     group = str(node.get("group") or "").strip()
-    return bool(node_id) and group in _DISKS_INVENTORY_MEMORY_GROUPS
+    return (
+        bool(node_id)
+        and group in _DISKS_INVENTORY_MEMORY_GROUPS
+        and not _inventory_node_is_transient(node)
+    )
 
 
 def _snapshot_cacheable_node(node: dict[str, Any]) -> dict[str, Any]:
@@ -3266,6 +4198,16 @@ def _merge_inventory_memory(host_nodes: list[dict[str, Any]]) -> None:
             if not isinstance(node_store, dict):
                 host_store["nodes"] = {}
                 node_store = host_store["nodes"]
+            else:
+                for record_id, record in list(node_store.items()):
+                    if not isinstance(record, dict):
+                        continue
+                    snapshot = (
+                        record.get("snapshot") if isinstance(record.get("snapshot"), dict) else {}
+                    )
+                    if _inventory_node_is_transient(snapshot) or "/dev/nbd" in str(record_id):
+                        node_store.pop(record_id, None)
+                        changed = True
 
             live_children = host_node.get("children")
             if not isinstance(live_children, list):
@@ -3837,10 +4779,12 @@ def _build_dataset_tree(
     datasets: list[dict[str, Any]],
     *,
     dataset_roles: dict[str, list[dict[str, Any]]],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
     guest_identity_lookup: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     children_by_parent: dict[str, list[str]] = {}
     entries: dict[str, dict[str, Any]] = {}
+    storage_aliases_by_pool = _zfs_storage_aliases_by_pool(snapshot)
 
     for row in datasets:
         if not isinstance(row, dict):
@@ -3856,26 +4800,90 @@ def _build_dataset_tree(
         row = entries[name]
         ds_type = str(row.get("type") or "").strip() or "dataset"
         volsize = _to_int(row.get("volsize_bytes"))
-        used = _to_int(row.get("used_bytes"))
+        zfs_used = _to_int(row.get("used_bytes"))
+        used_by_dataset = _to_int(row.get("used_by_dataset_bytes"))
+        used_by_children = _to_int(row.get("used_by_children_bytes"))
+        used_by_refreservation = _to_int(row.get("used_by_refreservation_bytes"))
+        used = zfs_used
         available = _to_int(row.get("available_bytes"))
         total = (
             volsize
             if volsize
             else (used + available if used is not None and available is not None else None)
         )
+        zvol_probe = _zvol_filesystem_probe(row, snapshot, filesystem_probe_by_path)
+        zvol_probe_used = _to_int(zvol_probe.get("used_bytes"))
+        zvol_probe_total = _to_int(zvol_probe.get("total_bytes"))
+        zvol_usage_note = ""
+        if zvol_probe and zvol_probe_used is not None:
+            used = zvol_probe_used
+            if zvol_probe_total is not None:
+                total = zvol_probe_total
+            probe_label = _probe_strategy_label(zvol_probe)
+            zvol_usage_note = (
+                (
+                    f"Usage is measured from {probe_label}. "
+                    "ZFS reserved or allocated space is listed in the facts."
+                )
+                if probe_label
+                else (
+                    "Usage is measured from the guest filesystem. "
+                    "ZFS reserved or allocated space is listed in the facts."
+                )
+            )
+        child_names = sorted(children_by_parent.get(name, []))
+        storage_aliases = storage_aliases_by_pool.get(name) or []
+        has_child_accounting = (
+            ds_type == "filesystem" and bool(child_names) and used_by_children not in (None, 0)
+        )
+        usage_source = (
+            "ZFS subtree accounting" if has_child_accounting else _probe_strategy_label(zvol_probe)
+        )
+        dataset_usage_text = ""
+        dataset_note = ""
+        if has_child_accounting:
+            dataset_usage_text = (
+                f"{_format_bytes(zfs_used)} ZFS subtree · "
+                f"{_format_bytes(used_by_dataset)} direct files"
+            )
+            dataset_note = (
+                "Most usage shown here belongs to child datasets or volumes, "
+                "not files directly in this mount."
+            )
         facts = _non_null_facts(
             _fact("Type", ds_type),
+            _fact("Proxmox storage", ", ".join(storage_aliases)),
             _fact("Mount", row.get("mountpoint")),
+            _fact("Filesystem", zvol_probe.get("fstype")),
+            _fact("Volume label", zvol_probe.get("volume_label")),
+            _fact("Usage source", usage_source),
+            _fact("Direct files", _format_bytes(used_by_dataset) if has_child_accounting else ""),
+            _fact(
+                "Child datasets/volumes",
+                _format_bytes(used_by_children) if has_child_accounting else "",
+            ),
+            _fact(
+                "Child reservations",
+                _format_bytes(used_by_refreservation)
+                if has_child_accounting and used_by_refreservation not in (None, 0)
+                else "",
+            ),
             _fact("Encryption", row.get("encryption")),
             _fact("Key status", row.get("keystatus")),
             _fact("Encryption root", row.get("encryptionroot")),
+            _fact("ZFS used", _format_bytes(zfs_used) if zvol_probe else ""),
+            _fact(
+                "ZFS reservation",
+                _format_bytes(_to_int(row.get("refreservation_bytes")))
+                if zvol_probe and _to_int(row.get("refreservation_bytes")) not in (None, 0)
+                else "",
+            ),
         )
         guest_roles = dataset_roles.get(name) or []
         if guest_roles:
             facts.append(
                 {"label": "Guest roles", "value": ", ".join(role["label"] for role in guest_roles)}
             )
-        child_names = sorted(children_by_parent.get(name, []))
         child_nodes = [make_dataset_node(child_name) for child_name in child_names]
         browse_meta = _filesystem_browser_meta(
             host=host,
@@ -3910,16 +4918,30 @@ def _build_dataset_tree(
                     label=name.split("/")[-1],
                 )
                 if assignment:
-                    offline_browser_meta = _offline_browser_meta_from_assignment(host, assignment)
+                    offline_browser_meta = _offline_browser_meta_from_assignment(
+                        host,
+                        assignment,
+                        sensitive_hint=" ".join(
+                            part
+                            for part in (
+                                name,
+                                str(row.get("encryptionroot") or "").strip(),
+                                str(row.get("mountpoint") or "").strip(),
+                            )
+                            if part
+                        ),
+                    )
         node = _node(
             f"{host}:dataset:{name}",
             "dataset" if ds_type == "filesystem" else "volume",
             name.split("/")[-1],
             subtitle=name,
             status="info",
+            note=zvol_usage_note or dataset_note,
             group="Datasets",
             facts=facts,
             children=child_nodes,
+            usage_text=dataset_usage_text,
             total_bytes=total,
             used_bytes=used,
             meta={**(browse_meta or {}), **guest_meta, **offline_browser_meta},
@@ -3937,6 +4959,7 @@ def _build_pool_nodes(
     by_path: dict[str, dict[str, Any]],
     thunderbolt_pools: dict[str, dict[str, Any]],
     dataset_roles: dict[str, list[dict[str, Any]]],
+    filesystem_probe_by_path: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     pool_rows = snapshot.get("zpool_list")
     if not isinstance(pool_rows, list):
@@ -4012,6 +5035,7 @@ def _build_pool_nodes(
             snapshot,
             dataset_lookup.get(pool_name) or [],
             dataset_roles=dataset_roles,
+            filesystem_probe_by_path=filesystem_probe_by_path,
             guest_identity_lookup=guest_identity_lookup,
         )
         guest_refs = (
@@ -4098,6 +5122,8 @@ def _build_standalone_logical_nodes(
         for node in candidates:
             path = str(node.get("path") or "").strip()
             if not path or guest_assignment_lookup.get(path):
+                continue
+            if _is_transient_nbd_path(path):
                 continue
             if node is not disk and (partition_pools.get(path) or []):
                 continue
@@ -4712,6 +5738,7 @@ def _build_host_node(
         by_path=by_path,
         thunderbolt_pools=thunderbolt_pools,
         dataset_roles=dataset_roles,
+        filesystem_probe_by_path=filesystem_probe_by_path,
     )
     standalone_logical_nodes = _build_standalone_logical_nodes(
         host,
@@ -5072,6 +6099,11 @@ async def disks_note(body: DisksNoteBody) -> dict[str, Any]:
     }
 
 
+@router.post("/filesystem/pin/unlock")
+async def disks_filesystem_pin_unlock(body: DisksFilesystemPinUnlockBody) -> dict[str, Any]:
+    return _unlock_disks_pin(body.pin)
+
+
 @router.post("/offline-browse/open")
 async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[str, Any]:
     clean_host = _safe_browse_host(body.host)
@@ -5081,6 +6113,10 @@ async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[st
     clean_volume_ref = _safe_volume_ref(body.volume_ref)
     guest_name = str(body.guest_name or "").strip()
     volume_label = str(body.volume_label or "").strip() or clean_volume_ref
+    sensitive_hint = str(body.sensitive_hint or "").strip()
+    if _access_text_contains_private(clean_volume_ref, volume_label, sensitive_hint):
+        if not _verify_disks_pin_token(body.pin_token):
+            raise HTTPException(423, "PIN required for this offline disk")
 
     prepare = await _offline_vm_prepare_host(
         clean_host,
@@ -5105,6 +6141,7 @@ async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[st
         "guest_name": guest_name,
         "volume_ref": clean_volume_ref,
         "volume_label": volume_label,
+        "sensitive_hint": sensitive_hint,
         "resolved_path": str(prepared.get("resolved_path") or "").strip(),
         "nbd_device": str(prepared.get("nbd_device") or "").strip(),
         "opened_at": now_iso,
@@ -5128,12 +6165,17 @@ async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[st
         raise HTTPException(502, detail)
 
     attached = attach["data"]
+    sources = copy.deepcopy(attached.get("sources") or [])
+    if sensitive_hint:
+        for source in sources:
+            if isinstance(source, dict):
+                source["sensitive_hint"] = sensitive_hint
     active_session = _offline_browse_update_session(
         session_id,
         lambda current: {
             **current,
             "state": "active",
-            "sources": copy.deepcopy(attached.get("sources") or []),
+            "sources": sources,
             "last_heartbeat_at": _utcnow_iso(),
         },
     )
@@ -5185,6 +6227,11 @@ async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]
     clean_source = _safe_device_path(body.source_path or "") if browse_mode == "device_ro" else ""
     clean_root = _normalize_browser_root_path(body.root_path)
     clean_path = _normalize_browser_relative_path(body.path)
+    if not _require_disks_pin_if_sensitive(body):
+        _, meta_payload = _filesystem_access_payload(body, action="meta")
+        meta_result = await _filesystem_access_json_host(clean_host, meta_payload)
+        if meta_result.get("ok") and isinstance(meta_result.get("data"), dict):
+            _require_disks_pin_if_sensitive(body, meta_result["data"])
     result = await _filesystem_tree_host(
         clean_host,
         browse_mode=browse_mode,
@@ -5200,6 +6247,8 @@ async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]
         payload["browse_mode"] = browse_mode
         if clean_source:
             payload["source_path"] = clean_source
+        payload["sensitive"] = _filesystem_access_is_sensitive(body, payload)
+        _require_disks_pin_if_sensitive(body, payload)
         return payload
     detail = str(result.get("error") or "Filesystem tree unavailable").strip()
     lowered = detail.lower()
@@ -5217,6 +6266,121 @@ async def disks_filesystem_tree(body: DisksFilesystemTreeBody) -> dict[str, Any]
     ):
         raise HTTPException(400, detail)
     raise HTTPException(502, detail)
+
+
+@router.post("/filesystem/preview")
+async def disks_filesystem_preview(body: DisksFilesystemAccessBody) -> dict[str, Any]:
+    _require_disks_pin_if_sensitive(body)
+    clean_host, payload = _filesystem_access_payload(body, action="preview")
+    _, meta_payload = _filesystem_access_payload(body, action="meta")
+    meta_result = await _filesystem_access_json_host(clean_host, meta_payload)
+    if not meta_result.get("ok") or not isinstance(meta_result.get("data"), dict):
+        detail = str(meta_result.get("error") or "Filesystem preview unavailable").strip()
+        raise _filesystem_error_to_http(detail)
+    _require_disks_pin_if_sensitive(body, meta_result["data"])
+    payload["max_bytes"] = _DISKS_FILE_PREVIEW_MAX_BYTES
+    result = await _filesystem_access_json_host(clean_host, payload)
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        data = result["data"]
+        data["host"] = clean_host
+        data["root_path"] = payload["root_path"]
+        data["browse_mode"] = payload["browse_mode"]
+        data["source_path"] = payload["source_path"]
+        data["editable"] = (
+            payload["browse_mode"] == "mounted"
+            and data.get("type") == "file"
+            and data.get("preview_kind") in {"markdown", "text"}
+            and int(data.get("size_bytes") or 0) <= _DISKS_FILE_EDIT_MAX_BYTES
+        )
+        data["sensitive"] = _filesystem_access_is_sensitive(body, data)
+        _require_disks_pin_if_sensitive(body, data)
+        return data
+    detail = str(result.get("error") or "Filesystem preview unavailable").strip()
+    raise _filesystem_error_to_http(detail)
+
+
+@router.post("/filesystem/save")
+async def disks_filesystem_save(body: DisksFilesystemSaveBody) -> dict[str, Any]:
+    _require_disks_pin_if_sensitive(body)
+    if _normalize_browser_mode(body.browse_mode) == "device_ro":
+        raise HTTPException(400, "Offline device browsing is read-only")
+    if len((body.content or "").encode("utf-8")) > _DISKS_FILE_EDIT_MAX_BYTES:
+        raise HTTPException(
+            400, f"File exceeds editable limit of {_format_bytes(_DISKS_FILE_EDIT_MAX_BYTES)}"
+        )
+    clean_host, meta_payload = _filesystem_access_payload(body, action="meta")
+    meta_result = await _filesystem_access_json_host(clean_host, meta_payload)
+    if not meta_result.get("ok") or not isinstance(meta_result.get("data"), dict):
+        detail = str(meta_result.get("error") or "Filesystem save unavailable").strip()
+        raise _filesystem_error_to_http(detail)
+    _require_disks_pin_if_sensitive(body, meta_result["data"])
+    clean_host, payload = _filesystem_access_payload(
+        body,
+        action="save",
+        write_tag=secrets.token_hex(6),
+        content=body.content or "",
+    )
+    result = await _filesystem_access_json_host(clean_host, payload)
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        data = result["data"]
+        data["host"] = clean_host
+        data["root_path"] = payload["root_path"]
+        data["browse_mode"] = payload["browse_mode"]
+        data["source_path"] = payload["source_path"]
+        data["sensitive"] = _filesystem_access_is_sensitive(body, data)
+        _require_disks_pin_if_sensitive(body, data)
+        return data
+    detail = str(result.get("error") or "Filesystem save unavailable").strip()
+    raise _filesystem_error_to_http(detail)
+
+
+@router.post("/filesystem/download")
+async def disks_filesystem_download(body: DisksFilesystemAccessBody) -> StreamingResponse:
+    _require_disks_pin_if_sensitive(body)
+    meta_host, meta_payload = _filesystem_access_payload(body, action="meta")
+    meta_result = await _filesystem_access_json_host(meta_host, meta_payload)
+    if not meta_result.get("ok") or not isinstance(meta_result.get("data"), dict):
+        detail = str(meta_result.get("error") or "Filesystem download unavailable").strip()
+        raise _filesystem_error_to_http(detail)
+    meta = meta_result["data"]
+    _require_disks_pin_if_sensitive(body, meta)
+    item_type = str(meta.get("type") or "").strip()
+    if item_type not in {"file", "folder"}:
+        raise HTTPException(400, "Download target is not a file or directory")
+
+    filename = _safe_download_filename(meta.get("filename") or body.path)
+    media_type = str(meta.get("mime") or "application/octet-stream")
+    transfer = "ssh-stream"
+    iterator: Iterator[bytes]
+    if (
+        item_type == "file"
+        and _normalize_browser_mode(body.browse_mode) == "mounted"
+        and str(meta.get("absolute_path") or "").startswith("/")
+    ):
+        transfer = "scp"
+        proc = _filesystem_scp_stream_process(meta_host, str(meta.get("absolute_path") or ""))
+        iterator = _iter_process_stdout(proc)
+    else:
+        mount_tag = secrets.token_hex(8)
+        clean_host, payload = _filesystem_access_payload(
+            body,
+            action="download",
+            mount_tag=mount_tag,
+        )
+        proc = _filesystem_access_stream_process(clean_host, payload)
+        iterator = _iter_filesystem_script_stream(proc, host=clean_host, mount_tag=mount_tag)
+    if item_type == "folder":
+        filename = f"{filename}.tar.gz" if not filename.endswith(".tar.gz") else filename
+        media_type = "application/gzip"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Blueprints-Disks-Transfer": transfer,
+    }
+    return StreamingResponse(
+        iterator,
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 @router.get("/smart")

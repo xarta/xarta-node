@@ -95,6 +95,12 @@ CREATE TABLE IF NOT EXISTS disks_notes (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS disks_security (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS pfsense_dns (
     dns_entry_id  TEXT PRIMARY KEY,
     ip_address    TEXT NOT NULL,
