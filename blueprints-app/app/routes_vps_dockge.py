@@ -8,6 +8,7 @@ tailnet address can be preferred with a public address used only as failover.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -64,7 +65,9 @@ _VPS_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-vps-dockge-cache"
 _VPS_DOCKGE_SPEECH_PROMPT_VERSION = "20260514-central-doc-context-v1"
 _VPS_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _VPS_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
-_VPS_DOCKGE_METRICS_MIN_INTERVAL = 0.9
+_VPS_DOCKGE_METRICS_STREAM_IDLE_TIMEOUT = 15.0
+_VPS_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT = 2.5
+_VPS_DOCKGE_SSH_CONTROL_DIR = Path("/run/blueprints-app/ssh")
 _VPS_DOCKGE_SOURCE_SUFFIXES = {
     ".conf",
     ".cfg",
@@ -84,8 +87,16 @@ _VPS_DOCKGE_REQUIRED_ENV = (
     "VPS_DOCKGE_SSH_KEY",
     "VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
 )
-_VPS_DOCKGE_METRICS_LOCK = threading.Lock()
-_VPS_DOCKGE_METRICS_CACHE: dict[str, Any] = {"monotonic": 0.0, "payload": None}
+_VPS_DOCKGE_METRICS_STREAM_CONDITION = threading.Condition()
+_VPS_DOCKGE_METRICS_STREAM: dict[str, Any] = {
+    "thread": None,
+    "process": None,
+    "payload": None,
+    "payload_at": 0.0,
+    "last_access": 0.0,
+    "host": "",
+    "error": None,
+}
 
 
 class VpsDockgeAction(BaseModel):
@@ -463,6 +474,20 @@ def _ssh_base_args(host: str, *, connect_timeout: int = 8) -> list[str]:
     key = cfg.VPS_DOCKGE_SSH_KEY.strip()
     if not key or not os.path.isfile(key):
         raise HTTPException(500, f"VPS_DOCKGE_SSH_KEY not found: {key or '(empty)'}")
+    try:
+        _VPS_DOCKGE_SSH_CONTROL_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(_VPS_DOCKGE_SSH_CONTROL_DIR, 0o700)
+        control_path = str(_VPS_DOCKGE_SSH_CONTROL_DIR / "vps-dockge-%C")
+        control_args = [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=90s",
+            "-o",
+            f"ControlPath={control_path}",
+        ]
+    except OSError:
+        control_args = []
     return [
         "ssh",
         "-i",
@@ -473,6 +498,7 @@ def _ssh_base_args(host: str, *, connect_timeout: int = 8) -> list[str]:
         "StrictHostKeyChecking=accept-new",
         "-o",
         f"ConnectTimeout={connect_timeout}",
+        *control_args,
         f"{cfg.VPS_DOCKGE_SSH_USER}@{host}",
     ]
 
@@ -501,11 +527,20 @@ def _run_remote(script: str, *, timeout: int = 30) -> tuple[subprocess.Completed
     )
 
 
-def _remote_metrics_script(root: str, source: str) -> str:
+def _remote_metrics_script(
+    root: str,
+    source: str,
+    *,
+    container_map: list[dict[str, Any]] | None,
+    refresh_container_map: bool,
+) -> str:
+    encoded_map = base64.b64encode(
+        json.dumps(container_map or [], separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
     remote_py = r"""
+import base64
 import json
 import os
-import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -569,37 +604,6 @@ def parse_labels(value):
     return labels
 
 
-def parse_size_bytes(value):
-    match = re.match(r"^\s*(?P<num>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>[A-Za-z]+)?", value or "")
-    if not match:
-        return 0
-    number = float(match.group("num"))
-    unit = (match.group("unit") or "B").lower()
-    multipliers = {
-        "b": 1,
-        "kb": 1000,
-        "kib": 1024,
-        "mb": 1000**2,
-        "mib": 1024**2,
-        "gb": 1000**3,
-        "gib": 1024**3,
-        "tb": 1000**4,
-        "tib": 1024**4,
-    }
-    return int(number * multipliers.get(unit, 1))
-
-
-def parse_percent(value):
-    try:
-        return float(str(value or "0").strip().rstrip("%"))
-    except ValueError:
-        return 0.0
-
-
-def memory_usage_bytes(value):
-    return parse_size_bytes(str(value or "").split("/", 1)[0].strip())
-
-
 def read_cgroup_number(path):
     try:
         raw = Path(path).read_text(encoding="utf-8").strip()
@@ -612,21 +616,6 @@ def read_cgroup_number(path):
     except ValueError:
         return None
     return value if value > 0 else None
-
-
-def available_memory_bytes():
-    cgroup_limit = read_cgroup_number("/sys/fs/cgroup/memory.max")
-    if cgroup_limit:
-        return cgroup_limit
-    try:
-        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-            if line.startswith("MemTotal:"):
-                parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[1]) * 1024
-    except OSError:
-        pass
-    return 0
 
 
 def parse_cpuset_count(value):
@@ -675,6 +664,59 @@ def available_cpu_units():
     return float(os.cpu_count() or 1)
 
 
+def proc_meminfo():
+    info = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if ":" not in line:
+                continue
+            key, raw = line.split(":", 1)
+            if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                parts = raw.split()
+                if parts:
+                    info[key] = int(parts[0]) * 1024
+    except OSError:
+        pass
+    return info
+
+
+def proc_stat_cpu():
+    try:
+        parts = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    except (OSError, IndexError):
+        return {"total": 0, "idle": 0}
+    values = [int(part) for part in parts[1:] if part.isdigit()]
+    idle = values[3] + values[4] if len(values) > 4 else (values[3] if len(values) > 3 else 0)
+    return {"total": sum(values), "idle": idle}
+
+
+def proc_netdev():
+    rows = []
+    try:
+        lines = Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]
+    except OSError:
+        return rows
+    for line in lines:
+        if ":" not in line:
+            continue
+        iface, raw = line.split(":", 1)
+        parts = raw.split()
+        if len(parts) < 16:
+            continue
+        name = iface.strip()
+        external = (
+            name.startswith(("en", "eth", "wl", "ww", "tailscale", "wg"))
+            and not name.startswith(("veth",))
+        )
+        rows.append({
+            "name": name,
+            "rx_bytes": int(parts[0]),
+            "tx_bytes": int(parts[8]),
+            "external": external,
+        })
+    return rows
+
+
 def stack_dirs(root):
     try:
         root_path = Path(root).expanduser().resolve()
@@ -700,95 +742,128 @@ def stack_name_from_labels(labels, root_path, known_stacks):
     return ""
 
 
-try:
-    stacks_root = os.environ.get("BP_STACKS_ROOT", "")
-    root_path, known_stacks = stack_dirs(stacks_root)
-    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=5)
-    by_ref = {}
-    by_stack = {}
+def container_map_from_docker(root):
+    root_path, known_stacks = stack_dirs(root)
+    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=4)
+    containers = []
+    seen = set()
     for row in rows:
         labels = parse_labels(row.get("Labels") if "Labels" in row else row.get("labels"))
         stack_name = stack_name_from_labels(labels, root_path, known_stacks)
-        if not stack_name:
-            continue
         container_id = field(row, "ID", "Id", "id")
-        name = field(row, "Names", "Name", "name")
-        state = field(row, "State", "state").lower()
-        meta = {
+        if not stack_name or not container_id or container_id in seen:
+            continue
+        seen.add(container_id)
+        containers.append({
             "id": container_id,
-            "name": name,
+            "name": field(row, "Names", "Name", "name"),
             "stack_name": stack_name,
             "service": labels.get("com.docker.compose.service", ""),
-            "state": state,
-        }
-        if container_id:
-            by_ref[container_id] = meta
-            by_ref[container_id[:12]] = meta
-        if name:
-            by_ref[name] = meta
-        by_stack.setdefault(stack_name, []).append(meta)
+            "state": field(row, "State", "state").lower(),
+        })
+    return sorted(containers, key=lambda item: (item["stack_name"].lower(), item.get("name", "")))
 
-    running_ids = sorted({meta["id"] for meta in by_ref.values() if meta.get("id") and meta.get("state") == "running"})
-    stat_rows = run_json(["docker", "stats", "--no-stream", "--format", "json", *running_ids], timeout=8) if running_ids else []
-    cpu_units = available_cpu_units()
-    memory_total = available_memory_bytes()
-    stacks = {
-        stack_name: {
-            "stack_name": stack_name,
-            "cpu_percent": 0.0,
-            "cpu_docker_percent": 0.0,
-            "memory_percent": 0.0,
-            "memory_bytes": 0,
-            "containers": [],
-        }
-        for stack_name in by_stack
-    }
 
-    for row in stat_rows:
-        container_ref = field(row, "Container", "ID", "Name")
-        name = field(row, "Name")
-        meta = by_ref.get(container_ref) or by_ref.get(container_ref[:12]) or by_ref.get(name)
-        if not meta:
+def decode_container_map():
+    raw = os.environ.get("BP_CONTAINER_MAP_B64", "")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(base64.b64decode(raw.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    containers = []
+    for item in parsed:
+        if not isinstance(item, dict):
             continue
-        stack_name = meta["stack_name"]
-        stack = stacks.setdefault(stack_name, {
+        container_id = str(item.get("id") or "")
+        stack_name = str(item.get("stack_name") or "")
+        if not container_id or not stack_name:
+            continue
+        containers.append({
+            "id": container_id,
+            "name": str(item.get("name") or ""),
             "stack_name": stack_name,
-            "cpu_percent": 0.0,
-            "cpu_docker_percent": 0.0,
-            "memory_percent": 0.0,
-            "memory_bytes": 0,
-            "containers": [],
+            "service": str(item.get("service") or ""),
+            "state": str(item.get("state") or ""),
         })
-        docker_cpu = parse_percent(field(row, "CPUPerc"))
-        memory_bytes = memory_usage_bytes(field(row, "MemUsage"))
-        stack["cpu_docker_percent"] += docker_cpu
-        stack["memory_bytes"] += memory_bytes
-        stack["containers"].append({
-            "id": meta.get("id", "")[:12],
-            "name": meta.get("name") or name,
-            "service": meta.get("service", ""),
-            "cpu_docker_percent": round(docker_cpu, 3),
-            "memory_bytes": memory_bytes,
-        })
+    return containers
 
-    for stack in stacks.values():
-        stack["cpu_percent"] = round(min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3)
-        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
-        stack["memory_percent"] = round(
-            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0) if memory_total else 0.0,
-            3,
-        )
+
+def cgroup_dir(container_id):
+    candidates = [
+        f"/sys/fs/cgroup/system.slice/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/docker/{container_id}",
+        f"/sys/fs/cgroup/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/system.slice/docker.service/docker/{container_id}",
+    ]
+    for path in candidates:
+        current = Path(path)
+        if (current / "cpu.stat").exists() or (current / "memory.current").exists():
+            return current
+    return None
+
+
+def cpu_usage_usec(cgroup):
+    if cgroup is None:
+        return None
+    try:
+        for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("usage_usec "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+try:
+    stacks_root = os.environ.get("BP_STACKS_ROOT", "")
+    refresh_map = os.environ.get("BP_REFRESH_CONTAINER_MAP", "0") == "1"
+    containers = container_map_from_docker(stacks_root) if refresh_map else decode_container_map()
+    if not containers:
+        refresh_map = True
+        containers = container_map_from_docker(stacks_root)
+
+    cpu_units = available_cpu_units()
+    meminfo = proc_meminfo()
+    sampled = []
+    for item in containers:
+        cgroup = cgroup_dir(item["id"])
+        memory_bytes = read_cgroup_number(cgroup / "memory.current") if cgroup else 0
+        sampled.append({
+            **item,
+            "cgroup_found": cgroup is not None,
+            "cpu_usage_usec": cpu_usage_usec(cgroup),
+            "memory_bytes": memory_bytes or 0,
+        })
 
     emit({
         "ok": True,
-        "source": os.environ.get("BP_METRICS_SOURCE", "docker-stats-ssh"),
+        "source": os.environ.get("BP_METRICS_SOURCE", "cgroup-fast-ssh"),
+        "sample_kind": "cgroup-counters",
+        "sample_monotonic_ns": time.monotonic_ns(),
+        "sample_epoch_seconds": time.time(),
+        "container_map_refreshed": refresh_map,
+        "container_map": containers if refresh_map else [],
         "capacity": {
             "cpu_units": round(cpu_units, 3),
-            "memory_bytes": memory_total,
+            "memory_bytes": meminfo.get("MemTotal", 0),
+        },
+        "host": {
+            "cpu": proc_stat_cpu(),
+            "memory": {
+                "total_bytes": meminfo.get("MemTotal", 0),
+                "available_bytes": meminfo.get("MemAvailable", 0),
+                "swap_total_bytes": meminfo.get("SwapTotal", 0),
+                "swap_free_bytes": meminfo.get("SwapFree", 0),
+            },
+            "network_interfaces": proc_netdev(),
         },
         "interval_seconds": 1,
         "window_seconds": 10,
-        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+        "containers": sampled,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
 except Exception as exc:
@@ -797,38 +872,722 @@ except Exception as exc:
     return (
         f"BP_STACKS_ROOT={shlex.quote(root)} "
         f"BP_METRICS_SOURCE={shlex.quote(source)} "
+        f"BP_REFRESH_CONTAINER_MAP={'1' if refresh_container_map else '0'} "
+        f"BP_CONTAINER_MAP_B64={shlex.quote(encoded_map)} "
         f"python3 - <<'PY'\n{remote_py}\nPY"
     )
 
 
+def _vps_dockge_stack_metrics_from_counters(current: dict, previous: dict | None) -> dict:
+    containers = current.get("containers") or []
+    prev_by_id = {
+        str(item.get("id") or ""): item
+        for item in (previous or {}).get("containers", [])
+        if item.get("id")
+    }
+    elapsed_seconds = 0.0
+    if previous:
+        elapsed_ns = int(current.get("sample_monotonic_ns") or 0) - int(
+            previous.get("sample_monotonic_ns") or 0
+        )
+        elapsed_seconds = max(0.0, elapsed_ns / 1_000_000_000)
+    sample_ready = elapsed_seconds > 0
+    elapsed_usec = elapsed_seconds * 1_000_000
+
+    memory_total = int((current.get("capacity") or {}).get("memory_bytes") or 0)
+    cpu_units = float((current.get("capacity") or {}).get("cpu_units") or 1.0)
+    stacks: dict[str, dict[str, Any]] = {}
+    for item in containers:
+        stack_name = str(item.get("stack_name") or "")
+        if not stack_name:
+            continue
+        stack = stacks.setdefault(
+            stack_name,
+            {
+                "stack_name": stack_name,
+                "cpu_percent": 0.0,
+                "cpu_docker_percent": 0.0,
+                "memory_percent": 0.0,
+                "memory_bytes": 0,
+                "containers": [],
+            },
+        )
+        container_id = str(item.get("id") or "")
+        current_usage = item.get("cpu_usage_usec")
+        previous_usage = (prev_by_id.get(container_id) or {}).get("cpu_usage_usec")
+        cpu_cores = 0.0
+        if (
+            sample_ready
+            and isinstance(current_usage, int)
+            and isinstance(previous_usage, int)
+            and elapsed_usec > 0
+        ):
+            cpu_cores = max(0.0, (current_usage - previous_usage) / elapsed_usec)
+        docker_cpu = cpu_cores * 100.0
+        memory_bytes = max(0, int(item.get("memory_bytes") or 0))
+        stack["cpu_docker_percent"] += docker_cpu
+        stack["memory_bytes"] += memory_bytes
+        stack["containers"].append(
+            {
+                "id": container_id[:12],
+                "name": item.get("name") or "",
+                "service": item.get("service") or "",
+                "state": item.get("state")
+                or ("running" if item.get("cgroup_found") else "stopped"),
+                "cgroup_found": bool(item.get("cgroup_found")),
+                "cpu_docker_percent": round(docker_cpu, 3),
+                "memory_bytes": memory_bytes,
+            }
+        )
+
+    for stack in stacks.values():
+        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+        stack["cpu_percent"] = round(
+            min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)),
+            3,
+        )
+        stack["memory_percent"] = round(
+            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0) if memory_total else 0.0,
+            3,
+        )
+
+    host = current.get("host") or {}
+    host_memory = host.get("memory") or {}
+    host_cpu_percent = 0.0
+    if previous:
+        current_cpu = host.get("cpu") or {}
+        previous_cpu = (previous.get("host") or {}).get("cpu") or {}
+        total_delta = int(current_cpu.get("total") or 0) - int(previous_cpu.get("total") or 0)
+        idle_delta = int(current_cpu.get("idle") or 0) - int(previous_cpu.get("idle") or 0)
+        if total_delta > 0:
+            host_cpu_percent = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+
+    previous_net = {
+        item.get("name"): item
+        for item in (((previous or {}).get("host") or {}).get("network_interfaces") or [])
+        if item.get("name")
+    }
+    interfaces = []
+    total_rx_bps = 0.0
+    total_tx_bps = 0.0
+    for item in host.get("network_interfaces") or []:
+        name = item.get("name")
+        prev = previous_net.get(name)
+        rx_bps = 0.0
+        tx_bps = 0.0
+        if sample_ready and prev:
+            rx_bps = max(
+                0.0,
+                (int(item.get("rx_bytes") or 0) - int(prev.get("rx_bytes") or 0)) / elapsed_seconds,
+            )
+            tx_bps = max(
+                0.0,
+                (int(item.get("tx_bytes") or 0) - int(prev.get("tx_bytes") or 0)) / elapsed_seconds,
+            )
+        if item.get("external"):
+            total_rx_bps += rx_bps
+            total_tx_bps += tx_bps
+        interfaces.append(
+            {
+                "name": name,
+                "rx_bytes": int(item.get("rx_bytes") or 0),
+                "tx_bytes": int(item.get("tx_bytes") or 0),
+                "rx_bytes_per_second": round(rx_bps, 1),
+                "tx_bytes_per_second": round(tx_bps, 1),
+                "external": bool(item.get("external")),
+            }
+        )
+
+    host_total = int(host_memory.get("total_bytes") or memory_total or 0)
+    host_available = int(host_memory.get("available_bytes") or 0)
+    host_memory_used = max(0, host_total - host_available)
+    host_payload = {
+        "cpu_percent": round(host_cpu_percent, 3),
+        "memory_total_bytes": host_total,
+        "memory_available_bytes": host_available,
+        "memory_used_bytes": host_memory_used,
+        "memory_percent": round(
+            min(100.0, (host_memory_used / host_total) * 100.0) if host_total else 0.0,
+            3,
+        ),
+        "network_external_rx_bytes_per_second": round(total_rx_bps, 1),
+        "network_external_tx_bytes_per_second": round(total_tx_bps, 1),
+        "network_interfaces": interfaces,
+    }
+
+    return {
+        "sample_ready": sample_ready,
+        "sample_elapsed_seconds": round(elapsed_seconds, 3) if sample_ready else 0,
+        "host": host_payload,
+        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+    }
+
+
+def _remote_metrics_stream_script(root: str, source: str) -> str:
+    remote_py = r"""
+import json
+import os
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+MAP_TTL_SECONDS = 20.0
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+def field(item, *names):
+    for name in names:
+        value = item.get(name)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def parse_json_lines(text):
+    rows = []
+    stripped = (text or "").strip()
+    if not stripped:
+        return rows
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    except json.JSONDecodeError:
+        pass
+    for line in stripped.splitlines():
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def run_json(args, timeout):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker command failed")
+    return parse_json_lines(result.stdout)
+
+
+def parse_labels(value):
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    labels = {}
+    for part in str(value or "").split(","):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        labels[key.strip()] = val.strip()
+    return labels
+
+
+def stack_dirs(root):
+    try:
+        root_path = Path(root).expanduser().resolve()
+        names = {path.name for path in root_path.iterdir() if path.is_dir()}
+    except OSError:
+        root_path = Path(root).expanduser()
+        names = set()
+    return root_path, names
+
+
+def stack_name_from_labels(labels, root_path, known_stacks):
+    working_dir = (labels.get("com.docker.compose.project.working_dir") or "").strip()
+    if working_dir:
+        try:
+            resolved = Path(working_dir).expanduser().resolve()
+            if resolved == root_path or root_path in resolved.parents:
+                return resolved.name
+        except OSError:
+            pass
+    project = (labels.get("com.docker.compose.project") or "").strip()
+    if project and (not known_stacks or project in known_stacks):
+        return project
+    return ""
+
+
+def container_map_from_docker(root):
+    root_path, known_stacks = stack_dirs(root)
+    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=4)
+    containers = []
+    seen = set()
+    for row in rows:
+        labels = parse_labels(row.get("Labels") if "Labels" in row else row.get("labels"))
+        stack_name = stack_name_from_labels(labels, root_path, known_stacks)
+        container_id = field(row, "ID", "Id", "id")
+        if not stack_name or not container_id or container_id in seen:
+            continue
+        seen.add(container_id)
+        containers.append({
+            "id": container_id,
+            "name": field(row, "Names", "Name", "name"),
+            "stack_name": stack_name,
+            "service": labels.get("com.docker.compose.service", ""),
+            "state": field(row, "State", "state").lower(),
+        })
+    return sorted(containers, key=lambda item: (item["stack_name"].lower(), item.get("name", "")))
+
+
+def read_number(path):
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def parse_cpuset_count(value):
+    total = 0
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                total += max(0, int(end) - int(start) + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(part)
+            except ValueError:
+                continue
+            total += 1
+    return total
+
+
+def available_cpu_units():
+    try:
+        quota_raw, period_raw, *_ = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip().split()
+        if quota_raw != "max":
+            quota = float(quota_raw)
+            period = float(period_raw)
+            if quota > 0 and period > 0:
+                return max(0.01, quota / period)
+    except (OSError, ValueError):
+        pass
+    try:
+        cpuset_count = parse_cpuset_count(Path("/sys/fs/cgroup/cpuset.cpus.effective").read_text(encoding="utf-8").strip())
+        if cpuset_count:
+            return float(cpuset_count)
+    except OSError:
+        pass
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return float(len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+def proc_meminfo():
+    info = {}
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return info
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+            parts = raw.split()
+            if parts:
+                info[key] = int(parts[0]) * 1024
+    return info
+
+
+def proc_stat_cpu():
+    try:
+        parts = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    except (OSError, IndexError):
+        return {"total": 0, "idle": 0}
+    values = [int(part) for part in parts[1:] if part.isdigit()]
+    idle = values[3] + values[4] if len(values) > 4 else (values[3] if len(values) > 3 else 0)
+    return {"total": sum(values), "idle": idle}
+
+
+def proc_netdev():
+    rows = []
+    try:
+        lines = Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]
+    except OSError:
+        return rows
+    for line in lines:
+        if ":" not in line:
+            continue
+        iface, raw = line.split(":", 1)
+        parts = raw.split()
+        if len(parts) < 16:
+            continue
+        name = iface.strip()
+        external = (
+            name.startswith(("en", "eth", "wl", "ww", "tailscale", "wg"))
+            and not name.startswith("veth")
+        )
+        rows.append({
+            "name": name,
+            "rx_bytes": int(parts[0]),
+            "tx_bytes": int(parts[8]),
+            "external": external,
+        })
+    return rows
+
+
+def cgroup_dir(container_id):
+    candidates = [
+        f"/sys/fs/cgroup/system.slice/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/docker/{container_id}",
+        f"/sys/fs/cgroup/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/system.slice/docker.service/docker/{container_id}",
+    ]
+    for path in candidates:
+        current = Path(path)
+        if (current / "cpu.stat").exists() or (current / "memory.current").exists():
+            return current
+    return None
+
+
+def cpu_usage_usec(cgroup):
+    if cgroup is None:
+        return None
+    try:
+        for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("usage_usec "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def sample_raw(containers):
+    meminfo = proc_meminfo()
+    sampled = []
+    for item in containers:
+        cgroup = cgroup_dir(item["id"])
+        memory_bytes = read_number(cgroup / "memory.current") if cgroup else 0
+        sampled.append({
+            **item,
+            "cgroup_found": cgroup is not None,
+            "cpu_usage_usec": cpu_usage_usec(cgroup),
+            "memory_bytes": memory_bytes or 0,
+        })
+    return {
+        "monotonic_ns": time.monotonic_ns(),
+        "capacity": {
+            "cpu_units": round(available_cpu_units(), 3),
+            "memory_bytes": meminfo.get("MemTotal", 0),
+        },
+        "host": {
+            "cpu": proc_stat_cpu(),
+            "memory": {
+                "total_bytes": meminfo.get("MemTotal", 0),
+                "available_bytes": meminfo.get("MemAvailable", 0),
+                "swap_total_bytes": meminfo.get("SwapTotal", 0),
+                "swap_free_bytes": meminfo.get("SwapFree", 0),
+            },
+            "network_interfaces": proc_netdev(),
+        },
+        "containers": sampled,
+    }
+
+
+def build_payload(current, previous, containers, refreshed, sample_elapsed_ms):
+    elapsed_seconds = 0.0
+    if previous:
+        elapsed_seconds = max(0.0, (current["monotonic_ns"] - previous["monotonic_ns"]) / 1_000_000_000)
+    sample_ready = elapsed_seconds > 0
+    elapsed_usec = elapsed_seconds * 1_000_000
+    prev_by_id = {
+        item["id"]: item
+        for item in (previous or {}).get("containers", [])
+        if item.get("id")
+    }
+    memory_total = int(current.get("capacity", {}).get("memory_bytes") or 0)
+    cpu_units = float(current.get("capacity", {}).get("cpu_units") or 1.0)
+    stacks = {}
+    for item in current["containers"]:
+        stack_name = item.get("stack_name") or ""
+        if not stack_name:
+            continue
+        stack = stacks.setdefault(stack_name, {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        })
+        previous_item = prev_by_id.get(item.get("id"))
+        cpu_cores = 0.0
+        if (
+            sample_ready
+            and isinstance(item.get("cpu_usage_usec"), int)
+            and previous_item
+            and isinstance(previous_item.get("cpu_usage_usec"), int)
+            and elapsed_usec > 0
+        ):
+            cpu_cores = max(0.0, (item["cpu_usage_usec"] - previous_item["cpu_usage_usec"]) / elapsed_usec)
+        docker_cpu = cpu_cores * 100.0
+        memory_bytes = max(0, int(item.get("memory_bytes") or 0))
+        stack["cpu_docker_percent"] += docker_cpu
+        stack["memory_bytes"] += memory_bytes
+        stack["containers"].append({
+            "id": (item.get("id") or "")[:12],
+            "name": item.get("name") or "",
+            "service": item.get("service") or "",
+            "state": item.get("state") or ("running" if item.get("cgroup_found") else "stopped"),
+            "cgroup_found": bool(item.get("cgroup_found")),
+            "cpu_docker_percent": round(docker_cpu, 3),
+            "memory_bytes": memory_bytes,
+        })
+    for stack in stacks.values():
+        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+        stack["cpu_percent"] = round(min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3)
+        stack["memory_percent"] = round(
+            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0)
+            if memory_total
+            else 0.0,
+            3,
+        )
+
+    host = current.get("host") or {}
+    host_memory = host.get("memory") or {}
+    host_cpu_percent = 0.0
+    if previous:
+        current_cpu = host.get("cpu") or {}
+        previous_cpu = (previous.get("host") or {}).get("cpu") or {}
+        total_delta = int(current_cpu.get("total") or 0) - int(previous_cpu.get("total") or 0)
+        idle_delta = int(current_cpu.get("idle") or 0) - int(previous_cpu.get("idle") or 0)
+        if total_delta > 0:
+            host_cpu_percent = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+
+    previous_net = {
+        item.get("name"): item
+        for item in ((previous or {}).get("host") or {}).get("network_interfaces", [])
+        if item.get("name")
+    }
+    interfaces = []
+    total_rx_bps = 0.0
+    total_tx_bps = 0.0
+    for item in host.get("network_interfaces") or []:
+        prev = previous_net.get(item.get("name"))
+        rx_bps = 0.0
+        tx_bps = 0.0
+        if sample_ready and prev:
+            rx_bps = max(0.0, (int(item.get("rx_bytes") or 0) - int(prev.get("rx_bytes") or 0)) / elapsed_seconds)
+            tx_bps = max(0.0, (int(item.get("tx_bytes") or 0) - int(prev.get("tx_bytes") or 0)) / elapsed_seconds)
+        if item.get("external"):
+            total_rx_bps += rx_bps
+            total_tx_bps += tx_bps
+        interfaces.append({
+            "name": item.get("name"),
+            "rx_bytes": int(item.get("rx_bytes") or 0),
+            "tx_bytes": int(item.get("tx_bytes") or 0),
+            "rx_bytes_per_second": round(rx_bps, 1),
+            "tx_bytes_per_second": round(tx_bps, 1),
+            "external": bool(item.get("external")),
+        })
+
+    host_total = int(host_memory.get("total_bytes") or memory_total or 0)
+    host_available = int(host_memory.get("available_bytes") or 0)
+    host_memory_used = max(0, host_total - host_available)
+    return {
+        "ok": True,
+        "source": os.environ.get("BP_METRICS_SOURCE", "cgroup-stream-ssh"),
+        "sample_kind": "cgroup-counters-stream",
+        "sample_ready": sample_ready,
+        "sample_elapsed_seconds": round(elapsed_seconds, 3) if sample_ready else 0,
+        "probe_elapsed_ms": round(sample_elapsed_ms, 3),
+        "container_map_refreshed": refreshed,
+        "capacity": current["capacity"],
+        "host": {
+            "cpu_percent": round(host_cpu_percent, 3),
+            "memory_total_bytes": host_total,
+            "memory_available_bytes": host_available,
+            "memory_used_bytes": host_memory_used,
+            "memory_percent": round(min(100.0, (host_memory_used / host_total) * 100.0) if host_total else 0.0, 3),
+            "network_external_rx_bytes_per_second": round(total_rx_bps, 1),
+            "network_external_tx_bytes_per_second": round(total_tx_bps, 1),
+            "network_interfaces": interfaces,
+        },
+        "interval_seconds": 1,
+        "window_seconds": 10,
+        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+stacks_root = os.environ.get("BP_STACKS_ROOT", "")
+containers = []
+last_map_at = 0.0
+previous_sample = None
+while True:
+    tick_started = time.monotonic()
+    refreshed = False
+    try:
+        if not containers or tick_started - last_map_at > MAP_TTL_SECONDS:
+            containers = container_map_from_docker(stacks_root)
+            last_map_at = tick_started
+            refreshed = True
+        read_started = time.perf_counter()
+        current_sample = sample_raw(containers)
+        sample_elapsed_ms = (time.perf_counter() - read_started) * 1000
+        emit(build_payload(current_sample, previous_sample, containers, refreshed, sample_elapsed_ms))
+        previous_sample = current_sample
+    except Exception as exc:
+        emit({
+            "ok": False,
+            "detail": str(exc),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    sleep_for = max(0.0, 1.0 - (time.monotonic() - tick_started))
+    time.sleep(sleep_for)
+"""
+    return (
+        f"BP_STACKS_ROOT={shlex.quote(root)} "
+        f"BP_METRICS_SOURCE={shlex.quote(source)} "
+        f"python3 -u - <<'PY'\n{remote_py}\nPY"
+    )
+
+
+def _vps_dockge_metrics_stream_worker() -> None:
+    current_thread = threading.current_thread()
+    errors: list[str] = []
+    try:
+        for host in _ssh_hosts():
+            proc: subprocess.Popen[str] | None = None
+            try:
+                proc = subprocess.Popen(
+                    _ssh_base_args(host)
+                    + [_remote_metrics_stream_script(_stacks_root(), "cgroup-stream-ssh")],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as exc:
+                errors.append(f"{host}: {exc}")
+                continue
+
+            with _VPS_DOCKGE_METRICS_STREAM_CONDITION:
+                _VPS_DOCKGE_METRICS_STREAM["process"] = proc
+                _VPS_DOCKGE_METRICS_STREAM["host"] = host
+                _VPS_DOCKGE_METRICS_STREAM["error"] = None
+                _VPS_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                with _VPS_DOCKGE_METRICS_STREAM_CONDITION:
+                    if payload.get("ok"):
+                        now = time.monotonic()
+                        _VPS_DOCKGE_METRICS_STREAM["payload"] = {
+                            **payload,
+                            "ssh_host": host,
+                            "cache": "stream",
+                        }
+                        _VPS_DOCKGE_METRICS_STREAM["payload_at"] = now
+                        _VPS_DOCKGE_METRICS_STREAM["error"] = None
+                        _VPS_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+                        idle_for = now - float(_VPS_DOCKGE_METRICS_STREAM.get("last_access") or 0.0)
+                    else:
+                        _VPS_DOCKGE_METRICS_STREAM["error"] = payload.get(
+                            "detail",
+                            "VPS Dockge metrics stream failed",
+                        )
+                        _VPS_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+                        idle_for = 0.0
+                if idle_for > _VPS_DOCKGE_METRICS_STREAM_IDLE_TIMEOUT:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return
+
+            stderr = ""
+            if proc.stderr is not None:
+                stderr = proc.stderr.read().strip()
+            returncode = proc.wait(timeout=2)
+            errors.append(f"{host}: exited {returncode} {stderr}".strip())
+            with _VPS_DOCKGE_METRICS_STREAM_CONDITION:
+                _VPS_DOCKGE_METRICS_STREAM["process"] = None
+                _VPS_DOCKGE_METRICS_STREAM["error"] = errors[-1]
+                _VPS_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+    finally:
+        with _VPS_DOCKGE_METRICS_STREAM_CONDITION:
+            if _VPS_DOCKGE_METRICS_STREAM.get("thread") is current_thread:
+                _VPS_DOCKGE_METRICS_STREAM["thread"] = None
+                _VPS_DOCKGE_METRICS_STREAM["process"] = None
+            if errors and not _VPS_DOCKGE_METRICS_STREAM.get("payload"):
+                _VPS_DOCKGE_METRICS_STREAM["error"] = "; ".join(errors)
+            _VPS_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+
+
+def _ensure_vps_dockge_metrics_stream_locked() -> None:
+    thread = _VPS_DOCKGE_METRICS_STREAM.get("thread")
+    if isinstance(thread, threading.Thread) and thread.is_alive():
+        return
+    _VPS_DOCKGE_METRICS_STREAM["error"] = None
+    new_thread = threading.Thread(
+        target=_vps_dockge_metrics_stream_worker,
+        name="vps-dockge-metrics-stream",
+        daemon=True,
+    )
+    _VPS_DOCKGE_METRICS_STREAM["thread"] = new_thread
+    new_thread.start()
+
+
 def _vps_dockge_metrics_sync() -> dict:
     _ensure_vps_dockge_config()
-    now = time.monotonic()
-    with _VPS_DOCKGE_METRICS_LOCK:
-        cached_at = float(_VPS_DOCKGE_METRICS_CACHE.get("monotonic") or 0.0)
-        cached_payload = _VPS_DOCKGE_METRICS_CACHE.get("payload")
-        if cached_payload and now - cached_at < _VPS_DOCKGE_METRICS_MIN_INTERVAL:
-            return {**cached_payload, "cache": "hit"}
+    deadline = time.monotonic() + _VPS_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT
+    with _VPS_DOCKGE_METRICS_STREAM_CONDITION:
+        _VPS_DOCKGE_METRICS_STREAM["last_access"] = time.monotonic()
+        _ensure_vps_dockge_metrics_stream_locked()
+        while True:
+            now = time.monotonic()
+            payload = _VPS_DOCKGE_METRICS_STREAM.get("payload")
+            payload_at = float(_VPS_DOCKGE_METRICS_STREAM.get("payload_at") or 0.0)
+            stream_age = now - payload_at if payload_at > 0 else 0.0
+            if (
+                isinstance(payload, dict)
+                and payload_at > 0
+                and stream_age <= _VPS_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT
+            ):
+                stream_age_ms = round(stream_age * 1000, 1)
+                return {**payload, "stream_age_ms": stream_age_ms}
 
-        result, host = _run_remote(
-            _remote_metrics_script(_stacks_root(), "docker-stats-ssh"),
-            timeout=12,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                502,
-                result.stderr.strip() or result.stdout.strip() or "VPS Dockge metrics read failed",
-            )
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(502, f"VPS Dockge metrics returned invalid JSON: {exc}") from exc
-        if not payload.get("ok"):
-            raise HTTPException(502, payload.get("detail") or "VPS Dockge metrics read failed")
-        payload = {**payload, "ssh_host": host}
-        _VPS_DOCKGE_METRICS_CACHE["monotonic"] = time.monotonic()
-        _VPS_DOCKGE_METRICS_CACHE["payload"] = payload
-        return {**payload, "cache": "miss"}
+            remaining = deadline - now
+            if remaining <= 0:
+                detail = (
+                    _VPS_DOCKGE_METRICS_STREAM.get("error")
+                    or "metrics stream has not produced a sample yet"
+                )
+                raise HTTPException(504, f"VPS Dockge metrics unavailable: {detail}")
+            _VPS_DOCKGE_METRICS_STREAM_CONDITION.wait(timeout=min(0.1, remaining))
 
 
 def _valid_stack_name(stack_name: str) -> str:

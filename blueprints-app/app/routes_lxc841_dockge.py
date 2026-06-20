@@ -63,7 +63,8 @@ _LXC841_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-lxc841-dockge-
 _LXC841_DOCKGE_SPEECH_PROMPT_VERSION = "20260514-central-doc-context-v1"
 _LXC841_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _LXC841_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
-_LXC841_DOCKGE_METRICS_MIN_INTERVAL = 0.9
+_LXC841_DOCKGE_METRICS_STREAM_IDLE_TIMEOUT = 15.0
+_LXC841_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT = 2.5
 _LXC841_DOCKGE_SOURCE_SUFFIXES = {
     ".conf",
     ".cfg",
@@ -88,8 +89,16 @@ _LXC841_DOCKGE_REQUIRED_ENV = (
     "LXC841_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
 )
 _LXC841_CADDY_ROUTES_CACHE: tuple[float, list[dict]] | None = None
-_LXC841_DOCKGE_METRICS_LOCK = threading.Lock()
-_LXC841_DOCKGE_METRICS_CACHE: dict[str, Any] = {"monotonic": 0.0, "payload": None}
+_LXC841_DOCKGE_METRICS_STREAM_CONDITION = threading.Condition()
+_LXC841_DOCKGE_METRICS_STREAM: dict[str, Any] = {
+    "thread": None,
+    "process": None,
+    "payload": None,
+    "payload_at": 0.0,
+    "last_access": 0.0,
+    "host": "",
+    "error": None,
+}
 
 
 class Lxc841DockgeAction(BaseModel):
@@ -837,36 +846,577 @@ except Exception as exc:
     )
 
 
+def _remote_metrics_stream_script(root: str, source: str) -> str:
+    remote_py = r"""
+import json
+import os
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+MAP_TTL_SECONDS = 20.0
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+def field(item, *names):
+    for name in names:
+        value = item.get(name)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def parse_json_lines(text):
+    rows = []
+    stripped = (text or "").strip()
+    if not stripped:
+        return rows
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    except json.JSONDecodeError:
+        pass
+    for line in stripped.splitlines():
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def run_json(args, timeout):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker command failed")
+    return parse_json_lines(result.stdout)
+
+
+def parse_labels(value):
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    labels = {}
+    for part in str(value or "").split(","):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        labels[key.strip()] = val.strip()
+    return labels
+
+
+def stack_dirs(root):
+    try:
+        root_path = Path(root).expanduser().resolve()
+        names = {path.name for path in root_path.iterdir() if path.is_dir()}
+    except OSError:
+        root_path = Path(root).expanduser()
+        names = set()
+    return root_path, names
+
+
+def stack_name_from_labels(labels, root_path, known_stacks):
+    working_dir = (labels.get("com.docker.compose.project.working_dir") or "").strip()
+    if working_dir:
+        try:
+            resolved = Path(working_dir).expanduser().resolve()
+            if resolved == root_path or root_path in resolved.parents:
+                return resolved.name
+        except OSError:
+            pass
+    project = (labels.get("com.docker.compose.project") or "").strip()
+    if project and (not known_stacks or project in known_stacks):
+        return project
+    return ""
+
+
+def container_map_from_docker(root):
+    root_path, known_stacks = stack_dirs(root)
+    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=4)
+    containers = []
+    seen = set()
+    for row in rows:
+        labels = parse_labels(row.get("Labels") if "Labels" in row else row.get("labels"))
+        stack_name = stack_name_from_labels(labels, root_path, known_stacks)
+        container_id = field(row, "ID", "Id", "id")
+        if not stack_name or not container_id or container_id in seen:
+            continue
+        seen.add(container_id)
+        containers.append({
+            "id": container_id,
+            "name": field(row, "Names", "Name", "name"),
+            "stack_name": stack_name,
+            "service": labels.get("com.docker.compose.service", ""),
+            "state": field(row, "State", "state").lower(),
+        })
+    return sorted(containers, key=lambda item: (item["stack_name"].lower(), item.get("name", "")))
+
+
+def read_number(path):
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def parse_cpuset_count(value):
+    total = 0
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                total += max(0, int(end) - int(start) + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(part)
+            except ValueError:
+                continue
+            total += 1
+    return total
+
+
+def available_cpu_units():
+    try:
+        quota_raw, period_raw, *_ = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip().split()
+        if quota_raw != "max":
+            quota = float(quota_raw)
+            period = float(period_raw)
+            if quota > 0 and period > 0:
+                return max(0.01, quota / period)
+    except (OSError, ValueError):
+        pass
+    try:
+        cpuset_count = parse_cpuset_count(Path("/sys/fs/cgroup/cpuset.cpus.effective").read_text(encoding="utf-8").strip())
+        if cpuset_count:
+            return float(cpuset_count)
+    except OSError:
+        pass
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return float(len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+def proc_meminfo():
+    info = {}
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return info
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+            parts = raw.split()
+            if parts:
+                info[key] = int(parts[0]) * 1024
+    return info
+
+
+def proc_stat_cpu():
+    try:
+        parts = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    except (OSError, IndexError):
+        return {"total": 0, "idle": 0}
+    values = [int(part) for part in parts[1:] if part.isdigit()]
+    idle = values[3] + values[4] if len(values) > 4 else (values[3] if len(values) > 3 else 0)
+    return {"total": sum(values), "idle": idle}
+
+
+def proc_netdev():
+    rows = []
+    try:
+        lines = Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]
+    except OSError:
+        return rows
+    for line in lines:
+        if ":" not in line:
+            continue
+        iface, raw = line.split(":", 1)
+        parts = raw.split()
+        if len(parts) < 16:
+            continue
+        name = iface.strip()
+        external = (
+            name.startswith(("en", "eth", "wl", "ww", "tailscale", "wg"))
+            and not name.startswith("veth")
+        )
+        rows.append({
+            "name": name,
+            "rx_bytes": int(parts[0]),
+            "tx_bytes": int(parts[8]),
+            "external": external,
+        })
+    return rows
+
+
+def cgroup_dir(container_id):
+    candidates = [
+        f"/sys/fs/cgroup/system.slice/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/docker/{container_id}",
+        f"/sys/fs/cgroup/docker-{container_id}.scope",
+        f"/sys/fs/cgroup/system.slice/docker.service/docker/{container_id}",
+    ]
+    for path in candidates:
+        current = Path(path)
+        if (current / "cpu.stat").exists() or (current / "memory.current").exists():
+            return current
+    return None
+
+
+def cpu_usage_usec(cgroup):
+    if cgroup is None:
+        return None
+    try:
+        for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("usage_usec "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def sample_raw(containers):
+    meminfo = proc_meminfo()
+    sampled = []
+    for item in containers:
+        cgroup = cgroup_dir(item["id"])
+        memory_bytes = read_number(cgroup / "memory.current") if cgroup else 0
+        sampled.append({
+            **item,
+            "cgroup_found": cgroup is not None,
+            "cpu_usage_usec": cpu_usage_usec(cgroup),
+            "memory_bytes": memory_bytes or 0,
+        })
+    return {
+        "monotonic_ns": time.monotonic_ns(),
+        "capacity": {
+            "cpu_units": round(available_cpu_units(), 3),
+            "memory_bytes": meminfo.get("MemTotal", 0),
+        },
+        "host": {
+            "cpu": proc_stat_cpu(),
+            "memory": {
+                "total_bytes": meminfo.get("MemTotal", 0),
+                "available_bytes": meminfo.get("MemAvailable", 0),
+                "swap_total_bytes": meminfo.get("SwapTotal", 0),
+                "swap_free_bytes": meminfo.get("SwapFree", 0),
+            },
+            "network_interfaces": proc_netdev(),
+        },
+        "containers": sampled,
+    }
+
+
+def build_payload(current, previous, refreshed, sample_elapsed_ms):
+    elapsed_seconds = 0.0
+    if previous:
+        elapsed_seconds = max(0.0, (current["monotonic_ns"] - previous["monotonic_ns"]) / 1_000_000_000)
+    sample_ready = elapsed_seconds > 0
+    elapsed_usec = elapsed_seconds * 1_000_000
+    prev_by_id = {
+        item["id"]: item
+        for item in (previous or {}).get("containers", [])
+        if item.get("id")
+    }
+    memory_total = int(current.get("capacity", {}).get("memory_bytes") or 0)
+    cpu_units = float(current.get("capacity", {}).get("cpu_units") or 1.0)
+    stacks = {}
+    for item in current["containers"]:
+        stack_name = item.get("stack_name") or ""
+        if not stack_name:
+            continue
+        stack = stacks.setdefault(stack_name, {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        })
+        previous_item = prev_by_id.get(item.get("id"))
+        cpu_cores = 0.0
+        if (
+            sample_ready
+            and isinstance(item.get("cpu_usage_usec"), int)
+            and previous_item
+            and isinstance(previous_item.get("cpu_usage_usec"), int)
+            and elapsed_usec > 0
+        ):
+            cpu_cores = max(0.0, (item["cpu_usage_usec"] - previous_item["cpu_usage_usec"]) / elapsed_usec)
+        docker_cpu = cpu_cores * 100.0
+        memory_bytes = max(0, int(item.get("memory_bytes") or 0))
+        stack["cpu_docker_percent"] += docker_cpu
+        stack["memory_bytes"] += memory_bytes
+        stack["containers"].append({
+            "id": (item.get("id") or "")[:12],
+            "name": item.get("name") or "",
+            "service": item.get("service") or "",
+            "state": item.get("state") or ("running" if item.get("cgroup_found") else "stopped"),
+            "cgroup_found": bool(item.get("cgroup_found")),
+            "cpu_docker_percent": round(docker_cpu, 3),
+            "memory_bytes": memory_bytes,
+        })
+    for stack in stacks.values():
+        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+        stack["cpu_percent"] = round(min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3)
+        stack["memory_percent"] = round(
+            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0)
+            if memory_total
+            else 0.0,
+            3,
+        )
+
+    host = current.get("host") or {}
+    host_memory = host.get("memory") or {}
+    host_cpu_percent = 0.0
+    if previous:
+        current_cpu = host.get("cpu") or {}
+        previous_cpu = (previous.get("host") or {}).get("cpu") or {}
+        total_delta = int(current_cpu.get("total") or 0) - int(previous_cpu.get("total") or 0)
+        idle_delta = int(current_cpu.get("idle") or 0) - int(previous_cpu.get("idle") or 0)
+        if total_delta > 0:
+            host_cpu_percent = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+
+    previous_net = {
+        item.get("name"): item
+        for item in ((previous or {}).get("host") or {}).get("network_interfaces", [])
+        if item.get("name")
+    }
+    interfaces = []
+    total_rx_bps = 0.0
+    total_tx_bps = 0.0
+    for item in host.get("network_interfaces") or []:
+        prev = previous_net.get(item.get("name"))
+        rx_bps = 0.0
+        tx_bps = 0.0
+        if sample_ready and prev:
+            rx_bps = max(0.0, (int(item.get("rx_bytes") or 0) - int(prev.get("rx_bytes") or 0)) / elapsed_seconds)
+            tx_bps = max(0.0, (int(item.get("tx_bytes") or 0) - int(prev.get("tx_bytes") or 0)) / elapsed_seconds)
+        if item.get("external"):
+            total_rx_bps += rx_bps
+            total_tx_bps += tx_bps
+        interfaces.append({
+            "name": item.get("name"),
+            "rx_bytes": int(item.get("rx_bytes") or 0),
+            "tx_bytes": int(item.get("tx_bytes") or 0),
+            "rx_bytes_per_second": round(rx_bps, 1),
+            "tx_bytes_per_second": round(tx_bps, 1),
+            "external": bool(item.get("external")),
+        })
+
+    host_total = int(host_memory.get("total_bytes") or memory_total or 0)
+    host_available = int(host_memory.get("available_bytes") or 0)
+    host_memory_used = max(0, host_total - host_available)
+    return {
+        "ok": True,
+        "source": os.environ.get("BP_METRICS_SOURCE", "cgroup-stream-pct"),
+        "sample_kind": "cgroup-counters-stream",
+        "sample_ready": sample_ready,
+        "sample_elapsed_seconds": round(elapsed_seconds, 3) if sample_ready else 0,
+        "probe_elapsed_ms": round(sample_elapsed_ms, 3),
+        "container_map_refreshed": refreshed,
+        "capacity": current["capacity"],
+        "host": {
+            "cpu_percent": round(host_cpu_percent, 3),
+            "memory_total_bytes": host_total,
+            "memory_available_bytes": host_available,
+            "memory_used_bytes": host_memory_used,
+            "memory_percent": round(min(100.0, (host_memory_used / host_total) * 100.0) if host_total else 0.0, 3),
+            "network_external_rx_bytes_per_second": round(total_rx_bps, 1),
+            "network_external_tx_bytes_per_second": round(total_tx_bps, 1),
+            "network_interfaces": interfaces,
+        },
+        "interval_seconds": 1,
+        "window_seconds": 10,
+        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+stacks_root = os.environ.get("BP_STACKS_ROOT", "")
+containers = []
+last_map_at = 0.0
+previous_sample = None
+while True:
+    tick_started = time.monotonic()
+    refreshed = False
+    try:
+        if not containers or tick_started - last_map_at > MAP_TTL_SECONDS:
+            containers = container_map_from_docker(stacks_root)
+            last_map_at = tick_started
+            refreshed = True
+        read_started = time.perf_counter()
+        current_sample = sample_raw(containers)
+        sample_elapsed_ms = (time.perf_counter() - read_started) * 1000
+        emit(build_payload(current_sample, previous_sample, refreshed, sample_elapsed_ms))
+        previous_sample = current_sample
+    except Exception as exc:
+        emit({
+            "ok": False,
+            "detail": str(exc),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    sleep_for = max(0.0, 1.0 - (time.monotonic() - tick_started))
+    time.sleep(sleep_for)
+"""
+    return (
+        f"BP_STACKS_ROOT={shlex.quote(root)} "
+        f"BP_METRICS_SOURCE={shlex.quote(source)} "
+        f"python3 -u - <<'PY'\n{remote_py}\nPY"
+    )
+
+
+def _lxc841_metrics_stream_worker() -> None:
+    current_thread = threading.current_thread()
+    errors: list[str] = []
+    vmid = cfg.LXC841_DOCKGE_PVE_VMID.strip()
+    wrapped_script = (
+        f"pct exec {shlex.quote(vmid)} -- bash -lc "
+        f"{shlex.quote(_remote_metrics_stream_script(_stacks_root(), 'cgroup-stream-pct'))}"
+    )
+    try:
+        for host in _ssh_hosts():
+            proc: subprocess.Popen[str] | None = None
+            try:
+                proc = subprocess.Popen(
+                    _ssh_base_args(host) + [wrapped_script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as exc:
+                errors.append(f"{host}: {exc}")
+                continue
+
+            with _LXC841_DOCKGE_METRICS_STREAM_CONDITION:
+                _LXC841_DOCKGE_METRICS_STREAM["process"] = proc
+                _LXC841_DOCKGE_METRICS_STREAM["host"] = host
+                _LXC841_DOCKGE_METRICS_STREAM["error"] = None
+                _LXC841_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                with _LXC841_DOCKGE_METRICS_STREAM_CONDITION:
+                    if payload.get("ok"):
+                        now = time.monotonic()
+                        _LXC841_DOCKGE_METRICS_STREAM["payload"] = {
+                            **payload,
+                            "ssh_host": host,
+                            "cache": "stream",
+                        }
+                        _LXC841_DOCKGE_METRICS_STREAM["payload_at"] = now
+                        _LXC841_DOCKGE_METRICS_STREAM["error"] = None
+                        _LXC841_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+                        idle_for = now - float(
+                            _LXC841_DOCKGE_METRICS_STREAM.get("last_access") or 0.0
+                        )
+                    else:
+                        _LXC841_DOCKGE_METRICS_STREAM["error"] = payload.get(
+                            "detail",
+                            "LXC841 Dockge metrics stream failed",
+                        )
+                        _LXC841_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+                        idle_for = 0.0
+                if idle_for > _LXC841_DOCKGE_METRICS_STREAM_IDLE_TIMEOUT:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return
+
+            stderr = ""
+            if proc.stderr is not None:
+                stderr = proc.stderr.read().strip()
+            returncode = proc.wait(timeout=2)
+            errors.append(f"{host}: exited {returncode} {stderr}".strip())
+            with _LXC841_DOCKGE_METRICS_STREAM_CONDITION:
+                _LXC841_DOCKGE_METRICS_STREAM["process"] = None
+                _LXC841_DOCKGE_METRICS_STREAM["error"] = errors[-1]
+                _LXC841_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+    finally:
+        with _LXC841_DOCKGE_METRICS_STREAM_CONDITION:
+            if _LXC841_DOCKGE_METRICS_STREAM.get("thread") is current_thread:
+                _LXC841_DOCKGE_METRICS_STREAM["thread"] = None
+                _LXC841_DOCKGE_METRICS_STREAM["process"] = None
+            if errors and not _LXC841_DOCKGE_METRICS_STREAM.get("payload"):
+                _LXC841_DOCKGE_METRICS_STREAM["error"] = "; ".join(errors)
+            _LXC841_DOCKGE_METRICS_STREAM_CONDITION.notify_all()
+
+
+def _ensure_lxc841_metrics_stream_locked() -> None:
+    thread = _LXC841_DOCKGE_METRICS_STREAM.get("thread")
+    if isinstance(thread, threading.Thread) and thread.is_alive():
+        return
+    _LXC841_DOCKGE_METRICS_STREAM["error"] = None
+    new_thread = threading.Thread(
+        target=_lxc841_metrics_stream_worker,
+        name="lxc841-dockge-metrics-stream",
+        daemon=True,
+    )
+    _LXC841_DOCKGE_METRICS_STREAM["thread"] = new_thread
+    new_thread.start()
+
+
 def _lxc841_dockge_metrics_sync() -> dict:
     _ensure_lxc841_dockge_config()
-    now = time.monotonic()
-    with _LXC841_DOCKGE_METRICS_LOCK:
-        cached_at = float(_LXC841_DOCKGE_METRICS_CACHE.get("monotonic") or 0.0)
-        cached_payload = _LXC841_DOCKGE_METRICS_CACHE.get("payload")
-        if cached_payload and now - cached_at < _LXC841_DOCKGE_METRICS_MIN_INTERVAL:
-            return {**cached_payload, "cache": "hit"}
+    deadline = time.monotonic() + _LXC841_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT
+    with _LXC841_DOCKGE_METRICS_STREAM_CONDITION:
+        _LXC841_DOCKGE_METRICS_STREAM["last_access"] = time.monotonic()
+        _ensure_lxc841_metrics_stream_locked()
+        while True:
+            now = time.monotonic()
+            payload = _LXC841_DOCKGE_METRICS_STREAM.get("payload")
+            payload_at = float(_LXC841_DOCKGE_METRICS_STREAM.get("payload_at") or 0.0)
+            stream_age = now - payload_at if payload_at > 0 else 0.0
+            if (
+                isinstance(payload, dict)
+                and payload_at > 0
+                and stream_age <= _LXC841_DOCKGE_METRICS_STREAM_WAIT_TIMEOUT
+            ):
+                stream_age_ms = round(stream_age * 1000, 1)
+                return {**payload, "stream_age_ms": stream_age_ms}
 
-        result, host = _run_remote(
-            _remote_metrics_script(_stacks_root(), "docker-stats-pct"),
-            timeout=12,
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                502,
-                result.stderr.strip()
-                or result.stdout.strip()
-                or "LXC841 Dockge metrics read failed",
-            )
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(502, f"LXC841 Dockge metrics returned invalid JSON: {exc}") from exc
-        if not payload.get("ok"):
-            raise HTTPException(502, payload.get("detail") or "LXC841 Dockge metrics read failed")
-        payload = {**payload, "ssh_host": host}
-        _LXC841_DOCKGE_METRICS_CACHE["monotonic"] = time.monotonic()
-        _LXC841_DOCKGE_METRICS_CACHE["payload"] = payload
-        return {**payload, "cache": "miss"}
+            remaining = deadline - now
+            if remaining <= 0:
+                detail = (
+                    _LXC841_DOCKGE_METRICS_STREAM.get("error")
+                    or "metrics stream has not produced a sample yet"
+                )
+                raise HTTPException(504, f"LXC841 Dockge metrics unavailable: {detail}")
+            _LXC841_DOCKGE_METRICS_STREAM_CONDITION.wait(timeout=min(0.1, remaining))
 
 
 def _route_url(host: str, path: str) -> str:
