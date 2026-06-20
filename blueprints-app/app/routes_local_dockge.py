@@ -693,6 +693,14 @@ def _proc_stat_cpu() -> dict[str, int]:
     return {"total": sum(values), "idle": idle}
 
 
+def _interface_speed_mbps(name: str) -> int:
+    try:
+        value = int((Path("/sys/class/net") / name / "speed").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def _proc_netdev() -> list[dict]:
     try:
         lines = Path("/proc/net/dev").read_text(encoding="utf-8").splitlines()[2:]
@@ -716,6 +724,7 @@ def _proc_netdev() -> list[dict]:
                 "rx_bytes": int(parts[0]),
                 "tx_bytes": int(parts[8]),
                 "external": external,
+                "speed_mbps": _interface_speed_mbps(name) if external else 0,
             }
         )
     return rows
@@ -871,11 +880,14 @@ def _local_dockge_stack_metrics_from_counters(current: dict, previous: dict | No
     interfaces = []
     total_rx_bps = 0.0
     total_tx_bps = 0.0
+    total_capacity_bps = 0.0
     for item in host.get("network_interfaces") or []:
         name = item.get("name")
         prev = previous_net.get(name)
         rx_bps = 0.0
         tx_bps = 0.0
+        speed_mbps = max(0.0, float(item.get("speed_mbps") or 0))
+        capacity_bps = (speed_mbps * 1_000_000) / 8 if speed_mbps > 0 else 0.0
         if sample_ready and prev:
             rx_bps = max(
                 0.0,
@@ -888,6 +900,7 @@ def _local_dockge_stack_metrics_from_counters(current: dict, previous: dict | No
         if item.get("external"):
             total_rx_bps += rx_bps
             total_tx_bps += tx_bps
+            total_capacity_bps += capacity_bps
         interfaces.append(
             {
                 "name": name,
@@ -896,6 +909,8 @@ def _local_dockge_stack_metrics_from_counters(current: dict, previous: dict | No
                 "rx_bytes_per_second": round(rx_bps, 1),
                 "tx_bytes_per_second": round(tx_bps, 1),
                 "external": bool(item.get("external")),
+                "speed_mbps": round(speed_mbps, 3),
+                "capacity_bytes_per_second": round(capacity_bps, 1),
             }
         )
 
@@ -916,6 +931,13 @@ def _local_dockge_stack_metrics_from_counters(current: dict, previous: dict | No
             ),
             "network_external_rx_bytes_per_second": round(total_rx_bps, 1),
             "network_external_tx_bytes_per_second": round(total_tx_bps, 1),
+            "network_external_capacity_bytes_per_second": round(total_capacity_bps, 1),
+            "network_external_percent": round(
+                min(100.0, ((total_rx_bps + total_tx_bps) / total_capacity_bps) * 100.0)
+                if total_capacity_bps
+                else 0.0,
+                3,
+            ),
             "network_interfaces": interfaces,
         },
         "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
