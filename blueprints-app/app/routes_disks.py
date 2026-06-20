@@ -22,16 +22,18 @@ import subprocess
 import textwrap
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 from . import db
 from .ssh import SshKeyMissing, resolve_env_key
+from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/disks", tags=["disks"])
 
@@ -44,6 +46,9 @@ class DisksFilesystemTreeBody(BaseModel):
     path: str | None = Field(default=None, max_length=4000)
     filesystem: str | None = Field(default=None, max_length=128)
     dataset_name: str | None = Field(default=None, max_length=1024)
+    guest_id: str | None = Field(default=None, max_length=64)
+    guest_name: str | None = Field(default=None, max_length=255)
+    guest_kind: str | None = Field(default=None, max_length=32)
     sensitive_hint: str | None = Field(default=None, max_length=2000)
     pin_token: str | None = Field(default=None, max_length=128)
     limit: int = Field(default=400, ge=1, le=1000)
@@ -57,6 +62,9 @@ class DisksFilesystemAccessBody(BaseModel):
     path: str | None = Field(default=None, max_length=4000)
     filesystem: str | None = Field(default=None, max_length=128)
     dataset_name: str | None = Field(default=None, max_length=1024)
+    guest_id: str | None = Field(default=None, max_length=64)
+    guest_name: str | None = Field(default=None, max_length=255)
+    guest_kind: str | None = Field(default=None, max_length=32)
     sensitive_hint: str | None = Field(default=None, max_length=2000)
     pin_token: str | None = Field(default=None, max_length=128)
 
@@ -67,6 +75,41 @@ class DisksFilesystemSaveBody(DisksFilesystemAccessBody):
 
 class DisksFilesystemPinUnlockBody(BaseModel):
     pin: str = Field(min_length=6, max_length=6)
+
+
+class DisksFilesystemFavoriteBody(BaseModel):
+    label: str = Field(default="", max_length=180)
+    host: str = Field(min_length=1, max_length=255)
+    root_path: str = Field(min_length=1, max_length=2000)
+    browse_mode: str | None = Field(default=None, max_length=32)
+    source_path: str | None = Field(default=None, max_length=2000)
+    path: str | None = Field(default=None, max_length=4000)
+    filesystem: str | None = Field(default=None, max_length=128)
+    dataset_name: str | None = Field(default=None, max_length=1024)
+    guest_id: str | None = Field(default=None, max_length=64)
+    guest_name: str | None = Field(default=None, max_length=255)
+    guest_kind: str | None = Field(default=None, max_length=32)
+    sensitive_hint: str | None = Field(default=None, max_length=2000)
+    enabled: bool = True
+    sort_order: int | None = Field(default=None, ge=-1000000, le=1000000)
+
+
+class DisksFilesystemFavoriteUpdateBody(BaseModel):
+    label: str | None = Field(default=None, max_length=180)
+    path: str | None = Field(default=None, max_length=4000)
+    enabled: bool | None = None
+    sort_order: int | None = Field(default=None, ge=-1000000, le=1000000)
+
+
+class DisksFilesystemFavoritesReorderBody(BaseModel):
+    favorite_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
+class DisksFilesystemTransferBody(BaseModel):
+    operation: str = Field(default="copy", max_length=16)
+    source: DisksFilesystemAccessBody
+    destination: DisksFilesystemAccessBody
+    conflict: str = Field(default="cancel", max_length=16)
 
 
 class DisksNoteBody(BaseModel):
@@ -162,6 +205,11 @@ _DISKS_PIN_TOKEN_TTL_SECONDS = max(60, int(os.environ.get("DISKS_PIN_TOKEN_TTL_S
 _DISKS_PIN_HASH_ITERATIONS = 210_000
 _DISKS_PIN_LOCK = threading.Lock()
 _DISKS_PIN_UNLOCK_TOKENS: dict[str, float] = {}
+_DISKS_SECURE_VM_HOSTS = frozenset(item.lower() for item in _env_list("DISKS_SECURE_VM_HOSTS"))
+_DISKS_SECURE_VM_NAMES = frozenset(
+    item.lower() for item in _env_list("DISKS_SECURE_VM_NAMES", "secure")
+)
+_DISKS_SECURE_VM_IDS = frozenset(item for item in _env_list("DISKS_SECURE_VM_IDS"))
 _DISKS_FILE_PREVIEW_MAX_BYTES = max(
     16_384,
     int(os.environ.get("DISKS_FILE_PREVIEW_MAX_BYTES", str(512 * 1024))),
@@ -169,6 +217,10 @@ _DISKS_FILE_PREVIEW_MAX_BYTES = max(
 _DISKS_FILE_EDIT_MAX_BYTES = max(
     16_384,
     int(os.environ.get("DISKS_FILE_EDIT_MAX_BYTES", str(1024 * 1024))),
+)
+_DISKS_FILE_UPLOAD_MAX_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("DISKS_FILE_UPLOAD_MAX_BYTES", str(64 * 1024 * 1024))),
 )
 _DISKS_INVENTORY_MEMORY_GROUPS = ("Physical drives", "Logical systems")
 _DISKS_INVENTORY_MEMORY_LOCK = threading.Lock()
@@ -1477,6 +1529,8 @@ _REMOTE_FILESYSTEM_ACCESS_SCRIPT = textwrap.dedent(
                 str(payload.get("root_path") or ""),
                 str(payload.get("source_path") or ""),
                 dataset_name,
+                str(payload.get("guest_name") or ""),
+                str(payload.get("sensitive_hint") or ""),
             ]
         ).lower()
         return {
@@ -1494,7 +1548,11 @@ _REMOTE_FILESYSTEM_ACCESS_SCRIPT = textwrap.dedent(
             "mount_source": str(mount.get("source") or ""),
             "mount_target": str(mount.get("target") or ""),
             "dataset_name": dataset_name,
-            "sensitive": "private" in private_text,
+            "guest_id": str(payload.get("guest_id") or "").strip(),
+            "guest_name": str(payload.get("guest_name") or "").strip(),
+            "guest_kind": str(payload.get("guest_kind") or "").strip().lower(),
+            "sensitive_hint": str(payload.get("sensitive_hint") or "").strip(),
+            "sensitive": "private" in private_text or bool(re.search(r"(^|[^a-z0-9])secure([^a-z0-9]|$)", private_text)),
         }
 
 
@@ -1625,6 +1683,445 @@ _REMOTE_FILESYSTEM_ACCESS_SCRIPT = textwrap.dedent(
                 mount_root.rmdir()
             except OSError:
                 pass
+    """
+).strip()
+
+_REMOTE_FILESYSTEM_TRANSFER_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import datetime as dt
+    import json
+    import os
+    from pathlib import Path
+    import re
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    PAYLOAD_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+
+
+    def fail(message, code=1):
+        print(json.dumps({"ok": False, "error": str(message)}))
+        raise SystemExit(0 if code else 0)
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Filesystem transfer payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Filesystem transfer payload is invalid: {exc}")
+        if not isinstance(body, dict):
+            fail("Filesystem transfer payload is invalid")
+        return body
+
+
+    def normalize_mode(value):
+        text = str(value or "").strip().lower()
+        return "device_ro" if text == "device_ro" else "mounted"
+
+
+    def normalize_relative(path):
+        text = str(path or "").strip().replace("\\\\", "/")
+        if not text or text == ".":
+            return "."
+        if text.startswith("/"):
+            fail("Path must be relative to the filesystem root")
+        parts = []
+        for part in text.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                fail("Path escapes filesystem root")
+            parts.append(part)
+        return "/".join(parts) if parts else "."
+
+
+    def clean_tag(value):
+        text = str(value or "").strip()
+        return text if re.match(r"^[A-Za-z0-9_-]{6,64}$", text) else ""
+
+
+    def within_root(candidate, root):
+        try:
+            candidate.relative_to(root)
+            return True
+        except Exception:
+            return False
+
+
+    def mounted_root(spec, tag_label):
+        mode = normalize_mode(spec.get("browse_mode"))
+        source_arg = str(spec.get("source_path") or "").strip()
+        root_arg = str(spec.get("root_path") or "").strip()
+        mount_root = None
+        mounted = False
+        if mode == "device_ro":
+            if not source_arg.startswith("/dev/"):
+                fail("Filesystem source must be a device path")
+            tag = clean_tag(spec.get("mount_tag")) or tag_label
+            mount_root = Path(tempfile.mkdtemp(prefix=f"disks-browse-{tag}-"))
+            mount_proc = subprocess.run(
+                ["mount", "-o", "ro", source_arg, str(mount_root)],
+                capture_output=True,
+                text=True,
+            )
+            if mount_proc.returncode != 0:
+                detail = (
+                    (mount_proc.stderr or "").strip()
+                    or (mount_proc.stdout or "").strip()
+                    or f"mount exited {mount_proc.returncode}"
+                )
+                fail(f"Could not mount filesystem read-only: {detail}")
+            mounted = True
+            return mount_root.resolve(), "/", mount_root, mounted, mode
+        if not root_arg.startswith("/"):
+            fail("Filesystem root must be an absolute path")
+        root_display = root_arg.rstrip("/") or "/"
+        root = Path(root_display).resolve()
+        if not root.exists():
+            fail(f"Filesystem root does not exist: {root_arg}")
+        if not root.is_dir():
+            fail(f"Filesystem root is not a directory: {root_arg}")
+        if not os.path.ismount(root):
+            fail(f"Filesystem root is not a mounted path: {root_arg}")
+        return root, root_display, None, False, mode
+
+
+    def resolve_child(root, relative_path):
+        target = root if relative_path == "." else (root / relative_path).resolve()
+        if not within_root(target, root):
+            fail("Path escapes filesystem root")
+        return target
+
+
+    def item_meta(path, root, root_display, relative_path):
+        if path.is_dir():
+            kind = "folder"
+            size = None
+        elif path.is_file():
+            kind = "file"
+            size = int(path.stat().st_size)
+        else:
+            kind = "other"
+            size = None
+        absolute_path = root_display if relative_path == "." else f"{root_display.rstrip('/')}/{relative_path}"
+        stat_obj = path.stat()
+        return {
+            "path": relative_path,
+            "absolute_path": absolute_path,
+            "filename": path.name or "filesystem",
+            "type": kind,
+            "size_bytes": size,
+            "modified_at": dt.datetime.fromtimestamp(
+                stat_obj.st_mtime,
+                dt.timezone.utc,
+            ).isoformat(),
+        }
+
+
+    def renamed_target(path):
+        parent = path.parent
+        stem = path.stem
+        suffix = path.suffix
+        if path.is_dir() and not suffix:
+            stem = path.name
+            suffix = ""
+        for index in range(1, 1000):
+            candidate = parent / f"{stem} copy {index}{suffix}"
+            if not candidate.exists():
+                return candidate
+        fail("Could not choose a non-conflicting destination name")
+
+
+    def remove_existing(path):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+    def copy_item(source, target):
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, target, symlinks=True, copy_function=shutil.copy2)
+        else:
+            shutil.copy2(source, target, follow_symlinks=False)
+
+
+    payload = decode_payload(PAYLOAD_ARG)
+    operation = str(payload.get("operation") or "copy").strip().lower()
+    conflict = str(payload.get("conflict") or "cancel").strip().lower()
+    if operation not in {"copy", "move"}:
+        fail("Unsupported transfer operation")
+    if conflict not in {"cancel", "overwrite", "skip", "rename"}:
+        fail("Unsupported conflict policy")
+    source_spec = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    dest_spec = payload.get("destination") if isinstance(payload.get("destination"), dict) else {}
+    src_root = src_mount = dst_mount = None
+    src_mounted = dst_mounted = False
+    try:
+        src_root, src_display, src_mount, src_mounted, src_mode = mounted_root(source_spec, "src")
+        dst_root, dst_display, dst_mount, dst_mounted, dst_mode = mounted_root(dest_spec, "dst")
+        if dst_mode == "device_ro":
+            fail("Destination cannot be a read-only offline filesystem")
+        if operation == "move" and src_mode == "device_ro":
+            fail("Move is not available from a read-only offline filesystem")
+        src_rel = normalize_relative(source_spec.get("relative_path"))
+        dst_rel = normalize_relative(dest_spec.get("relative_path"))
+        source = resolve_child(src_root, src_rel)
+        dest_dir = resolve_child(dst_root, dst_rel)
+        if not source.exists():
+            fail("Source path does not exist")
+        if not dest_dir.exists() or not dest_dir.is_dir():
+            fail("Destination is not a directory")
+        if source.is_dir() and (source == dest_dir or dest_dir in source.parents):
+            fail("Cannot transfer a folder into itself")
+        target = dest_dir / (source.name or "filesystem")
+        conflict_applied = ""
+        if target.exists():
+            if conflict == "skip":
+                print(json.dumps({
+                    "ok": True,
+                    "operation": operation,
+                    "skipped": True,
+                    "reason": "Destination already exists",
+                    "destination": item_meta(target, dst_root, dst_display, normalize_relative(f"{dst_rel}/{target.name}" if dst_rel != "." else target.name)),
+                }))
+                raise SystemExit(0)
+            if conflict == "cancel":
+                fail("Destination already exists")
+            if conflict == "rename":
+                target = renamed_target(target)
+                conflict_applied = "rename"
+            elif conflict == "overwrite":
+                remove_existing(target)
+                conflict_applied = "overwrite"
+        if operation == "copy":
+            copy_item(source, target)
+        else:
+            try:
+                os.rename(source, target)
+            except OSError:
+                copy_item(source, target)
+                remove_existing(source)
+        dest_relative = target.relative_to(dst_root).as_posix()
+        print(json.dumps({
+            "ok": True,
+            "operation": operation,
+            "skipped": False,
+            "conflict_applied": conflict_applied,
+            "source": item_meta(source, src_root, src_display, src_rel) if source.exists() else {"path": src_rel},
+            "destination": item_meta(target, dst_root, dst_display, dest_relative),
+        }))
+    finally:
+        for mount_root, mounted in ((src_mount, src_mounted), (dst_mount, dst_mounted)):
+            if mounted and mount_root is not None:
+                subprocess.run(["umount", str(mount_root)], capture_output=True, text=True, check=False)
+            if mount_root is not None:
+                try:
+                    mount_root.rmdir()
+                except OSError:
+                    pass
+    """
+).strip()
+
+_REMOTE_FILESYSTEM_UPLOAD_SCRIPT = textwrap.dedent(
+    """
+    import base64
+    import datetime as dt
+    import json
+    import os
+    from pathlib import Path
+    import re
+    import shutil
+    import sys
+    import tempfile
+
+    PAYLOAD_ARG = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+
+
+    def fail(message):
+        print(json.dumps({"ok": False, "error": str(message)}))
+        raise SystemExit(0)
+
+
+    def decode_payload(value):
+        text = str(value or "").strip()
+        if not text:
+            fail("Filesystem upload payload is missing")
+        try:
+            padding = "=" * (-len(text) % 4)
+            raw = base64.urlsafe_b64decode((text + padding).encode("ascii"))
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            fail(f"Filesystem upload payload is invalid: {exc}")
+        if not isinstance(body, dict):
+            fail("Filesystem upload payload is invalid")
+        return body
+
+
+    def normalize_mode(value):
+        text = str(value or "").strip().lower()
+        return "device_ro" if text == "device_ro" else "mounted"
+
+
+    def normalize_relative(path):
+        text = str(path or "").strip().replace("\\\\", "/")
+        if not text or text == ".":
+            return "."
+        if text.startswith("/"):
+            fail("Path must be relative to the filesystem root")
+        parts = []
+        for part in text.split("/"):
+            if part in {"", "."}:
+                continue
+            if part == "..":
+                fail("Path escapes filesystem root")
+            parts.append(part)
+        return "/".join(parts) if parts else "."
+
+
+    def within_root(candidate, root):
+        try:
+            candidate.relative_to(root)
+            return True
+        except Exception:
+            return False
+
+
+    def mounted_root(spec):
+        mode = normalize_mode(spec.get("browse_mode"))
+        if mode == "device_ro":
+            fail("Destination cannot be a read-only offline filesystem")
+        root_arg = str(spec.get("root_path") or "").strip()
+        if not root_arg.startswith("/"):
+            fail("Filesystem root must be an absolute path")
+        root_display = root_arg.rstrip("/") or "/"
+        root = Path(root_display).resolve()
+        if not root.exists():
+            fail(f"Filesystem root does not exist: {root_arg}")
+        if not root.is_dir():
+            fail(f"Filesystem root is not a directory: {root_arg}")
+        if not os.path.ismount(root):
+            fail(f"Filesystem root is not a mounted path: {root_arg}")
+        return root, root_display
+
+
+    def resolve_child(root, relative_path):
+        target = root if relative_path == "." else (root / relative_path).resolve()
+        if not within_root(target, root):
+            fail("Path escapes filesystem root")
+        return target
+
+
+    def safe_filename(value):
+        text = str(value or "").strip().replace("\\\\", "/").rsplit("/", 1)[-1]
+        text = re.sub(r"[^A-Za-z0-9._ -]+", "-", text).strip(" .-")
+        if not text:
+            fail("Upload filename is invalid")
+        return text
+
+
+    def renamed_target(path):
+        parent = path.parent
+        stem = path.stem or path.name
+        suffix = path.suffix
+        for index in range(1, 1000):
+            candidate = parent / f"{stem} copy {index}{suffix}"
+            if not candidate.exists():
+                return candidate
+        fail("Could not choose a non-conflicting destination name")
+
+
+    def item_meta(path, root, root_display):
+        relative_path = path.relative_to(root).as_posix()
+        stat_obj = path.stat()
+        return {
+            "path": relative_path,
+            "absolute_path": f"{root_display.rstrip('/')}/{relative_path}" if relative_path else root_display,
+            "filename": path.name or "upload",
+            "type": "folder" if path.is_dir() else "file" if path.is_file() else "other",
+            "size_bytes": int(stat_obj.st_size) if path.is_file() else None,
+            "modified_at": dt.datetime.fromtimestamp(
+                stat_obj.st_mtime,
+                dt.timezone.utc,
+            ).isoformat(),
+        }
+
+
+    payload = decode_payload(PAYLOAD_ARG)
+    conflict = str(payload.get("conflict") or "cancel").strip().lower()
+    if conflict not in {"cancel", "overwrite", "skip", "rename"}:
+        fail("Unsupported conflict policy")
+    spec = payload.get("destination") if isinstance(payload.get("destination"), dict) else {}
+    root, root_display = mounted_root(spec)
+    dest_rel = normalize_relative(spec.get("relative_path"))
+    dest_dir = resolve_child(root, dest_rel)
+    if not dest_dir.exists() or not dest_dir.is_dir():
+        fail("Destination is not a directory")
+    filename = safe_filename(payload.get("filename"))
+    max_bytes = max(1, int(payload.get("max_bytes") or 1))
+    temp_upload_path = Path(str(payload.get("temp_upload_path") or "").strip())
+    if (
+        not str(temp_upload_path).startswith("/tmp/disks-upload-")
+        or not temp_upload_path.exists()
+        or not temp_upload_path.is_file()
+    ):
+        fail("Upload staging file is unavailable")
+    if temp_upload_path.stat().st_size > max_bytes:
+        fail("Upload exceeds configured size limit")
+    target = dest_dir / filename
+    conflict_applied = ""
+    if target.exists():
+        if conflict == "skip":
+            print(json.dumps({
+                "ok": True,
+                "operation": "upload",
+                "skipped": True,
+                "reason": "Destination already exists",
+                "destination": item_meta(target, root, root_display),
+            }))
+            raise SystemExit(0)
+        if target.is_dir() and not target.is_symlink():
+            fail("Destination already contains a directory with that name")
+        if conflict == "cancel":
+            fail("Destination already exists")
+        if conflict == "rename":
+            target = renamed_target(target)
+            conflict_applied = "rename"
+        elif conflict == "overwrite":
+            target.unlink()
+            conflict_applied = "overwrite"
+    fd, tmp_name = tempfile.mkstemp(prefix=".disks-upload-", dir=str(dest_dir))
+    try:
+        with temp_upload_path.open("rb") as source, os.fdopen(fd, "wb") as handle:
+            shutil.copyfileobj(source, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+        try:
+            temp_upload_path.unlink()
+        except OSError:
+            pass
+    print(json.dumps({
+        "ok": True,
+        "operation": "upload",
+        "skipped": False,
+        "conflict_applied": conflict_applied,
+        "destination": item_meta(target, root, root_display),
+    }))
     """
 ).strip()
 
@@ -2280,6 +2777,85 @@ def _persist_disks_note(node_id: str, note: str) -> None:
         conn.commit()
 
 
+def _safe_favorite_id(value: str) -> str:
+    clean = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", clean):
+        raise HTTPException(400, "invalid favorite id")
+    return clean
+
+
+def _favorite_row_to_dict(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    data["enabled"] = bool(data.get("enabled", 0))
+    data["sort_order"] = int(data.get("sort_order") or 0)
+    return data
+
+
+def _favorite_default_label(record: dict[str, Any]) -> str:
+    path = str(record.get("path") or ".").strip()
+    root_path = str(record.get("root_path") or "/").strip()
+    dataset = str(record.get("dataset_name") or "").strip()
+    guest_name = str(record.get("guest_name") or "").strip()
+    if guest_name:
+        return f"{guest_name}: {path if path != '.' else root_path}"
+    if dataset:
+        return f"{dataset}: {path if path != '.' else 'root'}"
+    return f"{record.get('host')}: {path if path != '.' else root_path}"
+
+
+def _favorite_body_to_record(body: DisksFilesystemFavoriteBody) -> dict[str, Any]:
+    browse_mode = _normalize_browser_mode(body.browse_mode)
+    source_path = str(body.source_path or "").strip()
+    if browse_mode == "device_ro":
+        source_path = _safe_device_path(source_path)
+    record = {
+        "label": str(body.label or "").strip(),
+        "host": _safe_browse_host(body.host),
+        "root_path": _normalize_browser_root_path(body.root_path),
+        "path": _normalize_browser_relative_path(body.path),
+        "browse_mode": browse_mode,
+        "source_path": source_path,
+        "filesystem": str(body.filesystem or "").strip().lower(),
+        "dataset_name": str(body.dataset_name or "").strip(),
+        "guest_id": str(body.guest_id or "").strip(),
+        "guest_name": str(body.guest_name or "").strip(),
+        "guest_kind": str(body.guest_kind or "").strip().lower(),
+        "sensitive_hint": str(body.sensitive_hint or "").strip(),
+        "enabled": 1 if body.enabled else 0,
+        "sort_order": body.sort_order,
+    }
+    if not record["label"]:
+        record["label"] = _favorite_default_label(record)
+    return record
+
+
+def _fetch_disks_favorite(conn, favorite_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM disks_filesystem_favorites WHERE favorite_id = ?",
+        (favorite_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Filesystem favourite not found")
+    return _favorite_row_to_dict(row)
+
+
+def _enqueue_disks_favorite(
+    conn,
+    action: str,
+    favorite_id: str,
+    row_data: dict[str, Any] | None,
+) -> None:
+    gen = db.increment_gen(conn, "disks-filesystem-favorites")
+    enqueue_for_all_peers(
+        conn,
+        action,
+        "disks_filesystem_favorites",
+        favorite_id,
+        row_data,
+        gen,
+    )
+
+
 def _ensure_disks_security_table(conn) -> None:
     conn.execute(
         """
@@ -2386,6 +2962,38 @@ def _access_text_contains_private(*values: Any) -> bool:
     return any("private" in str(value or "").lower() for value in values)
 
 
+def _access_text_contains_secure(*values: Any) -> bool:
+    for value in values:
+        text = str(value or "").lower()
+        if re.search(r"(^|[^a-z0-9])secure([^a-z0-9]|$)", text):
+            return True
+    return False
+
+
+def _filesystem_access_matches_secure_vm(
+    body: DisksFilesystemAccessBody | DisksFilesystemTreeBody,
+    meta: dict[str, Any] | None = None,
+) -> bool:
+    meta = meta or {}
+    host = str(body.host or meta.get("host") or "").strip().lower()
+    if _DISKS_SECURE_VM_HOSTS and host not in _DISKS_SECURE_VM_HOSTS:
+        return False
+    guest_id = str(body.guest_id or meta.get("guest_id") or "").strip()
+    guest_name = str(body.guest_name or meta.get("guest_name") or "").strip().lower()
+    if guest_id and guest_id in _DISKS_SECURE_VM_IDS:
+        return True
+    if guest_name and guest_name in _DISKS_SECURE_VM_NAMES:
+        return True
+    return _access_text_contains_secure(
+        body.guest_name,
+        body.dataset_name,
+        body.sensitive_hint,
+        meta.get("guest_name"),
+        meta.get("dataset_name"),
+        meta.get("sensitive_hint"),
+    )
+
+
 def _filesystem_access_payload(
     body: DisksFilesystemAccessBody | DisksFilesystemTreeBody,
     *,
@@ -2407,6 +3015,9 @@ def _filesystem_access_payload(
         "relative_path": clean_path,
         "filesystem": str(body.filesystem or "").strip().lower(),
         "dataset_name": str(body.dataset_name or "").strip(),
+        "guest_id": str(body.guest_id or "").strip(),
+        "guest_name": str(body.guest_name or "").strip(),
+        "guest_kind": str(body.guest_kind or "").strip().lower(),
         "sensitive_hint": str(body.sensitive_hint or "").strip(),
     }
     if mount_tag:
@@ -2423,17 +3034,27 @@ def _filesystem_access_is_sensitive(
     meta: dict[str, Any] | None = None,
 ) -> bool:
     meta = meta or {}
+    filesystem = str(body.filesystem or meta.get("filesystem") or "").strip().lower()
+    has_zfs_dataset = bool(
+        filesystem == "zfs"
+        or str(body.dataset_name or "").strip()
+        or str(meta.get("dataset_name") or "").strip()
+    )
     return bool(
         meta.get("sensitive")
+        or has_zfs_dataset
+        or _filesystem_access_matches_secure_vm(body, meta)
         or _access_text_contains_private(
             body.root_path,
             body.source_path,
             body.path,
             body.dataset_name,
+            body.guest_name,
             body.sensitive_hint,
             meta.get("absolute_path"),
             meta.get("mount_source"),
             meta.get("mount_target"),
+            meta.get("guest_name"),
             meta.get("sensitive_hint"),
         )
     )
@@ -2501,6 +3122,127 @@ async def _filesystem_access_json_host(
     timeout: int | None = None,
 ) -> dict[str, Any]:
     return await asyncio.to_thread(_run_filesystem_access_json, host, payload, timeout=timeout)
+
+
+def _run_filesystem_transfer(host: str, payload: dict[str, Any]) -> dict[str, Any]:
+    payload_arg = _payload_arg(payload)
+    command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+    try:
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_FILESYSTEM_TRANSFER_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=int(os.environ.get("DISKS_FILESYSTEM_TRANSFER_TIMEOUT_SECONDS", "120")),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"filesystem transfer timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        try:
+            body = json.loads(stdout)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            if body.get("ok"):
+                return {"ok": True, "host": host, "error": "", "data": body}
+            return {
+                "ok": False,
+                "host": host,
+                "error": str(body.get("error") or stderr or f"ssh exited {proc.returncode}"),
+                "data": None,
+            }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+async def _filesystem_transfer_host(host: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return await asyncio.to_thread(_run_filesystem_transfer, host, payload)
+
+
+def _run_filesystem_upload(
+    host: str,
+    payload: dict[str, Any],
+    content: bytes,
+) -> dict[str, Any]:
+    remote_temp = f"/tmp/disks-upload-{secrets.token_hex(16)}"
+    timeout = int(os.environ.get("DISKS_FILESYSTEM_UPLOAD_TIMEOUT_SECONDS", "120"))
+    stage_command = _ssh_base_command(host) + [f"umask 077; cat > {shlex.quote(remote_temp)}"]
+    try:
+        stage_proc = subprocess.run(
+            stage_command,
+            input=content,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if stage_proc.returncode != 0:
+            stderr = (stage_proc.stderr or b"").decode("utf-8", errors="replace").strip()
+            return {
+                "ok": False,
+                "host": host,
+                "error": stderr or f"upload staging exited {stage_proc.returncode}",
+                "data": None,
+            }
+        payload_arg = _payload_arg({**payload, "temp_upload_path": remote_temp})
+        command = _ssh_base_command(host) + ["python3", "-", payload_arg]
+        proc = subprocess.run(
+            command,
+            input=_REMOTE_FILESYSTEM_UPLOAD_SCRIPT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "host": host,
+            "error": f"filesystem upload timed out: {exc}",
+            "data": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "host": host, "error": str(exc), "data": None}
+    finally:
+        cleanup_command = _ssh_base_command(host) + [f"rm -f {shlex.quote(remote_temp)}"]
+        subprocess.run(
+            cleanup_command,
+            capture_output=True,
+            timeout=min(10, timeout),
+            check=False,
+        )
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        try:
+            body = json.loads(stdout)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            if body.get("ok"):
+                return {"ok": True, "host": host, "error": "", "data": body}
+            return {
+                "ok": False,
+                "host": host,
+                "error": str(body.get("error") or stderr or f"ssh exited {proc.returncode}"),
+                "data": None,
+            }
+    detail = stderr or stdout or f"ssh exited {proc.returncode}"
+    return {"ok": False, "host": host, "error": detail[:500], "data": None}
+
+
+async def _filesystem_upload_host(
+    host: str,
+    payload: dict[str, Any],
+    content: bytes,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(_run_filesystem_upload, host, payload, content)
 
 
 def _filesystem_access_stream_process(host: str, payload: dict[str, Any]) -> subprocess.Popen:
@@ -6099,6 +6841,124 @@ async def disks_note(body: DisksNoteBody) -> dict[str, Any]:
     }
 
 
+@router.get("/filesystem/favorites")
+async def disks_filesystem_favorites() -> dict[str, Any]:
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM disks_filesystem_favorites
+            ORDER BY enabled DESC, sort_order ASC, label COLLATE NOCASE ASC, favorite_id ASC
+            """
+        ).fetchall()
+    return {"ok": True, "favorites": [_favorite_row_to_dict(row) for row in rows]}
+
+
+@router.post("/filesystem/favorites")
+async def disks_filesystem_favorite_create(body: DisksFilesystemFavoriteBody) -> dict[str, Any]:
+    record = _favorite_body_to_record(body)
+    favorite_id = f"fsfav_{uuid.uuid4().hex[:24]}"
+    with db.get_conn() as conn:
+        if record["sort_order"] is None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM disks_filesystem_favorites"
+            ).fetchone()
+            record["sort_order"] = int(row["max_order"] if row else 0) + 10
+        conn.execute(
+            """
+            INSERT INTO disks_filesystem_favorites (
+                favorite_id, label, host, root_path, path, browse_mode, source_path,
+                filesystem, dataset_name, guest_id, guest_name, guest_kind, sensitive_hint,
+                enabled, sort_order, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                favorite_id,
+                record["label"],
+                record["host"],
+                record["root_path"],
+                record["path"],
+                record["browse_mode"],
+                record["source_path"],
+                record["filesystem"],
+                record["dataset_name"],
+                record["guest_id"],
+                record["guest_name"],
+                record["guest_kind"],
+                record["sensitive_hint"],
+                record["enabled"],
+                record["sort_order"],
+            ),
+        )
+        row_data = _fetch_disks_favorite(conn, favorite_id)
+        _enqueue_disks_favorite(conn, "INSERT", favorite_id, row_data)
+    return {"ok": True, "favorite": row_data}
+
+
+@router.patch("/filesystem/favorites/{favorite_id}")
+async def disks_filesystem_favorite_update(
+    favorite_id: str,
+    body: DisksFilesystemFavoriteUpdateBody,
+) -> dict[str, Any]:
+    clean_id = _safe_favorite_id(favorite_id)
+    with db.get_conn() as conn:
+        current = _fetch_disks_favorite(conn, clean_id)
+        label = current["label"] if body.label is None else str(body.label or "").strip()
+        if not label:
+            label = _favorite_default_label(current)
+        path = current["path"] if body.path is None else _normalize_browser_relative_path(body.path)
+        enabled = current["enabled"] if body.enabled is None else bool(body.enabled)
+        sort_order = current["sort_order"] if body.sort_order is None else int(body.sort_order)
+        conn.execute(
+            """
+            UPDATE disks_filesystem_favorites
+            SET label = ?, path = ?, enabled = ?, sort_order = ?, updated_at = datetime('now')
+            WHERE favorite_id = ?
+            """,
+            (label, path, 1 if enabled else 0, sort_order, clean_id),
+        )
+        row_data = _fetch_disks_favorite(conn, clean_id)
+        _enqueue_disks_favorite(conn, "UPDATE", clean_id, row_data)
+    return {"ok": True, "favorite": row_data}
+
+
+@router.post("/filesystem/favorites/reorder")
+async def disks_filesystem_favorites_reorder(
+    body: DisksFilesystemFavoritesReorderBody,
+) -> dict[str, Any]:
+    clean_ids = [_safe_favorite_id(value) for value in body.favorite_ids]
+    seen: set[str] = set()
+    ordered_ids = [value for value in clean_ids if not (value in seen or seen.add(value))]
+    with db.get_conn() as conn:
+        favorites: list[dict[str, Any]] = []
+        for index, favorite_id in enumerate(ordered_ids):
+            _fetch_disks_favorite(conn, favorite_id)
+            sort_order = (index + 1) * 10
+            conn.execute(
+                """
+                UPDATE disks_filesystem_favorites
+                SET sort_order = ?, updated_at = datetime('now')
+                WHERE favorite_id = ?
+                """,
+                (sort_order, favorite_id),
+            )
+            row_data = _fetch_disks_favorite(conn, favorite_id)
+            _enqueue_disks_favorite(conn, "UPDATE", favorite_id, row_data)
+            favorites.append(row_data)
+    return {"ok": True, "favorites": favorites}
+
+
+@router.delete("/filesystem/favorites/{favorite_id}")
+async def disks_filesystem_favorite_delete(favorite_id: str) -> dict[str, Any]:
+    clean_id = _safe_favorite_id(favorite_id)
+    with db.get_conn() as conn:
+        _fetch_disks_favorite(conn, clean_id)
+        conn.execute("DELETE FROM disks_filesystem_favorites WHERE favorite_id = ?", (clean_id,))
+        _enqueue_disks_favorite(conn, "DELETE", clean_id, None)
+    return {"ok": True, "favorite_id": clean_id}
+
+
 @router.post("/filesystem/pin/unlock")
 async def disks_filesystem_pin_unlock(body: DisksFilesystemPinUnlockBody) -> dict[str, Any]:
     return _unlock_disks_pin(body.pin)
@@ -6114,7 +6974,17 @@ async def disks_offline_browse_open(body: DisksOfflineBrowseOpenBody) -> dict[st
     guest_name = str(body.guest_name or "").strip()
     volume_label = str(body.volume_label or "").strip() or clean_volume_ref
     sensitive_hint = str(body.sensitive_hint or "").strip()
-    if _access_text_contains_private(clean_volume_ref, volume_label, sensitive_hint):
+    secure_vm_body = DisksFilesystemAccessBody(
+        host=clean_host,
+        root_path="/",
+        guest_id=clean_guest_id,
+        guest_name=guest_name,
+        guest_kind="vm",
+        sensitive_hint=sensitive_hint,
+    )
+    if _access_text_contains_private(
+        clean_volume_ref, volume_label, sensitive_hint
+    ) or _filesystem_access_matches_secure_vm(secure_vm_body):
         if not _verify_disks_pin_token(body.pin_token):
             raise HTTPException(423, "PIN required for this offline disk")
 
@@ -6331,6 +7201,141 @@ async def disks_filesystem_save(body: DisksFilesystemSaveBody) -> dict[str, Any]
         _require_disks_pin_if_sensitive(body, data)
         return data
     detail = str(result.get("error") or "Filesystem save unavailable").strip()
+    raise _filesystem_error_to_http(detail)
+
+
+@router.post("/filesystem/transfer")
+async def disks_filesystem_transfer(body: DisksFilesystemTransferBody) -> dict[str, Any]:
+    operation = str(body.operation or "copy").strip().lower()
+    conflict = str(body.conflict or "cancel").strip().lower()
+    if operation not in {"copy", "move"}:
+        raise HTTPException(400, "Unsupported transfer operation")
+    if conflict not in {"cancel", "overwrite", "skip", "rename"}:
+        raise HTTPException(400, "Unsupported conflict policy")
+    if _normalize_browser_mode(body.destination.browse_mode) == "device_ro":
+        raise HTTPException(400, "Destination cannot be a read-only offline filesystem")
+    if operation == "move" and _normalize_browser_mode(body.source.browse_mode) == "device_ro":
+        raise HTTPException(400, "Move is not available from a read-only offline filesystem")
+
+    _require_disks_pin_if_sensitive(body.source)
+    _require_disks_pin_if_sensitive(body.destination)
+    source_host, source_meta_payload = _filesystem_access_payload(body.source, action="meta")
+    dest_host, dest_meta_payload = _filesystem_access_payload(body.destination, action="meta")
+
+    source_meta_result, dest_meta_result = await asyncio.gather(
+        _filesystem_access_json_host(source_host, source_meta_payload),
+        _filesystem_access_json_host(dest_host, dest_meta_payload),
+    )
+    if not source_meta_result.get("ok") or not isinstance(source_meta_result.get("data"), dict):
+        detail = str(source_meta_result.get("error") or "Filesystem source unavailable").strip()
+        raise _filesystem_error_to_http(detail)
+    if not dest_meta_result.get("ok") or not isinstance(dest_meta_result.get("data"), dict):
+        detail = str(dest_meta_result.get("error") or "Filesystem destination unavailable").strip()
+        raise _filesystem_error_to_http(detail)
+
+    source_meta = source_meta_result["data"]
+    dest_meta = dest_meta_result["data"]
+    source_sensitive = _require_disks_pin_if_sensitive(body.source, source_meta)
+    dest_sensitive = _require_disks_pin_if_sensitive(body.destination, dest_meta)
+    if str(dest_meta.get("type") or "").strip() != "folder":
+        raise HTTPException(400, "Destination is not a directory")
+    if source_host != dest_host:
+        raise HTTPException(400, "Cross-host filesystem transfers are not available yet")
+
+    _, source_payload = _filesystem_access_payload(
+        body.source,
+        action="transfer-source",
+        mount_tag=secrets.token_hex(8),
+    )
+    _, dest_payload = _filesystem_access_payload(
+        body.destination,
+        action="transfer-destination",
+        mount_tag=secrets.token_hex(8),
+    )
+    result = await _filesystem_transfer_host(
+        source_host,
+        {
+            "operation": operation,
+            "conflict": conflict,
+            "source": source_payload,
+            "destination": dest_payload,
+        },
+    )
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        data = result["data"]
+        data["host"] = source_host
+        data["source_sensitive"] = bool(source_sensitive)
+        data["destination_sensitive"] = bool(dest_sensitive)
+        return data
+    detail = str(result.get("error") or "Filesystem transfer unavailable").strip()
+    if "destination already exists" in detail.lower():
+        raise HTTPException(409, detail)
+    raise _filesystem_error_to_http(detail)
+
+
+@router.post("/filesystem/upload")
+async def disks_filesystem_upload(
+    access_payload: str = Form(...),
+    conflict: str = Form(default="cancel"),
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    try:
+        raw_access = json.loads(access_payload)
+        if not isinstance(raw_access, dict):
+            raise ValueError("access payload must be an object")
+        body = DisksFilesystemAccessBody(**raw_access)
+    except Exception as exc:
+        raise HTTPException(400, f"Filesystem upload payload is invalid: {exc}") from exc
+
+    clean_conflict = str(conflict or "cancel").strip().lower()
+    if clean_conflict not in {"cancel", "overwrite", "skip", "rename"}:
+        raise HTTPException(400, "Unsupported conflict policy")
+    if _normalize_browser_mode(body.browse_mode) == "device_ro":
+        raise HTTPException(400, "Destination cannot be a read-only offline filesystem")
+
+    upload_name = _safe_download_filename(file.filename or "upload.bin", fallback="upload.bin")
+    _require_disks_pin_if_sensitive(body)
+    clean_host, meta_payload = _filesystem_access_payload(body, action="meta")
+    meta_result = await _filesystem_access_json_host(clean_host, meta_payload)
+    if not meta_result.get("ok") or not isinstance(meta_result.get("data"), dict):
+        detail = str(
+            meta_result.get("error") or "Filesystem upload destination unavailable"
+        ).strip()
+        raise _filesystem_error_to_http(detail)
+    dest_meta = meta_result["data"]
+    dest_sensitive = _require_disks_pin_if_sensitive(body, dest_meta)
+    if str(dest_meta.get("type") or "").strip() != "folder":
+        raise HTTPException(400, "Destination is not a directory")
+
+    content = await file.read(_DISKS_FILE_UPLOAD_MAX_BYTES + 1)
+    if len(content) > _DISKS_FILE_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"Upload exceeds configured size limit of {_format_bytes(_DISKS_FILE_UPLOAD_MAX_BYTES)}",
+        )
+    _, destination_payload = _filesystem_access_payload(
+        body,
+        action="upload-destination",
+        write_tag=secrets.token_hex(6),
+    )
+    result = await _filesystem_upload_host(
+        clean_host,
+        {
+            "conflict": clean_conflict,
+            "destination": destination_payload,
+            "filename": upload_name,
+            "max_bytes": _DISKS_FILE_UPLOAD_MAX_BYTES,
+        },
+        content,
+    )
+    if result.get("ok") and isinstance(result.get("data"), dict):
+        data = result["data"]
+        data["host"] = clean_host
+        data["destination_sensitive"] = bool(dest_sensitive)
+        return data
+    detail = str(result.get("error") or "Filesystem upload unavailable").strip()
+    if "destination already exists" in detail.lower():
+        raise HTTPException(409, detail)
     raise _filesystem_error_to_http(detail)
 
 
