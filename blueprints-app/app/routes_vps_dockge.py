@@ -15,6 +15,8 @@ import os
 import re
 import shlex
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -62,6 +64,7 @@ _VPS_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-vps-dockge-cache"
 _VPS_DOCKGE_SPEECH_PROMPT_VERSION = "20260514-central-doc-context-v1"
 _VPS_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _VPS_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
+_VPS_DOCKGE_METRICS_MIN_INTERVAL = 0.9
 _VPS_DOCKGE_SOURCE_SUFFIXES = {
     ".conf",
     ".cfg",
@@ -81,6 +84,8 @@ _VPS_DOCKGE_REQUIRED_ENV = (
     "VPS_DOCKGE_SSH_KEY",
     "VPS_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
 )
+_VPS_DOCKGE_METRICS_LOCK = threading.Lock()
+_VPS_DOCKGE_METRICS_CACHE: dict[str, Any] = {"monotonic": 0.0, "payload": None}
 
 
 class VpsDockgeAction(BaseModel):
@@ -113,7 +118,9 @@ def _vps_dockge_speech_cache_candidates(stack_name: str) -> list[Path]:
     cache_dir = _vps_dockge_speech_cache_dir(stack_name)
     if not cache_dir.is_dir():
         return []
-    candidates = [path for path in cache_dir.iterdir() if path.is_file() and path.name.endswith(".txt")]
+    candidates = [
+        path for path in cache_dir.iterdir() if path.is_file() and path.name.endswith(".txt")
+    ]
     return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
@@ -123,11 +130,17 @@ def _vps_dockge_speech_cache_meta_path(cache_path: Path) -> Path:
 
 def _new_vps_dockge_speech_cache_path(stack_name: str) -> Path:
     cache_dir = _vps_dockge_speech_cache_dir(stack_name)
-    base = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    base = (
+        cache_dir
+        / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    )
     if not base.exists():
         return base
     for index in range(1, 100):
-        candidate = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        candidate = (
+            cache_dir
+            / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        )
         if not candidate.exists():
             return candidate
     raise HTTPException(500, "Could not allocate a unique VPS Dockge narration cache path")
@@ -144,7 +157,9 @@ def _invalidate_vps_dockge_speech_cache(stack_name: str) -> None:
             if meta_path.exists():
                 meta_path.unlink()
         except OSError as exc:
-            log.warning("VPS Dockge narration: could not remove stale cache metadata %s: %s", meta_path, exc)
+            log.warning(
+                "VPS Dockge narration: could not remove stale cache metadata %s: %s", meta_path, exc
+            )
 
 
 def _vps_dockge_speech_condition(stack: dict) -> dict:
@@ -155,7 +170,9 @@ def _vps_dockge_speech_condition(stack: dict) -> dict:
     return clean
 
 
-def _vps_dockge_speech_env_int(name: str, default: int, minimum: int = 0, maximum: int = 1000000) -> int:
+def _vps_dockge_speech_env_int(
+    name: str, default: int, minimum: int = 0, maximum: int = 1000000
+) -> int:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -220,18 +237,22 @@ def _add_vps_dockge_source_text(
         return
     seen.add(source_key)
     clipped = len(text) > _VPS_DOCKGE_SPEECH_FILE_LIMIT
-    source_items.append({
-        "path": path,
-        "kind": kind,
-        "size": len(text.encode("utf-8", errors="replace")),
-        "mtime_ns": mtime_ns,
-        "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
-        "clipped": clipped,
-        "text": text[:_VPS_DOCKGE_SPEECH_FILE_LIMIT],
-    })
+    source_items.append(
+        {
+            "path": path,
+            "kind": kind,
+            "size": len(text.encode("utf-8", errors="replace")),
+            "mtime_ns": mtime_ns,
+            "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+            "clipped": clipped,
+            "text": text[:_VPS_DOCKGE_SPEECH_FILE_LIMIT],
+        }
+    )
 
 
-def _read_vps_dockge_local_source(path: Path, kind: str, source_items: list[dict], seen: set[str]) -> None:
+def _read_vps_dockge_local_source(
+    path: Path, kind: str, source_items: list[dict], seen: set[str]
+) -> None:
     try:
         resolved = path.resolve()
     except OSError:
@@ -281,21 +302,29 @@ def _read_vps_dockge_remote_source(
 def _vps_stack_doc_names(stack_name: str) -> list[str]:
     upper_dash = re.sub(r"[^A-Za-z0-9]+", "-", stack_name).strip("-").upper()
     upper_underscore = re.sub(r"[^A-Za-z0-9]+", "_", stack_name).strip("_").upper()
-    return list(dict.fromkeys([
-        f"{upper_dash}.md",
-        f"{upper_underscore}.md",
-        f"{stack_name}.md",
-        f"{stack_name.upper()}.md",
-    ]))
+    return list(
+        dict.fromkeys(
+            [
+                f"{upper_dash}.md",
+                f"{upper_underscore}.md",
+                f"{stack_name}.md",
+                f"{stack_name.upper()}.md",
+            ]
+        )
+    )
 
 
 def _gather_vps_dockge_speech_sources(stack_name: str, compose_name: str) -> list[dict]:
     source_items: list[dict] = []
     seen: set[str] = set()
 
-    _read_vps_dockge_remote_source(stack_name, compose_name, "vps-stack-compose", source_items, seen)
+    _read_vps_dockge_remote_source(
+        stack_name, compose_name, "vps-stack-compose", source_items, seen
+    )
     for name in _EXPOSURE_FILENAMES:
-        _read_vps_dockge_remote_source(stack_name, name, "vps-stack-exposure-manifest", source_items, seen)
+        _read_vps_dockge_remote_source(
+            stack_name, name, "vps-stack-exposure-manifest", source_items, seen
+        )
     for name in ("README.md", "NOTES.md", "OPERATIONS.md", ".env.example"):
         _read_vps_dockge_remote_source(stack_name, name, "vps-stack-note", source_items, seen)
 
@@ -304,7 +333,9 @@ def _gather_vps_dockge_speech_sources(stack_name: str, compose_name: str) -> lis
         _read_vps_dockge_local_source(vps_docs / name, "central-vps-dockge-doc", source_items, seen)
 
     dockge_control_doc = _NODE_LOCAL_ROOT / "docs" / "dockge" / "VPS-DOCKGE-BLUEPRINTS-CONTROL.md"
-    _read_vps_dockge_local_source(dockge_control_doc, "central-blueprints-control-doc", source_items, seen)
+    _read_vps_dockge_local_source(
+        dockge_control_doc, "central-blueprints-control-doc", source_items, seen
+    )
     for path in (
         _NODE_LOCAL_ROOT / "docs" / "vps" / "my-vps" / "README.md",
         _NODE_LOCAL_ROOT / "docs" / "vps" / "README.md",
@@ -324,12 +355,14 @@ def _vps_dockge_source_markdown(stack: dict, source_items: list[dict]) -> str:
         "```",
     ]
     for item in source_items:
-        parts.extend([
-            "",
-            f"## Source: {item['kind']} - {item['path']}",
-            "",
-            item["text"],
-        ])
+        parts.extend(
+            [
+                "",
+                f"## Source: {item['kind']} - {item['path']}",
+                "",
+                item["text"],
+            ]
+        )
     return "\n".join(parts)
 
 
@@ -354,7 +387,9 @@ Rules:
 """.strip()
 
 
-async def _generate_vps_dockge_speech_markdown(stack: dict, source_items: list[dict]) -> tuple[str, dict[str, Any]]:
+async def _generate_vps_dockge_speech_markdown(
+    stack: dict, source_items: list[dict]
+) -> tuple[str, dict[str, Any]]:
     source_limit = _vps_dockge_speech_env_int(
         "VPS_DOCKGE_SPEECH_SOURCE_CHAR_LIMIT",
         _VPS_DOCKGE_SPEECH_SOURCE_LIMIT,
@@ -398,12 +433,14 @@ async def _generate_vps_dockge_speech_markdown(stack: dict, source_items: list[d
     speech = await _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty VPS Dockge narration")
-    generation_meta.update({
-        "speech_chars": len(speech),
-        "speech_words": len(speech.split()),
-        "source_count": len(source_items),
-        "prompt_version": _VPS_DOCKGE_SPEECH_PROMPT_VERSION,
-    })
+    generation_meta.update(
+        {
+            "speech_chars": len(speech),
+            "speech_words": len(speech.split()),
+            "source_count": len(source_items),
+            "prompt_version": _VPS_DOCKGE_SPEECH_PROMPT_VERSION,
+        }
+    )
     return speech, generation_meta
 
 
@@ -454,10 +491,344 @@ def _run_remote(script: str, *, timeout: int = 30) -> tuple[subprocess.Completed
             errors.append(f"{host}: SSH command timed out")
             continue
         if result.returncode == 255:
-            errors.append(f"{host}: {result.stderr.strip() or result.stdout.strip() or 'SSH failed'}")
+            errors.append(
+                f"{host}: {result.stderr.strip() or result.stdout.strip() or 'SSH failed'}"
+            )
             continue
         return result, host
-    raise HTTPException(504, f"Could not reach VPS over SSH: {'; '.join(errors) or 'all hosts failed'}")
+    raise HTTPException(
+        504, f"Could not reach VPS over SSH: {'; '.join(errors) or 'all hosts failed'}"
+    )
+
+
+def _remote_metrics_script(root: str, source: str) -> str:
+    remote_py = r"""
+import json
+import os
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def field(item, *names):
+    for name in names:
+        value = item.get(name)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def parse_json_lines(text):
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+    except json.JSONDecodeError:
+        pass
+    rows = []
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def run_json(args, timeout):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker command failed")
+    return parse_json_lines(result.stdout)
+
+
+def parse_labels(value):
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    labels = {}
+    for part in str(value or "").split(","):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        labels[key.strip()] = val.strip()
+    return labels
+
+
+def parse_size_bytes(value):
+    match = re.match(r"^\s*(?P<num>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>[A-Za-z]+)?", value or "")
+    if not match:
+        return 0
+    number = float(match.group("num"))
+    unit = (match.group("unit") or "B").lower()
+    multipliers = {
+        "b": 1,
+        "kb": 1000,
+        "kib": 1024,
+        "mb": 1000**2,
+        "mib": 1024**2,
+        "gb": 1000**3,
+        "gib": 1024**3,
+        "tb": 1000**4,
+        "tib": 1024**4,
+    }
+    return int(number * multipliers.get(unit, 1))
+
+
+def parse_percent(value):
+    try:
+        return float(str(value or "0").strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def memory_usage_bytes(value):
+    return parse_size_bytes(str(value or "").split("/", 1)[0].strip())
+
+
+def read_cgroup_number(path):
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def available_memory_bytes():
+    cgroup_limit = read_cgroup_number("/sys/fs/cgroup/memory.max")
+    if cgroup_limit:
+        return cgroup_limit
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def parse_cpuset_count(value):
+    total = 0
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                total += max(0, int(end) - int(start) + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(part)
+            except ValueError:
+                continue
+            total += 1
+    return total
+
+
+def available_cpu_units():
+    try:
+        quota_raw, period_raw, *_ = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip().split()
+        if quota_raw != "max":
+            quota = float(quota_raw)
+            period = float(period_raw)
+            if quota > 0 and period > 0:
+                return max(0.01, quota / period)
+    except (OSError, ValueError):
+        pass
+    try:
+        cpuset_count = parse_cpuset_count(Path("/sys/fs/cgroup/cpuset.cpus.effective").read_text(encoding="utf-8").strip())
+        if cpuset_count:
+            return float(cpuset_count)
+    except OSError:
+        pass
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return float(len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+def stack_dirs(root):
+    try:
+        root_path = Path(root).expanduser().resolve()
+        names = {path.name for path in root_path.iterdir() if path.is_dir()}
+    except OSError:
+        root_path = Path(root).expanduser()
+        names = set()
+    return root_path, names
+
+
+def stack_name_from_labels(labels, root_path, known_stacks):
+    working_dir = (labels.get("com.docker.compose.project.working_dir") or "").strip()
+    if working_dir:
+        try:
+            resolved = Path(working_dir).expanduser().resolve()
+            if resolved == root_path or root_path in resolved.parents:
+                return resolved.name
+        except OSError:
+            pass
+    project = (labels.get("com.docker.compose.project") or "").strip()
+    if project and (not known_stacks or project in known_stacks):
+        return project
+    return ""
+
+
+try:
+    stacks_root = os.environ.get("BP_STACKS_ROOT", "")
+    root_path, known_stacks = stack_dirs(stacks_root)
+    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=5)
+    by_ref = {}
+    by_stack = {}
+    for row in rows:
+        labels = parse_labels(row.get("Labels") if "Labels" in row else row.get("labels"))
+        stack_name = stack_name_from_labels(labels, root_path, known_stacks)
+        if not stack_name:
+            continue
+        container_id = field(row, "ID", "Id", "id")
+        name = field(row, "Names", "Name", "name")
+        state = field(row, "State", "state").lower()
+        meta = {
+            "id": container_id,
+            "name": name,
+            "stack_name": stack_name,
+            "service": labels.get("com.docker.compose.service", ""),
+            "state": state,
+        }
+        if container_id:
+            by_ref[container_id] = meta
+            by_ref[container_id[:12]] = meta
+        if name:
+            by_ref[name] = meta
+        by_stack.setdefault(stack_name, []).append(meta)
+
+    running_ids = sorted({meta["id"] for meta in by_ref.values() if meta.get("id") and meta.get("state") == "running"})
+    stat_rows = run_json(["docker", "stats", "--no-stream", "--format", "json", *running_ids], timeout=8) if running_ids else []
+    cpu_units = available_cpu_units()
+    memory_total = available_memory_bytes()
+    stacks = {
+        stack_name: {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        }
+        for stack_name in by_stack
+    }
+
+    for row in stat_rows:
+        container_ref = field(row, "Container", "ID", "Name")
+        name = field(row, "Name")
+        meta = by_ref.get(container_ref) or by_ref.get(container_ref[:12]) or by_ref.get(name)
+        if not meta:
+            continue
+        stack_name = meta["stack_name"]
+        stack = stacks.setdefault(stack_name, {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        })
+        docker_cpu = parse_percent(field(row, "CPUPerc"))
+        memory_bytes = memory_usage_bytes(field(row, "MemUsage"))
+        stack["cpu_docker_percent"] += docker_cpu
+        stack["memory_bytes"] += memory_bytes
+        stack["containers"].append({
+            "id": meta.get("id", "")[:12],
+            "name": meta.get("name") or name,
+            "service": meta.get("service", ""),
+            "cpu_docker_percent": round(docker_cpu, 3),
+            "memory_bytes": memory_bytes,
+        })
+
+    for stack in stacks.values():
+        stack["cpu_percent"] = round(min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3)
+        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+        stack["memory_percent"] = round(
+            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0) if memory_total else 0.0,
+            3,
+        )
+
+    emit({
+        "ok": True,
+        "source": os.environ.get("BP_METRICS_SOURCE", "docker-stats-ssh"),
+        "capacity": {
+            "cpu_units": round(cpu_units, 3),
+            "memory_bytes": memory_total,
+        },
+        "interval_seconds": 1,
+        "window_seconds": 10,
+        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+except Exception as exc:
+    emit({"ok": False, "detail": str(exc), "updated_at": datetime.now(timezone.utc).isoformat()})
+"""
+    return (
+        f"BP_STACKS_ROOT={shlex.quote(root)} "
+        f"BP_METRICS_SOURCE={shlex.quote(source)} "
+        f"python3 - <<'PY'\n{remote_py}\nPY"
+    )
+
+
+def _vps_dockge_metrics_sync() -> dict:
+    _ensure_vps_dockge_config()
+    now = time.monotonic()
+    with _VPS_DOCKGE_METRICS_LOCK:
+        cached_at = float(_VPS_DOCKGE_METRICS_CACHE.get("monotonic") or 0.0)
+        cached_payload = _VPS_DOCKGE_METRICS_CACHE.get("payload")
+        if cached_payload and now - cached_at < _VPS_DOCKGE_METRICS_MIN_INTERVAL:
+            return {**cached_payload, "cache": "hit"}
+
+        result, host = _run_remote(
+            _remote_metrics_script(_stacks_root(), "docker-stats-ssh"),
+            timeout=12,
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                502,
+                result.stderr.strip() or result.stdout.strip() or "VPS Dockge metrics read failed",
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(502, f"VPS Dockge metrics returned invalid JSON: {exc}") from exc
+        if not payload.get("ok"):
+            raise HTTPException(502, payload.get("detail") or "VPS Dockge metrics read failed")
+        payload = {**payload, "ssh_host": host}
+        _VPS_DOCKGE_METRICS_CACHE["monotonic"] = time.monotonic()
+        _VPS_DOCKGE_METRICS_CACHE["payload"] = payload
+        return {**payload, "cache": "miss"}
 
 
 def _valid_stack_name(stack_name: str) -> str:
@@ -477,14 +848,16 @@ def _remote_compose_name(stack_name: str) -> str:
         f'test -f "$dir/{name}" && printf %s {shlex.quote(name)} && exit 0'
         for name in _COMPOSE_FILENAMES
     )
-    script = f"dir={shlex.quote(stack_dir)}\ntest -d \"$dir\" || exit 43\n{checks}\nexit 44"
+    script = f'dir={shlex.quote(stack_dir)}\ntest -d "$dir" || exit 43\n{checks}\nexit 44'
     result, _host = _run_remote(script, timeout=12)
     if result.returncode == 43:
         raise HTTPException(404, f"stack '{stack_name}' not found")
     if result.returncode == 44:
         raise HTTPException(404, f"stack '{stack_name}' has no compose file")
     if result.returncode != 0:
-        raise HTTPException(500, result.stderr.strip() or result.stdout.strip() or "compose lookup failed")
+        raise HTTPException(
+            500, result.stderr.strip() or result.stdout.strip() or "compose lookup failed"
+        )
     return result.stdout.strip()
 
 
@@ -506,7 +879,9 @@ def _run_compose(
 
 
 def _compose_config(stack_name: str, compose_name: str) -> tuple[dict, str | None]:
-    result, _host = _run_compose(stack_name, compose_name, ["config", "--format", "json"], timeout=25)
+    result, _host = _run_compose(
+        stack_name, compose_name, ["config", "--format", "json"], timeout=25
+    )
     if result.returncode != 0:
         return {}, result.stderr.strip() or result.stdout.strip() or "docker compose config failed"
     try:
@@ -585,19 +960,21 @@ def _normalize_stack(
             services.append(service)
         labels = _parse_labels(_field(item, "Labels", "labels"))
         ports = _ports_from_publishers(item) or _ports_from_string(_field(item, "Ports", "ports"))
-        containers.append({
-            "id": _field(item, "ID", "Id", "id"),
-            "name": _field(item, "Name", "Names", "name"),
-            "service": service,
-            "image": _field(item, "Image", "image"),
-            "state": _field(item, "State", "state").lower() or "unknown",
-            "status": _field(item, "Status", "status"),
-            "health": _field(item, "Health", "health").lower(),
-            "ports": _field(item, "Ports", "ports"),
-            "ports_structured": ports,
-            "labels": labels,
-            "exit_code": item.get("ExitCode", item.get("exit_code")),
-        })
+        containers.append(
+            {
+                "id": _field(item, "ID", "Id", "id"),
+                "name": _field(item, "Name", "Names", "name"),
+                "service": service,
+                "image": _field(item, "Image", "image"),
+                "state": _field(item, "State", "state").lower() or "unknown",
+                "status": _field(item, "Status", "status"),
+                "health": _field(item, "Health", "health").lower(),
+                "ports": _field(item, "Ports", "ports"),
+                "ports_structured": ports,
+                "labels": labels,
+                "exit_code": item.get("ExitCode", item.get("exit_code")),
+            }
+        )
 
     compose_services = _service_configs(compose_config or {})
     for service in compose_services:
@@ -606,7 +983,9 @@ def _normalize_stack(
 
     services_sorted = sorted(set(services))
     exposures = _base_exposures(services_sorted, containers, compose_services, [])
-    exposures, manifest_error = _apply_manifest_exposures(exposures, _read_exposure_manifest(stack_name))
+    exposures, manifest_error = _apply_manifest_exposures(
+        exposures, _read_exposure_manifest(stack_name)
+    )
     status, health, running, total = _summarize_status(containers)
     stack = {
         "stack_name": stack_name,
@@ -637,7 +1016,9 @@ def _inspect_stack(stack_name: str) -> dict:
             f"docker compose ps failed for {name}: {result.stderr.strip() or result.stdout.strip() or '(no output)'}",
         )
     compose_config, config_error = _compose_config(name, compose_name)
-    stack = _normalize_stack(name, compose_name, _parse_compose_ps(result.stdout), compose_config, host)
+    stack = _normalize_stack(
+        name, compose_name, _parse_compose_ps(result.stdout), compose_config, host
+    )
     stack["env_requirements"] = _remote_env_requirements(name, compose_name)
     if config_error:
         stack["compose_config_error"] = config_error
@@ -650,7 +1031,9 @@ def _inspect_stack_lenient(stack_name: str) -> dict:
     result, host = _run_compose(name, compose_name, ["ps", "--all", "--format", "json"], timeout=25)
     compose_config, config_error = _compose_config(name, compose_name)
     if result.returncode == 0:
-        stack = _normalize_stack(name, compose_name, _parse_compose_ps(result.stdout), compose_config, host)
+        stack = _normalize_stack(
+            name, compose_name, _parse_compose_ps(result.stdout), compose_config, host
+        )
     else:
         services = sorted(_service_configs(compose_config))
         exposures, manifest_error = _apply_manifest_exposures(
@@ -764,18 +1147,25 @@ async def list_vps_dockge_stacks() -> dict:
     return await asyncio.to_thread(_list_vps_dockge_stacks_sync)
 
 
+@router.get("/metrics", status_code=200)
+async def vps_dockge_metrics() -> dict:
+    return await asyncio.to_thread(_vps_dockge_metrics_sync)
+
+
 def _list_vps_dockge_stacks_sync() -> dict:
     _ensure_vps_dockge_config()
     root = _stacks_root()
     result, host = _run_remote(
-        f"root={shlex.quote(root)}; test -d \"$root\" || exit 43; "
+        f'root={shlex.quote(root)}; test -d "$root" || exit 43; '
         "find \"$root\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' | sort",
         timeout=15,
     )
     if result.returncode == 43:
         raise HTTPException(404, f"VPS Dockge stacks directory not found: {root}")
     if result.returncode != 0:
-        raise HTTPException(500, result.stderr.strip() or result.stdout.strip() or "stack listing failed")
+        raise HTTPException(
+            500, result.stderr.strip() or result.stdout.strip() or "stack listing failed"
+        )
 
     stacks = []
     for name in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
@@ -783,7 +1173,9 @@ def _list_vps_dockge_stacks_sync() -> dict:
             compose_name = _remote_compose_name(name)
         except HTTPException:
             continue
-        ps_result, ps_host = _run_compose(name, compose_name, ["ps", "--all", "--format", "json"], timeout=25)
+        ps_result, ps_host = _run_compose(
+            name, compose_name, ["ps", "--all", "--format", "json"], timeout=25
+        )
         compose_config, config_error = _compose_config(name, compose_name)
         if ps_result.returncode != 0:
             stack = {
@@ -798,11 +1190,15 @@ def _list_vps_dockge_stacks_sync() -> dict:
                 "service_exposures": {},
                 "containers": [],
                 "connection_host": ps_host,
-                "error": ps_result.stderr.strip() or ps_result.stdout.strip() or "docker compose ps failed",
+                "error": ps_result.stderr.strip()
+                or ps_result.stdout.strip()
+                or "docker compose ps failed",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         else:
-            stack = _normalize_stack(name, compose_name, _parse_compose_ps(ps_result.stdout), compose_config, ps_host)
+            stack = _normalize_stack(
+                name, compose_name, _parse_compose_ps(ps_result.stdout), compose_config, ps_host
+            )
         stack["env_requirements"] = _remote_env_requirements(name, compose_name)
         if config_error:
             stack["compose_config_error"] = config_error
@@ -828,7 +1224,9 @@ async def vps_dockge_service_info(stack_name: str, service_name: str) -> dict:
     if exposure.get("openapi_url"):
         openapi_candidates.append(exposure["openapi_url"])
     if base_url:
-        openapi_candidates.extend(_candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES)
+        openapi_candidates.extend(
+            _candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES
+        )
 
     docs_candidates = []
     if exposure.get("docs_url"):
@@ -901,7 +1299,9 @@ async def vps_dockge_stack_speech(stack_name: str, body: VpsDockgeSpeechBody | N
             try:
                 speech_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                log.warning("VPS Dockge narration: could not read cache metadata %s: %s", meta_path, exc)
+                log.warning(
+                    "VPS Dockge narration: could not read cache metadata %s: %s", meta_path, exc
+                )
         return {
             "ok": True,
             "stack": stack["stack_name"],
