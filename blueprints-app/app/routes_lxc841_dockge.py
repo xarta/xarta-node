@@ -14,6 +14,8 @@ import os
 import re
 import shlex
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -61,6 +63,7 @@ _LXC841_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-lxc841-dockge-
 _LXC841_DOCKGE_SPEECH_PROMPT_VERSION = "20260514-central-doc-context-v1"
 _LXC841_DOCKGE_SPEECH_FILE_LIMIT = 24000
 _LXC841_DOCKGE_SPEECH_SOURCE_LIMIT = 180000
+_LXC841_DOCKGE_METRICS_MIN_INTERVAL = 0.9
 _LXC841_DOCKGE_SOURCE_SUFFIXES = {
     ".conf",
     ".cfg",
@@ -85,6 +88,8 @@ _LXC841_DOCKGE_REQUIRED_ENV = (
     "LXC841_DOCKGE_PROBE_ALLOWED_HOST_SUFFIXES",
 )
 _LXC841_CADDY_ROUTES_CACHE: tuple[float, list[dict]] | None = None
+_LXC841_DOCKGE_METRICS_LOCK = threading.Lock()
+_LXC841_DOCKGE_METRICS_CACHE: dict[str, Any] = {"monotonic": 0.0, "payload": None}
 
 
 class Lxc841DockgeAction(BaseModel):
@@ -117,7 +122,9 @@ def _lxc841_dockge_speech_cache_candidates(stack_name: str) -> list[Path]:
     cache_dir = _lxc841_dockge_speech_cache_dir(stack_name)
     if not cache_dir.is_dir():
         return []
-    candidates = [path for path in cache_dir.iterdir() if path.is_file() and path.name.endswith(".txt")]
+    candidates = [
+        path for path in cache_dir.iterdir() if path.is_file() and path.name.endswith(".txt")
+    ]
     return sorted(candidates, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
@@ -127,11 +134,17 @@ def _lxc841_dockge_speech_cache_meta_path(cache_path: Path) -> Path:
 
 def _new_lxc841_dockge_speech_cache_path(stack_name: str) -> Path:
     cache_dir = _lxc841_dockge_speech_cache_dir(stack_name)
-    base = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    base = (
+        cache_dir
+        / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}--{_safe_stack_cache_name(stack_name)}.txt"
+    )
     if not base.exists():
         return base
     for index in range(1, 100):
-        candidate = cache_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        candidate = (
+            cache_dir
+            / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{index:02d}--{_safe_stack_cache_name(stack_name)}.txt"
+        )
         if not candidate.exists():
             return candidate
     raise HTTPException(500, "Could not allocate a unique LXC841 Dockge narration cache path")
@@ -148,7 +161,11 @@ def _invalidate_lxc841_dockge_speech_cache(stack_name: str) -> None:
             if meta_path.exists():
                 meta_path.unlink()
         except OSError as exc:
-            log.warning("LXC841 Dockge narration: could not remove stale cache metadata %s: %s", meta_path, exc)
+            log.warning(
+                "LXC841 Dockge narration: could not remove stale cache metadata %s: %s",
+                meta_path,
+                exc,
+            )
 
 
 def _lxc841_dockge_speech_condition(stack: dict) -> dict:
@@ -159,7 +176,9 @@ def _lxc841_dockge_speech_condition(stack: dict) -> dict:
     return clean
 
 
-def _lxc841_dockge_speech_env_int(name: str, default: int, minimum: int = 0, maximum: int = 1000000) -> int:
+def _lxc841_dockge_speech_env_int(
+    name: str, default: int, minimum: int = 0, maximum: int = 1000000
+) -> int:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -220,22 +239,30 @@ def _add_lxc841_dockge_source_text(
     if PurePosixPath(path).name == ".env":
         return
     suffix = Path(path).suffix.lower()
-    if suffix and suffix not in _LXC841_DOCKGE_SOURCE_SUFFIXES and not path.endswith("/.env.example"):
+    if (
+        suffix
+        and suffix not in _LXC841_DOCKGE_SOURCE_SUFFIXES
+        and not path.endswith("/.env.example")
+    ):
         return
     seen.add(source_key)
     clipped = len(text) > _LXC841_DOCKGE_SPEECH_FILE_LIMIT
-    source_items.append({
-        "path": path,
-        "kind": kind,
-        "size": len(text.encode("utf-8", errors="replace")),
-        "mtime_ns": mtime_ns,
-        "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
-        "clipped": clipped,
-        "text": text[:_LXC841_DOCKGE_SPEECH_FILE_LIMIT],
-    })
+    source_items.append(
+        {
+            "path": path,
+            "kind": kind,
+            "size": len(text.encode("utf-8", errors="replace")),
+            "mtime_ns": mtime_ns,
+            "sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+            "clipped": clipped,
+            "text": text[:_LXC841_DOCKGE_SPEECH_FILE_LIMIT],
+        }
+    )
 
 
-def _read_lxc841_dockge_local_source(path: Path, kind: str, source_items: list[dict], seen: set[str]) -> None:
+def _read_lxc841_dockge_local_source(
+    path: Path, kind: str, source_items: list[dict], seen: set[str]
+) -> None:
     try:
         resolved = path.resolve()
     except OSError:
@@ -285,12 +312,16 @@ def _read_lxc841_dockge_remote_source(
 def _lxc841_stack_doc_names(stack_name: str) -> list[str]:
     upper_dash = re.sub(r"[^A-Za-z0-9]+", "-", stack_name).strip("-").upper()
     upper_underscore = re.sub(r"[^A-Za-z0-9]+", "_", stack_name).strip("_").upper()
-    return list(dict.fromkeys([
-        f"{upper_dash}.md",
-        f"{upper_underscore}.md",
-        f"{stack_name}.md",
-        f"{stack_name.upper()}.md",
-    ]))
+    return list(
+        dict.fromkeys(
+            [
+                f"{upper_dash}.md",
+                f"{upper_underscore}.md",
+                f"{stack_name}.md",
+                f"{stack_name.upper()}.md",
+            ]
+        )
+    )
 
 
 def _central_lxc841_dockge_docs_root() -> Path | None:
@@ -304,19 +335,29 @@ def _gather_lxc841_dockge_speech_sources(stack_name: str, compose_name: str) -> 
     source_items: list[dict] = []
     seen: set[str] = set()
 
-    _read_lxc841_dockge_remote_source(stack_name, compose_name, "lxc841-stack-compose", source_items, seen)
+    _read_lxc841_dockge_remote_source(
+        stack_name, compose_name, "lxc841-stack-compose", source_items, seen
+    )
     for name in _EXPOSURE_FILENAMES:
-        _read_lxc841_dockge_remote_source(stack_name, name, "lxc841-stack-exposure-manifest", source_items, seen)
+        _read_lxc841_dockge_remote_source(
+            stack_name, name, "lxc841-stack-exposure-manifest", source_items, seen
+        )
     for name in ("README.md", "NOTES.md", "OPERATIONS.md", ".env.example"):
         _read_lxc841_dockge_remote_source(stack_name, name, "lxc841-stack-note", source_items, seen)
 
     lxc841_docs = _central_lxc841_dockge_docs_root()
     if lxc841_docs:
         for name in ("README.md", *_lxc841_stack_doc_names(stack_name)):
-            _read_lxc841_dockge_local_source(lxc841_docs / name, "central-lxc841-dockge-doc", source_items, seen)
+            _read_lxc841_dockge_local_source(
+                lxc841_docs / name, "central-lxc841-dockge-doc", source_items, seen
+            )
 
-    dockge_control_doc = _NODE_LOCAL_ROOT / "docs" / "dockge" / "LXC841-DOCKGE-BLUEPRINTS-CONTROL.md"
-    _read_lxc841_dockge_local_source(dockge_control_doc, "central-blueprints-control-doc", source_items, seen)
+    dockge_control_doc = (
+        _NODE_LOCAL_ROOT / "docs" / "dockge" / "LXC841-DOCKGE-BLUEPRINTS-CONTROL.md"
+    )
+    _read_lxc841_dockge_local_source(
+        dockge_control_doc, "central-blueprints-control-doc", source_items, seen
+    )
     if lxc841_docs:
         host_docs = lxc841_docs.parent.parent
         for path in (
@@ -340,12 +381,14 @@ def _lxc841_dockge_source_markdown(stack: dict, source_items: list[dict]) -> str
         "```",
     ]
     for item in source_items:
-        parts.extend([
-            "",
-            f"## Source: {item['kind']} - {item['path']}",
-            "",
-            item["text"],
-        ])
+        parts.extend(
+            [
+                "",
+                f"## Source: {item['kind']} - {item['path']}",
+                "",
+                item["text"],
+            ]
+        )
     return "\n".join(parts)
 
 
@@ -370,7 +413,9 @@ Rules:
 """.strip()
 
 
-async def _generate_lxc841_dockge_speech_markdown(stack: dict, source_items: list[dict]) -> tuple[str, dict[str, Any]]:
+async def _generate_lxc841_dockge_speech_markdown(
+    stack: dict, source_items: list[dict]
+) -> tuple[str, dict[str, Any]]:
     source_limit = _lxc841_dockge_speech_env_int(
         "LXC841_DOCKGE_SPEECH_SOURCE_CHAR_LIMIT",
         _LXC841_DOCKGE_SPEECH_SOURCE_LIMIT,
@@ -414,12 +459,14 @@ async def _generate_lxc841_dockge_speech_markdown(stack: dict, source_items: lis
     speech = await _clean_doc_speech_markdown(str(answer or ""))
     if not speech:
         raise HTTPException(502, "Local LLM returned an empty LXC841 Dockge narration")
-    generation_meta.update({
-        "speech_chars": len(speech),
-        "speech_words": len(speech.split()),
-        "source_count": len(source_items),
-        "prompt_version": _LXC841_DOCKGE_SPEECH_PROMPT_VERSION,
-    })
+    generation_meta.update(
+        {
+            "speech_chars": len(speech),
+            "speech_words": len(speech.split()),
+            "source_count": len(source_items),
+            "prompt_version": _LXC841_DOCKGE_SPEECH_PROMPT_VERSION,
+        }
+    )
     return speech, generation_meta
 
 
@@ -474,16 +521,352 @@ def _run_pve(script: str, *, timeout: int = 30) -> tuple[subprocess.CompletedPro
             errors.append(f"{host}: SSH command timed out")
             continue
         if result.returncode == 255:
-            errors.append(f"{host}: {result.stderr.strip() or result.stdout.strip() or 'SSH failed'}")
+            errors.append(
+                f"{host}: {result.stderr.strip() or result.stdout.strip() or 'SSH failed'}"
+            )
             continue
         return result, host
-    raise HTTPException(504, f"Could not reach the configured Proxmox host over SSH for LXC841 Dockge: {'; '.join(errors) or 'all hosts failed'}")
+    raise HTTPException(
+        504,
+        f"Could not reach the configured Proxmox host over SSH for LXC841 Dockge: {'; '.join(errors) or 'all hosts failed'}",
+    )
 
 
 def _run_remote(script: str, *, timeout: int = 30) -> tuple[subprocess.CompletedProcess[str], str]:
     vmid = cfg.LXC841_DOCKGE_PVE_VMID.strip()
     wrapped = f"pct exec {shlex.quote(vmid)} -- bash -lc {shlex.quote(script)}"
     return _run_pve(wrapped, timeout=timeout)
+
+
+def _remote_metrics_script(root: str, source: str) -> str:
+    remote_py = r"""
+import json
+import os
+import re
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def field(item, *names):
+    for name in names:
+        value = item.get(name)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def parse_json_lines(text):
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+    except json.JSONDecodeError:
+        pass
+    rows = []
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def run_json(args, timeout):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "docker command failed")
+    return parse_json_lines(result.stdout)
+
+
+def parse_labels(value):
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    labels = {}
+    for part in str(value or "").split(","):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        labels[key.strip()] = val.strip()
+    return labels
+
+
+def parse_size_bytes(value):
+    match = re.match(r"^\s*(?P<num>[0-9]+(?:\.[0-9]+)?)\s*(?P<unit>[A-Za-z]+)?", value or "")
+    if not match:
+        return 0
+    number = float(match.group("num"))
+    unit = (match.group("unit") or "B").lower()
+    multipliers = {
+        "b": 1,
+        "kb": 1000,
+        "kib": 1024,
+        "mb": 1000**2,
+        "mib": 1024**2,
+        "gb": 1000**3,
+        "gib": 1024**3,
+        "tb": 1000**4,
+        "tib": 1024**4,
+    }
+    return int(number * multipliers.get(unit, 1))
+
+
+def parse_percent(value):
+    try:
+        return float(str(value or "0").strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def memory_usage_bytes(value):
+    return parse_size_bytes(str(value or "").split("/", 1)[0].strip())
+
+
+def read_cgroup_number(path):
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def available_memory_bytes():
+    cgroup_limit = read_cgroup_number("/sys/fs/cgroup/memory.max")
+    if cgroup_limit:
+        return cgroup_limit
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def parse_cpuset_count(value):
+    total = 0
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                total += max(0, int(end) - int(start) + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(part)
+            except ValueError:
+                continue
+            total += 1
+    return total
+
+
+def available_cpu_units():
+    try:
+        quota_raw, period_raw, *_ = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip().split()
+        if quota_raw != "max":
+            quota = float(quota_raw)
+            period = float(period_raw)
+            if quota > 0 and period > 0:
+                return max(0.01, quota / period)
+    except (OSError, ValueError):
+        pass
+    try:
+        cpuset_count = parse_cpuset_count(Path("/sys/fs/cgroup/cpuset.cpus.effective").read_text(encoding="utf-8").strip())
+        if cpuset_count:
+            return float(cpuset_count)
+    except OSError:
+        pass
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return float(len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return float(os.cpu_count() or 1)
+
+
+def stack_dirs(root):
+    try:
+        root_path = Path(root).expanduser().resolve()
+        names = {path.name for path in root_path.iterdir() if path.is_dir()}
+    except OSError:
+        root_path = Path(root).expanduser()
+        names = set()
+    return root_path, names
+
+
+def stack_name_from_labels(labels, root_path, known_stacks):
+    working_dir = (labels.get("com.docker.compose.project.working_dir") or "").strip()
+    if working_dir:
+        try:
+            resolved = Path(working_dir).expanduser().resolve()
+            if resolved == root_path or root_path in resolved.parents:
+                return resolved.name
+        except OSError:
+            pass
+    project = (labels.get("com.docker.compose.project") or "").strip()
+    if project and (not known_stacks or project in known_stacks):
+        return project
+    return ""
+
+
+try:
+    stacks_root = os.environ.get("BP_STACKS_ROOT", "")
+    root_path, known_stacks = stack_dirs(stacks_root)
+    rows = run_json(["docker", "ps", "--all", "--no-trunc", "--format", "json"], timeout=5)
+    by_ref = {}
+    by_stack = {}
+    for row in rows:
+        labels = parse_labels(row.get("Labels") if "Labels" in row else row.get("labels"))
+        stack_name = stack_name_from_labels(labels, root_path, known_stacks)
+        if not stack_name:
+            continue
+        container_id = field(row, "ID", "Id", "id")
+        name = field(row, "Names", "Name", "name")
+        state = field(row, "State", "state").lower()
+        meta = {
+            "id": container_id,
+            "name": name,
+            "stack_name": stack_name,
+            "service": labels.get("com.docker.compose.service", ""),
+            "state": state,
+        }
+        if container_id:
+            by_ref[container_id] = meta
+            by_ref[container_id[:12]] = meta
+        if name:
+            by_ref[name] = meta
+        by_stack.setdefault(stack_name, []).append(meta)
+
+    running_ids = sorted({meta["id"] for meta in by_ref.values() if meta.get("id") and meta.get("state") == "running"})
+    stat_rows = run_json(["docker", "stats", "--no-stream", "--format", "json", *running_ids], timeout=8) if running_ids else []
+    cpu_units = available_cpu_units()
+    memory_total = available_memory_bytes()
+    stacks = {
+        stack_name: {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        }
+        for stack_name in by_stack
+    }
+
+    for row in stat_rows:
+        container_ref = field(row, "Container", "ID", "Name")
+        name = field(row, "Name")
+        meta = by_ref.get(container_ref) or by_ref.get(container_ref[:12]) or by_ref.get(name)
+        if not meta:
+            continue
+        stack_name = meta["stack_name"]
+        stack = stacks.setdefault(stack_name, {
+            "stack_name": stack_name,
+            "cpu_percent": 0.0,
+            "cpu_docker_percent": 0.0,
+            "memory_percent": 0.0,
+            "memory_bytes": 0,
+            "containers": [],
+        })
+        docker_cpu = parse_percent(field(row, "CPUPerc"))
+        memory_bytes = memory_usage_bytes(field(row, "MemUsage"))
+        stack["cpu_docker_percent"] += docker_cpu
+        stack["memory_bytes"] += memory_bytes
+        stack["containers"].append({
+            "id": meta.get("id", "")[:12],
+            "name": meta.get("name") or name,
+            "service": meta.get("service", ""),
+            "cpu_docker_percent": round(docker_cpu, 3),
+            "memory_bytes": memory_bytes,
+        })
+
+    for stack in stacks.values():
+        stack["cpu_percent"] = round(min(100.0, stack["cpu_docker_percent"] / max(cpu_units, 0.01)), 3)
+        stack["cpu_docker_percent"] = round(stack["cpu_docker_percent"], 3)
+        stack["memory_percent"] = round(
+            min(100.0, (stack["memory_bytes"] / memory_total) * 100.0) if memory_total else 0.0,
+            3,
+        )
+
+    emit({
+        "ok": True,
+        "source": os.environ.get("BP_METRICS_SOURCE", "docker-stats-pct"),
+        "capacity": {
+            "cpu_units": round(cpu_units, 3),
+            "memory_bytes": memory_total,
+        },
+        "interval_seconds": 1,
+        "window_seconds": 10,
+        "stacks": sorted(stacks.values(), key=lambda item: item["stack_name"].lower()),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+except Exception as exc:
+    emit({"ok": False, "detail": str(exc), "updated_at": datetime.now(timezone.utc).isoformat()})
+"""
+    return (
+        f"BP_STACKS_ROOT={shlex.quote(root)} "
+        f"BP_METRICS_SOURCE={shlex.quote(source)} "
+        f"python3 - <<'PY'\n{remote_py}\nPY"
+    )
+
+
+def _lxc841_dockge_metrics_sync() -> dict:
+    _ensure_lxc841_dockge_config()
+    now = time.monotonic()
+    with _LXC841_DOCKGE_METRICS_LOCK:
+        cached_at = float(_LXC841_DOCKGE_METRICS_CACHE.get("monotonic") or 0.0)
+        cached_payload = _LXC841_DOCKGE_METRICS_CACHE.get("payload")
+        if cached_payload and now - cached_at < _LXC841_DOCKGE_METRICS_MIN_INTERVAL:
+            return {**cached_payload, "cache": "hit"}
+
+        result, host = _run_remote(
+            _remote_metrics_script(_stacks_root(), "docker-stats-pct"),
+            timeout=12,
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                502,
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "LXC841 Dockge metrics read failed",
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(502, f"LXC841 Dockge metrics returned invalid JSON: {exc}") from exc
+        if not payload.get("ok"):
+            raise HTTPException(502, payload.get("detail") or "LXC841 Dockge metrics read failed")
+        payload = {**payload, "ssh_host": host}
+        _LXC841_DOCKGE_METRICS_CACHE["monotonic"] = time.monotonic()
+        _LXC841_DOCKGE_METRICS_CACHE["payload"] = payload
+        return {**payload, "cache": "miss"}
 
 
 def _route_url(host: str, path: str) -> str:
@@ -528,7 +911,11 @@ def _parse_lxc841_caddy_routes() -> list[dict]:
         timeout=12,
     )
     if result.returncode != 0:
-        log.warning("LXC841 Dockge: could not read Caddyfile from LXC %s: %s", caddy_vmid, result.stderr.strip())
+        log.warning(
+            "LXC841 Dockge: could not read Caddyfile from LXC %s: %s",
+            caddy_vmid,
+            result.stderr.strip(),
+        )
         _LXC841_CADDY_ROUTES_CACHE = (now, [])
         return []
 
@@ -541,7 +928,9 @@ def _parse_lxc841_caddy_routes() -> list[dict]:
 
     site_re = re.compile(r"^(?P<hosts>[^{}#]+?)\s*\{")
     handle_re = re.compile(r"^handle(?:_path)?\s+([^\s{]+)")
-    proxy_re = re.compile(r"reverse_proxy\s+(?:https?://)?(?P<host>[A-Za-z0-9._-]+|\[[^\]]+\]):(?P<port>\d+)")
+    proxy_re = re.compile(
+        r"reverse_proxy\s+(?:https?://)?(?P<host>[A-Za-z0-9._-]+|\[[^\]]+\]):(?P<port>\d+)"
+    )
     ignored_block_heads = {
         "log",
         "header",
@@ -575,15 +964,17 @@ def _parse_lxc841_caddy_routes() -> list[dict]:
         if proxy_match and current_hosts and proxy_match.group("host").strip("[]") == lxc_ip:
             port = int(proxy_match.group("port"))
             for host in current_hosts:
-                routes.append({
-                    "host": urlparse(host).netloc or host,
-                    "site": host,
-                    "path": current_path,
-                    "url": _route_url(host, current_path),
-                    "upstream": f"{lxc_ip}:{port}",
-                    "upstream_port": port,
-                    "source": f"remote-caddy-lxc{caddy_vmid}",
-                })
+                routes.append(
+                    {
+                        "host": urlparse(host).netloc or host,
+                        "site": host,
+                        "path": current_path,
+                        "url": _route_url(host, current_path),
+                        "upstream": f"{lxc_ip}:{port}",
+                        "upstream_port": port,
+                        "source": f"remote-caddy-lxc{caddy_vmid}",
+                    }
+                )
 
         opens = line.count("{")
         closes = line.count("}")
@@ -624,14 +1015,16 @@ def _remote_compose_name(stack_name: str) -> str:
         f'test -f "$dir/{name}" && printf %s {shlex.quote(name)} && exit 0'
         for name in _COMPOSE_FILENAMES
     )
-    script = f"dir={shlex.quote(stack_dir)}\ntest -d \"$dir\" || exit 43\n{checks}\nexit 44"
+    script = f'dir={shlex.quote(stack_dir)}\ntest -d "$dir" || exit 43\n{checks}\nexit 44'
     result, _host = _run_remote(script, timeout=12)
     if result.returncode == 43:
         raise HTTPException(404, f"stack '{stack_name}' not found")
     if result.returncode == 44:
         raise HTTPException(404, f"stack '{stack_name}' has no compose file")
     if result.returncode != 0:
-        raise HTTPException(500, result.stderr.strip() or result.stdout.strip() or "compose lookup failed")
+        raise HTTPException(
+            500, result.stderr.strip() or result.stdout.strip() or "compose lookup failed"
+        )
     return result.stdout.strip()
 
 
@@ -653,7 +1046,9 @@ def _run_compose(
 
 
 def _compose_config(stack_name: str, compose_name: str) -> tuple[dict, str | None]:
-    result, _host = _run_compose(stack_name, compose_name, ["config", "--format", "json"], timeout=25)
+    result, _host = _run_compose(
+        stack_name, compose_name, ["config", "--format", "json"], timeout=25
+    )
     if result.returncode != 0:
         return {}, result.stderr.strip() or result.stdout.strip() or "docker compose config failed"
     try:
@@ -751,19 +1146,21 @@ def _normalize_stack(
             services.append(service)
         labels = _parse_labels(_field(item, "Labels", "labels"))
         ports = _ports_from_publishers(item) or _ports_from_string(_field(item, "Ports", "ports"))
-        containers.append({
-            "id": _field(item, "ID", "Id", "id"),
-            "name": _field(item, "Name", "Names", "name"),
-            "service": service,
-            "image": _field(item, "Image", "image"),
-            "state": _field(item, "State", "state").lower() or "unknown",
-            "status": _field(item, "Status", "status"),
-            "health": _field(item, "Health", "health").lower(),
-            "ports": _field(item, "Ports", "ports"),
-            "ports_structured": ports,
-            "labels": labels,
-            "exit_code": item.get("ExitCode", item.get("exit_code")),
-        })
+        containers.append(
+            {
+                "id": _field(item, "ID", "Id", "id"),
+                "name": _field(item, "Name", "Names", "name"),
+                "service": service,
+                "image": _field(item, "Image", "image"),
+                "state": _field(item, "State", "state").lower() or "unknown",
+                "status": _field(item, "Status", "status"),
+                "health": _field(item, "Health", "health").lower(),
+                "ports": _field(item, "Ports", "ports"),
+                "ports_structured": ports,
+                "labels": labels,
+                "exit_code": item.get("ExitCode", item.get("exit_code")),
+            }
+        )
 
     compose_services = _service_configs(compose_config or {})
     for service in compose_services:
@@ -811,7 +1208,9 @@ def _inspect_stack(stack_name: str) -> dict:
             f"docker compose ps failed for {name}: {result.stderr.strip() or result.stdout.strip() or '(no output)'}",
         )
     compose_config, config_error = _compose_config(name, compose_name)
-    stack = _normalize_stack(name, compose_name, _parse_compose_ps(result.stdout), compose_config, host)
+    stack = _normalize_stack(
+        name, compose_name, _parse_compose_ps(result.stdout), compose_config, host
+    )
     stack["env_requirements"] = _remote_env_requirements(name, compose_name)
     if config_error:
         stack["compose_config_error"] = config_error
@@ -824,11 +1223,15 @@ def _inspect_stack_lenient(stack_name: str) -> dict:
     result, host = _run_compose(name, compose_name, ["ps", "--all", "--format", "json"], timeout=25)
     compose_config, config_error = _compose_config(name, compose_name)
     if result.returncode == 0:
-        stack = _normalize_stack(name, compose_name, _parse_compose_ps(result.stdout), compose_config, host)
+        stack = _normalize_stack(
+            name, compose_name, _parse_compose_ps(result.stdout), compose_config, host
+        )
     else:
         services = sorted(_service_configs(compose_config))
         exposures, manifest_error = _apply_manifest_exposures(
-            _base_exposures(services, [], _service_configs(compose_config), _parse_lxc841_caddy_routes()),
+            _base_exposures(
+                services, [], _service_configs(compose_config), _parse_lxc841_caddy_routes()
+            ),
             _read_exposure_manifest(name),
         )
         stack = {
@@ -998,13 +1401,17 @@ print(json.dumps({{"missing_root": None, "snapshots": snapshots}}))
     script = f"BP_STACKS_ROOT={shlex.quote(root)} python3 - <<'PY'\n{remote_py}\nPY"
     result, host = _run_remote(script, timeout=120)
     if result.returncode != 0:
-        raise HTTPException(500, result.stderr.strip() or result.stdout.strip() or "stack snapshot failed")
+        raise HTTPException(
+            500, result.stderr.strip() or result.stdout.strip() or "stack snapshot failed"
+        )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise HTTPException(500, f"stack snapshot returned invalid JSON: {exc}") from exc
     if payload.get("missing_root"):
-        raise HTTPException(404, f"LXC841 Dockge stacks directory not found: {payload['missing_root']}")
+        raise HTTPException(
+            404, f"LXC841 Dockge stacks directory not found: {payload['missing_root']}"
+        )
     snapshots = payload.get("snapshots") if isinstance(payload, dict) else []
     return [item for item in snapshots if isinstance(item, dict)], host
 
@@ -1012,6 +1419,11 @@ print(json.dumps({{"missing_root": None, "snapshots": snapshots}}))
 @router.get("/stacks", status_code=200)
 async def list_lxc841_dockge_stacks() -> dict:
     return await asyncio.to_thread(_list_lxc841_dockge_stacks_sync)
+
+
+@router.get("/metrics", status_code=200)
+async def lxc841_dockge_metrics() -> dict:
+    return await asyncio.to_thread(_lxc841_dockge_metrics_sync)
 
 
 def _list_lxc841_dockge_stacks_sync() -> dict:
@@ -1036,7 +1448,11 @@ def _list_lxc841_dockge_stacks_sync() -> dict:
             except json.JSONDecodeError as exc:
                 config_error = f"docker compose config returned invalid JSON: {exc}"
         else:
-            config_error = config_result.get("stderr") or config_result.get("stdout") or "docker compose config failed"
+            config_error = (
+                config_result.get("stderr")
+                or config_result.get("stdout")
+                or "docker compose config failed"
+            )
         if ps_result.get("returncode") != 0:
             stack = {
                 "stack_name": name,
@@ -1050,7 +1466,9 @@ def _list_lxc841_dockge_stacks_sync() -> dict:
                 "service_exposures": {},
                 "containers": [],
                 "connection_host": host,
-                "error": ps_result.get("stderr") or ps_result.get("stdout") or "docker compose ps failed",
+                "error": ps_result.get("stderr")
+                or ps_result.get("stdout")
+                or "docker compose ps failed",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         else:
@@ -1060,7 +1478,9 @@ def _list_lxc841_dockge_stacks_sync() -> dict:
                 _parse_compose_ps(ps_result.get("stdout") or ""),
                 compose_config,
                 host,
-                exposure_manifest=_manifest_from_snapshot(snapshot.get("manifest_name"), snapshot.get("manifest_text")),
+                exposure_manifest=_manifest_from_snapshot(
+                    snapshot.get("manifest_name"), snapshot.get("manifest_text")
+                ),
                 caddy_routes=caddy_routes,
             )
         stack["env_requirements"] = _env_requirements_from_text(
@@ -1091,7 +1511,9 @@ async def lxc841_dockge_service_info(stack_name: str, service_name: str) -> dict
     if exposure.get("openapi_url"):
         openapi_candidates.append(exposure["openapi_url"])
     if base_url:
-        openapi_candidates.extend(_candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES)
+        openapi_candidates.extend(
+            _candidate_url(base_url, suffix) for suffix in _OPENAPI_CANDIDATES
+        )
 
     docs_candidates = []
     if exposure.get("docs_url"):
@@ -1144,7 +1566,9 @@ async def lxc841_dockge_service_info(stack_name: str, service_name: str) -> dict
 
 
 @router.post("/stacks/{stack_name}/speech", status_code=200)
-async def lxc841_dockge_stack_speech(stack_name: str, body: Lxc841DockgeSpeechBody | None = None) -> dict:
+async def lxc841_dockge_stack_speech(
+    stack_name: str, body: Lxc841DockgeSpeechBody | None = None
+) -> dict:
     _ensure_lxc841_dockge_config()
     force = bool(body.force) if body else False
     stack = _inspect_stack_lenient(stack_name)
@@ -1157,14 +1581,18 @@ async def lxc841_dockge_stack_speech(stack_name: str, body: Lxc841DockgeSpeechBo
         try:
             speech = cache_path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise HTTPException(500, f"Could not read LXC841 Dockge narration cache: {exc}") from exc
+            raise HTTPException(
+                500, f"Could not read LXC841 Dockge narration cache: {exc}"
+            ) from exc
         speech_meta = None
         meta_path = _lxc841_dockge_speech_cache_meta_path(cache_path)
         if meta_path.is_file():
             try:
                 speech_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                log.warning("LXC841 Dockge narration: could not read cache metadata %s: %s", meta_path, exc)
+                log.warning(
+                    "LXC841 Dockge narration: could not read cache metadata %s: %s", meta_path, exc
+                )
         return {
             "ok": True,
             "stack": stack["stack_name"],
