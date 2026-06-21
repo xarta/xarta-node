@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS disks_notes (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS disks_filesystem_favorites (
+    favorite_id    TEXT PRIMARY KEY,
+    label          TEXT NOT NULL,
+    host           TEXT NOT NULL,
+    root_path      TEXT NOT NULL,
+    path           TEXT NOT NULL DEFAULT '.',
+    browse_mode    TEXT NOT NULL DEFAULT 'mounted',
+    source_path    TEXT NOT NULL DEFAULT '',
+    filesystem     TEXT NOT NULL DEFAULT '',
+    dataset_name   TEXT NOT NULL DEFAULT '',
+    guest_id       TEXT NOT NULL DEFAULT '',
+    guest_name     TEXT NOT NULL DEFAULT '',
+    guest_kind     TEXT NOT NULL DEFAULT '',
+    sensitive_hint TEXT NOT NULL DEFAULT '',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    sort_order     INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS disks_security (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL DEFAULT '',
