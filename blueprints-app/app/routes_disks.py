@@ -157,6 +157,13 @@ _BROWSE_HOSTS = frozenset(
         if host
     }
 )
+_PBS_SECRET_PATHS = _env_list("DISKS_PBS_SECRET_PATHS")
+_PBS_DIRECT_VERIFY = os.environ.get("DISKS_PBS_DIRECT_VERIFY", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=4.0)
 _SSH_CONNECT_TIMEOUT = int(os.environ.get("DISKS_SSH_CONNECT_TIMEOUT_SECONDS", "5"))
 _SSH_INVENTORY_TIMEOUT = int(os.environ.get("DISKS_SSH_INVENTORY_TIMEOUT_SECONDS", "18"))
@@ -3544,6 +3551,221 @@ async def _maybe_fetch_json(client: httpx.AsyncClient, url: str) -> dict[str, An
         return {"ok": False, "data": None, "error": str(exc)}
 
 
+def _pbs_direct_secret_config(path_text: str) -> dict[str, Any]:
+    path = Path(path_text).expanduser()
+    base = {"ok": False, "secret": path.name, "path": str(path), "error": "", "data": None}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "error": f"could not read PBS secret envelope: {exc}"}
+    if not isinstance(raw, dict) or raw.get("schema") != "xarta-pbs-secret-v1":
+        return {**base, "error": "unsupported PBS secret envelope schema"}
+    connection = raw.get("connection") if isinstance(raw.get("connection"), dict) else {}
+    api_auth = connection.get("api_auth") if isinstance(connection.get("api_auth"), dict) else {}
+    data = {
+        "host": str(raw.get("host") or "").strip(),
+        "parent_host": str(raw.get("parent_host") or "").strip(),
+        "vmid": str(raw.get("vmid") or "").strip(),
+        "url": str(connection.get("url") or "").strip().rstrip("/"),
+        "datastore": str(connection.get("datastore") or "").strip(),
+        "username": str(connection.get("username") or "").strip(),
+        "password": str(api_auth.get("password") or ""),
+        "api_token": str(api_auth.get("api_token") or ""),
+    }
+    missing = [key for key in ("host", "parent_host", "url", "datastore") if not data.get(key)]
+    if missing:
+        return {**base, "error": f"PBS secret envelope missing {', '.join(missing)}"}
+    return {**base, "ok": True, "error": "", "data": data}
+
+
+def _pbs_status_bytes(payload: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    def first_int(*keys: str) -> int | None:
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            parsed = _to_int(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    total = first_int("total", "total_bytes", "total-bytes", "size", "size_bytes")
+    used = first_int("used", "used_bytes", "used-bytes")
+    available = first_int("available", "available_bytes", "avail", "free", "free_bytes")
+    if available is None and total is not None and used is not None:
+        available = max(0, total - used)
+    return total, used, available
+
+
+async def _pbs_direct_usage(config: dict[str, Any]) -> dict[str, Any]:
+    if not config.get("ok"):
+        return {
+            "ok": False,
+            "secret": config.get("secret"),
+            "host": "",
+            "parent_host": "",
+            "error": str(config.get("error") or "PBS secret config invalid"),
+        }
+    data = config.get("data") if isinstance(config.get("data"), dict) else {}
+    host = str(data.get("host") or "").strip()
+    parent_host = str(data.get("parent_host") or "").strip()
+    datastore = str(data.get("datastore") or "").strip()
+    url = str(data.get("url") or "").strip().rstrip("/")
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    api_token = str(data.get("api_token") or "")
+    if not password and not api_token:
+        return {
+            "ok": False,
+            "secret": config.get("secret"),
+            "host": host,
+            "parent_host": parent_host,
+            "datastore": datastore,
+            "error": "PBS API credential is not configured in secret envelope",
+        }
+
+    headers: dict[str, str] = {}
+    cookies: dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT,
+            follow_redirects=True,
+            verify=_PBS_DIRECT_VERIFY,
+        ) as client:
+            if api_token:
+                headers["Authorization"] = f"PBSAPIToken={api_token}"
+            else:
+                ticket_response = await client.post(
+                    f"{url}/api2/json/access/ticket",
+                    data={"username": username, "password": password},
+                )
+                ticket_response.raise_for_status()
+                ticket_data = ticket_response.json().get("data") or {}
+                ticket = str(ticket_data.get("ticket") or "")
+                if not ticket:
+                    raise RuntimeError("PBS API ticket response did not include a ticket")
+                cookies["PBSAuthCookie"] = ticket
+
+            response = await client.get(
+                f"{url}/api2/json/admin/datastore/{datastore}/status",
+                headers=headers,
+                cookies=cookies,
+            )
+            response.raise_for_status()
+            status_payload = response.json().get("data") or {}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "secret": config.get("secret"),
+            "host": host,
+            "parent_host": parent_host,
+            "datastore": datastore,
+            "error": str(exc),
+        }
+
+    if not isinstance(status_payload, dict):
+        return {
+            "ok": False,
+            "secret": config.get("secret"),
+            "host": host,
+            "parent_host": parent_host,
+            "datastore": datastore,
+            "error": "PBS status response was not an object",
+        }
+    total_bytes, used_bytes, available_bytes = _pbs_status_bytes(status_payload)
+    if not total_bytes:
+        return {
+            "ok": False,
+            "secret": config.get("secret"),
+            "host": host,
+            "parent_host": parent_host,
+            "datastore": datastore,
+            "error": "PBS status response did not include datastore capacity",
+        }
+    return {
+        "ok": True,
+        "secret": config.get("secret"),
+        "host": host,
+        "parent_host": parent_host,
+        "vmid": str(data.get("vmid") or "").strip(),
+        "datastore": datastore,
+        "status": "active",
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
+        "available_bytes": available_bytes,
+        "usage_pct": _pct(used_bytes, total_bytes),
+        "error": "",
+    }
+
+
+async def _pbs_direct_usage_results() -> list[dict[str, Any]]:
+    if not _PBS_SECRET_PATHS:
+        return []
+    configs = [_pbs_direct_secret_config(path) for path in _PBS_SECRET_PATHS]
+    return list(await asyncio.gather(*[_pbs_direct_usage(config) for config in configs]))
+
+
+def _merge_pbs_direct_usage(
+    inventories: list[dict[str, Any]], results: list[dict[str, Any]]
+) -> None:
+    for result in results:
+        if not isinstance(result, dict) or not result.get("ok"):
+            continue
+        parent_host = str(result.get("parent_host") or "").strip()
+        if not parent_host:
+            continue
+        for inventory in inventories:
+            if not isinstance(inventory, dict) or not inventory.get("ok"):
+                continue
+            if str(inventory.get("host") or "").strip() != parent_host:
+                continue
+            snapshot = inventory.get("data")
+            if not isinstance(snapshot, dict):
+                continue
+            storage_name = "-".join(
+                item
+                for item in (
+                    str(result.get("host") or "").strip(),
+                    "direct",
+                    str(result.get("datastore") or "").strip(),
+                )
+                if item
+            )
+            if not storage_name:
+                continue
+            pbs_storages = snapshot.setdefault("pbs_storages", [])
+            pvesm_status = snapshot.setdefault("pvesm_status", [])
+            if isinstance(pbs_storages, list) and not any(
+                isinstance(row, dict) and row.get("name") == storage_name for row in pbs_storages
+            ):
+                pbs_storages.append(
+                    {
+                        "type": "pbs",
+                        "name": storage_name,
+                        "server": str(result.get("host") or "").strip(),
+                        "datastore": str(result.get("datastore") or "").strip(),
+                        "direct_secret": str(result.get("secret") or "").strip(),
+                    }
+                )
+            if isinstance(pvesm_status, list) and not any(
+                isinstance(row, dict) and row.get("name") == storage_name for row in pvesm_status
+            ):
+                total = _to_int(result.get("total_bytes"))
+                used = _to_int(result.get("used_bytes"))
+                available = _to_int(result.get("available_bytes"))
+                pvesm_status.append(
+                    {
+                        "name": storage_name,
+                        "type": "pbs",
+                        "status": str(result.get("status") or "active"),
+                        "total_kib": total // 1024 if total is not None else None,
+                        "used_kib": used // 1024 if used is not None else None,
+                        "available_kib": available // 1024 if available is not None else None,
+                        "pct": _pct(used, total),
+                    }
+                )
+
+
 def _ssh_base_command(host: str) -> list[str]:
     try:
         key_path = resolve_env_key("PROXMOX_SSH_KEY")
@@ -6756,6 +6978,8 @@ async def disks_topology() -> dict[str, Any]:
     if not _DISK_HOSTS:
         raise HTTPException(503, "DISKS_HOSTS is not configured")
     inventories = await asyncio.gather(*[_inventory_host(host) for host in _DISK_HOSTS])
+    pbs_direct_results = await _pbs_direct_usage_results()
+    _merge_pbs_direct_usage(inventories, pbs_direct_results)
 
     if _AI_CONTROL_BASE_URL:
         async with httpx.AsyncClient(
@@ -6814,6 +7038,17 @@ async def disks_topology() -> dict[str, Any]:
                 "ok": bool(thunderbolt_result.get("ok")),
                 "error": str(thunderbolt_result.get("error") or ""),
             },
+            "pbs_direct": [
+                {
+                    "ok": bool(row.get("ok")),
+                    "host": str(row.get("host") or ""),
+                    "parent_host": str(row.get("parent_host") or ""),
+                    "datastore": str(row.get("datastore") or ""),
+                    "error": str(row.get("error") or ""),
+                }
+                for row in pbs_direct_results
+                if isinstance(row, dict)
+            ],
         },
     }
 
