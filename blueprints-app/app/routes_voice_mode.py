@@ -1961,6 +1961,12 @@ def _clean_active_browser_imports_dashboard(raw: Any) -> dict[str, Any]:
         "status": _clean_string(dashboard.get("status"), "", 40),
         "source_digest": _clean_string(dashboard.get("source_digest"), "", 96),
         "interests_status": _clean_string(dashboard.get("interests_status"), "", 40),
+        "recent_submission_count": _clean_browser_page_int(
+            dashboard.get("recent_submission_count"), maximum=100
+        ),
+        "first_recent_submission_label": _clean_string(
+            dashboard.get("first_recent_submission_label"), "", 160
+        ),
         "git_status": _clean_string(dashboard.get("git_status"), "", 40),
         "watched_repo_count": _clean_browser_page_int(
             dashboard.get("watched_repo_count"), maximum=200

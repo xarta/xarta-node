@@ -32,6 +32,42 @@ DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf
 XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xarta/.agents/lib"))
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
+INTERESTS_ROOT_REL = Path("interests")
+OPENCLAW_BOOKMARK_CANDIDATES_REL = Path(
+    "runtime/openclaw-migration/2026-06-12-vm720/derived/bookmark_candidates.jsonl"
+)
+IMPORT_ARTIFACT_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "docs/",
+    "interests/",
+    "stacks/hermes-local/data/health/",
+)
+IMPORT_ARTIFACT_TEXT_SUFFIXES: tuple[str, ...] = (
+    ".json",
+    ".jsonl",
+    ".md",
+    ".txt",
+    ".yaml",
+    ".yml",
+)
+IMPORT_ARTIFACT_PREVIEW_BYTES = 256 * 1024
+OPENCLAW_AUDIT_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "ai-developments",
+        "AI-ish OpenClaw URL candidates",
+        r"\b(ai|llm|large language|language model|openai|anthropic|deepmind|gemini|claude|qwen|llama|mistral|ollama|vllm|litellm|machine learning|neural|transformer|diffusion|embedding|agent|marktechpost|arxiv|model context protocol|mcp)\b",
+    ),
+    (
+        "hardware",
+        "electronics / embedded URL candidates",
+        r"\b(esp32|arduino|raspberry pi|microcontroller|electronics|pcb|solder|i2c|spi|uart|wifi hotspot|webflasher|embedded)\b",
+    ),
+    (
+        "games",
+        "game URL candidates",
+        r"\b(wordle|connections|nyt games|steam deck|videogame|boardgame)\b",
+    ),
+)
+OPENCLAW_AI_DEVELOPMENT_DOMAINS: tuple[str, ...] = ("marktechpost.com", "venturebeat.com")
 DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 DEFAULT_PERSONAL_GIT_REPOS: tuple[tuple[str, str, str], ...] = (
     ("p300", "/xarta-node", "Public non-root workspace"),
@@ -8231,6 +8267,186 @@ def _dashboard_link_path(href: str) -> str:
     return posixpath.normpath((INTERESTS_DASHBOARD_REL.parent / clean).as_posix())
 
 
+def _lone_wolf_rel(path: Any) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    raw = Path(text)
+    if raw.is_absolute():
+        with suppress(ValueError):
+            return raw.resolve().relative_to(LONE_WOLF_ROOT.resolve()).as_posix()
+    return text
+
+
+def _first_trace_candidate(payload: dict[str, Any]) -> dict[str, Any] | None:
+    categories = payload.get("categories") if isinstance(payload.get("categories"), dict) else {}
+    for category_data in categories.values():
+        extracted = category_data.get("extracted") if isinstance(category_data, dict) else []
+        for item in _as_list(extracted):
+            candidates = item.get("parsed_candidates") if isinstance(item, dict) else []
+            for candidate in _as_list(candidates):
+                if isinstance(candidate, dict) and candidate.get("game_type"):
+                    return candidate
+    return None
+
+
+def _trace_completed_at(payload: dict[str, Any]) -> str:
+    categories = payload.get("categories") if isinstance(payload.get("categories"), dict) else {}
+    values: list[str] = []
+    for category_data in categories.values():
+        if not isinstance(category_data, dict):
+            continue
+        for key in ("results", "importer_state", "worker_state", "wiki_pages"):
+            for item in _as_list(category_data.get(key)):
+                if isinstance(item, dict):
+                    value = str(item.get("completed_at") or item.get("updated_at") or "")
+                    if value:
+                        values.append(value)
+    return max(values) if values else str(payload.get("generated_at") or "")
+
+
+def _trace_artifacts(trace_path: Path, payload: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    surfaces = (
+        payload.get("operator_surfaces")
+        if isinstance(payload.get("operator_surfaces"), dict)
+        else {}
+    )
+
+    def items(key: str, label: str) -> list[dict[str, str]]:
+        paths = [str(path) for path in _as_list(surfaces.get(key)) if str(path or "").strip()]
+        return [
+            {
+                "label": f"{label} {index + 1}" if len(paths) > 1 else label,
+                "path": _lone_wolf_rel(path),
+            }
+            for index, path in enumerate(paths)
+        ]
+
+    return {
+        "trace": [{"label": "Trace proof", "path": _lone_wolf_rel(trace_path)}],
+        "raw": items("raw_records", "Raw record"),
+        "results": items("visible_results", "Result"),
+        "wiki": items("wiki_pages", "Wiki page"),
+    }
+
+
+def _trace_submission_summary(trace_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    raw_records = _as_list(payload.get("raw_records"))
+    dict_raw_records = [item for item in raw_records if isinstance(item, dict)]
+    first_raw = next(
+        (item for item in dict_raw_records if item.get("event_timestamp")), None
+    ) or next(iter(dict_raw_records), {})
+    selectors = payload.get("selectors") if isinstance(payload.get("selectors"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    categories = [str(item) for item in _as_list(summary.get("categories")) if str(item)]
+    category = categories[0] if categories else trace_path.parents[1].name
+    candidate = _first_trace_candidate(payload)
+    submitted_at = str(first_raw.get("event_timestamp") or first_raw.get("stored_at") or "")
+    title = ""
+    detected_as = ""
+    outcome = ""
+    details: list[str] = []
+    urls = [str(url) for url in _as_list(selectors.get("urls")) if str(url)]
+    event_ids = [
+        str(event_id) for event_id in _as_list(selectors.get("event_ids")) if str(event_id)
+    ]
+
+    if candidate:
+        game_type = str(candidate.get("game_type") or "").strip().lower()
+        detected_as = game_type.title()
+        if game_type == "wordle":
+            target = str(candidate.get("target_word") or "").strip()
+            score = str(candidate.get("score") or "").strip()
+            title = f"Wordle screenshot: {target or score or 'detected'}"
+            outcome = ", ".join(part for part in [score, target] if part) or "Wordle detected"
+            attempts = candidate.get("attempts")
+            status = str(candidate.get("status") or "").strip()
+            if attempts:
+                details.append(f"{attempts} attempts")
+            if status:
+                details.append(status)
+        elif game_type == "connections":
+            status = str(candidate.get("status") or "").strip()
+            mistakes = candidate.get("mistakes")
+            groups = [
+                str(group.get("category") or "").strip()
+                for group in _as_list(candidate.get("groups"))
+                if isinstance(group, dict) and group.get("category")
+            ]
+            title = "Connections screenshot"
+            outcome = f"Connections {status or 'detected'}"
+            if mistakes is not None:
+                outcome += f", {mistakes} mistakes"
+            if groups:
+                details.append("; ".join(groups[:4]))
+        else:
+            title = f"{detected_as} game screenshot"
+            outcome = str(candidate.get("status") or "Game detected")
+        parser = str(candidate.get("parser") or "").strip()
+        if parser:
+            details.append(parser)
+    else:
+        url = (
+            urls[0]
+            if urls
+            else str(first_raw.get("urls", [""])[0] if first_raw.get("urls") else "")
+        )
+        host = urlparse(url).netloc if url else ""
+        labels = (
+            first_raw.get("routing", {}).get("labels")
+            if isinstance(first_raw.get("routing"), dict)
+            else []
+        )
+        label_text = ", ".join(str(label) for label in _as_list(labels)[:4])
+        title = f"{category.title()} URL: {host or 'submitted URL'}"
+        detected_as = category
+        outcome = "URL captured, bookmark written, wiki updated" if url else "Submission processed"
+        if label_text:
+            details.append(label_text)
+        reason = (
+            first_raw.get("routing", {}).get("reason")
+            if isinstance(first_raw.get("routing"), dict)
+            else ""
+        )
+        if reason:
+            details.append(str(reason))
+
+    return {
+        "id": trace_path.stem,
+        "title": title or trace_path.stem,
+        "kind": "game" if candidate else "url" if urls else "submission",
+        "status": "processed" if payload.get("ok") is True else "needs_review",
+        "category": category,
+        "submitted_at": submitted_at,
+        "completed_at": _trace_completed_at(payload),
+        "detected_as": detected_as,
+        "outcome": outcome,
+        "details": details,
+        "matrix_event_ids": event_ids,
+        "url": urls[0] if urls else "",
+        "source_room_id": str(first_raw.get("source_room_id") or ""),
+        "trace_path": _lone_wolf_rel(trace_path),
+        "artifacts": _trace_artifacts(trace_path, payload),
+    }
+
+
+def _parse_ingestion_trace_submissions(limit: int = 12) -> list[dict[str, Any]]:
+    root = LONE_WOLF_ROOT / INTERESTS_ROOT_REL
+    rows: list[dict[str, Any]] = []
+    if not root.exists():
+        return rows
+    for path in root.glob("*/results/trace-*.json"):
+        payload = _read_json_file(path, {})
+        if payload.get("schema") != "xarta.interests.ingestion.traceability.v1":
+            continue
+        rows.append(_trace_submission_summary(path, payload))
+    return sorted(
+        rows,
+        key=lambda item: (str(item.get("submitted_at") or ""), str(item.get("id") or "")),
+        reverse=True,
+    )[:limit]
+
+
 def _markdown_link(value: str) -> dict[str, str] | None:
     match = re.search(r"\[([^\]]+)\]\(([^)]+)\)", value)
     if not match:
@@ -8333,10 +8549,284 @@ def _parse_interests_dashboard() -> dict[str, Any]:
         "category_summary": _markdown_table(text, "Category Summary", limit=20),
         "input_health": _markdown_table(text, "Input Health", limit=20),
         "recent_completed_work": _markdown_table(text, "Recent Completed Work", limit=12),
+        "recent_submissions": _parse_ingestion_trace_submissions(),
         "source_unavailable": _markdown_table(text, "Source-Unavailable", limit=12),
         "blockers": blocker_items,
         "rerun_status": "idempotent source digest" if "source digest changes" in text else "",
         "proof_links": proof_links,
+    }
+
+
+def _resolve_import_artifact_path(raw_path: str) -> tuple[Path, str]:
+    text = str(raw_path or "").strip().replace("\\", "/").lstrip("/")
+    if not text:
+        raise HTTPException(400, "artifact path is required")
+    clean = posixpath.normpath(text)
+    if clean.startswith("../") or clean == ".." or "/../" in clean:
+        raise HTTPException(400, "artifact path escapes the workspace")
+    if not any(
+        clean == prefix.rstrip("/") or clean.startswith(prefix)
+        for prefix in IMPORT_ARTIFACT_ALLOWED_PREFIXES
+    ):
+        raise HTTPException(403, "artifact path is outside the imports allowlist")
+    suffix = Path(clean).suffix.lower()
+    if suffix not in IMPORT_ARTIFACT_TEXT_SUFFIXES:
+        raise HTTPException(415, "artifact preview is limited to text artifacts")
+    root = LONE_WOLF_ROOT.resolve()
+    resolved = (root / clean).resolve()
+    with suppress(ValueError):
+        rel = resolved.relative_to(root).as_posix()
+        if rel == clean and resolved.is_file():
+            return resolved, rel
+    raise HTTPException(404, "artifact not found")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+@router.get("/imports-artifact")
+async def get_imports_artifact(
+    path: str = Query(..., min_length=1, max_length=500),
+) -> dict[str, Any]:
+    artifact_path, rel = _resolve_import_artifact_path(path)
+    stat = artifact_path.stat()
+    too_large = stat.st_size > IMPORT_ARTIFACT_PREVIEW_BYTES
+    with artifact_path.open("rb") as handle:
+        data = handle.read(IMPORT_ARTIFACT_PREVIEW_BYTES + 1)
+    preview = data[:IMPORT_ARTIFACT_PREVIEW_BYTES].decode("utf-8", errors="replace")
+    return {
+        "ok": True,
+        "path": rel,
+        "name": artifact_path.name,
+        "size_bytes": stat.st_size,
+        "sha256": _sha256_file(artifact_path),
+        "truncated": too_large,
+        "preview": preview,
+    }
+
+
+def _safe_audit_url(raw_url: str) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text.split("?", 1)[0].split("#", 1)[0][:240]
+    return parsed._replace(query="", fragment="").geturl()[:240]
+
+
+def _read_openclaw_bookmark_candidates() -> list[dict[str, Any]]:
+    path = LONE_WOLF_ROOT / OPENCLAW_BOOKMARK_CANDIDATES_REL
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            with suppress(json.JSONDecodeError):
+                payload = json.loads(text)
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    return rows
+
+
+def _openclaw_domain_for_url(raw_url: str) -> str:
+    host = urlparse(str(raw_url or "")).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for domain in OPENCLAW_AI_DEVELOPMENT_DOMAINS:
+        if host == domain or host.endswith(f".{domain}"):
+            return domain
+    return ""
+
+
+def _interest_text_file_paths() -> list[tuple[str, Path]]:
+    root = LONE_WOLF_ROOT / INTERESTS_ROOT_REL
+    if not root.exists():
+        return []
+    paths: list[tuple[str, Path]] = []
+    for category_root in root.iterdir():
+        if not category_root.is_dir():
+            continue
+        category = category_root.name
+        for folder in ("raw", "results", "extracted", "entities", "queries"):
+            base = category_root / folder
+            if not base.exists():
+                continue
+            for path in base.rglob("*"):
+                if path.is_file() and path.suffix.lower() in IMPORT_ARTIFACT_TEXT_SUFFIXES:
+                    paths.append((category, path))
+    return paths
+
+
+def _openclaw_ai_domain_audit(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_domain: dict[str, list[dict[str, Any]]] = {
+        domain: [] for domain in OPENCLAW_AI_DEVELOPMENT_DOMAINS
+    }
+    for row in rows:
+        domain = _openclaw_domain_for_url(str(row.get("url") or ""))
+        if domain:
+            by_domain.setdefault(domain, []).append(row)
+
+    unique_urls: dict[str, dict[str, Any]] = {}
+    for domain_rows in by_domain.values():
+        for row in domain_rows:
+            url = _safe_audit_url(str(row.get("url") or ""))
+            if url and url not in unique_urls:
+                unique_urls[url] = row
+
+    occurrences: dict[str, dict[str, Any]] = {
+        url: {"categories": set(), "paths": []} for url in unique_urls
+    }
+    needles = {url: (url.lower(), url.lower().rstrip("/")) for url in unique_urls}
+    domains = tuple(domain.lower() for domain in OPENCLAW_AI_DEVELOPMENT_DOMAINS)
+    for category, path in _interest_text_file_paths():
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if not any(domain in text for domain in domains):
+            continue
+        rel = _lone_wolf_rel(path)
+        for url, variants in needles.items():
+            if any(variant and variant in text for variant in variants):
+                occurrences[url]["categories"].add(category)
+                if len(occurrences[url]["paths"]) < 5:
+                    occurrences[url]["paths"].append(rel)
+
+    audits: list[dict[str, Any]] = []
+    for domain, domain_rows in by_domain.items():
+        unique_domain_urls = []
+        seen: set[str] = set()
+        for row in domain_rows:
+            url = _safe_audit_url(str(row.get("url") or ""))
+            if url and url not in seen:
+                seen.add(url)
+                unique_domain_urls.append((url, row))
+        example_rows = []
+        counts = {"in_ai_developments": 0, "in_other_category": 0, "missing_from_interests": 0}
+        for url, row in unique_domain_urls:
+            cats = sorted(occurrences.get(url, {}).get("categories") or [])
+            if "ai-developments" in cats:
+                state = "in_ai_developments"
+            elif cats:
+                state = "in_other_category"
+            else:
+                state = "missing_from_interests"
+            counts[state] += 1
+            if len(example_rows) < 10 and state != "in_ai_developments":
+                example_rows.append(
+                    {
+                        "url": url,
+                        "timestamp": str(row.get("timestamp") or ""),
+                        "state": state,
+                        "categories": cats,
+                        "paths": occurrences.get(url, {}).get("paths") or [],
+                    }
+                )
+        status = (
+            "ok"
+            if unique_domain_urls
+            and counts["in_other_category"] == 0
+            and counts["missing_from_interests"] == 0
+            else "needs_review"
+            if unique_domain_urls
+            else "not_seen"
+        )
+        note = (
+            "all unique OpenClaw URLs for this domain are present in ai-developments"
+            if status == "ok"
+            else "some OpenClaw URLs for this AI-development domain are missing or outside ai-developments"
+            if status == "needs_review"
+            else "no OpenClaw bookmark candidates found for this domain"
+        )
+        audits.append(
+            {
+                "domain": domain,
+                "status": status,
+                "candidate_count": len(domain_rows),
+                "unique_url_count": len(unique_domain_urls),
+                **counts,
+                "note": note,
+                "examples": example_rows,
+            }
+        )
+    return audits
+
+
+def _category_summary_by_name(interests: dict[str, Any]) -> dict[str, dict[str, str]]:
+    rows = (
+        interests.get("category_summary")
+        if isinstance(interests.get("category_summary"), list)
+        else []
+    )
+    return {
+        str(row.get("Category") or "").strip("`"): row
+        for row in rows
+        if isinstance(row, dict) and row.get("Category")
+    }
+
+
+def _openclaw_candidate_audit(interests: dict[str, Any]) -> dict[str, Any]:
+    source_path = LONE_WOLF_ROOT / OPENCLAW_BOOKMARK_CANDIDATES_REL
+    rows = _read_openclaw_bookmark_candidates()
+    summary = _category_summary_by_name(interests)
+    category_rows: list[dict[str, Any]] = []
+    for category, label, pattern in OPENCLAW_AUDIT_PATTERNS:
+        regex = re.compile(pattern, re.IGNORECASE)
+        hits = [
+            row
+            for row in rows
+            if regex.search(f"{row.get('url') or ''} {row.get('context') or ''}")
+        ]
+        current = summary.get(category, {})
+        examples = [
+            {
+                "timestamp": str(row.get("timestamp") or ""),
+                "url": _safe_audit_url(str(row.get("url") or "")),
+            }
+            for row in hits[:8]
+        ]
+        raw_count = int(str(current.get("Raw") or "0").strip("`") or 0)
+        results_count = int(str(current.get("Results") or "0").strip("`") or 0)
+        status = "ok"
+        note = "candidate count is within current raw/result scale"
+        if hits and raw_count < max(5, len(hits) // 4):
+            status = "needs_review"
+            note = (
+                "candidate count is much larger than current raw count; import coverage needs audit"
+            )
+        category_rows.append(
+            {
+                "category": category,
+                "label": label,
+                "status": status,
+                "candidate_count": len(hits),
+                "current_raw": raw_count,
+                "current_results": results_count,
+                "current_wiki_pages": int(str(current.get("Wiki pages") or "0").strip("`") or 0),
+                "note": note,
+                "examples": examples,
+            }
+        )
+    domain_audit = _openclaw_ai_domain_audit(rows)
+    blockers = [row for row in category_rows if row["status"] != "ok"]
+    blockers.extend(row for row in domain_audit if row["status"] == "needs_review")
+    return {
+        "status": "needs_review" if blockers else "ok",
+        "source_path": str(OPENCLAW_BOOKMARK_CANDIDATES_REL),
+        "source_exists": source_path.exists(),
+        "total_candidates": len(rows),
+        "categories": category_rows,
+        "ai_development_domains": domain_audit,
+        "blockers": blockers,
     }
 
 
@@ -8513,10 +9003,13 @@ def _git_activity_dashboard(counts: dict[str, Any]) -> dict[str, Any]:
 async def get_imports_dashboard() -> dict[str, Any]:
     counts = _personal_source_counts()
     interests = _parse_interests_dashboard()
+    openclaw_coverage = _openclaw_candidate_audit(interests)
     git_activity = _git_activity_dashboard(counts)
     blockers = []
     if interests.get("blockers"):
         blockers.append({"source": "interests-ingestion", "items": interests["blockers"]})
+    if openclaw_coverage.get("blockers"):
+        blockers.append({"source": "openclaw-carry-over", "items": openclaw_coverage["blockers"]})
     if git_activity.get("errors"):
         blockers.append({"source": "git-activity", "items": git_activity["errors"]})
 
@@ -8527,6 +9020,32 @@ async def get_imports_dashboard() -> dict[str, Any]:
                 "snapshot_at": interests.get("snapshot_at"),
                 "pending_review": interests.get("pending_review"),
                 "actionable_backlog": interests.get("actionable_backlog"),
+                "recent_submissions": interests.get("recent_submissions", []),
+            },
+            "openclaw": {
+                "status": openclaw_coverage.get("status"),
+                "total_candidates": openclaw_coverage.get("total_candidates"),
+                "categories": [
+                    {
+                        "category": row.get("category"),
+                        "candidate_count": row.get("candidate_count"),
+                        "current_raw": row.get("current_raw"),
+                        "current_results": row.get("current_results"),
+                        "status": row.get("status"),
+                    }
+                    for row in openclaw_coverage.get("categories", [])
+                ],
+                "ai_development_domains": [
+                    {
+                        "domain": row.get("domain"),
+                        "unique_url_count": row.get("unique_url_count"),
+                        "in_ai_developments": row.get("in_ai_developments"),
+                        "in_other_category": row.get("in_other_category"),
+                        "missing_from_interests": row.get("missing_from_interests"),
+                        "status": row.get("status"),
+                    }
+                    for row in openclaw_coverage.get("ai_development_domains", [])
+                ],
             },
             "git": [
                 {
@@ -8546,7 +9065,9 @@ async def get_imports_dashboard() -> dict[str, Any]:
     source_digest = "sha256:" + hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
     status = (
         "ok"
-        if interests.get("status") == "ok" and git_activity.get("status") == "ok"
+        if interests.get("status") == "ok"
+        and openclaw_coverage.get("status") == "ok"
+        and git_activity.get("status") == "ok"
         else "needs_review"
     )
     return {
@@ -8555,6 +9076,7 @@ async def get_imports_dashboard() -> dict[str, Any]:
         "source_digest": source_digest,
         "source_counts": counts,
         "interests": interests,
+        "openclaw_coverage": openclaw_coverage,
         "git_activity": git_activity,
         "recent_work": {
             "interests": interests.get("recent_completed_work", [])[:8],
