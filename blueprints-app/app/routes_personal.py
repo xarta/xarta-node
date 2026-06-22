@@ -8310,9 +8310,11 @@ def _parse_interests_dashboard() -> dict[str, Any]:
             "path": str(INTERESTS_DASHBOARD_REL),
         },
     ]
-    for label in ("Completion proof", "Follow-up add-on"):
+    for label in ("Completion proof", "Follow-up add-on", "Traceability proof"):
         link = _markdown_list_link(text, label)
         if link:
+            if label == "Traceability proof":
+                link["label"] = f"{label}: {link['label']}"
             proof_links.append(link)
     return {
         "status": "ok" if overall == "ok" else overall,

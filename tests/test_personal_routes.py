@@ -747,6 +747,7 @@ Overall: **OK**
 - Source digest: `sha256:testdigest`
 - Pending review: `0`
 - Actionable backlog: `0`
+- Traceability proof: [21 Jun Games Wordle trace](../../interests/games/results/trace-2026-06-21-games-wordle.json)
 
 ## Category Summary
 
@@ -822,6 +823,7 @@ The dashboard generator writes only when the source digest changes.
     assert "Personal Time Activity Step 8 proof" in [
         link["label"] for link in result["proof_links"]
     ]
+    assert any(link["label"].startswith("Traceability proof:") for link in result["proof_links"])
     assert result["git_activity"]["status"] == "ok"
     assert result["git_activity"]["watched_repos"][0]["repo_id"] == "test-repo"
     assert result["git_activity"]["watched_repos"][0]["dirty_count"] == 0
