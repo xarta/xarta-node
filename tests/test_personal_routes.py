@@ -9,6 +9,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
@@ -788,6 +790,67 @@ The dashboard generator writes only when the source digest changes.
 """,
         encoding="utf-8",
     )
+    trace = lone_wolf / "interests" / "games" / "results" / "trace-2026-06-21-games-wordle.json"
+    trace.parent.mkdir(parents=True)
+    raw = lone_wolf / "interests" / "games" / "raw" / "2026-06-22" / "wordle.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("{}", encoding="utf-8")
+    trace.write_text(
+        json.dumps(
+            {
+                "schema": "xarta.interests.ingestion.traceability.v1",
+                "ok": True,
+                "generated_at": "2026-06-22T10:00:00Z",
+                "selectors": {"event_ids": ["$wordle"], "urls": []},
+                "summary": {
+                    "categories": ["games"],
+                    "completed_work_types": ["game_parse", "wiki_update"],
+                    "game_types": ["wordle"],
+                    "results": 2,
+                    "wiki_pages": 1,
+                },
+                "raw_records": [
+                    {
+                        "category": "games",
+                        "event_timestamp": "2026-06-21T22:12:10Z",
+                        "path": str(raw),
+                        "source_event_id": "$wordle",
+                        "source_room_id": "!games:example.test",
+                    }
+                ],
+                "categories": {
+                    "games": {
+                        "extracted": [
+                            {
+                                "parsed_candidates": [
+                                    {
+                                        "game_type": "wordle",
+                                        "target_word": "ALIBI",
+                                        "score": "4/6",
+                                        "attempts": 4,
+                                        "status": "win",
+                                        "parser": "private_vision_wordle_screenshot_v2",
+                                    }
+                                ]
+                            }
+                        ],
+                        "results": [{"completed_at": "2026-06-22T10:04:28Z"}],
+                    }
+                },
+                "operator_surfaces": {
+                    "raw_records": [str(raw)],
+                    "visible_results": [
+                        str(lone_wolf / "interests" / "games" / "results" / "wordle-result.json")
+                    ],
+                    "wiki_pages": [
+                        str(lone_wolf / "interests" / "games" / "queries" / "wordle.md")
+                    ],
+                },
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -824,6 +887,13 @@ The dashboard generator writes only when the source digest changes.
         link["label"] for link in result["proof_links"]
     ]
     assert any(link["label"].startswith("Traceability proof:") for link in result["proof_links"])
+    assert result["interests"]["recent_submissions"][0]["title"] == "Wordle screenshot: ALIBI"
+    assert result["interests"]["recent_submissions"][0]["status"] == "processed"
+    assert result["interests"]["recent_submissions"][0]["outcome"] == "4/6, ALIBI"
+    assert (
+        result["interests"]["recent_submissions"][0]["artifacts"]["trace"][0]["path"]
+        == "interests/games/results/trace-2026-06-21-games-wordle.json"
+    )
     assert result["git_activity"]["status"] == "ok"
     assert result["git_activity"]["watched_repos"][0]["repo_id"] == "test-repo"
     assert result["git_activity"]["watched_repos"][0]["dirty_count"] == 0
@@ -837,6 +907,79 @@ The dashboard generator writes only when the source digest changes.
     assert dirty["git_activity"]["status"] == "needs_review"
     assert dirty["git_activity"]["watched_repos"][0]["dirty_count"] == 1
     assert dirty["git_activity"]["actionable_repos"][0]["repo_id"] == "test-repo"
+
+
+def test_imports_artifact_preview_is_allowlisted(monkeypatch, tmp_path):
+    lone_wolf = tmp_path / "lone-wolf"
+    artifact = lone_wolf / "interests" / "games" / "results" / "trace-wordle.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"game_type":"wordle","score":"4/6"}\n', encoding="utf-8")
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", lone_wolf)
+
+    result = asyncio.run(
+        routes_personal.get_imports_artifact(path="interests/games/results/trace-wordle.json")
+    )
+
+    assert result["ok"] is True
+    assert result["path"] == "interests/games/results/trace-wordle.json"
+    assert result["name"] == "trace-wordle.json"
+    assert result["truncated"] is False
+    assert result["sha256"].startswith("sha256:")
+    assert '"game_type":"wordle"' in result["preview"]
+
+
+def test_imports_artifact_preview_blocks_path_escape(monkeypatch, tmp_path):
+    lone_wolf = tmp_path / "lone-wolf"
+    lone_wolf.mkdir()
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", lone_wolf)
+
+    with pytest.raises(routes_personal.HTTPException) as error:
+        asyncio.run(routes_personal.get_imports_artifact(path="../.env"))
+
+    assert error.value.status_code == 400
+
+
+def test_openclaw_ai_domain_audit_flags_missing_or_misfiled_urls(monkeypatch, tmp_path):
+    lone_wolf = tmp_path / "lone-wolf"
+    candidates = (
+        lone_wolf
+        / "runtime"
+        / "openclaw-migration"
+        / "2026-06-12-vm720"
+        / "derived"
+        / "bookmark_candidates.jsonl"
+    )
+    candidates.parent.mkdir(parents=True)
+    marktechpost_url = "https://www.marktechpost.com/2026/02/21/example-ai-research/"
+    venturebeat_url = "https://venturebeat.com/ai/example-model-news/"
+    candidates.write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": "2026-02-22T22:40:20Z", "url": marktechpost_url}),
+                json.dumps({"timestamp": "2026-02-23T09:00:00Z", "url": venturebeat_url}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    software_result = lone_wolf / "interests" / "software" / "results" / "misfiled.json"
+    software_result.parent.mkdir(parents=True)
+    software_result.write_text(json.dumps({"url": marktechpost_url}), encoding="utf-8")
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", lone_wolf)
+
+    result = routes_personal._openclaw_candidate_audit(
+        {
+            "category_summary": [
+                {"Category": "ai-developments", "Raw": "0", "Results": "0", "Wiki pages": "0"}
+            ]
+        }
+    )
+
+    domains = {row["domain"]: row for row in result["ai_development_domains"]}
+    assert result["status"] == "needs_review"
+    assert domains["marktechpost.com"]["in_other_category"] == 1
+    assert domains["marktechpost.com"]["examples"][0]["categories"] == ["software"]
+    assert domains["venturebeat.com"]["missing_from_interests"] == 1
 
 
 def test_diary_day_read_model_hides_pin_events(monkeypatch, tmp_path):
