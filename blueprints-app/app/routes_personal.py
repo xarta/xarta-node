@@ -862,6 +862,7 @@ def _entry_title(body: str, local_time: str | None) -> str:
 
 
 def _body_excerpt(body: str, limit: int = 500) -> str:
+    # Compact summaries only; markdown-capable content_projection must keep raw whitespace.
     return re.sub(r"\s+", " ", body.strip())[:limit]
 
 
@@ -5633,7 +5634,9 @@ def _calendar_event_payload(
         tags.append("all-day")
     if not body.all_day and "timed" not in tags:
         tags.append("timed")
-    content = _body_excerpt(body.body or "", limit=2000)
+    # Keep this raw for Markdown preview/edit; body_excerpt is the compact row/search summary.
+    content = str(body.body or "").strip()[:20000]
+    content_excerpt = _body_excerpt(content, limit=2000)
     provenance = {
         "calendar": {
             "all_day": bool(body.all_day),
@@ -5658,7 +5661,7 @@ def _calendar_event_payload(
         "source_ref": "",
         "kind": kind,
         "title": title,
-        "body_excerpt": content,
+        "body_excerpt": content_excerpt,
         "content_projection": content,
         "start_at": start_at,
         "end_at": end_at,
