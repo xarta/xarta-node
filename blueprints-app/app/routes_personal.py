@@ -133,6 +133,10 @@ class DiaryEntryCreateRequest(BaseModel):
     body: str
     local_date: str | None = None
     local_time: str | None = None
+    end_time: str | None = None
+    all_day: bool | None = None
+    range_start_date: str | None = None
+    range_end_date: str | None = None
     timezone: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "diary-page"
@@ -7954,13 +7958,33 @@ def _project_personal_log_event(
     request_id: str,
     run_id: str,
     now: str,
+    all_day: bool = True,
+    local_time: str | None = None,
+    end_time: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict[str, Any]:
     local_date = result["local_date"]
     filename = result["filename"]
     event_id = f"diary-{local_date}-{Path(filename).stem}"
-    tags = ["diary", "personal-log", "quick-entry"]
+    timezone_name = result.get("timezone") or os.environ.get(
+        "XARTA_DIARY_TIMEZONE", "Europe/London"
+    )
+    event_tags = ["diary", "personal-log", "quick-entry"]
+    for tag in tags or []:
+        if tag not in event_tags:
+            event_tags.append(tag)
+    if all_day and "all-day" not in event_tags:
+        event_tags.append("all-day")
+    if not all_day and "timed" not in event_tags:
+        event_tags.append("timed")
     provenance = {
         "writer": "xarta_diary.create_personal_log",
+        "calendar": {
+            "all_day": bool(all_day),
+            "local_start_time": local_time or "",
+            "local_end_time": end_time or "",
+            "timezone": timezone_name,
+        },
         "audit_id": audit_id,
         "actor": actor,
         "source_surface": source_surface,
@@ -8011,12 +8035,12 @@ def _project_personal_log_event(
                 _entry_title(body, result.get("local_time")),
                 _body_excerpt(body),
                 body.strip(),
-                now,
+                _calendar_utc_iso(local_date, local_time, timezone_name),
                 local_date,
-                result.get("timezone") or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+                timezone_name,
                 "open",
                 "normal",
-                json.dumps(tags, ensure_ascii=True),
+                json.dumps(event_tags, ensure_ascii=True),
                 json.dumps([file_ref], ensure_ascii=True),
                 json.dumps([f"personal_time_audit:{audit_id}"], ensure_ascii=True),
                 json.dumps(provenance, ensure_ascii=True, sort_keys=True),
@@ -8064,7 +8088,9 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
     if len(text) > 20000:
         raise HTTPException(400, "entry body is too long")
     local_date = _validate_local_date(body.local_date)
-    local_time = _validate_local_time(body.local_time)
+    all_day = bool(body.all_day) if body.all_day is not None else not bool(body.local_time)
+    local_time = None if all_day else _validate_local_time(body.local_time)
+    end_time = None if all_day else _validate_local_time(body.end_time)
     module = _load_xarta_diary_module()
     owner = module.resolve_owner("xarta", "xarta")
     actor = _clean_short_text(body.actor, "blueprints-ui")
@@ -8119,6 +8145,10 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
         request_id=request_id,
         run_id=run_id,
         now=now,
+        all_day=all_day,
+        local_time=local_time,
+        end_time=end_time,
+        tags=tags,
     )
     return {
         "ok": True,
