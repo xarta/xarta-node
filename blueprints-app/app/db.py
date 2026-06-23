@@ -388,6 +388,141 @@ CREATE INDEX IF NOT EXISTS idx_personal_import_batches_source
 CREATE INDEX IF NOT EXISTS idx_personal_import_batches_privacy
     ON personal_import_batches(privacy_level);
 
+CREATE TABLE IF NOT EXISTS personal_git_repositories (
+    repo_full_name        TEXT PRIMARY KEY,
+    repo_id               INTEGER,
+    owner_login           TEXT NOT NULL DEFAULT '',
+    name                  TEXT NOT NULL DEFAULT '',
+    html_url              TEXT NOT NULL DEFAULT '',
+    description           TEXT NOT NULL DEFAULT '',
+    default_branch        TEXT NOT NULL DEFAULT '',
+    visibility            TEXT NOT NULL DEFAULT '',
+    is_private            INTEGER NOT NULL DEFAULT 0,
+    is_fork               INTEGER NOT NULL DEFAULT 0,
+    is_archived           INTEGER NOT NULL DEFAULT 0,
+    can_push              INTEGER NOT NULL DEFAULT 0,
+    last_pushed_at        TEXT,
+    last_seen_at          TEXT,
+    provenance_json       TEXT NOT NULL DEFAULT '{}',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_repositories_owner
+    ON personal_git_repositories(owner_login, can_push, visibility);
+CREATE INDEX IF NOT EXISTS idx_personal_git_repositories_seen
+    ON personal_git_repositories(last_seen_at);
+
+CREATE TABLE IF NOT EXISTS personal_git_commits (
+    commit_id             TEXT PRIMARY KEY,
+    repo_full_name        TEXT NOT NULL,
+    sha                   TEXT NOT NULL,
+    short_sha             TEXT NOT NULL DEFAULT '',
+    html_url              TEXT NOT NULL DEFAULT '',
+    author_login          TEXT NOT NULL DEFAULT '',
+    author_name           TEXT NOT NULL DEFAULT '',
+    committed_at          TEXT NOT NULL DEFAULT '',
+    local_date            TEXT NOT NULL DEFAULT '',
+    message_subject       TEXT NOT NULL DEFAULT '',
+    message_body          TEXT NOT NULL DEFAULT '',
+    branches_json         TEXT NOT NULL DEFAULT '[]',
+    pr_refs_json          TEXT NOT NULL DEFAULT '[]',
+    issue_refs_json       TEXT NOT NULL DEFAULT '[]',
+    feature_key           TEXT NOT NULL DEFAULT '',
+    source_hash           TEXT NOT NULL DEFAULT '',
+    provenance_json       TEXT NOT NULL DEFAULT '{}',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now')),
+    UNIQUE(repo_full_name, sha)
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_commits_day
+    ON personal_git_commits(local_date, repo_full_name);
+CREATE INDEX IF NOT EXISTS idx_personal_git_commits_feature
+    ON personal_git_commits(feature_key, local_date);
+
+CREATE TABLE IF NOT EXISTS personal_git_features (
+    feature_id            TEXT PRIMARY KEY,
+    feature_key           TEXT NOT NULL DEFAULT '',
+    title                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'active',
+    first_seen_date       TEXT NOT NULL DEFAULT '',
+    last_seen_date        TEXT NOT NULL DEFAULT '',
+    repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
+    commit_count          INTEGER NOT NULL DEFAULT 0,
+    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    project_arc_id        TEXT NOT NULL DEFAULT '',
+    subproject_arc_id     TEXT NOT NULL DEFAULT '',
+    parent_work_item_id   TEXT NOT NULL DEFAULT '',
+    source_hash           TEXT NOT NULL DEFAULT '',
+    provenance_json       TEXT NOT NULL DEFAULT '{}',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_features_key
+    ON personal_git_features(feature_key);
+CREATE INDEX IF NOT EXISTS idx_personal_git_features_dates
+    ON personal_git_features(first_seen_date, last_seen_date);
+
+CREATE TABLE IF NOT EXISTS personal_git_kanban_arcs (
+    arc_id                TEXT PRIMARY KEY,
+    arc_type              TEXT NOT NULL DEFAULT '',
+    arc_key               TEXT NOT NULL DEFAULT '',
+    title                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'active',
+    first_seen_date       TEXT NOT NULL DEFAULT '',
+    last_seen_date        TEXT NOT NULL DEFAULT '',
+    parent_arc_id         TEXT NOT NULL DEFAULT '',
+    repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
+    feature_keys_json     TEXT NOT NULL DEFAULT '[]',
+    commit_count          INTEGER NOT NULL DEFAULT 0,
+    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    source_hash           TEXT NOT NULL DEFAULT '',
+    provenance_json       TEXT NOT NULL DEFAULT '{}',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_kanban_arcs_type
+    ON personal_git_kanban_arcs(arc_type, arc_key);
+CREATE INDEX IF NOT EXISTS idx_personal_git_kanban_arcs_parent
+    ON personal_git_kanban_arcs(parent_arc_id, arc_type);
+
+CREATE TABLE IF NOT EXISTS personal_git_daily_summaries (
+    summary_id            TEXT PRIMARY KEY,
+    local_date            TEXT NOT NULL,
+    title                 TEXT NOT NULL DEFAULT '',
+    markdown              TEXT NOT NULL DEFAULT '',
+    repo_count            INTEGER NOT NULL DEFAULT 0,
+    commit_count          INTEGER NOT NULL DEFAULT 0,
+    feature_count         INTEGER NOT NULL DEFAULT 0,
+    related_work_items_json TEXT NOT NULL DEFAULT '[]',
+    source_hash           TEXT NOT NULL DEFAULT '',
+    provenance_json       TEXT NOT NULL DEFAULT '{}',
+    event_id              TEXT NOT NULL DEFAULT '',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_daily_summaries_date
+    ON personal_git_daily_summaries(local_date);
+
+CREATE TABLE IF NOT EXISTS personal_git_import_runs (
+    run_id                TEXT PRIMARY KEY,
+    status                TEXT NOT NULL DEFAULT 'pending_review',
+    mode                  TEXT NOT NULL DEFAULT 'dry-run',
+    started_at            TEXT NOT NULL DEFAULT '',
+    completed_at          TEXT,
+    date_start            TEXT NOT NULL DEFAULT '',
+    date_end              TEXT NOT NULL DEFAULT '',
+    repo_count            INTEGER NOT NULL DEFAULT 0,
+    commit_count          INTEGER NOT NULL DEFAULT 0,
+    summary_count         INTEGER NOT NULL DEFAULT 0,
+    params_json           TEXT NOT NULL DEFAULT '{}',
+    report_json           TEXT NOT NULL DEFAULT '{}',
+    source_hash           TEXT NOT NULL DEFAULT '',
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_git_import_runs_dates
+    ON personal_git_import_runs(date_start, date_end, started_at);
+
 CREATE TABLE IF NOT EXISTS personal_time_audit (
     audit_id        TEXT PRIMARY KEY,
     actor           TEXT NOT NULL DEFAULT '',
