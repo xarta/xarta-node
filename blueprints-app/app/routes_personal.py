@@ -133,6 +133,26 @@ class DiaryEntryCreateRequest(BaseModel):
     body: str
     local_date: str | None = None
     local_time: str | None = None
+    end_time: str | None = None
+    all_day: bool | None = None
+    range_start_date: str | None = None
+    range_end_date: str | None = None
+    timezone: str | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "diary-page"
+    request_id: str | None = None
+    run_id: str | None = None
+    tags: list[str] = []
+
+
+class DiaryEntryUpdateRequest(BaseModel):
+    body: str
+    local_date: str | None = None
+    local_time: str | None = None
+    end_time: str | None = None
+    all_day: bool | None = None
+    range_start_date: str | None = None
+    range_end_date: str | None = None
     timezone: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "diary-page"
@@ -842,6 +862,7 @@ def _entry_title(body: str, local_time: str | None) -> str:
 
 
 def _body_excerpt(body: str, limit: int = 500) -> str:
+    # Compact summaries only; markdown-capable content_projection must keep raw whitespace.
     return re.sub(r"\s+", " ", body.strip())[:limit]
 
 
@@ -5613,7 +5634,9 @@ def _calendar_event_payload(
         tags.append("all-day")
     if not body.all_day and "timed" not in tags:
         tags.append("timed")
-    content = _body_excerpt(body.body or "", limit=2000)
+    # Keep this raw for Markdown preview/edit; body_excerpt is the compact row/search summary.
+    content = str(body.body or "").strip()[:20000]
+    content_excerpt = _body_excerpt(content, limit=2000)
     provenance = {
         "calendar": {
             "all_day": bool(body.all_day),
@@ -5638,7 +5661,7 @@ def _calendar_event_payload(
         "source_ref": "",
         "kind": kind,
         "title": title,
-        "body_excerpt": content,
+        "body_excerpt": content_excerpt,
         "content_projection": content,
         "start_at": start_at,
         "end_at": end_at,
@@ -7942,6 +7965,23 @@ async def _project_browser_links(body: DiaryBrowserLinksProjectRequest) -> dict[
     }
 
 
+def _diary_entry_tags(tags: list[str] | None, *, all_day: bool) -> list[str]:
+    event_tags = ["diary", "personal-log", "quick-entry"]
+    for tag in tags or []:
+        clean = str(tag).strip()
+        if clean and clean not in event_tags:
+            event_tags.append(clean)
+    if all_day:
+        if "all-day" not in event_tags:
+            event_tags.append("all-day")
+        event_tags = [tag for tag in event_tags if tag != "timed"]
+    else:
+        if "timed" not in event_tags:
+            event_tags.append("timed")
+        event_tags = [tag for tag in event_tags if tag != "all-day"]
+    return event_tags
+
+
 def _project_personal_log_event(
     *,
     result: dict[str, Any],
@@ -7954,13 +7994,26 @@ def _project_personal_log_event(
     request_id: str,
     run_id: str,
     now: str,
+    all_day: bool = True,
+    local_time: str | None = None,
+    end_time: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict[str, Any]:
     local_date = result["local_date"]
     filename = result["filename"]
     event_id = f"diary-{local_date}-{Path(filename).stem}"
-    tags = ["diary", "personal-log", "quick-entry"]
+    timezone_name = result.get("timezone") or os.environ.get(
+        "XARTA_DIARY_TIMEZONE", "Europe/London"
+    )
+    event_tags = _diary_entry_tags(tags, all_day=all_day)
     provenance = {
         "writer": "xarta_diary.create_personal_log",
+        "calendar": {
+            "all_day": bool(all_day),
+            "local_start_time": local_time or "",
+            "local_end_time": end_time or "",
+            "timezone": timezone_name,
+        },
         "audit_id": audit_id,
         "actor": actor,
         "source_surface": source_surface,
@@ -8011,12 +8064,12 @@ def _project_personal_log_event(
                 _entry_title(body, result.get("local_time")),
                 _body_excerpt(body),
                 body.strip(),
-                now,
+                _calendar_utc_iso(local_date, local_time, timezone_name),
                 local_date,
-                result.get("timezone") or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London"),
+                timezone_name,
                 "open",
                 "normal",
-                json.dumps(tags, ensure_ascii=True),
+                json.dumps(event_tags, ensure_ascii=True),
                 json.dumps([file_ref], ensure_ascii=True),
                 json.dumps([f"personal_time_audit:{audit_id}"], ensure_ascii=True),
                 json.dumps(provenance, ensure_ascii=True, sort_keys=True),
@@ -8064,7 +8117,9 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
     if len(text) > 20000:
         raise HTTPException(400, "entry body is too long")
     local_date = _validate_local_date(body.local_date)
-    local_time = _validate_local_time(body.local_time)
+    all_day = bool(body.all_day) if body.all_day is not None else not bool(body.local_time)
+    local_time = None if all_day else _validate_local_time(body.local_time)
+    end_time = None if all_day else _validate_local_time(body.end_time)
     module = _load_xarta_diary_module()
     owner = module.resolve_owner("xarta", "xarta")
     actor = _clean_short_text(body.actor, "blueprints-ui")
@@ -8119,6 +8174,10 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
         request_id=request_id,
         run_id=run_id,
         now=now,
+        all_day=all_day,
+        local_time=local_time,
+        end_time=end_time,
+        tags=tags,
     )
     return {
         "ok": True,
@@ -8136,6 +8195,141 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
             "result": "ok",
         },
         "event": event,
+        "day": _build_diary_day_payload(local_date),
+    }
+
+
+@router.patch("/diary-day/entries/{event_id}")
+async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -> dict[str, Any]:
+    text = str(body.body or "").strip()
+    if not text:
+        raise HTTPException(400, "entry body is required")
+    if len(text) > 20000:
+        raise HTTPException(400, "entry body is too long")
+    local_date = _validate_local_date(body.local_date)
+    range_end_date = _validate_local_date(body.range_end_date or local_date)
+    all_day = bool(body.all_day) if body.all_day is not None else not bool(body.local_time)
+    local_time = None if all_day else _validate_local_time(body.local_time)
+    end_time = None if all_day else _validate_local_time(body.end_time)
+    timezone_name = body.timezone or os.environ.get("XARTA_DIARY_TIMEZONE", "Europe/London")
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "diary-page")
+    request_id = _clean_short_text(
+        body.request_id, f"diary-entry-edit-{uuid.uuid4().hex[:12]}", limit=160
+    )
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    event_tags = _diary_entry_tags(
+        [str(tag).strip() for tag in body.tags if str(tag).strip()],
+        all_day=all_day,
+    )
+    now = _utc_now_iso()
+    source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "diary entry not found")
+        existing_tags = _json_value(row["tags_json"], [])
+        if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
+            raise HTTPException(400, "only diary quick entries can be edited here")
+        provenance = _json_value(row["provenance_json"], {})
+        provenance["calendar"] = {
+            "all_day": bool(all_day),
+            "local_start_time": local_time or "",
+            "local_end_time": end_time or "",
+            "local_end_date": range_end_date,
+            "timezone": timezone_name,
+        }
+        provenance["edited_at"] = now
+        provenance["edited_by"] = actor
+        provenance["source_surface"] = source_surface
+        provenance["request_id"] = request_id
+        provenance["run_id"] = run_id
+        file_refs = _json_value(row["file_refs_json"], [])
+        db_refs = _json_value(row["db_refs_json"], [])
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        audit_ref = f"personal_time_audit:{audit_id}"
+        if audit_ref not in db_refs:
+            db_refs.append(audit_ref)
+        start_at = _calendar_utc_iso(local_date, local_time, timezone_name)
+        end_at = (
+            _calendar_utc_iso(range_end_date, end_time, timezone_name)
+            if end_time and not all_day
+            else None
+        )
+        conn.execute(
+            """
+            UPDATE personal_events
+            SET source_hash=?,
+                title=?,
+                body_excerpt=?,
+                content_projection=?,
+                start_at=?,
+                end_at=?,
+                local_date=?,
+                timezone=?,
+                tags_json=?,
+                db_refs_json=?,
+                provenance_json=?,
+                projection_state='hot',
+                provenance_state='linked',
+                last_rendered_at=?,
+                updated_at=?
+            WHERE event_id=?
+            """,
+            (
+                source_hash,
+                _entry_title(text, local_time),
+                _body_excerpt(text),
+                text,
+                start_at,
+                end_at,
+                local_date,
+                timezone_name,
+                json.dumps(event_tags, ensure_ascii=True),
+                json.dumps(db_refs, ensure_ascii=True),
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                now,
+                event_id,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="update_diary_entry",
+            target_ref=f"personal_events:{event_id}",
+            file_ref=str(file_refs[0]) if file_refs else "",
+            db_ref=f"personal_events:{event_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "local_date": local_date,
+                "range_end_date": range_end_date,
+                "kind": "personal-log",
+                "body_chars": len(text),
+            },
+        )
+        gen = increment_gen(conn, "personal-diary-edit")
+        enqueue_for_all_peers(conn, "UPDATE", "personal_events", event_id, dict(updated), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "audit": {
+            "audit_id": audit_id,
+            "actor": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "result": "ok",
+        },
+        "event": _row_to_event(updated),
         "day": _build_diary_day_payload(local_date),
     }
 
