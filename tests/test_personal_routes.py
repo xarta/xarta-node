@@ -2566,6 +2566,28 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert [row["todo_id"] for row in descendant_todos["items"]] == ["todo-step19-grandchild"]
     assert descendant_todos["groups"][0]["scope"]["relation"] == "self"
 
+    issue_direct = asyncio.run(routes_personal.get_work_issue("issue-step19-child"))
+    assert issue_direct["issue"]["body_excerpt"] == "Scoped issue proof"
+    assert issue_direct["item"]["item_id"] == "work-depth-2"
+    assert [item["item_id"] for item in issue_direct["breadcrumbs"]] == [
+        "work-child",
+        "work-depth-2",
+    ]
+    issue_bundle = asyncio.run(
+        routes_personal.get_rich_doc_bundle("kanban", "issue", "issue-step19-child")
+    )
+    assert issue_bundle["document"]["document_type"] == "issue"
+    assert issue_bundle["document"]["body"] == "Scoped issue proof"
+
+    todo_direct = asyncio.run(routes_personal.get_work_todo("todo-step19-grandchild"))
+    assert todo_direct["todo"]["body_excerpt"] == "Two-level scoped todo proof updated"
+    assert todo_direct["item"]["item_id"] == "work-depth-3"
+    todo_bundle = asyncio.run(
+        routes_personal.get_rich_doc_bundle("kanban", "todo", "todo-step19-grandchild")
+    )
+    assert todo_bundle["document"]["document_type"] == "todo"
+    assert todo_bundle["document"]["body"] == "Two-level scoped todo proof updated"
+
     work_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=200))
     work_task_refs = {
         item["source"]["ref"]
@@ -2804,6 +2826,43 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     }
     assert default_board["board"]["preferences"]["show_test_entries"] is True
 
+    asyncio.run(
+        routes_personal.create_work_todo(
+            routes_personal.WorkTodoUpsertRequest(
+                todo_id="todo-user-visible",
+                item_id="work-user-visible",
+                title="User visible todo",
+                body="Normal Kanban todo survives the proof filter.",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-user-visible-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_todo(
+            routes_personal.WorkTodoUpsertRequest(
+                todo_id="todo-proof-hidden",
+                item_id="work-proof-hidden",
+                title="Proof todo",
+                body="Automation proof todo should be hideable.",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="todo-proof-hidden-create",
+            )
+        )
+    )
+    default_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    default_refs = {
+        item["source"]["ref"]
+        for item in default_tasks["items"]
+        if item["source"]["type"] == "work-todo"
+    }
+    assert default_refs == {"work_todos:todo-user-visible", "work_todos:todo-proof-hidden"}
+    assert default_tasks["work_preferences"]["show_test_entries"] is True
+
     hidden_pref = asyncio.run(
         routes_personal.update_work_preferences(
             routes_personal.WorkPreferencesUpdateRequest(
@@ -2832,6 +2891,15 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     assert [item["item_id"] for item in todo_hidden["items"]] == ["work-user-visible"]
     assert hidden_board["board"]["rollup"]["items"]["total"] == 1
     assert hidden_board["board"]["hidden_test_items"] == 1
+    hidden_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    hidden_refs = {
+        item["source"]["ref"]
+        for item in hidden_tasks["items"]
+        if item["source"]["type"] == "work-todo"
+    }
+    assert hidden_refs == {"work_todos:todo-user-visible"}
+    assert hidden_tasks["work_preferences"]["show_test_entries"] is False
+    assert hidden_tasks["test_entries"]["hidden_work_todos"] == 1
 
     shown_pref = asyncio.run(
         routes_personal.update_work_preferences(
@@ -2854,6 +2922,15 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
         "work-user-visible",
         "work-proof-hidden",
     }
+    shown_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    shown_refs = {
+        item["source"]["ref"]
+        for item in shown_tasks["items"]
+        if item["source"]["type"] == "work-todo"
+    }
+    assert shown_refs == {"work_todos:todo-user-visible", "work_todos:todo-proof-hidden"}
+    assert shown_tasks["work_preferences"]["show_test_entries"] is True
+    assert shown_tasks["test_entries"]["hidden_work_todos"] == 0
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
