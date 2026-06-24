@@ -114,6 +114,12 @@ def _make_conn() -> sqlite3.Connection:
             guid TEXT,
             sent INTEGER DEFAULT 0
         );
+        CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            description TEXT,
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE personal_events (
             event_id TEXT PRIMARY KEY,
             source_type TEXT NOT NULL DEFAULT 'manual',
@@ -318,6 +324,18 @@ def _make_conn() -> sqlite3.Connection:
             embedding_model TEXT NOT NULL DEFAULT '',
             embedding_updated_at TEXT,
             vector_index_key TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE work_item_order_edges (
+            edge_id TEXT PRIMARY KEY,
+            parent_item_id TEXT NOT NULL DEFAULT '',
+            state_id TEXT NOT NULL,
+            priority_id TEXT NOT NULL,
+            before_item_id TEXT NOT NULL,
+            after_item_id TEXT NOT NULL,
+            source_hash TEXT NOT NULL DEFAULT '',
             provenance_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
@@ -1459,6 +1477,7 @@ def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypat
                 due_time="17:05",
                 timezone="Europe/London",
                 priority="medium",
+                tags=["work"],
                 related_work_items=["work:item-1"],
                 actor="codex-test",
                 source_surface="pytest",
@@ -1469,6 +1488,8 @@ def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypat
     assert updated["task"]["title"] == "Step 15 backend task updated"
     assert updated["task"]["mode"] == "work"
     assert updated["task"]["related"]["work_items"] == ["work:item-1"]
+    assert "kanban" in updated["task"]["tags"]
+    assert "work" in updated["task"]["tags"]
     assert updated["event"]["start_at"] == "2026-06-18T16:05:00Z"
 
     work_list = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=20, offset=0))
@@ -1555,7 +1576,7 @@ def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
             "2026-06-18",
             "Europe/London",
             "blocked",
-            json.dumps(["todo", "work"]),
+            json.dumps(["todo", "kanban"]),
             json.dumps(["work:item-9"]),
         ),
     )
@@ -2252,9 +2273,10 @@ def test_personal_graph_declared_link_keeps_inferred_under_review(monkeypatch):
     assert conn.execute("SELECT COUNT(*) AS count FROM sync_queue").fetchone()["count"] == 1
 
 
-def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
+def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
     conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
     conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
 
@@ -2275,7 +2297,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
             routes_personal.WorkItemCreateRequest(
                 item_id="work-root",
                 title="Step 16 root board item",
-                body="Root board proof",
+                body="Root board proof\n\nSecond paragraph",
                 state_id="todo",
                 priority_id="high",
                 tags=["proof"],
@@ -2289,6 +2311,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
     assert root["item_id"] == "work-root"
     assert root["depth"] == 0
     assert root["state_id"] == "todo"
+    assert root["body_excerpt"] == "Root board proof\n\nSecond paragraph"
     assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
     assert root["vector"]["index_key"] == "work_items:work-root"
 
@@ -2590,16 +2613,111 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
     assert blocker["vector"]["index_key"] == "work_blockers:blocker-step18"
     assert blocker["blocked_by_ref"] == f"work_items:{promoted['item_id']}"
 
+    detail_body = "# Work Root Detail\n\nLine one\nLine two"
+    detail_doc = asyncio.run(
+        routes_personal.update_work_item_detail_document(
+            "work-root",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=detail_body,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="detail-doc-update",
+            ),
+        )
+    )["detail_document"]
+    assert detail_doc["body"] == detail_body
+    assert detail_doc["file_ref"]["path"] == "step-16-root-board-item/items/work-root/detail.md"
+    assert (tmp_path / "kanban" / detail_doc["file_ref"]["path"]).exists()
+
+    discussion_body = "First discussion line\n\n- markdown survives"
+    discussion = asyncio.run(
+        routes_personal.create_work_discussion(
+            "work-root",
+            routes_personal.WorkDiscussionCreateRequest(
+                discussion_id="discussion-step18",
+                body=discussion_body,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-create",
+            ),
+        )
+    )["discussion"]
+    assert discussion["body"] == discussion_body
+    assert discussion["document"]["file_ref"]["path"] == (
+        "step-16-root-board-item/items/work-root/discussions/discussion-step18.md"
+    )
+
+    updated_discussion_body = "Edited discussion\n\n```text\nkeeps newlines\n```"
+    updated_discussion = asyncio.run(
+        routes_personal.update_work_discussion(
+            "discussion-step18",
+            routes_personal.WorkDiscussionUpdateRequest(
+                body=updated_discussion_body,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-update",
+            ),
+        )
+    )["discussion"]
+    assert updated_discussion["body"] == updated_discussion_body
+    assert updated_discussion["body_excerpt"] == updated_discussion_body
+
+    renamed_root = asyncio.run(
+        routes_personal.update_work_item(
+            "work-root",
+            routes_personal.WorkItemUpdateRequest(
+                title="Step 16 Root Board Renamed",
+                body="Root board proof\n\nRenamed paragraph",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="work-root-rename",
+            ),
+        )
+    )["item"]
+    assert renamed_root["title"] == "Step 16 Root Board Renamed"
+    assert renamed_root["body_excerpt"] == "Root board proof\n\nRenamed paragraph"
+    manifest = json.loads((tmp_path / "kanban" / "projects.json").read_text(encoding="utf-8"))
+    assert manifest["projects"]["work-root"]["title"] == "Step 16 Root Board Renamed"
+    assert manifest["projects"]["work-root"]["folder"] == "step-16-root-board-renamed"
+    assert manifest["projects"]["work-root"]["pending"] is None
+    assert not (tmp_path / "kanban" / "step-16-root-board-item").exists()
+    assert (tmp_path / "kanban" / "step-16-root-board-renamed").exists()
+
     detail = asyncio.run(routes_personal.get_work_item_detail("work-root"))
     assert detail["rollup"]["items"]["total"] >= 2
     assert [item["item_id"] for item in detail["breadcrumbs"]] == ["work-root"]
     assert detail["remaining_depth"] == 12
+    assert detail["detail_document"]["body"] == detail_body
+    assert detail["detail_document"]["file_ref"]["path"] == (
+        "step-16-root-board-renamed/items/work-root/detail.md"
+    )
     assert detail["issues"][0]["issue_id"] == "issue-step16"
     assert detail["todos"][0]["todo_id"] == "todo-step16"
     assert detail["links"][0]["link_id"] == link["link_id"]
     assert detail["blockers"][0]["blocker_id"] == "blocker-step18"
+    assert detail["discussions"][0]["body"] == updated_discussion_body
     assert detail["counts"]["links"] == 1
     assert detail["counts"]["blockers"] == 1
+    assert detail["counts"]["discussions"] == 1
+
+    deleted_discussion = asyncio.run(
+        routes_personal.delete_work_discussion(
+            "discussion-step18",
+            routes_personal.WorkItemActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-delete",
+            ),
+        )
+    )
+    assert deleted_discussion["ok"] is True
+    assert not (
+        tmp_path
+        / "kanban"
+        / "step-16-root-board-renamed/items/work-root/discussions/discussion-step18.md"
+    ).exists()
+    detail_after_delete = asyncio.run(routes_personal.get_work_item_detail("work-root"))
+    assert detail_after_delete["counts"]["discussions"] == 0
 
     audit_actions = {
         row["action"] for row in conn.execute("SELECT action FROM work_audit_log").fetchall()
@@ -2612,6 +2730,10 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         "promote_work_item",
         "create_work_item_link",
         "create_work_blocker",
+        "update_work_item_detail",
+        "create_work_discussion",
+        "update_work_discussion",
+        "delete_work_discussion",
     }.issubset(audit_actions)
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
@@ -2622,8 +2744,281 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch):
         "work_issues",
         "work_todos",
         "work_blockers",
+        "work_discussions",
         "work_audit_log",
     }.issubset(sync_tables)
+
+
+def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    user_item = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-user-visible",
+                title="User visible item",
+                body="Normal work survives the proof filter.",
+                state_id="todo",
+                priority_id="medium",
+                tags=["planning"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="work-user-visible-create",
+            )
+        )
+    )["item"]
+    proof_item = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-proof-hidden",
+                title="Proof item",
+                body="Automation proof should be hideable.",
+                state_id="todo",
+                priority_id="high",
+                tags=["proof", "step-19"],
+                actor="active-browser",
+                source_surface="kanban-active-browser-proof",
+                request_id="work-proof-hidden-create",
+            )
+        )
+    )["item"]
+    assert "kanban" in user_item["tags"]
+    assert "kanban" in proof_item["tags"]
+    assert "agent-working-out" not in user_item["tags"]
+    assert "agent-working-out" in proof_item["tags"]
+
+    default_config = asyncio.run(routes_personal.get_work_config())
+    assert default_config["preferences"]["show_test_entries"] is True
+    default_board = asyncio.run(routes_personal.get_work_root_board())
+    todo_default = next(
+        column
+        for column in default_board["board"]["columns"]
+        if column["state"]["state_id"] == "todo"
+    )
+    assert {item["item_id"] for item in todo_default["items"]} == {
+        "work-user-visible",
+        "work-proof-hidden",
+    }
+    assert default_board["board"]["preferences"]["show_test_entries"] is True
+
+    hidden_pref = asyncio.run(
+        routes_personal.update_work_preferences(
+            routes_personal.WorkPreferencesUpdateRequest(
+                show_test_entries=False,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="hide-proof-entries",
+            )
+        )
+    )
+    assert hidden_pref["preferences"]["show_test_entries"] is False
+    assert (
+        conn.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (routes_personal.WORK_SHOW_TEST_ENTRIES_SETTING,),
+        ).fetchone()["value"]
+        == "false"
+    )
+
+    hidden_board = asyncio.run(routes_personal.get_work_root_board())
+    todo_hidden = next(
+        column
+        for column in hidden_board["board"]["columns"]
+        if column["state"]["state_id"] == "todo"
+    )
+    assert [item["item_id"] for item in todo_hidden["items"]] == ["work-user-visible"]
+    assert hidden_board["board"]["rollup"]["items"]["total"] == 1
+    assert hidden_board["board"]["hidden_test_items"] == 1
+
+    shown_pref = asyncio.run(
+        routes_personal.update_work_preferences(
+            routes_personal.WorkPreferencesUpdateRequest(
+                show_test_entries=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="show-proof-entries",
+            )
+        )
+    )
+    assert shown_pref["preferences"]["show_test_entries"] is True
+    shown_board = asyncio.run(routes_personal.get_work_root_board())
+    todo_shown = next(
+        column
+        for column in shown_board["board"]["columns"]
+        if column["state"]["state_id"] == "todo"
+    )
+    assert {item["item_id"] for item in todo_shown["items"]} == {
+        "work-user-visible",
+        "work-proof-hidden",
+    }
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "settings" in sync_tables
+
+
+def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    def create_item(item_id: str, title: str, state_id: str, priority_id: str) -> dict:
+        return asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    title=title,
+                    body=f"{title} body",
+                    state_id=state_id,
+                    priority_id=priority_id,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{item_id}-create",
+                )
+            )
+        )["item"]
+
+    create_item("work-order-medium", "Medium Doing", "doing", "medium")
+    create_item("work-order-high-a", "High Doing A", "doing", "high")
+    create_item("work-order-high-b", "High Doing B", "doing", "high")
+    create_item("work-order-critical", "Critical Doing", "doing", "critical")
+    create_item("work-order-blocked-a", "Blocked Medium A", "blocked", "medium")
+    create_item("work-order-blocked-b", "Blocked Medium B", "blocked", "medium")
+
+    def lane_ids(state_id: str) -> list[str]:
+        board = asyncio.run(routes_personal.get_work_root_board())
+        column = next(
+            column
+            for column in board["board"]["columns"]
+            if column["state"]["state_id"] == state_id
+        )
+        return [item["item_id"] for item in column["items"]]
+
+    assert lane_ids("doing")[:4] == [
+        "work-order-critical",
+        "work-order-high-a",
+        "work-order-high-b",
+        "work-order-medium",
+    ]
+
+    ordered = asyncio.run(
+        routes_personal.order_work_item(
+            "work-order-high-b",
+            routes_personal.WorkItemOrderRequest(
+                direction="up",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="order-high-b-up",
+            ),
+        )
+    )
+    assert ordered["changed"] is True
+    assert ordered["lane_order"] == ["work-order-high-b", "work-order-high-a"]
+    assert lane_ids("doing")[:4] == [
+        "work-order-critical",
+        "work-order-high-b",
+        "work-order-high-a",
+        "work-order-medium",
+    ]
+
+    edge = conn.execute(
+        """
+        SELECT * FROM work_item_order_edges
+        WHERE state_id='doing' AND priority_id='high'
+        """
+    ).fetchone()
+    assert edge["before_item_id"] == "work-order-high-b"
+    assert edge["after_item_id"] == "work-order-high-a"
+
+    ordered_down = asyncio.run(
+        routes_personal.order_work_item(
+            "work-order-high-b",
+            routes_personal.WorkItemOrderRequest(
+                direction="down",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="order-high-b-down",
+            ),
+        )
+    )
+    assert ordered_down["lane_order"] == ["work-order-high-a", "work-order-high-b"]
+    assert lane_ids("doing")[:4] == [
+        "work-order-critical",
+        "work-order-high-a",
+        "work-order-high-b",
+        "work-order-medium",
+    ]
+
+    moved_to_blocked = asyncio.run(
+        routes_personal.move_work_item(
+            "work-order-medium",
+            routes_personal.WorkItemMoveRequest(
+                parent_item_id=None,
+                state_id="blocked",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="medium-to-blocked",
+            ),
+        )
+    )
+    assert moved_to_blocked["item"]["state_id"] == "blocked"
+    assert lane_ids("blocked")[:3] == [
+        "work-order-medium",
+        "work-order-blocked-a",
+        "work-order-blocked-b",
+    ]
+
+    blocked_edges = conn.execute(
+        """
+        SELECT before_item_id, after_item_id FROM work_item_order_edges
+        WHERE state_id='blocked' AND priority_id='medium'
+        ORDER BY before_item_id, after_item_id
+        """
+    ).fetchall()
+    assert {tuple(edge) for edge in blocked_edges} == {
+        ("work-order-blocked-a", "work-order-blocked-b"),
+        ("work-order-medium", "work-order-blocked-a"),
+    }
+
+    asyncio.run(
+        routes_personal.move_work_item(
+            "work-order-medium",
+            routes_personal.WorkItemMoveRequest(
+                parent_item_id=None,
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="medium-back-to-doing",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.move_work_item(
+            "work-order-medium",
+            routes_personal.WorkItemMoveRequest(
+                parent_item_id=None,
+                state_id="blocked",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="medium-back-to-blocked",
+            ),
+        )
+    )
+    assert lane_ids("blocked")[:3] == [
+        "work-order-medium",
+        "work-order-blocked-a",
+        "work-order-blocked-b",
+    ]
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "work_item_order_edges" in sync_tables
+    assert routes_sync._pk_for_table("work_item_order_edges") == "edge_id"
 
 
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):

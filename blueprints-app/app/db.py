@@ -682,6 +682,23 @@ CREATE INDEX IF NOT EXISTS idx_work_items_source
 CREATE INDEX IF NOT EXISTS idx_work_items_vector
     ON work_items(vector_index_key);
 
+CREATE TABLE IF NOT EXISTS work_item_order_edges (
+    edge_id        TEXT PRIMARY KEY,
+    parent_item_id TEXT NOT NULL DEFAULT '',
+    state_id       TEXT NOT NULL,
+    priority_id    TEXT NOT NULL,
+    before_item_id TEXT NOT NULL,
+    after_item_id  TEXT NOT NULL,
+    source_hash    TEXT NOT NULL DEFAULT '',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_order_edges_unique
+    ON work_item_order_edges(parent_item_id, state_id, priority_id, before_item_id, after_item_id);
+CREATE INDEX IF NOT EXISTS idx_work_item_order_edges_lane
+    ON work_item_order_edges(parent_item_id, state_id, priority_id);
+
 CREATE TABLE IF NOT EXISTS work_item_links (
     link_id        TEXT PRIMARY KEY,
     source_item_id TEXT NOT NULL,
