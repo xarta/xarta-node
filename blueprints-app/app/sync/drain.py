@@ -36,8 +36,7 @@ log = logging.getLogger(__name__)
 
 _drain_task: asyncio.Task | None = None
 _last_guid_cleanup: float = 0.0
-_full_backup_skip_until: dict[str, float] = {}
-_FULL_BACKUP_REJECT_COOLDOWN_SECONDS = 600
+_full_backup_rejected_overflow_peers: set[str] = set()
 
 
 # ── mTLS client factory ──────────────────────────────────────────────────────
@@ -180,15 +179,17 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     depth = get_queue_depth(node_id)
     log.debug("draining peer %s: %d pending actions", node_id, depth)
 
+    if depth < cfg.SYNC_QUEUE_MAX_DEPTH:
+        _full_backup_rejected_overflow_peers.discard(node_id)
+
     if depth >= cfg.SYNC_QUEUE_MAX_DEPTH:
-        now = time.time()
-        skip_until = _full_backup_skip_until.get(node_id, 0.0)
-        if now < skip_until:
+        if node_id in _full_backup_rejected_overflow_peers:
             log.debug(
-                "queue overflow for peer %s (depth=%d) — full backup skipped for %.0fs",
+                "queue overflow for peer %s (depth=%d) — full backup skipped until "
+                "depth falls below %d",
                 node_id,
                 depth,
-                skip_until - now,
+                cfg.SYNC_QUEUE_MAX_DEPTH,
             )
         else:
             log.warning(
@@ -197,14 +198,14 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                 depth,
             )
             if await _send_full_backup(node_id, peer_urls):
-                _full_backup_skip_until.pop(node_id, None)
+                _full_backup_rejected_overflow_peers.discard(node_id)
                 return
-            _full_backup_skip_until[node_id] = time.time() + _FULL_BACKUP_REJECT_COOLDOWN_SECONDS
+            _full_backup_rejected_overflow_peers.add(node_id)
             log.warning(
                 "full backup path not accepted for peer %s — falling back to batched action "
-                "drain and suppressing full backup retries for %ds",
+                "drain and suppressing full backup retries until depth falls below %d",
                 node_id,
-                _FULL_BACKUP_REJECT_COOLDOWN_SECONDS,
+                cfg.SYNC_QUEUE_MAX_DEPTH,
             )
 
     actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
