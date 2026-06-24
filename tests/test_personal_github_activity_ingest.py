@@ -32,6 +32,11 @@ TEST_LLM_MODEL = "TEST-LOCAL-LLM-MODEL"
 ingest.DEFAULT_LLM_MODEL = TEST_LLM_MODEL
 
 
+@pytest.fixture(autouse=True)
+def _disable_live_runtime_guard(monkeypatch):
+    monkeypatch.setattr(ingest, "require_runtime_readiness_for_live_apply", lambda *_args: None)
+
+
 def _repo(full_name="davros1973/xarta-node", *, owner="davros1973", can_push=True):
     return ingest.RepoRecord(
         full_name=full_name,
@@ -1625,6 +1630,52 @@ def test_apply_from_report_cli_is_cache_only_and_idempotent(tmp_path, monkeypatc
     review = review_path.read_text(encoding="utf-8")
     assert "Apply report. This run wrote approved Blueprints records." in review
     assert "Actual sync queue entries added: 28" in review
+
+
+def test_enqueue_for_peers_loads_node_id_from_env_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("BLUEPRINTS_NODE_ID", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text("BLUEPRINTS_NODE_ID=test-node\n", encoding="utf-8")
+    monkeypatch.setenv("BLUEPRINTS_ENV_FILE", str(env_path))
+    conn = _conn()
+    conn.executemany(
+        "INSERT INTO nodes(node_id) VALUES (?)",
+        [("test-node",), ("peer-a",), ("peer-b",)],
+    )
+
+    ingest.enqueue_for_peers(
+        conn,
+        "UPDATE",
+        "personal_events",
+        "evt-1",
+        {"event_id": "evt-1"},
+        1,
+    )
+
+    targets = [
+        row["target_node_id"]
+        for row in conn.execute("SELECT target_node_id FROM sync_queue ORDER BY target_node_id")
+    ]
+    assert targets == ["peer-a", "peer-b"]
+
+
+def test_enqueue_for_peers_refuses_unknown_self_node(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_NODE_ID", "missing-node")
+    conn = _conn()
+    conn.executemany(
+        "INSERT INTO nodes(node_id) VALUES (?)",
+        [("test-node",), ("peer-a",)],
+    )
+
+    with pytest.raises(RuntimeError, match="not present in the nodes table"):
+        ingest.enqueue_for_peers(
+            conn,
+            "UPDATE",
+            "personal_events",
+            "evt-1",
+            {"event_id": "evt-1"},
+            1,
+        )
 
 
 def test_apply_from_report_can_backup_sqlite_before_apply(tmp_path, monkeypatch):
