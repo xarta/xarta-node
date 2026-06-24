@@ -177,6 +177,13 @@ class DiaryWorkLinkRequest(BaseModel):
     run_id: str | None = None
 
 
+class PersonalEventDeleteRequest(BaseModel):
+    actor: str = "blueprints-ui"
+    source_surface: str = "personal-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class CalendarEventUpsertRequest(BaseModel):
     event_id: str | None = None
     title: str
@@ -5821,6 +5828,86 @@ async def update_calendar_event(event_id: str, body: CalendarEventUpsertRequest)
     return _upsert_calendar_event(body, event_id=clean_event_id, action="update_calendar_event")
 
 
+def _delete_personal_event_row(
+    event_id: str,
+    body: PersonalEventDeleteRequest,
+    *,
+    action: str,
+    gen_key: str,
+    not_found_message: str,
+) -> dict[str, Any]:
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "personal-page")
+    request_id = _clean_short_text(body.request_id, f"{action}-{uuid.uuid4().hex[:12]}", limit=160)
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, not_found_message)
+        event = _row_to_event(row)
+        file_refs = _json_value(row["file_refs_json"], [])
+        source_hash = row["source_hash"] or hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action=action,
+            target_ref=f"personal_events:{event_id}",
+            file_ref=str(file_refs[0]) if file_refs else "",
+            db_ref=f"personal_events:{event_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "event_id": event_id,
+                "local_date": row["local_date"],
+                "kind": row["kind"],
+                "source_type": row["source_type"],
+            },
+        )
+        conn.execute("DELETE FROM personal_events WHERE event_id=?", (event_id,))
+        gen = increment_gen(conn, gen_key)
+        enqueue_for_all_peers(conn, "DELETE", "personal_events", event_id, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "event_id": event_id,
+        "deleted_event": event,
+        "audit": {
+            "audit_id": audit_id,
+            "actor": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "result": "ok",
+            "action": action,
+        },
+    }
+
+
+@router.delete("/calendar/events/{event_id}")
+async def delete_calendar_event(event_id: str, body: PersonalEventDeleteRequest) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT source_type FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "calendar event not found")
+    if row["source_type"] != "manual-calendar":
+        raise HTTPException(400, "only manual calendar events can be deleted here")
+    return _delete_personal_event_row(
+        event_id,
+        body,
+        action="delete_calendar_event",
+        gen_key="personal-calendar-delete",
+        not_found_message="calendar event not found",
+    )
+
+
 def _visible_day_events(
     local_date: str,
     *,
@@ -8332,6 +8419,29 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
         "event": _row_to_event(updated),
         "day": _build_diary_day_payload(local_date),
     }
+
+
+@router.delete("/diary-day/entries/{event_id}")
+async def delete_diary_day_entry(event_id: str, body: PersonalEventDeleteRequest) -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT kind, tags_json FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "diary entry not found")
+    existing_tags = _json_value(row["tags_json"], [])
+    if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
+        raise HTTPException(400, "only diary quick entries can be deleted here")
+    result = _delete_personal_event_row(
+        event_id,
+        body,
+        action="delete_diary_entry",
+        gen_key="personal-diary-delete",
+        not_found_message="diary entry not found",
+    )
+    local_date = result["deleted_event"].get("local_date") or _validate_local_date(None)
+    result["day"] = _build_diary_day_payload(local_date)
+    return result
 
 
 def _summary_markdown(local_date: str, events: list[dict[str, Any]], now: str) -> str:

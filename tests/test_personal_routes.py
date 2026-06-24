@@ -1109,6 +1109,7 @@ def test_personal_list_routes_hide_pin_records_until_unlock(monkeypatch):
 def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
     monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
 
     created = asyncio.run(
@@ -1176,6 +1177,40 @@ def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
         == 1
     )
 
+    deleted = asyncio.run(
+        routes_personal.delete_diary_day_entry(
+            event["event_id"],
+            routes_personal.PersonalEventDeleteRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="diary-delete-test",
+            ),
+        )
+    )
+    assert deleted["ok"] is True
+    assert deleted["deleted_event"]["event_id"] == event["event_id"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE event_id=?",
+            (event["event_id"],),
+        ).fetchone()["count"]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='delete_diary_entry'"
+        ).fetchone()["count"]
+        == 1
+    )
+    delete_sync = conn.execute(
+        """
+        SELECT * FROM sync_queue
+        WHERE action_type='DELETE' AND table_name='personal_events' AND row_id=?
+        """,
+        (event["event_id"],),
+    ).fetchone()
+    assert delete_sync is not None
+
 
 def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
     conn = _make_conn()
@@ -1220,6 +1255,7 @@ def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
 def test_calendar_event_create_and_edit_use_shared_events(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
 
     created = asyncio.run(
         routes_personal.create_calendar_event(
@@ -1303,6 +1339,40 @@ def test_calendar_event_create_and_edit_use_shared_events(monkeypatch):
         "SELECT * FROM personal_sources WHERE source_id='manual-calendar'"
     ).fetchone()
     assert source["status"] == "ok"
+
+    deleted = asyncio.run(
+        routes_personal.delete_calendar_event(
+            event["event_id"],
+            routes_personal.PersonalEventDeleteRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="calendar-delete-test",
+            ),
+        )
+    )
+    assert deleted["ok"] is True
+    assert deleted["deleted_event"]["title"] == "Dentist moved"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE event_id=?",
+            (event["event_id"],),
+        ).fetchone()["count"]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='delete_calendar_event'"
+        ).fetchone()["count"]
+        == 1
+    )
+    delete_sync = conn.execute(
+        """
+        SELECT * FROM sync_queue
+        WHERE action_type='DELETE' AND table_name='personal_events' AND row_id=?
+        """,
+        (event["event_id"],),
+    ).fetchone()
+    assert delete_sync is not None
 
 
 def test_calendar_event_rejects_end_before_start(monkeypatch):
