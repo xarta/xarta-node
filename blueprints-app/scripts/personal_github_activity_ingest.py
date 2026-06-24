@@ -3205,7 +3205,21 @@ def append_missing_kanban_links(
     related_work_items: list[str],
     work_item_titles: dict[str, str],
 ) -> str:
-    clean = sanitize_calendar_markdown(markdown)
+    allowed_urls = {kanban_item_url(item_id) for item_id in related_work_items}
+
+    def keep_only_related_kanban_links(match: re.Match[str]) -> str:
+        label = match.group(1)
+        url = match.group(2)
+        if url.startswith("blueprints://kanban/items/") and url not in allowed_urls:
+            return sanitize_visible_identifier_text(label).strip() or "Kanban item"
+        return match.group(0)
+
+    canonicalized = re.sub(
+        r"\[([^\]]+)\]\((blueprints://kanban/items/[^)]+)\)",
+        keep_only_related_kanban_links,
+        markdown,
+    )
+    clean = sanitize_calendar_markdown(canonicalized)
     missing: list[tuple[str, str]] = []
     for item_id in related_work_items:
         url = kanban_item_url(item_id)
@@ -4009,6 +4023,7 @@ def daily_summaries_from_report(
     work_item_titles = {
         feature.related_work_item_id: feature.title for feature in features.values()
     }
+    canonical_feature_item_ids = set(work_item_titles)
     summaries = []
     for item in report.get("calendar_summaries") or []:
         day = str(item.get("local_date") or "")
@@ -4019,11 +4034,12 @@ def daily_summaries_from_report(
             for feature in features.values()
             if day_commit_ids and set(feature.commit_ids).intersection(day_commit_ids)
         ]
-        related = [
+        source_related = [
             str(value)
-            for value in [*(item.get("related_work_items") or []), *evidence_related]
-            if value
+            for value in item.get("related_work_items") or []
+            if str(value) in canonical_feature_item_ids
         ]
+        related = [str(value) for value in [*source_related, *evidence_related] if value]
         related = list(dict.fromkeys(related))
         markdown = append_missing_kanban_links(
             str(item.get("markdown") or ""),

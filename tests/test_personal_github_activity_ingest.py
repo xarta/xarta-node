@@ -837,6 +837,27 @@ def test_cached_report_summaries_append_readable_kanban_links_when_llm_omits_the
     assert "## Kanban Links" in preflight["calendar_summaries"][0]["markdown"]
 
 
+def test_cached_report_summaries_strip_noncanonical_llm_kanban_links():
+    report = _llm_enriched_report()
+    stale_item_id = "work-git-feature-stale1234567890"
+    report["calendar_summaries"][0]["related_work_items"] = [stale_item_id]
+    report["calendar_summaries"][0]["markdown"] = (
+        "# Git Activity - 2026-06-22\n\n"
+        "The LLM wrote a useful summary but reused a stale "
+        f"[Calendar Git Summary](blueprints://kanban/items/{stale_item_id}) link."
+    )
+
+    records = ingest.records_from_enriched_report(report, require_llm=True)
+    summary = records.summaries[0]
+    canonical_link = ingest.kanban_item_url(summary.related_work_items[0])
+
+    assert stale_item_id not in summary.related_work_items
+    assert stale_item_id not in summary.markdown
+    assert canonical_link in summary.markdown
+    assert "[Calendar Git Summary](blueprints://kanban/items/" in summary.markdown
+    assert ingest.visible_calendar_identifier_hits(summary.markdown) == []
+
+
 def test_call_llm_json_retries_invalid_json(monkeypatch):
     responses = iter(['{"projects": [', '{"projects": []}'])
     messages_seen = []
