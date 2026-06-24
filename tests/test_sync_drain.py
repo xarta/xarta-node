@@ -43,12 +43,14 @@ from app.sync import drain  # noqa: E402
 
 
 class _Response:
-    status_code = 204
+    def __init__(self, status_code=204):
+        self.status_code = status_code
 
 
 class _FakeClient:
-    def __init__(self, posts):
+    def __init__(self, posts, status_code=204):
         self._posts = posts
+        self._status_code = status_code
 
     async def __aenter__(self):
         return self
@@ -58,7 +60,7 @@ class _FakeClient:
 
     async def post(self, url, **kwargs):
         self._posts.append((url, kwargs))
-        return _Response()
+        return _Response(self._status_code)
 
 
 def test_full_backup_rejection_cooldown_still_drains_action_batches(monkeypatch):
@@ -110,3 +112,41 @@ def test_full_backup_rejection_cooldown_still_drains_action_batches(monkeypatch)
 
     assert len(backup_attempts) == 2
     assert len(action_posts) == 3
+
+
+def test_action_commit_guard_rejection_keeps_actions_queued(monkeypatch):
+    action_posts = []
+    marked_sent = []
+
+    monkeypatch.setattr(drain.cfg, "NODE_ID", "test-node")
+    monkeypatch.setattr(drain.cfg, "COMMIT_TS", 123)
+    monkeypatch.setattr(drain.cfg, "SYNC_SECRET", "")
+    monkeypatch.setattr(drain.cfg, "SYNC_QUEUE_MAX_DEPTH", 1000)
+    monkeypatch.setattr(drain.cfg, "SYNC_BATCH_SIZE", 1)
+    monkeypatch.setattr(drain, "get_queue_depth", lambda node_id: 1)
+    monkeypatch.setattr(
+        drain,
+        "get_pending_actions",
+        lambda node_id, limit: [
+            {
+                "queue_id": 10,
+                "action_type": "upsert",
+                "table_name": "personal_git_commits",
+                "row_id": "commit-1",
+                "row_data": "{}",
+                "gen": 1,
+                "guid": "guid-1",
+            }
+        ],
+    )
+    monkeypatch.setattr(drain, "mark_sent", lambda queue_ids: marked_sent.append(queue_ids))
+    monkeypatch.setattr(
+        drain,
+        "_make_sync_client",
+        lambda timeout: _FakeClient(action_posts, status_code=409),
+    )
+
+    asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
+
+    assert len(action_posts) == 1
+    assert marked_sent == []
