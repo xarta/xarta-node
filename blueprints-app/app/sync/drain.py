@@ -109,6 +109,23 @@ def _maybe_cleanup_guids() -> None:
         log.info("guid cleanup: removed %d expired seen-GUID entries", n)
 
 
+def _discard_self_target_actions() -> None:
+    """Mark impossible self-target queue rows as sent.
+
+    Normal enqueue paths exclude cfg.NODE_ID. If a standalone script runs
+    without node identity and creates rows addressed to this node, those rows
+    can never drain because self is not a configured peer.
+    """
+    with get_conn() as conn:
+        result = conn.execute(
+            "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
+            (cfg.NODE_ID,),
+        )
+        discarded = result.rowcount
+    if discarded:
+        log.warning("discarded %d self-targeted sync_queue action(s)", discarded)
+
+
 async def _drain_loop() -> None:
     """Main drain loop — runs indefinitely."""
     while True:
@@ -132,6 +149,7 @@ async def _drain_all_peers() -> None:
             return
 
     _maybe_cleanup_guids()
+    _discard_self_target_actions()
     pending_peers = get_peers_with_pending()
     if not pending_peers:
         return

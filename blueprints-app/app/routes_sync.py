@@ -24,7 +24,7 @@ import uuid
 from email.utils import parsedate_to_datetime
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from . import config as cfg
 from .auth import compute_token
@@ -737,6 +737,7 @@ async def table_parity(table_name: str) -> dict:
     }
 
 
+@router.post("/restore", status_code=204)
 async def receive_restore(request: Request) -> Response:
     """
     Layer 1 restore endpoint.
@@ -839,6 +840,117 @@ async def export_backup() -> Response:
 async def list_sync_tables() -> dict:
     """Return the sorted list of tables that participate in fleet sync."""
     return {"tables": sorted(_ALLOWED_TABLES)}
+
+
+def _runtime_readiness_result(
+    *,
+    node_id: str,
+    health: dict | None,
+    tables: list[str] | None,
+    min_commit_ts: int | None,
+    required_tables: list[str],
+    error: str | None = None,
+) -> dict:
+    commit_ts = int((health or {}).get("commit_ts") or 0)
+    table_set = set(tables or [])
+    missing_tables = sorted(t for t in required_tables if t not in table_set)
+    commit_ready = min_commit_ts is None or commit_ts >= min_commit_ts
+    ready = error is None and commit_ready and not missing_tables
+    return {
+        "node_id": node_id,
+        "ready": ready,
+        "commit": (health or {}).get("commit"),
+        "commit_ts": commit_ts or None,
+        "min_commit_ts": min_commit_ts,
+        "commit_ready": commit_ready,
+        "missing_tables": missing_tables,
+        "error": error,
+    }
+
+
+@router.get("/runtime-readiness")
+async def runtime_readiness(
+    min_commit_ts: int | None = None,
+    required_table: list[str] | None = Query(default=None),
+) -> dict:
+    """Check whether local and peer runtimes can accept a synced write set.
+
+    This is stricter than "git pull succeeded": it proves the running
+    FastAPI process is new enough and exposes every required sync table over
+    the same mTLS transport used by the queue drain.
+    """
+    required_tables = sorted(set(required_table or []))
+    local = _runtime_readiness_result(
+        node_id=cfg.NODE_ID,
+        health={
+            "commit": cfg.COMMIT_HASH,
+            "commit_ts": cfg.COMMIT_TS,
+        },
+        tables=sorted(_ALLOWED_TABLES),
+        min_commit_ts=min_commit_ts,
+        required_tables=required_tables,
+    )
+
+    async def _fetch_peer_runtime(node_id: str, urls: list[str], client: httpx.AsyncClient) -> dict:
+        last_error = "no sync addresses configured"
+        for url in urls:
+            try:
+                health_resp = await client.get(f"{url}/health")
+                if not health_resp.is_success:
+                    last_error = f"health HTTP {health_resp.status_code}"
+                    continue
+                tables_resp = await client.get(
+                    f"{url}/api/v1/sync/tables",
+                    headers={"x-api-token": compute_token(cfg.SYNC_SECRET)}
+                    if cfg.SYNC_SECRET
+                    else {},
+                )
+                if not tables_resp.is_success:
+                    last_error = f"tables HTTP {tables_resp.status_code}"
+                    continue
+                return _runtime_readiness_result(
+                    node_id=node_id,
+                    health=health_resp.json(),
+                    tables=(tables_resp.json() or {}).get("tables") or [],
+                    min_commit_ts=min_commit_ts,
+                    required_tables=required_tables,
+                )
+            except httpx.ConnectError as exc:
+                last_error = f"connect error: {exc}"
+            except httpx.TimeoutException:
+                last_error = "timeout"
+            except Exception as exc:
+                last_error = str(exc)
+        return _runtime_readiness_result(
+            node_id=node_id,
+            health=None,
+            tables=None,
+            min_commit_ts=min_commit_ts,
+            required_tables=required_tables,
+            error=last_error,
+        )
+
+    peers = []
+    if cfg._peer_nodes:
+        async with _probe_client(timeout=10.0) as client:
+            tasks = [
+                _fetch_peer_runtime(
+                    n["node_id"],
+                    cfg.PEER_SYNC_URLS.get(n["node_id"], []),
+                    client,
+                )
+                for n in cfg._peer_nodes
+            ]
+            peers = list(await asyncio.gather(*tasks))
+
+    all_nodes = [local, *peers]
+    return {
+        "all_ready": all(node["ready"] for node in all_nodes),
+        "min_commit_ts": min_commit_ts,
+        "required_tables": required_tables,
+        "local": local,
+        "peers": peers,
+    }
 
 
 @router.get("/status", response_model=SyncStatus)

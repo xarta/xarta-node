@@ -33,12 +33,25 @@ DEFAULT_AUTHORS = ("davros1973",)
 LLM_MODEL_ENV = "PERSONAL_GITHUB_ACTIVITY_LLM_MODEL"
 DEFAULT_LLM_MODEL = os.environ.get(LLM_MODEL_ENV, "")
 DEFAULT_LLM_ENDPOINT = "http://127.0.0.1:8080/api/v1/litellm/chat"
+DEFAULT_BLUEPRINTS_ENV_PATH = Path("/root/xarta-node/.env")
+DEFAULT_BLUEPRINTS_API = "http://127.0.0.1:8080"
 ROOT_WORK_ITEM_ID = "work-git-github-activity"
 ROOT_WORK_ITEM_LINK = f"blueprints://kanban/items/{ROOT_WORK_ITEM_ID}"
 SOURCE_ID = "github-git"
 SCRIPT_NAME = "personal-github-activity-ingest"
 LIVE_DB_PATH = Path("/opt/blueprints/data/db/blueprints.db")
 GITHUB_BASE = "https://github.com"
+REQUIRED_SYNC_TABLES = (
+    "personal_sources",
+    "personal_git_repositories",
+    "personal_git_commits",
+    "personal_git_features",
+    "personal_git_kanban_arcs",
+    "personal_git_daily_summaries",
+    "personal_git_import_runs",
+    "personal_events",
+    "work_items",
+)
 VISIBLE_CALENDAR_IDENTIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bghc-[0-9a-fA-F]{12,}\b"), "[commit reference]"),
     (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "[commit reference]"),
@@ -47,6 +60,36 @@ VISIBLE_CALENDAR_IDENTIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = 
         "[Kanban item]",
     ),
 )
+
+
+def load_blueprints_env() -> None:
+    """Load the node-local Blueprints env when this script runs outside systemd."""
+    env_path = Path(os.environ.get("BLUEPRINTS_ENV_FILE", str(DEFAULT_BLUEPRINTS_ENV_PATH)))
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def blueprints_node_id(*, required: bool = False) -> str:
+    load_blueprints_env()
+    node_id = os.environ.get("BLUEPRINTS_NODE_ID", "").strip()
+    if required and not node_id:
+        raise RuntimeError(
+            "BLUEPRINTS_NODE_ID is not set; refusing to enqueue fleet sync rows "
+            "without knowing this node's identity."
+        )
+    return node_id
+
 
 GIT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS personal_git_repositories (
@@ -431,6 +474,80 @@ def backup_sqlite_database(db_path: Path, backup_path: Path) -> dict[str, Any]:
         "size_bytes": backup_path.stat().st_size,
         "created_at": utc_now_iso(),
     }
+
+
+def is_live_db_path(db_path: Path) -> bool:
+    try:
+        return db_path.resolve() == LIVE_DB_PATH.resolve()
+    except OSError:
+        return False
+
+
+def repo_commit_ts(repo_path: Path) -> int:
+    try:
+        return int(
+            subprocess.check_output(
+                ["git", "-C", str(repo_path), "log", "-1", "--format=%ct"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not determine expected Blueprints commit timestamp: {exc}"
+        ) from exc
+
+
+def runtime_readiness_report(min_commit_ts: int) -> dict[str, Any]:
+    query_parts: list[tuple[str, str]] = [("min_commit_ts", str(min_commit_ts))]
+    query_parts.extend(("required_table", table) for table in REQUIRED_SYNC_TABLES)
+    base_url = os.environ.get("BLUEPRINTS_LOCAL_API", DEFAULT_BLUEPRINTS_API).rstrip("/")
+    url = f"{base_url}/api/v1/sync/runtime-readiness?{urlencode(query_parts)}"
+    try:
+        with urlopen(Request(url), timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise SystemExit(
+            "Blueprints runtime readiness check failed before live apply. "
+            "The local app may not have restarted onto the fleet-update code yet: "
+            f"{exc}"
+        ) from exc
+
+
+def _runtime_failure_reason(node: dict[str, Any]) -> str:
+    if node.get("error"):
+        return str(node["error"])
+    missing = node.get("missing_tables") or []
+    if missing:
+        return "missing sync tables " + ",".join(str(table) for table in missing)
+    if node.get("commit_ready") is False:
+        return f"commit_ts {node.get('commit_ts')} < required {node.get('min_commit_ts')}"
+    return "not ready"
+
+
+def require_runtime_readiness_for_live_apply(db_path: Path) -> dict[str, Any] | None:
+    if os.environ.get("PERSONAL_GITHUB_ACTIVITY_SKIP_RUNTIME_READINESS") == "1":
+        return {"skipped": True, "reason": "PERSONAL_GITHUB_ACTIVITY_SKIP_RUNTIME_READINESS=1"}
+    if not is_live_db_path(db_path):
+        return None
+
+    load_blueprints_env()
+    min_commit_ts = repo_commit_ts(Path("/root/xarta-node"))
+    report = runtime_readiness_report(min_commit_ts)
+    if report.get("all_ready") is True:
+        return report
+
+    failed_nodes = [report.get("local") or {}]
+    failed_nodes.extend(report.get("peers") or [])
+    failed = [
+        f"{node.get('node_id')}: {_runtime_failure_reason(node)}"
+        for node in failed_nodes
+        if node and node.get("ready") is not True
+    ]
+    raise SystemExit(
+        "Blueprints runtime readiness check failed before live apply; "
+        "refusing to create fleet sync rows. " + "; ".join(failed)
+    )
 
 
 def ensure_git_tables(conn: sqlite3.Connection) -> None:
@@ -1206,8 +1323,17 @@ def enqueue_for_peers(
 ) -> None:
     if gen <= 0 or not table_exists(conn, "sync_queue") or not table_exists(conn, "nodes"):
         return
-    node_id = os.environ.get("BLUEPRINTS_NODE_ID", "")
+    node_id = blueprints_node_id(required=True)
     try:
+        node_count = conn.execute("SELECT COUNT(*) AS c FROM nodes").fetchone()
+        if node_count is not None and int(node_count["c"]) == 0:
+            return
+        self_row = conn.execute("SELECT 1 FROM nodes WHERE node_id=?", (node_id,)).fetchone()
+        if self_row is None:
+            raise RuntimeError(
+                f"BLUEPRINTS_NODE_ID={node_id!r} is not present in the nodes table; "
+                "refusing to enqueue fleet sync rows."
+            )
         rows = conn.execute("SELECT node_id FROM nodes WHERE node_id != ?", (node_id,)).fetchall()
     except sqlite3.Error:
         return
@@ -1960,7 +2086,7 @@ def sync_queue_count(conn: sqlite3.Connection) -> int | None:
 def sync_target_node_count(conn: sqlite3.Connection) -> int | None:
     if not table_exists(conn, "nodes"):
         return None
-    node_id = os.environ.get("BLUEPRINTS_NODE_ID", "")
+    node_id = blueprints_node_id(required=True)
     row = conn.execute("SELECT COUNT(*) AS c FROM nodes WHERE node_id != ?", (node_id,)).fetchone()
     return int(row["c"]) if row else 0
 
@@ -4568,6 +4694,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         apply_report["approved_preflight_report_path"] = str(args.approved_preflight_report)
         apply_report["approved_preflight_digest"] = preflight_approval_digest(expected_preflight)
+        runtime_readiness = require_runtime_readiness_for_live_apply(args.db_path)
+        if runtime_readiness is not None:
+            apply_report["runtime_readiness"] = runtime_readiness
         if args.backup_before_apply:
             backup_path = args.backup_path or default_backup_path(args.db_path, run_id)
             apply_report["database_backup"] = backup_sqlite_database(args.db_path, backup_path)
@@ -4658,6 +4787,7 @@ def main(argv: list[str] | None = None) -> int:
             "Legacy direct scanner apply requires --allow-scanner-apply. "
             "For historical imports, use --apply-from-report with --approved-preflight-report."
         )
+    runtime_readiness = require_runtime_readiness_for_live_apply(args.db_path) if apply else None
     started_at = utc_now_iso()
     run_id = f"git-import-{started_at.replace(':', '').replace('-', '').replace('Z', '')}-{uuid.uuid4().hex[:8]}"
     owners = parse_list(args.owner_allowlist, DEFAULT_OWNERS)
@@ -4762,6 +4892,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.report:
             report["report_path"] = str(args.report)
+        if runtime_readiness is not None:
+            report["runtime_readiness"] = runtime_readiness
         if apply:
             apply_ingest(
                 conn,
