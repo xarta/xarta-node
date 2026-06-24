@@ -29,7 +29,6 @@ from ..sync.queue import (
     get_pending_actions,
     get_queue_depth,
     mark_sent,
-    purge_unsent_db_actions,
 )
 from ..sync.restore import make_full_backup
 
@@ -251,15 +250,15 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                     return
                 elif resp.status_code == 409:
                     # Commit guard: peer is on a newer commit and refused our
-                    # data. Purge stale outgoing DB-write actions; system
-                    # actions are preserved.  No point trying other addresses
-                    # — the issue is a code mismatch, not connectivity.
-                    purged = purge_unsent_db_actions(node_id)
+                    # data. Keep the rows queued so they can drain after this
+                    # node pulls/restarts onto the same runtime as the peer.
+                    # No point trying other addresses — the issue is a code
+                    # mismatch, not connectivity.
                     log.warning(
                         "commit guard: peer %s rejected actions (409) — "
-                        "purged %d outgoing DB actions. Local code is behind.",
+                        "leaving %d outgoing action(s) queued. Local code is behind.",
                         node_id,
-                        purged,
+                        len(actions),
                     )
                     return
                 else:

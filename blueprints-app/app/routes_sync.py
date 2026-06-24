@@ -181,6 +181,25 @@ async def _git_pull(repo_path: str, label: str) -> bool:
     return False
 
 
+async def _runtime_repo_is_stale(repo_path: str, label: str) -> bool:
+    """Return True when the checked-out runtime repo is newer than this process."""
+    if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
+        return False
+    head = await _git_head(repo_path, label)
+    running = cfg.COMMIT_HASH
+    if not head or not running:
+        return False
+    stale = not head.startswith(running)
+    if stale:
+        log.info(
+            "runtime repo [%s] is newer than process: running=%s disk=%s",
+            label,
+            running,
+            head[:12],
+        )
+    return stale
+
+
 async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> None:
     """Run a coalesced git-pull batch and restart once if runtime code changed."""
     global _RESTART_PENDING
@@ -198,7 +217,8 @@ async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> Non
         for scope in ordered_scopes:
             repo_path, restart_service = targets[scope]
             changed = await _git_pull(repo_path, scope)
-            restart_needed = restart_needed or (changed and restart_service)
+            runtime_stale = restart_service and await _runtime_repo_is_stale(repo_path, scope)
+            restart_needed = restart_needed or (restart_service and (changed or runtime_stale))
         if restart_needed:
             if cfg.SERVICE_RESTART_CMD:
                 _RESTART_PENDING = True
