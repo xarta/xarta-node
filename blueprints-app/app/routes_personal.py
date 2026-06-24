@@ -23,12 +23,13 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from . import hermes_minutes
-from .db import get_conn, increment_gen
+from .db import get_conn, get_setting, increment_gen, set_setting
 from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/personal", tags=["personal"])
 
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
+KANBAN_ROOT = Path(os.environ.get("BLUEPRINTS_KANBAN_DIR", "/xarta-node/.lone-wolf/kanban"))
 XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xarta/.agents/lib"))
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
@@ -69,6 +70,8 @@ OPENCLAW_AUDIT_PATTERNS: tuple[tuple[str, str, str], ...] = (
 )
 OPENCLAW_AI_DEVELOPMENT_DOMAINS: tuple[str, ...] = ("marktechpost.com", "venturebeat.com")
 DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
+KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
+KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 DEFAULT_PERSONAL_GIT_REPOS: tuple[tuple[str, str, str], ...] = (
     ("p300", "/xarta-node", "Public non-root workspace"),
     ("p200", "/root/xarta-node", "Public root workspace"),
@@ -82,7 +85,7 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
         "filters": {"date": "today", "status_exclude": ["archived"]},
     },
     "work": {
-        "label": "Work",
+        "label": "Kanban",
         "filters": {"source_type": "work-management"},
     },
     "personal": {
@@ -115,6 +118,10 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
     },
 }
 WORK_DEPTH_LIMIT = 12
+WORK_SHOW_TEST_ENTRIES_SETTING = "personal.kanban.show_test_entries"
+WORK_KANBAN_TAG = "kanban"
+WORK_AGENT_WORKING_OUT_TAG = "agent-working-out"
+WORK_PROOF_TAG = "proof"
 
 
 class PersonalRehydrateRequest(BaseModel):
@@ -281,7 +288,52 @@ class WorkItemMoveRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkItemOrderRequest(BaseModel):
+    direction: str
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkItemActionRequest(BaseModel):
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkPreferencesUpdateRequest(BaseModel):
+    show_test_entries: bool | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkItemDetailDocumentUpdateRequest(BaseModel):
+    body: str = ""
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkDiscussionCreateRequest(BaseModel):
+    discussion_id: str | None = None
+    body: str = ""
+    author: str | None = None
+    status: str = "open"
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkDiscussionUpdateRequest(BaseModel):
+    body: str | None = None
+    author: str | None = None
+    status: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -413,6 +465,40 @@ def _json_value(value: str | None, fallback: Any) -> Any:
         parsed = json.loads(value)
         return parsed if parsed is not None else fallback
     return fallback
+
+
+def _work_item_tags(tags: list[str] | None) -> list[str]:
+    clean = []
+    for tag in _clean_event_list(tags or [], limit=32):
+        if tag and tag not in clean:
+            clean.append(tag)
+    if WORK_KANBAN_TAG not in clean:
+        clean.append(WORK_KANBAN_TAG)
+    return clean
+
+
+def _work_request_is_agent_working_out(meta: dict[str, str], tags: list[str]) -> bool:
+    if WORK_AGENT_WORKING_OUT_TAG in tags:
+        return True
+    source_surface = str(meta.get("source_surface") or "").lower()
+    actor = str(meta.get("actor") or "").lower()
+    request_id = str(meta.get("request_id") or "").lower()
+    return (
+        source_surface == "kanban-active-browser-proof"
+        or actor in {"codex-playwright"}
+        or "active-browser-step" in request_id
+        or WORK_PROOF_TAG in tags
+        and source_surface.startswith("kanban-")
+    )
+
+
+def _work_item_tags_for_request(tags: list[str] | None, meta: dict[str, str]) -> list[str]:
+    clean = _work_item_tags(tags)
+    if _work_request_is_agent_working_out(meta, clean):
+        for tag in (WORK_AGENT_WORKING_OUT_TAG, WORK_PROOF_TAG):
+            if tag not in clean:
+                clean.append(tag)
+    return clean
 
 
 def _row_to_event(row: Any) -> dict[str, Any]:
@@ -658,7 +744,7 @@ def _work_todo_to_task(row: Any) -> dict[str, Any]:
         "local_date": local_date,
         "timezone": "",
         "privacy_level": "normal",
-        "tags": ["work", "todo"],
+        "tags": [WORK_KANBAN_TAG, "todo", "task"],
         "source": {
             "type": "work-todo",
             "ref": f"work_todos:{row['todo_id']}",
@@ -704,12 +790,14 @@ def _row_to_work_blocker(row: Any) -> dict[str, Any]:
     }
 
 
-def _row_to_work_discussion(row: Any) -> dict[str, Any]:
-    return {
+def _row_to_work_discussion(row: Any, conn: Any | None = None) -> dict[str, Any]:
+    document = _work_discussion_document(conn, row) if conn is not None else None
+    payload = {
         "discussion_id": row["discussion_id"],
         "item_id": row["item_id"],
         "author": row["author"],
         "body_excerpt": row["body_excerpt"],
+        "body": document["body"] if document else row["body_excerpt"],
         "status": row["status"],
         "search": {
             "text": row["search_text"],
@@ -725,6 +813,10 @@ def _row_to_work_discussion(row: Any) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    if document:
+        payload["document"] = document
+        payload["file_refs"] = [document["file_ref"]]
+    return payload
 
 
 def _event_to_task(row: Any) -> dict[str, Any]:
@@ -839,6 +931,68 @@ def _diary_relative_path(path: Path) -> str:
     return resolved.relative_to(root).as_posix()
 
 
+def _kanban_relative_path(path: Path) -> str:
+    resolved = Path(path).resolve()
+    root = KANBAN_ROOT.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("kanban path is outside kanban root")
+    return resolved.relative_to(root).as_posix()
+
+
+def _safe_kanban_slug(value: str | None, default: str = "item") -> str:
+    clean = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    clean = re.sub(r"-{2,}", "-", clean)
+    return clean or default
+
+
+def _normalise_markdown_document_body(value: str | None) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _kanban_markdown_text(schema: str, metadata: dict[str, Any], body: str) -> str:
+    frontmatter = {
+        "schema": schema,
+        **metadata,
+    }
+    return (
+        "---\n"
+        f"{json.dumps(frontmatter, ensure_ascii=False, sort_keys=True, indent=2)}\n"
+        "---\n\n"
+        f"{_normalise_markdown_document_body(body)}"
+    )
+
+
+def _split_kanban_markdown_text(text: str) -> tuple[dict[str, Any], str]:
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end < 0:
+        return {}, text
+    frontmatter_text = text[4:end].strip()
+    body = text[end + len("\n---") :]
+    if body.startswith("\r\n"):
+        body = body[2:]
+    elif body.startswith("\n"):
+        body = body[1:]
+    if body.startswith("\n"):
+        body = body[1:]
+    metadata = {}
+    with suppress(json.JSONDecodeError, TypeError):
+        parsed = json.loads(frontmatter_text)
+        if isinstance(parsed, dict):
+            metadata = parsed
+    return metadata, body
+
+
+def _read_kanban_markdown_document(path: Path) -> tuple[dict[str, Any], str, bool]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}, "", False
+    metadata, body = _split_kanban_markdown_text(text)
+    return metadata, body, True
+
+
 def _load_xarta_diary_module() -> Any:
     if str(XARTA_AGENT_LIB) not in sys.path:
         sys.path.insert(0, str(XARTA_AGENT_LIB))
@@ -869,8 +1023,9 @@ def _entry_title(body: str, local_time: str | None) -> str:
 
 
 def _body_excerpt(body: str, limit: int = 500) -> str:
-    # Compact summaries only; markdown-capable content_projection must keep raw whitespace.
-    return re.sub(r"\s+", " ", body.strip())[:limit]
+    # Compact summaries may still be rendered as markdown, so preserve line breaks.
+    text = _normalise_markdown_document_body(body).strip()
+    return "\n".join(line.rstrip() for line in text.split("\n"))[:limit]
 
 
 def _upsert_personal_source(conn: Any, now: str) -> None:
@@ -3563,13 +3718,14 @@ def _task_payload(
     status = _task_status(status_override or body.status)
     mode = _task_mode(body.mode, related_work_items)
     tags = _clean_event_list(body.tags)
-    for required in ("todo", "task", mode):
+    mode_tag = WORK_KANBAN_TAG if mode == "work" else mode
+    for required in ("todo", "task", mode_tag):
         if required not in tags:
             tags.append(required)
     if due_at and "due" not in tags:
         tags.append("due")
-    if related_work_items and "work" not in tags:
-        tags.append("work")
+    if related_work_items and WORK_KANBAN_TAG not in tags:
+        tags.append(WORK_KANBAN_TAG)
     clean_task_id = _task_id(task_id or body.task_id, local_date)
     provenance = {
         "task": {
@@ -4049,6 +4205,295 @@ def _work_item_or_404(conn: Any, item_id: str) -> Any:
     return row
 
 
+def _work_root_item(conn: Any, item_id: str) -> Any:
+    current = _work_item_or_404(conn, item_id)
+    seen: set[str] = set()
+    while current["parent_item_id"]:
+        if current["item_id"] in seen:
+            raise HTTPException(400, "work item parent cycle detected")
+        seen.add(current["item_id"])
+        current = _work_item_or_404(conn, current["parent_item_id"])
+    return current
+
+
+def _kanban_projects_manifest_path() -> Path:
+    return KANBAN_ROOT / "projects.json"
+
+
+def _read_kanban_projects_manifest() -> dict[str, Any]:
+    path = _kanban_projects_manifest_path()
+    fallback = {"schema": "xarta.kanban.projects.v1", "projects": {}}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(parsed, dict):
+        return fallback
+    projects = parsed.get("projects")
+    if not isinstance(projects, dict):
+        parsed["projects"] = {}
+    parsed.setdefault("schema", "xarta.kanban.projects.v1")
+    return parsed
+
+
+def _write_kanban_projects_manifest(manifest: dict[str, Any]) -> None:
+    KANBAN_ROOT.mkdir(parents=True, exist_ok=True)
+    manifest["schema"] = "xarta.kanban.projects.v1"
+    manifest.setdefault("projects", {})
+    path = _kanban_projects_manifest_path()
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _kanban_project_slug_available(
+    slug: str,
+    *,
+    manifest: dict[str, Any],
+    root_item_id: str,
+    current_folder: str = "",
+) -> bool:
+    projects = manifest.get("projects") if isinstance(manifest.get("projects"), dict) else {}
+    for other_id, entry in projects.items():
+        if other_id == root_item_id:
+            continue
+        if isinstance(entry, dict) and entry.get("folder") == slug:
+            return False
+    if slug == current_folder:
+        return True
+    path = KANBAN_ROOT / slug
+    return not path.exists()
+
+
+def _allocate_kanban_project_slug(
+    title: str | None,
+    *,
+    manifest: dict[str, Any],
+    root_item_id: str,
+    current_folder: str = "",
+) -> str:
+    base = _safe_kanban_slug(title or root_item_id, "root-project")
+    candidate = base
+    suffix = 1
+    while not _kanban_project_slug_available(
+        candidate,
+        manifest=manifest,
+        root_item_id=root_item_id,
+        current_folder=current_folder,
+    ):
+        suffix += 1
+        candidate = f"{base}-{suffix}"
+    return candidate
+
+
+def _kanban_root_project_slug(conn: Any, root_item: Any, *, ensure_manifest: bool = False) -> str:
+    manifest = _read_kanban_projects_manifest()
+    projects = manifest.setdefault("projects", {})
+    root_id = root_item["item_id"]
+    entry = projects.get(root_id) if isinstance(projects.get(root_id), dict) else None
+    if entry and entry.get("folder"):
+        if ensure_manifest and entry.get("title") != root_item["title"]:
+            entry["title"] = root_item["title"]
+            entry["updated_at"] = _utc_now_iso()
+            _write_kanban_projects_manifest(manifest)
+        return str(entry["folder"])
+    folder = _allocate_kanban_project_slug(
+        root_item["title"], manifest=manifest, root_item_id=root_id
+    )
+    if ensure_manifest:
+        projects[root_id] = {
+            "item_id": root_id,
+            "title": root_item["title"],
+            "folder": folder,
+            "pending": None,
+            "updated_at": _utc_now_iso(),
+        }
+        _write_kanban_projects_manifest(manifest)
+    return folder
+
+
+def _sync_kanban_root_project_title(
+    conn: Any,
+    *,
+    root_item_id: str,
+    old_title: str,
+    new_title: str,
+    now: str,
+) -> dict[str, Any]:
+    manifest = _read_kanban_projects_manifest()
+    projects = manifest.setdefault("projects", {})
+    entry = projects.get(root_item_id) if isinstance(projects.get(root_item_id), dict) else None
+    old_folder = (
+        str(entry.get("folder"))
+        if entry and entry.get("folder")
+        else _safe_kanban_slug(old_title or root_item_id, "root-project")
+    )
+    new_folder = _allocate_kanban_project_slug(
+        new_title,
+        manifest=manifest,
+        root_item_id=root_item_id,
+        current_folder=old_folder,
+    )
+    if old_folder == new_folder:
+        projects[root_item_id] = {
+            "item_id": root_item_id,
+            "title": new_title,
+            "folder": old_folder,
+            "pending": None,
+            "updated_at": now,
+        }
+        _write_kanban_projects_manifest(manifest)
+        return {"folder": old_folder, "renamed": False}
+    projects[root_item_id] = {
+        "item_id": root_item_id,
+        "title": old_title,
+        "folder": old_folder,
+        "pending": {
+            "action": "rename",
+            "from": old_folder,
+            "to": new_folder,
+            "title": new_title,
+            "started_at": now,
+        },
+        "updated_at": now,
+    }
+    _write_kanban_projects_manifest(manifest)
+    old_path = KANBAN_ROOT / old_folder
+    new_path = KANBAN_ROOT / new_folder
+    renamed = old_path.exists()
+    if old_path.exists():
+        if new_path.exists():
+            raise HTTPException(409, "kanban project folder target already exists")
+        old_path.rename(new_path)
+    projects[root_item_id] = {
+        "item_id": root_item_id,
+        "title": new_title,
+        "folder": new_folder,
+        "previous_folder": old_folder,
+        "pending": None,
+        "updated_at": now,
+    }
+    _write_kanban_projects_manifest(manifest)
+    return {"folder": new_folder, "previous_folder": old_folder, "renamed": renamed}
+
+
+def _kanban_item_dir(conn: Any, item_id: str, *, ensure_project: bool = False) -> Path:
+    root = _work_root_item(conn, item_id)
+    project_slug = _kanban_root_project_slug(conn, root, ensure_manifest=ensure_project)
+    item_slug = _safe_kanban_slug(item_id, "item")
+    return KANBAN_ROOT / project_slug / "items" / item_slug
+
+
+def _kanban_item_detail_path(conn: Any, item_id: str, *, ensure_project: bool = False) -> Path:
+    return _kanban_item_dir(conn, item_id, ensure_project=ensure_project) / "detail.md"
+
+
+def _kanban_discussion_path(
+    conn: Any, item_id: str, discussion_id: str, *, ensure_project: bool = False
+) -> Path:
+    safe_discussion = _safe_kanban_slug(discussion_id, "discussion")
+    return (
+        _kanban_item_dir(conn, item_id, ensure_project=ensure_project)
+        / "discussions"
+        / f"{safe_discussion}.md"
+    )
+
+
+def _kanban_document_ref(path: Path) -> dict[str, Any]:
+    return {
+        "root": "kanban",
+        "path": _kanban_relative_path(path),
+    }
+
+
+def _work_item_detail_document(conn: Any, item_id: str) -> dict[str, Any]:
+    item = _work_item_or_404(conn, item_id)
+    path = _kanban_item_detail_path(conn, item_id)
+    metadata, body, exists = _read_kanban_markdown_document(path)
+    return {
+        "schema": metadata.get("schema") or KANBAN_ITEM_DETAIL_SCHEMA,
+        "item_id": item_id,
+        "body": body,
+        "exists": exists,
+        "file_ref": _kanban_document_ref(path),
+        "metadata": metadata,
+        "updated_at": metadata.get("updated_at") or item["updated_at"],
+    }
+
+
+def _write_work_item_detail_document(
+    conn: Any,
+    item_id: str,
+    body: str,
+    *,
+    actor: str,
+    now: str,
+) -> dict[str, Any]:
+    item = _work_item_or_404(conn, item_id)
+    path = _kanban_item_detail_path(conn, item_id, ensure_project=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean_body = _normalise_markdown_document_body(body)
+    metadata = {
+        "item_id": item_id,
+        "root_item_id": _work_root_item(conn, item_id)["item_id"],
+        "title": item["title"],
+        "actor": actor,
+        "updated_at": now,
+    }
+    path.write_text(
+        _kanban_markdown_text(KANBAN_ITEM_DETAIL_SCHEMA, metadata, clean_body),
+        encoding="utf-8",
+    )
+    return _work_item_detail_document(conn, item_id)
+
+
+def _work_discussion_document(conn: Any, row: Any) -> dict[str, Any]:
+    path = _kanban_discussion_path(conn, row["item_id"], row["discussion_id"])
+    metadata, body, exists = _read_kanban_markdown_document(path)
+    if not exists:
+        body = row["body_excerpt"] or ""
+    return {
+        "schema": metadata.get("schema") or KANBAN_DISCUSSION_SCHEMA,
+        "discussion_id": row["discussion_id"],
+        "item_id": row["item_id"],
+        "body": body,
+        "exists": exists,
+        "file_ref": _kanban_document_ref(path),
+        "metadata": metadata,
+        "updated_at": metadata.get("updated_at") or row["updated_at"],
+    }
+
+
+def _write_work_discussion_document(
+    conn: Any,
+    row: Any,
+    body: str,
+    *,
+    actor: str,
+    now: str,
+) -> dict[str, Any]:
+    path = _kanban_discussion_path(conn, row["item_id"], row["discussion_id"], ensure_project=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean_body = _normalise_markdown_document_body(body)
+    metadata = {
+        "discussion_id": row["discussion_id"],
+        "item_id": row["item_id"],
+        "author": row["author"],
+        "status": row["status"],
+        "actor": actor,
+        "created_at": row["created_at"],
+        "updated_at": now,
+    }
+    path.write_text(
+        _kanban_markdown_text(KANBAN_DISCUSSION_SCHEMA, metadata, clean_body),
+        encoding="utf-8",
+    )
+    return _work_discussion_document(conn, row)
+
+
 def _work_parent_depth(conn: Any, parent_item_id: str | None, *, moving_item_id: str = "") -> int:
     parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
     if not parent_id:
@@ -4205,9 +4650,15 @@ def _write_work_audit(
     return row
 
 
-def _work_scope_item_ids(conn: Any, item_id: str | None) -> list[str]:
+def _work_scope_item_ids(
+    conn: Any,
+    item_id: str | None,
+    *,
+    show_test_entries: bool = True,
+) -> list[str]:
     if not item_id:
-        rows = conn.execute("SELECT item_id FROM work_items WHERE status != 'archived'").fetchall()
+        rows = conn.execute("SELECT * FROM work_items WHERE status != 'archived'").fetchall()
+        rows, _hidden = _filter_work_test_rows(rows, show_test_entries)
         return [row["item_id"] for row in rows]
     _work_item_or_404(conn, item_id)
     rows = conn.execute(
@@ -4224,7 +4675,16 @@ def _work_scope_item_ids(conn: Any, item_id: str | None) -> list[str]:
         """,
         (item_id,),
     ).fetchall()
-    return [row["item_id"] for row in rows]
+    item_ids = [row["item_id"] for row in rows]
+    if show_test_entries or not item_ids:
+        return item_ids
+    placeholders = ",".join("?" for _ in item_ids)
+    scoped_rows = conn.execute(
+        f"SELECT * FROM work_items WHERE item_id IN ({placeholders})",
+        item_ids,
+    ).fetchall()
+    scoped_rows, _hidden = _filter_work_test_rows(scoped_rows, show_test_entries)
+    return [row["item_id"] for row in scoped_rows]
 
 
 def _work_scope_item_rows(conn: Any, item_id: str, scope: str) -> list[Any]:
@@ -4377,8 +4837,13 @@ def _work_breadcrumbs(conn: Any, item_id: str | None) -> list[dict[str, Any]]:
     return [_row_to_work_item(row) for row in reversed(rows)]
 
 
-def _work_rollup(conn: Any, item_id: str | None = None) -> dict[str, Any]:
-    item_ids = _work_scope_item_ids(conn, item_id)
+def _work_rollup(
+    conn: Any,
+    item_id: str | None = None,
+    *,
+    show_test_entries: bool = True,
+) -> dict[str, Any]:
+    item_ids = _work_scope_item_ids(conn, item_id, show_test_entries=show_test_entries)
     if not item_ids:
         return {
             "items": {"total": 0, "by_state": {}, "by_status": {}},
@@ -4426,9 +4891,359 @@ def _work_rollup(conn: Any, item_id: str | None = None) -> dict[str, Any]:
     }
 
 
-def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[str, Any]:
+def _work_priority_sort_map(conn: Any) -> dict[str, dict[str, int]]:
+    rows = conn.execute(
+        "SELECT priority_id, weight, sort_order FROM work_item_priorities"
+    ).fetchall()
+    return {
+        row["priority_id"]: {
+            "weight": int(row["weight"] or 0),
+            "sort_order": int(row["sort_order"] or 0),
+        }
+        for row in rows
+    }
+
+
+def _bool_setting_value(value: str | None, default: bool = True) -> bool:
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "show"}:
+        return True
+    if text in {"0", "false", "no", "off", "hide"}:
+        return False
+    return default
+
+
+def _work_preferences(conn: Any) -> dict[str, Any]:
+    return {
+        "show_test_entries": _bool_setting_value(
+            get_setting(conn, WORK_SHOW_TEST_ENTRIES_SETTING),
+            default=True,
+        )
+    }
+
+
+def _work_item_is_test_entry(row: Any) -> bool:
+    tags = {
+        str(tag).strip().lower() for tag in _json_value(row["tags_json"], []) if str(tag).strip()
+    }
+    return WORK_AGENT_WORKING_OUT_TAG in tags
+
+
+def _filter_work_test_rows(rows: list[Any], show_test_entries: bool) -> tuple[list[Any], int]:
+    if show_test_entries:
+        return list(rows), 0
+    visible: list[Any] = []
+    hidden = 0
+    for row in rows:
+        if _work_item_is_test_entry(row):
+            hidden += 1
+        else:
+            visible.append(row)
+    return visible, hidden
+
+
+def _work_lane_parent_key(parent_item_id: str | None) -> str:
+    return _clean_short_text(parent_item_id, "", limit=180)
+
+
+def _work_order_edge_id(
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+    before_item_id: str,
+    after_item_id: str,
+) -> str:
+    digest = _hash_json_payload(
+        {
+            "parent_item_id": _work_lane_parent_key(parent_item_id),
+            "state_id": state_id,
+            "priority_id": priority_id,
+            "before_item_id": before_item_id,
+            "after_item_id": after_item_id,
+        }
+    )[:24]
+    return f"work-order-{digest}"
+
+
+def _work_order_group_rows(
+    conn: Any,
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+) -> list[Any]:
+    parent_key = _work_lane_parent_key(parent_item_id)
+    if parent_key:
+        return conn.execute(
+            """
+            SELECT * FROM work_items
+            WHERE parent_item_id=? AND state_id=? AND priority_id=? AND status != 'archived'
+            """,
+            (parent_key, state_id, priority_id),
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT * FROM work_items
+        WHERE parent_item_id IS NULL AND state_id=? AND priority_id=? AND status != 'archived'
+        """,
+        (state_id, priority_id),
+    ).fetchall()
+
+
+def _work_order_edges_for_group(
+    conn: Any,
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+    item_ids: set[str],
+) -> list[Any]:
+    if not item_ids:
+        return []
+    rows = conn.execute(
+        """
+        SELECT * FROM work_item_order_edges
+        WHERE parent_item_id=? AND state_id=? AND priority_id=?
+        ORDER BY updated_at DESC, edge_id
+        """,
+        (_work_lane_parent_key(parent_item_id), state_id, priority_id),
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if row["before_item_id"] in item_ids
+        and row["after_item_id"] in item_ids
+        and row["before_item_id"] != row["after_item_id"]
+    ]
+
+
+def _order_work_priority_group(conn: Any, rows: list[Any]) -> list[Any]:
+    if len(rows) <= 1:
+        return list(rows)
+    fallback = sorted(
+        rows,
+        key=lambda row: (
+            int(row["sort_order"] or 0),
+            str(row["created_at"] or ""),
+            row["item_id"],
+        ),
+    )
+    fallback_index = {row["item_id"]: index for index, row in enumerate(fallback)}
+    row_by_id = {row["item_id"]: row for row in fallback}
+    item_ids = set(row_by_id)
+    first = fallback[0]
+    edges = _work_order_edges_for_group(
+        conn,
+        first["parent_item_id"],
+        first["state_id"],
+        first["priority_id"],
+        item_ids,
+    )
+    if not edges:
+        return fallback
+    adjacency: dict[str, set[str]] = {item_id: set() for item_id in item_ids}
+    indegree: dict[str, int] = {item_id: 0 for item_id in item_ids}
+    seen_pairs: set[tuple[str, str]] = set()
+    for edge in edges:
+        before = edge["before_item_id"]
+        after = edge["after_item_id"]
+        pair = (before, after)
+        if pair in seen_pairs or after in adjacency[before]:
+            continue
+        seen_pairs.add(pair)
+        adjacency[before].add(after)
+        indegree[after] += 1
+    ready = sorted(
+        [item_id for item_id, value in indegree.items() if value == 0],
+        key=lambda item_id: fallback_index[item_id],
+    )
+    ordered_ids: list[str] = []
+    while ready:
+        item_id = ready.pop(0)
+        ordered_ids.append(item_id)
+        for after in sorted(adjacency[item_id], key=lambda value: fallback_index[value]):
+            indegree[after] -= 1
+            if indegree[after] == 0:
+                ready.append(after)
+                ready.sort(key=lambda value: fallback_index[value])
+    if len(ordered_ids) < len(item_ids):
+        ordered_ids.extend(row["item_id"] for row in fallback if row["item_id"] not in ordered_ids)
+    return [row_by_id[item_id] for item_id in ordered_ids]
+
+
+def _sort_work_items_for_lane(conn: Any, rows: list[Any]) -> list[Any]:
+    if len(rows) <= 1:
+        return list(rows)
+    priorities = _work_priority_sort_map(conn)
+    groups: dict[str, list[Any]] = {}
+    for row in rows:
+        groups.setdefault(row["priority_id"] or "medium", []).append(row)
+    priority_ids = sorted(
+        groups,
+        key=lambda priority_id: (
+            -priorities.get(priority_id, {}).get("weight", 0),
+            -priorities.get(priority_id, {}).get("sort_order", 0),
+            priority_id,
+        ),
+    )
+    ordered: list[Any] = []
+    for priority_id in priority_ids:
+        ordered.extend(_order_work_priority_group(conn, groups[priority_id]))
+    return ordered
+
+
+def _work_item_has_order_relation(
+    conn: Any,
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+    item_id: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM work_item_order_edges
+        WHERE parent_item_id=? AND state_id=? AND priority_id=?
+          AND (before_item_id=? OR after_item_id=?)
+        LIMIT 1
+        """,
+        (_work_lane_parent_key(parent_item_id), state_id, priority_id, item_id, item_id),
+    ).fetchone()
+    return bool(row)
+
+
+def _replace_work_item_order_edges(
+    conn: Any,
+    *,
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+    ordered_ids: list[str],
+    now: str,
+    meta: dict[str, str],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    parent_key = _work_lane_parent_key(parent_item_id)
+    clean_ids = [item_id for item_id in ordered_ids if item_id]
+    wanted_pairs = list(zip(clean_ids, clean_ids[1:]))
+    wanted_edge_ids = {
+        _work_order_edge_id(parent_key, state_id, priority_id, before, after)
+        for before, after in wanted_pairs
+    }
+    sync_changes: list[tuple[str, str, dict[str, Any]]] = []
+    existing = conn.execute(
+        """
+        SELECT * FROM work_item_order_edges
+        WHERE parent_item_id=? AND state_id=? AND priority_id=?
+        """,
+        (parent_key, state_id, priority_id),
+    ).fetchall()
+    for row in existing:
+        if row["edge_id"] in wanted_edge_ids:
+            continue
+        conn.execute("DELETE FROM work_item_order_edges WHERE edge_id=?", (row["edge_id"],))
+        sync_changes.append(("DELETE", row["edge_id"], {}))
+    for before, after in wanted_pairs:
+        edge_id = _work_order_edge_id(parent_key, state_id, priority_id, before, after)
+        provenance = {
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+            "before_item_id": before,
+            "after_item_id": after,
+        }
+        payload = {
+            "edge_id": edge_id,
+            "parent_item_id": parent_key,
+            "state_id": state_id,
+            "priority_id": priority_id,
+            "before_item_id": before,
+            "after_item_id": after,
+            "provenance": provenance,
+        }
+        source_hash = _hash_json_payload(payload)
+        conn.execute(
+            """
+            INSERT INTO work_item_order_edges (
+                edge_id, parent_item_id, state_id, priority_id, before_item_id,
+                after_item_id, source_hash, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(edge_id) DO UPDATE SET
+                before_item_id=excluded.before_item_id,
+                after_item_id=excluded.after_item_id,
+                source_hash=excluded.source_hash,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                edge_id,
+                parent_key,
+                state_id,
+                priority_id,
+                before,
+                after,
+                source_hash,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM work_item_order_edges WHERE edge_id=?", (edge_id,)
+        ).fetchone()
+        sync_changes.append(("UPDATE", edge_id, dict(row)))
+    return sync_changes
+
+
+def _ensure_work_item_lane_order(
+    conn: Any,
+    item_id: str,
+    *,
+    prefer_top_if_new: bool,
+    now: str,
+    meta: dict[str, str],
+) -> tuple[list[str], list[tuple[str, str, dict[str, Any]]]]:
+    item = _work_item_or_404(conn, item_id)
+    rows = _work_order_group_rows(
+        conn, item["parent_item_id"], item["state_id"], item["priority_id"]
+    )
+    ordered_ids = [row["item_id"] for row in _order_work_priority_group(conn, rows)]
+    if (
+        item_id in ordered_ids
+        and prefer_top_if_new
+        and not _work_item_has_order_relation(
+            conn,
+            item["parent_item_id"],
+            item["state_id"],
+            item["priority_id"],
+            item_id,
+        )
+    ):
+        ordered_ids = [item_id, *[value for value in ordered_ids if value != item_id]]
+    sync_changes = _replace_work_item_order_edges(
+        conn,
+        parent_item_id=item["parent_item_id"],
+        state_id=item["state_id"],
+        priority_id=item["priority_id"],
+        ordered_ids=ordered_ids,
+        now=now,
+        meta=meta,
+    )
+    return ordered_ids, sync_changes
+
+
+def _work_board_payload(
+    conn: Any,
+    parent_item_id: str | None = None,
+    *,
+    show_test_entries: bool | None = None,
+) -> dict[str, Any]:
     parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
     parent = _work_item_or_404(conn, parent_id) if parent_id else None
+    preferences = _work_preferences(conn)
+    if show_test_entries is None:
+        show_test_entries = bool(preferences["show_test_entries"])
+    else:
+        preferences["show_test_entries"] = bool(show_test_entries)
     breadcrumbs = _work_breadcrumbs(conn, parent_id)
     remaining_depth = (
         max(0, WORK_DEPTH_LIMIT - int(parent["depth"])) if parent is not None else WORK_DEPTH_LIMIT
@@ -4439,7 +5254,7 @@ def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[st
             """
             SELECT * FROM work_items
             WHERE parent_item_id=? AND status != 'archived'
-            ORDER BY state_id, sort_order, updated_at DESC, item_id
+            ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
             """,
             (parent_id,),
         ).fetchall()
@@ -4448,12 +5263,17 @@ def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[st
             """
             SELECT * FROM work_items
             WHERE parent_item_id IS NULL AND status != 'archived'
-            ORDER BY state_id, sort_order, updated_at DESC, item_id
+            ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
             """
         ).fetchall()
-    items_by_state: dict[str, list[dict[str, Any]]] = {row["state_id"]: [] for row in states}
+    rows, hidden_test_items = _filter_work_test_rows(rows, bool(show_test_entries))
+    raw_items_by_state: dict[str, list[Any]] = {row["state_id"]: [] for row in states}
     for row in rows:
-        items_by_state.setdefault(row["state_id"], []).append(_row_to_work_item(row))
+        raw_items_by_state.setdefault(row["state_id"], []).append(row)
+    items_by_state = {
+        state_id: [_row_to_work_item(row) for row in _sort_work_items_for_lane(conn, state_rows)]
+        for state_id, state_rows in raw_items_by_state.items()
+    }
     return {
         "ok": True,
         "board": {
@@ -4465,7 +5285,17 @@ def _work_board_payload(conn: Any, parent_item_id: str | None = None) -> dict[st
                 {"state": _row_to_work_state(state), "items": items_by_state[state["state_id"]]}
                 for state in states
             ],
-            "rollup": _work_rollup(conn, parent_id),
+            "rollup": _work_rollup(
+                conn,
+                parent_id,
+                show_test_entries=bool(show_test_entries),
+            ),
+            "preferences": preferences,
+            "hidden_test_items": hidden_test_items,
+            "test_entries": {
+                "show": bool(show_test_entries),
+                "hidden": hidden_test_items,
+            },
         },
     }
 
@@ -4484,9 +5314,7 @@ def _work_item_payload(
     parent_id = _clean_short_text(body.parent_item_id, "", limit=180) or None
     depth = _work_parent_depth(conn, parent_id)
     item_id = _clean_work_id(body.item_id, "work")
-    tags = _clean_event_list(body.tags, limit=32)
-    if "work" not in tags:
-        tags.append("work")
+    tags = _work_item_tags_for_request(body.tags, _work_request_meta(body))
     item_type = _clean_short_text(body.item_type, "work", limit=80)
     body_excerpt = _body_excerpt(body.body or "", limit=4000)
     related_events = _clean_event_list(body.related_event_ids, limit=32)
@@ -4622,12 +5450,55 @@ async def get_work_config() -> dict[str, Any]:
         priorities = conn.execute(
             "SELECT * FROM work_item_priorities ORDER BY sort_order, priority_id"
         ).fetchall()
+        preferences = _work_preferences(conn)
     return {
         "ok": True,
         "depth_limit": WORK_DEPTH_LIMIT,
         "states": [_row_to_work_state(row) for row in states],
         "priorities": [_row_to_work_priority(row) for row in priorities],
+        "preferences": preferences,
     }
+
+
+@router.get("/work/preferences")
+async def get_work_preferences() -> dict[str, Any]:
+    with get_conn() as conn:
+        return {"ok": True, "preferences": _work_preferences(conn)}
+
+
+@router.put("/work/preferences")
+async def update_work_preferences(body: WorkPreferencesUpdateRequest) -> dict[str, Any]:
+    meta = _work_request_meta(body)
+    with get_conn() as conn:
+        preferences = _work_preferences(conn)
+        if body.show_test_entries is not None:
+            preferences["show_test_entries"] = bool(body.show_test_entries)
+            set_setting(
+                conn,
+                WORK_SHOW_TEST_ENTRIES_SETTING,
+                "true" if preferences["show_test_entries"] else "false",
+                "Kanban board proof/test entry visibility",
+            )
+            gen = increment_gen(conn, "work-preferences")
+            row = conn.execute(
+                "SELECT * FROM settings WHERE key=?",
+                (WORK_SHOW_TEST_ENTRIES_SETTING,),
+            ).fetchone()
+            if row is not None:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "settings",
+                    WORK_SHOW_TEST_ENTRIES_SETTING,
+                    dict(row),
+                    gen,
+                )
+        audit = {
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+        }
+        return {"ok": True, "preferences": preferences, "audit": audit}
 
 
 @router.get("/work/board")
@@ -4667,7 +5538,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             (item_id,),
         ).fetchall()
         discussions = conn.execute(
-            "SELECT * FROM work_discussions WHERE item_id=? ORDER BY created_at DESC, discussion_id",
+            "SELECT * FROM work_discussions WHERE item_id=? ORDER BY created_at ASC, discussion_id",
             (item_id,),
         ).fetchall()
         links = conn.execute(
@@ -4690,6 +5561,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         return {
             "ok": True,
             "item": _row_to_work_item(item),
+            "detail_document": _work_item_detail_document(conn, item_id),
             "breadcrumbs": _work_breadcrumbs(conn, item_id),
             "depth_limit": WORK_DEPTH_LIMIT,
             "remaining_depth": max(0, WORK_DEPTH_LIMIT - int(item["depth"])),
@@ -4697,7 +5569,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             "issues": [_row_to_work_issue(row) for row in issues],
             "todos": [_row_to_work_todo(row) for row in todos],
             "blockers": [_row_to_work_blocker(row) for row in blockers],
-            "discussions": [_row_to_work_discussion(row) for row in discussions],
+            "discussions": [_row_to_work_discussion(row, conn) for row in discussions],
             "links": [
                 {
                     "link_id": row["link_id"],
@@ -4767,6 +5639,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             if body.tags is not None
             else _json_value(existing["tags_json"], [])
         )
+        tags = _work_item_tags_for_request(tags, meta)
         related_events = (
             _clean_event_list(body.related_event_ids, limit=32)
             if body.related_event_ids is not None
@@ -4859,6 +5732,25 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             ),
         )
         item_row = _work_item_or_404(conn, item_id)
+        project_document = None
+        if not existing["parent_item_id"] and title != existing["title"]:
+            project_document = _sync_kanban_root_project_title(
+                conn,
+                root_item_id=item_id,
+                old_title=existing["title"],
+                new_title=title,
+                now=now,
+            )
+        order_ids, order_sync_changes = _ensure_work_item_lane_order(
+            conn,
+            item_id,
+            prefer_top_if_new=(
+                item_row["state_id"] != existing["state_id"]
+                or item_row["priority_id"] != existing["priority_id"]
+            ),
+            now=now,
+            meta=meta,
+        )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -4873,15 +5765,346 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             run_id=meta["run_id"],
             result="ok",
             source_hash=payload["source_hash"],
-            metadata={"state_id": item_row["state_id"], "priority_id": item_row["priority_id"]},
+            metadata={
+                "state_id": item_row["state_id"],
+                "priority_id": item_row["priority_id"],
+                "kanban_project_document": project_document,
+                "lane_order": order_ids,
+            },
         )
         gen = increment_gen(conn, "work-item")
         enqueue_for_all_peers(conn, "UPDATE", "work_items", item_id, dict(item_row), gen)
+        for action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
         "audit": {"audit_id": audit_id, "action": "update_work_item", "result": "ok"},
+    }
+
+
+@router.put("/work/items/{item_id}/detail")
+async def update_work_item_detail_document(
+    item_id: str, body: WorkItemDetailDocumentUpdateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_body = _normalise_markdown_document_body(body.body)
+    source_hash = _hash_json_payload({"item_id": item_id, "body": clean_body})
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        document = _write_work_item_detail_document(
+            conn,
+            item_id,
+            clean_body,
+            actor=meta["actor"],
+            now=now,
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_item_detail",
+            target_ref=f"work_items:{item_id}:detail",
+            item_id=item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "file_ref": document["file_ref"],
+                "body_bytes": len(clean_body.encode("utf-8")),
+            },
+        )
+        gen = increment_gen(conn, "work-item-detail")
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "detail_document": document,
+        "audit": {"audit_id": audit_id, "action": "update_work_item_detail", "result": "ok"},
+    }
+
+
+@router.post("/work/items/{item_id}/discussions")
+async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    clean_discussion_id = _clean_work_id(body.discussion_id, "discussion")
+    clean_body = _normalise_markdown_document_body(body.body)
+    body_excerpt = _body_excerpt(clean_body, limit=4000)
+    author = _clean_short_text(body.author or meta["actor"], meta["actor"], limit=120)
+    status = _clean_work_leaf_status(body.status, default="open")
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_discussions",
+            row_id=clean_discussion_id,
+            kind="discussion",
+            title=author,
+            body=body_excerpt,
+            related_refs=[f"work_items:{clean_item_id}"],
+        )
+        provenance = {
+            "discussion": {"item_id": clean_item_id},
+            **meta,
+        }
+        row = {
+            "discussion_id": clean_discussion_id,
+            "item_id": clean_item_id,
+            "author": author,
+            "body_excerpt": body_excerpt,
+            "status": status,
+            "search_text": search_text,
+            "search_metadata_json": json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+            "embedding_ref": "",
+            "embedding_model": "",
+            "embedding_updated_at": None,
+            "vector_index_key": vector_key,
+            "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            "created_at": now,
+            "updated_at": now,
+        }
+        source_hash = _hash_json_payload({**row, "body": clean_body})
+        conn.execute(
+            """
+            INSERT INTO work_discussions (
+                discussion_id, item_id, author, body_excerpt, status, search_text,
+                search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+                vector_index_key, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :discussion_id, :item_id, :author, :body_excerpt, :status, :search_text,
+                :search_metadata_json, :embedding_ref, :embedding_model, :embedding_updated_at,
+                :vector_index_key, :provenance_json, :created_at, :updated_at
+            )
+            """,
+            row,
+        )
+        discussion_row = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        document = _write_work_discussion_document(
+            conn,
+            discussion_row,
+            clean_body,
+            actor=meta["actor"],
+            now=now,
+        )
+        provenance["document"] = {"file_ref": document["file_ref"]}
+        conn.execute(
+            "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
+            (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
+        )
+        discussion_row = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="create_work_discussion",
+            target_ref=f"work_discussions:{clean_discussion_id}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "status": status,
+                "file_ref": document["file_ref"],
+            },
+        )
+        gen = increment_gen(conn, "work-discussion")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "work_discussions", clean_discussion_id, dict(discussion_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        discussion = _row_to_work_discussion(discussion_row, conn)
+    return {
+        "ok": True,
+        "discussion": discussion,
+        "audit": {"audit_id": audit_id, "action": "create_work_discussion", "result": "ok"},
+    }
+
+
+@router.patch("/work/discussions/{discussion_id}")
+async def update_work_discussion(
+    discussion_id: str, body: WorkDiscussionUpdateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "work discussion not found")
+        item = _work_item_or_404(conn, existing["item_id"])
+        existing_document = _work_discussion_document(conn, existing)
+        clean_body = (
+            _normalise_markdown_document_body(body.body)
+            if body.body is not None
+            else existing_document["body"]
+        )
+        author = (
+            _clean_short_text(body.author, existing["author"], limit=120)
+            if body.author is not None
+            else existing["author"]
+        )
+        status = (
+            _clean_work_leaf_status(body.status, default=existing["status"])
+            if body.status is not None
+            else existing["status"]
+        )
+        body_excerpt = _body_excerpt(clean_body, limit=4000)
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="work_discussions",
+            row_id=clean_discussion_id,
+            kind="discussion",
+            title=author,
+            body=body_excerpt,
+            related_refs=[f"work_items:{existing['item_id']}"],
+        )
+        provenance = _json_value(existing["provenance_json"], {})
+        provenance["last_update"] = meta
+        source_hash = _hash_json_payload(
+            {
+                "discussion_id": clean_discussion_id,
+                "item_id": existing["item_id"],
+                "author": author,
+                "status": status,
+                "body": clean_body,
+            }
+        )
+        conn.execute(
+            """
+            UPDATE work_discussions
+            SET author=?, body_excerpt=?, status=?, search_text=?, search_metadata_json=?,
+                vector_index_key=?, provenance_json=?, updated_at=?
+            WHERE discussion_id=?
+            """,
+            (
+                author,
+                body_excerpt,
+                status,
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                clean_discussion_id,
+            ),
+        )
+        discussion_row = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        document = _write_work_discussion_document(
+            conn,
+            discussion_row,
+            clean_body,
+            actor=meta["actor"],
+            now=now,
+        )
+        provenance["document"] = {"file_ref": document["file_ref"]}
+        conn.execute(
+            "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
+            (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
+        )
+        discussion_row = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_discussion",
+            target_ref=f"work_discussions:{clean_discussion_id}",
+            item_id=existing["item_id"],
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "status": status,
+                "file_ref": document["file_ref"],
+            },
+        )
+        gen = increment_gen(conn, "work-discussion")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "work_discussions", clean_discussion_id, dict(discussion_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        discussion = _row_to_work_discussion(discussion_row, conn)
+    return {
+        "ok": True,
+        "discussion": discussion,
+        "audit": {"audit_id": audit_id, "action": "update_work_discussion", "result": "ok"},
+    }
+
+
+@router.delete("/work/discussions/{discussion_id}")
+async def delete_work_discussion(
+    discussion_id: str, body: WorkItemActionRequest | None = None
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body or WorkItemActionRequest())
+    clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "work discussion not found")
+        item = _work_item_or_404(conn, existing["item_id"])
+        document = _work_discussion_document(conn, existing)
+        source_hash = _hash_json_payload({"discussion_id": clean_discussion_id, "deleted": True})
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="delete_work_discussion",
+            target_ref=f"work_discussions:{clean_discussion_id}",
+            item_id=existing["item_id"],
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "file_ref": document["file_ref"],
+            },
+        )
+        conn.execute("DELETE FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,))
+        with suppress(OSError):
+            _kanban_discussion_path(conn, existing["item_id"], clean_discussion_id).unlink()
+        gen = increment_gen(conn, "work-discussion")
+        enqueue_for_all_peers(conn, "DELETE", "work_discussions", clean_discussion_id, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        deleted = _row_to_work_discussion(existing, conn)
+    return {
+        "ok": True,
+        "discussion_id": clean_discussion_id,
+        "deleted_discussion": deleted,
+        "audit": {"audit_id": audit_id, "action": "delete_work_discussion", "result": "ok"},
     }
 
 
@@ -4929,6 +6152,17 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             (item_id,),
         ).fetchall()
         item_row = next(row for row in moved_rows if row["item_id"] == item_id)
+        order_ids, order_sync_changes = _ensure_work_item_lane_order(
+            conn,
+            item_id,
+            prefer_top_if_new=(
+                item_row["parent_item_id"] != existing["parent_item_id"]
+                or item_row["state_id"] != existing["state_id"]
+                or item_row["priority_id"] != existing["priority_id"]
+            ),
+            now=now,
+            meta=meta,
+        )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -4948,16 +6182,93 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
                 "to_parent_item_id": new_parent,
                 "state_id": state["state_id"],
                 "depth": new_depth,
+                "lane_order": order_ids,
             },
         )
         gen = increment_gen(conn, "work-item")
         for row in moved_rows:
             enqueue_for_all_peers(conn, "UPDATE", "work_items", row["item_id"], dict(row), gen)
+        for action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
         "audit": {"audit_id": audit_id, "action": "move_work_item", "result": "ok"},
+    }
+
+
+@router.post("/work/items/{item_id}/order")
+async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    direction = _clean_short_text(body.direction, "", limit=20).lower()
+    if direction not in {"up", "down"}:
+        raise HTTPException(400, "work item order direction must be up or down")
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        rows = _work_order_group_rows(
+            conn,
+            item["parent_item_id"],
+            item["state_id"],
+            item["priority_id"],
+        )
+        ordered_rows = _order_work_priority_group(conn, rows)
+        ordered_ids = [row["item_id"] for row in ordered_rows]
+        if item_id not in ordered_ids:
+            raise HTTPException(404, "work item not found in lane order")
+        index = ordered_ids.index(item_id)
+        target_index = index - 1 if direction == "up" else index + 1
+        changed = 0 <= target_index < len(ordered_ids)
+        if changed:
+            ordered_ids[index], ordered_ids[target_index] = (
+                ordered_ids[target_index],
+                ordered_ids[index],
+            )
+        order_sync_changes = _replace_work_item_order_edges(
+            conn,
+            parent_item_id=item["parent_item_id"],
+            state_id=item["state_id"],
+            priority_id=item["priority_id"],
+            ordered_ids=ordered_ids,
+            now=now,
+            meta=meta,
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="order_work_item",
+            target_ref=f"work_items:{item_id}",
+            item_id=item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=item["source_hash"],
+            metadata={
+                "direction": direction,
+                "changed": changed,
+                "state_id": item["state_id"],
+                "priority_id": item["priority_id"],
+                "lane_order": ordered_ids,
+            },
+        )
+        gen = increment_gen(conn, "work-item-order")
+        for action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        item_row = _work_item_or_404(conn, item_id)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(item_row),
+        "direction": direction,
+        "changed": changed,
+        "lane_order": ordered_ids,
+        "audit": {"audit_id": audit_id, "action": "order_work_item", "result": "ok"},
     }
 
 
@@ -5526,7 +6837,7 @@ def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
             "title": row["title"],
             "body": row["body_excerpt"],
             "related_task_ids": [task_id],
-            "tags": ["work", "task"],
+            "tags": [WORK_KANBAN_TAG, "task"],
         }
     if source_ref.startswith("work_todos:"):
         todo_id = source_ref.split(":", 1)[1]
@@ -5537,7 +6848,7 @@ def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
             "title": row["title"],
             "body": row["body_excerpt"],
             "related_task_ids": [row["related_task_id"]] if row["related_task_id"] else [],
-            "tags": ["work", "todo"],
+            "tags": [WORK_KANBAN_TAG, "todo"],
         }
     if source_ref.startswith("work_issues:"):
         issue_id = source_ref.split(":", 1)[1]
@@ -5548,7 +6859,7 @@ def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
             "title": row["title"],
             "body": row["body_excerpt"],
             "related_issue_ids": [issue_id],
-            "tags": ["work", "issue"],
+            "tags": [WORK_KANBAN_TAG, "issue"],
         }
     raise HTTPException(400, "promotion source ref is invalid")
 
