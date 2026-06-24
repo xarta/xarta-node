@@ -123,6 +123,8 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
 }
 WORK_DEPTH_LIMIT = 12
 WORK_SHOW_TEST_ENTRIES_SETTING = "personal.kanban.show_test_entries"
+# "work" is a legacy DB/API mode id for the recursive Kanban system. Human and
+# agent-facing identifiers should say "kanban" so future job-work tags stay distinct.
 WORK_KANBAN_TAG = "kanban"
 WORK_AGENT_WORKING_OUT_TAG = "agent-working-out"
 WORK_PROOF_TAG = "proof"
@@ -1578,6 +1580,32 @@ async def get_rich_doc_bundle(
                 raise HTTPException(404, "work discussion not found")
             document.update(_work_discussion_document(conn, row))
             document["document_type"] = "discussion"
+        elif clean_domain == "kanban" and clean_type in {"issue", "work-issue", "kanban-issue"}:
+            row = conn.execute("SELECT * FROM work_issues WHERE issue_id=?", (clean_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "work issue not found")
+            document.update(
+                {
+                    "document_type": "issue",
+                    "body": row["body_excerpt"] or "",
+                    "item_id": row["item_id"],
+                    "metadata": _json_value(row["provenance_json"], {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        elif clean_domain == "kanban" and clean_type in {"todo", "work-todo", "kanban-todo"}:
+            row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (clean_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "work todo not found")
+            document.update(
+                {
+                    "document_type": "todo",
+                    "body": row["body_excerpt"] or "",
+                    "item_id": row["item_id"],
+                    "metadata": _json_value(row["provenance_json"], {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
         elif clean_domain == "diary" and clean_type in {"todo", "todo-task", "task"}:
             row = conn.execute(
                 "SELECT * FROM personal_time_tasks WHERE task_id=?", (clean_id,)
@@ -4088,6 +4116,7 @@ async def list_personal_tasks(
             """,
             (*event_params, fetch_limit),
         ).fetchall()
+        work_preferences = _work_preferences(conn)
         work_todo_rows = _work_todo_task_page_rows(
             conn,
             mode=mode,
@@ -4098,7 +4127,12 @@ async def list_personal_tasks(
             related_work_item=related_work_item,
             fetch_limit=fetch_limit,
         )
-        counts = _task_counts(conn)
+        work_todo_rows, hidden_work_todos = _filter_work_todo_test_rows(
+            conn,
+            work_todo_rows,
+            bool(work_preferences["show_test_entries"]),
+        )
+        counts = _task_counts(conn, show_test_entries=bool(work_preferences["show_test_entries"]))
 
     items = [_row_to_task(row) for row in task_rows]
     items.extend(_event_to_task(row) for row in event_rows)
@@ -4130,6 +4164,11 @@ async def list_personal_tasks(
             "sources": source_counts,
             "status": status_counts,
             "total": len(items),
+        },
+        "work_preferences": work_preferences,
+        "test_entries": {
+            "show": bool(work_preferences["show_test_entries"]),
+            "hidden_work_todos": hidden_work_todos,
         },
         "filters": {
             "date_start": date_start,
@@ -4707,7 +4746,7 @@ def _event_task_where(mode: str | None) -> tuple[list[str], list[Any]]:
     return where, params
 
 
-def _task_counts(conn: Any) -> dict[str, int]:
+def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]:
     counts = {"today": 0, "personal": 0, "work": 0, "blocked": 0, "review": 0, "done": 0}
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     today_row = conn.execute(
@@ -4737,12 +4776,17 @@ def _task_counts(conn: Any) -> dict[str, int]:
             counts["blocked"] += count
         if status in {"done", "archived"}:
             counts["done"] += count
-    work_todo_rows = conn.execute(
-        "SELECT status, COUNT(*) AS count FROM work_todos GROUP BY status"
-    ).fetchall()
+    work_todo_rows = conn.execute("SELECT * FROM work_todos").fetchall()
+    work_todo_rows, _hidden = _filter_work_todo_test_rows(
+        conn,
+        work_todo_rows,
+        show_test_entries,
+    )
+    work_todo_counts: dict[str, int] = {}
     for row in work_todo_rows:
         status = row["status"]
-        count = int(row["count"])
+        work_todo_counts[status] = work_todo_counts.get(status, 0) + 1
+    for status, count in work_todo_counts.items():
         if status != "archived":
             counts["work"] += count
         if status == "blocked":
@@ -5590,6 +5634,26 @@ def _filter_work_test_rows(rows: list[Any], show_test_entries: bool) -> tuple[li
         else:
             visible.append(row)
     return visible, hidden
+
+
+def _filter_work_todo_test_rows(
+    conn: Any,
+    rows: list[Any],
+    show_test_entries: bool,
+) -> tuple[list[Any], int]:
+    if show_test_entries or not rows:
+        return list(rows), 0
+    item_ids = sorted({row["item_id"] for row in rows if row["item_id"]})
+    if not item_ids:
+        return list(rows), 0
+    placeholders = ",".join("?" for _ in item_ids)
+    item_rows = conn.execute(
+        f"SELECT * FROM work_items WHERE item_id IN ({placeholders})",
+        item_ids,
+    ).fetchall()
+    hidden_item_ids = {row["item_id"] for row in item_rows if _work_item_is_test_entry(row)}
+    visible = [row for row in rows if row["item_id"] not in hidden_item_ids]
+    return visible, len(rows) - len(visible)
 
 
 def _work_lane_parent_key(parent_item_id: str | None) -> str:
@@ -7047,6 +7111,56 @@ async def list_work_item_todos(
         )
 
 
+@router.get("/work/issues/{issue_id}")
+async def get_work_issue(issue_id: str) -> dict[str, Any]:
+    clean_issue_id = _clean_short_text(issue_id, "", limit=180)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM work_issues WHERE issue_id=?", (clean_issue_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "work issue not found")
+        item = _work_item_or_404(conn, row["item_id"])
+        return {
+            "ok": True,
+            "issue": _row_to_work_issue(row),
+            "item": _row_to_work_item(item),
+            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"]),
+            "rich_document": {
+                "domain": "kanban",
+                "document_type": "issue",
+                "document_id": row["issue_id"],
+                "body": row["body_excerpt"] or "",
+                "item_id": row["item_id"],
+                "updated_at": row["updated_at"],
+            },
+        }
+
+
+@router.get("/work/todos/{todo_id}")
+async def get_work_todo(todo_id: str) -> dict[str, Any]:
+    clean_todo_id = _clean_short_text(todo_id, "", limit=180)
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (clean_todo_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "work todo not found")
+        item = _work_item_or_404(conn, row["item_id"])
+        return {
+            "ok": True,
+            "todo": _row_to_work_todo(row),
+            "item": _row_to_work_item(item),
+            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"]),
+            "rich_document": {
+                "domain": "kanban",
+                "document_type": "todo",
+                "document_id": row["todo_id"],
+                "body": row["body_excerpt"] or "",
+                "item_id": row["item_id"],
+                "updated_at": row["updated_at"],
+            },
+        }
+
+
 def _clean_work_link_type(value: str | None) -> str:
     link_type = _clean_short_text(value, "related", limit=60)
     if link_type not in {
@@ -7273,9 +7387,20 @@ def _upsert_work_issue(
         gen = increment_gen(conn, "work-issue")
         enqueue_for_all_peers(conn, "UPDATE", "work_issues", clean_issue_id, dict(issue_row), gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    issue = _row_to_work_issue(issue_row)
+    image_associations = _associate_rich_doc_images_for_document(
+        domain="kanban",
+        markdown=issue["body_excerpt"],
+        document_type="issue",
+        document_id=issue["issue_id"],
+        item_id=issue["item_id"],
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+    )
     return {
         "ok": True,
-        "issue": _row_to_work_issue(issue_row),
+        "issue": issue,
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": action, "result": "ok"},
     }
 
@@ -7395,9 +7520,20 @@ def _upsert_work_todo(
         gen = increment_gen(conn, "work-todo")
         enqueue_for_all_peers(conn, "UPDATE", "work_todos", clean_todo_id, dict(todo_row), gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    todo = _row_to_work_todo(todo_row)
+    image_associations = _associate_rich_doc_images_for_document(
+        domain="kanban",
+        markdown=todo["body_excerpt"],
+        document_type="todo",
+        document_id=todo["todo_id"],
+        item_id=todo["item_id"],
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+    )
     return {
         "ok": True,
-        "todo": _row_to_work_todo(todo_row),
+        "todo": todo,
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": action, "result": "ok"},
     }
 
