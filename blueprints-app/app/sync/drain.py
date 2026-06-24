@@ -37,6 +37,8 @@ log = logging.getLogger(__name__)
 
 _drain_task: asyncio.Task | None = None
 _last_guid_cleanup: float = 0.0
+_full_backup_skip_until: dict[str, float] = {}
+_FULL_BACKUP_REJECT_COOLDOWN_SECONDS = 600
 
 
 # ── mTLS client factory ──────────────────────────────────────────────────────
@@ -180,17 +182,31 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     log.debug("draining peer %s: %d pending actions", node_id, depth)
 
     if depth >= cfg.SYNC_QUEUE_MAX_DEPTH:
-        log.warning(
-            "queue overflow for peer %s (depth=%d) — sending full backup",
-            node_id,
-            depth,
-        )
-        if await _send_full_backup(node_id, peer_urls):
-            return
-        log.warning(
-            "full backup path not accepted for peer %s — falling back to batched action drain",
-            node_id,
-        )
+        now = time.time()
+        skip_until = _full_backup_skip_until.get(node_id, 0.0)
+        if now < skip_until:
+            log.debug(
+                "queue overflow for peer %s (depth=%d) — full backup skipped for %.0fs",
+                node_id,
+                depth,
+                skip_until - now,
+            )
+        else:
+            log.warning(
+                "queue overflow for peer %s (depth=%d) — sending full backup",
+                node_id,
+                depth,
+            )
+            if await _send_full_backup(node_id, peer_urls):
+                _full_backup_skip_until.pop(node_id, None)
+                return
+            _full_backup_skip_until[node_id] = time.time() + _FULL_BACKUP_REJECT_COOLDOWN_SECONDS
+            log.warning(
+                "full backup path not accepted for peer %s — falling back to batched action "
+                "drain and suppressing full backup retries for %ds",
+                node_id,
+                _FULL_BACKUP_REJECT_COOLDOWN_SECONDS,
+            )
 
     actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
     if not actions:
