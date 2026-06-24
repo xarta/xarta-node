@@ -1663,12 +1663,69 @@ def _clean_active_browser_layout_delta(value: Any) -> float | None:
     return round(max(-100000.0, min(number, 100000.0)), 2)
 
 
+def _clean_active_browser_local_shade(raw: Any) -> dict[str, Any] | None:
+    shade = raw if isinstance(raw, dict) else {}
+    key = _clean_string(shade.get("key"), "", 120)
+    if not key:
+        return None
+    return {
+        "key": key,
+        "css_var": _clean_string(shade.get("css_var"), "", 120),
+        "media": _clean_string(shade.get("media"), "", 240),
+        "visible": bool(shade.get("visible")),
+        "rect": _clean_active_browser_layout_rect(shade.get("rect")),
+        "aria_value_now": _clean_string(shade.get("aria_value_now"), "", 40),
+    }
+
+
+def _clean_active_browser_kanban_lane_column(raw: Any) -> dict[str, Any] | None:
+    column = raw if isinstance(raw, dict) else {}
+    state_id = _clean_string(column.get("state_id"), "", 120)
+    if not state_id:
+        return None
+    return {
+        "state_id": state_id,
+        "width": _clean_viewport_number(column.get("width"), maximum=100000.0, decimals=2),
+        "resized": bool(column.get("resized")),
+    }
+
+
+def _clean_active_browser_kanban_lanes(raw: Any) -> dict[str, Any] | None:
+    lanes = raw if isinstance(raw, dict) else {}
+    if not lanes:
+        return None
+    columns: list[dict[str, Any]] = []
+    for item in lanes.get("columns") if isinstance(lanes.get("columns"), list) else []:
+        column = _clean_active_browser_kanban_lane_column(item)
+        if column:
+            columns.append(column)
+        if len(columns) >= 12:
+            break
+    return {
+        "handle_count": _clean_viewport_int(lanes.get("handle_count"), maximum=1000),
+        "visible_handle_count": _clean_viewport_int(
+            lanes.get("visible_handle_count"),
+            maximum=1000,
+        ),
+        "column_count": _clean_viewport_int(lanes.get("column_count"), maximum=1000),
+        "resized_count": _clean_viewport_int(lanes.get("resized_count"), maximum=1000),
+        "columns": columns,
+    }
+
+
 def _clean_active_browser_layout_report(raw: Any) -> dict[str, Any]:
     layout = raw if isinstance(raw, dict) else {}
     root = layout.get("root") if isinstance(layout.get("root"), dict) else {}
     rects = layout.get("rects") if isinstance(layout.get("rects"), dict) else {}
     shell = layout.get("shell") if isinstance(layout.get("shell"), dict) else {}
     alignment = layout.get("alignment") if isinstance(layout.get("alignment"), dict) else {}
+    local_shades: list[dict[str, Any]] = []
+    for item in layout.get("local_shades") if isinstance(layout.get("local_shades"), list) else []:
+        shade = _clean_active_browser_local_shade(item)
+        if shade:
+            local_shades.append(shade)
+        if len(local_shades) >= 24:
+            break
     return {
         "active_panel_id": _clean_string(layout.get("active_panel_id"), "", 120),
         "root": {
@@ -1716,6 +1773,8 @@ def _clean_active_browser_layout_report(raw: Any) -> dict[str, Any]:
                 alignment.get("panel_right_delta_from_menu")
             ),
         },
+        "local_shades": local_shades,
+        "kanban_lanes": _clean_active_browser_kanban_lanes(layout.get("kanban_lanes")),
     }
 
 

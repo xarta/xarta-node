@@ -45,7 +45,13 @@ for _cidr in cfg.ALLOWED_NETWORKS_RAW.split(","):
         log.warning("middleware_auth: ignoring invalid CIDR %r", _cidr)
 
 # Prefixes that require NO token (IP allowlist still applies)
-_TOKEN_EXEMPT_PREFIXES = ("/health", "/ui", "/favicon.ico", "/api/v1/pwa/manifest")
+_TOKEN_EXEMPT_PREFIXES = (
+    "/health",
+    "/ui",
+    "/favicon.ico",
+    "/api/v1/pwa/manifest",
+    "/api/v1/personal/rich-doc/images/file/",
+)
 # Exact API paths that require NO token (IP allowlist still applies). Keep this
 # intentionally narrow: these are lookup/research surfaces advertised to local
 # AI clients through LiteLLM workspace context.

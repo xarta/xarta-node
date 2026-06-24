@@ -19,8 +19,9 @@ from typing import Annotated, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
+from starlette.responses import FileResponse
 
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
@@ -72,6 +73,9 @@ OPENCLAW_AI_DEVELOPMENT_DOMAINS: tuple[str, ...] = ("marktechpost.com", "venture
 DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
+RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
+RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+RICH_DOC_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 DEFAULT_PERSONAL_GIT_REPOS: tuple[tuple[str, str, str], ...] = (
     ("p300", "/xarta-node", "Public non-root workspace"),
     ("p200", "/root/xarta-node", "Public root workspace"),
@@ -299,6 +303,20 @@ class WorkItemOrderRequest(BaseModel):
 class WorkItemActionRequest(BaseModel):
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class RichDocImageAssociateRequest(BaseModel):
+    domain: str = "diary"
+    markdown: str = ""
+    document_type: str = "document"
+    document_id: str = ""
+    local_date: str = ""
+    item_id: str = ""
+    discussion_id: str = ""
+    actor: str = "blueprints-ui"
+    source_surface: str = "rich-document-editor"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -991,6 +1009,636 @@ def _read_kanban_markdown_document(path: Path) -> tuple[dict[str, Any], str, boo
         return {}, "", False
     metadata, body = _split_kanban_markdown_text(text)
     return metadata, body, True
+
+
+def _rich_doc_image_domain_root(domain: str) -> tuple[str, Path]:
+    clean = _clean_short_text(domain, "diary", limit=40).lower()
+    if clean in {"personal", "diary", "calendar", "todo"}:
+        return "diary", DIARY_ROOT
+    if clean == "kanban":
+        return "kanban", KANBAN_ROOT
+    raise HTTPException(400, "rich document image domain is invalid")
+
+
+def _rich_doc_image_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".gif": "image/gif",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+
+
+def _safe_rich_doc_token(value: str | None, default: str = "document", limit: int = 120) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", str(value or "").strip()).strip("-")
+    clean = re.sub(r"-{2,}", "-", clean)
+    return (clean or default)[:limit]
+
+
+def _safe_rich_doc_image_filename(filename: str | None) -> str:
+    raw = Path(str(filename or "image.png")).name
+    stem = re.sub(r"[^a-zA-Z0-9_.:-]+", "-", Path(raw).stem).strip("-")[:90] or "image"
+    suffix = Path(raw).suffix.lower()
+    if suffix not in RICH_DOC_IMAGE_SUFFIXES:
+        raise HTTPException(400, "uploaded picture type is not supported")
+    return f"{stem}{suffix}"
+
+
+def _unique_rich_doc_path(directory: Path, filename: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    candidate = directory / filename
+    counter = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def _rich_doc_image_uri(domain: str, rel_path: str) -> str:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    clean_path = posixpath.normpath(str(rel_path).replace("\\", "/")).lstrip("/")
+    return f"blueprints://rich-doc-image/{clean_domain}/{clean_path}"
+
+
+def _rich_doc_image_url(domain: str, rel_path: str) -> str:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    clean_path = posixpath.normpath(str(rel_path).replace("\\", "/")).lstrip("/")
+    return f"/api/v1/personal/rich-doc/images/file/{clean_domain}/{clean_path}"
+
+
+def _rich_doc_sidecar_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.json")
+
+
+def _read_rich_doc_image_metadata(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(_rich_doc_sidecar_path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _rich_doc_linked_document(
+    *,
+    document_type: str,
+    document_id: str,
+    local_date: str = "",
+    item_id: str = "",
+    discussion_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "document_type": _safe_rich_doc_token(document_type, "document"),
+        "document_id": _safe_rich_doc_token(document_id, "document", limit=180),
+        "local_date": local_date,
+        "item_id": _safe_rich_doc_token(item_id, "", limit=180) if item_id else "",
+        "discussion_id": _safe_rich_doc_token(discussion_id, "", limit=180)
+        if discussion_id
+        else "",
+    }
+
+
+def _rich_doc_same_link(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return all(
+        str(left.get(key) or "") == str(right.get(key) or "")
+        for key in ("document_type", "document_id", "local_date", "item_id", "discussion_id")
+    )
+
+
+def _rich_doc_referenced_image_refs(markdown: str) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for domain, rel_path in re.findall(
+        r"blueprints://rich-doc-image/([a-zA-Z0-9_-]+)/([^\s)]+)",
+        markdown or "",
+    ):
+        try:
+            clean_domain, _root = _rich_doc_image_domain_root(domain)
+        except HTTPException:
+            continue
+        clean_rel = posixpath.normpath(str(rel_path).replace("\\", "/")).lstrip("/")
+        if clean_rel.startswith("../") or clean_rel == "..":
+            continue
+        key = (clean_domain, clean_rel)
+        if key not in seen:
+            refs.append(key)
+            seen.add(key)
+    return refs
+
+
+def _associate_rich_doc_images_for_document(
+    *,
+    domain: str,
+    markdown: str,
+    document_type: str,
+    document_id: str,
+    local_date: str = "",
+    item_id: str = "",
+    discussion_id: str = "",
+    actor: str = "blueprints-ui",
+    source_surface: str = "rich-document-editor",
+) -> dict[str, Any]:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    doc = _rich_doc_linked_document(
+        document_type=document_type,
+        document_id=document_id,
+        local_date=local_date,
+        item_id=item_id,
+        discussion_id=discussion_id,
+    )
+    associated: list[dict[str, Any]] = []
+    for uri_domain, rel_path in _rich_doc_referenced_image_refs(markdown):
+        if uri_domain != clean_domain:
+            continue
+        _same_domain, root = _rich_doc_image_domain_root(uri_domain)
+        try:
+            path = (root / rel_path).resolve()
+            path.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if (
+            not path.exists()
+            or not path.is_file()
+            or path.suffix.lower() not in RICH_DOC_IMAGE_SUFFIXES
+        ):
+            continue
+        meta = _read_rich_doc_image_metadata(path)
+        links = [link for link in meta.get("linked_documents", []) if isinstance(link, dict)]
+        if any(_rich_doc_same_link(link, doc) for link in links):
+            associated.append(_rich_doc_image_record(uri_domain, path, meta))
+            continue
+        now = _utc_now_iso()
+        if not meta:
+            rel = (
+                _kanban_relative_path(path)
+                if uri_domain == "kanban"
+                else _diary_relative_path(path)
+            )
+            meta = {
+                "schema": RICH_DOC_IMAGE_SCHEMA,
+                "image_id": f"image-{uuid.uuid4().hex[:16]}",
+                "domain": uri_domain,
+                "path": rel,
+                "original_filename": path.name,
+                "content_type": _rich_doc_image_media_type(path),
+                "linked_documents": [],
+                "actor": _clean_short_text(actor, "blueprints-ui"),
+                "source_surface": _clean_short_text(source_surface, "rich-document-editor"),
+                "created_at": now,
+            }
+            links = []
+        links.append(doc)
+        meta["linked_documents"] = links
+        meta["updated_at"] = now
+        _write_rich_doc_image_metadata(path, meta)
+        associated.append(_rich_doc_image_record(uri_domain, path, meta))
+    return {
+        "ok": True,
+        "domain": clean_domain,
+        "document": doc,
+        "images": associated,
+        "count": len(associated),
+    }
+
+
+def _rich_doc_image_record(
+    domain: str, path: Path, metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    clean_domain, root = _rich_doc_image_domain_root(domain)
+    rel_path = (
+        _diary_relative_path(path) if clean_domain == "diary" else _kanban_relative_path(path)
+    )
+    meta = metadata if metadata is not None else _read_rich_doc_image_metadata(path)
+    stat = path.stat()
+    image_id = str(
+        meta.get("image_id") or hashlib.sha256(rel_path.encode("utf-8")).hexdigest()[:24]
+    )
+    return {
+        "image_id": image_id,
+        "domain": clean_domain,
+        "path": rel_path,
+        "filename": path.name,
+        "size_bytes": int(stat.st_size),
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "content_type": meta.get("content_type") or _rich_doc_image_media_type(path),
+        "url": _rich_doc_image_url(clean_domain, rel_path),
+        "uri": _rich_doc_image_uri(clean_domain, rel_path),
+        "markdown": f"![{Path(path.name).stem}]({_rich_doc_image_uri(clean_domain, rel_path)})",
+        "metadata": meta,
+        "linked_documents": meta.get("linked_documents", []),
+    }
+
+
+def _rich_doc_image_sidecar_payload(
+    *,
+    domain: str,
+    path: Path,
+    original_filename: str,
+    content_type: str,
+    document_type: str,
+    document_id: str,
+    local_date: str,
+    item_id: str,
+    discussion_id: str,
+    actor: str,
+    source_surface: str,
+    now: str,
+) -> dict[str, Any]:
+    clean_domain = _rich_doc_image_domain_root(domain)[0]
+    rel_path = (
+        _diary_relative_path(path) if clean_domain == "diary" else _kanban_relative_path(path)
+    )
+    doc = _rich_doc_linked_document(
+        document_type=document_type,
+        document_id=document_id,
+        local_date=local_date,
+        item_id=item_id,
+        discussion_id=discussion_id,
+    )
+    return {
+        "schema": RICH_DOC_IMAGE_SCHEMA,
+        "image_id": f"image-{uuid.uuid4().hex[:16]}",
+        "domain": clean_domain,
+        "path": rel_path,
+        "original_filename": original_filename,
+        "content_type": content_type,
+        "linked_documents": [doc],
+        "actor": _clean_short_text(actor, "blueprints-ui"),
+        "source_surface": _clean_short_text(source_surface, "rich-document-editor"),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _write_rich_doc_image_metadata(path: Path, payload: dict[str, Any]) -> None:
+    _rich_doc_sidecar_path(path).write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _personal_document_image_dir(
+    *,
+    document_type: str,
+    document_id: str,
+    local_date: str,
+) -> Path:
+    clean_type = _safe_rich_doc_token(document_type, "document")
+    clean_id = _safe_rich_doc_token(document_id, "document", limit=180)
+    clean_date = (
+        _validate_local_date(local_date) if local_date else datetime.now().strftime("%Y-%m-%d")
+    )
+    with suppress(Exception):
+        with get_conn() as conn:
+            if clean_type in {"todo", "todo-task", "task"} and clean_id:
+                row = conn.execute(
+                    "SELECT file_refs_json, local_date FROM personal_time_tasks WHERE task_id=?",
+                    (clean_id,),
+                ).fetchone()
+                refs = _json_value(row["file_refs_json"], []) if row else []
+                for ref in refs:
+                    candidate = (DIARY_ROOT / str(ref)).resolve()
+                    if candidate.suffix.lower() == ".md":
+                        candidate.relative_to(DIARY_ROOT.resolve())
+                        return candidate.parent / "images"
+            if clean_type in {"diary", "diary-entry", "calendar", "calendar-event"} and clean_id:
+                row = conn.execute(
+                    "SELECT file_refs_json, local_date FROM personal_events WHERE event_id=?",
+                    (clean_id,),
+                ).fetchone()
+                refs = _json_value(row["file_refs_json"], []) if row else []
+                for ref in refs:
+                    candidate = (DIARY_ROOT / str(ref)).resolve()
+                    if candidate.suffix.lower() in {".md", ".markdown", ".txt"}:
+                        candidate.relative_to(DIARY_ROOT.resolve())
+                        return candidate.parent / "images"
+                if row and row["local_date"]:
+                    clean_date = _validate_local_date(row["local_date"])
+    year, month, day = clean_date.split("-")
+    return DIARY_ROOT / "rich-documents" / clean_type / year / month / day / clean_id / "images"
+
+
+def _kanban_document_image_dir(
+    *,
+    document_type: str,
+    document_id: str,
+    item_id: str,
+    discussion_id: str,
+) -> Path:
+    clean_type = _safe_rich_doc_token(document_type, "document")
+    clean_doc = _safe_rich_doc_token(document_id or discussion_id or item_id, "document", limit=180)
+    return KANBAN_ROOT / "images" / clean_type / clean_doc
+
+
+def _rich_doc_image_upload_dir(
+    *,
+    domain: str,
+    document_type: str,
+    document_id: str,
+    local_date: str,
+    item_id: str,
+    discussion_id: str,
+) -> Path:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    if clean_domain == "kanban":
+        return _kanban_document_image_dir(
+            document_type=document_type,
+            document_id=document_id,
+            item_id=item_id,
+            discussion_id=discussion_id,
+        )
+    return _personal_document_image_dir(
+        document_type=document_type,
+        document_id=document_id,
+        local_date=local_date,
+    )
+
+
+def _rich_doc_image_matches(
+    record: dict[str, Any],
+    *,
+    document_type: str = "",
+    document_id: str = "",
+    item_id: str = "",
+    discussion_id: str = "",
+    q: str = "",
+) -> bool:
+    query = q.strip().lower()
+    if query and query not in record["filename"].lower() and query not in record["path"].lower():
+        return False
+    doc_type = _safe_rich_doc_token(document_type, "", limit=120) if document_type else ""
+    doc_id = _safe_rich_doc_token(document_id, "", limit=180) if document_id else ""
+    clean_item = _safe_rich_doc_token(item_id, "", limit=180) if item_id else ""
+    clean_discussion = _safe_rich_doc_token(discussion_id, "", limit=180) if discussion_id else ""
+    if not any((doc_type, doc_id, clean_item, clean_discussion)):
+        return True
+    for linked in record.get("linked_documents") or []:
+        if not isinstance(linked, dict):
+            continue
+        if doc_type and linked.get("document_type") != doc_type:
+            continue
+        if doc_id and linked.get("document_id") != doc_id:
+            continue
+        if clean_item and linked.get("item_id") != clean_item:
+            continue
+        if clean_discussion and linked.get("discussion_id") != clean_discussion:
+            continue
+        return True
+    return False
+
+
+def _iter_rich_doc_image_records(domain: str) -> list[dict[str, Any]]:
+    clean_domain, root = _rich_doc_image_domain_root(domain)
+    scan_root = root / "images" if clean_domain == "kanban" else root
+    if not scan_root.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in scan_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in RICH_DOC_IMAGE_SUFFIXES:
+            continue
+        with suppress(Exception):
+            records.append(_rich_doc_image_record(clean_domain, path))
+    records.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    return records
+
+
+@router.get("/rich-doc/images")
+async def list_rich_doc_images(
+    domain: str = Query("diary"),
+    document_type: str = Query(""),
+    document_id: str = Query(""),
+    item_id: str = Query(""),
+    discussion_id: str = Query(""),
+    q: str = Query(""),
+    limit: int = Query(120, ge=1, le=500),
+) -> dict[str, Any]:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    if clean_domain == "kanban":
+        records = [
+            record
+            for record in _iter_rich_doc_image_records(clean_domain)
+            if _rich_doc_image_matches(record, q=q)
+        ][:limit]
+        return {
+            "ok": True,
+            "domain": clean_domain,
+            "scope": "central",
+            "images": records,
+            "count": len(records),
+        }
+    records = [
+        record
+        for record in _iter_rich_doc_image_records(clean_domain)
+        if _rich_doc_image_matches(
+            record,
+            document_type=document_type,
+            document_id=document_id,
+            item_id=item_id,
+            discussion_id=discussion_id,
+            q=q,
+        )
+    ][:limit]
+    return {
+        "ok": True,
+        "domain": clean_domain,
+        "images": records,
+        "count": len(records),
+    }
+
+
+@router.post("/rich-doc/images/upload")
+async def upload_rich_doc_image(
+    file: UploadFile = File(...),
+    domain: str = Form("diary"),
+    document_type: str = Form("document"),
+    document_id: str = Form(""),
+    local_date: str = Form(""),
+    item_id: str = Form(""),
+    discussion_id: str = Form(""),
+    actor: str = Form("blueprints-ui"),
+    source_surface: str = Form("rich-document-editor"),
+) -> dict[str, Any]:
+    clean_domain, root = _rich_doc_image_domain_root(domain)
+    safe_name = _safe_rich_doc_image_filename(file.filename)
+    content_type = file.content_type or _rich_doc_image_media_type(Path(safe_name))
+    target_dir = _rich_doc_image_upload_dir(
+        domain=clean_domain,
+        document_type=document_type,
+        document_id=document_id,
+        local_date=local_date,
+        item_id=item_id,
+        discussion_id=discussion_id,
+    )
+    target = _unique_rich_doc_path(target_dir, safe_name)
+    resolved_target = target.resolve()
+    resolved_target.relative_to(root.resolve())
+    data = await file.read(RICH_DOC_IMAGE_MAX_BYTES + 1)
+    if len(data) > RICH_DOC_IMAGE_MAX_BYTES:
+        raise HTTPException(400, "uploaded picture is too large")
+    if not data:
+        raise HTTPException(400, "uploaded picture is empty")
+    target.write_bytes(data)
+    now = _utc_now_iso()
+    metadata = _rich_doc_image_sidecar_payload(
+        domain=clean_domain,
+        path=target,
+        original_filename=file.filename or safe_name,
+        content_type=content_type,
+        document_type=document_type,
+        document_id=document_id,
+        local_date=local_date,
+        item_id=item_id,
+        discussion_id=discussion_id,
+        actor=actor,
+        source_surface=source_surface,
+        now=now,
+    )
+    _write_rich_doc_image_metadata(target, metadata)
+    record = _rich_doc_image_record(clean_domain, target, metadata)
+    return {"ok": True, "image": record}
+
+
+@router.post("/rich-doc/images/associate")
+async def associate_rich_doc_images(body: RichDocImageAssociateRequest) -> dict[str, Any]:
+    return _associate_rich_doc_images_for_document(
+        domain=body.domain,
+        markdown=body.markdown,
+        document_type=body.document_type,
+        document_id=body.document_id,
+        local_date=body.local_date,
+        item_id=body.item_id,
+        discussion_id=body.discussion_id,
+        actor=body.actor,
+        source_surface=body.source_surface,
+    )
+
+
+@router.get("/rich-doc/images/file/{domain}/{rel_path:path}")
+async def serve_rich_doc_image(domain: str, rel_path: str) -> FileResponse:
+    clean_domain, root = _rich_doc_image_domain_root(domain)
+    clean_rel = posixpath.normpath(str(rel_path).replace("\\", "/")).lstrip("/")
+    if clean_rel.startswith("../") or clean_rel == "..":
+        raise HTTPException(400, "image path is invalid")
+    path = (root / clean_rel).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise HTTPException(400, "image path is outside document root") from exc
+    if (
+        not path.exists()
+        or not path.is_file()
+        or path.suffix.lower() not in RICH_DOC_IMAGE_SUFFIXES
+    ):
+        raise HTTPException(404, "image not found")
+    return FileResponse(str(path), media_type=_rich_doc_image_media_type(path))
+
+
+@router.get("/rich-doc/documents/{domain}/{document_type}/{document_id}/bundle")
+async def get_rich_doc_bundle(
+    domain: str,
+    document_type: str,
+    document_id: str,
+) -> dict[str, Any]:
+    clean_domain, _root = _rich_doc_image_domain_root(domain)
+    clean_type = _safe_rich_doc_token(document_type, "document")
+    clean_id = _safe_rich_doc_token(document_id, "document", limit=180)
+    document: dict[str, Any] = {
+        "domain": clean_domain,
+        "document_type": clean_type,
+        "document_id": clean_id,
+        "body": "",
+        "file_ref": {},
+        "metadata": {},
+    }
+    with get_conn() as conn:
+        if clean_domain == "kanban" and clean_type in {"body", "item-body", "work-item"}:
+            row = _work_item_or_404(conn, clean_id)
+            document.update(
+                {
+                    "document_type": "item-body",
+                    "body": row["body_excerpt"] or "",
+                    "metadata": _json_value(row["provenance_json"], {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        elif clean_domain == "kanban" and clean_type in {"detail", "item-detail", "kanban-detail"}:
+            document.update(_work_item_detail_document(conn, clean_id))
+            document["document_type"] = "item-detail"
+        elif clean_domain == "kanban" and clean_type in {"discussion", "kanban-discussion"}:
+            row = conn.execute(
+                "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "work discussion not found")
+            document.update(_work_discussion_document(conn, row))
+            document["document_type"] = "discussion"
+        elif clean_domain == "diary" and clean_type in {"todo", "todo-task", "task"}:
+            row = conn.execute(
+                "SELECT * FROM personal_time_tasks WHERE task_id=?", (clean_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "task not found")
+            document.update(
+                {
+                    "document_type": "todo-task",
+                    "body": row["body_excerpt"] or "",
+                    "file_refs": _json_value(row["file_refs_json"], []),
+                    "metadata": _json_value(row["provenance_json"], {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        elif clean_domain == "diary":
+            row = conn.execute(
+                "SELECT * FROM personal_events WHERE event_id=?", (clean_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "personal event not found")
+            document.update(
+                {
+                    "document_type": clean_type,
+                    "body": row["content_projection"] or row["body_excerpt"] or "",
+                    "file_refs": _json_value(row["file_refs_json"], []),
+                    "metadata": _json_value(row["provenance_json"], {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
+    records = [
+        record
+        for record in _iter_rich_doc_image_records(clean_domain)
+        if _rich_doc_image_matches(
+            record,
+            document_type=document["document_type"],
+            document_id=clean_id,
+        )
+    ]
+    referenced_uris = set(
+        re.findall(
+            r"blueprints://rich-doc-image/([a-zA-Z0-9_-]+)/([^\s)]+)", document.get("body") or ""
+        )
+    )
+    if referenced_uris:
+        seen = {record["uri"] for record in records}
+        for uri_domain, uri_path in referenced_uris:
+            try:
+                record_path = (_rich_doc_image_domain_root(uri_domain)[1] / uri_path).resolve()
+                record = _rich_doc_image_record(uri_domain, record_path)
+            except Exception:
+                continue
+            if record["uri"] not in seen:
+                records.append(record)
+                seen.add(record["uri"])
+    return {
+        "ok": True,
+        "document": document,
+        "images": records,
+        "count": len(records),
+    }
 
 
 def _load_xarta_diary_module() -> Any:
@@ -5618,9 +6266,19 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
         gen = increment_gen(conn, "work-item")
         enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    image_associations = _associate_rich_doc_images_for_document(
+        domain="kanban",
+        markdown=payload["body_excerpt"],
+        document_type="item-body",
+        document_id=payload["item_id"],
+        item_id=payload["item_id"],
+        actor=body.actor,
+        source_surface=body.source_surface,
+    )
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "create_work_item", "result": "ok"},
     }
 
@@ -5777,9 +6435,23 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         for action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+    image_associations = (
+        _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=payload["body_excerpt"],
+            document_type="item-body",
+            document_id=item_id,
+            item_id=item_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
+        if body.body is not None
+        else {"ok": True, "domain": "kanban", "document": {}, "images": [], "count": 0}
+    )
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "update_work_item", "result": "ok"},
     }
 
@@ -5802,6 +6474,15 @@ async def update_work_item_detail_document(
             actor=meta["actor"],
             now=now,
         )
+        image_associations = _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=clean_body,
+            document_type="item-detail",
+            document_id=item_id,
+            item_id=item_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -5819,6 +6500,7 @@ async def update_work_item_detail_document(
             metadata={
                 "file_ref": document["file_ref"],
                 "body_bytes": len(clean_body.encode("utf-8")),
+                "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
         gen = increment_gen(conn, "work-item-detail")
@@ -5827,6 +6509,7 @@ async def update_work_item_detail_document(
         "ok": True,
         "item_id": item_id,
         "detail_document": document,
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "update_work_item_detail", "result": "ok"},
     }
 
@@ -5898,6 +6581,16 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             actor=meta["actor"],
             now=now,
         )
+        image_associations = _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=clean_body,
+            document_type="discussion",
+            document_id=clean_discussion_id,
+            item_id=clean_item_id,
+            discussion_id=clean_discussion_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
         provenance["document"] = {"file_ref": document["file_ref"]}
         conn.execute(
             "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
@@ -5923,6 +6616,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             metadata={
                 "status": status,
                 "file_ref": document["file_ref"],
+                "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
         gen = increment_gen(conn, "work-discussion")
@@ -5934,6 +6628,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
     return {
         "ok": True,
         "discussion": discussion,
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "create_work_discussion", "result": "ok"},
     }
 
@@ -6018,6 +6713,16 @@ async def update_work_discussion(
             actor=meta["actor"],
             now=now,
         )
+        image_associations = _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=clean_body,
+            document_type="discussion",
+            document_id=clean_discussion_id,
+            item_id=existing["item_id"],
+            discussion_id=clean_discussion_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
         provenance["document"] = {"file_ref": document["file_ref"]}
         conn.execute(
             "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
@@ -6043,6 +6748,7 @@ async def update_work_discussion(
             metadata={
                 "status": status,
                 "file_ref": document["file_ref"],
+                "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
         gen = increment_gen(conn, "work-discussion")
@@ -6054,6 +6760,7 @@ async def update_work_discussion(
     return {
         "ok": True,
         "discussion": discussion,
+        "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "update_work_discussion", "result": "ok"},
     }
 
