@@ -2601,6 +2601,9 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         routes_personal.get_work_item_rollup("work-root")
     )["rollup"]
     assert root_rollup_with_todo_filter_tag["todos"]["open"] == 1
+    assert root_rollup_with_todo_filter_tag["items"]["leaf_metrics"]["active"] == 2
+    assert root_rollup_with_todo_filter_tag["items"]["leaf_metrics"]["active_doing"] == 1
+    assert root_rollup_with_todo_filter_tag["issues"]["leaf_metrics"]["done"] == 1
 
     scoped_todo = asyncio.run(
         routes_personal.create_work_todo(
@@ -2845,6 +2848,27 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert detail_doc["file_ref"]["path"] == "step-16-root-board-item/items/work-root/detail.md"
     assert (tmp_path / "kanban" / detail_doc["file_ref"]["path"]).exists()
 
+    review_body = "## Review\n\nNegative learning stays available for future agents."
+    review_doc = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-root",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=review_body,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-doc-update",
+            ),
+        )
+    )["review_document"]
+    assert review_doc["body"] == review_body
+    assert review_doc["file_ref"]["path"] == "step-16-root-board-item/items/work-root/review.md"
+    assert (tmp_path / "kanban" / review_doc["file_ref"]["path"]).exists()
+    review_bundle = asyncio.run(
+        routes_personal.get_rich_doc_bundle("kanban", "item-review", "work-root")
+    )
+    assert review_bundle["document"]["document_type"] == "item-review"
+    assert review_bundle["document"]["body"] == review_body
+
     discussion_body = "First discussion line\n\n- markdown survives"
     discussion = asyncio.run(
         routes_personal.create_work_discussion(
@@ -2915,6 +2939,10 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert detail["detail_document"]["file_ref"]["path"] == (
         "step-16-root-board-renamed/items/work-root/detail.md"
     )
+    assert detail["review_document"]["body"] == review_body
+    assert detail["review_document"]["file_ref"]["path"] == (
+        "step-16-root-board-renamed/items/work-root/review.md"
+    )
     assert {issue["issue_id"] for issue in detail["issues"]} == {"issue-step16"}
     assert {todo["todo_id"] for todo in detail["todos"]} == {"todo-step16"}
     assert detail["todos"][0]["item_card"]["item_type"] == "item"
@@ -2925,6 +2953,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert detail["counts"]["links"] == 1
     assert detail["counts"]["blockers"] == 1
     assert detail["counts"]["discussions"] == 1
+    assert detail["counts"]["review"] == 1
 
     deleted_discussion = asyncio.run(
         routes_personal.delete_work_discussion(
@@ -2957,6 +2986,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "create_work_item_link",
         "create_work_blocker",
         "update_work_item_detail",
+        "update_work_item_review",
         "create_work_discussion",
         "update_work_discussion",
         "delete_work_discussion",

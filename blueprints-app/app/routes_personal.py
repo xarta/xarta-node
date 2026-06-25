@@ -72,6 +72,7 @@ OPENCLAW_AUDIT_PATTERNS: tuple[tuple[str, str, str], ...] = (
 OPENCLAW_AI_DEVELOPMENT_DOMAINS: tuple[str, ...] = ("marktechpost.com", "venturebeat.com")
 DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
+KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -1822,6 +1823,9 @@ async def get_rich_doc_bundle(
         elif clean_domain == "kanban" and clean_type in {"detail", "item-detail", "kanban-detail"}:
             document.update(_work_item_detail_document(conn, clean_id))
             document["document_type"] = "item-detail"
+        elif clean_domain == "kanban" and clean_type in {"review", "item-review", "kanban-review"}:
+            document.update(_work_item_review_document(conn, clean_id))
+            document["document_type"] = "item-review"
         elif clean_domain == "kanban" and clean_type in {"discussion", "kanban-discussion"}:
             row = conn.execute(
                 "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_id,)
@@ -5359,6 +5363,10 @@ def _kanban_item_detail_path(conn: Any, item_id: str, *, ensure_project: bool = 
     return _kanban_item_dir(conn, item_id, ensure_project=ensure_project) / "detail.md"
 
 
+def _kanban_item_review_path(conn: Any, item_id: str, *, ensure_project: bool = False) -> Path:
+    return _kanban_item_dir(conn, item_id, ensure_project=ensure_project) / "review.md"
+
+
 def _kanban_discussion_path(
     conn: Any, item_id: str, discussion_id: str, *, ensure_project: bool = False
 ) -> Path:
@@ -5392,16 +5400,37 @@ def _work_item_detail_document(conn: Any, item_id: str) -> dict[str, Any]:
     }
 
 
-def _write_work_item_detail_document(
+def _work_item_review_document(conn: Any, item_id: str) -> dict[str, Any]:
+    item = _work_item_or_404(conn, item_id)
+    path = _kanban_item_review_path(conn, item_id)
+    metadata, body, exists = _read_kanban_markdown_document(path)
+    return {
+        "schema": metadata.get("schema") or KANBAN_ITEM_REVIEW_SCHEMA,
+        "item_id": item_id,
+        "body": body,
+        "exists": exists,
+        "file_ref": _kanban_document_ref(path),
+        "metadata": metadata,
+        "updated_at": metadata.get("updated_at") or item["updated_at"],
+    }
+
+
+def _write_work_item_markdown_document(
     conn: Any,
     item_id: str,
     body: str,
     *,
+    document_kind: str,
     actor: str,
     now: str,
 ) -> dict[str, Any]:
     item = _work_item_or_404(conn, item_id)
-    path = _kanban_item_detail_path(conn, item_id, ensure_project=True)
+    if document_kind == "review":
+        path = _kanban_item_review_path(conn, item_id, ensure_project=True)
+        schema = KANBAN_ITEM_REVIEW_SCHEMA
+    else:
+        path = _kanban_item_detail_path(conn, item_id, ensure_project=True)
+        schema = KANBAN_ITEM_DETAIL_SCHEMA
     path.parent.mkdir(parents=True, exist_ok=True)
     clean_body = _normalise_markdown_document_body(body)
     metadata = {
@@ -5412,10 +5441,48 @@ def _write_work_item_detail_document(
         "updated_at": now,
     }
     path.write_text(
-        _kanban_markdown_text(KANBAN_ITEM_DETAIL_SCHEMA, metadata, clean_body),
+        _kanban_markdown_text(schema, metadata, clean_body),
         encoding="utf-8",
     )
+    if document_kind == "review":
+        return _work_item_review_document(conn, item_id)
     return _work_item_detail_document(conn, item_id)
+
+
+def _write_work_item_detail_document(
+    conn: Any,
+    item_id: str,
+    body: str,
+    *,
+    actor: str,
+    now: str,
+) -> dict[str, Any]:
+    return _write_work_item_markdown_document(
+        conn,
+        item_id,
+        body,
+        document_kind="detail",
+        actor=actor,
+        now=now,
+    )
+
+
+def _write_work_item_review_document(
+    conn: Any,
+    item_id: str,
+    body: str,
+    *,
+    actor: str,
+    now: str,
+) -> dict[str, Any]:
+    return _write_work_item_markdown_document(
+        conn,
+        item_id,
+        body,
+        document_kind="review",
+        actor=actor,
+        now=now,
+    )
 
 
 def _work_discussion_document(conn: Any, row: Any) -> dict[str, Any]:
@@ -5818,6 +5885,65 @@ def _work_breadcrumbs(conn: Any, item_id: str | None) -> list[dict[str, Any]]:
     return [_row_to_work_item(row) for row in reversed(rows)]
 
 
+def _work_leaf_metrics(rows: list[Any]) -> dict[str, Any]:
+    by_state: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    active = 0
+    active_doing = 0
+    blocked = 0
+    done = 0
+    for row in rows:
+        state_id = str(row["state_id"] or "")
+        status = str(row["status"] or "")
+        by_state[state_id] = by_state.get(state_id, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        if state_id in {"backlog", "todo", "doing"}:
+            active += 1
+        if state_id == "doing":
+            active_doing += 1
+        if state_id == "blocked" or status == "blocked":
+            blocked += 1
+        if state_id == "done" or status in {"done", "closed", "promoted"}:
+            done += 1
+    return {
+        "total": len(rows),
+        "active": active,
+        "active_doing": active_doing,
+        "blocked": blocked,
+        "done": done,
+        "by_state": by_state,
+        "by_status": by_status,
+    }
+
+
+def _work_rollup_leaf_metrics(
+    conn: Any,
+    descendant_item_ids: list[str],
+    *,
+    issue_cards: bool,
+) -> dict[str, Any]:
+    if not descendant_item_ids:
+        return _work_leaf_metrics([])
+    descendant_placeholders = ",".join("?" for _ in descendant_item_ids)
+    issue_predicate = "w.item_type='issue'" if issue_cards else "w.item_type!='issue'"
+    rows = conn.execute(
+        f"""
+        SELECT w.*
+        FROM kanban_items w
+        WHERE w.item_id IN ({descendant_placeholders})
+          AND w.status != 'archived'
+          AND {issue_predicate}
+          AND NOT EXISTS (
+              SELECT 1 FROM kanban_items child
+              WHERE child.parent_item_id=w.item_id
+                AND child.status != 'archived'
+          )
+        """,
+        descendant_item_ids,
+    ).fetchall()
+    return _work_leaf_metrics(rows)
+
+
 def _work_rollup(
     conn: Any,
     item_id: str | None = None,
@@ -5827,8 +5953,16 @@ def _work_rollup(
     item_ids = _work_scope_item_ids(conn, item_id, show_test_entries=show_test_entries)
     if not item_ids:
         return {
-            "items": {"total": 0, "by_state": {}, "by_status": {}},
-            "issues": {"open": 0},
+            "items": {
+                "total": 0,
+                "by_state": {},
+                "by_status": {},
+                "leaf_metrics": _work_leaf_metrics([]),
+            },
+            "issues": {
+                "open": 0,
+                "leaf_metrics": _work_leaf_metrics([]),
+            },
             "todos": {"open": 0},
             "blockers": {"open": 0},
             "depth_limit": KANBAN_DEPTH_LIMIT,
@@ -5873,6 +6007,16 @@ def _work_rollup(
     else:
         issue_open = {"count": 0}
         todo_open = {"count": 0}
+    item_leaf_metrics = _work_rollup_leaf_metrics(
+        conn,
+        descendant_item_ids,
+        issue_cards=False,
+    )
+    issue_leaf_metrics = _work_rollup_leaf_metrics(
+        conn,
+        descendant_item_ids,
+        issue_cards=True,
+    )
     blocker_open = conn.execute(
         f"SELECT COUNT(*) AS count FROM kanban_blockers WHERE item_id IN ({placeholders}) "
         "AND status NOT IN ('resolved', 'archived')",
@@ -5883,8 +6027,12 @@ def _work_rollup(
             "total": len(item_ids),
             "by_state": {row["state_id"]: row["count"] for row in state_rows},
             "by_status": {row["status"]: row["count"] for row in status_rows},
+            "leaf_metrics": item_leaf_metrics,
         },
-        "issues": {"open": int(issue_open["count"] if issue_open else 0)},
+        "issues": {
+            "open": int(issue_open["count"] if issue_open else 0),
+            "leaf_metrics": issue_leaf_metrics,
+        },
         "todos": {"open": int(todo_open["count"] if todo_open else 0)},
         "blockers": {"open": int(blocker_open["count"] if blocker_open else 0)},
         "depth_limit": KANBAN_DEPTH_LIMIT,
@@ -6863,10 +7011,13 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             """,
             (item_id,),
         ).fetchall()
+        detail_document = _work_item_detail_document(conn, item_id)
+        review_document = _work_item_review_document(conn, item_id)
         return {
             "ok": True,
             "item": _row_to_work_item(item),
-            "detail_document": _work_item_detail_document(conn, item_id),
+            "detail_document": detail_document,
+            "review_document": review_document,
             "breadcrumbs": _work_breadcrumbs(conn, item_id),
             "depth_limit": KANBAN_DEPTH_LIMIT,
             "remaining_depth": max(0, KANBAN_DEPTH_LIMIT - int(item["depth"])),
@@ -6909,6 +7060,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 "commits": len(commits),
                 "audit": len(audit),
                 "discussions": len(discussions),
+                "review": 1 if (review_document.get("body") or "").strip() else 0,
             },
         }
 
@@ -7179,6 +7331,64 @@ async def update_work_item_detail_document(
         "detail_document": document,
         "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "update_work_item_detail", "result": "ok"},
+    }
+
+
+@router.put("/kanban/items/{item_id}/review")
+async def update_work_item_review_document(
+    item_id: str, body: WorkItemDetailDocumentUpdateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_body = _normalise_markdown_document_body(body.body)
+    source_hash = _hash_json_payload({"item_id": item_id, "body": clean_body})
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        document = _write_work_item_review_document(
+            conn,
+            item_id,
+            clean_body,
+            actor=meta["actor"],
+            now=now,
+        )
+        image_associations = _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=clean_body,
+            document_type="item-review",
+            document_id=item_id,
+            item_id=item_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_item_review",
+            target_ref=f"kanban_items:{item_id}:review",
+            item_id=item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "file_ref": document["file_ref"],
+                "body_bytes": len(clean_body.encode("utf-8")),
+                "rich_doc_image_count": len(image_associations.get("images", [])),
+            },
+        )
+        gen = increment_gen(conn, "kanban-item-review")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "review_document": document,
+        "image_associations": image_associations,
+        "audit": {"audit_id": audit_id, "action": "update_work_item_review", "result": "ok"},
     }
 
 
