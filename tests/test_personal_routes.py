@@ -2234,12 +2234,23 @@ def test_personal_graph_sync_default_request_id_is_stable(monkeypatch):
             routes_personal.PersonalGraphSyncRequest(actor="codex-test")
         )
     )
+    metadata_only_sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(
+                actor="codex-other",
+                source_surface="pytest",
+                request_id="different-proof-request",
+            )
+        )
+    )
 
     assert first_sync["ok"] is True
     assert first_sync["candidate_count"] >= 2
     assert first_sync["links"]["inserted"] == first_sync["candidate_count"]
     assert second_sync["links"]["unchanged"] == first_sync["candidate_count"]
     assert second_sync["links"]["updated"] == 0
+    assert metadata_only_sync["links"]["unchanged"] == first_sync["candidate_count"]
+    assert metadata_only_sync["links"]["updated"] == 0
 
     listed = asyncio.run(
         routes_personal.list_personal_graph_links(
