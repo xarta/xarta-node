@@ -4325,10 +4325,32 @@ async def list_personal_tasks(
             event_where, event_params, "related_import_batches_json", import_batch
         )
 
-    task_clause = f"WHERE {' AND '.join(task_where)}" if task_where else ""
-    event_clause = f"WHERE {' AND '.join(event_where)}" if event_where else ""
     fetch_limit = max(limit + offset, 200)
     with get_conn() as conn:
+        kanban_preferences = _kanban_preferences(conn)
+        show_test_entries = bool(kanban_preferences["show_test_entries"])
+        hidden_personal_tasks = 0
+        hidden_personal_events = 0
+        if not show_test_entries:
+            hidden_personal_tasks = _count_agent_working_out_rows(
+                conn,
+                "personal_time_tasks",
+                task_where,
+                task_params,
+            )
+            hidden_personal_events = _count_agent_working_out_rows(
+                conn,
+                "personal_events",
+                event_where,
+                event_params,
+                exclude_task_projection=True,
+            )
+            task_where.append(_agent_working_out_hidden_sql("tags_json"))
+            task_params.append(KANBAN_AGENT_WORKING_OUT_TAG)
+            event_where.append(_agent_working_out_hidden_sql("tags_json"))
+            event_params.append(KANBAN_AGENT_WORKING_OUT_TAG)
+        task_clause = f"WHERE {' AND '.join(task_where)}" if task_where else ""
+        event_clause = f"WHERE {' AND '.join(event_where)}" if event_where else ""
         task_rows = conn.execute(
             f"""
             SELECT * FROM personal_time_tasks
@@ -4347,7 +4369,6 @@ async def list_personal_tasks(
             """,
             (*event_params, fetch_limit),
         ).fetchall()
-        kanban_preferences = _kanban_preferences(conn)
         kanban_todo_rows = _kanban_todo_task_page_rows(
             conn,
             mode=mode,
@@ -4361,9 +4382,9 @@ async def list_personal_tasks(
         kanban_todo_rows, hidden_kanban_todos = _filter_kanban_todo_test_rows(
             conn,
             kanban_todo_rows,
-            bool(kanban_preferences["show_test_entries"]),
+            show_test_entries,
         )
-        counts = _task_counts(conn, show_test_entries=bool(kanban_preferences["show_test_entries"]))
+        counts = _task_counts(conn, show_test_entries=show_test_entries)
 
     items = [_row_to_task(row) for row in task_rows]
     items.extend(_event_to_task(row) for row in event_rows)
@@ -4398,8 +4419,10 @@ async def list_personal_tasks(
         },
         "kanban_preferences": kanban_preferences,
         "test_entries": {
-            "show": bool(kanban_preferences["show_test_entries"]),
+            "show": show_test_entries,
             "hidden_kanban_todos": hidden_kanban_todos,
+            "hidden_personal_tasks": hidden_personal_tasks,
+            "hidden_personal_events": hidden_personal_events,
         },
         "filters": {
             "date_start": date_start,
@@ -4978,22 +5001,30 @@ def _event_task_where(mode: str | None) -> tuple[list[str], list[Any]]:
 def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]:
     counts = {"today": 0, "personal": 0, "kanban": 0, "blocked": 0, "review": 0, "done": 0}
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    tag_filter = ""
+    tag_params: tuple[str, ...] = ()
+    if not show_test_entries:
+        tag_filter = f" AND {_agent_working_out_hidden_sql('tags_json')}"
+        tag_params = (KANBAN_AGENT_WORKING_OUT_TAG,)
     today_row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS count FROM personal_time_tasks
         WHERE local_date=? AND status IN ('open', 'blocked', 'pending_review')
           AND privacy_level != 'pin'
+          {tag_filter}
         """,
-        (today,),
+        (today, *tag_params),
     ).fetchone()
     counts["today"] = int(today_row["count"] if today_row else 0)
     rows = conn.execute(
-        """
+        f"""
         SELECT status, mode, COUNT(*) AS count
         FROM personal_time_tasks
         WHERE privacy_level != 'pin'
+        {tag_filter}
         GROUP BY status, mode
-        """
+        """,
+        tag_params,
     ).fetchall()
     for row in rows:
         status = row["status"]
@@ -6070,6 +6101,36 @@ def _kanban_preferences(conn: Any) -> dict[str, Any]:
             default=True,
         )
     }
+
+
+def _agent_working_out_hidden_sql(tags_column: str) -> str:
+    return f"NOT EXISTS (SELECT 1 FROM json_each({tags_column}) WHERE lower(value) = ?)"
+
+
+def _agent_working_out_only_sql(tags_column: str) -> str:
+    return f"EXISTS (SELECT 1 FROM json_each({tags_column}) WHERE lower(value) = ?)"
+
+
+def _count_agent_working_out_rows(
+    conn: Any,
+    table_name: str,
+    where: list[str],
+    params: list[Any],
+    *,
+    exclude_task_projection: bool = False,
+) -> int:
+    if table_name not in {"personal_time_tasks", "personal_events"}:
+        return 0
+    count_where = [*where, _agent_working_out_only_sql("tags_json")]
+    count_params = [*params, KANBAN_AGENT_WORKING_OUT_TAG]
+    if exclude_task_projection:
+        count_where.append("source_type != 'manual-task'")
+    clause = f"WHERE {' AND '.join(count_where)}" if count_where else ""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS count FROM {table_name} {clause}",
+        count_params,
+    ).fetchone()
+    return int(row["count"] if row else 0)
 
 
 def _work_item_is_test_entry(row: Any) -> bool:

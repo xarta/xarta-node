@@ -3426,6 +3426,40 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     assert "agent-working-out" in agent_todo_filter_tags
     assert "todo" in user_todo_filter_tags
     assert "todo" in agent_todo_filter_tags
+    asyncio.run(
+        routes_personal.create_personal_task(
+            routes_personal.PersonalTaskUpsertRequest(
+                task_id="task-kanban-proof-visible",
+                title="User visible legacy Kanban proof task",
+                body="Normal manual Kanban-linked task survives the test-entry filter.",
+                mode="kanban",
+                status="archived",
+                due_date="2026-06-18",
+                tags=["proof"],
+                related_kanban_items=["STEP15-PW-visible"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-kanban-proof-visible-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_personal_task(
+            routes_personal.PersonalTaskUpsertRequest(
+                task_id="task-kanban-proof-agent",
+                title="Agent working-out legacy Kanban proof task",
+                body="Older manual ToDo proof rows should be hideable by persisted tag.",
+                mode="kanban",
+                status="archived",
+                due_date="2026-06-18",
+                tags=["proof", routes_personal.KANBAN_AGENT_WORKING_OUT_TAG],
+                related_kanban_items=["STEP15-PW-agent"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="task-kanban-proof-agent-create",
+            )
+        )
+    )
     default_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=50))
     default_refs = {
         item["source"]["ref"]
@@ -3433,6 +3467,15 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
         if item["source"]["type"] == "kanban-todo"
     }
     assert default_refs == {"kanban_items:todo-user-visible", "kanban_items:todo-agent-hidden"}
+    default_manual_refs = {
+        item["source"]["ref"]
+        for item in default_tasks["items"]
+        if item["source"]["type"] == "manual-task"
+    }
+    assert default_manual_refs == {
+        "personal_time_tasks:task-kanban-proof-visible",
+        "personal_time_tasks:task-kanban-proof-agent",
+    }
     assert default_tasks["kanban_preferences"]["show_test_entries"] is True
 
     hidden_pref = asyncio.run(
@@ -3472,8 +3515,15 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
         if item["source"]["type"] == "kanban-todo"
     }
     assert hidden_refs == {"kanban_items:todo-user-visible"}
+    hidden_manual_refs = {
+        item["source"]["ref"]
+        for item in hidden_tasks["items"]
+        if item["source"]["type"] == "manual-task"
+    }
+    assert hidden_manual_refs == {"personal_time_tasks:task-kanban-proof-visible"}
     assert hidden_tasks["kanban_preferences"]["show_test_entries"] is False
     assert hidden_tasks["test_entries"]["hidden_kanban_todos"] == 1
+    assert hidden_tasks["test_entries"]["hidden_personal_tasks"] == 1
 
     shown_pref = asyncio.run(
         routes_personal.update_kanban_preferences(
@@ -3503,6 +3553,15 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
         if item["source"]["type"] == "kanban-todo"
     }
     assert shown_refs == {"kanban_items:todo-user-visible", "kanban_items:todo-agent-hidden"}
+    shown_manual_refs = {
+        item["source"]["ref"]
+        for item in shown_tasks["items"]
+        if item["source"]["type"] == "manual-task"
+    }
+    assert shown_manual_refs == {
+        "personal_time_tasks:task-kanban-proof-visible",
+        "personal_time_tasks:task-kanban-proof-agent",
+    }
     assert shown_tasks["kanban_preferences"]["show_test_entries"] is True
     assert shown_tasks["test_entries"]["hidden_kanban_todos"] == 0
     sync_tables = {
