@@ -41,6 +41,8 @@ SOURCE_ID = "github-git"
 SCRIPT_NAME = "personal-github-activity-ingest"
 LIVE_DB_PATH = Path("/opt/blueprints/data/db/blueprints.db")
 GITHUB_BASE = "https://github.com"
+GITHUB_ACTIVITY_TAG = "github"
+KANBAN_TAG = "kanban"
 REQUIRED_SYNC_TABLES = (
     "personal_sources",
     "personal_git_repositories",
@@ -1530,8 +1532,8 @@ def upsert_root_work_item(conn: sqlite3.Connection, now: str) -> None:
             "Retrospective GitHub work inferred from writable davros1973 and xarta repositories.",
             "git-root:github-activity",
             source_hash,
-            json_dumps(["git", "github"]),
-            "github git activity davros1973 xarta",
+            json_dumps([KANBAN_TAG, GITHUB_ACTIVITY_TAG]),
+            "github activity davros1973 xarta",
             json_dumps({"link_schema": ROOT_WORK_ITEM_LINK}),
             json_dumps({"source": SCRIPT_NAME, "link": ROOT_WORK_ITEM_LINK}),
             now,
@@ -1650,7 +1652,7 @@ def upsert_arc_work_item(
             depth,
             f"git-arc:{arc.arc_id}",
             arc.source_hash,
-            json_dumps(["git", "github", arc.arc_type]),
+            json_dumps([KANBAN_TAG, GITHUB_ACTIVITY_TAG]),
             search,
             json_dumps(
                 {
@@ -1778,7 +1780,7 @@ def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, n
             depth,
             f"git-feature:{feature.feature_id}",
             feature.source_hash,
-            json_dumps(["git", "github", "feature"]),
+            json_dumps([KANBAN_TAG, GITHUB_ACTIVITY_TAG]),
             search,
             json_dumps(
                 {
@@ -1890,7 +1892,7 @@ def upsert_daily_summary(
             summary.markdown,
             summary.local_date,
             tz_name,
-            json_dumps(["git", "github", "work"]),
+            json_dumps([GITHUB_ACTIVITY_TAG]),
             json_dumps(summary.related_kanban_items),
             json_dumps(
                 [
@@ -2242,7 +2244,7 @@ def verify_applied_records(
     tz = ZoneInfo(tz_name or "Etc/UTC")
     today = datetime.now(tz).date()
     future_git_events = 0
-    git_events_missing_git_tag: list[str] = []
+    git_events_missing_github_tag: list[str] = []
     summary_pair_failures: list[str] = []
     summary_kanban_link_failures: list[str] = []
     visible_identifier_failures: dict[str, list[str]] = {}
@@ -2277,9 +2279,9 @@ def verify_applied_records(
             if (
                 event["source_type"] != "git"
                 or event["kind"] != "git-summary"
-                or not _json_array_contains(tags, "git")
+                or not _json_array_contains(tags, GITHUB_ACTIVITY_TAG)
             ):
-                git_events_missing_git_tag.append(summary.event_id)
+                git_events_missing_github_tag.append(summary.event_id)
             visible_hits = visible_calendar_identifier_hits(str(event["content_projection"] or ""))
             if visible_hits:
                 visible_identifier_failures[summary.event_id] = visible_hits
@@ -2347,10 +2349,10 @@ def verify_applied_records(
         ),
         _acceptance_check(
             check_id="git_event_tags",
-            label="Git event tags",
-            ok=not git_events_missing_git_tag,
-            detail=f"{len(git_events_missing_git_tag)} git events missing source/kind/tag",
-            metrics={"offending_event_ids": git_events_missing_git_tag},
+            label="GitHub activity event tags",
+            ok=not git_events_missing_github_tag,
+            detail=f"{len(git_events_missing_github_tag)} git events missing source/kind/github tag",
+            metrics={"offending_event_ids": git_events_missing_github_tag},
         ),
         _acceptance_check(
             check_id="summary_event_pairs",

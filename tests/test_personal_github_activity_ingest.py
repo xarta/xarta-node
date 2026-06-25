@@ -1261,6 +1261,9 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
     assert feature["title"] == "Calendar Git Summary"
     assert feature["parent_item_id"] == subproject["item_id"]
     assert feature["depth"] == 3
+    assert ingest.json.loads(project["tags_json"]) == ["kanban", "github"]
+    assert ingest.json.loads(subproject["tags_json"]) == ["kanban", "github"]
+    assert ingest.json.loads(feature["tags_json"]) == ["kanban", "github"]
 
     event = conn.execute(
         "SELECT * FROM personal_events WHERE event_id='git-summary-2026-06-22'"
@@ -1287,7 +1290,8 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
         ingest.kanban_item_url(item_id) for item_id in summary_related_kanban_items
     ]
     assert ingest.kanban_item_url(feature["item_id"]) in summary_provenance["kanban_links"]
-    assert "git" in ingest.json.loads(event["tags_json"])
+    tags = ingest.json.loads(event["tags_json"])
+    assert tags == ["github"]
     related_kanban_items = ingest.json.loads(event["related_kanban_items_json"])
     assert feature["item_id"] in related_kanban_items
     db_refs = ingest.json.loads(event["db_refs_json"])
@@ -1995,5 +1999,6 @@ def test_apply_ingest_is_idempotent_for_cache_calendar_and_kanban_rows(monkeypat
     ).fetchone()
     assert event["source_type"] == "git"
     assert event["kind"] == "git-summary"
-    assert "git" in event["tags_json"]
+    tags = ingest.json.loads(event["tags_json"])
+    assert tags == ["github"]
     assert "blueprints://kanban/items/" in event["content_projection"]
