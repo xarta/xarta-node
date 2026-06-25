@@ -519,6 +519,27 @@ def _work_item_tags_for_request(tags: list[str] | None, meta: dict[str, str]) ->
     return clean
 
 
+def _work_row_tags(row: Any) -> list[str]:
+    return [str(tag).strip() for tag in _json_value(row["tags_json"], []) if str(tag).strip()]
+
+
+def _work_row_has_filter_tag(row: Any, tag: str) -> bool:
+    clean_tag = str(tag or "").strip().lower()
+    return clean_tag in {entry.lower() for entry in _work_row_tags(row)}
+
+
+def _clean_work_item_type(value: str | None, default: str = "item") -> str:
+    item_type = _clean_short_text(value, default, limit=80)
+    if item_type.lower() == "todo":
+        raise HTTPException(
+            400,
+            "Kanban ToDo is a todo-lane leaf item or filter tag, not item_type='todo'",
+        )
+    if item_type.lower() == "work":
+        return "item"
+    return item_type
+
+
 def _row_to_event(row: Any) -> dict[str, Any]:
     return {
         "event_id": row["event_id"],
@@ -737,7 +758,8 @@ def _row_to_work_todo(row: Any) -> dict[str, Any]:
         "todo_id": row["item_id"],
         "item_id": row["item_id"],
         "parent_item_id": parent_item_id,
-        "item_type": "todo",
+        "item_type": row["item_type"],
+        "todo_view": True,
         "title": row["title"],
         "body_excerpt": row["body_excerpt"],
         "status": row["status"],
@@ -2412,13 +2434,13 @@ def _personal_graph_candidates(
                 request_id=request_id,
                 now=now,
             )
-        if row["item_type"] in {"issue", "todo"} and row["parent_item_id"]:
+        if row["item_type"] == "issue" and row["parent_item_id"]:
             _add_graph_candidate(
                 candidates,
                 source_ref=source_ref,
                 target_ref=f"kanban_items:{row['parent_item_id']}",
                 link_type="evidence_for",
-                title=f"{row['item_type'].title()} item belongs to parent item",
+                title="Issue item belongs to parent item",
                 metadata={"status": row["status"], "item_type": row["item_type"]},
                 provenance=base,
                 actor=actor,
@@ -4748,7 +4770,16 @@ def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]
             counts["blocked"] += count
         if status in {"done", "archived"}:
             counts["done"] += count
-    kanban_todo_rows = conn.execute("SELECT * FROM kanban_items WHERE item_type='todo'").fetchall()
+    kanban_todo_rows = _kanban_todo_task_page_rows(
+        conn,
+        mode="kanban",
+        date_start=None,
+        date_end=None,
+        status=None,
+        source_type=None,
+        related_kanban_item=None,
+        fetch_limit=10000,
+    )
     kanban_todo_rows, _hidden = _filter_kanban_todo_test_rows(
         conn,
         kanban_todo_rows,
@@ -4790,7 +4821,7 @@ def _kanban_todo_task_page_rows(
         include = source_type in work_source_filters
     if not include:
         return []
-    where: list[str] = ["item_type = 'todo'"]
+    where: list[str] = ["item_type != 'issue'"]
     params: list[Any] = []
     if status:
         where.append("status = ?")
@@ -4811,7 +4842,7 @@ def _kanban_todo_task_page_rows(
         )
         params.append(date_end)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT * FROM kanban_items
         {clause}
@@ -4820,6 +4851,7 @@ def _kanban_todo_task_page_rows(
         """,
         (*params, fetch_limit),
     ).fetchall()
+    return [row for row in rows if _work_row_has_filter_tag(row, "todo")]
 
 
 def _clean_work_id(value: str | None, prefix: str) -> str:
@@ -5422,20 +5454,32 @@ def _work_scoped_leaf_payload(
     rows: list[Any] = []
     if item_ids:
         placeholders = ",".join("?" for _ in item_ids)
-        leaf_type = "issue" if clean_kind == "issues" else "todo"
-        order_expr = (
-            "updated_at DESC, item_id"
-            if clean_kind == "issues"
-            else "COALESCE(json_extract(provenance_json, '$.todo.due_at'), updated_at), item_id"
-        )
-        rows = conn.execute(
-            f"""
-            SELECT * FROM kanban_items
-            WHERE item_type=? AND parent_item_id IN ({placeholders})
-            ORDER BY {order_expr}
-            """,
-            [leaf_type, *item_ids],
-        ).fetchall()
+        if clean_kind == "issues":
+            rows = conn.execute(
+                f"""
+                SELECT * FROM kanban_items
+                WHERE item_type='issue' AND parent_item_id IN ({placeholders})
+                ORDER BY updated_at DESC, item_id
+                """,
+                item_ids,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT w.* FROM kanban_items w
+                WHERE w.parent_item_id IN ({placeholders})
+                  AND w.state_id='todo'
+                  AND w.status != 'archived'
+                  AND w.item_type != 'issue'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM kanban_items child
+                      WHERE child.parent_item_id=w.item_id
+                        AND child.status != 'archived'
+                  )
+                ORDER BY COALESCE(json_extract(w.provenance_json, '$.todo.due_at'), w.updated_at), w.item_id
+                """,
+                item_ids,
+            ).fetchall()
     row_mapper = _row_to_work_issue if clean_kind == "issues" else _row_to_work_todo
     records: list[dict[str, Any]] = []
     counts_by_status: dict[str, int] = {}
@@ -5452,7 +5496,7 @@ def _work_scoped_leaf_payload(
     if clean_view in {"grouped", "tree"}:
         records_by_item: dict[str, list[dict[str, Any]]] = {item_ref: [] for item_ref in item_ids}
         for record in records:
-            records_by_item.setdefault(record["item_id"], []).append(record)
+            records_by_item.setdefault(record["parent_item_id"], []).append(record)
         for row in scope_rows:
             group = {
                 "item": _row_to_work_item(row),
@@ -5539,16 +5583,35 @@ def _work_rollup(
         "GROUP BY status",
         item_ids,
     ).fetchall()
-    issue_open = conn.execute(
-        f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
-        "AND item_type='issue' AND status NOT IN ('done', 'closed', 'archived')",
-        item_ids,
-    ).fetchone()
-    todo_open = conn.execute(
-        f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
-        "AND item_type='todo' AND status NOT IN ('done', 'archived')",
-        item_ids,
-    ).fetchone()
+    descendant_item_ids = [
+        scope_item_id for scope_item_id in item_ids if not item_id or scope_item_id != item_id
+    ]
+    if descendant_item_ids:
+        descendant_placeholders = ",".join("?" for _ in descendant_item_ids)
+        issue_open = conn.execute(
+            f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({descendant_placeholders}) "
+            "AND item_type='issue' AND status NOT IN ('done', 'closed', 'archived')",
+            descendant_item_ids,
+        ).fetchone()
+        todo_open = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM kanban_items w
+            WHERE w.item_id IN ({descendant_placeholders})
+              AND w.state_id='todo'
+              AND w.status != 'archived'
+              AND w.item_type != 'issue'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kanban_items child
+                  WHERE child.parent_item_id=w.item_id
+                    AND child.status != 'archived'
+              )
+            """,
+            descendant_item_ids,
+        ).fetchone()
+    else:
+        issue_open = {"count": 0}
+        todo_open = {"count": 0}
     blocker_open = conn.execute(
         f"SELECT COUNT(*) AS count FROM kanban_blockers WHERE item_id IN ({placeholders}) "
         "AND status NOT IN ('resolved', 'archived')",
@@ -6015,7 +6078,7 @@ def _work_item_payload(
     depth = _work_parent_depth(conn, parent_id)
     item_id = _clean_work_id(body.item_id, "kanban")
     tags = _work_item_tags_for_request(body.tags, _work_request_meta(body))
-    item_type = _clean_short_text(body.item_type, "item", limit=80)
+    item_type = _clean_work_item_type(body.item_type, "item")
     body_excerpt = _body_excerpt(body.body or "", limit=4000)
     related_events = _clean_event_list(body.related_event_ids, limit=32)
     related_tasks = _clean_event_list(body.related_task_ids, limit=32)
@@ -6174,6 +6237,20 @@ def _work_leaf_item_status(status: str, state: Any) -> str:
     return _work_status_for_state(state)
 
 
+def _work_row_is_todo_lane_leaf(conn: Any, row: Any) -> bool:
+    if row["state_id"] != "todo" or row["status"] == "archived" or row["item_type"] == "issue":
+        return False
+    child = conn.execute(
+        """
+        SELECT 1 FROM kanban_items
+        WHERE parent_item_id=? AND status != 'archived'
+        LIMIT 1
+        """,
+        (row["item_id"],),
+    ).fetchone()
+    return child is None
+
+
 def _work_typed_leaf_item_row(conn: Any, kind: str, leaf_id: str) -> Any | None:
     clean_kind = _clean_short_text(kind, "", limit=40)
     clean_leaf_id = _clean_short_text(leaf_id, "", limit=180)
@@ -6189,6 +6266,10 @@ def _work_typed_leaf_item_row(conn: Any, kind: str, leaf_id: str) -> Any | None:
     if isinstance(provenance.get(clean_kind), dict):
         return row
     if kanban_meta.get("leaf_kind") == clean_kind:
+        return row
+    if clean_kind == "todo" and (
+        _work_row_has_filter_tag(row, "todo") or _work_row_is_todo_lane_leaf(conn, row)
+    ):
         return row
     return None
 
@@ -6235,11 +6316,11 @@ def _upsert_typed_work_leaf_item(
     state = _work_state_for_leaf_status(conn, leaf_status)
     item_status = _work_leaf_item_status(leaf_status, state)
     archived_at = now if item_status == "archived" else None
-    item_type = clean_kind
+    item_type = "issue" if clean_kind == "issue" else "item"
     if (
         existing
         and existing["promoted_from_ref"] == source_ref
-        and existing["item_type"] not in {"issue", "todo"}
+        and existing["item_type"] != "issue"
     ):
         item_type = existing["item_type"]
     tags = _work_leaf_tags(parent_row, clean_kind, meta)
@@ -6265,17 +6346,23 @@ def _upsert_typed_work_leaf_item(
         provenance = {}
     provenance["kanban"] = {
         **(provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}),
-        "typed_leaf_card": True,
+        "typed_leaf_card": clean_kind == "issue",
         "leaf_kind": clean_kind,
         "parent_item_id": parent_id,
     }
     provenance[clean_kind] = {
         **(provenance.get(clean_kind) if isinstance(provenance.get(clean_kind), dict) else {}),
         "item_id": parent_id,
-        "typed_item_id": clean_leaf_id,
+        **(
+            {"typed_item_id": clean_leaf_id}
+            if clean_kind == "issue"
+            else {"kanban_item_id": clean_leaf_id}
+        ),
         "external_source_ref": external_source_ref,
         "due_at": due_at or "",
     }
+    if clean_kind == "todo" and isinstance(provenance.get("todo"), dict):
+        provenance["todo"].pop("typed_item_id", None)
     provenance["last_update"] = meta
     source_hash = _hash_json_payload(
         {
@@ -6464,9 +6551,17 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         ).fetchall()
         todos = conn.execute(
             """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id=? AND item_type='todo' AND status != 'archived'
-            ORDER BY COALESCE(json_extract(provenance_json, '$.todo.due_at'), updated_at), item_id
+            SELECT w.* FROM kanban_items w
+            WHERE w.parent_item_id=?
+              AND w.state_id='todo'
+              AND w.status != 'archived'
+              AND w.item_type != 'issue'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kanban_items child
+                  WHERE child.parent_item_id=w.item_id
+                    AND child.status != 'archived'
+              )
+            ORDER BY COALESCE(json_extract(w.provenance_json, '$.todo.due_at'), w.updated_at), w.item_id
             """,
             (item_id,),
         ).fetchall()
@@ -6612,7 +6707,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             if body.body is not None
             else existing["body_excerpt"]
         )
-        item_type = _clean_short_text(body.item_type, existing["item_type"], limit=80)
+        item_type = _clean_work_item_type(body.item_type, existing["item_type"])
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_items",
             row_id=item_id,
@@ -7853,11 +7948,13 @@ def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
             raise HTTPException(404, "promotion source item not found")
         provenance = _json_value(row["provenance_json"], {})
         kanban_meta = provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}
-        kind = row["item_type"]
-        if kind not in {"issue", "todo"}:
+        kind = "issue" if row["item_type"] == "issue" else ""
+        if not kind and _work_typed_leaf_item_row(conn, "todo", item_id):
+            kind = "todo"
+        if not kind:
             kind = _clean_short_text(kanban_meta.get("leaf_kind"), "", limit=40)
         if kind not in {"issue", "todo"}:
-            raise HTTPException(400, "promotion source item is not an issue or todo card")
+            raise HTTPException(400, "promotion source item is not an issue card or ToDo-view item")
         return {
             "title": row["title"],
             "body": row["body_excerpt"],

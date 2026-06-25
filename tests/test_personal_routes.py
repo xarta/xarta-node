@@ -2394,6 +2394,32 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert issue_card["state_id"] == "todo"
     assert issue_card["source_ref"] == "kanban_items:issue-step16"
     assert json.loads(issue_card["tags_json"]) == ["issue", "kanban"]
+    root_rollup_with_open_issue = asyncio.run(routes_personal.get_work_item_rollup("work-root"))[
+        "rollup"
+    ]
+    assert root_rollup_with_open_issue["issues"]["open"] == 1
+
+    done_issue = asyncio.run(
+        routes_personal.update_work_issue(
+            "issue-step16",
+            routes_personal.WorkIssueUpsertRequest(
+                item_id="work-root",
+                title="Step 16 issue",
+                body="Issue proof",
+                status="done",
+                severity_id="high",
+                source_ref="docs:step-16",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="issue-done",
+            ),
+        )
+    )["issue"]
+    assert done_issue["status"] == "done"
+    root_rollup_with_done_issue = asyncio.run(routes_personal.get_work_item_rollup("work-root"))[
+        "rollup"
+    ]
+    assert root_rollup_with_done_issue["issues"]["open"] == 0
 
     child_issue = asyncio.run(
         routes_personal.create_work_issue(
@@ -2445,11 +2471,40 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     )["todo"]
     assert todo["related_task_id"] == "task-step16"
     todo_card = conn.execute("SELECT * FROM kanban_items WHERE item_id='todo-step16'").fetchone()
-    assert todo_card["item_type"] == "todo"
+    assert todo_card["item_type"] == "item"
     assert todo_card["parent_item_id"] == "work-root"
     assert todo_card["state_id"] == "todo"
     assert todo_card["source_ref"] == "kanban_items:todo-step16"
     assert json.loads(todo_card["related_task_ids_json"]) == ["task-step16"]
+    assert "todo" in json.loads(todo_card["tags_json"])
+    root_rollup_with_todo_lane_leaf = asyncio.run(
+        routes_personal.get_work_item_rollup("work-root")
+    )["rollup"]
+    assert root_rollup_with_todo_lane_leaf["todos"]["open"] == 1
+
+    tagged_todo_filter_item = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-filter-tag-todo",
+                parent_item_id="work-root",
+                title="Filter tag ToDo item",
+                body="This appears on the ToDo page by tag, not in Kanban ToDo rollups.",
+                item_type="item",
+                state_id="doing",
+                priority_id="medium",
+                tags=["ToDo"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-tag-todo-create",
+            )
+        )
+    )["item"]
+    assert tagged_todo_filter_item["item_type"] == "item"
+    assert "todo" in {tag.lower() for tag in tagged_todo_filter_item["tags"]}
+    root_rollup_with_todo_filter_tag = asyncio.run(
+        routes_personal.get_work_item_rollup("work-root")
+    )["rollup"]
+    assert root_rollup_with_todo_filter_tag["todos"]["open"] == 1
 
     scoped_todo = asyncio.run(
         routes_personal.create_work_todo(
@@ -2489,10 +2544,14 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     scoped_todo_card = conn.execute(
         "SELECT * FROM kanban_items WHERE item_id='todo-step19-grandchild'"
     ).fetchone()
-    assert scoped_todo_card["item_type"] == "todo"
+    assert scoped_todo_card["item_type"] == "item"
     assert scoped_todo_card["parent_item_id"] == "work-depth-3"
     assert scoped_todo_card["state_id"] == "doing"
     assert scoped_todo_card["priority_id"] == "critical"
+    assert "todo" in json.loads(scoped_todo_card["tags_json"])
+    assert (
+        conn.execute("SELECT COUNT(*) FROM kanban_items WHERE item_type='todo'").fetchone()[0] == 0
+    )
 
     promoted = asyncio.run(
         routes_personal.promote_work_item(
@@ -2547,7 +2606,11 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     descendant_todos = asyncio.run(
         routes_personal.list_work_item_todos("work-child", scope="descendants", view="tree")
     )
-    assert [row["todo_id"] for row in descendant_todos["items"]] == ["todo-step19-grandchild"]
+    descendant_todo_ids = {row["todo_id"] for row in descendant_todos["items"]}
+    assert "todo-step19-grandchild" not in descendant_todo_ids
+    assert descendant_todo_ids == {"issue-step19-child", "work-depth-12"}
+    assert all(row["item_card"]["item_type"] == "item" for row in descendant_todos["items"])
+    assert all(row["item_card"]["state_id"] == "todo" for row in descendant_todos["items"])
     assert descendant_todos["groups"][0]["scope"]["relation"] == "self"
 
     issue_direct = asyncio.run(routes_personal.get_work_issue("issue-step19-child"))
@@ -2569,7 +2632,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert todo_direct["todo"]["body_excerpt"] == "Two-level scoped todo proof updated"
     assert todo_direct["item"]["item_id"] == "work-depth-3"
     assert todo_direct["item_card"]["item_id"] == "todo-step19-grandchild"
-    assert todo_direct["item_card"]["item_type"] == "todo"
+    assert todo_direct["item_card"]["item_type"] == "item"
     assert todo_direct["item_card"]["state_id"] == "doing"
     todo_bundle = asyncio.run(
         routes_personal.get_rich_doc_bundle("kanban", "todo", "todo-step19-grandchild")
@@ -2583,7 +2646,11 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         for item in work_tasks["items"]
         if item["source"]["type"] == "kanban-todo"
     }
-    assert work_task_refs == {"kanban_items:todo-step19-grandchild"}
+    assert work_task_refs == {
+        "kanban_items:todo-step16",
+        "kanban_items:todo-step19-grandchild",
+        "kanban_items:work-filter-tag-todo",
+    }
     assert len(work_task_refs) == len(
         [item for item in work_tasks["items"] if item["source"]["type"] == "kanban-todo"]
     )
@@ -2712,7 +2779,9 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "step-16-root-board-renamed/items/work-root/detail.md"
     )
     assert {issue["issue_id"] for issue in detail["issues"]} == {"issue-step16"}
-    assert detail["todos"] == []
+    assert {todo["todo_id"] for todo in detail["todos"]} == {"todo-step16"}
+    assert detail["todos"][0]["item_card"]["item_type"] == "item"
+    assert detail["todos"][0]["item_card"]["state_id"] == "todo"
     assert detail["links"][0]["link_id"] == link["link_id"]
     assert detail["blockers"][0]["blocker_id"] == "blocker-step18"
     assert detail["discussions"][0]["body"] == updated_discussion_body
@@ -2850,18 +2919,32 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
             )
         )
     )
-    typed_user_todo_tags = json.loads(
+    user_todo_filter_tags = json.loads(
         conn.execute(
             "SELECT tags_json FROM kanban_items WHERE item_id='todo-user-visible'"
         ).fetchone()[0]
     )
-    typed_agent_todo_tags = json.loads(
+    agent_todo_filter_tags = json.loads(
         conn.execute(
             "SELECT tags_json FROM kanban_items WHERE item_id='todo-agent-hidden'"
         ).fetchone()[0]
     )
-    assert "agent-working-out" not in typed_user_todo_tags
-    assert "agent-working-out" in typed_agent_todo_tags
+    assert (
+        conn.execute(
+            "SELECT item_type FROM kanban_items WHERE item_id='todo-user-visible'"
+        ).fetchone()[0]
+        == "item"
+    )
+    assert (
+        conn.execute(
+            "SELECT item_type FROM kanban_items WHERE item_id='todo-agent-hidden'"
+        ).fetchone()[0]
+        == "item"
+    )
+    assert "agent-working-out" not in user_todo_filter_tags
+    assert "agent-working-out" in agent_todo_filter_tags
+    assert "todo" in user_todo_filter_tags
+    assert "todo" in agent_todo_filter_tags
     default_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=50))
     default_refs = {
         item["source"]["ref"]
