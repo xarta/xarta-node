@@ -331,6 +331,7 @@ def _make_conn() -> sqlite3.Connection:
             depth INTEGER NOT NULL DEFAULT 0,
             sort_order INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'open',
+            goal_flag INTEGER NOT NULL DEFAULT 0,
             archived_at TEXT,
             promoted_from_ref TEXT,
             source_type TEXT NOT NULL DEFAULT 'manual-kanban',
@@ -2323,6 +2324,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
                 body="Root board proof\n\nSecond paragraph",
                 state_id="todo",
                 priority_id="high",
+                goal_flag=True,
                 tags=["proof"],
                 actor="codex-test",
                 source_surface="pytest",
@@ -2334,6 +2336,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert root["item_id"] == "work-root"
     assert root["depth"] == 0
     assert root["state_id"] == "todo"
+    assert root["goal_flag"] is True
     assert root["body_excerpt"] == "Root board proof\n\nSecond paragraph"
     assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
     assert root["vector"]["index_key"] == "kanban_items:work-root"
@@ -2343,6 +2346,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         column for column in board["board"]["columns"] if column["state"]["state_id"] == "todo"
     )
     assert [item["item_id"] for item in todo_column["items"]] == ["work-root"]
+    assert todo_column["items"][0]["goal_flag"] is True
 
     child = asyncio.run(
         routes_personal.create_work_item(
@@ -2360,6 +2364,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         )
     )["item"]
     assert child["depth"] == 1
+    assert child["goal_flag"] is False
 
     parent_id = "work-child"
     for depth in range(2, 13):
@@ -2809,6 +2814,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             routes_personal.WorkItemUpdateRequest(
                 title="Step 16 Root Board Renamed",
                 body="Root board proof\n\nRenamed paragraph",
+                goal_flag=False,
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="work-root-rename",
@@ -2816,7 +2822,14 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         )
     )["item"]
     assert renamed_root["title"] == "Step 16 Root Board Renamed"
+    assert renamed_root["goal_flag"] is False
     assert renamed_root["body_excerpt"] == "Root board proof\n\nRenamed paragraph"
+    assert (
+        conn.execute("SELECT goal_flag FROM kanban_items WHERE item_id='work-root'").fetchone()[
+            "goal_flag"
+        ]
+        == 0
+    )
     manifest = json.loads((tmp_path / "kanban" / "projects.json").read_text(encoding="utf-8"))
     assert manifest["projects"]["work-root"]["title"] == "Step 16 Root Board Renamed"
     assert manifest["projects"]["work-root"]["folder"] == "step-16-root-board-renamed"
