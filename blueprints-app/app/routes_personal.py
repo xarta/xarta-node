@@ -368,6 +368,24 @@ class WorkItemLinkCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkItemCommitCreateRequest(BaseModel):
+    repo_full_name: str
+    sha: str
+    short_sha: str | None = None
+    html_url: str | None = None
+    author_login: str | None = None
+    author_name: str | None = None
+    committed_at: str | None = None
+    message_subject: str | None = None
+    message_body: str | None = None
+    branch: str | None = None
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class PersonalGraphLinkCreateRequest(BaseModel):
     source_ref: str
     target_ref: str
@@ -538,6 +556,59 @@ def _clean_work_item_type(value: str | None, default: str = "item") -> str:
     if item_type.lower() == "work":
         return "item"
     return item_type
+
+
+def _clean_git_repo_full_name(value: str | None) -> str:
+    repo = _clean_short_text(value, "", limit=240)
+    if not repo or "/" not in repo or repo.startswith("/") or repo.endswith("/"):
+        raise HTTPException(400, "Git commit repo_full_name must be owner/name")
+    if any(ch.isspace() for ch in repo):
+        raise HTTPException(400, "Git commit repo_full_name must not contain whitespace")
+    return repo
+
+
+def _clean_git_sha(value: str | None) -> str:
+    sha = _clean_short_text(value, "", limit=80).lower()
+    if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+        raise HTTPException(400, "Git commit sha must be a 7-64 character hex SHA")
+    return sha
+
+
+def _kanban_commit_link_id(item_id: str, repo_full_name: str, sha: str) -> str:
+    digest = hashlib.sha256(f"{item_id}\n{repo_full_name}\n{sha}".encode("utf-8")).hexdigest()
+    return f"kanban-commit-{digest[:24]}"
+
+
+def _git_commit_ref(repo_full_name: str, sha: str) -> str:
+    return f"git_commit:{repo_full_name}@{sha}"
+
+
+def _github_commit_url(repo_full_name: str, sha: str) -> str:
+    return f"https://github.com/{repo_full_name}/commit/{sha}"
+
+
+def _row_to_work_commit(row: Any) -> dict[str, Any]:
+    repo_full_name = row["repo_full_name"]
+    sha = row["sha"]
+    return {
+        "commit_link_id": row["commit_link_id"],
+        "item_id": row["item_id"],
+        "repo_full_name": repo_full_name,
+        "sha": sha,
+        "short_sha": row["short_sha"],
+        "html_url": row["html_url"],
+        "author_login": row["author_login"],
+        "author_name": row["author_name"],
+        "committed_at": row["committed_at"],
+        "message_subject": row["message_subject"],
+        "message_body": row["message_body"],
+        "branch": row["branch"],
+        "commit_ref": _git_commit_ref(repo_full_name, sha),
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def _row_to_event(row: Any) -> dict[str, Any]:
@@ -2459,6 +2530,29 @@ def _personal_graph_candidates(
             provenance={
                 "source_table": "kanban_item_links",
                 "db_ref": f"kanban_item_links:{row['link_id']}",
+            },
+            actor=actor,
+            request_id=request_id,
+            now=now,
+        )
+
+    for row in conn.execute("SELECT * FROM kanban_item_commits"):
+        _add_graph_candidate(
+            candidates,
+            source_ref=_git_commit_ref(row["repo_full_name"], row["sha"]),
+            target_ref=f"kanban_items:{row['item_id']}",
+            link_type="implements",
+            title="Git commit implements Kanban item",
+            metadata={
+                "commit_link_id": row["commit_link_id"],
+                "repo_full_name": row["repo_full_name"],
+                "sha": row["sha"],
+                "short_sha": row["short_sha"],
+                "html_url": row["html_url"],
+            },
+            provenance={
+                "source_table": "kanban_item_commits",
+                "db_ref": f"kanban_item_commits:{row['commit_link_id']}",
             },
             actor=actor,
             request_id=request_id,
@@ -6581,6 +6675,15 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             """,
             (item_id, item_id),
         ).fetchall()
+        commits = conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
+                     repo_full_name, sha
+            """,
+            (item_id,),
+        ).fetchall()
         audit = conn.execute(
             """
             SELECT * FROM kanban_audit_log
@@ -6614,6 +6717,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 }
                 for row in links
             ],
+            "commits": [_row_to_work_commit(row) for row in commits],
             "audit": [
                 {
                     "audit_id": row["audit_id"],
@@ -6632,6 +6736,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 "todos": len(todos),
                 "blockers": len(blockers),
                 "links": len(links),
+                "commits": len(commits),
                 "audit": len(audit),
                 "discussions": len(discussions),
             },
@@ -7601,6 +7706,192 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
             "updated_at": link_row["updated_at"],
         },
         "audit": {"audit_id": audit_id, "action": "create_work_item_link", "result": "ok"},
+    }
+
+
+@router.get("/kanban/items/{item_id}/commits")
+async def list_work_item_commits(item_id: str) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        rows = conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
+                     repo_full_name, sha
+            """,
+            (clean_item_id,),
+        ).fetchall()
+        return {
+            "ok": True,
+            "item": _row_to_work_item(item),
+            "count": len(rows),
+            "commits": [_row_to_work_commit(row) for row in rows],
+        }
+
+
+@router.post("/kanban/items/{item_id}/commits")
+async def record_work_item_commit(
+    item_id: str, body: WorkItemCommitCreateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    repo_full_name = _clean_git_repo_full_name(body.repo_full_name)
+    sha = _clean_git_sha(body.sha)
+    metadata = dict(body.metadata) if isinstance(body.metadata, dict) else {}
+    link_id = _kanban_commit_link_id(clean_item_id, repo_full_name, sha)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        git_row = None
+        with suppress(sqlite3.OperationalError):
+            git_row = conn.execute(
+                """
+                SELECT * FROM personal_git_commits
+                WHERE repo_full_name=? AND sha=?
+                """,
+                (repo_full_name, sha),
+            ).fetchone()
+        short_sha = _clean_short_text(
+            body.short_sha or (git_row["short_sha"] if git_row else "") or sha[:7],
+            sha[:7],
+            limit=16,
+        )
+        html_url = _clean_short_text(
+            body.html_url or (git_row["html_url"] if git_row else "") or "",
+            "",
+            limit=500,
+        )
+        if not html_url:
+            html_url = _github_commit_url(repo_full_name, sha)
+        row = {
+            "commit_link_id": link_id,
+            "item_id": clean_item_id,
+            "repo_full_name": repo_full_name,
+            "sha": sha,
+            "short_sha": short_sha,
+            "html_url": html_url,
+            "author_login": _clean_short_text(
+                body.author_login or (git_row["author_login"] if git_row else ""),
+                "",
+                limit=120,
+            ),
+            "author_name": _clean_short_text(
+                body.author_name or (git_row["author_name"] if git_row else ""),
+                "",
+                limit=160,
+            ),
+            "committed_at": _clean_short_text(
+                body.committed_at or (git_row["committed_at"] if git_row else ""),
+                "",
+                limit=80,
+            ),
+            "message_subject": _clean_short_text(
+                body.message_subject or (git_row["message_subject"] if git_row else ""),
+                "",
+                limit=240,
+            ),
+            "message_body": _body_excerpt(
+                body.message_body
+                if body.message_body is not None
+                else (git_row["message_body"] if git_row else ""),
+                limit=4000,
+            ),
+            "branch": _clean_short_text(body.branch or "", "", limit=160),
+            "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+            "provenance_json": json.dumps(
+                {
+                    "commit_ref": _git_commit_ref(repo_full_name, sha),
+                    "recorded_by": meta["actor"],
+                    "source_surface": meta["source_surface"],
+                    "request_id": meta["request_id"],
+                    "run_id": meta["run_id"],
+                    "personal_git_commit_id": git_row["commit_id"] if git_row else "",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "created_at": now,
+            "updated_at": now,
+        }
+        source_hash = _hash_json_payload(row)
+        existing = conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=? AND repo_full_name=? AND sha=?
+            """,
+            (clean_item_id, repo_full_name, sha),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO kanban_item_commits (
+                commit_link_id, item_id, repo_full_name, sha, short_sha, html_url,
+                author_login, author_name, committed_at, message_subject, message_body,
+                branch, metadata_json, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :commit_link_id, :item_id, :repo_full_name, :sha, :short_sha,
+                :html_url, :author_login, :author_name, :committed_at,
+                :message_subject, :message_body, :branch, :metadata_json,
+                :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(item_id, repo_full_name, sha) DO UPDATE SET
+                short_sha=excluded.short_sha,
+                html_url=excluded.html_url,
+                author_login=excluded.author_login,
+                author_name=excluded.author_name,
+                committed_at=excluded.committed_at,
+                message_subject=excluded.message_subject,
+                message_body=excluded.message_body,
+                branch=excluded.branch,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        commit_row = conn.execute(
+            "SELECT * FROM kanban_item_commits WHERE commit_link_id=?",
+            (existing["commit_link_id"] if existing else link_id,),
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="record_work_commit",
+            target_ref=f"kanban_item_commits:{commit_row['commit_link_id']}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "repo_full_name": repo_full_name,
+                "sha": sha,
+                "commit_ref": _git_commit_ref(repo_full_name, sha),
+                "html_url": html_url,
+                "upsert": "updated" if existing else "inserted",
+            },
+        )
+        gen = increment_gen(conn, "kanban-item-commit")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_item_commits",
+            commit_row["commit_link_id"],
+            dict(commit_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "commit": _row_to_work_commit(commit_row),
+        "audit": {"audit_id": audit_id, "action": "record_work_commit", "result": "ok"},
     }
 
 
