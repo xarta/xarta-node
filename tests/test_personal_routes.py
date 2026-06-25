@@ -2779,6 +2779,23 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert link["target_item_id"] == promoted["item_id"]
     assert link["metadata"]["proof_step"] == 18
 
+    share_code_link = asyncio.run(
+        routes_personal.create_work_item_link(
+            "work-child",
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id=f"xarta-kanban:item:{promoted['item_id']}",
+                link_type="depends_on",
+                metadata={"proof_step": "share-code-ref"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="link-create-share-code",
+            ),
+        )
+    )["link"]
+    assert share_code_link["source_item_id"] == "work-child"
+    assert share_code_link["target_item_id"] == promoted["item_id"]
+    assert share_code_link["metadata"]["proof_step"] == "share-code-ref"
+
     blocker = asyncio.run(
         routes_personal.create_work_blocker(
             routes_personal.WorkBlockerUpsertRequest(
@@ -2795,6 +2812,22 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     )["blocker"]
     assert blocker["vector"]["index_key"] == "kanban_blockers:blocker-step18"
     assert blocker["blocked_by_ref"] == f"kanban_items:{promoted['item_id']}"
+
+    share_code_blocker = asyncio.run(
+        routes_personal.create_work_blocker(
+            routes_personal.WorkBlockerUpsertRequest(
+                blocker_id="blocker-share-code",
+                item_id="work-child",
+                title="Share code blocker",
+                body="Blocker proof with pasted share code",
+                blocked_by_ref=f"xarta-kanban:todo:{todo['item_id']}",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="blocker-create-share-code",
+            )
+        )
+    )["blocker"]
+    assert share_code_blocker["blocked_by_ref"] == f"kanban_items:{todo['item_id']}"
 
     detail_body = "# Work Root Detail\n\nLine one\nLine two"
     detail_doc = asyncio.run(
