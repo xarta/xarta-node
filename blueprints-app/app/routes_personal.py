@@ -1141,6 +1141,24 @@ def _clean_short_text(value: str | None, default: str, *, limit: int = 120) -> s
     return (text or default)[:limit]
 
 
+def _kanban_item_id_from_share_ref(value: Any) -> str:
+    clean = _clean_short_text(str(value or ""), "", limit=260)
+    if not clean:
+        return ""
+    if clean.startswith("xarta-kanban:"):
+        parts = clean.split(":", 2)
+        if len(parts) == 3 and parts[1] in {"item", "issue", "todo"}:
+            return _clean_short_text(parts[2], "", limit=180)
+    if clean.startswith("kanban_items:"):
+        return _clean_short_text(clean.split(":", 1)[1], "", limit=180)
+    return ""
+
+
+def _normalize_kanban_graph_ref(value: Any) -> str:
+    item_id = _kanban_item_id_from_share_ref(value)
+    return f"kanban_items:{item_id}" if item_id else ""
+
+
 PERSONAL_PRIVACY_LEVELS = {"normal", "pin", "vault"}
 
 
@@ -2199,6 +2217,9 @@ def _graph_ref_parts(ref: str) -> tuple[str, str]:
 
 
 def _target_ref(default_table: str, value: Any) -> str:
+    kanban_ref = _normalize_kanban_graph_ref(value)
+    if kanban_ref:
+        return kanban_ref
     clean = _clean_graph_ref(value)
     if not clean:
         return ""
@@ -7788,7 +7809,9 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
     source_item_id = _clean_short_text(item_id, "", limit=180)
-    target_item_id = _clean_short_text(body.target_item_id, "", limit=180)
+    target_item_id = _kanban_item_id_from_share_ref(body.target_item_id) or _clean_short_text(
+        body.target_item_id, "", limit=180
+    )
     if not source_item_id or not target_item_id:
         raise HTTPException(400, "source and target Kanban item ids are required")
     if source_item_id == target_item_id:
@@ -8746,7 +8769,9 @@ def _upsert_work_blocker(
         if not title:
             raise HTTPException(400, "Kanban blocker title is required")
         body_excerpt = _body_excerpt(body.body or "", limit=4000)
-        blocked_by_ref = _clean_short_text(body.blocked_by_ref, "", limit=220)
+        blocked_by_ref = _normalize_kanban_graph_ref(body.blocked_by_ref) or _clean_short_text(
+            body.blocked_by_ref, "", limit=220
+        )
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_blockers",
             row_id=clean_blocker_id,
