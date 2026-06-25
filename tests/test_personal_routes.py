@@ -404,6 +404,26 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE kanban_agent_sessions (
+            session_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL DEFAULT '',
+            node_id TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            repo_full_name TEXT NOT NULL DEFAULT '',
+            branch TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            started_at TEXT NOT NULL DEFAULT '',
+            ended_at TEXT NOT NULL DEFAULT '',
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            request_hash TEXT NOT NULL DEFAULT '',
+            source_surface TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE kanban_blockers (
             blocker_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL,
@@ -2330,6 +2350,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_item_commits") == "commit_link_id"
     assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
+    assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_agent_sessions") == "session_id"
 
     created = asyncio.run(
         routes_personal.create_work_item(
@@ -3141,6 +3163,95 @@ def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):
     }
     assert "kanban_agent_hints" in sync_tables
     assert "kanban_audit_log" in sync_tables
+
+
+def test_work_kanban_agent_sessions_api(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-agent-session",
+                title="Agent session proof",
+                body="Visible card text",
+                state_id="doing",
+                priority_id="high",
+                tags=["agent-ledger"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="agent-session-item-create",
+            )
+        )
+    )
+    conn.execute("DELETE FROM sync_queue")
+
+    empty = asyncio.run(routes_personal.list_work_item_agent_sessions("work-agent-session"))
+    assert empty["count"] == 0
+
+    created = asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "work-agent-session",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="session-proof-1",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                request_hash="sha256:test-request",
+                source_surface="pytest-session",
+                summary="Started schema/API work",
+                metadata={"slice": "sessions-api"},
+                actor="codex-test",
+                request_id="agent-session-create",
+            ),
+        )
+    )
+    session = created["agent_session"]
+    assert session["session_id"] == "session-proof-1"
+    assert session["item_id"] == "work-agent-session"
+    assert session["agent_id"] == "codex"
+    assert session["node_id"] == "test-node"
+    assert session["repo_full_name"] == "xarta/xarta-node"
+    assert session["status"] == "active"
+    assert session["metadata"]["slice"] == "sessions-api"
+
+    updated = asyncio.run(
+        routes_personal.update_work_agent_session(
+            "session-proof-1",
+            routes_personal.WorkAgentSessionUpdateRequest(
+                status="done",
+                summary="Completed schema/API work",
+                metadata={"slice": "sessions-api", "result": "done"},
+                actor="codex-test",
+                source_surface="pytest-session",
+                request_id="agent-session-update",
+            ),
+        )
+    )["agent_session"]
+    assert updated["status"] == "done"
+    assert updated["ended_at"]
+    assert updated["metadata"]["result"] == "done"
+
+    listed = asyncio.run(routes_personal.list_work_item_agent_sessions("work-agent-session"))
+    assert listed["count"] == 1
+    assert listed["agent_sessions"][0]["session_id"] == "session-proof-1"
+    detail = asyncio.run(routes_personal.get_work_item_detail("work-agent-session"))
+    assert "agent_sessions" not in detail
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_agent_sessions" in sync_tables
+    assert "kanban_audit_log" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "record_work_agent_session" in audit_actions
+    assert "update_work_agent_session" in audit_actions
 
 
 def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):
