@@ -254,6 +254,7 @@ class WorkItemCreateRequest(BaseModel):
     item_type: str = "item"
     state_id: str = "todo"
     priority_id: str = "medium"
+    goal_flag: bool = False
     sort_order: int = 0
     tags: list[str] = []
     related_event_ids: list[str] = []
@@ -271,6 +272,7 @@ class WorkItemUpdateRequest(BaseModel):
     item_type: str | None = None
     state_id: str | None = None
     priority_id: str | None = None
+    goal_flag: bool | None = None
     sort_order: int | None = None
     tags: list[str] | None = None
     related_event_ids: list[str] | None = None
@@ -744,6 +746,7 @@ def _row_to_work_priority(row: Any) -> dict[str, Any]:
 
 
 def _row_to_work_item(row: Any) -> dict[str, Any]:
+    row_keys = row.keys() if hasattr(row, "keys") else []
     return {
         "item_id": row["item_id"],
         "parent_item_id": row["parent_item_id"],
@@ -755,6 +758,7 @@ def _row_to_work_item(row: Any) -> dict[str, Any]:
         "depth": row["depth"],
         "sort_order": row["sort_order"],
         "status": row["status"],
+        "goal_flag": bool(row["goal_flag"]) if "goal_flag" in row_keys else False,
         "archived_at": row["archived_at"],
         "promoted_from_ref": row["promoted_from_ref"],
         "source": {
@@ -6171,6 +6175,7 @@ def _work_item_payload(
     item_id = _clean_work_id(body.item_id, "kanban")
     tags = _work_item_tags_for_request(body.tags, _work_request_meta(body))
     item_type = _clean_work_item_type(body.item_type, "item")
+    goal_flag = bool(body.goal_flag)
     body_excerpt = _body_excerpt(body.body or "", limit=4000)
     related_events = _clean_event_list(body.related_event_ids, limit=32)
     related_tasks = _clean_event_list(body.related_task_ids, limit=32)
@@ -6207,6 +6212,7 @@ def _work_item_payload(
         "depth": depth,
         "sort_order": int(body.sort_order),
         "status": _work_status_for_state(state),
+        "goal_flag": goal_flag,
         "promoted_from_ref": promoted_from_ref,
         "source_type": "manual-kanban",
         "source_ref": f"kanban_items:{item_id}",
@@ -6235,13 +6241,13 @@ def _insert_work_item(
         """
         INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
-            priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
+            priority_id, depth, sort_order, status, goal_flag, archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
             related_task_ids_json, related_issue_ids_json, search_text,
             search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
             vector_index_key, provenance_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
                 NULL, ?, ?, ?, ?)
         """,
         (
@@ -6255,6 +6261,7 @@ def _insert_work_item(
             payload["depth"],
             payload["sort_order"],
             payload["status"],
+            int(payload["goal_flag"]),
             payload["promoted_from_ref"],
             payload["source_type"],
             payload["source_ref"],
@@ -6811,6 +6818,10 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             else existing["body_excerpt"]
         )
         item_type = _clean_work_item_type(body.item_type, existing["item_type"])
+        existing_goal_flag = (
+            bool(existing["goal_flag"]) if "goal_flag" in existing.keys() else False
+        )
+        goal_flag = existing_goal_flag if body.goal_flag is None else bool(body.goal_flag)
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_items",
             row_id=item_id,
@@ -6837,6 +6848,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 body.sort_order if body.sort_order is not None else existing["sort_order"]
             ),
             "status": _work_status_for_state(state),
+            "goal_flag": goal_flag,
             "tags": tags,
             "related_event_ids": related_events,
             "related_task_ids": related_tasks,
@@ -6851,7 +6863,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             """
             UPDATE kanban_items
             SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
-                sort_order=?, status=?, source_hash=?, tags_json=?,
+                sort_order=?, status=?, goal_flag=?, source_hash=?, tags_json=?,
                 related_event_ids_json=?, related_task_ids_json=?,
                 related_issue_ids_json=?, search_text=?, search_metadata_json=?,
                 vector_index_key=?, provenance_json=?, updated_at=?
@@ -6865,6 +6877,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 payload["priority_id"],
                 payload["sort_order"],
                 payload["status"],
+                int(payload["goal_flag"]),
                 payload["source_hash"],
                 json.dumps(payload["tags"], ensure_ascii=True),
                 json.dumps(payload["related_event_ids"], ensure_ascii=True),
@@ -6915,6 +6928,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             metadata={
                 "state_id": item_row["state_id"],
                 "priority_id": item_row["priority_id"],
+                "goal_flag": bool(item_row["goal_flag"]),
                 "kanban_project_document": project_document,
                 "lane_order": order_ids,
             },
