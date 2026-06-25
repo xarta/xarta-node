@@ -388,6 +388,18 @@ class WorkItemCommitCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkAgentHintsUpdateRequest(BaseModel):
+    required_skills: list[str] | None = None
+    routing_notes: str | None = None
+    commit_attribution: dict[str, Any] | None = None
+    status: str | None = None
+    metadata: dict[str, Any] | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-agent-context-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class PersonalGraphLinkCreateRequest(BaseModel):
     source_ref: str
     target_ref: str
@@ -581,6 +593,11 @@ def _kanban_commit_link_id(item_id: str, repo_full_name: str, sha: str) -> str:
     return f"kanban-commit-{digest[:24]}"
 
 
+def _kanban_agent_hints_id(item_id: str) -> str:
+    digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
+    return f"kanban-agent-hints-{digest[:24]}"
+
+
 def _git_commit_ref(repo_full_name: str, sha: str) -> str:
     return f"git_commit:{repo_full_name}@{sha}"
 
@@ -606,6 +623,40 @@ def _row_to_work_commit(row: Any) -> dict[str, Any]:
         "message_body": row["message_body"],
         "branch": row["branch"],
         "commit_ref": _git_commit_ref(repo_full_name, sha),
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_agent_hints(row: Any | None, item_id: str) -> dict[str, Any]:
+    if row is None:
+        return {
+            "schema": "xarta.kanban.agent_hints.v1",
+            "exists": False,
+            "hint_id": _kanban_agent_hints_id(item_id),
+            "item_id": item_id,
+            "required_skills": [],
+            "routing_notes": "",
+            "commit_attribution": {},
+            "visibility": "agent",
+            "status": "missing",
+            "metadata": {},
+            "provenance": {},
+            "created_at": None,
+            "updated_at": None,
+        }
+    return {
+        "schema": "xarta.kanban.agent_hints.v1",
+        "exists": True,
+        "hint_id": row["hint_id"],
+        "item_id": row["item_id"],
+        "required_skills": _json_value(row["required_skills_json"], []),
+        "routing_notes": row["routing_notes"],
+        "commit_attribution": _json_value(row["commit_attribution_json"], {}),
+        "visibility": row["visibility"],
+        "status": row["status"],
         "metadata": _json_value(row["metadata_json"], {}),
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
@@ -4970,6 +5021,25 @@ def _work_request_meta(body: Any) -> dict[str, str]:
     }
 
 
+def _clean_work_agent_skills(values: list[str] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        skill = _clean_short_text(value, "", limit=220)
+        if not skill or skill in seen:
+            continue
+        cleaned.append(skill)
+        seen.add(skill)
+    return cleaned
+
+
+def _clean_work_agent_hint_status(value: str | None, *, default: str = "active") -> str:
+    status = _clean_short_text(value, default, limit=40)
+    if status not in {"active", "archived"}:
+        raise HTTPException(400, "Kanban agent hints status is invalid")
+    return status
+
+
 def _require_work_state(conn: Any, state_id: str | None) -> Any:
     clean_state = _clean_short_text(state_id, "todo", limit=80)
     row = conn.execute(
@@ -7904,6 +7974,159 @@ async def record_work_item_commit(
         "ok": True,
         "commit": _row_to_work_commit(commit_row),
         "audit": {"audit_id": audit_id, "action": "record_work_commit", "result": "ok"},
+    }
+
+
+@router.get("/kanban/items/{item_id}/agent-hints")
+async def get_work_item_agent_hints(item_id: str) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        row = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (clean_item_id,),
+        ).fetchone()
+        return {
+            "ok": True,
+            "item": _row_to_work_item(item),
+            "agent_hints": _row_to_work_agent_hints(row, clean_item_id),
+        }
+
+
+@router.put("/kanban/items/{item_id}/agent-hints")
+async def update_work_item_agent_hints(
+    item_id: str, body: WorkAgentHintsUpdateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    hint_id = _kanban_agent_hints_id(clean_item_id)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        existing = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (clean_item_id,),
+        ).fetchone()
+        required_skills = (
+            _clean_work_agent_skills(body.required_skills)
+            if body.required_skills is not None
+            else (_json_value(existing["required_skills_json"], []) if existing is not None else [])
+        )
+        routing_notes = (
+            _body_excerpt(body.routing_notes, limit=6000)
+            if body.routing_notes is not None
+            else (existing["routing_notes"] if existing is not None else "")
+        )
+        commit_attribution = (
+            dict(body.commit_attribution)
+            if isinstance(body.commit_attribution, dict)
+            else (
+                _json_value(existing["commit_attribution_json"], {}) if existing is not None else {}
+            )
+        )
+        metadata = (
+            dict(body.metadata)
+            if isinstance(body.metadata, dict)
+            else (_json_value(existing["metadata_json"], {}) if existing is not None else {})
+        )
+        status = _clean_work_agent_hint_status(
+            body.status,
+            default=existing["status"] if existing is not None else "active",
+        )
+        row = {
+            "hint_id": existing["hint_id"] if existing is not None else hint_id,
+            "item_id": clean_item_id,
+            "required_skills_json": json.dumps(required_skills, ensure_ascii=True),
+            "routing_notes": routing_notes,
+            "commit_attribution_json": json.dumps(
+                commit_attribution,
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "visibility": "agent",
+            "status": status,
+            "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+            "provenance_json": json.dumps(
+                {
+                    "schema": "xarta.kanban.agent_hints.provenance.v1",
+                    "visibility": "agent",
+                    "recorded_by": meta["actor"],
+                    "source_surface": meta["source_surface"],
+                    "request_id": meta["request_id"],
+                    "run_id": meta["run_id"],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "created_at": existing["created_at"] if existing is not None else now,
+            "updated_at": now,
+        }
+        source_hash = _hash_json_payload(row)
+        conn.execute(
+            """
+            INSERT INTO kanban_agent_hints (
+                hint_id, item_id, required_skills_json, routing_notes,
+                commit_attribution_json, visibility, status, metadata_json,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :hint_id, :item_id, :required_skills_json, :routing_notes,
+                :commit_attribution_json, :visibility, :status, :metadata_json,
+                :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(item_id) DO UPDATE SET
+                required_skills_json=excluded.required_skills_json,
+                routing_notes=excluded.routing_notes,
+                commit_attribution_json=excluded.commit_attribution_json,
+                visibility=excluded.visibility,
+                status=excluded.status,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        hint_row = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (clean_item_id,),
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_agent_hints",
+            target_ref=f"kanban_agent_hints:{hint_row['hint_id']}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "required_skill_count": len(required_skills),
+                "has_routing_notes": bool(routing_notes),
+                "has_commit_attribution": bool(commit_attribution),
+                "upsert": "updated" if existing is not None else "inserted",
+                "visibility": "agent",
+            },
+        )
+        gen = increment_gen(conn, "kanban-agent-hints")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_agent_hints",
+            hint_row["hint_id"],
+            dict(hint_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "agent_hints": _row_to_work_agent_hints(hint_row, clean_item_id),
+        "audit": {"audit_id": audit_id, "action": "update_work_agent_hints", "result": "ok"},
     }
 
 

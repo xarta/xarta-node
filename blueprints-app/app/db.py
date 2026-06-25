@@ -739,6 +739,22 @@ CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_item
 CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_commit
     ON kanban_item_commits(repo_full_name, sha);
 
+CREATE TABLE IF NOT EXISTS kanban_agent_hints (
+    hint_id                 TEXT PRIMARY KEY,
+    item_id                 TEXT NOT NULL UNIQUE,
+    required_skills_json    TEXT NOT NULL DEFAULT '[]',
+    routing_notes           TEXT NOT NULL DEFAULT '',
+    commit_attribution_json TEXT NOT NULL DEFAULT '{}',
+    visibility              TEXT NOT NULL DEFAULT 'agent',
+    status                  TEXT NOT NULL DEFAULT 'active',
+    metadata_json           TEXT NOT NULL DEFAULT '{}',
+    provenance_json         TEXT NOT NULL DEFAULT '{}',
+    created_at              TEXT DEFAULT (datetime('now')),
+    updated_at              TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_agent_hints_item
+    ON kanban_agent_hints(item_id, status);
+
 CREATE TABLE IF NOT EXISTS kanban_blockers (
     blocker_id           TEXT PRIMARY KEY,
     item_id              TEXT NOT NULL,

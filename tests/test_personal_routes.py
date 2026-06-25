@@ -391,6 +391,19 @@ def _make_conn() -> sqlite3.Connection:
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             UNIQUE(item_id, repo_full_name, sha)
         );
+        CREATE TABLE kanban_agent_hints (
+            hint_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL UNIQUE,
+            required_skills_json TEXT NOT NULL DEFAULT '[]',
+            routing_notes TEXT NOT NULL DEFAULT '',
+            commit_attribution_json TEXT NOT NULL DEFAULT '{}',
+            visibility TEXT NOT NULL DEFAULT 'agent',
+            status TEXT NOT NULL DEFAULT 'active',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE kanban_blockers (
             blocker_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL,
@@ -2315,6 +2328,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_items") == "item_id"
     assert "kanban_item_commits" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_item_commits") == "commit_link_id"
+    assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
 
     created = asyncio.run(
         routes_personal.create_work_item(
@@ -3046,6 +3061,86 @@ def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     )
     targets = {link["target_ref"] for link in commit_links["links"]}
     assert {"kanban_items:work-commit-a", "kanban_items:work-commit-b"}.issubset(targets)
+
+
+def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    created = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-agent-hints",
+                title="Agent hints proof",
+                body="Visible card text",
+                state_id="todo",
+                priority_id="high",
+                tags=["agent-ledger"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="agent-hints-create",
+            )
+        )
+    )
+    assert created["item"]["item_id"] == "work-agent-hints"
+    conn.execute("DELETE FROM sync_queue")
+
+    empty = asyncio.run(routes_personal.get_work_item_agent_hints("work-agent-hints"))
+    assert empty["agent_hints"]["exists"] is False
+    assert empty["agent_hints"]["required_skills"] == []
+
+    detail_before = asyncio.run(routes_personal.get_work_item_detail("work-agent-hints"))
+    assert "agent_hints" not in detail_before
+    board = asyncio.run(routes_personal.get_work_root_board())
+    board_item = next(
+        item
+        for column in board["board"]["columns"]
+        for item in column["items"]
+        if item["item_id"] == "work-agent-hints"
+    )
+    assert "agent_hints" not in board_item
+
+    updated = asyncio.run(
+        routes_personal.update_work_item_agent_hints(
+            "work-agent-hints",
+            routes_personal.WorkAgentHintsUpdateRequest(
+                required_skills=[
+                    "blueprints-work-management",
+                    "git-operations",
+                    "blueprints-work-management",
+                ],
+                routing_notes="Use the Kanban helper before committing.",
+                commit_attribution={"mode": "explicit_item", "require_commit_link": True},
+                metadata={"slice": "hints-schema"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="agent-hints-update",
+            ),
+        )
+    )
+    hints = updated["agent_hints"]
+    assert hints["exists"] is True
+    assert hints["visibility"] == "agent"
+    assert hints["required_skills"] == ["blueprints-work-management", "git-operations"]
+    assert hints["commit_attribution"]["require_commit_link"] is True
+    assert hints["metadata"]["slice"] == "hints-schema"
+    assert hints["provenance"]["recorded_by"] == "codex-test"
+
+    detail_after = asyncio.run(routes_personal.get_work_item_detail("work-agent-hints"))
+    assert "agent_hints" not in detail_after
+    row = conn.execute(
+        "SELECT * FROM kanban_agent_hints WHERE item_id='work-agent-hints'"
+    ).fetchone()
+    assert row is not None
+    assert row["visibility"] == "agent"
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_agent_hints" in sync_tables
+    assert "kanban_audit_log" in sync_tables
 
 
 def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):
