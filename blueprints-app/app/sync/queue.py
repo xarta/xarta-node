@@ -22,8 +22,11 @@ from ..db import get_conn
 
 log = logging.getLogger(__name__)
 
+_SYSTEM_ACTION_TYPES = ("sync_git_outer", "sync_git_non_root", "sync_git_inner")
+
 
 # ── Enqueue ───────────────────────────────────────────────────────────────────
+
 
 def enqueue(
     conn: sqlite3.Connection,
@@ -101,9 +104,29 @@ def enqueue_for_all_peers(
 
 # ── Query ─────────────────────────────────────────────────────────────────────
 
+
 def get_pending_actions(target_node_id: str, limit: int = 50) -> list[dict]:
-    """Return the oldest unsent actions for a peer, in FIFO order."""
+    """Return pending actions for a peer.
+
+    Git-pull system actions get priority over regular DB writes and are
+    returned alone. A stale peer should pull newer code before it receives
+    any more data rows from that newer runtime.
+    """
     with get_conn() as conn:
+        system_rows = conn.execute(
+            """
+            SELECT queue_id, action_type, table_name, row_id, row_data, gen, guid
+            FROM   sync_queue
+            WHERE  target_node_id=? AND sent=0
+              AND  action_type IN (?, ?, ?)
+            ORDER  BY queue_id ASC
+            LIMIT  ?
+            """,
+            (target_node_id, *_SYSTEM_ACTION_TYPES, limit),
+        ).fetchall()
+        if system_rows:
+            return [dict(r) for r in system_rows]
+
         rows = conn.execute(
             """
             SELECT queue_id, action_type, table_name, row_id, row_data, gen, guid
@@ -165,8 +188,8 @@ def purge_unsent_db_actions(target_node_id: str) -> int:
         cur = conn.execute(
             "UPDATE sync_queue SET sent=1 "
             "WHERE target_node_id=? AND sent=0 "
-            "AND action_type NOT IN ('sync_git_outer', 'sync_git_inner')",
-            (target_node_id,),
+            "AND action_type NOT IN (?, ?, ?)",
+            (target_node_id, *_SYSTEM_ACTION_TYPES),
         )
     return cur.rowcount
 
@@ -174,9 +197,7 @@ def purge_unsent_db_actions(target_node_id: str) -> int:
 def get_peer_url(node_id: str) -> str | None:
     """Look up the first address URL for a registered peer node."""
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT addresses FROM nodes WHERE node_id=?", (node_id,)
-        ).fetchone()
+        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
     if not row or not row["addresses"]:
         return None
     try:
