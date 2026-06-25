@@ -2160,7 +2160,7 @@ def _upsert_graph_link(conn: Any, payload: dict[str, Any]) -> str:
         "SELECT * FROM personal_graph_links WHERE link_id=?", (payload["link_id"],)
     ).fetchone()
     if existing:
-        comparable = [
+        semantic_fields = [
             "source_ref",
             "source_table",
             "source_id",
@@ -2173,10 +2173,8 @@ def _upsert_graph_link(conn: Any, payload: dict[str, Any]) -> str:
             "title",
             "metadata_json",
             "provenance_json",
-            "created_by",
-            "request_id",
         ]
-        if all(str(existing[key] or "") == str(payload[key] or "") for key in comparable):
+        if all(str(existing[key] or "") == str(payload[key] or "") for key in semantic_fields):
             return "unchanged"
         payload = {**payload, "created_at": existing["created_at"]}
         result = "updated"
