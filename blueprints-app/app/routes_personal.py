@@ -400,6 +400,45 @@ class WorkAgentHintsUpdateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkAgentSessionCreateRequest(BaseModel):
+    session_id: str | None = None
+    agent_id: str
+    node_id: str | None = None
+    worktree_path: str | None = None
+    repo_full_name: str | None = None
+    branch: str | None = None
+    status: str = "active"
+    started_at: str | None = None
+    ended_at: str | None = None
+    last_seen_at: str | None = None
+    request_hash: str | None = None
+    source_surface: str = "kanban-agent-session-api"
+    summary: str | None = None
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkAgentSessionUpdateRequest(BaseModel):
+    agent_id: str | None = None
+    node_id: str | None = None
+    worktree_path: str | None = None
+    repo_full_name: str | None = None
+    branch: str | None = None
+    status: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    last_seen_at: str | None = None
+    request_hash: str | None = None
+    source_surface: str = "kanban-agent-session-api"
+    summary: str | None = None
+    metadata: dict[str, Any] | None = None
+    actor: str = "blueprints-ui"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class PersonalGraphLinkCreateRequest(BaseModel):
     source_ref: str
     target_ref: str
@@ -657,6 +696,30 @@ def _row_to_work_agent_hints(row: Any | None, item_id: str) -> dict[str, Any]:
         "commit_attribution": _json_value(row["commit_attribution_json"], {}),
         "visibility": row["visibility"],
         "status": row["status"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_work_agent_session(row: Any) -> dict[str, Any]:
+    return {
+        "schema": "xarta.kanban.agent_session.v1",
+        "session_id": row["session_id"],
+        "item_id": row["item_id"],
+        "agent_id": row["agent_id"],
+        "node_id": row["node_id"],
+        "worktree_path": row["worktree_path"],
+        "repo_full_name": row["repo_full_name"],
+        "branch": row["branch"],
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "last_seen_at": row["last_seen_at"],
+        "request_hash": row["request_hash"],
+        "source_surface": row["source_surface"],
+        "summary": row["summary"],
         "metadata": _json_value(row["metadata_json"], {}),
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
@@ -5040,6 +5103,17 @@ def _clean_work_agent_hint_status(value: str | None, *, default: str = "active")
     return status
 
 
+def _clean_work_agent_session_status(value: str | None, *, default: str = "active") -> str:
+    status = _clean_short_text(value, default, limit=40)
+    if status not in {"active", "paused", "done", "abandoned"}:
+        raise HTTPException(400, "Kanban agent session status is invalid")
+    return status
+
+
+def _clean_work_agent_session_id(value: str | None) -> str:
+    return _clean_work_id(value, "kanban-agent-session")
+
+
 def _require_work_state(conn: Any, state_id: str | None) -> Any:
     clean_state = _clean_short_text(state_id, "todo", limit=80)
     row = conn.execute(
@@ -8127,6 +8201,329 @@ async def update_work_item_agent_hints(
         "ok": True,
         "agent_hints": _row_to_work_agent_hints(hint_row, clean_item_id),
         "audit": {"audit_id": audit_id, "action": "update_work_agent_hints", "result": "ok"},
+    }
+
+
+@router.get("/kanban/items/{item_id}/agent-sessions")
+async def list_work_item_agent_sessions(item_id: str, limit: int = 12) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    clean_limit = max(1, min(int(limit or 12), 50))
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        rows = conn.execute(
+            """
+            SELECT * FROM kanban_agent_sessions
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(last_seen_at, ''), updated_at) DESC,
+                     session_id
+            LIMIT ?
+            """,
+            (clean_item_id, clean_limit),
+        ).fetchall()
+        return {
+            "ok": True,
+            "item": _row_to_work_item(item),
+            "count": len(rows),
+            "agent_sessions": [_row_to_work_agent_session(row) for row in rows],
+        }
+
+
+@router.post("/kanban/items/{item_id}/agent-sessions")
+async def create_work_item_agent_session(
+    item_id: str, body: WorkAgentSessionCreateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    session_id = _clean_work_agent_session_id(body.session_id)
+    started_at = _clean_short_text(body.started_at or now, now, limit=80)
+    last_seen_at = _clean_short_text(body.last_seen_at or started_at, started_at, limit=80)
+    status = _clean_work_agent_session_status(body.status)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        row = {
+            "session_id": session_id,
+            "item_id": clean_item_id,
+            "agent_id": _clean_short_text(body.agent_id, "", limit=160),
+            "node_id": _clean_short_text(body.node_id or "", "", limit=120),
+            "worktree_path": _clean_short_text(body.worktree_path or "", "", limit=500),
+            "repo_full_name": _clean_short_text(body.repo_full_name or "", "", limit=240),
+            "branch": _clean_short_text(body.branch or "", "", limit=160),
+            "status": status,
+            "started_at": started_at,
+            "ended_at": _clean_short_text(body.ended_at or "", "", limit=80),
+            "last_seen_at": last_seen_at,
+            "request_hash": _clean_short_text(body.request_hash or "", "", limit=160),
+            "source_surface": meta["source_surface"],
+            "summary": _body_excerpt(body.summary or "", limit=2000),
+            "metadata_json": json.dumps(
+                dict(body.metadata) if isinstance(body.metadata, dict) else {},
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "provenance_json": json.dumps(
+                {
+                    "schema": "xarta.kanban.agent_session.provenance.v1",
+                    "recorded_by": meta["actor"],
+                    "source_surface": meta["source_surface"],
+                    "request_id": meta["request_id"],
+                    "run_id": meta["run_id"],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "created_at": now,
+            "updated_at": now,
+        }
+        if not row["agent_id"]:
+            raise HTTPException(400, "Kanban agent session agent_id is required")
+        source_hash = _hash_json_payload(row)
+        existing = conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if existing is not None and existing["item_id"] != clean_item_id:
+            raise HTTPException(409, "Kanban agent session belongs to another item")
+        if existing is not None:
+            row["created_at"] = existing["created_at"]
+        conn.execute(
+            """
+            INSERT INTO kanban_agent_sessions (
+                session_id, item_id, agent_id, node_id, worktree_path,
+                repo_full_name, branch, status, started_at, ended_at,
+                last_seen_at, request_hash, source_surface, summary,
+                metadata_json, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :session_id, :item_id, :agent_id, :node_id, :worktree_path,
+                :repo_full_name, :branch, :status, :started_at, :ended_at,
+                :last_seen_at, :request_hash, :source_surface, :summary,
+                :metadata_json, :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                agent_id=excluded.agent_id,
+                node_id=excluded.node_id,
+                worktree_path=excluded.worktree_path,
+                repo_full_name=excluded.repo_full_name,
+                branch=excluded.branch,
+                status=excluded.status,
+                started_at=excluded.started_at,
+                ended_at=excluded.ended_at,
+                last_seen_at=excluded.last_seen_at,
+                request_hash=excluded.request_hash,
+                source_surface=excluded.source_surface,
+                summary=excluded.summary,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        session_row = conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="record_work_agent_session",
+            target_ref=f"kanban_agent_sessions:{session_id}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "agent_id": row["agent_id"],
+                "node_id": row["node_id"],
+                "repo_full_name": row["repo_full_name"],
+                "branch": row["branch"],
+                "status": row["status"],
+                "upsert": "updated" if existing is not None else "inserted",
+            },
+        )
+        gen = increment_gen(conn, "kanban-agent-session")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_agent_sessions",
+            session_id,
+            dict(session_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "agent_session": _row_to_work_agent_session(session_row),
+        "audit": {"audit_id": audit_id, "action": "record_work_agent_session", "result": "ok"},
+    }
+
+
+@router.patch("/kanban/agent-sessions/{session_id}")
+async def update_work_agent_session(
+    session_id: str, body: WorkAgentSessionUpdateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_session_id = _clean_work_agent_session_id(session_id)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (clean_session_id,),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(404, "Kanban agent session not found")
+        item = _work_item_or_404(conn, existing["item_id"])
+        status = _clean_work_agent_session_status(
+            body.status,
+            default=existing["status"],
+        )
+        metadata = (
+            dict(body.metadata)
+            if isinstance(body.metadata, dict)
+            else _json_value(existing["metadata_json"], {})
+        )
+        row = {
+            "session_id": clean_session_id,
+            "agent_id": (
+                _clean_short_text(body.agent_id, "", limit=160)
+                if body.agent_id is not None
+                else existing["agent_id"]
+            ),
+            "node_id": (
+                _clean_short_text(body.node_id, "", limit=120)
+                if body.node_id is not None
+                else existing["node_id"]
+            ),
+            "worktree_path": (
+                _clean_short_text(body.worktree_path, "", limit=500)
+                if body.worktree_path is not None
+                else existing["worktree_path"]
+            ),
+            "repo_full_name": (
+                _clean_short_text(body.repo_full_name, "", limit=240)
+                if body.repo_full_name is not None
+                else existing["repo_full_name"]
+            ),
+            "branch": (
+                _clean_short_text(body.branch, "", limit=160)
+                if body.branch is not None
+                else existing["branch"]
+            ),
+            "status": status,
+            "started_at": (
+                _clean_short_text(body.started_at, "", limit=80)
+                if body.started_at is not None
+                else existing["started_at"]
+            ),
+            "ended_at": (
+                _clean_short_text(body.ended_at, "", limit=80)
+                if body.ended_at is not None
+                else (
+                    now if status == "done" and not existing["ended_at"] else existing["ended_at"]
+                )
+            ),
+            "last_seen_at": (
+                _clean_short_text(body.last_seen_at, "", limit=80)
+                if body.last_seen_at is not None
+                else now
+            ),
+            "request_hash": (
+                _clean_short_text(body.request_hash, "", limit=160)
+                if body.request_hash is not None
+                else existing["request_hash"]
+            ),
+            "source_surface": meta["source_surface"],
+            "summary": (
+                _body_excerpt(body.summary, limit=2000)
+                if body.summary is not None
+                else existing["summary"]
+            ),
+            "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+            "provenance_json": json.dumps(
+                {
+                    "schema": "xarta.kanban.agent_session.provenance.v1",
+                    "recorded_by": meta["actor"],
+                    "source_surface": meta["source_surface"],
+                    "request_id": meta["request_id"],
+                    "run_id": meta["run_id"],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            "updated_at": now,
+        }
+        if not row["agent_id"]:
+            raise HTTPException(400, "Kanban agent session agent_id is required")
+        source_hash = _hash_json_payload(row)
+        conn.execute(
+            """
+            UPDATE kanban_agent_sessions SET
+                agent_id=:agent_id,
+                node_id=:node_id,
+                worktree_path=:worktree_path,
+                repo_full_name=:repo_full_name,
+                branch=:branch,
+                status=:status,
+                started_at=:started_at,
+                ended_at=:ended_at,
+                last_seen_at=:last_seen_at,
+                request_hash=:request_hash,
+                source_surface=:source_surface,
+                summary=:summary,
+                metadata_json=:metadata_json,
+                provenance_json=:provenance_json,
+                updated_at=:updated_at
+            WHERE session_id=:session_id
+            """,
+            row,
+        )
+        session_row = conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (clean_session_id,),
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="update_work_agent_session",
+            target_ref=f"kanban_agent_sessions:{clean_session_id}",
+            item_id=existing["item_id"],
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "agent_id": row["agent_id"],
+                "node_id": row["node_id"],
+                "repo_full_name": row["repo_full_name"],
+                "branch": row["branch"],
+                "status": row["status"],
+            },
+        )
+        gen = increment_gen(conn, "kanban-agent-session")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_agent_sessions",
+            clean_session_id,
+            dict(session_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "agent_session": _row_to_work_agent_session(session_row),
+        "audit": {"audit_id": audit_id, "action": "update_work_agent_session", "result": "ok"},
     }
 
 

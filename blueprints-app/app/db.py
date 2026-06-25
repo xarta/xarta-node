@@ -755,6 +755,31 @@ CREATE TABLE IF NOT EXISTS kanban_agent_hints (
 CREATE INDEX IF NOT EXISTS idx_kanban_agent_hints_item
     ON kanban_agent_hints(item_id, status);
 
+CREATE TABLE IF NOT EXISTS kanban_agent_sessions (
+    session_id       TEXT PRIMARY KEY,
+    item_id          TEXT NOT NULL,
+    agent_id         TEXT NOT NULL DEFAULT '',
+    node_id          TEXT NOT NULL DEFAULT '',
+    worktree_path    TEXT NOT NULL DEFAULT '',
+    repo_full_name   TEXT NOT NULL DEFAULT '',
+    branch           TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'active',
+    started_at       TEXT NOT NULL DEFAULT '',
+    ended_at         TEXT NOT NULL DEFAULT '',
+    last_seen_at     TEXT NOT NULL DEFAULT '',
+    request_hash     TEXT NOT NULL DEFAULT '',
+    source_surface   TEXT NOT NULL DEFAULT '',
+    summary          TEXT NOT NULL DEFAULT '',
+    metadata_json    TEXT NOT NULL DEFAULT '{}',
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_agent_sessions_item
+    ON kanban_agent_sessions(item_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_agent_sessions_agent
+    ON kanban_agent_sessions(agent_id, node_id, updated_at);
+
 CREATE TABLE IF NOT EXISTS kanban_blockers (
     blocker_id           TEXT PRIMARY KEY,
     item_id              TEXT NOT NULL,
