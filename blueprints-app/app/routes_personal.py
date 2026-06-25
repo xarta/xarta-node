@@ -127,6 +127,32 @@ KANBAN_SHOW_TEST_ENTRIES_SETTING = "personal.kanban.show_test_entries"
 KANBAN_TAG = "kanban"
 KANBAN_AGENT_WORKING_OUT_TAG = "agent-working-out"
 KANBAN_PROOF_TAG = "proof"
+PERSONAL_FILTER_COLORS = {
+    "red",
+    "yellow",
+    "pink",
+    "green",
+    "purple",
+    "orange",
+    "blue",
+    "brown",
+    "white",
+    "black",
+    "grey",
+    "gold",
+}
+PERSONAL_FILTER_SHAPES = {
+    "circle",
+    "square",
+    "triangle",
+    "star",
+    "pentagon",
+    "rectangle",
+    "rhombus",
+    "semicircle",
+    "crescent",
+}
+PERSONAL_FILTER_FILLS = {"filled", "outline"}
 
 
 class PersonalRehydrateRequest(BaseModel):
@@ -215,6 +241,39 @@ class CalendarEventUpsertRequest(BaseModel):
     related_import_batches: list[str] = []
     actor: str = "blueprints-ui"
     source_surface: str = "calendar-page"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class PersonalFilterTagUpsertRequest(BaseModel):
+    tag_id: str | None = None
+    label: str
+    color: str = "blue"
+    shape: str = "circle"
+    fill: str = "outline"
+    meta_tag_id: str | None = None
+    builtin: bool = False
+    actor: str = "blueprints-ui"
+    source_surface: str = "personal-filters"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class PersonalFilterMetaTagUpsertRequest(BaseModel):
+    meta_tag_id: str | None = None
+    label: str
+    color: str = "blue"
+    priority: int = 0
+    actor: str = "blueprints-ui"
+    source_surface: str = "personal-filters"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class PersonalFilterDeleteRequest(BaseModel):
+    force: bool = False
+    actor: str = "blueprints-ui"
+    source_surface: str = "personal-filters"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -1140,6 +1199,39 @@ def _validate_local_time(value: str | None) -> str | None:
 def _clean_short_text(value: str | None, default: str, *, limit: int = 120) -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     return (text or default)[:limit]
+
+
+def _normalise_filter_id(value: Any, default: str = "") -> str:
+    text = re.sub(r"&", " and ", str(value or "").strip().lower())
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or default
+
+
+def _filter_title(value: str) -> str:
+    return " ".join(part[:1].upper() + part[1:] for part in re.split(r"[-_\s]+", value) if part)
+
+
+def _clean_filter_color(value: str | None, default: str = "blue") -> str:
+    clean = _clean_short_text(value, default, limit=32).lower()
+    return clean if clean in PERSONAL_FILTER_COLORS else default
+
+
+def _clean_filter_shape(value: str | None, default: str = "circle") -> str:
+    clean = _clean_short_text(value, default, limit=32).lower()
+    return clean if clean in PERSONAL_FILTER_SHAPES else default
+
+
+def _clean_filter_fill(value: str | None, default: str = "outline") -> str:
+    clean = _clean_short_text(value, default, limit=32).lower()
+    return clean if clean in PERSONAL_FILTER_FILLS else default
+
+
+def _clean_filter_priority(value: Any) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = 0
+    return max(0, min(999, numeric))
 
 
 def _kanban_item_id_from_share_ref(value: Any) -> str:
@@ -9411,6 +9503,435 @@ async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
         "item": _row_to_work_item(item_row),
         "audit": {"audit_id": audit_id, "action": "promote_work_item", "result": "ok"},
     }
+
+
+def _row_to_filter_meta_tag(row: Any) -> dict[str, Any]:
+    return {
+        "meta_tag_id": row["meta_tag_id"],
+        "id": row["meta_tag_id"],
+        "label": row["label"],
+        "color": row["color"],
+        "priority": int(row["priority"] or 0),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_filter_tag(
+    row: Any, usage_count: int = 0, *, source: str = "registry"
+) -> dict[str, Any]:
+    return {
+        "tag_id": row["tag_id"],
+        "id": row["tag_id"],
+        "label": row["label"],
+        "color": row["color"],
+        "shape": row["shape"],
+        "fill": row["fill"],
+        "meta_tag_id": row["meta_tag_id"] or "",
+        "group": row["meta_tag_id"] or "",
+        "builtin": bool(row["builtin"]),
+        "custom": not bool(row["builtin"]),
+        "source": source,
+        "usage_count": usage_count,
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _tag_values_from_row(row: Any) -> list[str]:
+    return [
+        _normalise_filter_id(tag)
+        for tag in _json_value(row["tags_json"], [])
+        if _normalise_filter_id(tag)
+    ]
+
+
+def _personal_filter_usage_counts(conn: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table_name in ("personal_events", "personal_time_tasks", "kanban_items"):
+        try:
+            rows = conn.execute(f"SELECT tags_json FROM {table_name}").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for row in rows:
+            for tag_id in set(_tag_values_from_row(row)):
+                counts[tag_id] = counts.get(tag_id, 0) + 1
+    return counts
+
+
+def _personal_filter_registry_payload(conn: Any) -> dict[str, Any]:
+    usage_counts = _personal_filter_usage_counts(conn)
+    meta_rows = conn.execute(
+        "SELECT * FROM personal_filter_meta_tags ORDER BY priority DESC, label, meta_tag_id"
+    ).fetchall()
+    tag_rows = conn.execute("SELECT * FROM personal_filter_tags ORDER BY label, tag_id").fetchall()
+    tags = {
+        row["tag_id"]: _row_to_filter_tag(
+            row,
+            usage_counts.get(row["tag_id"], 0),
+            source="registry",
+        )
+        for row in tag_rows
+    }
+    now = _utc_now_iso()
+    for tag_id, count in usage_counts.items():
+        if tag_id in tags:
+            continue
+        tags[tag_id] = {
+            "tag_id": tag_id,
+            "id": tag_id,
+            "label": _filter_title(tag_id) or tag_id,
+            "color": "blue",
+            "shape": "circle",
+            "fill": "outline",
+            "meta_tag_id": "",
+            "group": "",
+            "builtin": False,
+            "custom": False,
+            "source": "discovered",
+            "usage_count": count,
+            "provenance": {
+                "schema": "xarta.personal.filter_tag.discovered.v1",
+                "note": "Tag discovered from durable record tags_json; save it to persist presentation settings.",
+            },
+            "created_at": "",
+            "updated_at": now,
+        }
+    return {
+        "ok": True,
+        "schema": "xarta.personal.filters.v1",
+        "meta_tags": [_row_to_filter_meta_tag(row) for row in meta_rows],
+        "tags": sorted(
+            tags.values(), key=lambda item: (str(item["label"]).lower(), item["tag_id"])
+        ),
+        "usage_counts": usage_counts,
+    }
+
+
+def _personal_filter_body_meta(body: Any, default_request_id: str) -> dict[str, str]:
+    request_id = _clean_short_text(body.request_id, default_request_id, limit=160)
+    return {
+        "actor": _clean_short_text(body.actor, "blueprints-ui", limit=80),
+        "source_surface": _clean_short_text(body.source_surface, "personal-filters", limit=120),
+        "request_id": request_id,
+        "run_id": _clean_short_text(body.run_id or body.request_id, request_id, limit=160),
+    }
+
+
+@router.get("/filters")
+async def list_personal_filters() -> dict[str, Any]:
+    with get_conn() as conn:
+        return _personal_filter_registry_payload(conn)
+
+
+@router.post("/filters/meta-tags")
+async def upsert_personal_filter_meta_tag(
+    body: PersonalFilterMetaTagUpsertRequest,
+) -> dict[str, Any]:
+    label = _clean_short_text(body.label, "", limit=80)
+    if not label:
+        raise HTTPException(400, "meta tag label is required")
+    meta_tag_id = _normalise_filter_id(body.meta_tag_id or label)
+    if not meta_tag_id:
+        raise HTTPException(400, "meta tag id is required")
+    now = _utc_now_iso()
+    request_meta = _personal_filter_body_meta(
+        body, f"personal-filter-meta-tag-{uuid.uuid4().hex[:12]}"
+    )
+    provenance = {
+        "schema": "xarta.personal.filter_meta_tag.v1",
+        **request_meta,
+    }
+    with get_conn() as conn:
+        previous = conn.execute(
+            "SELECT created_at FROM personal_filter_meta_tags WHERE meta_tag_id=?",
+            (meta_tag_id,),
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO personal_filter_meta_tags (
+                meta_tag_id, label, color, priority, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(meta_tag_id) DO UPDATE SET
+                label=excluded.label,
+                color=excluded.color,
+                priority=excluded.priority,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                meta_tag_id,
+                label,
+                _clean_filter_color(body.color),
+                _clean_filter_priority(body.priority),
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM personal_filter_meta_tags WHERE meta_tag_id=?",
+            (meta_tag_id,),
+        ).fetchone()
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=request_meta["actor"],
+            source_surface=request_meta["source_surface"],
+            action="upsert_personal_filter_meta_tag",
+            target_ref=f"personal_filter_meta_tags:{meta_tag_id}",
+            file_ref="",
+            db_ref=f"personal_filter_meta_tags:{meta_tag_id}",
+            created_at=now,
+            request_id=request_meta["request_id"],
+            run_id=request_meta["run_id"],
+            result="ok",
+            source_hash=_hash_json_payload(dict(row)),
+            metadata={"meta_tag_id": meta_tag_id},
+        )
+        gen = increment_gen(conn, "personal-filter-meta-tag")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "personal_filter_meta_tags", meta_tag_id, dict(row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {"ok": True, "meta_tag": _row_to_filter_meta_tag(row), "audit": audit_row}
+
+
+@router.patch("/filters/meta-tags/{meta_tag_id}")
+async def update_personal_filter_meta_tag(
+    meta_tag_id: str,
+    body: PersonalFilterMetaTagUpsertRequest,
+) -> dict[str, Any]:
+    return await upsert_personal_filter_meta_tag(
+        PersonalFilterMetaTagUpsertRequest(
+            meta_tag_id=meta_tag_id,
+            label=body.label,
+            color=body.color,
+            priority=body.priority,
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        )
+    )
+
+
+@router.delete("/filters/meta-tags/{meta_tag_id}")
+async def delete_personal_filter_meta_tag(
+    meta_tag_id: str,
+    body: PersonalFilterDeleteRequest,
+) -> dict[str, Any]:
+    clean = _normalise_filter_id(meta_tag_id)
+    if not clean:
+        raise HTTPException(400, "meta tag id is required")
+    now = _utc_now_iso()
+    request_meta = _personal_filter_body_meta(
+        body, f"personal-filter-meta-delete-{uuid.uuid4().hex[:12]}"
+    )
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM personal_filter_meta_tags WHERE meta_tag_id=?",
+            (clean,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "meta tag not found")
+        assigned = conn.execute(
+            "SELECT * FROM personal_filter_tags WHERE meta_tag_id=?",
+            (clean,),
+        ).fetchall()
+        if assigned and not body.force:
+            raise HTTPException(400, "meta tag is assigned to filter tags")
+        if assigned:
+            for tag_row in assigned:
+                conn.execute(
+                    "UPDATE personal_filter_tags SET meta_tag_id='', updated_at=? WHERE tag_id=?",
+                    (now, tag_row["tag_id"]),
+                )
+        conn.execute("DELETE FROM personal_filter_meta_tags WHERE meta_tag_id=?", (clean,))
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=request_meta["actor"],
+            source_surface=request_meta["source_surface"],
+            action="delete_personal_filter_meta_tag",
+            target_ref=f"personal_filter_meta_tags:{clean}",
+            file_ref="",
+            db_ref=f"personal_filter_meta_tags:{clean}",
+            created_at=now,
+            request_id=request_meta["request_id"],
+            run_id=request_meta["run_id"],
+            result="ok",
+            source_hash=_hash_json_payload(dict(row)),
+            metadata={"meta_tag_id": clean, "cleared_filter_tag_count": len(assigned)},
+        )
+        gen = increment_gen(conn, "personal-filter-meta-tag-delete")
+        for tag_row in assigned:
+            updated = conn.execute(
+                "SELECT * FROM personal_filter_tags WHERE tag_id=?",
+                (tag_row["tag_id"],),
+            ).fetchone()
+            enqueue_for_all_peers(
+                conn, "UPDATE", "personal_filter_tags", tag_row["tag_id"], dict(updated), gen
+            )
+        enqueue_for_all_peers(conn, "DELETE", "personal_filter_meta_tags", clean, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {"ok": True, "meta_tag_id": clean, "audit": audit_row}
+
+
+@router.post("/filters/tags")
+async def upsert_personal_filter_tag(body: PersonalFilterTagUpsertRequest) -> dict[str, Any]:
+    label = _clean_short_text(body.label, "", limit=80)
+    if not label:
+        raise HTTPException(400, "filter tag label is required")
+    tag_id = _normalise_filter_id(body.tag_id or label)
+    if not tag_id:
+        raise HTTPException(400, "filter tag id is required")
+    meta_tag_id = _normalise_filter_id(body.meta_tag_id or "")
+    now = _utc_now_iso()
+    request_meta = _personal_filter_body_meta(body, f"personal-filter-tag-{uuid.uuid4().hex[:12]}")
+    provenance = {
+        "schema": "xarta.personal.filter_tag.v1",
+        **request_meta,
+    }
+    with get_conn() as conn:
+        if meta_tag_id:
+            exists = conn.execute(
+                "SELECT meta_tag_id FROM personal_filter_meta_tags WHERE meta_tag_id=?",
+                (meta_tag_id,),
+            ).fetchone()
+            if not exists:
+                raise HTTPException(400, "assigned meta tag does not exist")
+        previous = conn.execute(
+            "SELECT created_at FROM personal_filter_tags WHERE tag_id=?",
+            (tag_id,),
+        ).fetchone()
+        created_at = previous["created_at"] if previous and previous["created_at"] else now
+        conn.execute(
+            """
+            INSERT INTO personal_filter_tags (
+                tag_id, label, color, shape, fill, meta_tag_id, builtin,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tag_id) DO UPDATE SET
+                label=excluded.label,
+                color=excluded.color,
+                shape=excluded.shape,
+                fill=excluded.fill,
+                meta_tag_id=excluded.meta_tag_id,
+                builtin=excluded.builtin,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                tag_id,
+                label,
+                _clean_filter_color(body.color),
+                _clean_filter_shape(body.shape),
+                _clean_filter_fill(body.fill),
+                meta_tag_id,
+                1 if body.builtin else 0,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM personal_filter_tags WHERE tag_id=?", (tag_id,)
+        ).fetchone()
+        usage_count = _personal_filter_usage_counts(conn).get(tag_id, 0)
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=request_meta["actor"],
+            source_surface=request_meta["source_surface"],
+            action="upsert_personal_filter_tag",
+            target_ref=f"personal_filter_tags:{tag_id}",
+            file_ref="",
+            db_ref=f"personal_filter_tags:{tag_id}",
+            created_at=now,
+            request_id=request_meta["request_id"],
+            run_id=request_meta["run_id"],
+            result="ok",
+            source_hash=_hash_json_payload(dict(row)),
+            metadata={"tag_id": tag_id, "meta_tag_id": meta_tag_id},
+        )
+        gen = increment_gen(conn, "personal-filter-tag")
+        enqueue_for_all_peers(conn, "UPDATE", "personal_filter_tags", tag_id, dict(row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {"ok": True, "tag": _row_to_filter_tag(row, usage_count), "audit": audit_row}
+
+
+@router.patch("/filters/tags/{tag_id}")
+async def update_personal_filter_tag(
+    tag_id: str,
+    body: PersonalFilterTagUpsertRequest,
+) -> dict[str, Any]:
+    return await upsert_personal_filter_tag(
+        PersonalFilterTagUpsertRequest(
+            tag_id=tag_id,
+            label=body.label,
+            color=body.color,
+            shape=body.shape,
+            fill=body.fill,
+            meta_tag_id=body.meta_tag_id,
+            builtin=body.builtin,
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        )
+    )
+
+
+@router.delete("/filters/tags/{tag_id}")
+async def delete_personal_filter_tag(
+    tag_id: str,
+    body: PersonalFilterDeleteRequest,
+) -> dict[str, Any]:
+    clean = _normalise_filter_id(tag_id)
+    if not clean:
+        raise HTTPException(400, "filter tag id is required")
+    now = _utc_now_iso()
+    request_meta = _personal_filter_body_meta(
+        body, f"personal-filter-tag-delete-{uuid.uuid4().hex[:12]}"
+    )
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_filter_tags WHERE tag_id=?", (clean,)).fetchone()
+        if not row:
+            raise HTTPException(404, "filter tag not found")
+        usage_count = _personal_filter_usage_counts(conn).get(clean, 0)
+        if usage_count and not body.force:
+            raise HTTPException(400, "filter tag is assigned to records")
+        conn.execute("DELETE FROM personal_filter_tags WHERE tag_id=?", (clean,))
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=request_meta["actor"],
+            source_surface=request_meta["source_surface"],
+            action="delete_personal_filter_tag",
+            target_ref=f"personal_filter_tags:{clean}",
+            file_ref="",
+            db_ref=f"personal_filter_tags:{clean}",
+            created_at=now,
+            request_id=request_meta["request_id"],
+            run_id=request_meta["run_id"],
+            result="ok",
+            source_hash=_hash_json_payload(dict(row)),
+            metadata={"tag_id": clean, "usage_count": usage_count},
+        )
+        gen = increment_gen(conn, "personal-filter-tag-delete")
+        enqueue_for_all_peers(conn, "DELETE", "personal_filter_tags", clean, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {"ok": True, "tag_id": clean, "audit": audit_row}
 
 
 def _calendar_event_payload(

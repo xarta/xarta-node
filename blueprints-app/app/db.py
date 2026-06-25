@@ -366,6 +366,33 @@ CREATE TABLE IF NOT EXISTS personal_sources (
 CREATE INDEX IF NOT EXISTS idx_personal_sources_type
     ON personal_sources(source_type, status);
 
+CREATE TABLE IF NOT EXISTS personal_filter_meta_tags (
+    meta_tag_id      TEXT PRIMARY KEY,
+    label            TEXT NOT NULL DEFAULT '',
+    color            TEXT NOT NULL DEFAULT 'blue',
+    priority         INTEGER NOT NULL DEFAULT 0,
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_filter_meta_tags_priority
+    ON personal_filter_meta_tags(priority, label);
+
+CREATE TABLE IF NOT EXISTS personal_filter_tags (
+    tag_id           TEXT PRIMARY KEY,
+    label            TEXT NOT NULL DEFAULT '',
+    color            TEXT NOT NULL DEFAULT 'blue',
+    shape            TEXT NOT NULL DEFAULT 'circle',
+    fill             TEXT NOT NULL DEFAULT 'outline',
+    meta_tag_id      TEXT NOT NULL DEFAULT '',
+    builtin          INTEGER NOT NULL DEFAULT 0,
+    provenance_json  TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_personal_filter_tags_meta
+    ON personal_filter_tags(meta_tag_id, label);
+
 CREATE TABLE IF NOT EXISTS personal_import_batches (
     import_batch_id      TEXT PRIMARY KEY,
     source_type          TEXT NOT NULL,
