@@ -4651,6 +4651,35 @@ def _clean_event_list(values: list[str], *, limit: int = 24) -> list[str]:
     return cleaned
 
 
+def _time_tags(tags: list[str], *, all_day: bool, timed: bool) -> list[str]:
+    cleaned = [tag for tag in _clean_event_list(tags) if tag not in {"all-day", "timed"}]
+    if all_day:
+        cleaned.append("all-day")
+    elif timed:
+        cleaned.append("timed")
+    return cleaned
+
+
+def _operator_event_text_parts(text: str, fallback_title: str = "") -> tuple[str, str]:
+    lines = str(text or "").strip().splitlines()
+    title_index = next((idx for idx, line in enumerate(lines) if line.strip()), -1)
+    if title_index < 0:
+        return _clean_short_text(fallback_title, "Untitled", limit=180), ""
+    title = _clean_short_text(lines[title_index], fallback_title or "Untitled", limit=180)
+    body = "\n".join(lines[title_index + 1 :]).strip()
+    return title, body
+
+
+def _manual_task_id_from_event_row(row: Any) -> str:
+    source_ref = str(row["source_ref"] or "")
+    if source_ref.startswith("personal_time_tasks:"):
+        return source_ref.split(":", 1)[1]
+    provenance = _json_value(row["provenance_json"], {})
+    task_meta = provenance.get("task") if isinstance(provenance, dict) else {}
+    task_id = str(task_meta.get("task_id") or "").strip() if isinstance(task_meta, dict) else ""
+    return task_id or str(row["event_id"] or "")
+
+
 def _task_status(value: str | None) -> str:
     status = _clean_short_text(value, "open", limit=40)
     if status == "completed":
@@ -10143,10 +10172,71 @@ async def update_calendar_event(event_id: str, body: CalendarEventUpsertRequest)
     clean_event_id = _calendar_event_id(event_id, _validate_local_date(body.local_date))
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT event_id FROM personal_events WHERE event_id=?", (clean_event_id,)
+            "SELECT * FROM personal_events WHERE event_id=?", (clean_event_id,)
         ).fetchone()
     if not existing:
         raise HTTPException(404, "calendar event not found")
+    if existing["source_type"] == "manual-task":
+        result = _operator_update_manual_task_event(
+            _manual_task_id_from_event_row(existing),
+            existing,
+            title=_clean_short_text(body.title, existing["title"] or "Untitled", limit=180),
+            body_text=str(body.body or "").strip(),
+            local_date=_validate_local_date(body.local_date),
+            local_time=None if body.all_day else _validate_local_time(body.start_time),
+            all_day=bool(body.all_day),
+            timezone_name=_validate_timezone_name(body.timezone),
+            tags=_time_tags(body.tags, all_day=bool(body.all_day), timed=not bool(body.all_day)),
+            actor=_clean_short_text(body.actor, "blueprints-ui"),
+            source_surface=_clean_short_text(body.source_surface, "calendar-page"),
+            request_id=_clean_short_text(
+                body.request_id, f"calendar-task-edit-{uuid.uuid4().hex[:12]}", limit=160
+            ),
+            run_id=_clean_short_text(
+                body.run_id or body.request_id,
+                body.request_id or f"calendar-task-run-{uuid.uuid4().hex[:12]}",
+                limit=160,
+            ),
+            action="update_calendar_task_event",
+        )
+        if result:
+            return result
+    if existing["source_type"] != "manual-calendar":
+        local_date = _validate_local_date(body.local_date)
+        all_day = bool(body.all_day)
+        start_time = None if all_day else _validate_local_time(body.start_time)
+        end_time = None if all_day else _validate_local_time(body.end_time)
+        timezone_name = _validate_timezone_name(body.timezone)
+        actor = _clean_short_text(body.actor, "blueprints-ui")
+        source_surface = _clean_short_text(body.source_surface, "calendar-page")
+        request_id = _clean_short_text(
+            body.request_id, f"calendar-event-edit-{uuid.uuid4().hex[:12]}", limit=160
+        )
+        run_id = _clean_short_text(
+            body.run_id or body.request_id,
+            body.request_id or f"calendar-run-{uuid.uuid4().hex[:12]}",
+            limit=160,
+        )
+        result = _operator_update_personal_event_row(
+            clean_event_id,
+            title=_clean_short_text(body.title, existing["title"] or "Untitled", limit=180),
+            body_text=str(body.body or "").strip(),
+            content_text=str(body.body or "").strip(),
+            local_date=local_date,
+            range_end_date=local_date,
+            local_time=start_time,
+            end_time=end_time,
+            all_day=all_day,
+            timezone_name=timezone_name,
+            tags=_time_tags(body.tags, all_day=all_day, timed=not all_day),
+            actor=actor,
+            source_surface=source_surface,
+            request_id=request_id,
+            run_id=run_id,
+            action="update_calendar_event",
+            not_found_message="calendar event not found",
+        )
+        return result
     return _upsert_calendar_event(body, event_id=clean_event_id, action="update_calendar_event")
 
 
@@ -10211,16 +10301,284 @@ def _delete_personal_event_row(
     }
 
 
+def _operator_update_manual_task_event(
+    task_id: str,
+    event_row: Any,
+    *,
+    title: str,
+    body_text: str,
+    local_date: str,
+    local_time: str | None,
+    all_day: bool,
+    timezone_name: str,
+    tags: list[str],
+    actor: str,
+    source_surface: str,
+    request_id: str,
+    run_id: str,
+    action: str,
+) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        task_row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+    if not task_row:
+        return None
+    request = PersonalTaskUpsertRequest(
+        task_id=task_id,
+        title=title,
+        body=body_text,
+        mode=task_row["mode"],
+        status=task_row["status"],
+        priority=task_row["priority"],
+        due_date=local_date,
+        due_time=None if all_day else local_time,
+        timezone=timezone_name,
+        privacy_level=task_row["privacy_level"],
+        tags=tags,
+        related_kanban_items=_json_value(task_row["related_kanban_items_json"], []),
+        related_tasks=_json_value(task_row["related_tasks_json"], []),
+        related_import_batches=_json_value(task_row["related_import_batches_json"], []),
+        actor=actor,
+        source_surface=source_surface,
+        request_id=request_id,
+        run_id=run_id,
+    )
+    result = _upsert_personal_task(request, task_id=task_id, action=action)
+    result["day"] = _build_diary_day_payload(
+        result["event"].get("local_date") or event_row["local_date"] or local_date
+    )
+    return result
+
+
+def _operator_update_personal_event_row(
+    event_id: str,
+    *,
+    title: str,
+    body_text: str,
+    content_text: str,
+    local_date: str,
+    range_end_date: str,
+    local_time: str | None,
+    end_time: str | None,
+    all_day: bool,
+    timezone_name: str,
+    tags: list[str],
+    actor: str,
+    source_surface: str,
+    request_id: str,
+    run_id: str,
+    action: str,
+    not_found_message: str,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    start_at = _calendar_utc_iso(local_date, local_time, timezone_name)
+    end_at = (
+        _calendar_utc_iso(range_end_date, end_time, timezone_name)
+        if end_time and not all_day
+        else None
+    )
+    source_hash = _hash_json_payload(
+        {
+            "event_id": event_id,
+            "title": title,
+            "content": content_text,
+            "local_date": local_date,
+            "local_time": local_time,
+            "end_time": end_time,
+            "tags": tags,
+        }
+    )
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, not_found_message)
+        db_refs = _json_value(row["db_refs_json"], [])
+        audit_ref = f"personal_time_audit:{audit_id}"
+        if audit_ref not in db_refs:
+            db_refs.append(audit_ref)
+        provenance = _json_value(row["provenance_json"], {})
+        if not isinstance(provenance, dict):
+            provenance = {}
+        provenance["calendar"] = {
+            "all_day": bool(all_day),
+            "local_start_time": local_time or "",
+            "local_end_time": end_time or "",
+            "local_end_date": range_end_date,
+            "timezone": timezone_name,
+        }
+        provenance["operator_edit"] = {
+            "edited_at": now,
+            "edited_by": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "run_id": run_id,
+            "preserved_source_type": row["source_type"],
+        }
+        conn.execute(
+            """
+            UPDATE personal_events
+            SET source_hash=?,
+                title=?,
+                body_excerpt=?,
+                content_projection=?,
+                start_at=?,
+                end_at=?,
+                local_date=?,
+                timezone=?,
+                tags_json=?,
+                db_refs_json=?,
+                provenance_json=?,
+                projection_state='hot',
+                provenance_state='linked',
+                last_rendered_at=?,
+                updated_at=?
+            WHERE event_id=?
+            """,
+            (
+                source_hash,
+                title,
+                _body_excerpt(body_text or content_text, limit=2000),
+                content_text,
+                start_at,
+                end_at,
+                local_date,
+                timezone_name,
+                json.dumps(tags, ensure_ascii=True),
+                json.dumps(db_refs, ensure_ascii=True),
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                now,
+                event_id,
+            ),
+        )
+        updated = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action=action,
+            target_ref=f"personal_events:{event_id}",
+            file_ref="",
+            db_ref=f"personal_events:{event_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "event_id": event_id,
+                "local_date": local_date,
+                "kind": row["kind"],
+                "source_type": row["source_type"],
+                "operator_override": True,
+            },
+        )
+        gen = increment_gen(conn, "personal-event-operator-edit")
+        enqueue_for_all_peers(conn, "UPDATE", "personal_events", event_id, dict(updated), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "event": _row_to_event(updated),
+        "audit": {
+            "audit_id": audit_id,
+            "actor": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "result": "ok",
+            "action": action,
+        },
+    }
+
+
+def _operator_delete_manual_task_event(
+    task_id: str,
+    body: PersonalEventDeleteRequest,
+    *,
+    action: str,
+    not_found_message: str,
+) -> dict[str, Any] | None:
+    actor = _clean_short_text(body.actor, "blueprints-ui")
+    source_surface = _clean_short_text(body.source_surface, "personal-page")
+    request_id = _clean_short_text(body.request_id, f"{action}-{uuid.uuid4().hex[:12]}", limit=160)
+    run_id = _clean_short_text(body.run_id, request_id, limit=160)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        task_row = conn.execute(
+            "SELECT * FROM personal_time_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not task_row:
+            return None
+        event_id = task_row["event_id"] or task_id
+        event_row = conn.execute(
+            "SELECT * FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if not event_row:
+            raise HTTPException(404, not_found_message)
+        source_hash = task_row["source_hash"] or hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+        audit_row = _write_personal_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action=action,
+            target_ref=f"personal_time_tasks:{task_id}",
+            file_ref="",
+            db_ref=f"personal_time_tasks:{task_id}",
+            created_at=now,
+            request_id=request_id,
+            run_id=run_id,
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "task_id": task_id,
+                "event_id": event_id,
+                "source_type": task_row["source_type"],
+                "operator_override": True,
+            },
+        )
+        conn.execute("DELETE FROM personal_time_tasks WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM personal_events WHERE event_id=?", (event_id,))
+        gen = increment_gen(conn, "personal-task-operator-delete")
+        enqueue_for_all_peers(conn, "DELETE", "personal_time_tasks", task_id, {}, gen)
+        enqueue_for_all_peers(conn, "DELETE", "personal_events", event_id, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "event_id": event_id,
+        "deleted_event": _row_to_event(event_row),
+        "deleted_task": _row_to_task(task_row),
+        "audit": {
+            "audit_id": audit_id,
+            "actor": actor,
+            "source_surface": source_surface,
+            "request_id": request_id,
+            "result": "ok",
+            "action": action,
+        },
+    }
+
+
 @router.delete("/calendar/events/{event_id}")
 async def delete_calendar_event(event_id: str, body: PersonalEventDeleteRequest) -> dict[str, Any]:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT source_type FROM personal_events WHERE event_id=?", (event_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
     if not row:
         raise HTTPException(404, "calendar event not found")
-    if row["source_type"] != "manual-calendar":
-        raise HTTPException(400, "only manual calendar events can be deleted here")
+    if row["source_type"] == "manual-task":
+        result = _operator_delete_manual_task_event(
+            _manual_task_id_from_event_row(row),
+            body,
+            action="delete_calendar_event",
+            not_found_message="calendar event not found",
+        )
+        if result:
+            return result
     return _delete_personal_event_row(
         event_id,
         body,
@@ -12700,21 +13058,66 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
     source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "diary entry not found")
-        existing_tags = _json_value(row["tags_json"], [])
-        if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
-            raise HTTPException(400, "only diary quick entries can be edited here")
-        event_tags = _diary_entry_tags(
-            [str(tag).strip() for tag in body.tags if str(tag).strip()],
+    if not row:
+        raise HTTPException(404, "diary entry not found")
+    existing_tags = _json_value(row["tags_json"], [])
+    if row["source_type"] == "manual-task":
+        title, task_body = _operator_event_text_parts(text, row["title"])
+        result = _operator_update_manual_task_event(
+            _manual_task_id_from_event_row(row),
+            row,
+            title=title,
+            body_text=task_body,
+            local_date=local_date,
+            local_time=local_time,
             all_day=all_day,
-            body=text,
+            timezone_name=timezone_name,
+            tags=_time_tags(body.tags, all_day=all_day, timed=bool(local_time)),
             actor=actor,
             source_surface=source_surface,
             request_id=request_id,
             run_id=run_id,
-            existing_kind=row["kind"],
+            action="update_diary_task_event",
         )
+        if result:
+            return result
+    if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
+        title, source_body = _operator_event_text_parts(text, row["title"])
+        result = _operator_update_personal_event_row(
+            event_id,
+            title=title,
+            body_text=source_body,
+            content_text=text,
+            local_date=local_date,
+            range_end_date=range_end_date,
+            local_time=local_time,
+            end_time=end_time,
+            all_day=all_day,
+            timezone_name=timezone_name,
+            tags=_time_tags(body.tags, all_day=all_day, timed=bool(local_time)),
+            actor=actor,
+            source_surface=source_surface,
+            request_id=request_id,
+            run_id=run_id,
+            action="update_diary_source_event",
+            not_found_message="diary entry not found",
+        )
+        result["day"] = _build_diary_day_payload(local_date)
+        return result
+    event_tags = _diary_entry_tags(
+        [str(tag).strip() for tag in body.tags if str(tag).strip()],
+        all_day=all_day,
+        body=text,
+        actor=actor,
+        source_surface=source_surface,
+        request_id=request_id,
+        run_id=run_id,
+        existing_kind=row["kind"],
+    )
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "diary entry not found")
         provenance = _json_value(row["provenance_json"], {})
         provenance["calendar"] = {
             "all_day": bool(all_day),
@@ -12821,14 +13224,20 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
 @router.delete("/diary-day/entries/{event_id}")
 async def delete_diary_day_entry(event_id: str, body: PersonalEventDeleteRequest) -> dict[str, Any]:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT kind, tags_json FROM personal_events WHERE event_id=?", (event_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
     if not row:
         raise HTTPException(404, "diary entry not found")
-    existing_tags = _json_value(row["tags_json"], [])
-    if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
-        raise HTTPException(400, "only diary quick entries can be deleted here")
+    if row["source_type"] == "manual-task":
+        result = _operator_delete_manual_task_event(
+            _manual_task_id_from_event_row(row),
+            body,
+            action="delete_diary_entry",
+            not_found_message="diary entry not found",
+        )
+        if result:
+            local_date = result["deleted_event"].get("local_date") or _validate_local_date(None)
+            result["day"] = _build_diary_day_payload(local_date)
+            return result
     result = _delete_personal_event_row(
         event_id,
         body,

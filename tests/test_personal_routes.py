@@ -1321,6 +1321,168 @@ def test_diary_entry_write_classifies_automation_proof_outside_personal_log(monk
     assert "personal-log" not in json.loads(row["tags_json"])
 
 
+def test_diary_edit_allows_operator_to_update_task_backed_event_tags(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+
+    created = asyncio.run(
+        routes_personal.create_personal_task(
+            routes_personal.PersonalTaskUpsertRequest(
+                title="Step 15 Playwright ToDo proof",
+                body="Original proof body",
+                mode="kanban",
+                status="open",
+                due_date="2026-06-18",
+                tags=["work", "diary", routes_personal.KANBAN_AGENT_WORKING_OUT_TAG],
+                related_kanban_items=["kanban-proof"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="operator-task-create",
+            )
+        )
+    )
+
+    event_id = created["event"]["event_id"]
+    assert "work" in created["task"]["tags"]
+    assert "work" in created["event"]["tags"]
+
+    updated = asyncio.run(
+        routes_personal.update_diary_day_entry(
+            event_id,
+            routes_personal.DiaryEntryUpdateRequest(
+                body="Step 15 Playwright ToDo proof edited\n\nEdited from Diary.",
+                local_date="2026-06-18",
+                all_day=True,
+                tags=[
+                    "todo",
+                    "task",
+                    "due",
+                    routes_personal.KANBAN_AGENT_WORKING_OUT_TAG,
+                    "kanban",
+                    "diary",
+                ],
+                actor="operator",
+                source_surface="diary-page",
+                request_id="operator-task-edit",
+            ),
+        )
+    )
+
+    assert updated["ok"] is True
+    assert updated["event"]["event_id"] == event_id
+    assert updated["task"]["title"] == "Step 15 Playwright ToDo proof edited"
+    assert "work" not in updated["task"]["tags"]
+    assert "work" not in updated["event"]["tags"]
+    task_row = conn.execute(
+        "SELECT tags_json FROM personal_time_tasks WHERE task_id=?", (event_id,)
+    ).fetchone()
+    event_row = conn.execute(
+        "SELECT tags_json FROM personal_events WHERE event_id=?", (event_id,)
+    ).fetchone()
+    assert "work" not in json.loads(task_row["tags_json"])
+    assert "work" not in json.loads(event_row["tags_json"])
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='update_diary_task_event'"
+        ).fetchone()["count"]
+        == 1
+    )
+
+    deleted = asyncio.run(
+        routes_personal.delete_diary_day_entry(
+            event_id,
+            routes_personal.PersonalEventDeleteRequest(
+                actor="operator",
+                source_surface="diary-page",
+                request_id="operator-task-delete",
+            ),
+        )
+    )
+    assert deleted["ok"] is True
+    assert deleted["deleted_task"]["task_id"] == event_id
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_tasks WHERE task_id=?", (event_id,)
+        ).fetchone()["count"]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_events WHERE event_id=?", (event_id,)
+        ).fetchone()["count"]
+        == 0
+    )
+    delete_tables = {
+        row["table_name"]
+        for row in conn.execute(
+            "SELECT table_name FROM sync_queue WHERE action_type='DELETE'"
+        ).fetchall()
+    }
+    assert {"personal_time_tasks", "personal_events"}.issubset(delete_tables)
+
+
+def test_diary_edit_allows_operator_to_update_source_owned_event(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
+            content_projection, start_at, local_date, timezone, status, privacy_level,
+            tags_json, provenance_json, last_rendered_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "github-proof-event",
+            "git",
+            "git:test",
+            "old-hash",
+            "git-activity",
+            "Git activity summary",
+            "Old body",
+            "Old body",
+            "2026-06-18T00:00:00Z",
+            "2026-06-18",
+            "Europe/London",
+            "open",
+            "normal",
+            json.dumps(["github", "work"]),
+            json.dumps({"source": "test"}),
+            "2026-06-18T10:00:00Z",
+        ),
+    )
+
+    updated = asyncio.run(
+        routes_personal.update_diary_day_entry(
+            "github-proof-event",
+            routes_personal.DiaryEntryUpdateRequest(
+                body="Git activity summary edited\n\nOperator changed tags.",
+                local_date="2026-06-18",
+                all_day=True,
+                tags=["github"],
+                actor="operator",
+                source_surface="diary-page",
+                request_id="operator-source-edit",
+            ),
+        )
+    )
+
+    assert updated["event"]["source"]["type"] == "git"
+    assert updated["event"]["title"] == "Git activity summary edited"
+    assert updated["event"]["tags"] == ["github", "all-day"]
+    assert updated["event"]["provenance"]["operator_edit"]["preserved_source_type"] == "git"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='update_diary_source_event'"
+        ).fetchone()["count"]
+        == 1
+    )
+
+
 def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
