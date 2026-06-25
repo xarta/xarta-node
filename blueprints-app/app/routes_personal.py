@@ -12372,10 +12372,72 @@ async def _project_browser_links(body: DiaryBrowserLinksProjectRequest) -> dict[
     }
 
 
-def _diary_entry_tags(tags: list[str] | None, *, all_day: bool) -> list[str]:
-    event_tags = ["diary", "personal-log", "quick-entry"]
+def _is_automation_proof_entry(
+    *,
+    body: str = "",
+    actor: str = "",
+    source_surface: str = "",
+    request_id: str = "",
+    run_id: str = "",
+    tags: list[str] | None = None,
+    existing_kind: str = "",
+) -> bool:
+    clean_tags = [str(tag).strip().lower() for tag in tags or [] if str(tag).strip()]
+    if existing_kind == "automation-proof" or "automation-proof" in clean_tags:
+        return True
+    context = " ".join(
+        [
+            body,
+            actor,
+            source_surface,
+            request_id,
+            run_id,
+            " ".join(clean_tags),
+        ]
+    ).lower()
+    proofish = "proof" in context or "playwright" in context
+    automationish = any(
+        marker in context
+        for marker in (
+            "codex",
+            "playwright",
+            "automation",
+            "active browser",
+            "live proof",
+        )
+    )
+    return proofish and automationish
+
+
+def _diary_entry_tags(
+    tags: list[str] | None,
+    *,
+    all_day: bool,
+    body: str = "",
+    actor: str = "",
+    source_surface: str = "",
+    request_id: str = "",
+    run_id: str = "",
+    existing_kind: str = "",
+) -> list[str]:
+    automation_proof = _is_automation_proof_entry(
+        body=body,
+        actor=actor,
+        source_surface=source_surface,
+        request_id=request_id,
+        run_id=run_id,
+        tags=tags,
+        existing_kind=existing_kind,
+    )
+    event_tags = ["diary", "quick-entry"]
+    if automation_proof:
+        event_tags.append("automation-proof")
+    else:
+        event_tags.insert(1, "personal-log")
     for tag in tags or []:
         clean = str(tag).strip()
+        if automation_proof and clean.lower() == "personal-log":
+            continue
         if clean and clean not in event_tags:
             event_tags.append(clean)
     if all_day:
@@ -12412,7 +12474,16 @@ def _project_personal_log_event(
     timezone_name = result.get("timezone") or os.environ.get(
         "XARTA_DIARY_TIMEZONE", "Europe/London"
     )
-    event_tags = _diary_entry_tags(tags, all_day=all_day)
+    event_tags = _diary_entry_tags(
+        tags,
+        all_day=all_day,
+        body=body,
+        actor=actor,
+        source_surface=source_surface,
+        request_id=request_id,
+        run_id=run_id,
+    )
+    event_kind = "automation-proof" if "automation-proof" in event_tags else "personal-log"
     provenance = {
         "writer": "xarta_diary.create_personal_log",
         "calendar": {
@@ -12467,7 +12538,7 @@ def _project_personal_log_event(
                 "manual",
                 file_ref,
                 source_hash,
-                "personal-log",
+                event_kind,
                 _entry_title(body, result.get("local_time")),
                 _body_excerpt(body),
                 body.strip(),
@@ -12503,7 +12574,7 @@ def _project_personal_log_event(
             source_hash=source_hash,
             metadata={
                 "local_date": local_date,
-                "kind": "personal-log",
+                "kind": event_kind,
                 "body_chars": len(body.strip()),
             },
         )
@@ -12625,10 +12696,6 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
         body.request_id, f"diary-entry-edit-{uuid.uuid4().hex[:12]}", limit=160
     )
     run_id = _clean_short_text(body.run_id, request_id, limit=160)
-    event_tags = _diary_entry_tags(
-        [str(tag).strip() for tag in body.tags if str(tag).strip()],
-        all_day=all_day,
-    )
     now = _utc_now_iso()
     source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     with get_conn() as conn:
@@ -12638,6 +12705,16 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
         existing_tags = _json_value(row["tags_json"], [])
         if row["kind"] != "personal-log" and "quick-entry" not in existing_tags:
             raise HTTPException(400, "only diary quick entries can be edited here")
+        event_tags = _diary_entry_tags(
+            [str(tag).strip() for tag in body.tags if str(tag).strip()],
+            all_day=all_day,
+            body=text,
+            actor=actor,
+            source_surface=source_surface,
+            request_id=request_id,
+            run_id=run_id,
+            existing_kind=row["kind"],
+        )
         provenance = _json_value(row["provenance_json"], {})
         provenance["calendar"] = {
             "all_day": bool(all_day),
@@ -12720,7 +12797,7 @@ async def update_diary_day_entry(event_id: str, body: DiaryEntryUpdateRequest) -
             metadata={
                 "local_date": local_date,
                 "range_end_date": range_end_date,
-                "kind": "personal-log",
+                "kind": row["kind"],
                 "body_chars": len(text),
             },
         )

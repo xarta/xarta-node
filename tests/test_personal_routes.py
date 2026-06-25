@@ -1288,6 +1288,39 @@ def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
     assert delete_sync is not None
 
 
+def test_diary_entry_write_classifies_automation_proof_outside_personal_log(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+
+    created = asyncio.run(
+        routes_personal.create_diary_day_entry(
+            routes_personal.DiaryEntryCreateRequest(
+                body="Step 10 Playwright browser quick-entry proof from Codex",
+                local_date="2026-06-18",
+                actor="codex",
+                source_surface="playwright-proof",
+                request_id="codex-live-proof-test",
+            )
+        )
+    )
+
+    event = created["event"]
+    tags = event["tags"]
+    assert event["kind"] == "automation-proof"
+    assert "automation-proof" in tags
+    assert "quick-entry" in tags
+    assert "personal-log" not in tags
+
+    row = conn.execute(
+        "SELECT kind, tags_json FROM personal_events WHERE event_id=?",
+        (event["event_id"],),
+    ).fetchone()
+    assert row["kind"] == "automation-proof"
+    assert "personal-log" not in json.loads(row["tags_json"])
+
+
 def test_diary_summary_generation_writes_file_and_audit(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
