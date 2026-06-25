@@ -206,6 +206,28 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE personal_git_commits (
+            commit_id TEXT PRIMARY KEY,
+            repo_full_name TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            short_sha TEXT NOT NULL DEFAULT '',
+            html_url TEXT NOT NULL DEFAULT '',
+            author_login TEXT NOT NULL DEFAULT '',
+            author_name TEXT NOT NULL DEFAULT '',
+            committed_at TEXT NOT NULL DEFAULT '',
+            local_date TEXT NOT NULL DEFAULT '',
+            message_subject TEXT NOT NULL DEFAULT '',
+            message_body TEXT NOT NULL DEFAULT '',
+            branches_json TEXT NOT NULL DEFAULT '[]',
+            pr_refs_json TEXT NOT NULL DEFAULT '[]',
+            issue_refs_json TEXT NOT NULL DEFAULT '[]',
+            feature_key TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            UNIQUE(repo_full_name, sha)
+        );
         CREATE TABLE personal_time_audit (
             audit_id TEXT PRIMARY KEY,
             actor TEXT NOT NULL DEFAULT '',
@@ -348,6 +370,25 @@ def _make_conn() -> sqlite3.Connection:
             metadata_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE kanban_item_commits (
+            commit_link_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            repo_full_name TEXT NOT NULL DEFAULT '',
+            sha TEXT NOT NULL DEFAULT '',
+            short_sha TEXT NOT NULL DEFAULT '',
+            html_url TEXT NOT NULL DEFAULT '',
+            author_login TEXT NOT NULL DEFAULT '',
+            author_name TEXT NOT NULL DEFAULT '',
+            committed_at TEXT NOT NULL DEFAULT '',
+            message_subject TEXT NOT NULL DEFAULT '',
+            message_body TEXT NOT NULL DEFAULT '',
+            branch TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            UNIQUE(item_id, repo_full_name, sha)
         );
         CREATE TABLE kanban_blockers (
             blocker_id TEXT PRIMARY KEY,
@@ -2260,6 +2301,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     ]
     assert "kanban_items" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_items") == "item_id"
+    assert "kanban_item_commits" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_item_commits") == "commit_link_id"
 
     created = asyncio.run(
         routes_personal.create_work_item(
@@ -2834,6 +2877,151 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "kanban_discussions",
         "kanban_audit_log",
     }.issubset(sync_tables)
+
+
+def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    sha_one = "a" * 40
+    sha_two = "b" * 40
+    conn.execute(
+        """
+        INSERT INTO personal_git_commits (
+            commit_id, repo_full_name, sha, short_sha, html_url, author_login,
+            author_name, committed_at, local_date, message_subject, message_body
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "ghc-one",
+            "xarta/xarta-node",
+            sha_one,
+            sha_one[:7],
+            f"https://github.com/xarta/xarta-node/commit/{sha_one}",
+            "codex",
+            "Codex",
+            "2026-06-25T01:30:00Z",
+            "2026-06-25",
+            "Add commit association support",
+            "Body from git import",
+        ),
+    )
+    for item_id, title in (("work-commit-a", "Commit item A"), ("work-commit-b", "Commit item B")):
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    title=title,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{item_id}-create",
+                )
+            )
+        )
+
+    first = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-commit-a",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha_one,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="commit-one",
+            ),
+        )
+    )
+    assert first["commit"]["message_subject"] == "Add commit association support"
+    assert first["commit"]["commit_ref"] == f"git_commit:xarta/xarta-node@{sha_one}"
+
+    asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-commit-a",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha_two,
+                message_subject="Second commit",
+                branch="main",
+                metadata={"note": "second"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="commit-two",
+            ),
+        )
+    )
+    updated = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-commit-a",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha_two,
+                message_subject="Second commit amended metadata",
+                branch="main",
+                metadata={"note": "updated"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="commit-two-update",
+            ),
+        )
+    )
+    assert updated["commit"]["message_subject"] == "Second commit amended metadata"
+
+    asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-commit-b",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha_one,
+                message_subject="Same commit explicitly linked to B",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="commit-one-b",
+            ),
+        )
+    )
+
+    detail_a = asyncio.run(routes_personal.get_work_item_detail("work-commit-a"))
+    detail_b = asyncio.run(routes_personal.get_work_item_detail("work-commit-b"))
+    assert detail_a["counts"]["commits"] == 2
+    assert {row["sha"] for row in detail_a["commits"]} == {sha_one, sha_two}
+    assert all(row["item_id"] == "work-commit-a" for row in detail_a["commits"])
+    assert detail_b["counts"]["commits"] == 1
+    assert detail_b["commits"][0]["sha"] == sha_one
+    assert detail_b["commits"][0]["item_id"] == "work-commit-b"
+
+    list_a = asyncio.run(routes_personal.list_work_item_commits("work-commit-a"))
+    assert list_a["count"] == 2
+    assert conn.execute("SELECT COUNT(*) FROM kanban_item_commits").fetchone()[0] == 3
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_item_commits" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "record_work_commit" in audit_actions
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_graph_links(
+            routes_personal.PersonalGraphSyncRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="commit-graph-sync",
+            )
+        )
+    )
+    assert sync["ok"] is True
+    commit_links = asyncio.run(
+        routes_personal.list_personal_graph_links(
+            source_ref=f"git_commit:xarta/xarta-node@{sha_one}",
+            sync=False,
+            limit=10,
+        )
+    )
+    targets = {link["target_ref"] for link in commit_links["links"]}
+    assert {"kanban_items:work-commit-a", "kanban_items:work-commit-b"}.issubset(targets)
 
 
 def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):

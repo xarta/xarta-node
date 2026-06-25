@@ -714,6 +714,30 @@ CREATE INDEX IF NOT EXISTS idx_kanban_item_links_source
 CREATE INDEX IF NOT EXISTS idx_kanban_item_links_target
     ON kanban_item_links(target_item_id, link_type);
 
+CREATE TABLE IF NOT EXISTS kanban_item_commits (
+    commit_link_id TEXT PRIMARY KEY,
+    item_id        TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL DEFAULT '',
+    sha            TEXT NOT NULL DEFAULT '',
+    short_sha      TEXT NOT NULL DEFAULT '',
+    html_url       TEXT NOT NULL DEFAULT '',
+    author_login   TEXT NOT NULL DEFAULT '',
+    author_name    TEXT NOT NULL DEFAULT '',
+    committed_at   TEXT NOT NULL DEFAULT '',
+    message_subject TEXT NOT NULL DEFAULT '',
+    message_body   TEXT NOT NULL DEFAULT '',
+    branch         TEXT NOT NULL DEFAULT '',
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT DEFAULT (datetime('now')),
+    updated_at     TEXT DEFAULT (datetime('now')),
+    UNIQUE(item_id, repo_full_name, sha)
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_item
+    ON kanban_item_commits(item_id, committed_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_commit
+    ON kanban_item_commits(repo_full_name, sha);
+
 CREATE TABLE IF NOT EXISTS kanban_blockers (
     blocker_id           TEXT PRIMARY KEY,
     item_id              TEXT NOT NULL,
