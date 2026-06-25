@@ -1694,7 +1694,7 @@ def _migrate_leaf_table_to_kanban_items(
         ).fetchone()
         state_id, item_status = _kanban_leaf_state_status(row["status"])
         source_status = str(row["status"] or "")
-        item_type = "item" if source_status == "promoted" else kind
+        item_type = "issue" if kind == "issue" and source_status != "promoted" else "item"
         if existing and existing["item_type"] not in {"issue", "todo"}:
             item_type = existing["item_type"]
         tags = _kanban_leaf_tags(parent_tags_json, kind)
@@ -1718,7 +1718,7 @@ def _migrate_leaf_table_to_kanban_items(
         kanban_meta = provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}
         provenance["kanban"] = {
             **kanban_meta,
-            "typed_leaf_card": item_type in {"issue", "todo"},
+            "typed_leaf_card": item_type == "issue",
             "leaf_kind": kind,
             "migrated_from_ref": old_ref,
             "parent_item_id": parent_id,
@@ -1727,7 +1727,7 @@ def _migrate_leaf_table_to_kanban_items(
         provenance[kind] = {
             **leaf_meta,
             "item_id": parent_id,
-            "typed_item_id": leaf_id,
+            **({"typed_item_id": leaf_id} if kind == "issue" else {"kanban_item_id": leaf_id}),
             "migrated_from_ref": old_ref,
             "external_source_ref": row["source_ref"] if "source_ref" in row.keys() else "",
             "due_at": row["due_at"] if "due_at" in row.keys() and row["due_at"] else "",
@@ -1896,6 +1896,36 @@ def _migrate_kanban_storage(conn: sqlite3.Connection) -> None:
     _migrate_leaf_table_to_kanban_items(conn, table="work_todos", id_col="todo_id", kind="todo")
     if _table_exists(conn, "kanban_items"):
         conn.execute("UPDATE kanban_items SET item_type='item' WHERE item_type='work'")
+        conn.execute(
+            """
+            UPDATE kanban_items
+            SET search_metadata_json=json_set(search_metadata_json, '$.kind', 'item')
+            WHERE item_type='todo' AND json_valid(search_metadata_json)
+            """
+        )
+        conn.execute(
+            """
+            UPDATE kanban_items
+            SET provenance_json=json_remove(
+                json_set(
+                    json_set(
+                        provenance_json,
+                        '$.kanban.typed_leaf_card',
+                        json('false')
+                    ),
+                    '$.todo.kanban_item_id',
+                    COALESCE(json_extract(provenance_json, '$.todo.typed_item_id'), item_id)
+                ),
+                '$.todo.typed_item_id'
+            )
+            WHERE json_valid(provenance_json)
+              AND (
+                  item_type='todo'
+                  OR json_extract(provenance_json, '$.kanban.leaf_kind')='todo'
+              )
+            """
+        )
+        conn.execute("UPDATE kanban_items SET item_type='item' WHERE item_type='todo'")
     _rewrite_kanban_ref_text(conn)
 
 
