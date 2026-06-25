@@ -190,6 +190,27 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE personal_filter_meta_tags (
+            meta_tag_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT 'blue',
+            priority INTEGER NOT NULL DEFAULT 0,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE personal_filter_tags (
+            tag_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT 'blue',
+            shape TEXT NOT NULL DEFAULT 'circle',
+            fill TEXT NOT NULL DEFAULT 'outline',
+            meta_tag_id TEXT NOT NULL DEFAULT '',
+            builtin INTEGER NOT NULL DEFAULT 0,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE personal_import_batches (
             import_batch_id TEXT PRIMARY KEY,
             source_type TEXT NOT NULL,
@@ -1451,6 +1472,127 @@ def test_calendar_event_rejects_end_before_start(monkeypatch):
         assert "end time" in exc.detail
     else:
         raise AssertionError("calendar event with end before start must fail")
+
+
+def test_personal_filter_tags_and_meta_tags_are_server_backed_and_synced(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    meta = asyncio.run(
+        routes_personal.upsert_personal_filter_meta_tag(
+            routes_personal.PersonalFilterMetaTagUpsertRequest(
+                meta_tag_id="calendar",
+                label="Calendar",
+                color="blue",
+                priority=250,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-meta-upsert-test",
+            )
+        )
+    )
+    assert meta["ok"] is True
+    assert meta["meta_tag"]["meta_tag_id"] == "calendar"
+    assert meta["meta_tag"]["color"] == "blue"
+
+    tag = asyncio.run(
+        routes_personal.upsert_personal_filter_tag(
+            routes_personal.PersonalFilterTagUpsertRequest(
+                tag_id="national-holiday",
+                label="National Holiday",
+                color="red",
+                shape="star",
+                fill="outline",
+                meta_tag_id="calendar",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-tag-upsert-test",
+            )
+        )
+    )
+    assert tag["ok"] is True
+    assert tag["tag"]["tag_id"] == "national-holiday"
+    assert tag["tag"]["meta_tag_id"] == "calendar"
+
+    created = asyncio.run(
+        routes_personal.create_calendar_event(
+            routes_personal.CalendarEventUpsertRequest(
+                event_id="uk-bank-holiday-test",
+                title="UK Bank Holiday",
+                body="Server-backed filter tag proof",
+                local_date="2026-06-18",
+                timezone="Europe/London",
+                all_day=True,
+                tags=["national-holiday"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-tag-event-test",
+            )
+        )
+    )
+    assert "national-holiday" in created["event"]["tags"]
+
+    registry = asyncio.run(routes_personal.list_personal_filters())
+    meta_by_id = {item["meta_tag_id"]: item for item in registry["meta_tags"]}
+    tags_by_id = {item["tag_id"]: item for item in registry["tags"]}
+    assert meta_by_id["calendar"]["color"] == "blue"
+    assert tags_by_id["national-holiday"]["meta_tag_id"] == "calendar"
+    assert tags_by_id["national-holiday"]["usage_count"] == 1
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "personal_filter_meta_tags" in sync_tables
+    assert "personal_filter_tags" in sync_tables
+
+    try:
+        asyncio.run(
+            routes_personal.delete_personal_filter_tag(
+                "national-holiday",
+                routes_personal.PersonalFilterDeleteRequest(
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="filter-tag-delete-assigned-test",
+                ),
+            )
+        )
+    except routes_personal.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "assigned" in exc.detail
+    else:
+        raise AssertionError("assigned filter tag delete must be gated")
+
+    temp_tag = asyncio.run(
+        routes_personal.upsert_personal_filter_tag(
+            routes_personal.PersonalFilterTagUpsertRequest(
+                tag_id="temporary-proof",
+                label="Temporary Proof",
+                color="gold",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-tag-unused-test",
+            )
+        )
+    )
+    assert temp_tag["ok"] is True
+    deleted = asyncio.run(
+        routes_personal.delete_personal_filter_tag(
+            "temporary-proof",
+            routes_personal.PersonalFilterDeleteRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="filter-tag-delete-unused-test",
+            ),
+        )
+    )
+    assert deleted["ok"] is True
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_filter_tags WHERE tag_id='temporary-proof'"
+        ).fetchone()["count"]
+        == 0
+    )
 
 
 def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypatch, tmp_path):
