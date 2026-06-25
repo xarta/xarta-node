@@ -219,6 +219,7 @@ _ACTIVE_BROWSER_COMMAND_ACTIONS = {
     "selector_action",
     "set_body_shade",
     "diagnostic_snapshot",
+    "kanban_external_refresh",
 }
 _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "refresh": "hard_refresh",
@@ -257,6 +258,10 @@ _ACTIVE_BROWSER_COMMAND_ALIASES = {
     "request_diagnostics": "diagnostic_snapshot",
     "runtime_snapshot": "diagnostic_snapshot",
     "debug_snapshot": "diagnostic_snapshot",
+    "kanban_refresh": "kanban_external_refresh",
+    "kanban_lane_refresh": "kanban_external_refresh",
+    "kanban_lane_update": "kanban_external_refresh",
+    "lane_update": "kanban_external_refresh",
 }
 _ACTIVE_BROWSER_DIAGNOSTIC_SOURCES = {"gpu_activity_sound", "personal_search", "personal_graph"}
 _ACTIVE_BROWSER_DIAGNOSTIC_ALIASES = {
@@ -379,6 +384,9 @@ class ActiveBrowserCommandBody(BaseModel):
     doc_id: str | None = None
     path: str | None = None
     doc_path: str | None = None
+    item_id: str | None = None
+    parent_item_id: str | None = None
+    state_id: str | None = None
     highlight_terms: list[str] | None = None
     selector_action: str | None = None
     event_kind: str | None = None
@@ -2123,8 +2131,15 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "selected_item_id": _clean_string(kanban.get("selected_item_id"), "", 180),
         "selected_state": _clean_string(kanban.get("selected_state"), "", 80),
         "detail_open": bool(kanban.get("detail_open")),
+        "detail_panel_open": bool(kanban.get("detail_panel_open")),
         "detail_item_id": _clean_string(kanban.get("detail_item_id"), "", 180),
         "detail_state": _clean_string(kanban.get("detail_state"), "", 80),
+        "editing": bool(kanban.get("editing")),
+        "draft_dirty": bool(kanban.get("draft_dirty")),
+        "external_refresh_skipped": bool(kanban.get("external_refresh_skipped")),
+        "external_refresh_skipped_reason": _clean_string(
+            kanban.get("external_refresh_skipped_reason"), "", 120
+        ),
         "depth_remaining": _clean_browser_page_int(kanban.get("depth_remaining"), maximum=12),
         "child_count": _clean_browser_page_int(kanban.get("child_count"), maximum=5000),
         "link_count": _clean_browser_page_int(kanban.get("link_count"), maximum=5000),
@@ -2483,6 +2498,115 @@ def _browser_client_inventory(
         ),
         reverse=True,
     )
+
+
+def _active_browser_kanban_snapshot(client: dict[str, Any]) -> dict[str, Any]:
+    automation = client.get("automation") if isinstance(client.get("automation"), dict) else {}
+    surfaces = automation.get("surfaces") if isinstance(automation.get("surfaces"), dict) else {}
+    kanban = surfaces.get("kanban") if isinstance(surfaces.get("kanban"), dict) else {}
+    return kanban if isinstance(kanban, dict) else {}
+
+
+def _active_browser_client_is_kanban(client: dict[str, Any]) -> bool:
+    page = client.get("page") if isinstance(client.get("page"), dict) else {}
+    automation = client.get("automation") if isinstance(client.get("automation"), dict) else {}
+    kanban = _active_browser_kanban_snapshot(client)
+    return any(
+        [
+            _clean_active_browser_group(page.get("group")) == "kanban",
+            _clean_active_browser_page_id(page.get("tab")) == "kanban",
+            _clean_active_browser_group(automation.get("current_group")) == "kanban",
+            bool(kanban.get("loaded")),
+        ]
+    )
+
+
+def _active_browser_kanban_skip_reason(client: dict[str, Any]) -> str:
+    if not client.get("fresh"):
+        return "stale"
+    if not _active_browser_client_is_kanban(client):
+        return "not-kanban"
+    kanban = _active_browser_kanban_snapshot(client)
+    if kanban.get("editing") or kanban.get("draft_dirty") or kanban.get("scoped_open"):
+        return "editing"
+    return ""
+
+
+async def publish_kanban_external_refresh_commands(
+    *,
+    item_id: str = "",
+    parent_item_id: str = "",
+    state_id: str = "",
+    actor: str = "",
+    source_surface: str = "",
+    max_age_seconds: int = 45,
+) -> dict[str, Any]:
+    """Ask fresh Kanban browser tabs to reload their board if locally safe."""
+    now = time.time()
+    max_age = max(5, min(int(max_age_seconds or 45), 300))
+    async with _state_lock:
+        state = _read_state_unlocked()
+        active = state.get("active") if isinstance(state.get("active"), dict) else None
+        clients = _browser_client_inventory(state, now=now, max_age_seconds=max_age)
+
+    active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
+    active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
+    clean_item_id = _clean_string(item_id, "", 180)
+    clean_parent_item_id = _clean_string(parent_item_id, "", 180)
+    clean_state_id = _clean_string(state_id, "", 80)
+    clean_actor = _clean_string(actor, "", 120)
+    clean_source_surface = _clean_string(source_surface, "", 120)
+    skipped: list[dict[str, Any]] = []
+    published_payloads: list[dict[str, Any]] = []
+    for client in clients:
+        target_browser_id = _clean_browser_id(client.get("browser_id"))
+        target_tab_id = _clean_string(client.get("tab_id"), "", 120)
+        reason = _active_browser_kanban_skip_reason(client)
+        if reason:
+            skipped.append(
+                {
+                    "browser_id": target_browser_id,
+                    "tab_id": target_tab_id,
+                    "reason": reason,
+                }
+            )
+            continue
+        command_id = _clean_active_browser_command_id(f"kanban-refresh-{uuid.uuid4().hex[:12]}")
+        payload: dict[str, Any] = {
+            "schema": "xarta.active_browser.command.v1",
+            "command_id": command_id,
+            "action": "kanban_external_refresh",
+            "target_browser_id": target_browser_id,
+            "target_tab_id": target_tab_id,
+            "active_browser_id": active_browser_id,
+            "active_tab_id": active_tab_id,
+            "created_at": now,
+            "max_age_seconds": max_age,
+            "item_id": clean_item_id,
+            "parent_item_id": clean_parent_item_id,
+            "state_id": clean_state_id,
+            "actor": clean_actor,
+            "source_surface": clean_source_surface,
+        }
+        event = AppEvent.create(
+            _ACTIVE_BROWSER_COMMAND_EVENT_TYPE,
+            "Kanban Browser Refresh",
+            "Kanban lane changed outside this browser.",
+            severity="info",
+            source="blueprints-active-browser",
+            payload=payload,
+            event_id=f"active-browser-command-{command_id}",
+        )
+        await publish_event(event)
+        published_payloads.append(payload)
+    return {
+        "ok": True,
+        "candidate_count": len(clients),
+        "published_count": len(published_payloads),
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "payloads": published_payloads,
+    }
 
 
 def _find_browser_client_report(
@@ -3498,6 +3622,15 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload["doc_id"] = doc_id
     if doc_path:
         payload["path"] = doc_path
+    item_id = _clean_string(body.item_id, "", 180)
+    parent_item_id = _clean_string(body.parent_item_id, "", 180)
+    state_id = _clean_string(body.state_id, "", 80)
+    if item_id:
+        payload["item_id"] = item_id
+    if parent_item_id:
+        payload["parent_item_id"] = parent_item_id
+    if state_id:
+        payload["state_id"] = state_id
     if highlight_terms:
         payload["highlight_terms"] = highlight_terms
     if selector_action:

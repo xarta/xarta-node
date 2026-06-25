@@ -138,7 +138,7 @@ def _make_conn() -> sqlite3.Connection:
             privacy_level TEXT NOT NULL DEFAULT 'normal',
             tags_json TEXT NOT NULL DEFAULT '[]',
             entities_json TEXT NOT NULL DEFAULT '[]',
-            related_work_items_json TEXT NOT NULL DEFAULT '[]',
+            related_kanban_items_json TEXT NOT NULL DEFAULT '[]',
             related_tasks_json TEXT NOT NULL DEFAULT '[]',
             related_import_batches_json TEXT NOT NULL DEFAULT '[]',
             file_refs_json TEXT NOT NULL DEFAULT '[]',
@@ -167,7 +167,7 @@ def _make_conn() -> sqlite3.Connection:
             timezone TEXT,
             privacy_level TEXT NOT NULL DEFAULT 'normal',
             tags_json TEXT NOT NULL DEFAULT '[]',
-            related_work_items_json TEXT NOT NULL DEFAULT '[]',
+            related_kanban_items_json TEXT NOT NULL DEFAULT '[]',
             related_tasks_json TEXT NOT NULL DEFAULT '[]',
             related_import_batches_json TEXT NOT NULL DEFAULT '[]',
             file_refs_json TEXT NOT NULL DEFAULT '[]',
@@ -280,7 +280,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_item_states (
+        CREATE TABLE kanban_item_states (
             state_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
             lane_key TEXT NOT NULL,
@@ -290,7 +290,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_item_priorities (
+        CREATE TABLE kanban_item_priorities (
             priority_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
             weight INTEGER NOT NULL DEFAULT 0,
@@ -298,12 +298,12 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_items (
+        CREATE TABLE kanban_items (
             item_id TEXT PRIMARY KEY,
             parent_item_id TEXT,
             title TEXT NOT NULL DEFAULT '',
             body_excerpt TEXT NOT NULL DEFAULT '',
-            item_type TEXT NOT NULL DEFAULT 'work',
+            item_type TEXT NOT NULL DEFAULT 'item',
             state_id TEXT NOT NULL DEFAULT 'todo',
             priority_id TEXT NOT NULL DEFAULT 'medium',
             depth INTEGER NOT NULL DEFAULT 0,
@@ -311,7 +311,7 @@ def _make_conn() -> sqlite3.Connection:
             status TEXT NOT NULL DEFAULT 'open',
             archived_at TEXT,
             promoted_from_ref TEXT,
-            source_type TEXT NOT NULL DEFAULT 'manual-work',
+            source_type TEXT NOT NULL DEFAULT 'manual-kanban',
             source_ref TEXT NOT NULL DEFAULT '',
             source_hash TEXT NOT NULL DEFAULT '',
             tags_json TEXT NOT NULL DEFAULT '[]',
@@ -328,7 +328,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_item_order_edges (
+        CREATE TABLE kanban_item_order_edges (
             edge_id TEXT PRIMARY KEY,
             parent_item_id TEXT NOT NULL DEFAULT '',
             state_id TEXT NOT NULL,
@@ -340,7 +340,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_item_links (
+        CREATE TABLE kanban_item_links (
             link_id TEXT PRIMARY KEY,
             source_item_id TEXT NOT NULL,
             target_item_id TEXT NOT NULL,
@@ -349,45 +349,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_issues (
-            issue_id TEXT PRIMARY KEY,
-            item_id TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            body_excerpt TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'open',
-            priority_id TEXT NOT NULL DEFAULT 'medium',
-            source_ref TEXT NOT NULL DEFAULT '',
-            related_task_id TEXT NOT NULL DEFAULT '',
-            search_text TEXT NOT NULL DEFAULT '',
-            search_metadata_json TEXT NOT NULL DEFAULT '{}',
-            embedding_ref TEXT NOT NULL DEFAULT '',
-            embedding_model TEXT NOT NULL DEFAULT '',
-            embedding_updated_at TEXT,
-            vector_index_key TEXT NOT NULL DEFAULT '',
-            provenance_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
-            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
-        );
-        CREATE TABLE work_todos (
-            todo_id TEXT PRIMARY KEY,
-            item_id TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            body_excerpt TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'open',
-            priority_id TEXT NOT NULL DEFAULT 'medium',
-            due_at TEXT,
-            related_task_id TEXT NOT NULL DEFAULT '',
-            search_text TEXT NOT NULL DEFAULT '',
-            search_metadata_json TEXT NOT NULL DEFAULT '{}',
-            embedding_ref TEXT NOT NULL DEFAULT '',
-            embedding_model TEXT NOT NULL DEFAULT '',
-            embedding_updated_at TEXT,
-            vector_index_key TEXT NOT NULL DEFAULT '',
-            provenance_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
-            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
-        );
-        CREATE TABLE work_blockers (
+        CREATE TABLE kanban_blockers (
             blocker_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL,
             title TEXT NOT NULL DEFAULT '',
@@ -404,7 +366,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_discussions (
+        CREATE TABLE kanban_discussions (
             discussion_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL,
             author TEXT NOT NULL DEFAULT '',
@@ -420,7 +382,7 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
-        CREATE TABLE work_audit_log (
+        CREATE TABLE kanban_audit_log (
             audit_id TEXT PRIMARY KEY,
             actor TEXT NOT NULL DEFAULT '',
             source_surface TEXT NOT NULL DEFAULT '',
@@ -435,7 +397,7 @@ def _make_conn() -> sqlite3.Connection:
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
-        INSERT INTO work_item_states (
+        INSERT INTO kanban_item_states (
             state_id, label, lane_key, status_category, sort_order, is_terminal
         ) VALUES
             ('backlog', 'Backlog', 'backlog', 'open', 10, 0),
@@ -443,7 +405,7 @@ def _make_conn() -> sqlite3.Connection:
             ('doing', 'Doing', 'doing', 'active', 30, 0),
             ('blocked', 'Blocked', 'blocked', 'blocked', 40, 0),
             ('done', 'Done', 'done', 'done', 50, 1);
-        INSERT INTO work_item_priorities (
+        INSERT INTO kanban_item_priorities (
             priority_id, label, weight, sort_order
         ) VALUES
             ('low', 'Low', 10, 10),
@@ -525,7 +487,7 @@ def test_personal_events_filters_and_shape(monkeypatch):
         """
         INSERT INTO personal_events (
             event_id, source_type, source_ref, kind, title, local_date, timezone,
-            status, tags_json, related_work_items_json, related_import_batches_json
+            status, tags_json, related_kanban_items_json, related_import_batches_json
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -565,7 +527,7 @@ def test_personal_events_filters_and_shape(monkeypatch):
             date_start="2026-06-18",
             date_end="2026-06-18",
             tag="diary",
-            related_work_item="work-1",
+            related_kanban_item="work-1",
             limit=20,
             offset=0,
         )
@@ -576,7 +538,7 @@ def test_personal_events_filters_and_shape(monkeypatch):
     assert item["event_id"] == "evt-1"
     assert item["source"]["type"] == "manual"
     assert item["tags"] == ["diary", "personal"]
-    assert item["related"]["work_items"] == ["work-1"]
+    assert item["related"]["kanban_items"] == ["work-1"]
 
 
 def test_personal_import_batches_and_sources(monkeypatch):
@@ -1178,8 +1140,8 @@ def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
     linked = asyncio.run(
         routes_personal.link_personal_event_work_item(
             event["event_id"],
-            routes_personal.DiaryWorkLinkRequest(
-                work_item_ref="work:test-1",
+            routes_personal.DiaryKanbanLinkRequest(
+                kanban_item_ref="test-1",
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="link-test",
@@ -1187,10 +1149,10 @@ def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
         )
     )
     assert linked["ok"] is True
-    assert linked["event"]["related"]["work_items"] == ["work:test-1"]
+    assert linked["event"]["related"]["kanban_items"] == ["test-1"]
     assert (
         conn.execute(
-            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='link_work_item'"
+            "SELECT COUNT(*) AS count FROM personal_time_audit WHERE action='link_kanban_item'"
         ).fetchone()["count"]
         == 1
     )
@@ -1472,13 +1434,13 @@ def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypat
             routes_personal.PersonalTaskUpsertRequest(
                 title="Step 15 backend task updated",
                 body="Edited task body",
-                mode="work",
+                mode="kanban",
                 due_date="2026-06-18",
                 due_time="17:05",
                 timezone="Europe/London",
                 priority="medium",
-                tags=["work"],
-                related_work_items=["work:item-1"],
+                tags=["kanban"],
+                related_kanban_items=["item-1"],
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="task-update-test",
@@ -1486,14 +1448,15 @@ def test_personal_task_create_edit_complete_archive_projects_to_events(monkeypat
         )
     )
     assert updated["task"]["title"] == "Step 15 backend task updated"
-    assert updated["task"]["mode"] == "work"
-    assert updated["task"]["related"]["work_items"] == ["work:item-1"]
+    assert updated["task"]["mode"] == "kanban"
+    assert updated["task"]["related"]["kanban_items"] == ["item-1"]
     assert "kanban" in updated["task"]["tags"]
-    assert "work" in updated["task"]["tags"]
     assert updated["event"]["start_at"] == "2026-06-18T16:05:00Z"
 
-    work_list = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=20, offset=0))
-    assert [item["task_id"] for item in work_list["items"]] == [task["task_id"]]
+    kanban_list = asyncio.run(
+        routes_personal.list_personal_tasks(mode="kanban", limit=20, offset=0)
+    )
+    assert [item["task_id"] for item in kanban_list["items"]] == [task["task_id"]]
 
     completed = asyncio.run(
         routes_personal.complete_personal_task(
@@ -1543,7 +1506,7 @@ def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
         """
         INSERT INTO personal_events (
             event_id, source_type, kind, title, local_date, timezone, status,
-            tags_json, related_work_items_json, provenance_state
+            tags_json, related_kanban_items_json, provenance_state
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -1564,30 +1527,30 @@ def test_personal_tasks_list_includes_event_sourced_next_actions(monkeypatch):
         """
         INSERT INTO personal_events (
             event_id, source_type, kind, title, local_date, timezone, status,
-            tags_json, related_work_items_json
+            tags_json, related_kanban_items_json
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "evt-work",
-            "work-management",
+            "kanban",
             "todo",
             "Work source task",
             "2026-06-18",
             "Europe/London",
             "blocked",
             json.dumps(["todo", "kanban"]),
-            json.dumps(["work:item-9"]),
+            json.dumps(["item-9"]),
         ),
     )
 
     personal = asyncio.run(routes_personal.list_personal_tasks(mode="personal", limit=20, offset=0))
-    work = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=20, offset=0))
+    kanban = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=20, offset=0))
     blocked = asyncio.run(routes_personal.list_personal_tasks(mode="blocked", limit=20, offset=0))
 
     assert [item["task_id"] for item in personal["items"]] == ["evt-reminder"]
     assert personal["items"][0]["source"]["authority"] == "event"
-    assert [item["task_id"] for item in work["items"]] == ["evt-work"]
+    assert [item["task_id"] for item in kanban["items"]] == ["evt-work"]
     assert [item["task_id"] for item in blocked["items"]] == ["evt-work"]
 
 
@@ -1600,7 +1563,7 @@ def test_personal_search_sync_exact_fts_and_filters(monkeypatch):
         INSERT INTO personal_events (
             event_id, source_type, source_ref, source_hash, kind, title,
             body_excerpt, content_projection, local_date, timezone, status,
-            tags_json, related_work_items_json, provenance_json
+            tags_json, related_kanban_items_json, provenance_json
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -1959,7 +1922,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
         INSERT INTO personal_events (
             event_id, source_type, source_ref, source_hash, kind, title,
             body_excerpt, content_projection, local_date, timezone, status,
-            tags_json, related_work_items_json, related_tasks_json,
+            tags_json, related_kanban_items_json, related_tasks_json,
             related_import_batches_json, file_refs_json, db_refs_json,
             provenance_json
         )
@@ -1978,7 +1941,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
             "Europe/London",
             "open",
             json.dumps(["diary", "graph"]),
-            json.dumps(["work:work-graph"]),
+            json.dumps(["work-graph"]),
             json.dumps(["task:task-graph"]),
             json.dumps(["import:batch-graph"]),
             json.dumps(["browser_link:visit-graph"]),
@@ -1997,7 +1960,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
         """
         INSERT INTO personal_time_tasks (
             task_id, source_type, title, local_date, timezone, status,
-            related_work_items_json, event_id
+            related_kanban_items_json, event_id
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -2008,7 +1971,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
             "2026-06-18",
             "Europe/London",
             "open",
-            json.dumps(["work:work-graph"]),
+            json.dumps(["work-graph"]),
             "evt-graph",
         ),
     )
@@ -2042,7 +2005,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
     )
     conn.execute(
         """
-        INSERT INTO work_items (
+        INSERT INTO kanban_items (
             item_id, title, state_id, status, promoted_from_ref,
             related_event_ids_json, related_task_ids_json
         )
@@ -2060,37 +2023,42 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
     )
     conn.execute(
         """
-        INSERT INTO work_items (item_id, title, state_id, status)
+        INSERT INTO kanban_items (item_id, title, state_id, status)
         VALUES (?, ?, ?, ?)
         """,
         ("work-other", "Graph dependency", "todo", "open"),
     )
     conn.execute(
         """
-        INSERT INTO work_item_links (link_id, source_item_id, target_item_id, link_type)
+        INSERT INTO kanban_item_links (link_id, source_item_id, target_item_id, link_type)
         VALUES (?, ?, ?, ?)
         """,
         ("wil-graph", "work-graph", "work-other", "depends_on"),
     )
     conn.execute(
         """
-        INSERT INTO work_issues (
-            issue_id, item_id, title, status, source_ref, related_task_id
+        INSERT INTO kanban_items (
+            item_id, parent_item_id, title, item_type, state_id, status,
+            source_type, source_ref, related_task_ids_json, tags_json
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "issue-graph",
             "work-graph",
             "Graph issue",
+            "issue",
+            "todo",
             "open",
-            "github:issue-123",
-            "task-graph",
+            "kanban-issue",
+            "kanban_items:issue-graph",
+            json.dumps(["task-graph"]),
+            json.dumps(["issue", "kanban"]),
         ),
     )
     conn.execute(
         """
-        INSERT INTO work_blockers (
+        INSERT INTO kanban_blockers (
             blocker_id, item_id, title, status, blocked_by_ref
         )
         VALUES (?, ?, ?, ?, ?)
@@ -2131,7 +2099,7 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
     assert ("source_for", "git_commit:abc123def456", "accepted") in event_targets
     assert ("source_for", "browser_links:visit-graph", "accepted") in event_targets
     assert ("evidence_for", "manual_links:manual-graph", "accepted") in event_targets
-    assert ("relates_to", "work_items:work-graph", "accepted") in event_targets
+    assert ("relates_to", "kanban_items:work-graph", "accepted") in event_targets
     assert ("relates_to", "personal_time_tasks:task-graph", "accepted") in event_targets
     assert ("created_from", "personal_import_batches:batch-graph", "accepted") in event_targets
     assert ("same_day_as", "diary_day:2026-06-18", "accepted") in event_targets
@@ -2147,20 +2115,21 @@ def test_personal_graph_sync_projects_explicit_provenance_links(monkeypatch):
     assert git_link["provenance"]["source_hash"] == "sha256:event-graph"
     assert git_link["provenance"]["provenance_state"] == "linked"
 
-    work_links = asyncio.run(
+    kanban_links = asyncio.run(
         routes_personal.list_personal_graph_links(
-            source_ref="work_items:work-graph",
+            source_ref="kanban_items:work-graph",
             sync=False,
             limit=80,
         )
     )
     work_targets = {
-        (link["link_type"], link["target_ref"], link["link_state"]) for link in work_links["links"]
+        (link["link_type"], link["target_ref"], link["link_state"])
+        for link in kanban_links["links"]
     }
     assert ("evidence_for", "personal_events:evt-graph", "accepted") in work_targets
     assert ("evidence_for", "personal_time_tasks:task-graph", "accepted") in work_targets
     assert ("promoted_from", "personal_events:evt-graph", "accepted") in work_targets
-    assert ("depends_on", "work_items:work-other", "accepted") in work_targets
+    assert ("depends_on", "kanban_items:work-other", "accepted") in work_targets
 
     import_links = asyncio.run(
         routes_personal.list_personal_graph_links(
@@ -2289,8 +2258,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "blocked",
         "done",
     ]
-    assert "work_items" in routes_sync._ALLOWED_TABLES
-    assert routes_sync._pk_for_table("work_items") == "item_id"
+    assert "kanban_items" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_items") == "item_id"
 
     created = asyncio.run(
         routes_personal.create_work_item(
@@ -2313,7 +2282,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert root["state_id"] == "todo"
     assert root["body_excerpt"] == "Root board proof\n\nSecond paragraph"
     assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
-    assert root["vector"]["index_key"] == "work_items:work-root"
+    assert root["vector"]["index_key"] == "kanban_items:work-root"
 
     board = asyncio.run(routes_personal.get_work_root_board())
     todo_column = next(
@@ -2417,8 +2386,14 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["issue"]
-    assert issue["vector"]["index_key"] == "work_issues:issue-step16"
+    assert issue["vector"]["index_key"] == "kanban_items:issue-step16"
     assert issue["severity_id"] == "high"
+    issue_card = conn.execute("SELECT * FROM kanban_items WHERE item_id='issue-step16'").fetchone()
+    assert issue_card["item_type"] == "issue"
+    assert issue_card["parent_item_id"] == "work-root"
+    assert issue_card["state_id"] == "todo"
+    assert issue_card["source_ref"] == "kanban_items:issue-step16"
+    assert json.loads(issue_card["tags_json"]) == ["issue", "kanban"]
 
     child_issue = asyncio.run(
         routes_personal.create_work_issue(
@@ -2450,7 +2425,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["issue"]
-    assert grandchild_issue["item_id"] == "work-depth-3"
+    assert grandchild_issue["item_id"] == "issue-step19-grandchild"
+    assert grandchild_issue["parent_item_id"] == "work-depth-3"
 
     todo = asyncio.run(
         routes_personal.create_work_todo(
@@ -2468,6 +2444,12 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         )
     )["todo"]
     assert todo["related_task_id"] == "task-step16"
+    todo_card = conn.execute("SELECT * FROM kanban_items WHERE item_id='todo-step16'").fetchone()
+    assert todo_card["item_type"] == "todo"
+    assert todo_card["parent_item_id"] == "work-root"
+    assert todo_card["state_id"] == "todo"
+    assert todo_card["source_ref"] == "kanban_items:todo-step16"
+    assert json.loads(todo_card["related_task_ids_json"]) == ["task-step16"]
 
     scoped_todo = asyncio.run(
         routes_personal.create_work_todo(
@@ -2484,7 +2466,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["todo"]
-    assert scoped_todo["item_id"] == "work-depth-3"
+    assert scoped_todo["item_id"] == "todo-step19-grandchild"
+    assert scoped_todo["parent_item_id"] == "work-depth-3"
     scoped_todo = asyncio.run(
         routes_personal.update_work_todo(
             "todo-step19-grandchild",
@@ -2503,11 +2486,18 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     )["todo"]
     assert scoped_todo["status"] == "active"
     assert scoped_todo["priority_id"] == "critical"
+    scoped_todo_card = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='todo-step19-grandchild'"
+    ).fetchone()
+    assert scoped_todo_card["item_type"] == "todo"
+    assert scoped_todo_card["parent_item_id"] == "work-depth-3"
+    assert scoped_todo_card["state_id"] == "doing"
+    assert scoped_todo_card["priority_id"] == "critical"
 
     promoted = asyncio.run(
         routes_personal.promote_work_item(
             routes_personal.WorkPromoteRequest(
-                source_ref="work_todos:todo-step16",
+                source_ref="kanban_items:todo-step16",
                 title="Promoted Step 16 todo",
                 parent_item_id="work-root",
                 actor="codex-test",
@@ -2516,17 +2506,15 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["item"]
-    assert promoted["promoted_from_ref"] == "work_todos:todo-step16"
+    assert promoted["item_id"] == "todo-step16"
+    assert promoted["item_type"] == "item"
+    assert promoted["promoted_from_ref"] == "kanban_items:todo-step16"
     assert promoted["related"]["tasks"] == ["task-step16"]
-    assert (
-        conn.execute("SELECT status FROM work_todos WHERE todo_id='todo-step16'").fetchone()[0]
-        == "promoted"
-    )
 
     promoted_issue = asyncio.run(
         routes_personal.promote_work_item(
             routes_personal.WorkPromoteRequest(
-                source_ref="work_issues:issue-step19-child",
+                source_ref="kanban_items:issue-step19-child",
                 title="Promoted Step 19 issue",
                 parent_item_id="work-depth-2",
                 actor="codex-test",
@@ -2535,14 +2523,10 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["item"]
-    assert promoted_issue["promoted_from_ref"] == "work_issues:issue-step19-child"
+    assert promoted_issue["item_id"] == "issue-step19-child"
+    assert promoted_issue["item_type"] == "item"
+    assert promoted_issue["promoted_from_ref"] == "kanban_items:issue-step19-child"
     assert promoted_issue["related"]["issues"] == ["issue-step19-child"]
-    assert (
-        conn.execute(
-            "SELECT status FROM work_issues WHERE issue_id='issue-step19-child'"
-        ).fetchone()[0]
-        == "promoted"
-    )
 
     local_issues = asyncio.run(
         routes_personal.list_work_item_issues("work-root", scope="local", view="flat")
@@ -2554,7 +2538,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         routes_personal.list_work_item_issues("work-child", scope="descendants", view="grouped")
     )
     descendant_issue_ids = {row["issue_id"] for row in descendant_issues["items"]}
-    assert {"issue-step19-child", "issue-step19-grandchild"}.issubset(descendant_issue_ids)
+    assert descendant_issue_ids == {"issue-step19-grandchild"}
     assert descendant_issues["counts"]["descendant_items"] >= 2
     assert {group["scope"]["depth_offset"] for group in descendant_issues["groups"]}.issuperset(
         {1, 2}
@@ -2569,6 +2553,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     issue_direct = asyncio.run(routes_personal.get_work_issue("issue-step19-child"))
     assert issue_direct["issue"]["body_excerpt"] == "Scoped issue proof"
     assert issue_direct["item"]["item_id"] == "work-depth-2"
+    assert issue_direct["item_card"]["item_id"] == "issue-step19-child"
+    assert issue_direct["item_card"]["item_type"] == "item"
     assert [item["item_id"] for item in issue_direct["breadcrumbs"]] == [
         "work-child",
         "work-depth-2",
@@ -2582,24 +2568,36 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     todo_direct = asyncio.run(routes_personal.get_work_todo("todo-step19-grandchild"))
     assert todo_direct["todo"]["body_excerpt"] == "Two-level scoped todo proof updated"
     assert todo_direct["item"]["item_id"] == "work-depth-3"
+    assert todo_direct["item_card"]["item_id"] == "todo-step19-grandchild"
+    assert todo_direct["item_card"]["item_type"] == "todo"
+    assert todo_direct["item_card"]["state_id"] == "doing"
     todo_bundle = asyncio.run(
         routes_personal.get_rich_doc_bundle("kanban", "todo", "todo-step19-grandchild")
     )
     assert todo_bundle["document"]["document_type"] == "todo"
     assert todo_bundle["document"]["body"] == "Two-level scoped todo proof updated"
 
-    work_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=200))
+    work_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=200))
     work_task_refs = {
         item["source"]["ref"]
         for item in work_tasks["items"]
-        if item["source"]["type"] == "work-todo"
+        if item["source"]["type"] == "kanban-todo"
     }
-    assert {"work_todos:todo-step16", "work_todos:todo-step19-grandchild"}.issubset(work_task_refs)
-
+    assert work_task_refs == {"kanban_items:todo-step19-grandchild"}
+    assert len(work_task_refs) == len(
+        [item for item in work_tasks["items"] if item["source"]["type"] == "kanban-todo"]
+    )
     child_board = asyncio.run(routes_personal.get_work_child_board("work-root"))
     assert child_board["board"]["parent"]["item_id"] == "work-root"
     assert [item["item_id"] for item in child_board["board"]["breadcrumbs"]] == ["work-root"]
     assert child_board["board"]["remaining_depth"] == 12
+    root_child_cards = {
+        item["item_id"]: item
+        for column in child_board["board"]["columns"]
+        for item in column["items"]
+    }
+    assert root_child_cards["issue-step16"]["item_type"] == "issue"
+    assert root_child_cards["todo-step16"]["item_type"] == "item"
 
     link = asyncio.run(
         routes_personal.create_work_item_link(
@@ -2625,15 +2623,15 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
                 item_id="work-root",
                 title="Step 18 blocker",
                 body="Blocker proof",
-                blocked_by_ref=f"work_items:{promoted['item_id']}",
+                blocked_by_ref=f"kanban_items:{promoted['item_id']}",
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="blocker-create",
             )
         )
     )["blocker"]
-    assert blocker["vector"]["index_key"] == "work_blockers:blocker-step18"
-    assert blocker["blocked_by_ref"] == f"work_items:{promoted['item_id']}"
+    assert blocker["vector"]["index_key"] == "kanban_blockers:blocker-step18"
+    assert blocker["blocked_by_ref"] == f"kanban_items:{promoted['item_id']}"
 
     detail_body = "# Work Root Detail\n\nLine one\nLine two"
     detail_doc = asyncio.run(
@@ -2713,8 +2711,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert detail["detail_document"]["file_ref"]["path"] == (
         "step-16-root-board-renamed/items/work-root/detail.md"
     )
-    assert detail["issues"][0]["issue_id"] == "issue-step16"
-    assert detail["todos"][0]["todo_id"] == "todo-step16"
+    assert {issue["issue_id"] for issue in detail["issues"]} == {"issue-step16"}
+    assert detail["todos"] == []
     assert detail["links"][0]["link_id"] == link["link_id"]
     assert detail["blockers"][0]["blocker_id"] == "blocker-step18"
     assert detail["discussions"][0]["body"] == updated_discussion_body
@@ -2742,7 +2740,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert detail_after_delete["counts"]["discussions"] == 0
 
     audit_actions = {
-        row["action"] for row in conn.execute("SELECT action FROM work_audit_log").fetchall()
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert {
         "create_work_item",
@@ -2761,13 +2759,11 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
     assert {
-        "work_items",
-        "work_item_links",
-        "work_issues",
-        "work_todos",
-        "work_blockers",
-        "work_discussions",
-        "work_audit_log",
+        "kanban_items",
+        "kanban_item_links",
+        "kanban_blockers",
+        "kanban_discussions",
+        "kanban_audit_log",
     }.issubset(sync_tables)
 
 
@@ -2782,7 +2778,7 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
             routes_personal.WorkItemCreateRequest(
                 item_id="work-user-visible",
                 title="User visible item",
-                body="Normal work survives the proof filter.",
+                body="Normal work survives the test-entry filter.",
                 state_id="todo",
                 priority_id="medium",
                 tags=["planning"],
@@ -2792,25 +2788,25 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
             )
         )
     )["item"]
-    proof_item = asyncio.run(
+    agent_item = asyncio.run(
         routes_personal.create_work_item(
             routes_personal.WorkItemCreateRequest(
-                item_id="work-proof-hidden",
-                title="Proof item",
-                body="Automation proof should be hideable.",
+                item_id="work-agent-hidden",
+                title="Agent working-out item",
+                body="Automation test entry should be hideable.",
                 state_id="todo",
                 priority_id="high",
                 tags=["proof", "step-19"],
                 actor="active-browser",
                 source_surface="kanban-active-browser-proof",
-                request_id="work-proof-hidden-create",
+                request_id="work-agent-hidden-create",
             )
         )
     )["item"]
     assert "kanban" in user_item["tags"]
-    assert "kanban" in proof_item["tags"]
+    assert "kanban" in agent_item["tags"]
     assert "agent-working-out" not in user_item["tags"]
-    assert "agent-working-out" in proof_item["tags"]
+    assert "agent-working-out" in agent_item["tags"]
 
     default_config = asyncio.run(routes_personal.get_work_config())
     assert default_config["preferences"]["show_test_entries"] is True
@@ -2822,7 +2818,7 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     )
     assert {item["item_id"] for item in todo_default["items"]} == {
         "work-user-visible",
-        "work-proof-hidden",
+        "work-agent-hidden",
     }
     assert default_board["board"]["preferences"]["show_test_entries"] is True
 
@@ -2832,7 +2828,7 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
                 todo_id="todo-user-visible",
                 item_id="work-user-visible",
                 title="User visible todo",
-                body="Normal Kanban todo survives the proof filter.",
+                body="Normal Kanban todo survives the test-entry filter.",
                 priority_id="medium",
                 actor="codex-test",
                 source_surface="pytest",
@@ -2843,33 +2839,45 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     asyncio.run(
         routes_personal.create_work_todo(
             routes_personal.WorkTodoUpsertRequest(
-                todo_id="todo-proof-hidden",
-                item_id="work-proof-hidden",
-                title="Proof todo",
-                body="Automation proof todo should be hideable.",
+                todo_id="todo-agent-hidden",
+                item_id="work-agent-hidden",
+                title="Agent working-out todo",
+                body="Automation test-entry todo should be hideable.",
                 priority_id="medium",
                 actor="codex-test",
                 source_surface="pytest",
-                request_id="todo-proof-hidden-create",
+                request_id="todo-agent-hidden-create",
             )
         )
     )
-    default_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    typed_user_todo_tags = json.loads(
+        conn.execute(
+            "SELECT tags_json FROM kanban_items WHERE item_id='todo-user-visible'"
+        ).fetchone()[0]
+    )
+    typed_agent_todo_tags = json.loads(
+        conn.execute(
+            "SELECT tags_json FROM kanban_items WHERE item_id='todo-agent-hidden'"
+        ).fetchone()[0]
+    )
+    assert "agent-working-out" not in typed_user_todo_tags
+    assert "agent-working-out" in typed_agent_todo_tags
+    default_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=50))
     default_refs = {
         item["source"]["ref"]
         for item in default_tasks["items"]
-        if item["source"]["type"] == "work-todo"
+        if item["source"]["type"] == "kanban-todo"
     }
-    assert default_refs == {"work_todos:todo-user-visible", "work_todos:todo-proof-hidden"}
-    assert default_tasks["work_preferences"]["show_test_entries"] is True
+    assert default_refs == {"kanban_items:todo-user-visible", "kanban_items:todo-agent-hidden"}
+    assert default_tasks["kanban_preferences"]["show_test_entries"] is True
 
     hidden_pref = asyncio.run(
-        routes_personal.update_work_preferences(
+        routes_personal.update_kanban_preferences(
             routes_personal.WorkPreferencesUpdateRequest(
                 show_test_entries=False,
                 actor="codex-test",
                 source_surface="pytest",
-                request_id="hide-proof-entries",
+                request_id="hide-test-entries",
             )
         )
     )
@@ -2877,7 +2885,7 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     assert (
         conn.execute(
             "SELECT value FROM settings WHERE key=?",
-            (routes_personal.WORK_SHOW_TEST_ENTRIES_SETTING,),
+            (routes_personal.KANBAN_SHOW_TEST_ENTRIES_SETTING,),
         ).fetchone()["value"]
         == "false"
     )
@@ -2889,25 +2897,27 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
         if column["state"]["state_id"] == "todo"
     )
     assert [item["item_id"] for item in todo_hidden["items"]] == ["work-user-visible"]
-    assert hidden_board["board"]["rollup"]["items"]["total"] == 1
+    assert all("kanban" in item["tags"] for item in todo_hidden["items"])
+    assert all("agent-working-out" not in item["tags"] for item in todo_hidden["items"])
+    assert hidden_board["board"]["rollup"]["items"]["total"] == 2
     assert hidden_board["board"]["hidden_test_items"] == 1
-    hidden_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    hidden_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=50))
     hidden_refs = {
         item["source"]["ref"]
         for item in hidden_tasks["items"]
-        if item["source"]["type"] == "work-todo"
+        if item["source"]["type"] == "kanban-todo"
     }
-    assert hidden_refs == {"work_todos:todo-user-visible"}
-    assert hidden_tasks["work_preferences"]["show_test_entries"] is False
-    assert hidden_tasks["test_entries"]["hidden_work_todos"] == 1
+    assert hidden_refs == {"kanban_items:todo-user-visible"}
+    assert hidden_tasks["kanban_preferences"]["show_test_entries"] is False
+    assert hidden_tasks["test_entries"]["hidden_kanban_todos"] == 1
 
     shown_pref = asyncio.run(
-        routes_personal.update_work_preferences(
+        routes_personal.update_kanban_preferences(
             routes_personal.WorkPreferencesUpdateRequest(
                 show_test_entries=True,
                 actor="codex-test",
                 source_surface="pytest",
-                request_id="show-proof-entries",
+                request_id="show-test-entries",
             )
         )
     )
@@ -2920,17 +2930,17 @@ def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch)
     )
     assert {item["item_id"] for item in todo_shown["items"]} == {
         "work-user-visible",
-        "work-proof-hidden",
+        "work-agent-hidden",
     }
-    shown_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="work", limit=50))
+    shown_tasks = asyncio.run(routes_personal.list_personal_tasks(mode="kanban", limit=50))
     shown_refs = {
         item["source"]["ref"]
         for item in shown_tasks["items"]
-        if item["source"]["type"] == "work-todo"
+        if item["source"]["type"] == "kanban-todo"
     }
-    assert shown_refs == {"work_todos:todo-user-visible", "work_todos:todo-proof-hidden"}
-    assert shown_tasks["work_preferences"]["show_test_entries"] is True
-    assert shown_tasks["test_entries"]["hidden_work_todos"] == 0
+    assert shown_refs == {"kanban_items:todo-user-visible", "kanban_items:todo-agent-hidden"}
+    assert shown_tasks["kanban_preferences"]["show_test_entries"] is True
+    assert shown_tasks["test_entries"]["hidden_kanban_todos"] == 0
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
@@ -2959,12 +2969,12 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
             )
         )["item"]
 
-    create_item("work-order-medium", "Medium Doing", "doing", "medium")
-    create_item("work-order-high-a", "High Doing A", "doing", "high")
-    create_item("work-order-high-b", "High Doing B", "doing", "high")
-    create_item("work-order-critical", "Critical Doing", "doing", "critical")
-    create_item("work-order-blocked-a", "Blocked Medium A", "blocked", "medium")
-    create_item("work-order-blocked-b", "Blocked Medium B", "blocked", "medium")
+    create_item("kanban-order-medium", "Medium Doing", "doing", "medium")
+    create_item("kanban-order-high-a", "High Doing A", "doing", "high")
+    create_item("kanban-order-high-b", "High Doing B", "doing", "high")
+    create_item("kanban-order-critical", "Critical Doing", "doing", "critical")
+    create_item("kanban-order-blocked-a", "Blocked Medium A", "blocked", "medium")
+    create_item("kanban-order-blocked-b", "Blocked Medium B", "blocked", "medium")
 
     def lane_ids(state_id: str) -> list[str]:
         board = asyncio.run(routes_personal.get_work_root_board())
@@ -2976,15 +2986,15 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
         return [item["item_id"] for item in column["items"]]
 
     assert lane_ids("doing")[:4] == [
-        "work-order-critical",
-        "work-order-high-a",
-        "work-order-high-b",
-        "work-order-medium",
+        "kanban-order-critical",
+        "kanban-order-high-a",
+        "kanban-order-high-b",
+        "kanban-order-medium",
     ]
 
     ordered = asyncio.run(
         routes_personal.order_work_item(
-            "work-order-high-b",
+            "kanban-order-high-b",
             routes_personal.WorkItemOrderRequest(
                 direction="up",
                 actor="codex-test",
@@ -2994,26 +3004,26 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
         )
     )
     assert ordered["changed"] is True
-    assert ordered["lane_order"] == ["work-order-high-b", "work-order-high-a"]
+    assert ordered["lane_order"] == ["kanban-order-high-b", "kanban-order-high-a"]
     assert lane_ids("doing")[:4] == [
-        "work-order-critical",
-        "work-order-high-b",
-        "work-order-high-a",
-        "work-order-medium",
+        "kanban-order-critical",
+        "kanban-order-high-b",
+        "kanban-order-high-a",
+        "kanban-order-medium",
     ]
 
     edge = conn.execute(
         """
-        SELECT * FROM work_item_order_edges
+        SELECT * FROM kanban_item_order_edges
         WHERE state_id='doing' AND priority_id='high'
         """
     ).fetchone()
-    assert edge["before_item_id"] == "work-order-high-b"
-    assert edge["after_item_id"] == "work-order-high-a"
+    assert edge["before_item_id"] == "kanban-order-high-b"
+    assert edge["after_item_id"] == "kanban-order-high-a"
 
     ordered_down = asyncio.run(
         routes_personal.order_work_item(
-            "work-order-high-b",
+            "kanban-order-high-b",
             routes_personal.WorkItemOrderRequest(
                 direction="down",
                 actor="codex-test",
@@ -3022,17 +3032,17 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
             ),
         )
     )
-    assert ordered_down["lane_order"] == ["work-order-high-a", "work-order-high-b"]
+    assert ordered_down["lane_order"] == ["kanban-order-high-a", "kanban-order-high-b"]
     assert lane_ids("doing")[:4] == [
-        "work-order-critical",
-        "work-order-high-a",
-        "work-order-high-b",
-        "work-order-medium",
+        "kanban-order-critical",
+        "kanban-order-high-a",
+        "kanban-order-high-b",
+        "kanban-order-medium",
     ]
 
     moved_to_blocked = asyncio.run(
         routes_personal.move_work_item(
-            "work-order-medium",
+            "kanban-order-medium",
             routes_personal.WorkItemMoveRequest(
                 parent_item_id=None,
                 state_id="blocked",
@@ -3044,26 +3054,26 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
     )
     assert moved_to_blocked["item"]["state_id"] == "blocked"
     assert lane_ids("blocked")[:3] == [
-        "work-order-medium",
-        "work-order-blocked-a",
-        "work-order-blocked-b",
+        "kanban-order-medium",
+        "kanban-order-blocked-a",
+        "kanban-order-blocked-b",
     ]
 
     blocked_edges = conn.execute(
         """
-        SELECT before_item_id, after_item_id FROM work_item_order_edges
+        SELECT before_item_id, after_item_id FROM kanban_item_order_edges
         WHERE state_id='blocked' AND priority_id='medium'
         ORDER BY before_item_id, after_item_id
         """
     ).fetchall()
     assert {tuple(edge) for edge in blocked_edges} == {
-        ("work-order-blocked-a", "work-order-blocked-b"),
-        ("work-order-medium", "work-order-blocked-a"),
+        ("kanban-order-blocked-a", "kanban-order-blocked-b"),
+        ("kanban-order-medium", "kanban-order-blocked-a"),
     }
 
     asyncio.run(
         routes_personal.move_work_item(
-            "work-order-medium",
+            "kanban-order-medium",
             routes_personal.WorkItemMoveRequest(
                 parent_item_id=None,
                 state_id="doing",
@@ -3075,7 +3085,7 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
     )
     asyncio.run(
         routes_personal.move_work_item(
-            "work-order-medium",
+            "kanban-order-medium",
             routes_personal.WorkItemMoveRequest(
                 parent_item_id=None,
                 state_id="blocked",
@@ -3086,16 +3096,16 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
         )
     )
     assert lane_ids("blocked")[:3] == [
-        "work-order-medium",
-        "work-order-blocked-a",
-        "work-order-blocked-b",
+        "kanban-order-medium",
+        "kanban-order-blocked-a",
+        "kanban-order-blocked-b",
     ]
 
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
-    assert "work_item_order_edges" in sync_tables
-    assert routes_sync._pk_for_table("work_item_order_edges") == "edge_id"
+    assert "kanban_item_order_edges" in sync_tables
+    assert routes_sync._pk_for_table("kanban_item_order_edges") == "edge_id"
 
 
 def test_minutes_projection_writes_compact_day_file_events_and_ledger(monkeypatch, tmp_path):
@@ -3539,23 +3549,15 @@ def test_personal_automation_signatures_and_skip_gate(monkeypatch, tmp_path):
                 task_id TEXT PRIMARY KEY,
                 updated_at TEXT
             );
-            CREATE TABLE work_items (
+            CREATE TABLE kanban_items (
                 item_id TEXT PRIMARY KEY,
                 updated_at TEXT
             );
-            CREATE TABLE work_issues (
-                issue_id TEXT PRIMARY KEY,
-                updated_at TEXT
-            );
-            CREATE TABLE work_todos (
-                todo_id TEXT PRIMARY KEY,
-                updated_at TEXT
-            );
-            CREATE TABLE work_blockers (
+            CREATE TABLE kanban_blockers (
                 blocker_id TEXT PRIMARY KEY,
                 updated_at TEXT
             );
-            CREATE TABLE work_discussions (
+            CREATE TABLE kanban_discussions (
                 discussion_id TEXT PRIMARY KEY,
                 updated_at TEXT
             );

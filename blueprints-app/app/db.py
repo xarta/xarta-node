@@ -6,11 +6,12 @@ read concurrency. The generation counter in sync_meta provides a total
 ordering across all committed writes — critical for the sync engine.
 """
 
+import hashlib
 import json
 import logging
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Generator
 
 from . import config as cfg
@@ -292,7 +293,7 @@ CREATE TABLE IF NOT EXISTS personal_events (
     privacy_level                 TEXT NOT NULL DEFAULT 'normal',
     tags_json                     TEXT NOT NULL DEFAULT '[]',
     entities_json                 TEXT NOT NULL DEFAULT '[]',
-    related_work_items_json       TEXT NOT NULL DEFAULT '[]',
+    related_kanban_items_json       TEXT NOT NULL DEFAULT '[]',
     related_tasks_json            TEXT NOT NULL DEFAULT '[]',
     related_import_batches_json   TEXT NOT NULL DEFAULT '[]',
     file_refs_json                TEXT NOT NULL DEFAULT '[]',
@@ -330,7 +331,7 @@ CREATE TABLE IF NOT EXISTS personal_time_tasks (
     timezone                      TEXT,
     privacy_level                 TEXT NOT NULL DEFAULT 'normal',
     tags_json                     TEXT NOT NULL DEFAULT '[]',
-    related_work_items_json       TEXT NOT NULL DEFAULT '[]',
+    related_kanban_items_json       TEXT NOT NULL DEFAULT '[]',
     related_tasks_json            TEXT NOT NULL DEFAULT '[]',
     related_import_batches_json   TEXT NOT NULL DEFAULT '[]',
     file_refs_json                TEXT NOT NULL DEFAULT '[]',
@@ -448,7 +449,7 @@ CREATE TABLE IF NOT EXISTS personal_git_features (
     last_seen_date        TEXT NOT NULL DEFAULT '',
     repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
     commit_count          INTEGER NOT NULL DEFAULT 0,
-    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    related_kanban_item_id  TEXT NOT NULL DEFAULT '',
     project_arc_id        TEXT NOT NULL DEFAULT '',
     subproject_arc_id     TEXT NOT NULL DEFAULT '',
     parent_work_item_id   TEXT NOT NULL DEFAULT '',
@@ -474,7 +475,7 @@ CREATE TABLE IF NOT EXISTS personal_git_kanban_arcs (
     repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
     feature_keys_json     TEXT NOT NULL DEFAULT '[]',
     commit_count          INTEGER NOT NULL DEFAULT 0,
-    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    related_kanban_item_id  TEXT NOT NULL DEFAULT '',
     source_hash           TEXT NOT NULL DEFAULT '',
     provenance_json       TEXT NOT NULL DEFAULT '{}',
     created_at            TEXT DEFAULT (datetime('now')),
@@ -493,7 +494,7 @@ CREATE TABLE IF NOT EXISTS personal_git_daily_summaries (
     repo_count            INTEGER NOT NULL DEFAULT 0,
     commit_count          INTEGER NOT NULL DEFAULT 0,
     feature_count         INTEGER NOT NULL DEFAULT 0,
-    related_work_items_json TEXT NOT NULL DEFAULT '[]',
+    related_kanban_items_json TEXT NOT NULL DEFAULT '[]',
     source_hash           TEXT NOT NULL DEFAULT '',
     provenance_json       TEXT NOT NULL DEFAULT '{}',
     event_id              TEXT NOT NULL DEFAULT '',
@@ -619,7 +620,7 @@ CREATE INDEX IF NOT EXISTS idx_personal_graph_links_target
 CREATE INDEX IF NOT EXISTS idx_personal_graph_links_type
     ON personal_graph_links(link_type, link_state, updated_at);
 
-CREATE TABLE IF NOT EXISTS work_item_states (
+CREATE TABLE IF NOT EXISTS kanban_item_states (
     state_id        TEXT PRIMARY KEY,
     label           TEXT NOT NULL,
     lane_key        TEXT NOT NULL,
@@ -629,10 +630,10 @@ CREATE TABLE IF NOT EXISTS work_item_states (
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_item_states_order
-    ON work_item_states(sort_order, state_id);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_states_order
+    ON kanban_item_states(sort_order, state_id);
 
-CREATE TABLE IF NOT EXISTS work_item_priorities (
+CREATE TABLE IF NOT EXISTS kanban_item_priorities (
     priority_id TEXT PRIMARY KEY,
     label       TEXT NOT NULL,
     weight      INTEGER NOT NULL DEFAULT 0,
@@ -640,15 +641,15 @@ CREATE TABLE IF NOT EXISTS work_item_priorities (
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_item_priorities_order
-    ON work_item_priorities(sort_order, priority_id);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_priorities_order
+    ON kanban_item_priorities(sort_order, priority_id);
 
-CREATE TABLE IF NOT EXISTS work_items (
+CREATE TABLE IF NOT EXISTS kanban_items (
     item_id                    TEXT PRIMARY KEY,
     parent_item_id             TEXT,
     title                      TEXT NOT NULL DEFAULT '',
     body_excerpt               TEXT NOT NULL DEFAULT '',
-    item_type                  TEXT NOT NULL DEFAULT 'work',
+    item_type                  TEXT NOT NULL DEFAULT 'item',
     state_id                   TEXT NOT NULL DEFAULT 'todo',
     priority_id                TEXT NOT NULL DEFAULT 'medium',
     depth                      INTEGER NOT NULL DEFAULT 0,
@@ -656,7 +657,7 @@ CREATE TABLE IF NOT EXISTS work_items (
     status                     TEXT NOT NULL DEFAULT 'open',
     archived_at                TEXT,
     promoted_from_ref          TEXT,
-    source_type                TEXT NOT NULL DEFAULT 'manual-work',
+    source_type                TEXT NOT NULL DEFAULT 'manual-kanban',
     source_ref                 TEXT NOT NULL DEFAULT '',
     source_hash                TEXT NOT NULL DEFAULT '',
     tags_json                  TEXT NOT NULL DEFAULT '[]',
@@ -673,16 +674,16 @@ CREATE TABLE IF NOT EXISTS work_items (
     created_at                 TEXT DEFAULT (datetime('now')),
     updated_at                 TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_items_board
-    ON work_items(parent_item_id, state_id, sort_order, updated_at);
-CREATE INDEX IF NOT EXISTS idx_work_items_state
-    ON work_items(state_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_items_source
-    ON work_items(source_type, source_ref);
-CREATE INDEX IF NOT EXISTS idx_work_items_vector
-    ON work_items(vector_index_key);
+CREATE INDEX IF NOT EXISTS idx_kanban_items_board
+    ON kanban_items(parent_item_id, state_id, sort_order, updated_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_items_state
+    ON kanban_items(state_id, status);
+CREATE INDEX IF NOT EXISTS idx_kanban_items_source
+    ON kanban_items(source_type, source_ref);
+CREATE INDEX IF NOT EXISTS idx_kanban_items_vector
+    ON kanban_items(vector_index_key);
 
-CREATE TABLE IF NOT EXISTS work_item_order_edges (
+CREATE TABLE IF NOT EXISTS kanban_item_order_edges (
     edge_id        TEXT PRIMARY KEY,
     parent_item_id TEXT NOT NULL DEFAULT '',
     state_id       TEXT NOT NULL,
@@ -694,12 +695,12 @@ CREATE TABLE IF NOT EXISTS work_item_order_edges (
     created_at     TEXT DEFAULT (datetime('now')),
     updated_at     TEXT DEFAULT (datetime('now'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_order_edges_unique
-    ON work_item_order_edges(parent_item_id, state_id, priority_id, before_item_id, after_item_id);
-CREATE INDEX IF NOT EXISTS idx_work_item_order_edges_lane
-    ON work_item_order_edges(parent_item_id, state_id, priority_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kanban_item_order_edges_unique
+    ON kanban_item_order_edges(parent_item_id, state_id, priority_id, before_item_id, after_item_id);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_order_edges_lane
+    ON kanban_item_order_edges(parent_item_id, state_id, priority_id);
 
-CREATE TABLE IF NOT EXISTS work_item_links (
+CREATE TABLE IF NOT EXISTS kanban_item_links (
     link_id        TEXT PRIMARY KEY,
     source_item_id TEXT NOT NULL,
     target_item_id TEXT NOT NULL,
@@ -708,62 +709,12 @@ CREATE TABLE IF NOT EXISTS work_item_links (
     created_at     TEXT DEFAULT (datetime('now')),
     updated_at     TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_item_links_source
-    ON work_item_links(source_item_id, link_type);
-CREATE INDEX IF NOT EXISTS idx_work_item_links_target
-    ON work_item_links(target_item_id, link_type);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_links_source
+    ON kanban_item_links(source_item_id, link_type);
+CREATE INDEX IF NOT EXISTS idx_kanban_item_links_target
+    ON kanban_item_links(target_item_id, link_type);
 
-CREATE TABLE IF NOT EXISTS work_issues (
-    issue_id             TEXT PRIMARY KEY,
-    item_id              TEXT NOT NULL,
-    title                TEXT NOT NULL DEFAULT '',
-    body_excerpt         TEXT NOT NULL DEFAULT '',
-    status               TEXT NOT NULL DEFAULT 'open',
-    priority_id          TEXT NOT NULL DEFAULT 'medium',
-    source_ref           TEXT NOT NULL DEFAULT '',
-    related_task_id      TEXT NOT NULL DEFAULT '',
-    search_text          TEXT NOT NULL DEFAULT '',
-    search_metadata_json TEXT NOT NULL DEFAULT '{}',
-    embedding_ref        TEXT NOT NULL DEFAULT '',
-    embedding_model      TEXT NOT NULL DEFAULT '',
-    embedding_updated_at TEXT,
-    vector_index_key     TEXT NOT NULL DEFAULT '',
-    provenance_json      TEXT NOT NULL DEFAULT '{}',
-    created_at           TEXT DEFAULT (datetime('now')),
-    updated_at           TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_work_issues_item
-    ON work_issues(item_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_issues_vector
-    ON work_issues(vector_index_key);
-
-CREATE TABLE IF NOT EXISTS work_todos (
-    todo_id              TEXT PRIMARY KEY,
-    item_id              TEXT NOT NULL,
-    title                TEXT NOT NULL DEFAULT '',
-    body_excerpt         TEXT NOT NULL DEFAULT '',
-    status               TEXT NOT NULL DEFAULT 'open',
-    priority_id          TEXT NOT NULL DEFAULT 'medium',
-    due_at               TEXT,
-    related_task_id      TEXT NOT NULL DEFAULT '',
-    search_text          TEXT NOT NULL DEFAULT '',
-    search_metadata_json TEXT NOT NULL DEFAULT '{}',
-    embedding_ref        TEXT NOT NULL DEFAULT '',
-    embedding_model      TEXT NOT NULL DEFAULT '',
-    embedding_updated_at TEXT,
-    vector_index_key     TEXT NOT NULL DEFAULT '',
-    provenance_json      TEXT NOT NULL DEFAULT '{}',
-    created_at           TEXT DEFAULT (datetime('now')),
-    updated_at           TEXT DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_work_todos_item
-    ON work_todos(item_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_todos_due
-    ON work_todos(due_at, status);
-CREATE INDEX IF NOT EXISTS idx_work_todos_vector
-    ON work_todos(vector_index_key);
-
-CREATE TABLE IF NOT EXISTS work_blockers (
+CREATE TABLE IF NOT EXISTS kanban_blockers (
     blocker_id           TEXT PRIMARY KEY,
     item_id              TEXT NOT NULL,
     title                TEXT NOT NULL DEFAULT '',
@@ -780,12 +731,12 @@ CREATE TABLE IF NOT EXISTS work_blockers (
     created_at           TEXT DEFAULT (datetime('now')),
     updated_at           TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_blockers_item
-    ON work_blockers(item_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_blockers_vector
-    ON work_blockers(vector_index_key);
+CREATE INDEX IF NOT EXISTS idx_kanban_blockers_item
+    ON kanban_blockers(item_id, status);
+CREATE INDEX IF NOT EXISTS idx_kanban_blockers_vector
+    ON kanban_blockers(vector_index_key);
 
-CREATE TABLE IF NOT EXISTS work_discussions (
+CREATE TABLE IF NOT EXISTS kanban_discussions (
     discussion_id        TEXT PRIMARY KEY,
     item_id              TEXT NOT NULL,
     author               TEXT NOT NULL DEFAULT '',
@@ -801,12 +752,12 @@ CREATE TABLE IF NOT EXISTS work_discussions (
     created_at           TEXT DEFAULT (datetime('now')),
     updated_at           TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_work_discussions_item
-    ON work_discussions(item_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_work_discussions_vector
-    ON work_discussions(vector_index_key);
+CREATE INDEX IF NOT EXISTS idx_kanban_discussions_item
+    ON kanban_discussions(item_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_discussions_vector
+    ON kanban_discussions(vector_index_key);
 
-CREATE TABLE IF NOT EXISTS work_audit_log (
+CREATE TABLE IF NOT EXISTS kanban_audit_log (
     audit_id       TEXT PRIMARY KEY,
     actor          TEXT NOT NULL DEFAULT '',
     source_surface TEXT NOT NULL DEFAULT '',
@@ -821,10 +772,10 @@ CREATE TABLE IF NOT EXISTS work_audit_log (
     source_hash    TEXT NOT NULL DEFAULT '',
     metadata_json  TEXT NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_work_audit_log_target
-    ON work_audit_log(target_ref, created_at);
-CREATE INDEX IF NOT EXISTS idx_work_audit_log_item
-    ON work_audit_log(item_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_audit_log_target
+    ON kanban_audit_log(target_ref, created_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_audit_log_item
+    ON kanban_audit_log(item_id, created_at);
 
 CREATE TABLE IF NOT EXISTS pve_hosts (
     pve_id        TEXT PRIMARY KEY,   -- IP address — stable, no external config needed
@@ -1504,7 +1455,7 @@ INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.bm_fetch_li
 INSERT OR IGNORE INTO settings (key, value, description) VALUES ('fe.sound_enabled', 'false', 'Enable sound playback on menu item clicks');
 """
 
-_WORK_ITEM_STATE_SEED = (
+_KANBAN_ITEM_STATE_SEED = (
     ("backlog", "Backlog", "backlog", "open", 10, 0),
     ("todo", "To Do", "todo", "open", 20, 0),
     ("doing", "Doing", "doing", "active", 30, 0),
@@ -1512,7 +1463,7 @@ _WORK_ITEM_STATE_SEED = (
     ("done", "Done", "done", "done", 50, 1),
 )
 
-_WORK_ITEM_PRIORITY_SEED = (
+_KANBAN_ITEM_PRIORITY_SEED = (
     ("low", "Low", 10, 10),
     ("medium", "Medium", 50, 20),
     ("high", "High", 80, 30),
@@ -1574,8 +1525,437 @@ def _migrate_embed_menu_items_composite_unique(conn: sqlite3.Connection) -> None
     log.info("migration: embed_menu_items composite unique applied")
 
 
+_KANBAN_TABLE_RENAMES = (
+    ("work_item_states", "kanban_item_states"),
+    ("work_item_priorities", "kanban_item_priorities"),
+    ("work_items", "kanban_items"),
+    ("work_item_order_edges", "kanban_item_order_edges"),
+    ("work_item_links", "kanban_item_links"),
+    ("work_blockers", "kanban_blockers"),
+    ("work_discussions", "kanban_discussions"),
+    ("work_audit_log", "kanban_audit_log"),
+)
+
+_KANBAN_REF_REPLACEMENTS = (
+    ("work_issues:", "kanban_items:"),
+    ("work_todos:", "kanban_items:"),
+    ("work_items:", "kanban_items:"),
+    ("work_item_links:", "kanban_item_links:"),
+    ("work_blockers:", "kanban_blockers:"),
+    ("work_discussions:", "kanban_discussions:"),
+    ("work_audit_log:", "kanban_audit_log:"),
+    ('"table": "work_items"', '"table": "kanban_items"'),
+    ('"table":"work_items"', '"table":"kanban_items"'),
+    ('"table": "work_issues"', '"table": "kanban_items"'),
+    ('"table":"work_issues"', '"table":"kanban_items"'),
+    ('"table": "work_todos"', '"table": "kanban_items"'),
+    ('"table":"work_todos"', '"table":"kanban_items"'),
+    ('"table": "work_blockers"', '"table": "kanban_blockers"'),
+    ('"table":"work_blockers"', '"table":"kanban_blockers"'),
+    ('"table": "work_discussions"', '"table": "kanban_discussions"'),
+    ('"table":"work_discussions"', '"table":"kanban_discussions"'),
+    ('"source_table": "work_items"', '"source_table": "kanban_items"'),
+    ('"source_table":"work_items"', '"source_table":"kanban_items"'),
+    ('"source_table": "work_issues"', '"source_table": "kanban_items"'),
+    ('"source_table":"work_issues"', '"source_table":"kanban_items"'),
+    ('"source_table": "work_todos"', '"source_table": "kanban_items"'),
+    ('"source_table":"work_todos"', '"source_table":"kanban_items"'),
+    ('"source_table": "work_blockers"', '"source_table": "kanban_blockers"'),
+    ('"source_table":"work_blockers"', '"source_table":"kanban_blockers"'),
+    ("xarta.work.search_metadata.v1", "xarta.kanban.search_metadata.v1"),
+    ("work-management", "kanban"),
+    ("manual-work", "manual-kanban"),
+    ("work-todo", "kanban-todo"),
+    ("work_todo", "kanban_todo"),
+    ("work_issue", "kanban_issue"),
+    ("work_blocker", "kanban_blocker"),
+    ("work_discussion", "kanban_discussion"),
+    ('"kind": "work"', '"kind": "item"'),
+    ('"kind":"work"', '"kind":"item"'),
+)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    )
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _copy_then_drop_table(conn: sqlite3.Connection, old_table: str, new_table: str) -> None:
+    if not _table_exists(conn, old_table):
+        return
+    old_cols = _table_columns(conn, old_table)
+    new_cols = _table_columns(conn, new_table)
+    cols = [col for col in new_cols if col in old_cols]
+    if cols:
+        col_sql = ", ".join(cols)
+        conn.execute(
+            f"INSERT OR IGNORE INTO {new_table} ({col_sql}) SELECT {col_sql} FROM {old_table}"
+        )
+    conn.execute(f"DROP TABLE {old_table}")
+    log.info("migration: renamed %s into %s", old_table, new_table)
+
+
+def _load_json_dict(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _load_json_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item).strip()]
+
+
+def _kanban_leaf_state_status(source_status: str | None) -> tuple[str, str]:
+    status = (source_status or "open").strip().lower()
+    if status == "archived":
+        return "todo", "archived"
+    if status == "blocked":
+        return "blocked", "blocked"
+    if status in {"active", "in_progress"}:
+        return "doing", "active"
+    if status in {"done", "closed", "promoted", "resolved"}:
+        return "done", "done"
+    return "todo", "open"
+
+
+def _kanban_leaf_tags(parent_tags_json: str | None, kind: str) -> list[str]:
+    tags = [kind, "kanban"]
+    parent_tags = _load_json_list(parent_tags_json)
+    if "agent-working-out" in parent_tags:
+        tags.append("agent-working-out")
+    return tags
+
+
+def _kanban_search_payload(
+    *,
+    row_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    tags: list[str],
+    related_refs: list[str],
+) -> tuple[str, str, str]:
+    search_text = "\n".join(part for part in [title, body, " ".join(tags)] if part)
+    vector_key = f"kanban_items:{row_id}"
+    metadata = {
+        "schema": "xarta.kanban.search_metadata.v1",
+        "table": "kanban_items",
+        "row_id": row_id,
+        "kind": kind,
+        "related_refs": related_refs,
+        "embedding": {"state": "pending", "ref": "", "model": ""},
+        "vector": {"index": "kanban", "key": vector_key, "turbo_vec_ready": True},
+    }
+    return search_text, json.dumps(metadata, ensure_ascii=True, sort_keys=True), vector_key
+
+
+def _migrate_leaf_table_to_kanban_items(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    id_col: str,
+    kind: str,
+) -> None:
+    if not _table_exists(conn, table):
+        return
+    rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+    for row in rows:
+        leaf_id = row[id_col]
+        parent_id = row["item_id"]
+        parent = conn.execute(
+            "SELECT depth, tags_json FROM kanban_items WHERE item_id=?",
+            (parent_id,),
+        ).fetchone()
+        depth = int(parent["depth"]) + 1 if parent and parent["depth"] is not None else 0
+        parent_tags_json = parent["tags_json"] if parent else "[]"
+        existing = conn.execute(
+            "SELECT * FROM kanban_items WHERE item_id=?",
+            (leaf_id,),
+        ).fetchone()
+        state_id, item_status = _kanban_leaf_state_status(row["status"])
+        source_status = str(row["status"] or "")
+        item_type = "item" if source_status == "promoted" else kind
+        if existing and existing["item_type"] not in {"issue", "todo"}:
+            item_type = existing["item_type"]
+        tags = _kanban_leaf_tags(parent_tags_json, kind)
+        related_tasks = [row["related_task_id"]] if row["related_task_id"] else []
+        related_issues = [leaf_id] if kind == "issue" else []
+        old_ref = f"{table}:{leaf_id}"
+        related_refs = [
+            f"kanban_items:{parent_id}",
+            *([row["source_ref"]] if "source_ref" in row.keys() and row["source_ref"] else []),
+            *([f"personal_time_tasks:{row['related_task_id']}"] if row["related_task_id"] else []),
+        ]
+        search_text, search_metadata, vector_key = _kanban_search_payload(
+            row_id=leaf_id,
+            kind=item_type,
+            title=row["title"] or "",
+            body=row["body_excerpt"] or "",
+            tags=tags,
+            related_refs=related_refs,
+        )
+        provenance = _load_json_dict(row["provenance_json"])
+        kanban_meta = provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}
+        provenance["kanban"] = {
+            **kanban_meta,
+            "typed_leaf_card": item_type in {"issue", "todo"},
+            "leaf_kind": kind,
+            "migrated_from_ref": old_ref,
+            "parent_item_id": parent_id,
+        }
+        leaf_meta = provenance.get(kind) if isinstance(provenance.get(kind), dict) else {}
+        provenance[kind] = {
+            **leaf_meta,
+            "item_id": parent_id,
+            "typed_item_id": leaf_id,
+            "migrated_from_ref": old_ref,
+            "external_source_ref": row["source_ref"] if "source_ref" in row.keys() else "",
+            "due_at": row["due_at"] if "due_at" in row.keys() and row["due_at"] else "",
+        }
+        created_at = row["created_at"] or (existing["created_at"] if existing else None)
+        updated_at = row["updated_at"] or (existing["updated_at"] if existing else None)
+        source_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "item_id": leaf_id,
+                    "parent_item_id": parent_id,
+                    "title": row["title"] or "",
+                    "body": row["body_excerpt"] or "",
+                    "item_type": item_type,
+                    "state_id": state_id,
+                    "priority_id": row["priority_id"] or "medium",
+                    "status": item_status,
+                    "source_ref": f"kanban_items:{leaf_id}",
+                    "related_task_ids": related_tasks,
+                    "related_issue_ids": related_issues,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO kanban_items (
+                item_id, parent_item_id, title, body_excerpt, item_type, state_id,
+                priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
+                source_type, source_ref, source_hash, tags_json, related_event_ids_json,
+                related_task_ids_json, related_issue_ids_json, search_text,
+                search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+                vector_index_key, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?,
+                    ?, '', '', NULL, ?, ?, COALESCE(?, datetime('now')),
+                    COALESCE(?, datetime('now')))
+            ON CONFLICT(item_id) DO UPDATE SET
+                parent_item_id=excluded.parent_item_id,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                item_type=excluded.item_type,
+                state_id=excluded.state_id,
+                priority_id=excluded.priority_id,
+                depth=excluded.depth,
+                status=excluded.status,
+                archived_at=excluded.archived_at,
+                promoted_from_ref=excluded.promoted_from_ref,
+                source_type=excluded.source_type,
+                source_ref=excluded.source_ref,
+                source_hash=excluded.source_hash,
+                tags_json=excluded.tags_json,
+                related_task_ids_json=excluded.related_task_ids_json,
+                related_issue_ids_json=excluded.related_issue_ids_json,
+                search_text=excluded.search_text,
+                search_metadata_json=excluded.search_metadata_json,
+                vector_index_key=excluded.vector_index_key,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                leaf_id,
+                parent_id,
+                row["title"] or "",
+                row["body_excerpt"] or "",
+                item_type,
+                state_id,
+                row["priority_id"] or "medium",
+                depth,
+                item_status,
+                row["updated_at"] if item_status == "archived" else None,
+                f"kanban_items:{leaf_id}"
+                if item_type == "item" and source_status == "promoted"
+                else "",
+                f"kanban-{kind}",
+                f"kanban_items:{leaf_id}",
+                source_hash,
+                json.dumps(tags, ensure_ascii=True),
+                json.dumps(related_tasks, ensure_ascii=True),
+                json.dumps(related_issues, ensure_ascii=True),
+                search_text,
+                search_metadata,
+                vector_key,
+                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                created_at,
+                updated_at,
+            ),
+        )
+    conn.execute(f"DROP TABLE {table}")
+    log.info("migration: folded %d %s rows into kanban_items", len(rows), table)
+
+
+def _rewrite_kanban_ref_text(conn: sqlite3.Connection) -> None:
+    ref_columns = {
+        "kanban_items": (
+            "promoted_from_ref",
+            "source_type",
+            "source_ref",
+            "search_metadata_json",
+            "vector_index_key",
+            "provenance_json",
+        ),
+        "kanban_item_links": ("metadata_json",),
+        "kanban_blockers": (
+            "blocked_by_ref",
+            "search_metadata_json",
+            "vector_index_key",
+            "provenance_json",
+        ),
+        "kanban_discussions": ("search_metadata_json", "vector_index_key", "provenance_json"),
+        "kanban_audit_log": ("target_ref", "source_surface", "metadata_json"),
+        "personal_graph_links": (
+            "source_ref",
+            "source_table",
+            "source_id",
+            "target_ref",
+            "target_table",
+            "target_id",
+            "title",
+            "metadata_json",
+            "provenance_json",
+        ),
+        "personal_search_documents": (
+            "document_id",
+            "record_type",
+            "record_table",
+            "record_id",
+            "source_type",
+            "source_ref",
+            "search_text",
+            "related_refs_json",
+            "page_ref_json",
+            "source_refs_json",
+            "provenance_json",
+            "vector_index_key",
+        ),
+        "personal_time_audit": ("target_ref", "metadata_json"),
+        "table_layout_catalog": ("table_name", "table_meta"),
+    }
+    for table, wanted_columns in ref_columns.items():
+        if not _table_exists(conn, table):
+            continue
+        existing_columns = set(_table_columns(conn, table))
+        for column_name in wanted_columns:
+            if column_name not in existing_columns:
+                continue
+            for old, new in _KANBAN_REF_REPLACEMENTS:
+                conn.execute(
+                    f"UPDATE {table} SET {column_name}=REPLACE({column_name}, ?, ?) "
+                    f"WHERE {column_name} LIKE ?",
+                    (old, new, f"%{old}%"),
+                )
+    if _table_exists(conn, "sync_queue"):
+        for old, new in _KANBAN_TABLE_RENAMES:
+            conn.execute("UPDATE sync_queue SET table_name=? WHERE table_name=?", (new, old))
+        conn.execute("DELETE FROM sync_queue WHERE table_name IN ('work_issues', 'work_todos')")
+
+
+def _migrate_kanban_storage(conn: sqlite3.Connection) -> None:
+    """Move Kanban storage to canonical kanban_* tables and typed item cards."""
+    conn.row_factory = sqlite3.Row
+    for old_table, new_table in _KANBAN_TABLE_RENAMES:
+        _copy_then_drop_table(conn, old_table, new_table)
+    _migrate_leaf_table_to_kanban_items(conn, table="work_issues", id_col="issue_id", kind="issue")
+    _migrate_leaf_table_to_kanban_items(conn, table="work_todos", id_col="todo_id", kind="todo")
+    if _table_exists(conn, "kanban_items"):
+        conn.execute("UPDATE kanban_items SET item_type='item' WHERE item_type='work'")
+    _rewrite_kanban_ref_text(conn)
+
+
+def _migrate_personal_kanban_refs(conn: sqlite3.Connection) -> None:
+    """Rename cross-page Kanban reference columns and mode values."""
+    conn.row_factory = sqlite3.Row
+    for table in ("personal_events", "personal_time_tasks", "personal_git_daily_summaries"):
+        if not _table_exists(conn, table):
+            continue
+        columns = _table_columns(conn, table)
+        if "related_work_items_json" in columns and "related_kanban_items_json" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} RENAME COLUMN related_work_items_json TO related_kanban_items_json"
+            )
+        elif "related_work_items_json" in columns and "related_kanban_items_json" in columns:
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET related_kanban_items_json=related_work_items_json
+                WHERE COALESCE(related_kanban_items_json, '') IN ('', '[]')
+                  AND COALESCE(related_work_items_json, '') NOT IN ('', '[]')
+                """
+            )
+            with suppress(sqlite3.OperationalError):
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN related_work_items_json")
+        if "related_kanban_items_json" in _table_columns(conn, table):
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET related_kanban_items_json=replace(related_kanban_items_json, '"work:', '"')
+                WHERE related_kanban_items_json LIKE '%"work:%'
+                """
+            )
+    for table in ("personal_git_features", "personal_git_kanban_arcs"):
+        if not _table_exists(conn, table):
+            continue
+        columns = _table_columns(conn, table)
+        if "related_work_item_id" in columns and "related_kanban_item_id" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} RENAME COLUMN related_work_item_id TO related_kanban_item_id"
+            )
+        elif "related_work_item_id" in columns and "related_kanban_item_id" in columns:
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET related_kanban_item_id=related_work_item_id
+                WHERE COALESCE(related_kanban_item_id, '') = ''
+                  AND COALESCE(related_work_item_id, '') != ''
+                """
+            )
+            with suppress(sqlite3.OperationalError):
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN related_work_item_id")
+    if _table_exists(conn, "personal_time_tasks"):
+        conn.execute("UPDATE personal_time_tasks SET mode='kanban' WHERE mode='work'")
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Idempotent ALTER TABLE migrations for columns added after initial deploy."""
+    _migrate_kanban_storage(conn)
+    _migrate_personal_kanban_refs(conn)
     migrations = [
         ("nodes", "ui_url", "TEXT"),
         # ── Phase-1 schema evolution (2026-03-11) ─────────────────────────
@@ -1880,12 +2260,12 @@ def _seed_table_layout_catalog(conn: sqlite3.Connection) -> None:
         )
 
 
-def _seed_work_management_config(conn: sqlite3.Connection) -> None:
-    """Ensure the recursive Kanban board has deterministic lane and priority config."""
-    for state_id, label, lane_key, category, sort_order, is_terminal in _WORK_ITEM_STATE_SEED:
+def _seed_kanban_config(conn: sqlite3.Connection) -> None:
+    """Ensure Kanban has deterministic lane and priority config."""
+    for state_id, label, lane_key, category, sort_order, is_terminal in _KANBAN_ITEM_STATE_SEED:
         conn.execute(
             """
-            INSERT INTO work_item_states (
+            INSERT INTO kanban_item_states (
                 state_id, label, lane_key, status_category, sort_order, is_terminal
             )
             VALUES (?, ?, ?, ?, ?, ?)
@@ -1899,10 +2279,10 @@ def _seed_work_management_config(conn: sqlite3.Connection) -> None:
             """,
             (state_id, label, lane_key, category, sort_order, is_terminal),
         )
-    for priority_id, label, weight, sort_order in _WORK_ITEM_PRIORITY_SEED:
+    for priority_id, label, weight, sort_order in _KANBAN_ITEM_PRIORITY_SEED:
         conn.execute(
             """
-            INSERT INTO work_item_priorities (priority_id, label, weight, sort_order)
+            INSERT INTO kanban_item_priorities (priority_id, label, weight, sort_order)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(priority_id) DO UPDATE SET
                 label=excluded.label,
@@ -2118,7 +2498,7 @@ def init_db() -> None:
         _backfill_visit_events(conn)
         _seed_vlans_from_proxmox_nets(conn)
         _seed_table_layout_catalog(conn)
-        _seed_work_management_config(conn)
+        _seed_kanban_config(conn)
         _seed_manual_links_ai_assignment(conn)
         _seed_personal_search_ai_assignments(conn)
         _seed_manual_link_categories_from_groups(conn)
