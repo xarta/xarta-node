@@ -199,11 +199,9 @@ def sqlite_signature(*, local_date: str, kind: str) -> dict[str, Any]:
             for table in (
                 "personal_events",
                 "personal_time_tasks",
-                "work_items",
-                "work_issues",
-                "work_todos",
-                "work_blockers",
-                "work_discussions",
+                "kanban_items",
+                "kanban_blockers",
+                "kanban_discussions",
             ):
                 row = conn.execute(
                     f"SELECT COUNT(*) AS count, MAX(updated_at) AS max_updated_at FROM {table}"
@@ -512,8 +510,9 @@ def run_git_rollup(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_work_rollup(args: argparse.Namespace) -> dict[str, Any]:
-    payload = get_json(args, "/api/v1/personal/work/board")
-    lanes = payload.get("lanes") if isinstance(payload.get("lanes"), list) else []
+    payload = get_json(args, "/api/v1/personal/kanban/board")
+    board = payload.get("board") if isinstance(payload.get("board"), dict) else {}
+    lanes = board.get("columns") if isinstance(board.get("columns"), list) else []
     item_count = 0
     for lane in lanes:
         if isinstance(lane, dict):

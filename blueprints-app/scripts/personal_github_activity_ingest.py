@@ -50,7 +50,7 @@ REQUIRED_SYNC_TABLES = (
     "personal_git_daily_summaries",
     "personal_git_import_runs",
     "personal_events",
-    "work_items",
+    "kanban_items",
 )
 VISIBLE_CALENDAR_IDENTIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bghc-[0-9a-fA-F]{12,}\b"), "[commit reference]"),
@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS personal_git_features (
     last_seen_date        TEXT NOT NULL DEFAULT '',
     repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
     commit_count          INTEGER NOT NULL DEFAULT 0,
-    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    related_kanban_item_id  TEXT NOT NULL DEFAULT '',
     project_arc_id        TEXT NOT NULL DEFAULT '',
     subproject_arc_id     TEXT NOT NULL DEFAULT '',
     parent_work_item_id   TEXT NOT NULL DEFAULT '',
@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS personal_git_kanban_arcs (
     repo_full_names_json  TEXT NOT NULL DEFAULT '[]',
     feature_keys_json     TEXT NOT NULL DEFAULT '[]',
     commit_count          INTEGER NOT NULL DEFAULT 0,
-    related_work_item_id  TEXT NOT NULL DEFAULT '',
+    related_kanban_item_id  TEXT NOT NULL DEFAULT '',
     source_hash           TEXT NOT NULL DEFAULT '',
     provenance_json       TEXT NOT NULL DEFAULT '{}',
     created_at            TEXT DEFAULT (datetime('now')),
@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS personal_git_daily_summaries (
     repo_count            INTEGER NOT NULL DEFAULT 0,
     commit_count          INTEGER NOT NULL DEFAULT 0,
     feature_count         INTEGER NOT NULL DEFAULT 0,
-    related_work_items_json TEXT NOT NULL DEFAULT '[]',
+    related_kanban_items_json TEXT NOT NULL DEFAULT '[]',
     source_hash           TEXT NOT NULL DEFAULT '',
     provenance_json       TEXT NOT NULL DEFAULT '{}',
     event_id              TEXT NOT NULL DEFAULT '',
@@ -279,7 +279,7 @@ class FeatureRecord:
     repo_full_names: list[str]
     commit_ids: list[str]
     commit_count: int
-    related_work_item_id: str
+    related_kanban_item_id: str
     source_hash: str
     provenance: dict[str, Any]
     project_arc_id: str = ""
@@ -300,7 +300,7 @@ class KanbanArcRecord:
     repo_full_names: list[str]
     feature_keys: list[str]
     commit_count: int
-    related_work_item_id: str
+    related_kanban_item_id: str
     source_hash: str
     provenance: dict[str, Any]
 
@@ -315,7 +315,7 @@ class DailySummary:
     repo_count: int
     commit_count: int
     feature_count: int
-    related_work_items: list[str]
+    related_kanban_items: list[str]
     source_hash: str
     provenance: dict[str, Any]
     body_excerpt: str
@@ -355,7 +355,7 @@ def slugify(value: str, fallback: str = "general") -> str:
 def title_from_slug(slug: str) -> str:
     overrides = {
         "personal-time-activity": "Personal Time Activity",
-        "kanban-work-management": "Kanban Work Management",
+        "kanban-kanban": "Kanban Work Management",
         "calendar-diary": "Calendar And Diary",
         "source-imports": "Source Imports",
         "security-cleanup": "Security Cleanup",
@@ -876,7 +876,7 @@ def infer_feature_key(repo: RepoRecord, subject: str, branches: list[str]) -> st
     if re.search(r"\b(calendar|diary|personal time|time activity|personal activity)\b", text):
         return "personal-time-activity"
     if re.search(r"\b(kanban|work item|work management|project arc)\b", text):
-        return "kanban-work-management"
+        return "kanban-kanban"
     if re.search(r"\b(source record|import batch|imports|provenance)\b", text):
         return "source-imports"
     if re.search(r"\b(voice|tts|stt|wake|vad)\b", text):
@@ -1096,7 +1096,7 @@ def build_features(commits: list[CommitRecord]) -> dict[str, FeatureRecord]:
             repo_full_names=repo_names,
             commit_ids=[commit.commit_id for commit in feature_commits],
             commit_count=len(feature_commits),
-            related_work_item_id=work_item_id,
+            related_kanban_item_id=work_item_id,
             source_hash=source_hash,
             provenance=provenance,
         )
@@ -1197,7 +1197,7 @@ def build_daily_markdown(
                 if commit.feature_key == feature.feature_key
             }
         )
-        link = markdown_link(feature.title, kanban_item_url(feature.related_work_item_id))
+        link = markdown_link(feature.title, kanban_item_url(feature.related_kanban_item_id))
         lines.append(
             f"- {link}: {plural(count, 'commit')} across {plural(repo_total, 'repository', 'repositories')}; status {feature.status}."
         )
@@ -1242,8 +1242,8 @@ def build_daily_summaries(
     for day, day_commits in sorted(by_day.items()):
         day_commits.sort(key=lambda commit: (commit.committed_at, commit.repo_full_name))
         day_feature_keys = sorted({commit.feature_key for commit in day_commits})
-        related_work_items = [
-            features[key].related_work_item_id for key in day_feature_keys if key in features
+        related_kanban_items = [
+            features[key].related_kanban_item_id for key in day_feature_keys if key in features
         ]
         markdown = build_daily_markdown(day, day_commits, repos_by_name, features)
         provenance = {
@@ -1253,7 +1253,7 @@ def build_daily_summaries(
             "source_shas": [commit.sha for commit in day_commits],
             "commit_urls": [commit.html_url for commit in day_commits],
             "feature_keys": day_feature_keys,
-            "kanban_links": [kanban_item_url(item_id) for item_id in related_work_items],
+            "kanban_links": [kanban_item_url(item_id) for item_id in related_kanban_items],
         }
         source_hash = stable_digest(
             {
@@ -1274,7 +1274,7 @@ def build_daily_summaries(
                 repo_count=len({commit.repo_full_name for commit in day_commits}),
                 commit_count=len(day_commits),
                 feature_count=len(day_feature_keys),
-                related_work_items=related_work_items,
+                related_kanban_items=related_kanban_items,
                 source_hash=source_hash,
                 provenance=provenance,
                 body_excerpt=first_sentence(markdown),
@@ -1498,7 +1498,7 @@ def upsert_root_work_item(conn: sqlite3.Connection, now: str) -> None:
     source_hash = stable_digest({"id": ROOT_WORK_ITEM_ID, "title": "GitHub Activity"}, 32)
     conn.execute(
         """
-        INSERT INTO work_items (
+        INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
             priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
@@ -1546,7 +1546,7 @@ def upsert_kanban_arc(conn: sqlite3.Connection, arc: KanbanArcRecord, now: str) 
         INSERT INTO personal_git_kanban_arcs (
             arc_id, arc_type, arc_key, title, status, first_seen_date, last_seen_date,
             parent_arc_id, repo_full_names_json, feature_keys_json, commit_count,
-            related_work_item_id, source_hash, provenance_json, created_at, updated_at
+            related_kanban_item_id, source_hash, provenance_json, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(arc_id) DO UPDATE SET
@@ -1560,7 +1560,7 @@ def upsert_kanban_arc(conn: sqlite3.Connection, arc: KanbanArcRecord, now: str) 
             repo_full_names_json=excluded.repo_full_names_json,
             feature_keys_json=excluded.feature_keys_json,
             commit_count=excluded.commit_count,
-            related_work_item_id=excluded.related_work_item_id,
+            related_kanban_item_id=excluded.related_kanban_item_id,
             source_hash=excluded.source_hash,
             provenance_json=excluded.provenance_json,
             updated_at=excluded.updated_at
@@ -1577,7 +1577,7 @@ def upsert_kanban_arc(conn: sqlite3.Connection, arc: KanbanArcRecord, now: str) 
             json_dumps(arc.repo_full_names),
             json_dumps(arc.feature_keys),
             arc.commit_count,
-            arc.related_work_item_id,
+            arc.related_kanban_item_id,
             arc.source_hash,
             json_dumps(arc.provenance),
             now,
@@ -1597,9 +1597,9 @@ def upsert_arc_work_item(
     if arc.parent_arc_id:
         parent_arc = arcs_by_id.get(arc.parent_arc_id)
         if parent_arc:
-            parent_item_id = parent_arc.related_work_item_id
+            parent_item_id = parent_arc.related_kanban_item_id
             parent_row = conn.execute(
-                "SELECT depth FROM work_items WHERE item_id=?", (parent_item_id,)
+                "SELECT depth FROM kanban_items WHERE item_id=?", (parent_item_id,)
             ).fetchone()
             depth = int(parent_row["depth"]) + 1 if parent_row else 2
 
@@ -1612,7 +1612,7 @@ def upsert_arc_work_item(
     search = " ".join([arc.title, arc.arc_key, *arc.repo_full_names, *arc.feature_keys])
     conn.execute(
         """
-        INSERT INTO work_items (
+        INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
             priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
@@ -1641,7 +1641,7 @@ def upsert_arc_work_item(
             updated_at=excluded.updated_at
         """,
         (
-            arc.related_work_item_id,
+            arc.related_kanban_item_id,
             parent_item_id,
             arc.title,
             body,
@@ -1658,7 +1658,7 @@ def upsert_arc_work_item(
                     "arc_key": arc.arc_key,
                     "arc_type": arc.arc_type,
                     "parent_arc_id": arc.parent_arc_id,
-                    "link": kanban_item_url(arc.related_work_item_id),
+                    "link": kanban_item_url(arc.related_kanban_item_id),
                 }
             ),
             json_dumps(arc.provenance),
@@ -1681,7 +1681,7 @@ def upsert_feature(conn: sqlite3.Connection, feature: FeatureRecord, now: str) -
         """
         INSERT INTO personal_git_features (
             feature_id, feature_key, title, status, first_seen_date, last_seen_date,
-            repo_full_names_json, commit_count, related_work_item_id, source_hash,
+            repo_full_names_json, commit_count, related_kanban_item_id, source_hash,
             project_arc_id, subproject_arc_id, parent_work_item_id, provenance_json,
             created_at, updated_at
         )
@@ -1694,7 +1694,7 @@ def upsert_feature(conn: sqlite3.Connection, feature: FeatureRecord, now: str) -
             last_seen_date=excluded.last_seen_date,
             repo_full_names_json=excluded.repo_full_names_json,
             commit_count=excluded.commit_count,
-            related_work_item_id=excluded.related_work_item_id,
+            related_kanban_item_id=excluded.related_kanban_item_id,
             source_hash=excluded.source_hash,
             project_arc_id=excluded.project_arc_id,
             subproject_arc_id=excluded.subproject_arc_id,
@@ -1711,7 +1711,7 @@ def upsert_feature(conn: sqlite3.Connection, feature: FeatureRecord, now: str) -
             feature.last_seen_date,
             json_dumps(feature.repo_full_names),
             feature.commit_count,
-            feature.related_work_item_id,
+            feature.related_kanban_item_id,
             feature.source_hash,
             feature.project_arc_id,
             feature.subproject_arc_id,
@@ -1726,7 +1726,7 @@ def upsert_feature(conn: sqlite3.Connection, feature: FeatureRecord, now: str) -
 def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, now: str) -> None:
     parent_item_id = feature.parent_work_item_id or ROOT_WORK_ITEM_ID
     parent_row = conn.execute(
-        "SELECT depth FROM work_items WHERE item_id=?", (parent_item_id,)
+        "SELECT depth FROM kanban_items WHERE item_id=?", (parent_item_id,)
     ).fetchone()
     depth = (
         int(parent_row["depth"]) + 1
@@ -1741,7 +1741,7 @@ def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, n
     search = " ".join([feature.title, feature.feature_key, *feature.repo_full_names])
     conn.execute(
         """
-        INSERT INTO work_items (
+        INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
             priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
@@ -1770,7 +1770,7 @@ def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, n
             updated_at=excluded.updated_at
         """,
         (
-            feature.related_work_item_id,
+            feature.related_kanban_item_id,
             parent_item_id,
             feature.title,
             body,
@@ -1785,7 +1785,7 @@ def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, n
                     "feature_key": feature.feature_key,
                     "project_arc_id": feature.project_arc_id,
                     "subproject_arc_id": feature.subproject_arc_id,
-                    "link": kanban_item_url(feature.related_work_item_id),
+                    "link": kanban_item_url(feature.related_kanban_item_id),
                 }
             ),
             json_dumps(feature.provenance),
@@ -1802,7 +1802,7 @@ def upsert_daily_summary(
         """
         INSERT INTO personal_git_daily_summaries (
             summary_id, local_date, title, markdown, repo_count, commit_count,
-            feature_count, related_work_items_json, source_hash, provenance_json,
+            feature_count, related_kanban_items_json, source_hash, provenance_json,
             event_id, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1813,7 +1813,7 @@ def upsert_daily_summary(
             repo_count=excluded.repo_count,
             commit_count=excluded.commit_count,
             feature_count=excluded.feature_count,
-            related_work_items_json=excluded.related_work_items_json,
+            related_kanban_items_json=excluded.related_kanban_items_json,
             source_hash=excluded.source_hash,
             provenance_json=excluded.provenance_json,
             event_id=excluded.event_id,
@@ -1827,7 +1827,7 @@ def upsert_daily_summary(
             summary.repo_count,
             summary.commit_count,
             summary.feature_count,
-            json_dumps(summary.related_work_items),
+            json_dumps(summary.related_kanban_items),
             summary.source_hash,
             json_dumps(summary.provenance),
             summary.event_id,
@@ -1847,7 +1847,7 @@ def upsert_daily_summary(
         INSERT INTO personal_events (
             event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
             content_projection, start_at, end_at, local_date, timezone, status, priority,
-            privacy_level, tags_json, related_work_items_json, related_tasks_json,
+            privacy_level, tags_json, related_kanban_items_json, related_tasks_json,
             related_import_batches_json, file_refs_json, db_refs_json, provenance_json,
             projection_state, provenance_state, last_rendered_at, created_at, updated_at
         )
@@ -1870,7 +1870,7 @@ def upsert_daily_summary(
             priority=excluded.priority,
             privacy_level=excluded.privacy_level,
             tags_json=excluded.tags_json,
-            related_work_items_json=excluded.related_work_items_json,
+            related_kanban_items_json=excluded.related_kanban_items_json,
             related_tasks_json=excluded.related_tasks_json,
             related_import_batches_json=excluded.related_import_batches_json,
             file_refs_json=excluded.file_refs_json,
@@ -1891,11 +1891,11 @@ def upsert_daily_summary(
             summary.local_date,
             tz_name,
             json_dumps(["git", "github", "work"]),
-            json_dumps(summary.related_work_items),
+            json_dumps(summary.related_kanban_items),
             json_dumps(
                 [
                     f"personal_git_daily_summaries:{summary.summary_id}",
-                    *[f"work_items:{item_id}" for item_id in summary.related_work_items],
+                    *[f"kanban_items:{item_id}" for item_id in summary.related_kanban_items],
                 ]
             ),
             json_dumps(event_provenance),
@@ -1989,7 +1989,7 @@ def apply_ingest(
     report: dict[str, Any],
     apply_mode: str = "apply",
 ) -> None:
-    required = ["personal_events", "personal_sources", "work_items"]
+    required = ["personal_events", "personal_sources", "kanban_items"]
     missing = [table for table in required if not table_exists(conn, table)]
     if missing:
         raise RuntimeError(f"Database is missing required Blueprints tables: {', '.join(missing)}")
@@ -2037,13 +2037,13 @@ def apply_ingest(
     rows_to_queue.extend(
         ("personal_git_commits", "commit_id", commit.commit_id) for commit in commits
     )
-    rows_to_queue.append(("work_items", "item_id", ROOT_WORK_ITEM_ID))
+    rows_to_queue.append(("kanban_items", "item_id", ROOT_WORK_ITEM_ID))
     for arc in sorted_kanban_arcs(arcs_by_id):
         rows_to_queue.append(("personal_git_kanban_arcs", "arc_id", arc.arc_id))
-        rows_to_queue.append(("work_items", "item_id", arc.related_work_item_id))
+        rows_to_queue.append(("kanban_items", "item_id", arc.related_kanban_item_id))
     for feature in features.values():
         rows_to_queue.append(("personal_git_features", "feature_id", feature.feature_id))
-        rows_to_queue.append(("work_items", "item_id", feature.related_work_item_id))
+        rows_to_queue.append(("kanban_items", "item_id", feature.related_kanban_item_id))
     for summary in summaries:
         rows_to_queue.append(("personal_git_daily_summaries", "summary_id", summary.summary_id))
         rows_to_queue.append(("personal_events", "event_id", summary.event_id))
@@ -2112,12 +2112,12 @@ def count_git_calendar_events(conn: sqlite3.Connection) -> int:
 
 
 def count_git_work_items(conn: sqlite3.Connection) -> int:
-    if not table_exists(conn, "work_items"):
+    if not table_exists(conn, "kanban_items"):
         return 0
     row = conn.execute(
         """
         SELECT COUNT(*) AS c
-        FROM work_items
+        FROM kanban_items
         WHERE source_type='git' OR tags_json LIKE '%"git"%'
         """
     ).fetchone()
@@ -2146,8 +2146,8 @@ def _missing_keys(
 
 def _expected_git_work_item_ids(records: ReportRecordSet) -> list[str]:
     ids = [ROOT_WORK_ITEM_ID]
-    ids.extend(arc.related_work_item_id for arc in records.kanban_arcs.values())
-    ids.extend(feature.related_work_item_id for feature in records.features.values())
+    ids.extend(arc.related_kanban_item_id for arc in records.kanban_arcs.values())
+    ids.extend(feature.related_kanban_item_id for feature in records.features.values())
     return list(dict.fromkeys(ids))
 
 
@@ -2173,11 +2173,11 @@ def verify_applied_records(
         "personal_git_daily_summaries": len(records.summaries),
         "personal_git_import_runs": 1,
         "personal_events": len(records.summaries),
-        "work_items": len(_expected_git_work_item_ids(records)),
+        "kanban_items": len(_expected_git_work_item_ids(records)),
     }
     actual = {table: count_rows(conn, table) for table in expected}
     actual["personal_events"] = count_git_calendar_events(conn)
-    actual["work_items"] = count_git_work_items(conn)
+    actual["kanban_items"] = count_git_work_items(conn)
     required_tables = [
         "personal_git_repositories",
         "personal_git_commits",
@@ -2186,7 +2186,7 @@ def verify_applied_records(
         "personal_git_daily_summaries",
         "personal_git_import_runs",
         "personal_events",
-        "work_items",
+        "kanban_items",
     ]
     missing_tables = [table for table in required_tables if not table_exists(conn, table)]
 
@@ -2234,7 +2234,7 @@ def verify_applied_records(
     )
     missing_work_items = _missing_keys(
         conn,
-        table="work_items",
+        table="kanban_items",
         key_column="item_id",
         keys=_expected_git_work_item_ids(records),
     )
@@ -2293,7 +2293,7 @@ def verify_applied_records(
             or event["content_projection"] != summary_row["markdown"]
         ):
             summary_pair_failures.append(summary.summary_id)
-        related = json.loads(summary_row["related_work_items_json"] or "[]")
+        related = json.loads(summary_row["related_kanban_items_json"] or "[]")
         markdown = str(summary_row["markdown"] or "")
         if related and "blueprints://kanban/items/" not in markdown:
             summary_kanban_link_failures.append(summary.summary_id)
@@ -2310,7 +2310,7 @@ def verify_applied_records(
         "personal_git_daily_summaries": missing_summaries,
         "personal_git_import_runs": missing_import_runs,
         "personal_events": missing_events,
-        "work_items": missing_work_items,
+        "kanban_items": missing_work_items,
     }
     missing_expected_count = sum(len(values) for values in expected_rows_missing.values())
     checks = [
@@ -2487,8 +2487,8 @@ def build_report(
                 "status": feature.status,
                 "commit_count": feature.commit_count,
                 "repos": feature.repo_full_names,
-                "kanban_item_id": feature.related_work_item_id,
-                "kanban_link": kanban_item_url(feature.related_work_item_id),
+                "kanban_item_id": feature.related_kanban_item_id,
+                "kanban_link": kanban_item_url(feature.related_kanban_item_id),
                 "project_arc_id": feature.project_arc_id,
                 "subproject_arc_id": feature.subproject_arc_id,
                 "parent_work_item_id": feature.parent_work_item_id,
@@ -2506,8 +2506,8 @@ def build_report(
                 "repos": arc.repo_full_names,
                 "feature_keys": arc.feature_keys,
                 "parent_arc_id": arc.parent_arc_id,
-                "kanban_item_id": arc.related_work_item_id,
-                "kanban_link": kanban_item_url(arc.related_work_item_id),
+                "kanban_item_id": arc.related_kanban_item_id,
+                "kanban_link": kanban_item_url(arc.related_kanban_item_id),
             }
             for arc in sorted_kanban_arcs(arcs_by_id)
         ],
@@ -2520,7 +2520,7 @@ def build_report(
                 "repo_count": summary.repo_count,
                 "commit_count": summary.commit_count,
                 "feature_count": summary.feature_count,
-                "related_work_items": summary.related_work_items,
+                "related_kanban_items": summary.related_kanban_items,
                 "markdown": summary.markdown,
             }
             for summary in summaries
@@ -2530,7 +2530,7 @@ def build_report(
             "personal_git_commits": len(commits),
             "personal_git_features": len(features),
             "personal_git_kanban_arcs": len(arcs_by_id),
-            "work_items": 1 + len(features) + len(arcs_by_id),
+            "kanban_items": 1 + len(features) + len(arcs_by_id),
             "personal_git_daily_summaries": len(summaries),
             "personal_events": len(summaries),
             "personal_git_import_runs": 1 if mode == "apply" else 0,
@@ -2706,9 +2706,11 @@ def build_preflight_acceptance_checks(report: dict[str, Any]) -> dict[str, Any]:
     }
     visible_identifier_count = sum(visible_identifier_days.values())
     missing_kanban_link_days = {
-        str(summary.get("local_date") or "<missing>"): len(summary.get("related_work_items") or [])
+        str(summary.get("local_date") or "<missing>"): len(
+            summary.get("related_kanban_items") or []
+        )
         for summary in summaries
-        if summary.get("related_work_items")
+        if summary.get("related_kanban_items")
         and "blueprints://kanban/items/" not in str(summary.get("markdown") or "")
     }
     no_today_ok = today_commit_count == 0 and _safe_iso_day_before_or_equal(
@@ -3328,10 +3330,10 @@ def sanitize_calendar_markdown(markdown: str) -> str:
 
 def append_missing_kanban_links(
     markdown: str,
-    related_work_items: list[str],
+    related_kanban_items: list[str],
     work_item_titles: dict[str, str],
 ) -> str:
-    allowed_urls = {kanban_item_url(item_id) for item_id in related_work_items}
+    allowed_urls = {kanban_item_url(item_id) for item_id in related_kanban_items}
 
     def keep_only_related_kanban_links(match: re.Match[str]) -> str:
         label = match.group(1)
@@ -3347,7 +3349,7 @@ def append_missing_kanban_links(
     )
     clean = sanitize_calendar_markdown(canonicalized)
     missing: list[tuple[str, str]] = []
-    for item_id in related_work_items:
+    for item_id in related_kanban_items:
         url = kanban_item_url(item_id)
         if url in clean:
             continue
@@ -4076,7 +4078,7 @@ def llm_records_from_arc_context(
             repo_full_names=repos,
             commit_ids=evidence_commit_ids,
             commit_count=commit_count,
-            related_work_item_id=feature_work_item_id,
+            related_kanban_item_id=feature_work_item_id,
             source_hash=source_hash,
             provenance={
                 "source": SCRIPT_NAME,
@@ -4102,7 +4104,7 @@ def llm_records_from_arc_context(
                 fallback_start.isoformat(),
                 fallback_end.isoformat(),
             )
-            related_work_item_id = work_item_id_for_arc(arc_type, arc_id)
+            related_kanban_item_id = work_item_id_for_arc(arc_type, arc_id)
             source_hash = stable_digest(
                 {
                     "arc_id": arc_id,
@@ -4126,13 +4128,13 @@ def llm_records_from_arc_context(
                 repo_full_names=sorted(bucket["repos"]),
                 feature_keys=sorted(bucket["feature_keys"]),
                 commit_count=int(bucket["commit_count"]),
-                related_work_item_id=related_work_item_id,
+                related_kanban_item_id=related_kanban_item_id,
                 source_hash=source_hash,
                 provenance={
                     "source": SCRIPT_NAME,
                     "summary_source": "local_llm",
                     "arc_context_entries": bucket["entries"],
-                    "kanban_link": kanban_item_url(related_work_item_id),
+                    "kanban_link": kanban_item_url(related_kanban_item_id),
                 },
             )
     return arcs, features
@@ -4147,7 +4149,7 @@ def daily_summaries_from_report(
     for commit in report.get("commits") or []:
         commits_by_day[str(commit.get("local_date") or "")].append(commit)
     work_item_titles = {
-        feature.related_work_item_id: feature.title for feature in features.values()
+        feature.related_kanban_item_id: feature.title for feature in features.values()
     }
     canonical_feature_item_ids = set(work_item_titles)
     summaries = []
@@ -4156,13 +4158,13 @@ def daily_summaries_from_report(
         day_commits = commits_by_day.get(day, [])
         day_commit_ids = {str(commit.get("commit_id") or "") for commit in day_commits}
         evidence_related = [
-            feature.related_work_item_id
+            feature.related_kanban_item_id
             for feature in features.values()
             if day_commit_ids and set(feature.commit_ids).intersection(day_commit_ids)
         ]
         source_related = [
             str(value)
-            for value in item.get("related_work_items") or []
+            for value in item.get("related_kanban_items") or []
             if str(value) in canonical_feature_item_ids
         ]
         related = [str(value) for value in [*source_related, *evidence_related] if value]
@@ -4208,7 +4210,7 @@ def daily_summaries_from_report(
                 repo_count=int(item.get("repo_count") or 0),
                 commit_count=int(item.get("commit_count") or len(day_commits)),
                 feature_count=len(related),
-                related_work_items=related,
+                related_kanban_items=related,
                 source_hash=source_hash,
                 provenance=provenance,
                 body_excerpt=first_sentence(markdown),
@@ -4303,8 +4305,8 @@ def report_for_record_set(
             "repos": arc.repo_full_names,
             "feature_keys": arc.feature_keys,
             "parent_arc_id": arc.parent_arc_id,
-            "kanban_item_id": arc.related_work_item_id,
-            "kanban_link": kanban_item_url(arc.related_work_item_id),
+            "kanban_item_id": arc.related_kanban_item_id,
+            "kanban_link": kanban_item_url(arc.related_kanban_item_id),
         }
         for arc in sorted_kanban_arcs(records.kanban_arcs)
     ]
@@ -4316,8 +4318,8 @@ def report_for_record_set(
             "status": feature.status,
             "commit_count": feature.commit_count,
             "repos": feature.repo_full_names,
-            "kanban_item_id": feature.related_work_item_id,
-            "kanban_link": kanban_item_url(feature.related_work_item_id),
+            "kanban_item_id": feature.related_kanban_item_id,
+            "kanban_link": kanban_item_url(feature.related_kanban_item_id),
             "project_arc_id": feature.project_arc_id,
             "subproject_arc_id": feature.subproject_arc_id,
             "parent_work_item_id": feature.parent_work_item_id,
@@ -4334,7 +4336,7 @@ def report_for_record_set(
             "repo_count": summary.repo_count,
             "commit_count": summary.commit_count,
             "feature_count": summary.feature_count,
-            "related_work_items": summary.related_work_items,
+            "related_kanban_items": summary.related_kanban_items,
             "summary_source": summary.provenance.get("summary_source") or "fallback",
             "provenance": summary.provenance,
         }
@@ -4345,7 +4347,7 @@ def report_for_record_set(
         "personal_git_commits": len(records.commits),
         "personal_git_features": len(records.features),
         "personal_git_kanban_arcs": len(records.kanban_arcs),
-        "work_items": 1 + len(records.features) + len(records.kanban_arcs),
+        "kanban_items": 1 + len(records.features) + len(records.kanban_arcs),
         "personal_git_daily_summaries": len(records.summaries),
         "personal_events": len(records.summaries),
         "personal_git_import_runs": 1,
@@ -4390,8 +4392,8 @@ def attach_llm_record_preview(report: dict[str, Any]) -> dict[str, Any]:
                 "repos": arc.repo_full_names,
                 "feature_keys": arc.feature_keys,
                 "parent_arc_id": arc.parent_arc_id,
-                "kanban_item_id": arc.related_work_item_id,
-                "kanban_link": kanban_item_url(arc.related_work_item_id),
+                "kanban_item_id": arc.related_kanban_item_id,
+                "kanban_link": kanban_item_url(arc.related_kanban_item_id),
             }
             for arc in sorted_kanban_arcs(kanban_arcs)
         ]
@@ -4404,8 +4406,8 @@ def attach_llm_record_preview(report: dict[str, Any]) -> dict[str, Any]:
                 "status": feature.status,
                 "commit_count": feature.commit_count,
                 "repos": feature.repo_full_names,
-                "kanban_item_id": feature.related_work_item_id,
-                "kanban_link": kanban_item_url(feature.related_work_item_id),
+                "kanban_item_id": feature.related_kanban_item_id,
+                "kanban_link": kanban_item_url(feature.related_kanban_item_id),
                 "project_arc_id": feature.project_arc_id,
                 "subproject_arc_id": feature.subproject_arc_id,
                 "parent_work_item_id": feature.parent_work_item_id,
@@ -4417,7 +4419,7 @@ def attach_llm_record_preview(report: dict[str, Any]) -> dict[str, Any]:
         planned["personal_git_features"] = len(features)
     if kanban_arcs:
         planned["personal_git_kanban_arcs"] = len(kanban_arcs)
-        planned["work_items"] = 1 + len(features) + len(kanban_arcs)
+        planned["kanban_items"] = 1 + len(features) + len(kanban_arcs)
     if planned:
         report["planned_writes"] = planned
     return report

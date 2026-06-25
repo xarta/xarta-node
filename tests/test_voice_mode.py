@@ -313,6 +313,10 @@ def test_active_browser_command_action_aliases_are_sanitized():
     assert voice_mode._clean_active_browser_command_action("selector") == "selector_action"
     assert voice_mode._clean_active_browser_command_action("body shade") == "set_body_shade"
     assert voice_mode._clean_active_browser_command_action("shade-up") == "set_body_shade"
+    assert (
+        voice_mode._clean_active_browser_command_action("kanban lane update")
+        == "kanban_external_refresh"
+    )
 
 
 def test_voice_dev_vad_detector_actions_are_allowed():
@@ -1030,6 +1034,90 @@ def test_active_browser_client_inventory_marks_active_fresh_and_stale():
     assert clients[0]["age_seconds"] == 5
     assert clients[1]["browser_id"] == "other-browser"
     assert clients[1]["stale"] is True
+
+
+def test_publish_kanban_external_refresh_targets_safe_kanban_tabs(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "active": {"browser_id": "safe-browser", "tab_id": "tab-1"},
+                "browser_views": {
+                    "safe-browser::tab-1": {
+                        "browser_id": "safe-browser",
+                        "tab_id": "tab-1",
+                        "reported_at": 95,
+                        "page": {"group": "kanban", "tab": "kanban"},
+                        "automation": {
+                            "surfaces": {
+                                "kanban": {
+                                    "loaded": True,
+                                    "editing": False,
+                                    "draft_dirty": False,
+                                    "scoped_open": False,
+                                }
+                            }
+                        },
+                    },
+                    "dirty-browser::tab-2": {
+                        "browser_id": "dirty-browser",
+                        "tab_id": "tab-2",
+                        "reported_at": 95,
+                        "page": {"group": "kanban", "tab": "kanban"},
+                        "automation": {
+                            "surfaces": {
+                                "kanban": {
+                                    "loaded": True,
+                                    "editing": True,
+                                    "draft_dirty": True,
+                                    "scoped_open": False,
+                                }
+                            }
+                        },
+                    },
+                    "chat-browser::tab-3": {
+                        "browser_id": "chat-browser",
+                        "tab_id": "tab-3",
+                        "reported_at": 95,
+                        "page": {"group": "settings", "tab": "matrix-chat"},
+                        "automation": {"surfaces": {"kanban": {"loaded": False}}},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(voice_mode.time, "time", lambda: 100.0)
+    published = []
+
+    async def fake_publish(event):
+        published.append(event.payload)
+        return event
+
+    monkeypatch.setattr(voice_mode, "publish_event", fake_publish)
+
+    result = asyncio.run(
+        voice_mode.publish_kanban_external_refresh_commands(
+            item_id="item-1",
+            parent_item_id="parent-1",
+            state_id="done",
+            actor="test",
+            source_surface="test-suite",
+            max_age_seconds=30,
+        )
+    )
+
+    assert result["published_count"] == 1
+    assert result["skipped_count"] == 2
+    assert {item["reason"] for item in result["skipped"]} == {"editing", "not-kanban"}
+    assert published[0]["action"] == "kanban_external_refresh"
+    assert published[0]["target_browser_id"] == "safe-browser"
+    assert published[0]["target_tab_id"] == "tab-1"
+    assert published[0]["item_id"] == "item-1"
+    assert published[0]["parent_item_id"] == "parent-1"
+    assert published[0]["state_id"] == "done"
 
 
 def test_active_browser_client_lookup_rejects_missing_and_stale_reports():

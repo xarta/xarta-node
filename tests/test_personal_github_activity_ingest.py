@@ -126,7 +126,7 @@ def _conn():
             priority TEXT,
             privacy_level TEXT,
             tags_json TEXT,
-            related_work_items_json TEXT,
+            related_kanban_items_json TEXT,
             related_tasks_json TEXT,
             related_import_batches_json TEXT,
             file_refs_json TEXT,
@@ -138,7 +138,7 @@ def _conn():
             created_at TEXT,
             updated_at TEXT
         );
-        CREATE TABLE work_items (
+        CREATE TABLE kanban_items (
             item_id TEXT PRIMARY KEY,
             parent_item_id TEXT,
             title TEXT,
@@ -350,7 +350,7 @@ def test_last_summarized_git_day_uses_git_tag_or_source_type():
     conn.execute(
         """
         INSERT INTO personal_events (
-            event_id, source_type, kind, title, local_date, tags_json, related_work_items_json,
+            event_id, source_type, kind, title, local_date, tags_json, related_kanban_items_json,
             related_tasks_json, related_import_batches_json, file_refs_json, db_refs_json,
             provenance_json, projection_state, provenance_state
         )
@@ -399,7 +399,7 @@ def test_window_without_since_date_resumes_day_after_last_git_summary():
     conn.execute(
         """
         INSERT INTO personal_events (
-            event_id, source_type, kind, title, local_date, tags_json, related_work_items_json,
+            event_id, source_type, kind, title, local_date, tags_json, related_kanban_items_json,
             related_tasks_json, related_import_batches_json, file_refs_json, db_refs_json,
             provenance_json, projection_state, provenance_state
         )
@@ -426,7 +426,7 @@ def test_cli_dry_run_report_resumes_after_existing_git_summary(tmp_path, monkeyp
         """
         INSERT INTO personal_events (
             event_id, source_type, kind, title, local_date, timezone, tags_json,
-            related_work_items_json, related_tasks_json, related_import_batches_json,
+            related_kanban_items_json, related_tasks_json, related_import_batches_json,
             file_refs_json, db_refs_json, provenance_json, projection_state, provenance_state
         )
         VALUES ('git-summary-2026-06-20', 'git', 'git-summary', 'Git summary', '2026-06-20',
@@ -468,7 +468,7 @@ def test_cli_dry_run_with_no_new_complete_days_skips_github(tmp_path, monkeypatc
         """
         INSERT INTO personal_events (
             event_id, source_type, kind, title, local_date, timezone, tags_json,
-            related_work_items_json, related_tasks_json, related_import_batches_json,
+            related_kanban_items_json, related_tasks_json, related_import_batches_json,
             file_refs_json, db_refs_json, provenance_json, projection_state, provenance_state
         )
         VALUES ('git-summary-2026-06-22', 'git', 'git-summary', 'Git summary', '2026-06-22',
@@ -552,7 +552,7 @@ def test_daily_markdown_is_aggregate_readable_and_hides_full_hashes():
     markdown = summaries[0].markdown
     assert "Git work touched 1 repository across 2 commits." in markdown
     assert "Feature Threads" in markdown
-    assert ingest.kanban_item_url(next(iter(features.values())).related_work_item_id) in markdown
+    assert ingest.kanban_item_url(next(iter(features.values())).related_kanban_item_id) in markdown
     assert "a" * 40 not in markdown
     assert "b" * 40 not in markdown
     assert markdown.count("- [davros1973/xarta-node]") == 1
@@ -821,7 +821,7 @@ def test_cached_report_summaries_append_readable_kanban_links_when_llm_omits_the
         "# Git Activity - 2026-06-22\n\n"
         "The local LLM wrote useful natural English but forgot the Kanban link."
     )
-    report["calendar_summaries"][0]["related_work_items"] = []
+    report["calendar_summaries"][0]["related_kanban_items"] = []
 
     records = ingest.records_from_enriched_report(report, require_llm=True)
     summary = records.summaries[0]
@@ -829,7 +829,7 @@ def test_cached_report_summaries_append_readable_kanban_links_when_llm_omits_the
     assert "## Kanban Links" in summary.markdown
     assert "[Calendar Git Summary](blueprints://kanban/items/" in summary.markdown
     assert ingest.visible_calendar_identifier_hits(summary.markdown) == []
-    assert len(summary.related_work_items) == 1
+    assert len(summary.related_kanban_items) == 1
 
     preflight = ingest.report_for_record_set(
         report,
@@ -845,7 +845,7 @@ def test_cached_report_summaries_append_readable_kanban_links_when_llm_omits_the
 def test_cached_report_summaries_strip_noncanonical_llm_kanban_links():
     report = _llm_enriched_report()
     stale_item_id = "work-git-feature-stale1234567890"
-    report["calendar_summaries"][0]["related_work_items"] = [stale_item_id]
+    report["calendar_summaries"][0]["related_kanban_items"] = [stale_item_id]
     report["calendar_summaries"][0]["markdown"] = (
         "# Git Activity - 2026-06-22\n\n"
         "The LLM wrote a useful summary but reused a stale "
@@ -854,9 +854,9 @@ def test_cached_report_summaries_strip_noncanonical_llm_kanban_links():
 
     records = ingest.records_from_enriched_report(report, require_llm=True)
     summary = records.summaries[0]
-    canonical_link = ingest.kanban_item_url(summary.related_work_items[0])
+    canonical_link = ingest.kanban_item_url(summary.related_kanban_items[0])
 
-    assert stale_item_id not in summary.related_work_items
+    assert stale_item_id not in summary.related_kanban_items
     assert stale_item_id not in summary.markdown
     assert canonical_link in summary.markdown
     assert "[Calendar Git Summary](blueprints://kanban/items/" in summary.markdown
@@ -1236,7 +1236,7 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
             "personal_git_daily_summaries",
             "personal_git_import_runs",
             "personal_events",
-            "work_items",
+            "kanban_items",
         ]
     }
     ingest.apply_ingest(**kwargs)
@@ -1248,11 +1248,11 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
     assert second_counts == first_counts
 
     project = conn.execute(
-        "SELECT * FROM work_items WHERE item_type='project' AND parent_item_id=?",
+        "SELECT * FROM kanban_items WHERE item_type='project' AND parent_item_id=?",
         (ingest.ROOT_WORK_ITEM_ID,),
     ).fetchone()
-    subproject = conn.execute("SELECT * FROM work_items WHERE item_type='subproject'").fetchone()
-    feature = conn.execute("SELECT * FROM work_items WHERE item_type='feature'").fetchone()
+    subproject = conn.execute("SELECT * FROM kanban_items WHERE item_type='subproject'").fetchone()
+    feature = conn.execute("SELECT * FROM kanban_items WHERE item_type='feature'").fetchone()
     assert project["title"] == "Blueprints Personal"
     assert project["depth"] == 1
     assert subproject["title"] == "Git Activity"
@@ -1282,17 +1282,17 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
     assert summary_provenance["repo_full_names"] == ["davros1973/xarta-node"]
     assert summary_provenance["commit_ids"] == [commit["commit_id"] for commit in report["commits"]]
     assert summary_provenance["commit_urls"] == [commit["html_url"] for commit in report["commits"]]
-    summary_related_work_items = ingest.json.loads(summary["related_work_items_json"])
+    summary_related_kanban_items = ingest.json.loads(summary["related_kanban_items_json"])
     assert summary_provenance["kanban_links"] == [
-        ingest.kanban_item_url(item_id) for item_id in summary_related_work_items
+        ingest.kanban_item_url(item_id) for item_id in summary_related_kanban_items
     ]
     assert ingest.kanban_item_url(feature["item_id"]) in summary_provenance["kanban_links"]
     assert "git" in ingest.json.loads(event["tags_json"])
-    related_work_items = ingest.json.loads(event["related_work_items_json"])
-    assert feature["item_id"] in related_work_items
+    related_kanban_items = ingest.json.loads(event["related_kanban_items_json"])
+    assert feature["item_id"] in related_kanban_items
     db_refs = ingest.json.loads(event["db_refs_json"])
     assert "personal_git_daily_summaries:git-day-2026-06-22" in db_refs
-    assert f"work_items:{feature['item_id']}" in db_refs
+    assert f"kanban_items:{feature['item_id']}" in db_refs
     provenance = ingest.json.loads(event["provenance_json"])
     assert provenance["git"]["summary_source"] == "local_llm"
     assert provenance["link_schema"] == "blueprints://kanban/items/<item_id>"
@@ -1605,7 +1605,7 @@ def test_apply_from_report_cli_is_cache_only_and_idempotent(tmp_path, monkeypatc
             "personal_git_daily_summaries",
             "personal_git_import_runs",
             "personal_events",
-            "work_items",
+            "kanban_items",
         ]
     }
     assert ingest.main(args) == 0
@@ -1824,10 +1824,10 @@ def test_verify_apply_from_report_cli_is_read_only_and_passes_after_apply(
         )
         unrelated_conn.execute(
             """
-            INSERT INTO work_items (
+            INSERT INTO kanban_items (
                 item_id, title, item_type, source_type, tags_json
             )
-            VALUES ('manual-work-item', 'Manual work item', 'project', 'manual', '["kanban"]')
+            VALUES ('manual-kanban-item', 'Manual work item', 'project', 'manual', '["kanban"]')
             """
         )
         unrelated_conn.commit()
@@ -1881,8 +1881,8 @@ def test_verify_apply_from_report_cli_is_read_only_and_passes_after_apply(
     assert (
         verify_report["post_apply_verification"]["actual_counts"]["personal_git_import_runs"] == 1
     )
-    assert verify_report["post_apply_verification"]["expected_counts"]["work_items"] == 4
-    assert verify_report["post_apply_verification"]["actual_counts"]["work_items"] == 4
+    assert verify_report["post_apply_verification"]["expected_counts"]["kanban_items"] == 4
+    assert verify_report["post_apply_verification"]["actual_counts"]["kanban_items"] == 4
     review = verify_review_path.read_text(encoding="utf-8")
     assert "Post-apply verification only" in review
     assert "## Post-Apply Verification Checks" in review
@@ -1980,7 +1980,7 @@ def test_apply_ingest_is_idempotent_for_cache_calendar_and_kanban_rows(monkeypat
             "personal_git_daily_summaries",
             "personal_git_import_runs",
             "personal_events",
-            "work_items",
+            "kanban_items",
         ]
     }
     ingest.apply_ingest(**kwargs)

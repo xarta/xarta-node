@@ -88,9 +88,9 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
         "label": "Today",
         "filters": {"date": "today", "status_exclude": ["archived"]},
     },
-    "work": {
+    "kanban": {
         "label": "Kanban",
-        "filters": {"source_type": "work-management"},
+        "filters": {"source_type": "kanban"},
     },
     "personal": {
         "label": "Personal",
@@ -121,13 +121,11 @@ PERSONAL_MODES: dict[str, dict[str, Any]] = {
         "filters": {"source_type": "git"},
     },
 }
-WORK_DEPTH_LIMIT = 12
-WORK_SHOW_TEST_ENTRIES_SETTING = "personal.kanban.show_test_entries"
-# "work" is a legacy DB/API mode id for the recursive Kanban system. Human and
-# agent-facing identifiers should say "kanban" so future job-work tags stay distinct.
-WORK_KANBAN_TAG = "kanban"
-WORK_AGENT_WORKING_OUT_TAG = "agent-working-out"
-WORK_PROOF_TAG = "proof"
+KANBAN_DEPTH_LIMIT = 12
+KANBAN_SHOW_TEST_ENTRIES_SETTING = "personal.kanban.show_test_entries"
+KANBAN_TAG = "kanban"
+KANBAN_AGENT_WORKING_OUT_TAG = "agent-working-out"
+KANBAN_PROOF_TAG = "proof"
 
 
 class PersonalRehydrateRequest(BaseModel):
@@ -182,8 +180,8 @@ class DiarySummaryGenerateRequest(BaseModel):
     run_id: str | None = None
 
 
-class DiaryWorkLinkRequest(BaseModel):
-    work_item_ref: str
+class DiaryKanbanLinkRequest(BaseModel):
+    kanban_item_ref: str
     actor: str = "blueprints-ui"
     source_surface: str = "diary-page"
     request_id: str | None = None
@@ -211,7 +209,7 @@ class CalendarEventUpsertRequest(BaseModel):
     priority: str | None = None
     privacy_level: str = "normal"
     tags: list[str] = []
-    related_work_items: list[str] = []
+    related_kanban_items: list[str] = []
     related_tasks: list[str] = []
     related_import_batches: list[str] = []
     actor: str = "blueprints-ui"
@@ -232,7 +230,7 @@ class PersonalTaskUpsertRequest(BaseModel):
     timezone: str | None = None
     privacy_level: str = "normal"
     tags: list[str] = []
-    related_work_items: list[str] = []
+    related_kanban_items: list[str] = []
     related_tasks: list[str] = []
     related_import_batches: list[str] = []
     actor: str = "blueprints-ui"
@@ -253,7 +251,7 @@ class WorkItemCreateRequest(BaseModel):
     parent_item_id: str | None = None
     title: str
     body: str | None = None
-    item_type: str = "work"
+    item_type: str = "item"
     state_id: str = "todo"
     priority_id: str = "medium"
     sort_order: int = 0
@@ -492,13 +490,13 @@ def _work_item_tags(tags: list[str] | None) -> list[str]:
     for tag in _clean_event_list(tags or [], limit=32):
         if tag and tag not in clean:
             clean.append(tag)
-    if WORK_KANBAN_TAG not in clean:
-        clean.append(WORK_KANBAN_TAG)
+    if KANBAN_TAG not in clean:
+        clean.append(KANBAN_TAG)
     return clean
 
 
 def _work_request_is_agent_working_out(meta: dict[str, str], tags: list[str]) -> bool:
-    if WORK_AGENT_WORKING_OUT_TAG in tags:
+    if KANBAN_AGENT_WORKING_OUT_TAG in tags:
         return True
     source_surface = str(meta.get("source_surface") or "").lower()
     actor = str(meta.get("actor") or "").lower()
@@ -507,7 +505,7 @@ def _work_request_is_agent_working_out(meta: dict[str, str], tags: list[str]) ->
         source_surface == "kanban-active-browser-proof"
         or actor in {"codex-playwright"}
         or "active-browser-step" in request_id
-        or WORK_PROOF_TAG in tags
+        or KANBAN_PROOF_TAG in tags
         and source_surface.startswith("kanban-")
     )
 
@@ -515,7 +513,7 @@ def _work_request_is_agent_working_out(meta: dict[str, str], tags: list[str]) ->
 def _work_item_tags_for_request(tags: list[str] | None, meta: dict[str, str]) -> list[str]:
     clean = _work_item_tags(tags)
     if _work_request_is_agent_working_out(meta, clean):
-        for tag in (WORK_AGENT_WORKING_OUT_TAG, WORK_PROOF_TAG):
+        for tag in (KANBAN_AGENT_WORKING_OUT_TAG, KANBAN_PROOF_TAG):
             if tag not in clean:
                 clean.append(tag)
     return clean
@@ -543,7 +541,7 @@ def _row_to_event(row: Any) -> dict[str, Any]:
             "hash": row["source_hash"],
         },
         "related": {
-            "work_items": _json_value(row["related_work_items_json"], []),
+            "kanban_items": _json_value(row["related_kanban_items_json"], []),
             "tasks": _json_value(row["related_tasks_json"], []),
             "import_batches": _json_value(row["related_import_batches_json"], []),
         },
@@ -615,7 +613,7 @@ def _row_to_task(row: Any) -> dict[str, Any]:
             "authority": "task",
         },
         "related": {
-            "work_items": _json_value(row["related_work_items_json"], []),
+            "kanban_items": _json_value(row["related_kanban_items_json"], []),
             "tasks": _json_value(row["related_tasks_json"], []),
             "import_batches": _json_value(row["related_import_batches_json"], []),
         },
@@ -695,16 +693,24 @@ def _row_to_work_item(row: Any) -> dict[str, Any]:
 
 
 def _row_to_work_issue(row: Any) -> dict[str, Any]:
+    provenance = _json_value(row["provenance_json"], {})
+    issue_meta = provenance.get("issue") if isinstance(provenance.get("issue"), dict) else {}
+    related_tasks = _json_value(row["related_task_ids_json"], [])
+    parent_item_id = row["parent_item_id"] or ""
+    item_card = _row_to_work_item(row)
     return {
-        "issue_id": row["issue_id"],
+        "issue_id": row["item_id"],
         "item_id": row["item_id"],
+        "parent_item_id": parent_item_id,
+        "item_type": "issue",
         "title": row["title"],
         "body_excerpt": row["body_excerpt"],
         "status": row["status"],
         "priority_id": row["priority_id"],
         "severity_id": row["priority_id"],
-        "source_ref": row["source_ref"],
-        "related_task_id": row["related_task_id"],
+        "source_ref": issue_meta.get("external_source_ref") or row["source_ref"],
+        "related_task_id": related_tasks[0] if related_tasks else "",
+        "item_card": item_card,
         "search": {
             "text": row["search_text"],
             "metadata": _json_value(row["search_metadata_json"], {}),
@@ -715,22 +721,30 @@ def _row_to_work_issue(row: Any) -> dict[str, Any]:
             "embedding_updated_at": row["embedding_updated_at"],
             "index_key": row["vector_index_key"],
         },
-        "provenance": _json_value(row["provenance_json"], {}),
+        "provenance": provenance,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
 def _row_to_work_todo(row: Any) -> dict[str, Any]:
+    provenance = _json_value(row["provenance_json"], {})
+    todo_meta = provenance.get("todo") if isinstance(provenance.get("todo"), dict) else {}
+    related_tasks = _json_value(row["related_task_ids_json"], [])
+    parent_item_id = row["parent_item_id"] or ""
+    item_card = _row_to_work_item(row)
     return {
-        "todo_id": row["todo_id"],
+        "todo_id": row["item_id"],
         "item_id": row["item_id"],
+        "parent_item_id": parent_item_id,
+        "item_type": "todo",
         "title": row["title"],
         "body_excerpt": row["body_excerpt"],
         "status": row["status"],
         "priority_id": row["priority_id"],
-        "due_at": row["due_at"],
-        "related_task_id": row["related_task_id"],
+        "due_at": todo_meta.get("due_at") or "",
+        "related_task_id": related_tasks[0] if related_tasks else "",
+        "item_card": item_card,
         "search": {
             "text": row["search_text"],
             "metadata": _json_value(row["search_metadata_json"], {}),
@@ -741,48 +755,53 @@ def _row_to_work_todo(row: Any) -> dict[str, Any]:
             "embedding_updated_at": row["embedding_updated_at"],
             "index_key": row["vector_index_key"],
         },
-        "provenance": _json_value(row["provenance_json"], {}),
+        "provenance": provenance,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
-def _work_todo_to_task(row: Any) -> dict[str, Any]:
-    due_at = row["due_at"] or ""
+def _kanban_todo_to_task(row: Any) -> dict[str, Any]:
+    todo = _row_to_work_todo(row)
+    due_at = todo["due_at"] or ""
     local_date = due_at[:10] if len(due_at) >= 10 else ""
-    related_task_id = row["related_task_id"] or ""
+    related_task_id = todo["related_task_id"] or ""
+    parent_item_id = todo["parent_item_id"] or ""
     return {
-        "task_id": row["todo_id"],
+        "task_id": todo["todo_id"],
         "event_id": "",
         "kind": "task",
-        "title": row["title"],
-        "body_excerpt": row["body_excerpt"],
-        "status": row["status"],
-        "mode": "work",
-        "priority": row["priority_id"],
-        "due_at": row["due_at"],
+        "title": todo["title"],
+        "body_excerpt": todo["body_excerpt"],
+        "status": todo["status"],
+        "mode": "kanban",
+        "priority": todo["priority_id"],
+        "due_at": due_at,
         "local_date": local_date,
         "timezone": "",
         "privacy_level": "normal",
-        "tags": [WORK_KANBAN_TAG, "todo", "task"],
+        "tags": [KANBAN_TAG, "todo", "task"],
         "source": {
-            "type": "work-todo",
-            "ref": f"work_todos:{row['todo_id']}",
+            "type": "kanban-todo",
+            "ref": f"kanban_items:{todo['todo_id']}",
             "hash": "",
-            "authority": "work_todo",
+            "authority": "kanban_todo",
         },
         "related": {
-            "work_items": [row["item_id"]] if row["item_id"] else [],
+            "kanban_items": [parent_item_id] if parent_item_id else [],
             "tasks": [related_task_id] if related_task_id else [],
             "import_batches": [],
         },
         "file_refs": [],
-        "db_refs": [f"work_todos:{row['todo_id']}", f"work_items:{row['item_id']}"],
-        "provenance": _json_value(row["provenance_json"], {}),
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "db_refs": [
+            f"kanban_items:{todo['todo_id']}",
+            *([f"kanban_items:{parent_item_id}"] if parent_item_id else []),
+        ],
+        "provenance": todo["provenance"],
+        "created_at": todo["created_at"],
+        "updated_at": todo["updated_at"],
         "completed_at": None,
-        "archived_at": row["updated_at"] if row["status"] == "archived" else None,
+        "archived_at": todo["updated_at"] if todo["status"] == "archived" else None,
     }
 
 
@@ -843,8 +862,10 @@ def _event_to_task(row: Any) -> dict[str, Any]:
     event = _row_to_event(row)
     tags = event.get("tags") if isinstance(event.get("tags"), list) else []
     related = event.get("related") if isinstance(event.get("related"), dict) else {}
-    related_work = related.get("work_items") if isinstance(related.get("work_items"), list) else []
-    mode = "work" if event["source"]["type"] == "work-management" or related_work else "personal"
+    related_kanban = (
+        related.get("kanban_items") if isinstance(related.get("kanban_items"), list) else []
+    )
+    mode = "kanban" if event["source"]["type"] == "kanban" or related_kanban else "personal"
     if event["status"] == "blocked":
         mode = "blocked"
     elif event["status"] == "pending_review" or "review" in tags:
@@ -1559,7 +1580,7 @@ async def get_rich_doc_bundle(
         "metadata": {},
     }
     with get_conn() as conn:
-        if clean_domain == "kanban" and clean_type in {"body", "item-body", "work-item"}:
+        if clean_domain == "kanban" and clean_type in {"body", "item-body", "kanban-item"}:
             row = _work_item_or_404(conn, clean_id)
             document.update(
                 {
@@ -1574,34 +1595,34 @@ async def get_rich_doc_bundle(
             document["document_type"] = "item-detail"
         elif clean_domain == "kanban" and clean_type in {"discussion", "kanban-discussion"}:
             row = conn.execute(
-                "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_id,)
+                "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_id,)
             ).fetchone()
             if not row:
-                raise HTTPException(404, "work discussion not found")
+                raise HTTPException(404, "Kanban discussion not found")
             document.update(_work_discussion_document(conn, row))
             document["document_type"] = "discussion"
-        elif clean_domain == "kanban" and clean_type in {"issue", "work-issue", "kanban-issue"}:
-            row = conn.execute("SELECT * FROM work_issues WHERE issue_id=?", (clean_id,)).fetchone()
+        elif clean_domain == "kanban" and clean_type in {"issue", "kanban-issue"}:
+            row = _work_typed_leaf_item_row(conn, "issue", clean_id)
             if not row:
-                raise HTTPException(404, "work issue not found")
+                raise HTTPException(404, "kanban issue not found")
             document.update(
                 {
                     "document_type": "issue",
                     "body": row["body_excerpt"] or "",
-                    "item_id": row["item_id"],
+                    "item_id": row["parent_item_id"] or "",
                     "metadata": _json_value(row["provenance_json"], {}),
                     "updated_at": row["updated_at"],
                 }
             )
-        elif clean_domain == "kanban" and clean_type in {"todo", "work-todo", "kanban-todo"}:
-            row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (clean_id,)).fetchone()
+        elif clean_domain == "kanban" and clean_type in {"todo", "kanban-todo"}:
+            row = _work_typed_leaf_item_row(conn, "todo", clean_id)
             if not row:
-                raise HTTPException(404, "work todo not found")
+                raise HTTPException(404, "kanban todo not found")
             document.update(
                 {
                     "document_type": "todo",
                     "body": row["body_excerpt"] or "",
-                    "item_id": row["item_id"],
+                    "item_id": row["parent_item_id"] or "",
                     "metadata": _json_value(row["provenance_json"], {}),
                     "updated_at": row["updated_at"],
                 }
@@ -1870,10 +1891,8 @@ def _apply_mode(where: list[str], params: list[Any], mode: str | None) -> None:
         where.append("local_date = ?")
         params.append(datetime.now().astimezone().strftime("%Y-%m-%d"))
         where.append("status != 'archived'")
-    elif mode == "work":
-        where.append(
-            "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
-        )
+    elif mode == "kanban":
+        where.append("(source_type = 'kanban' OR json_array_length(related_kanban_items_json) > 0)")
     elif mode == "personal":
         where.append(
             "source_type IN ('manual', 'diary-file', 'manual-calendar', "
@@ -1957,8 +1976,8 @@ def _graph_ref_parts(ref: str) -> tuple[str, str]:
         return "", clean
     table, record_id = clean.split(":", 1)
     table = {
-        "work": "work_items",
-        "work_item": "work_items",
+        "kanban": "kanban_items",
+        "work_item": "kanban_items",
         "task": "personal_time_tasks",
         "import": "personal_import_batches",
         "doc": "docs",
@@ -2214,14 +2233,14 @@ def _personal_graph_candidates(
             "source_ref": row["source_ref"] or "",
             "provenance_state": row["provenance_state"] or "",
         }
-        for ref in _json_value(row["related_work_items_json"], []):
+        for ref in _json_value(row["related_kanban_items_json"], []):
             _add_graph_candidate(
                 candidates,
                 source_ref=source_ref,
-                target_ref=_target_ref("work_items", str(ref).removeprefix("work:")),
+                target_ref=_target_ref("kanban_items", str(ref)),
                 link_type="relates_to",
-                title="Diary event relates to work item",
-                metadata={"field": "related_work_items_json"},
+                title="Diary event relates to Kanban item",
+                metadata={"field": "related_kanban_items_json"},
                 provenance=base,
                 actor=actor,
                 request_id=request_id,
@@ -2337,30 +2356,30 @@ def _personal_graph_candidates(
     for row in conn.execute("SELECT * FROM personal_time_tasks WHERE privacy_level != 'pin'"):
         source_ref = f"personal_time_tasks:{row['task_id']}"
         base = {"source_table": "personal_time_tasks", "source_hash": row["source_hash"] or ""}
-        for ref in _json_value(row["related_work_items_json"], []):
+        for ref in _json_value(row["related_kanban_items_json"], []):
             _add_graph_candidate(
                 candidates,
                 source_ref=source_ref,
-                target_ref=_target_ref("work_items", str(ref).removeprefix("work:")),
+                target_ref=_target_ref("kanban_items", str(ref)),
                 link_type="relates_to",
-                title="Task relates to work item",
-                metadata={"field": "related_work_items_json"},
+                title="Task relates to Kanban item",
+                metadata={"field": "related_kanban_items_json"},
                 provenance=base,
                 actor=actor,
                 request_id=request_id,
                 now=now,
             )
 
-    for row in conn.execute("SELECT * FROM work_items WHERE status != 'archived'"):
-        source_ref = f"work_items:{row['item_id']}"
-        base = {"source_table": "work_items", "source_hash": row["source_hash"] or ""}
+    for row in conn.execute("SELECT * FROM kanban_items WHERE status != 'archived'"):
+        source_ref = f"kanban_items:{row['item_id']}"
+        base = {"source_table": "kanban_items", "source_hash": row["source_hash"] or ""}
         for ref in _json_value(row["related_event_ids_json"], []):
             _add_graph_candidate(
                 candidates,
                 source_ref=source_ref,
                 target_ref=_target_ref("personal_events", ref),
                 link_type="evidence_for",
-                title="Work item links diary/work evidence",
+                title="Kanban item links diary evidence",
                 metadata={"field": "related_event_ids_json"},
                 provenance=base,
                 actor=actor,
@@ -2373,7 +2392,7 @@ def _personal_graph_candidates(
                 source_ref=source_ref,
                 target_ref=_target_ref("personal_time_tasks", ref),
                 link_type="evidence_for",
-                title="Work item links task evidence",
+                title="Kanban item links task evidence",
                 metadata={"field": "related_task_ids_json"},
                 provenance=base,
                 actor=actor,
@@ -2386,102 +2405,57 @@ def _personal_graph_candidates(
                 source_ref=source_ref,
                 target_ref=_target_ref("", row["promoted_from_ref"]),
                 link_type="promoted_from",
-                title="Work item promoted from source record",
+                title="Kanban item promoted from source record",
                 metadata={"field": "promoted_from_ref"},
                 provenance=base,
                 actor=actor,
                 request_id=request_id,
                 now=now,
             )
+        if row["item_type"] in {"issue", "todo"} and row["parent_item_id"]:
+            _add_graph_candidate(
+                candidates,
+                source_ref=source_ref,
+                target_ref=f"kanban_items:{row['parent_item_id']}",
+                link_type="evidence_for",
+                title=f"{row['item_type'].title()} item belongs to parent item",
+                metadata={"status": row["status"], "item_type": row["item_type"]},
+                provenance=base,
+                actor=actor,
+                request_id=request_id,
+                now=now,
+            )
 
-    for row in conn.execute("SELECT * FROM work_item_links"):
+    for row in conn.execute("SELECT * FROM kanban_item_links"):
         _add_graph_candidate(
             candidates,
-            source_ref=f"work_items:{row['source_item_id']}",
-            target_ref=f"work_items:{row['target_item_id']}",
+            source_ref=f"kanban_items:{row['source_item_id']}",
+            target_ref=f"kanban_items:{row['target_item_id']}",
             link_type=PERSONAL_GRAPH_LINK_TYPE_ALIASES.get(row["link_type"], row["link_type"]),
-            title="Work item link",
+            title="Kanban item link",
             metadata={"work_item_link_id": row["link_id"], **_json_value(row["metadata_json"], {})},
             provenance={
-                "source_table": "work_item_links",
-                "db_ref": f"work_item_links:{row['link_id']}",
+                "source_table": "kanban_item_links",
+                "db_ref": f"kanban_item_links:{row['link_id']}",
             },
             actor=actor,
             request_id=request_id,
             now=now,
         )
 
-    for row in conn.execute("SELECT * FROM work_issues"):
-        source_ref = f"work_issues:{row['issue_id']}"
-        base = {"source_table": "work_issues", "db_ref": source_ref}
-        _add_graph_candidate(
-            candidates,
-            source_ref=source_ref,
-            target_ref=f"work_items:{row['item_id']}",
-            link_type="evidence_for",
-            title="Issue is evidence for work item",
-            metadata={"status": row["status"]},
-            provenance=base,
-            actor=actor,
-            request_id=request_id,
-            now=now,
-        )
-        if row["related_task_id"]:
-            _add_graph_candidate(
-                candidates,
-                source_ref=source_ref,
-                target_ref=_target_ref("personal_time_tasks", row["related_task_id"]),
-                link_type="relates_to",
-                title="Issue relates to task",
-                metadata={"field": "related_task_id"},
-                provenance=base,
-                actor=actor,
-                request_id=request_id,
-                now=now,
-            )
-
-    for row in conn.execute("SELECT * FROM work_todos"):
-        source_ref = f"work_todos:{row['todo_id']}"
-        base = {"source_table": "work_todos", "db_ref": source_ref}
-        _add_graph_candidate(
-            candidates,
-            source_ref=source_ref,
-            target_ref=f"work_items:{row['item_id']}",
-            link_type="evidence_for",
-            title="Work todo is evidence for work item",
-            metadata={"status": row["status"]},
-            provenance=base,
-            actor=actor,
-            request_id=request_id,
-            now=now,
-        )
-        if row["related_task_id"]:
-            _add_graph_candidate(
-                candidates,
-                source_ref=source_ref,
-                target_ref=_target_ref("personal_time_tasks", row["related_task_id"]),
-                link_type="relates_to",
-                title="Work todo relates to task",
-                metadata={"field": "related_task_id"},
-                provenance=base,
-                actor=actor,
-                request_id=request_id,
-                now=now,
-            )
-
-    for row in conn.execute("SELECT * FROM work_blockers"):
+    for row in conn.execute("SELECT * FROM kanban_blockers"):
         if not row["blocked_by_ref"]:
             continue
         _add_graph_candidate(
             candidates,
-            source_ref=f"work_blockers:{row['blocker_id']}",
+            source_ref=f"kanban_blockers:{row['blocker_id']}",
             target_ref=_target_ref("", row["blocked_by_ref"]),
             link_type="blocks",
             title="Blocker cites blocking source",
             metadata={"status": row["status"]},
             provenance={
-                "source_table": "work_blockers",
-                "db_ref": f"work_blockers:{row['blocker_id']}",
+                "source_table": "kanban_blockers",
+                "db_ref": f"kanban_blockers:{row['blocker_id']}",
             },
             actor=actor,
             request_id=request_id,
@@ -2577,7 +2551,7 @@ def _event_search_mode(row: Any, record_type: str) -> str:
     if record_type == "git":
         return "git_activity"
     if record_type == "task_event":
-        return "work" if _json_value(row["related_work_items_json"], []) else "personal"
+        return "kanban" if _json_value(row["related_kanban_items_json"], []) else "personal"
     if row["status"] == "blocked":
         return "blocked"
     if row["status"] == "pending_review":
@@ -2692,7 +2666,7 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
         record_type = _event_search_record_type(row)
         tags = _search_tags(row)
         related_refs = _search_related_refs(
-            _json_value(row["related_work_items_json"], []),
+            _json_value(row["related_kanban_items_json"], []),
             _json_value(row["related_tasks_json"], []),
             _json_value(row["related_import_batches_json"], []),
             _json_value(row["file_refs_json"], []),
@@ -2727,7 +2701,7 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
     for row in task_rows:
         tags = _search_tags(row)
         related_refs = _search_related_refs(
-            _json_value(row["related_work_items_json"], []),
+            _json_value(row["related_kanban_items_json"], []),
             _json_value(row["related_tasks_json"], []),
             _json_value(row["related_import_batches_json"], []),
             _json_value(row["file_refs_json"], []),
@@ -2786,18 +2760,16 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
         )
 
     work_specs = [
-        ("work_items", "item_id", "work_item", "manual-work"),
-        ("work_issues", "issue_id", "work_issue", "work-management"),
-        ("work_todos", "todo_id", "work_todo", "work-management"),
-        ("work_blockers", "blocker_id", "work_blocker", "work-management"),
-        ("work_discussions", "discussion_id", "work_discussion", "work-management"),
+        ("kanban_items", "item_id", "kanban_item", "manual-kanban"),
+        ("kanban_blockers", "blocker_id", "kanban_blocker", "kanban"),
+        ("kanban_discussions", "discussion_id", "kanban_discussion", "kanban"),
     ]
     for table, id_col, record_type, default_source in work_specs:
         for row in conn.execute(f"SELECT * FROM {table}").fetchall():
             row_id = row[id_col]
             tags = _json_value(row["tags_json"], []) if "tags_json" in row.keys() else []
             related_refs = []
-            if table == "work_items":
+            if table == "kanban_items":
                 related_refs = _search_related_refs(
                     _json_value(row["related_event_ids_json"], []),
                     _json_value(row["related_task_ids_json"], []),
@@ -2836,7 +2808,7 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
                     if "due_at" in row.keys() and row["due_at"]
                     else None,
                     status=row["status"] or "",
-                    mode="work",
+                    mode="kanban",
                     privacy_level="normal",
                     tags=[str(item) for item in _as_list(tags) if str(item)],
                     related_refs=related_refs,
@@ -3837,7 +3809,7 @@ async def list_personal_events(
     status: str | None = None,
     privacy_level: str | None = None,
     tag: str | None = None,
-    related_work_item: str | None = None,
+    related_kanban_item: str | None = None,
     import_batch: str | None = None,
     mode: str | None = None,
     kind: str | None = None,
@@ -3863,8 +3835,8 @@ async def list_personal_events(
         params.append(kind)
     if tag:
         _add_json_array_filter(where, params, "tags_json", tag)
-    if related_work_item:
-        _add_json_array_filter(where, params, "related_work_items_json", related_work_item)
+    if related_kanban_item:
+        _add_json_array_filter(where, params, "related_kanban_items_json", related_kanban_item)
     if import_batch:
         _add_json_array_filter(where, params, "related_import_batches_json", import_batch)
     _apply_mode(where, params, mode)
@@ -3889,7 +3861,7 @@ async def list_personal_events(
             "status": status,
             "privacy_level": privacy_level,
             "tag": tag,
-            "related_work_item": related_work_item,
+            "related_kanban_item": related_kanban_item,
             "import_batch": import_batch,
             "mode": mode,
             "kind": kind,
@@ -3906,16 +3878,18 @@ async def get_personal_event(event_id: str) -> dict[str, Any]:
     return _row_to_event(row)
 
 
-@router.post("/events/{event_id}/work-links")
+@router.post("/events/{event_id}/kanban-links")
 async def link_personal_event_work_item(
-    event_id: str, body: DiaryWorkLinkRequest
+    event_id: str, body: DiaryKanbanLinkRequest
 ) -> dict[str, Any]:
-    work_ref = _clean_short_text(body.work_item_ref, "", limit=200)
-    if not work_ref:
-        raise HTTPException(400, "work item ref is required")
+    kanban_ref = _clean_short_text(body.kanban_item_ref, "", limit=200)
+    if not kanban_ref:
+        raise HTTPException(400, "Kanban item ref is required")
     actor = _clean_short_text(body.actor, "blueprints-ui")
     source_surface = _clean_short_text(body.source_surface, "diary-page")
-    request_id = _clean_short_text(body.request_id, f"work-link-{uuid.uuid4().hex[:12]}", limit=160)
+    request_id = _clean_short_text(
+        body.request_id, f"kanban-link-{uuid.uuid4().hex[:12]}", limit=160
+    )
     run_id = _clean_short_text(body.run_id, request_id, limit=160)
     audit_id = f"audit-{uuid.uuid4().hex}"
     now = _utc_now_iso()
@@ -3923,27 +3897,27 @@ async def link_personal_event_work_item(
         row = conn.execute("SELECT * FROM personal_events WHERE event_id=?", (event_id,)).fetchone()
         if not row:
             raise HTTPException(404, "event not found")
-        work_items = _json_value(row["related_work_items_json"], [])
-        if not isinstance(work_items, list):
-            work_items = []
-        if work_ref not in work_items:
-            work_items.append(work_ref)
+        kanban_items = _json_value(row["related_kanban_items_json"], [])
+        if not isinstance(kanban_items, list):
+            kanban_items = []
+        if kanban_ref not in kanban_items:
+            kanban_items.append(kanban_ref)
         provenance = _json_value(row["provenance_json"], {})
-        links = provenance.get("work_link_audit") if isinstance(provenance, dict) else []
+        links = provenance.get("kanban_link_audit") if isinstance(provenance, dict) else []
         if not isinstance(links, list):
             links = []
-        links.append({"work_item_ref": work_ref, "audit_id": audit_id, "created_at": now})
-        provenance["work_link_audit"] = links[-12:]
+        links.append({"kanban_item_ref": kanban_ref, "audit_id": audit_id, "created_at": now})
+        provenance["kanban_link_audit"] = links[-12:]
         conn.execute(
             """
             UPDATE personal_events
-            SET related_work_items_json=?,
+            SET related_kanban_items_json=?,
                 provenance_json=?,
                 updated_at=?
             WHERE event_id=?
             """,
             (
-                json.dumps(work_items, ensure_ascii=True),
+                json.dumps(kanban_items, ensure_ascii=True),
                 json.dumps(provenance, ensure_ascii=True, sort_keys=True),
                 now,
                 event_id,
@@ -3957,7 +3931,7 @@ async def link_personal_event_work_item(
             audit_id=audit_id,
             actor=actor,
             source_surface=source_surface,
-            action="link_work_item",
+            action="link_kanban_item",
             target_ref=f"personal_events:{event_id}",
             file_ref="",
             db_ref=f"personal_events:{event_id}",
@@ -3966,9 +3940,9 @@ async def link_personal_event_work_item(
             run_id=run_id,
             result="ok",
             source_hash=row["source_hash"] or "",
-            metadata={"work_item_ref": work_ref},
+            metadata={"kanban_item_ref": kanban_ref},
         )
-        gen = increment_gen(conn, "personal-work-link")
+        gen = increment_gen(conn, "personal-kanban-link")
         enqueue_for_all_peers(conn, "UPDATE", "personal_events", event_id, dict(updated), gen)
         enqueue_for_all_peers(conn, "UPDATE", "personal_time_audit", audit_id, audit_row, gen)
     return {"ok": True, "event": _row_to_event(updated), "audit": {"audit_id": audit_id}}
@@ -4047,7 +4021,7 @@ async def list_personal_tasks(
     status: str | None = None,
     privacy_level: str | None = None,
     tag: str | None = None,
-    related_work_item: str | None = None,
+    related_kanban_item: str | None = None,
     import_batch: str | None = None,
     mode: str | None = None,
     source_type: str | None = None,
@@ -4081,12 +4055,12 @@ async def list_personal_tasks(
     if tag:
         _add_json_array_filter(task_where, task_params, "tags_json", tag)
         _add_json_array_filter(event_where, event_params, "tags_json", tag)
-    if related_work_item:
+    if related_kanban_item:
         _add_json_array_filter(
-            task_where, task_params, "related_work_items_json", related_work_item
+            task_where, task_params, "related_kanban_items_json", related_kanban_item
         )
         _add_json_array_filter(
-            event_where, event_params, "related_work_items_json", related_work_item
+            event_where, event_params, "related_kanban_items_json", related_kanban_item
         )
     if import_batch:
         _add_json_array_filter(task_where, task_params, "related_import_batches_json", import_batch)
@@ -4116,27 +4090,27 @@ async def list_personal_tasks(
             """,
             (*event_params, fetch_limit),
         ).fetchall()
-        work_preferences = _work_preferences(conn)
-        work_todo_rows = _work_todo_task_page_rows(
+        kanban_preferences = _kanban_preferences(conn)
+        kanban_todo_rows = _kanban_todo_task_page_rows(
             conn,
             mode=mode,
             date_start=date_start,
             date_end=date_end,
             status=status,
             source_type=source_type,
-            related_work_item=related_work_item,
+            related_kanban_item=related_kanban_item,
             fetch_limit=fetch_limit,
         )
-        work_todo_rows, hidden_work_todos = _filter_work_todo_test_rows(
+        kanban_todo_rows, hidden_kanban_todos = _filter_kanban_todo_test_rows(
             conn,
-            work_todo_rows,
-            bool(work_preferences["show_test_entries"]),
+            kanban_todo_rows,
+            bool(kanban_preferences["show_test_entries"]),
         )
-        counts = _task_counts(conn, show_test_entries=bool(work_preferences["show_test_entries"]))
+        counts = _task_counts(conn, show_test_entries=bool(kanban_preferences["show_test_entries"]))
 
     items = [_row_to_task(row) for row in task_rows]
     items.extend(_event_to_task(row) for row in event_rows)
-    items.extend(_work_todo_to_task(row) for row in work_todo_rows)
+    items.extend(_kanban_todo_to_task(row) for row in kanban_todo_rows)
     deduped: dict[str, dict[str, Any]] = {}
     for item in items:
         deduped.setdefault(item["task_id"], item)
@@ -4165,10 +4139,10 @@ async def list_personal_tasks(
             "status": status_counts,
             "total": len(items),
         },
-        "work_preferences": work_preferences,
+        "kanban_preferences": kanban_preferences,
         "test_entries": {
-            "show": bool(work_preferences["show_test_entries"]),
-            "hidden_work_todos": hidden_work_todos,
+            "show": bool(kanban_preferences["show_test_entries"]),
+            "hidden_kanban_todos": hidden_kanban_todos,
         },
         "filters": {
             "date_start": date_start,
@@ -4176,7 +4150,7 @@ async def list_personal_tasks(
             "status": status,
             "privacy_level": privacy_level,
             "tag": tag,
-            "related_work_item": related_work_item,
+            "related_kanban_item": related_kanban_item,
             "import_batch": import_batch,
             "mode": mode,
             "source_type": source_type,
@@ -4209,7 +4183,7 @@ def _task_request_from_row(
         timezone=row["timezone"],
         privacy_level=row["privacy_level"],
         tags=_json_value(row["tags_json"], []),
-        related_work_items=_json_value(row["related_work_items_json"], []),
+        related_kanban_items=_json_value(row["related_kanban_items_json"], []),
         related_tasks=_json_value(row["related_tasks_json"], []),
         related_import_batches=_json_value(row["related_import_batches_json"], []),
         actor=action.actor,
@@ -4314,13 +4288,13 @@ def _task_status(value: str | None) -> str:
     return status
 
 
-def _task_mode(value: str | None, related_work_items: list[str]) -> str:
+def _task_mode(value: str | None, related_kanban_items: list[str]) -> str:
     mode = _clean_short_text(value, "personal", limit=40)
     if mode == "today":
         mode = "personal"
-    if related_work_items and mode == "personal":
-        mode = "work"
-    if mode not in {"personal", "work", "review"}:
+    if related_kanban_items and mode == "personal":
+        mode = "kanban"
+    if mode not in {"personal", "kanban", "review"}:
         raise HTTPException(400, "task mode is invalid")
     return mode
 
@@ -4354,7 +4328,7 @@ def _write_task_files(payload: dict[str, Any], now: str) -> list[str]:
         "timezone": payload["timezone"],
         "privacy_level": payload["privacy_level"],
         "tags": payload["tags"],
-        "related_work_items": payload["related_work_items"],
+        "related_kanban_items": payload["related_kanban_items"],
         "related_tasks": payload["related_tasks"],
         "related_import_batches": payload["related_import_batches"],
         "source_hash": payload["source_hash"],
@@ -4401,18 +4375,18 @@ def _task_payload(
     title = _clean_short_text(body.title, "", limit=180)
     if not title:
         raise HTTPException(400, "task title is required")
-    related_work_items = _clean_event_list(body.related_work_items)
+    related_kanban_items = _clean_event_list(body.related_kanban_items)
     status = _task_status(status_override or body.status)
-    mode = _task_mode(body.mode, related_work_items)
+    mode = _task_mode(body.mode, related_kanban_items)
     tags = _clean_event_list(body.tags)
-    mode_tag = WORK_KANBAN_TAG if mode == "work" else mode
+    mode_tag = KANBAN_TAG if mode == "kanban" else mode
     for required in ("todo", "task", mode_tag):
         if required not in tags:
             tags.append(required)
     if due_at and "due" not in tags:
         tags.append("due")
-    if related_work_items and WORK_KANBAN_TAG not in tags:
-        tags.append(WORK_KANBAN_TAG)
+    if related_kanban_items and KANBAN_TAG not in tags:
+        tags.append(KANBAN_TAG)
     clean_task_id = _task_id(task_id or body.task_id, local_date)
     provenance = {
         "task": {
@@ -4446,7 +4420,7 @@ def _task_payload(
         "timezone": timezone_name,
         "privacy_level": _clean_privacy_level(body.privacy_level),
         "tags": tags,
-        "related_work_items": related_work_items,
+        "related_kanban_items": related_kanban_items,
         "related_tasks": _clean_event_list(body.related_tasks),
         "related_import_batches": _clean_event_list(body.related_import_batches),
         "provenance": provenance,
@@ -4477,7 +4451,7 @@ def _upsert_task_event(
         INSERT INTO personal_events (
             event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
             content_projection, start_at, end_at, local_date, timezone, status, priority,
-            privacy_level, tags_json, related_work_items_json, related_tasks_json,
+            privacy_level, tags_json, related_kanban_items_json, related_tasks_json,
             related_import_batches_json, file_refs_json, db_refs_json, provenance_json,
             projection_state, provenance_state, last_rendered_at, created_at, updated_at
         )
@@ -4497,7 +4471,7 @@ def _upsert_task_event(
             priority=excluded.priority,
             privacy_level=excluded.privacy_level,
             tags_json=excluded.tags_json,
-            related_work_items_json=excluded.related_work_items_json,
+            related_kanban_items_json=excluded.related_kanban_items_json,
             related_tasks_json=excluded.related_tasks_json,
             related_import_batches_json=excluded.related_import_batches_json,
             file_refs_json=excluded.file_refs_json,
@@ -4525,7 +4499,7 @@ def _upsert_task_event(
             payload["priority"],
             payload["privacy_level"],
             json.dumps(payload["tags"], ensure_ascii=True),
-            json.dumps(payload["related_work_items"], ensure_ascii=True),
+            json.dumps(payload["related_kanban_items"], ensure_ascii=True),
             json.dumps([payload["task_id"], *payload["related_tasks"]], ensure_ascii=True),
             json.dumps(payload["related_import_batches"], ensure_ascii=True),
             json.dumps(file_refs, ensure_ascii=True),
@@ -4579,7 +4553,7 @@ def _upsert_personal_task(
             INSERT INTO personal_time_tasks (
                 task_id, source_type, source_ref, source_hash, title, body_excerpt,
                 status, mode, priority, due_at, local_date, timezone, privacy_level,
-                tags_json, related_work_items_json, related_tasks_json,
+                tags_json, related_kanban_items_json, related_tasks_json,
                 related_import_batches_json, file_refs_json, db_refs_json, event_id,
                 provenance_json, completed_at, archived_at, created_at, updated_at
             )
@@ -4598,7 +4572,7 @@ def _upsert_personal_task(
                 timezone=excluded.timezone,
                 privacy_level=excluded.privacy_level,
                 tags_json=excluded.tags_json,
-                related_work_items_json=excluded.related_work_items_json,
+                related_kanban_items_json=excluded.related_kanban_items_json,
                 related_tasks_json=excluded.related_tasks_json,
                 related_import_batches_json=excluded.related_import_batches_json,
                 file_refs_json=excluded.file_refs_json,
@@ -4624,7 +4598,7 @@ def _upsert_personal_task(
                 payload["timezone"],
                 payload["privacy_level"],
                 json.dumps(payload["tags"], ensure_ascii=True),
-                json.dumps(payload["related_work_items"], ensure_ascii=True),
+                json.dumps(payload["related_kanban_items"], ensure_ascii=True),
                 json.dumps(payload["related_tasks"], ensure_ascii=True),
                 json.dumps(payload["related_import_batches"], ensure_ascii=True),
                 json.dumps(file_refs, ensure_ascii=True),
@@ -4698,15 +4672,15 @@ def _upsert_personal_task(
 def _task_mode_where(mode: str | None) -> tuple[list[str], list[Any]]:
     if not mode:
         return [], []
-    if mode not in {"today", "personal", "work", "blocked", "review", "done"}:
+    if mode not in {"today", "personal", "kanban", "blocked", "review", "done"}:
         raise HTTPException(400, f"unknown task mode: {mode}")
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     if mode == "today":
         return ["local_date = ?", "status IN ('open', 'blocked', 'pending_review')"], [today]
     if mode == "personal":
         return ["mode = 'personal'", "status NOT IN ('done', 'archived')"], []
-    if mode == "work":
-        return ["(mode = 'work' OR json_array_length(related_work_items_json) > 0)"], []
+    if mode == "kanban":
+        return ["(mode = 'kanban' OR json_array_length(related_kanban_items_json) > 0)"], []
     if mode == "blocked":
         return ["status = 'blocked'"], []
     if mode == "review":
@@ -4729,12 +4703,10 @@ def _event_task_where(mode: str | None) -> tuple[list[str], list[Any]]:
         where.append(
             "source_type IN ('manual', 'diary-file', 'manual-calendar', 'hermes-minutes', 'browser-links')"
         )
-        where.append("json_array_length(related_work_items_json) = 0")
+        where.append("json_array_length(related_kanban_items_json) = 0")
         where.append("status NOT IN ('done', 'archived')")
-    elif mode == "work":
-        where.append(
-            "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
-        )
+    elif mode == "kanban":
+        where.append("(source_type = 'kanban' OR json_array_length(related_kanban_items_json) > 0)")
     elif mode == "blocked":
         where.append("status = 'blocked'")
     elif mode == "review":
@@ -4747,7 +4719,7 @@ def _event_task_where(mode: str | None) -> tuple[list[str], list[Any]]:
 
 
 def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]:
-    counts = {"today": 0, "personal": 0, "work": 0, "blocked": 0, "review": 0, "done": 0}
+    counts = {"today": 0, "personal": 0, "kanban": 0, "blocked": 0, "review": 0, "done": 0}
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     today_row = conn.execute(
         """
@@ -4770,25 +4742,25 @@ def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]
         status = row["status"]
         mode = row["mode"]
         count = int(row["count"])
-        if mode in {"personal", "work", "review"} and status not in {"done", "archived"}:
+        if mode in {"personal", "kanban", "review"} and status not in {"done", "archived"}:
             counts[mode] += count
         if status == "blocked":
             counts["blocked"] += count
         if status in {"done", "archived"}:
             counts["done"] += count
-    work_todo_rows = conn.execute("SELECT * FROM work_todos").fetchall()
-    work_todo_rows, _hidden = _filter_work_todo_test_rows(
+    kanban_todo_rows = conn.execute("SELECT * FROM kanban_items WHERE item_type='todo'").fetchall()
+    kanban_todo_rows, _hidden = _filter_kanban_todo_test_rows(
         conn,
-        work_todo_rows,
+        kanban_todo_rows,
         show_test_entries,
     )
-    work_todo_counts: dict[str, int] = {}
-    for row in work_todo_rows:
+    kanban_todo_counts: dict[str, int] = {}
+    for row in kanban_todo_rows:
         status = row["status"]
-        work_todo_counts[status] = work_todo_counts.get(status, 0) + 1
-    for status, count in work_todo_counts.items():
+        kanban_todo_counts[status] = kanban_todo_counts.get(status, 0) + 1
+    for status, count in kanban_todo_counts.items():
         if status != "archived":
-            counts["work"] += count
+            counts["kanban"] += count
         if status == "blocked":
             counts["blocked"] += count
         if status in {"done", "archived", "promoted"}:
@@ -4796,7 +4768,7 @@ def _task_counts(conn: Any, *, show_test_entries: bool = True) -> dict[str, int]
     return counts
 
 
-def _work_todo_task_page_rows(
+def _kanban_todo_task_page_rows(
     conn: Any,
     *,
     mode: str | None,
@@ -4804,37 +4776,46 @@ def _work_todo_task_page_rows(
     date_end: str | None,
     status: str | None,
     source_type: str | None,
-    related_work_item: str | None,
+    related_kanban_item: str | None,
     fetch_limit: int,
 ) -> list[Any]:
-    work_source_filters = {"work-todo", "work_todo", "work_todos", "work-management"}
-    include = mode == "work" or bool(related_work_item)
+    work_source_filters = {
+        "kanban-todo",
+        "kanban_todo",
+        "kanban_items",
+        "kanban",
+    }
+    include = mode == "kanban" or bool(related_kanban_item)
     if source_type:
         include = source_type in work_source_filters
     if not include:
         return []
-    where: list[str] = []
+    where: list[str] = ["item_type = 'todo'"]
     params: list[Any] = []
     if status:
         where.append("status = ?")
         params.append(status)
-    elif mode == "work":
+    elif mode == "kanban":
         where.append("status != 'archived'")
-    if related_work_item:
-        where.append("item_id = ?")
-        params.append(related_work_item)
+    if related_kanban_item:
+        where.append("(parent_item_id = ? OR item_id = ?)")
+        params.extend([related_kanban_item, related_kanban_item])
     if date_start:
-        where.append("COALESCE(substr(due_at, 1, 10), '') >= ?")
+        where.append(
+            "COALESCE(substr(json_extract(provenance_json, '$.todo.due_at'), 1, 10), '') >= ?"
+        )
         params.append(date_start)
     if date_end:
-        where.append("COALESCE(substr(due_at, 1, 10), '') <= ?")
+        where.append(
+            "COALESCE(substr(json_extract(provenance_json, '$.todo.due_at'), 1, 10), '') <= ?"
+        )
         params.append(date_end)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     return conn.execute(
         f"""
-        SELECT * FROM work_todos
+        SELECT * FROM kanban_items
         {clause}
-        ORDER BY COALESCE(due_at, updated_at, created_at) ASC, todo_id ASC
+        ORDER BY COALESCE(json_extract(provenance_json, '$.todo.due_at'), updated_at, created_at) ASC, item_id ASC
         LIMIT ?
         """,
         (*params, fetch_limit),
@@ -4850,7 +4831,7 @@ def _clean_work_id(value: str | None, prefix: str) -> str:
 
 def _work_request_meta(body: Any) -> dict[str, str]:
     request_id = _clean_short_text(
-        getattr(body, "request_id", None), f"work-{uuid.uuid4().hex[:12]}", limit=160
+        getattr(body, "request_id", None), f"kanban-{uuid.uuid4().hex[:12]}", limit=160
     )
     run_id = _clean_short_text(getattr(body, "run_id", None) or request_id, request_id, limit=160)
     return {
@@ -4863,19 +4844,21 @@ def _work_request_meta(body: Any) -> dict[str, str]:
 
 def _require_work_state(conn: Any, state_id: str | None) -> Any:
     clean_state = _clean_short_text(state_id, "todo", limit=80)
-    row = conn.execute("SELECT * FROM work_item_states WHERE state_id=?", (clean_state,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM kanban_item_states WHERE state_id=?", (clean_state,)
+    ).fetchone()
     if not row:
-        raise HTTPException(400, "work item state is invalid")
+        raise HTTPException(400, "Kanban item state is invalid")
     return row
 
 
 def _require_work_priority(conn: Any, priority_id: str | None) -> Any:
     clean_priority = _clean_short_text(priority_id, "medium", limit=80)
     row = conn.execute(
-        "SELECT * FROM work_item_priorities WHERE priority_id=?", (clean_priority,)
+        "SELECT * FROM kanban_item_priorities WHERE priority_id=?", (clean_priority,)
     ).fetchone()
     if not row:
-        raise HTTPException(400, "work item priority is invalid")
+        raise HTTPException(400, "Kanban item priority is invalid")
     return row
 
 
@@ -4891,9 +4874,9 @@ def _work_status_for_state(state_row: Any) -> str:
 
 
 def _work_item_or_404(conn: Any, item_id: str) -> Any:
-    row = conn.execute("SELECT * FROM work_items WHERE item_id=?", (item_id,)).fetchone()
+    row = conn.execute("SELECT * FROM kanban_items WHERE item_id=?", (item_id,)).fetchone()
     if not row:
-        raise HTTPException(404, "work item not found")
+        raise HTTPException(404, "Kanban item not found")
     return row
 
 
@@ -4902,7 +4885,7 @@ def _work_root_item(conn: Any, item_id: str) -> Any:
     seen: set[str] = set()
     while current["parent_item_id"]:
         if current["item_id"] in seen:
-            raise HTTPException(400, "work item parent cycle detected")
+            raise HTTPException(400, "Kanban item parent cycle detected")
         seen.add(current["item_id"])
         current = _work_item_or_404(conn, current["parent_item_id"])
     return current
@@ -5191,29 +5174,29 @@ def _work_parent_depth(conn: Any, parent_item_id: str | None, *, moving_item_id:
     if not parent_id:
         return 0
     if moving_item_id and parent_id == moving_item_id:
-        raise HTTPException(400, "work item cannot be its own parent")
+        raise HTTPException(400, "Kanban item cannot be its own parent")
     immediate_parent = conn.execute(
-        "SELECT item_id, parent_item_id, depth FROM work_items WHERE item_id=?", (parent_id,)
+        "SELECT item_id, parent_item_id, depth FROM kanban_items WHERE item_id=?", (parent_id,)
     ).fetchone()
     if not immediate_parent:
-        raise HTTPException(404, "parent work item not found")
+        raise HTTPException(404, "parent Kanban item not found")
     current = parent_id
     seen: set[str] = set()
     while current:
         if current in seen:
-            raise HTTPException(400, "work item parent cycle detected")
+            raise HTTPException(400, "Kanban item parent cycle detected")
         seen.add(current)
         row = conn.execute(
-            "SELECT item_id, parent_item_id, depth FROM work_items WHERE item_id=?", (current,)
+            "SELECT item_id, parent_item_id, depth FROM kanban_items WHERE item_id=?", (current,)
         ).fetchone()
         if not row:
-            raise HTTPException(404, "parent work item not found")
+            raise HTTPException(404, "parent Kanban item not found")
         if moving_item_id and row["item_id"] == moving_item_id:
-            raise HTTPException(400, "work item cannot move under its descendant")
+            raise HTTPException(400, "Kanban item cannot move under its descendant")
         current = row["parent_item_id"]
     depth = int(immediate_parent["depth"]) + 1
-    if depth > WORK_DEPTH_LIMIT:
-        raise HTTPException(400, "work item depth limit exceeded")
+    if depth > KANBAN_DEPTH_LIMIT:
+        raise HTTPException(400, "Kanban item depth limit exceeded")
     return depth
 
 
@@ -5221,10 +5204,10 @@ def _work_subtree_max_relative_depth(conn: Any, item_id: str) -> int:
     row = conn.execute(
         """
         WITH RECURSIVE descendants(item_id, rel_depth) AS (
-            SELECT item_id, 0 FROM work_items WHERE item_id=?
+            SELECT item_id, 0 FROM kanban_items WHERE item_id=?
             UNION ALL
             SELECT w.item_id, descendants.rel_depth + 1
-            FROM work_items w
+            FROM kanban_items w
             JOIN descendants ON w.parent_item_id = descendants.item_id
         )
         SELECT COALESCE(MAX(rel_depth), 0) AS max_depth FROM descendants
@@ -5236,12 +5219,12 @@ def _work_subtree_max_relative_depth(conn: Any, item_id: str) -> int:
 
 def _recompute_work_child_depths(conn: Any, item_id: str, depth: int) -> None:
     rows = conn.execute(
-        "SELECT item_id FROM work_items WHERE parent_item_id=?", (item_id,)
+        "SELECT item_id FROM kanban_items WHERE parent_item_id=?", (item_id,)
     ).fetchall()
     for row in rows:
         child_depth = depth + 1
         conn.execute(
-            "UPDATE work_items SET depth=?, updated_at=? WHERE item_id=?",
+            "UPDATE kanban_items SET depth=?, updated_at=? WHERE item_id=?",
             (child_depth, _utc_now_iso(), row["item_id"]),
         )
         _recompute_work_child_depths(conn, row["item_id"], child_depth)
@@ -5261,7 +5244,7 @@ def _work_search_payload(
     search_text = "\n".join(part for part in [title, body, " ".join(tag_values)] if part)
     vector_key = f"{table_name}:{row_id}"
     metadata = {
-        "schema": "xarta.work.search_metadata.v1",
+        "schema": "xarta.kanban.search_metadata.v1",
         "table": table_name,
         "row_id": row_id,
         "kind": kind,
@@ -5272,7 +5255,7 @@ def _work_search_payload(
             "model": "",
         },
         "vector": {
-            "index": "work-management",
+            "index": "kanban",
             "key": vector_key,
             "turbo_vec_ready": True,
         },
@@ -5314,7 +5297,7 @@ def _write_work_audit(
     }
     conn.execute(
         """
-        INSERT INTO work_audit_log (
+        INSERT INTO kanban_audit_log (
             audit_id, actor, source_surface, action, target_ref, item_id, parent_item_id,
             created_at, request_id, run_id, result, source_hash, metadata_json
         )
@@ -5349,17 +5332,17 @@ def _work_scope_item_ids(
     show_test_entries: bool = True,
 ) -> list[str]:
     if not item_id:
-        rows = conn.execute("SELECT * FROM work_items WHERE status != 'archived'").fetchall()
+        rows = conn.execute("SELECT * FROM kanban_items WHERE status != 'archived'").fetchall()
         rows, _hidden = _filter_work_test_rows(rows, show_test_entries)
         return [row["item_id"] for row in rows]
     _work_item_or_404(conn, item_id)
     rows = conn.execute(
         """
         WITH RECURSIVE descendants(item_id) AS (
-            SELECT item_id FROM work_items WHERE item_id=?
+            SELECT item_id FROM kanban_items WHERE item_id=?
             UNION ALL
             SELECT w.item_id
-            FROM work_items w
+            FROM kanban_items w
             JOIN descendants ON w.parent_item_id = descendants.item_id
             WHERE w.status != 'archived'
         )
@@ -5372,7 +5355,7 @@ def _work_scope_item_ids(
         return item_ids
     placeholders = ",".join("?" for _ in item_ids)
     scoped_rows = conn.execute(
-        f"SELECT * FROM work_items WHERE item_id IN ({placeholders})",
+        f"SELECT * FROM kanban_items WHERE item_id IN ({placeholders})",
         item_ids,
     ).fetchall()
     scoped_rows, _hidden = _filter_work_test_rows(scoped_rows, show_test_entries)
@@ -5383,25 +5366,25 @@ def _work_scope_item_rows(conn: Any, item_id: str, scope: str) -> list[Any]:
     clean_scope = _clean_short_text(scope, "local", limit=40).replace("-", "_")
     if clean_scope in {"local", "self"}:
         return conn.execute(
-            "SELECT *, 0 AS rel_depth FROM work_items WHERE item_id=?",
+            "SELECT *, 0 AS rel_depth FROM kanban_items WHERE item_id=?",
             (item_id,),
         ).fetchall()
     if clean_scope not in {"descendant", "descendants", "tree", "subtree"}:
-        raise HTTPException(400, "work scope is invalid")
+        raise HTTPException(400, "Kanban scope is invalid")
     _work_item_or_404(conn, item_id)
     return conn.execute(
         """
         WITH RECURSIVE scoped(item_id, rel_depth) AS (
-            SELECT item_id, 0 FROM work_items WHERE item_id=?
+            SELECT item_id, 0 FROM kanban_items WHERE item_id=?
             UNION ALL
             SELECT w.item_id, scoped.rel_depth + 1
-            FROM work_items w
+            FROM kanban_items w
             JOIN scoped ON w.parent_item_id = scoped.item_id
             WHERE w.status != 'archived'
         )
         SELECT w.*, scoped.rel_depth
         FROM scoped
-        JOIN work_items w ON w.item_id = scoped.item_id
+        JOIN kanban_items w ON w.item_id = scoped.item_id
         ORDER BY scoped.rel_depth, COALESCE(w.parent_item_id, ''), w.sort_order, w.updated_at DESC, w.item_id
         """,
         (item_id,),
@@ -5419,10 +5402,10 @@ def _work_scoped_leaf_payload(
     root = _work_item_or_404(conn, item_id)
     clean_kind = _clean_short_text(kind, "", limit=40)
     if clean_kind not in {"issues", "todos"}:
-        raise HTTPException(400, "work scoped leaf kind is invalid")
+        raise HTTPException(400, "Kanban scoped leaf kind is invalid")
     clean_view = _clean_short_text(view, "flat", limit=40).replace("-", "_")
     if clean_view not in {"flat", "grouped", "tree"}:
-        raise HTTPException(400, "work scoped leaf view is invalid")
+        raise HTTPException(400, "Kanban scoped leaf view is invalid")
     scope_rows = _work_scope_item_rows(conn, item_id, scope)
     item_ids = [row["item_id"] for row in scope_rows]
     scope_by_item_id = {
@@ -5439,19 +5422,19 @@ def _work_scoped_leaf_payload(
     rows: list[Any] = []
     if item_ids:
         placeholders = ",".join("?" for _ in item_ids)
-        table = "work_issues" if clean_kind == "issues" else "work_todos"
+        leaf_type = "issue" if clean_kind == "issues" else "todo"
         order_expr = (
-            "updated_at DESC, issue_id"
+            "updated_at DESC, item_id"
             if clean_kind == "issues"
-            else "COALESCE(due_at, updated_at), todo_id"
+            else "COALESCE(json_extract(provenance_json, '$.todo.due_at'), updated_at), item_id"
         )
         rows = conn.execute(
             f"""
-            SELECT * FROM {table}
-            WHERE item_id IN ({placeholders})
+            SELECT * FROM kanban_items
+            WHERE item_type=? AND parent_item_id IN ({placeholders})
             ORDER BY {order_expr}
             """,
-            item_ids,
+            [leaf_type, *item_ids],
         ).fetchall()
     row_mapper = _row_to_work_issue if clean_kind == "issues" else _row_to_work_todo
     records: list[dict[str, Any]] = []
@@ -5459,11 +5442,12 @@ def _work_scoped_leaf_payload(
     counts_by_item: dict[str, int] = {item_ref: 0 for item_ref in item_ids}
     for row in rows:
         record = row_mapper(row)
-        scope_info = scope_by_item_id.get(row["item_id"], {})
+        scope_info = scope_by_item_id.get(row["parent_item_id"] or "", {})
         record["scope"] = scope_info
         records.append(record)
         counts_by_status[row["status"]] = counts_by_status.get(row["status"], 0) + 1
-        counts_by_item[row["item_id"]] = counts_by_item.get(row["item_id"], 0) + 1
+        parent_item_id = row["parent_item_id"] or ""
+        counts_by_item[parent_item_id] = counts_by_item.get(parent_item_id, 0) + 1
     groups: list[dict[str, Any]] = []
     if clean_view in {"grouped", "tree"}:
         records_by_item: dict[str, list[dict[str, Any]]] = {item_ref: [] for item_ref in item_ids}
@@ -5519,13 +5503,13 @@ def _work_breadcrumbs(conn: Any, item_id: str | None) -> list[dict[str, Any]]:
     seen: set[str] = set()
     while current:
         if current in seen:
-            raise HTTPException(400, "work item parent cycle detected")
+            raise HTTPException(400, "Kanban item parent cycle detected")
         seen.add(current)
         row = _work_item_or_404(conn, current)
         rows.append(row)
         current = row["parent_item_id"]
-        if len(rows) > WORK_DEPTH_LIMIT + 2:
-            raise HTTPException(400, "work item parent cycle detected")
+        if len(rows) > KANBAN_DEPTH_LIMIT + 2:
+            raise HTTPException(400, "Kanban item parent cycle detected")
     return [_row_to_work_item(row) for row in reversed(rows)]
 
 
@@ -5542,31 +5526,31 @@ def _work_rollup(
             "issues": {"open": 0},
             "todos": {"open": 0},
             "blockers": {"open": 0},
-            "depth_limit": WORK_DEPTH_LIMIT,
+            "depth_limit": KANBAN_DEPTH_LIMIT,
         }
     placeholders = ",".join("?" for _ in item_ids)
     state_rows = conn.execute(
-        f"SELECT state_id, COUNT(*) AS count FROM work_items WHERE item_id IN ({placeholders}) "
+        f"SELECT state_id, COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
         "GROUP BY state_id",
         item_ids,
     ).fetchall()
     status_rows = conn.execute(
-        f"SELECT status, COUNT(*) AS count FROM work_items WHERE item_id IN ({placeholders}) "
+        f"SELECT status, COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
         "GROUP BY status",
         item_ids,
     ).fetchall()
     issue_open = conn.execute(
-        f"SELECT COUNT(*) AS count FROM work_issues WHERE item_id IN ({placeholders}) "
-        "AND status != 'closed'",
+        f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
+        "AND item_type='issue' AND status NOT IN ('done', 'closed', 'archived')",
         item_ids,
     ).fetchone()
     todo_open = conn.execute(
-        f"SELECT COUNT(*) AS count FROM work_todos WHERE item_id IN ({placeholders}) "
-        "AND status NOT IN ('done', 'archived')",
+        f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
+        "AND item_type='todo' AND status NOT IN ('done', 'archived')",
         item_ids,
     ).fetchone()
     blocker_open = conn.execute(
-        f"SELECT COUNT(*) AS count FROM work_blockers WHERE item_id IN ({placeholders}) "
+        f"SELECT COUNT(*) AS count FROM kanban_blockers WHERE item_id IN ({placeholders}) "
         "AND status NOT IN ('resolved', 'archived')",
         item_ids,
     ).fetchone()
@@ -5579,13 +5563,13 @@ def _work_rollup(
         "issues": {"open": int(issue_open["count"] if issue_open else 0)},
         "todos": {"open": int(todo_open["count"] if todo_open else 0)},
         "blockers": {"open": int(blocker_open["count"] if blocker_open else 0)},
-        "depth_limit": WORK_DEPTH_LIMIT,
+        "depth_limit": KANBAN_DEPTH_LIMIT,
     }
 
 
 def _work_priority_sort_map(conn: Any) -> dict[str, dict[str, int]]:
     rows = conn.execute(
-        "SELECT priority_id, weight, sort_order FROM work_item_priorities"
+        "SELECT priority_id, weight, sort_order FROM kanban_item_priorities"
     ).fetchall()
     return {
         row["priority_id"]: {
@@ -5607,10 +5591,10 @@ def _bool_setting_value(value: str | None, default: bool = True) -> bool:
     return default
 
 
-def _work_preferences(conn: Any) -> dict[str, Any]:
+def _kanban_preferences(conn: Any) -> dict[str, Any]:
     return {
         "show_test_entries": _bool_setting_value(
-            get_setting(conn, WORK_SHOW_TEST_ENTRIES_SETTING),
+            get_setting(conn, KANBAN_SHOW_TEST_ENTRIES_SETTING),
             default=True,
         )
     }
@@ -5620,7 +5604,7 @@ def _work_item_is_test_entry(row: Any) -> bool:
     tags = {
         str(tag).strip().lower() for tag in _json_value(row["tags_json"], []) if str(tag).strip()
     }
-    return WORK_AGENT_WORKING_OUT_TAG in tags
+    return KANBAN_AGENT_WORKING_OUT_TAG in tags
 
 
 def _filter_work_test_rows(rows: list[Any], show_test_entries: bool) -> tuple[list[Any], int]:
@@ -5636,7 +5620,7 @@ def _filter_work_test_rows(rows: list[Any], show_test_entries: bool) -> tuple[li
     return visible, hidden
 
 
-def _filter_work_todo_test_rows(
+def _filter_kanban_todo_test_rows(
     conn: Any,
     rows: list[Any],
     show_test_entries: bool,
@@ -5648,7 +5632,7 @@ def _filter_work_todo_test_rows(
         return list(rows), 0
     placeholders = ",".join("?" for _ in item_ids)
     item_rows = conn.execute(
-        f"SELECT * FROM work_items WHERE item_id IN ({placeholders})",
+        f"SELECT * FROM kanban_items WHERE item_id IN ({placeholders})",
         item_ids,
     ).fetchall()
     hidden_item_ids = {row["item_id"] for row in item_rows if _work_item_is_test_entry(row)}
@@ -5676,7 +5660,7 @@ def _work_order_edge_id(
             "after_item_id": after_item_id,
         }
     )[:24]
-    return f"work-order-{digest}"
+    return f"kanban-order-{digest}"
 
 
 def _work_order_group_rows(
@@ -5689,14 +5673,14 @@ def _work_order_group_rows(
     if parent_key:
         return conn.execute(
             """
-            SELECT * FROM work_items
+            SELECT * FROM kanban_items
             WHERE parent_item_id=? AND state_id=? AND priority_id=? AND status != 'archived'
             """,
             (parent_key, state_id, priority_id),
         ).fetchall()
     return conn.execute(
         """
-        SELECT * FROM work_items
+        SELECT * FROM kanban_items
         WHERE parent_item_id IS NULL AND state_id=? AND priority_id=? AND status != 'archived'
         """,
         (state_id, priority_id),
@@ -5714,7 +5698,7 @@ def _work_order_edges_for_group(
         return []
     rows = conn.execute(
         """
-        SELECT * FROM work_item_order_edges
+        SELECT * FROM kanban_item_order_edges
         WHERE parent_item_id=? AND state_id=? AND priority_id=?
         ORDER BY updated_at DESC, edge_id
         """,
@@ -5783,7 +5767,7 @@ def _order_work_priority_group(conn: Any, rows: list[Any]) -> list[Any]:
     return [row_by_id[item_id] for item_id in ordered_ids]
 
 
-def _sort_work_items_for_lane(conn: Any, rows: list[Any]) -> list[Any]:
+def _sort_kanban_items_for_lane(conn: Any, rows: list[Any]) -> list[Any]:
     if len(rows) <= 1:
         return list(rows)
     priorities = _work_priority_sort_map(conn)
@@ -5813,7 +5797,7 @@ def _work_item_has_order_relation(
 ) -> bool:
     row = conn.execute(
         """
-        SELECT 1 FROM work_item_order_edges
+        SELECT 1 FROM kanban_item_order_edges
         WHERE parent_item_id=? AND state_id=? AND priority_id=?
           AND (before_item_id=? OR after_item_id=?)
         LIMIT 1
@@ -5823,7 +5807,7 @@ def _work_item_has_order_relation(
     return bool(row)
 
 
-def _replace_work_item_order_edges(
+def _replace_kanban_item_order_edges(
     conn: Any,
     *,
     parent_item_id: str | None,
@@ -5843,7 +5827,7 @@ def _replace_work_item_order_edges(
     sync_changes: list[tuple[str, str, dict[str, Any]]] = []
     existing = conn.execute(
         """
-        SELECT * FROM work_item_order_edges
+        SELECT * FROM kanban_item_order_edges
         WHERE parent_item_id=? AND state_id=? AND priority_id=?
         """,
         (parent_key, state_id, priority_id),
@@ -5851,7 +5835,7 @@ def _replace_work_item_order_edges(
     for row in existing:
         if row["edge_id"] in wanted_edge_ids:
             continue
-        conn.execute("DELETE FROM work_item_order_edges WHERE edge_id=?", (row["edge_id"],))
+        conn.execute("DELETE FROM kanban_item_order_edges WHERE edge_id=?", (row["edge_id"],))
         sync_changes.append(("DELETE", row["edge_id"], {}))
     for before, after in wanted_pairs:
         edge_id = _work_order_edge_id(parent_key, state_id, priority_id, before, after)
@@ -5874,7 +5858,7 @@ def _replace_work_item_order_edges(
         source_hash = _hash_json_payload(payload)
         conn.execute(
             """
-            INSERT INTO work_item_order_edges (
+            INSERT INTO kanban_item_order_edges (
                 edge_id, parent_item_id, state_id, priority_id, before_item_id,
                 after_item_id, source_hash, provenance_json, created_at, updated_at
             )
@@ -5900,7 +5884,7 @@ def _replace_work_item_order_edges(
             ),
         )
         row = conn.execute(
-            "SELECT * FROM work_item_order_edges WHERE edge_id=?", (edge_id,)
+            "SELECT * FROM kanban_item_order_edges WHERE edge_id=?", (edge_id,)
         ).fetchone()
         sync_changes.append(("UPDATE", edge_id, dict(row)))
     return sync_changes
@@ -5931,7 +5915,7 @@ def _ensure_work_item_lane_order(
         )
     ):
         ordered_ids = [item_id, *[value for value in ordered_ids if value != item_id]]
-    sync_changes = _replace_work_item_order_edges(
+    sync_changes = _replace_kanban_item_order_edges(
         conn,
         parent_item_id=item["parent_item_id"],
         state_id=item["state_id"],
@@ -5951,20 +5935,24 @@ def _work_board_payload(
 ) -> dict[str, Any]:
     parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
     parent = _work_item_or_404(conn, parent_id) if parent_id else None
-    preferences = _work_preferences(conn)
+    preferences = _kanban_preferences(conn)
     if show_test_entries is None:
         show_test_entries = bool(preferences["show_test_entries"])
     else:
         preferences["show_test_entries"] = bool(show_test_entries)
     breadcrumbs = _work_breadcrumbs(conn, parent_id)
     remaining_depth = (
-        max(0, WORK_DEPTH_LIMIT - int(parent["depth"])) if parent is not None else WORK_DEPTH_LIMIT
+        max(0, KANBAN_DEPTH_LIMIT - int(parent["depth"]))
+        if parent is not None
+        else KANBAN_DEPTH_LIMIT
     )
-    states = conn.execute("SELECT * FROM work_item_states ORDER BY sort_order, state_id").fetchall()
+    states = conn.execute(
+        "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id"
+    ).fetchall()
     if parent_id:
         rows = conn.execute(
             """
-            SELECT * FROM work_items
+            SELECT * FROM kanban_items
             WHERE parent_item_id=? AND status != 'archived'
             ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
             """,
@@ -5973,7 +5961,7 @@ def _work_board_payload(
     else:
         rows = conn.execute(
             """
-            SELECT * FROM work_items
+            SELECT * FROM kanban_items
             WHERE parent_item_id IS NULL AND status != 'archived'
             ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
             """
@@ -5983,14 +5971,14 @@ def _work_board_payload(
     for row in rows:
         raw_items_by_state.setdefault(row["state_id"], []).append(row)
     items_by_state = {
-        state_id: [_row_to_work_item(row) for row in _sort_work_items_for_lane(conn, state_rows)]
+        state_id: [_row_to_work_item(row) for row in _sort_kanban_items_for_lane(conn, state_rows)]
         for state_id, state_rows in raw_items_by_state.items()
     }
     return {
         "ok": True,
         "board": {
             "parent": _row_to_work_item(parent) if parent else None,
-            "depth_limit": WORK_DEPTH_LIMIT,
+            "depth_limit": KANBAN_DEPTH_LIMIT,
             "remaining_depth": remaining_depth,
             "breadcrumbs": breadcrumbs,
             "columns": [
@@ -6020,14 +6008,14 @@ def _work_item_payload(
 ) -> dict[str, Any]:
     title = _clean_short_text(body.title, "", limit=180)
     if not title:
-        raise HTTPException(400, "work item title is required")
+        raise HTTPException(400, "Kanban item title is required")
     state = _require_work_state(conn, body.state_id)
     priority = _require_work_priority(conn, body.priority_id)
     parent_id = _clean_short_text(body.parent_item_id, "", limit=180) or None
     depth = _work_parent_depth(conn, parent_id)
-    item_id = _clean_work_id(body.item_id, "work")
+    item_id = _clean_work_id(body.item_id, "kanban")
     tags = _work_item_tags_for_request(body.tags, _work_request_meta(body))
-    item_type = _clean_short_text(body.item_type, "work", limit=80)
+    item_type = _clean_short_text(body.item_type, "item", limit=80)
     body_excerpt = _body_excerpt(body.body or "", limit=4000)
     related_events = _clean_event_list(body.related_event_ids, limit=32)
     related_tasks = _clean_event_list(body.related_task_ids, limit=32)
@@ -6035,10 +6023,10 @@ def _work_item_payload(
     related_refs = [
         *[f"personal_events:{event_id}" for event_id in related_events],
         *[f"personal_time_tasks:{task_id}" for task_id in related_tasks],
-        *[f"work_issues:{issue_id}" for issue_id in related_issues],
+        *[f"kanban_items:{issue_id}" for issue_id in related_issues],
     ]
     search_text, search_metadata, vector_key = _work_search_payload(
-        table_name="work_items",
+        table_name="kanban_items",
         row_id=item_id,
         kind=item_type,
         title=title,
@@ -6047,8 +6035,8 @@ def _work_item_payload(
         related_refs=related_refs,
     )
     provenance = {
-        "work": {
-            "depth_limit": WORK_DEPTH_LIMIT,
+        "kanban": {
+            "depth_limit": KANBAN_DEPTH_LIMIT,
             "promoted_from_ref": promoted_from_ref,
         },
         **_work_request_meta(body),
@@ -6065,8 +6053,8 @@ def _work_item_payload(
         "sort_order": int(body.sort_order),
         "status": _work_status_for_state(state),
         "promoted_from_ref": promoted_from_ref,
-        "source_type": "manual-work",
-        "source_ref": f"work_items:{item_id}",
+        "source_type": "manual-kanban",
+        "source_ref": f"kanban_items:{item_id}",
         "tags": tags,
         "related_event_ids": related_events,
         "related_task_ids": related_tasks,
@@ -6090,7 +6078,7 @@ def _insert_work_item(
 ) -> tuple[Any, dict[str, Any]]:
     conn.execute(
         """
-        INSERT INTO work_items (
+        INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
             priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
@@ -6135,7 +6123,7 @@ def _insert_work_item(
         actor=payload["provenance"]["actor"],
         source_surface=payload["provenance"]["source_surface"],
         action=action,
-        target_ref=f"work_items:{payload['item_id']}",
+        target_ref=f"kanban_items:{payload['item_id']}",
         item_id=payload["item_id"],
         parent_item_id=payload["parent_item_id"] or "",
         created_at=now,
@@ -6153,55 +6141,284 @@ def _insert_work_item(
     return item_row, audit_row
 
 
-@router.get("/work/config")
+def _work_state_for_leaf_status(conn: Any, status: str) -> Any:
+    clean_status = _clean_work_leaf_status(status)
+    if clean_status == "blocked":
+        candidates = ["blocked", "doing", "todo"]
+    elif clean_status in {"done", "closed", "promoted", "archived"}:
+        candidates = ["done", "todo"]
+    elif clean_status in {"active", "in_progress"}:
+        candidates = ["doing", "todo"]
+    elif clean_status in {"pending_review", "source_unavailable"}:
+        candidates = ["review", "doing", "todo"]
+    else:
+        candidates = ["todo", "backlog"]
+    for state_id in candidates:
+        row = conn.execute(
+            "SELECT * FROM kanban_item_states WHERE state_id=?", (state_id,)
+        ).fetchone()
+        if row:
+            return row
+    row = conn.execute(
+        "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id LIMIT 1"
+    ).fetchone()
+    if not row:
+        raise HTTPException(400, "Kanban item state is invalid")
+    return row
+
+
+def _work_leaf_item_status(status: str, state: Any) -> str:
+    clean_status = _clean_work_leaf_status(status)
+    if clean_status == "archived":
+        return "archived"
+    return _work_status_for_state(state)
+
+
+def _work_typed_leaf_item_row(conn: Any, kind: str, leaf_id: str) -> Any | None:
+    clean_kind = _clean_short_text(kind, "", limit=40)
+    clean_leaf_id = _clean_short_text(leaf_id, "", limit=180)
+    if clean_kind not in {"issue", "todo"} or not clean_leaf_id:
+        return None
+    row = conn.execute("SELECT * FROM kanban_items WHERE item_id=?", (clean_leaf_id,)).fetchone()
+    if not row:
+        return None
+    if row["item_type"] == clean_kind:
+        return row
+    provenance = _json_value(row["provenance_json"], {})
+    kanban_meta = provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}
+    if isinstance(provenance.get(clean_kind), dict):
+        return row
+    if kanban_meta.get("leaf_kind") == clean_kind:
+        return row
+    return None
+
+
+def _work_leaf_tags(parent_row: Any, kind: str, meta: dict[str, str]) -> list[str]:
+    parent_tags = {
+        str(tag).strip() for tag in _json_value(parent_row["tags_json"], []) if str(tag).strip()
+    }
+    inherited_tags = (
+        [KANBAN_AGENT_WORKING_OUT_TAG] if KANBAN_AGENT_WORKING_OUT_TAG in parent_tags else []
+    )
+    return _work_item_tags_for_request([kind, *inherited_tags], meta)
+
+
+def _upsert_typed_work_leaf_item(
+    conn: Any,
+    *,
+    kind: str,
+    leaf_id: str,
+    parent_row: Any,
+    title: str,
+    body_excerpt: str,
+    leaf_status: str,
+    priority_id: str,
+    external_source_ref: str = "",
+    related_task_id: str = "",
+    due_at: str | None = None,
+    meta: dict[str, str],
+    now: str,
+) -> tuple[Any, list[tuple[str, str, dict[str, Any]]]]:
+    clean_kind = _clean_short_text(kind, "", limit=40)
+    if clean_kind not in {"issue", "todo"}:
+        raise HTTPException(400, "typed Kanban leaf kind is invalid")
+    clean_leaf_id = _clean_work_id(leaf_id, clean_kind)
+    source_ref = f"kanban_items:{clean_leaf_id}"
+    parent_id = parent_row["item_id"]
+    existing = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?", (clean_leaf_id,)
+    ).fetchone()
+    previous_parent_id = existing["parent_item_id"] if existing else None
+    previous_state_id = existing["state_id"] if existing else None
+    previous_priority_id = existing["priority_id"] if existing else None
+    depth = _work_parent_depth(conn, parent_id, moving_item_id=clean_leaf_id if existing else "")
+    state = _work_state_for_leaf_status(conn, leaf_status)
+    item_status = _work_leaf_item_status(leaf_status, state)
+    archived_at = now if item_status == "archived" else None
+    item_type = clean_kind
+    if (
+        existing
+        and existing["promoted_from_ref"] == source_ref
+        and existing["item_type"] not in {"issue", "todo"}
+    ):
+        item_type = existing["item_type"]
+    tags = _work_leaf_tags(parent_row, clean_kind, meta)
+    related_tasks = [related_task_id] if related_task_id else []
+    related_issues = [clean_leaf_id] if clean_kind == "issue" else []
+    related_refs = [
+        f"kanban_items:{parent_id}",
+        source_ref,
+        *([external_source_ref] if external_source_ref else []),
+        *([f"personal_time_tasks:{related_task_id}"] if related_task_id else []),
+    ]
+    search_text, search_metadata, vector_key = _work_search_payload(
+        table_name="kanban_items",
+        row_id=clean_leaf_id,
+        kind=item_type,
+        title=title,
+        body=body_excerpt,
+        tags=tags,
+        related_refs=related_refs,
+    )
+    provenance = _json_value(existing["provenance_json"], {}) if existing else {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+    provenance["kanban"] = {
+        **(provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}),
+        "typed_leaf_card": True,
+        "leaf_kind": clean_kind,
+        "parent_item_id": parent_id,
+    }
+    provenance[clean_kind] = {
+        **(provenance.get(clean_kind) if isinstance(provenance.get(clean_kind), dict) else {}),
+        "item_id": parent_id,
+        "typed_item_id": clean_leaf_id,
+        "external_source_ref": external_source_ref,
+        "due_at": due_at or "",
+    }
+    provenance["last_update"] = meta
+    source_hash = _hash_json_payload(
+        {
+            "item_id": clean_leaf_id,
+            "parent_item_id": parent_id,
+            "title": title,
+            "body": body_excerpt,
+            "item_type": item_type,
+            "state_id": state["state_id"],
+            "priority_id": priority_id,
+            "status": item_status,
+            "source_ref": source_ref,
+            "related_task_id": related_task_id,
+            "related_issue_ids": related_issues,
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_items (
+            item_id, parent_item_id, title, body_excerpt, item_type, state_id,
+            priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
+            source_type, source_ref, source_hash, tags_json, related_event_ids_json,
+            related_task_ids_json, related_issue_ids_json, search_text,
+            search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+            vector_index_key, provenance_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '', ?, ?, ?, ?, '[]', ?, ?, ?, ?,
+                '', '', NULL, ?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+            parent_item_id=excluded.parent_item_id,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            item_type=excluded.item_type,
+            state_id=excluded.state_id,
+            priority_id=excluded.priority_id,
+            depth=excluded.depth,
+            status=excluded.status,
+            archived_at=excluded.archived_at,
+            source_type=excluded.source_type,
+            source_ref=excluded.source_ref,
+            source_hash=excluded.source_hash,
+            tags_json=excluded.tags_json,
+            related_event_ids_json=excluded.related_event_ids_json,
+            related_task_ids_json=excluded.related_task_ids_json,
+            related_issue_ids_json=excluded.related_issue_ids_json,
+            search_text=excluded.search_text,
+            search_metadata_json=excluded.search_metadata_json,
+            vector_index_key=excluded.vector_index_key,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            clean_leaf_id,
+            parent_id,
+            title,
+            body_excerpt,
+            item_type,
+            state["state_id"],
+            priority_id,
+            depth,
+            item_status,
+            archived_at,
+            f"kanban-{clean_kind}",
+            source_ref,
+            source_hash,
+            json.dumps(tags, ensure_ascii=True),
+            json.dumps(related_tasks, ensure_ascii=True),
+            json.dumps(related_issues, ensure_ascii=True),
+            search_text,
+            json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+            vector_key,
+            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            now,
+            now,
+        ),
+    )
+    if existing:
+        _recompute_work_child_depths(conn, clean_leaf_id, depth)
+    item_row = _work_item_or_404(conn, clean_leaf_id)
+    _order_ids, order_sync_changes = _ensure_work_item_lane_order(
+        conn,
+        clean_leaf_id,
+        prefer_top_if_new=(
+            not existing
+            or previous_parent_id != item_row["parent_item_id"]
+            or previous_state_id != item_row["state_id"]
+            or previous_priority_id != item_row["priority_id"]
+        ),
+        now=now,
+        meta=meta,
+    )
+    return item_row, order_sync_changes
+
+
+@router.get("/kanban/config")
 async def get_work_config() -> dict[str, Any]:
     with get_conn() as conn:
         states = conn.execute(
-            "SELECT * FROM work_item_states ORDER BY sort_order, state_id"
+            "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id"
         ).fetchall()
         priorities = conn.execute(
-            "SELECT * FROM work_item_priorities ORDER BY sort_order, priority_id"
+            "SELECT * FROM kanban_item_priorities ORDER BY sort_order, priority_id"
         ).fetchall()
-        preferences = _work_preferences(conn)
+        preferences = _kanban_preferences(conn)
     return {
         "ok": True,
-        "depth_limit": WORK_DEPTH_LIMIT,
+        "depth_limit": KANBAN_DEPTH_LIMIT,
         "states": [_row_to_work_state(row) for row in states],
         "priorities": [_row_to_work_priority(row) for row in priorities],
         "preferences": preferences,
     }
 
 
-@router.get("/work/preferences")
-async def get_work_preferences() -> dict[str, Any]:
+@router.get("/kanban/preferences")
+async def get_kanban_preferences() -> dict[str, Any]:
     with get_conn() as conn:
-        return {"ok": True, "preferences": _work_preferences(conn)}
+        return {"ok": True, "preferences": _kanban_preferences(conn)}
 
 
-@router.put("/work/preferences")
-async def update_work_preferences(body: WorkPreferencesUpdateRequest) -> dict[str, Any]:
+@router.put("/kanban/preferences")
+async def update_kanban_preferences(body: WorkPreferencesUpdateRequest) -> dict[str, Any]:
     meta = _work_request_meta(body)
     with get_conn() as conn:
-        preferences = _work_preferences(conn)
+        preferences = _kanban_preferences(conn)
         if body.show_test_entries is not None:
             preferences["show_test_entries"] = bool(body.show_test_entries)
             set_setting(
                 conn,
-                WORK_SHOW_TEST_ENTRIES_SETTING,
+                KANBAN_SHOW_TEST_ENTRIES_SETTING,
                 "true" if preferences["show_test_entries"] else "false",
                 "Kanban board proof/test entry visibility",
             )
-            gen = increment_gen(conn, "work-preferences")
+            gen = increment_gen(conn, "kanban-preferences")
             row = conn.execute(
                 "SELECT * FROM settings WHERE key=?",
-                (WORK_SHOW_TEST_ENTRIES_SETTING,),
+                (KANBAN_SHOW_TEST_ENTRIES_SETTING,),
             ).fetchone()
             if row is not None:
                 enqueue_for_all_peers(
                     conn,
                     "UPDATE",
                     "settings",
-                    WORK_SHOW_TEST_ENTRIES_SETTING,
+                    KANBAN_SHOW_TEST_ENTRIES_SETTING,
                     dict(row),
                     gen,
                 )
@@ -6213,49 +6430,57 @@ async def update_work_preferences(body: WorkPreferencesUpdateRequest) -> dict[st
         return {"ok": True, "preferences": preferences, "audit": audit}
 
 
-@router.get("/work/board")
+@router.get("/kanban/board")
 async def get_work_root_board() -> dict[str, Any]:
     with get_conn() as conn:
         return _work_board_payload(conn)
 
 
-@router.get("/work/items/{item_id}/board")
+@router.get("/kanban/items/{item_id}/board")
 async def get_work_child_board(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_board_payload(conn, item_id)
 
 
-@router.get("/work/items/{item_id}")
+@router.get("/kanban/items/{item_id}")
 async def get_work_item_detail(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         item = _work_item_or_404(conn, item_id)
         children = conn.execute(
             """
-            SELECT * FROM work_items
+            SELECT * FROM kanban_items
             WHERE parent_item_id=? AND status != 'archived'
             ORDER BY state_id, sort_order, updated_at DESC, item_id
             """,
             (item_id,),
         ).fetchall()
         issues = conn.execute(
-            "SELECT * FROM work_issues WHERE item_id=? ORDER BY updated_at DESC, issue_id",
+            """
+            SELECT * FROM kanban_items
+            WHERE parent_item_id=? AND item_type='issue' AND status != 'archived'
+            ORDER BY updated_at DESC, item_id
+            """,
             (item_id,),
         ).fetchall()
         todos = conn.execute(
-            "SELECT * FROM work_todos WHERE item_id=? ORDER BY COALESCE(due_at, updated_at), todo_id",
+            """
+            SELECT * FROM kanban_items
+            WHERE parent_item_id=? AND item_type='todo' AND status != 'archived'
+            ORDER BY COALESCE(json_extract(provenance_json, '$.todo.due_at'), updated_at), item_id
+            """,
             (item_id,),
         ).fetchall()
         blockers = conn.execute(
-            "SELECT * FROM work_blockers WHERE item_id=? ORDER BY updated_at DESC, blocker_id",
+            "SELECT * FROM kanban_blockers WHERE item_id=? ORDER BY updated_at DESC, blocker_id",
             (item_id,),
         ).fetchall()
         discussions = conn.execute(
-            "SELECT * FROM work_discussions WHERE item_id=? ORDER BY created_at ASC, discussion_id",
+            "SELECT * FROM kanban_discussions WHERE item_id=? ORDER BY created_at ASC, discussion_id",
             (item_id,),
         ).fetchall()
         links = conn.execute(
             """
-            SELECT * FROM work_item_links
+            SELECT * FROM kanban_item_links
             WHERE source_item_id=? OR target_item_id=?
             ORDER BY link_type, updated_at DESC, link_id
             """,
@@ -6263,7 +6488,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         ).fetchall()
         audit = conn.execute(
             """
-            SELECT * FROM work_audit_log
+            SELECT * FROM kanban_audit_log
             WHERE item_id=?
             ORDER BY created_at DESC
             LIMIT 20
@@ -6275,8 +6500,8 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             "item": _row_to_work_item(item),
             "detail_document": _work_item_detail_document(conn, item_id),
             "breadcrumbs": _work_breadcrumbs(conn, item_id),
-            "depth_limit": WORK_DEPTH_LIMIT,
-            "remaining_depth": max(0, WORK_DEPTH_LIMIT - int(item["depth"])),
+            "depth_limit": KANBAN_DEPTH_LIMIT,
+            "remaining_depth": max(0, KANBAN_DEPTH_LIMIT - int(item["depth"])),
             "children": [_row_to_work_item(row) for row in children],
             "issues": [_row_to_work_issue(row) for row in issues],
             "todos": [_row_to_work_todo(row) for row in todos],
@@ -6318,7 +6543,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         }
 
 
-@router.post("/work/items")
+@router.post("/kanban/items")
 async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -6327,9 +6552,11 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
         item_row, audit_row = _insert_work_item(
             conn, payload, action="create_work_item", audit_id=audit_id, now=now
         )
-        gen = increment_gen(conn, "work-item")
-        enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-item")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "kanban_items", payload["item_id"], dict(item_row), gen
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     image_associations = _associate_rich_doc_images_for_document(
         domain="kanban",
         markdown=payload["body_excerpt"],
@@ -6347,7 +6574,7 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
     }
 
 
-@router.patch("/work/items/{item_id}")
+@router.patch("/kanban/items/{item_id}")
 async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -6379,7 +6606,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         )
         title = _clean_short_text(body.title, existing["title"], limit=180)
         if not title:
-            raise HTTPException(400, "work item title is required")
+            raise HTTPException(400, "Kanban item title is required")
         body_excerpt = (
             _body_excerpt(body.body, limit=4000)
             if body.body is not None
@@ -6387,7 +6614,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         )
         item_type = _clean_short_text(body.item_type, existing["item_type"], limit=80)
         search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_items",
+            table_name="kanban_items",
             row_id=item_id,
             kind=item_type,
             title=title,
@@ -6396,7 +6623,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             related_refs=[
                 *[f"personal_events:{event_id}" for event_id in related_events],
                 *[f"personal_time_tasks:{task_id}" for task_id in related_tasks],
-                *[f"work_issues:{issue_id}" for issue_id in related_issues],
+                *[f"kanban_items:{issue_id}" for issue_id in related_issues],
             ],
         )
         provenance = _json_value(existing["provenance_json"], {})
@@ -6424,7 +6651,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         payload["source_hash"] = _hash_json_payload(payload)
         conn.execute(
             """
-            UPDATE work_items
+            UPDATE kanban_items
             SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
                 sort_order=?, status=?, source_hash=?, tags_json=?,
                 related_event_ids_json=?, related_task_ids_json=?,
@@ -6479,7 +6706,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="update_work_item",
-            target_ref=f"work_items:{item_id}",
+            target_ref=f"kanban_items:{item_id}",
             item_id=item_id,
             parent_item_id=item_row["parent_item_id"] or "",
             created_at=now,
@@ -6494,11 +6721,11 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 "lane_order": order_ids,
             },
         )
-        gen = increment_gen(conn, "work-item")
-        enqueue_for_all_peers(conn, "UPDATE", "work_items", item_id, dict(item_row), gen)
+        gen = increment_gen(conn, "kanban-item")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
         for action, row_id, row_data in order_sync_changes:
-            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+            enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     image_associations = (
         _associate_rich_doc_images_for_document(
             domain="kanban",
@@ -6520,7 +6747,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
     }
 
 
-@router.put("/work/items/{item_id}/detail")
+@router.put("/kanban/items/{item_id}/detail")
 async def update_work_item_detail_document(
     item_id: str, body: WorkItemDetailDocumentUpdateRequest
 ) -> dict[str, Any]:
@@ -6553,7 +6780,7 @@ async def update_work_item_detail_document(
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="update_work_item_detail",
-            target_ref=f"work_items:{item_id}:detail",
+            target_ref=f"kanban_items:{item_id}:detail",
             item_id=item_id,
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -6567,8 +6794,8 @@ async def update_work_item_detail_document(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "work-item-detail")
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-item-detail")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item_id": item_id,
@@ -6578,7 +6805,7 @@ async def update_work_item_detail_document(
     }
 
 
-@router.post("/work/items/{item_id}/discussions")
+@router.post("/kanban/items/{item_id}/discussions")
 async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -6592,12 +6819,12 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
     with get_conn() as conn:
         item = _work_item_or_404(conn, clean_item_id)
         search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_discussions",
+            table_name="kanban_discussions",
             row_id=clean_discussion_id,
             kind="discussion",
             title=author,
             body=body_excerpt,
-            related_refs=[f"work_items:{clean_item_id}"],
+            related_refs=[f"kanban_items:{clean_item_id}"],
         )
         provenance = {
             "discussion": {"item_id": clean_item_id},
@@ -6622,7 +6849,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
         source_hash = _hash_json_payload({**row, "body": clean_body})
         conn.execute(
             """
-            INSERT INTO work_discussions (
+            INSERT INTO kanban_discussions (
                 discussion_id, item_id, author, body_excerpt, status, search_text,
                 search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
                 vector_index_key, provenance_json, created_at, updated_at
@@ -6636,7 +6863,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             row,
         )
         discussion_row = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         document = _write_work_discussion_document(
             conn,
@@ -6657,11 +6884,11 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
         )
         provenance["document"] = {"file_ref": document["file_ref"]}
         conn.execute(
-            "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
+            "UPDATE kanban_discussions SET provenance_json=? WHERE discussion_id=?",
             (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
         )
         discussion_row = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         audit_row = _write_work_audit(
             conn,
@@ -6669,7 +6896,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="create_work_discussion",
-            target_ref=f"work_discussions:{clean_discussion_id}",
+            target_ref=f"kanban_discussions:{clean_discussion_id}",
             item_id=clean_item_id,
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -6683,11 +6910,11 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "work-discussion")
+        gen = increment_gen(conn, "kanban-discussion")
         enqueue_for_all_peers(
-            conn, "UPDATE", "work_discussions", clean_discussion_id, dict(discussion_row), gen
+            conn, "UPDATE", "kanban_discussions", clean_discussion_id, dict(discussion_row), gen
         )
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         discussion = _row_to_work_discussion(discussion_row, conn)
     return {
         "ok": True,
@@ -6697,7 +6924,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
     }
 
 
-@router.patch("/work/discussions/{discussion_id}")
+@router.patch("/kanban/discussions/{discussion_id}")
 async def update_work_discussion(
     discussion_id: str, body: WorkDiscussionUpdateRequest
 ) -> dict[str, Any]:
@@ -6707,10 +6934,10 @@ async def update_work_discussion(
     clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         if not existing:
-            raise HTTPException(404, "work discussion not found")
+            raise HTTPException(404, "Kanban discussion not found")
         item = _work_item_or_404(conn, existing["item_id"])
         existing_document = _work_discussion_document(conn, existing)
         clean_body = (
@@ -6730,12 +6957,12 @@ async def update_work_discussion(
         )
         body_excerpt = _body_excerpt(clean_body, limit=4000)
         search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_discussions",
+            table_name="kanban_discussions",
             row_id=clean_discussion_id,
             kind="discussion",
             title=author,
             body=body_excerpt,
-            related_refs=[f"work_items:{existing['item_id']}"],
+            related_refs=[f"kanban_items:{existing['item_id']}"],
         )
         provenance = _json_value(existing["provenance_json"], {})
         provenance["last_update"] = meta
@@ -6750,7 +6977,7 @@ async def update_work_discussion(
         )
         conn.execute(
             """
-            UPDATE work_discussions
+            UPDATE kanban_discussions
             SET author=?, body_excerpt=?, status=?, search_text=?, search_metadata_json=?,
                 vector_index_key=?, provenance_json=?, updated_at=?
             WHERE discussion_id=?
@@ -6768,7 +6995,7 @@ async def update_work_discussion(
             ),
         )
         discussion_row = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         document = _write_work_discussion_document(
             conn,
@@ -6789,11 +7016,11 @@ async def update_work_discussion(
         )
         provenance["document"] = {"file_ref": document["file_ref"]}
         conn.execute(
-            "UPDATE work_discussions SET provenance_json=? WHERE discussion_id=?",
+            "UPDATE kanban_discussions SET provenance_json=? WHERE discussion_id=?",
             (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
         )
         discussion_row = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         audit_row = _write_work_audit(
             conn,
@@ -6801,7 +7028,7 @@ async def update_work_discussion(
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="update_work_discussion",
-            target_ref=f"work_discussions:{clean_discussion_id}",
+            target_ref=f"kanban_discussions:{clean_discussion_id}",
             item_id=existing["item_id"],
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -6815,11 +7042,11 @@ async def update_work_discussion(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "work-discussion")
+        gen = increment_gen(conn, "kanban-discussion")
         enqueue_for_all_peers(
-            conn, "UPDATE", "work_discussions", clean_discussion_id, dict(discussion_row), gen
+            conn, "UPDATE", "kanban_discussions", clean_discussion_id, dict(discussion_row), gen
         )
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         discussion = _row_to_work_discussion(discussion_row, conn)
     return {
         "ok": True,
@@ -6829,7 +7056,7 @@ async def update_work_discussion(
     }
 
 
-@router.delete("/work/discussions/{discussion_id}")
+@router.delete("/kanban/discussions/{discussion_id}")
 async def delete_work_discussion(
     discussion_id: str, body: WorkItemActionRequest | None = None
 ) -> dict[str, Any]:
@@ -6839,10 +7066,10 @@ async def delete_work_discussion(
     clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT * FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,)
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
         ).fetchone()
         if not existing:
-            raise HTTPException(404, "work discussion not found")
+            raise HTTPException(404, "Kanban discussion not found")
         item = _work_item_or_404(conn, existing["item_id"])
         document = _work_discussion_document(conn, existing)
         source_hash = _hash_json_payload({"discussion_id": clean_discussion_id, "deleted": True})
@@ -6852,7 +7079,7 @@ async def delete_work_discussion(
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="delete_work_discussion",
-            target_ref=f"work_discussions:{clean_discussion_id}",
+            target_ref=f"kanban_discussions:{clean_discussion_id}",
             item_id=existing["item_id"],
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -6864,12 +7091,12 @@ async def delete_work_discussion(
                 "file_ref": document["file_ref"],
             },
         )
-        conn.execute("DELETE FROM work_discussions WHERE discussion_id=?", (clean_discussion_id,))
+        conn.execute("DELETE FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,))
         with suppress(OSError):
             _kanban_discussion_path(conn, existing["item_id"], clean_discussion_id).unlink()
-        gen = increment_gen(conn, "work-discussion")
-        enqueue_for_all_peers(conn, "DELETE", "work_discussions", clean_discussion_id, {}, gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-discussion")
+        enqueue_for_all_peers(conn, "DELETE", "kanban_discussions", clean_discussion_id, {}, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         deleted = _row_to_work_discussion(existing, conn)
     return {
         "ok": True,
@@ -6879,7 +7106,7 @@ async def delete_work_discussion(
     }
 
 
-@router.post("/work/items/{item_id}/move")
+@router.post("/kanban/items/{item_id}/move")
 async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -6890,11 +7117,11 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
         new_depth = _work_parent_depth(conn, new_parent, moving_item_id=item_id)
         max_relative = _work_subtree_max_relative_depth(conn, item_id)
-        if new_depth + max_relative > WORK_DEPTH_LIMIT:
-            raise HTTPException(400, "work item depth limit exceeded")
+        if new_depth + max_relative > KANBAN_DEPTH_LIMIT:
+            raise HTTPException(400, "Kanban item depth limit exceeded")
         conn.execute(
             """
-            UPDATE work_items
+            UPDATE kanban_items
             SET parent_item_id=?, state_id=?, status=?, depth=?, sort_order=?, updated_at=?
             WHERE item_id=?
             """,
@@ -6912,13 +7139,13 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         moved_rows = conn.execute(
             """
             WITH RECURSIVE descendants(item_id) AS (
-                SELECT item_id FROM work_items WHERE item_id=?
+                SELECT item_id FROM kanban_items WHERE item_id=?
                 UNION ALL
                 SELECT w.item_id
-                FROM work_items w
+                FROM kanban_items w
                 JOIN descendants ON w.parent_item_id = descendants.item_id
             )
-            SELECT w.* FROM work_items w JOIN descendants ON descendants.item_id = w.item_id
+            SELECT w.* FROM kanban_items w JOIN descendants ON descendants.item_id = w.item_id
             """,
             (item_id,),
         ).fetchall()
@@ -6940,7 +7167,7 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="move_work_item",
-            target_ref=f"work_items:{item_id}",
+            target_ref=f"kanban_items:{item_id}",
             item_id=item_id,
             parent_item_id=new_parent or "",
             created_at=now,
@@ -6956,27 +7183,51 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
                 "lane_order": order_ids,
             },
         )
-        gen = increment_gen(conn, "work-item")
+        gen = increment_gen(conn, "kanban-item")
         for row in moved_rows:
-            enqueue_for_all_peers(conn, "UPDATE", "work_items", row["item_id"], dict(row), gen)
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_items", row["item_id"], dict(row), gen)
         for action, row_id, row_data in order_sync_changes:
-            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+            enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        browser_refresh = {
+            "ok": True,
+            "published_count": 0,
+            "skipped_count": 0,
+            "detail": "skipped during pytest",
+        }
+    else:
+        try:
+            from .routes_voice_mode import publish_kanban_external_refresh_commands
+
+            browser_refresh = await publish_kanban_external_refresh_commands(
+                item_id=item_id,
+                parent_item_id=item_row["parent_item_id"] or "",
+                state_id=item_row["state_id"],
+                actor=meta["actor"],
+                source_surface=meta["source_surface"],
+            )
+        except Exception as exc:
+            browser_refresh = {
+                "ok": False,
+                "detail": str(exc)[:240],
+            }
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
         "audit": {"audit_id": audit_id, "action": "move_work_item", "result": "ok"},
+        "browser_refresh": browser_refresh,
     }
 
 
-@router.post("/work/items/{item_id}/order")
+@router.post("/kanban/items/{item_id}/order")
 async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
     direction = _clean_short_text(body.direction, "", limit=20).lower()
     if direction not in {"up", "down"}:
-        raise HTTPException(400, "work item order direction must be up or down")
+        raise HTTPException(400, "Kanban item order direction must be up or down")
     with get_conn() as conn:
         item = _work_item_or_404(conn, item_id)
         rows = _work_order_group_rows(
@@ -6988,7 +7239,7 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
         ordered_rows = _order_work_priority_group(conn, rows)
         ordered_ids = [row["item_id"] for row in ordered_rows]
         if item_id not in ordered_ids:
-            raise HTTPException(404, "work item not found in lane order")
+            raise HTTPException(404, "Kanban item not found in lane order")
         index = ordered_ids.index(item_id)
         target_index = index - 1 if direction == "up" else index + 1
         changed = 0 <= target_index < len(ordered_ids)
@@ -6997,7 +7248,7 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
                 ordered_ids[target_index],
                 ordered_ids[index],
             )
-        order_sync_changes = _replace_work_item_order_edges(
+        order_sync_changes = _replace_kanban_item_order_edges(
             conn,
             parent_item_id=item["parent_item_id"],
             state_id=item["state_id"],
@@ -7012,7 +7263,7 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="order_work_item",
-            target_ref=f"work_items:{item_id}",
+            target_ref=f"kanban_items:{item_id}",
             item_id=item_id,
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -7028,10 +7279,10 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
                 "lane_order": ordered_ids,
             },
         )
-        gen = increment_gen(conn, "work-item-order")
+        gen = increment_gen(conn, "kanban-item-order")
         for action, row_id, row_data in order_sync_changes:
-            enqueue_for_all_peers(conn, action, "work_item_order_edges", row_id, row_data, gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+            enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         item_row = _work_item_or_404(conn, item_id)
     return {
         "ok": True,
@@ -7043,7 +7294,7 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
     }
 
 
-@router.post("/work/items/{item_id}/archive")
+@router.post("/kanban/items/{item_id}/archive")
 async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -7051,7 +7302,7 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
     with get_conn() as conn:
         existing = _work_item_or_404(conn, item_id)
         conn.execute(
-            "UPDATE work_items SET status='archived', archived_at=?, updated_at=? WHERE item_id=?",
+            "UPDATE kanban_items SET status='archived', archived_at=?, updated_at=? WHERE item_id=?",
             (now, now, item_id),
         )
         item_row = _work_item_or_404(conn, item_id)
@@ -7061,7 +7312,7 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="archive_work_item",
-            target_ref=f"work_items:{item_id}",
+            target_ref=f"kanban_items:{item_id}",
             item_id=item_id,
             parent_item_id=existing["parent_item_id"] or "",
             created_at=now,
@@ -7071,9 +7322,9 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
             source_hash=item_row["source_hash"],
             metadata={"archived_at": now},
         )
-        gen = increment_gen(conn, "work-item")
-        enqueue_for_all_peers(conn, "UPDATE", "work_items", item_id, dict(item_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-item")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
@@ -7081,13 +7332,13 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
     }
 
 
-@router.get("/work/items/{item_id}/rollup")
+@router.get("/kanban/items/{item_id}/rollup")
 async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
 
 
-@router.get("/work/items/{item_id}/issues")
+@router.get("/kanban/items/{item_id}/issues")
 async def list_work_item_issues(
     item_id: str,
     scope: str = "local",
@@ -7099,7 +7350,7 @@ async def list_work_item_issues(
         )
 
 
-@router.get("/work/items/{item_id}/todos")
+@router.get("/kanban/items/{item_id}/todos")
 async def list_work_item_todos(
     item_id: str,
     scope: str = "local",
@@ -7111,57 +7362,57 @@ async def list_work_item_todos(
         )
 
 
-@router.get("/work/issues/{issue_id}")
+@router.get("/kanban/issues/{issue_id}")
 async def get_work_issue(issue_id: str) -> dict[str, Any]:
     clean_issue_id = _clean_short_text(issue_id, "", limit=180)
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM work_issues WHERE issue_id=?", (clean_issue_id,)
-        ).fetchone()
+        row = _work_typed_leaf_item_row(conn, "issue", clean_issue_id)
         if not row:
-            raise HTTPException(404, "work issue not found")
-        item = _work_item_or_404(conn, row["item_id"])
+            raise HTTPException(404, "kanban issue not found")
+        item = _work_item_or_404(conn, row["parent_item_id"]) if row["parent_item_id"] else None
         return {
             "ok": True,
             "issue": _row_to_work_issue(row),
-            "item": _row_to_work_item(item),
-            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"]),
+            "item": _row_to_work_item(item) if item else None,
+            "item_card": _row_to_work_item(row),
+            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"] if item else row["item_id"]),
             "rich_document": {
                 "domain": "kanban",
                 "document_type": "issue",
-                "document_id": row["issue_id"],
+                "document_id": row["item_id"],
                 "body": row["body_excerpt"] or "",
-                "item_id": row["item_id"],
+                "item_id": row["parent_item_id"] or "",
                 "updated_at": row["updated_at"],
             },
         }
 
 
-@router.get("/work/todos/{todo_id}")
+@router.get("/kanban/todos/{todo_id}")
 async def get_work_todo(todo_id: str) -> dict[str, Any]:
     clean_todo_id = _clean_short_text(todo_id, "", limit=180)
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (clean_todo_id,)).fetchone()
+        row = _work_typed_leaf_item_row(conn, "todo", clean_todo_id)
         if not row:
-            raise HTTPException(404, "work todo not found")
-        item = _work_item_or_404(conn, row["item_id"])
+            raise HTTPException(404, "kanban todo not found")
+        item = _work_item_or_404(conn, row["parent_item_id"]) if row["parent_item_id"] else None
         return {
             "ok": True,
             "todo": _row_to_work_todo(row),
-            "item": _row_to_work_item(item),
-            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"]),
+            "item": _row_to_work_item(item) if item else None,
+            "item_card": _row_to_work_item(row),
+            "breadcrumbs": _work_breadcrumbs(conn, item["item_id"] if item else row["item_id"]),
             "rich_document": {
                 "domain": "kanban",
                 "document_type": "todo",
-                "document_id": row["todo_id"],
+                "document_id": row["item_id"],
                 "body": row["body_excerpt"] or "",
-                "item_id": row["item_id"],
+                "item_id": row["parent_item_id"] or "",
                 "updated_at": row["updated_at"],
             },
         }
 
 
-def _clean_work_link_type(value: str | None) -> str:
+def _clean_kanban_link_type(value: str | None) -> str:
     link_type = _clean_short_text(value, "related", limit=60)
     if link_type not in {
         "related",
@@ -7171,11 +7422,11 @@ def _clean_work_link_type(value: str | None) -> str:
         "references",
         "split_from",
     }:
-        raise HTTPException(400, "work item link type is invalid")
+        raise HTTPException(400, "Kanban item link type is invalid")
     return link_type
 
 
-@router.post("/work/items/{item_id}/links")
+@router.post("/kanban/items/{item_id}/links")
 async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -7183,14 +7434,14 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
     source_item_id = _clean_short_text(item_id, "", limit=180)
     target_item_id = _clean_short_text(body.target_item_id, "", limit=180)
     if not source_item_id or not target_item_id:
-        raise HTTPException(400, "source and target work item ids are required")
+        raise HTTPException(400, "source and target Kanban item ids are required")
     if source_item_id == target_item_id:
-        raise HTTPException(400, "work item link target must be a different item")
-    link_type = _clean_work_link_type(body.link_type)
+        raise HTTPException(400, "Kanban item link target must be a different item")
+    link_type = _clean_kanban_link_type(body.link_type)
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
     link_id = _clean_work_id(
         metadata.get("link_id") if isinstance(metadata.get("link_id"), str) else None,
-        "work-link",
+        "kanban-link",
     )
     row = {
         "link_id": link_id,
@@ -7207,7 +7458,7 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
         _work_item_or_404(conn, target_item_id)
         conn.execute(
             """
-            INSERT INTO work_item_links (
+            INSERT INTO kanban_item_links (
                 link_id, source_item_id, target_item_id, link_type, metadata_json,
                 created_at, updated_at
             )
@@ -7219,7 +7470,7 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
             row,
         )
         link_row = conn.execute(
-            "SELECT * FROM work_item_links WHERE link_id=?", (link_id,)
+            "SELECT * FROM kanban_item_links WHERE link_id=?", (link_id,)
         ).fetchone()
         audit_row = _write_work_audit(
             conn,
@@ -7227,7 +7478,7 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action="create_work_item_link",
-            target_ref=f"work_item_links:{link_id}",
+            target_ref=f"kanban_item_links:{link_id}",
             item_id=source_item_id,
             parent_item_id=source["parent_item_id"] or "",
             created_at=now,
@@ -7240,9 +7491,9 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
                 "link_type": link_type,
             },
         )
-        gen = increment_gen(conn, "work-item-link")
-        enqueue_for_all_peers(conn, "UPDATE", "work_item_links", link_id, dict(link_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-item-link")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_item_links", link_id, dict(link_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "link": {
@@ -7271,7 +7522,7 @@ def _clean_work_leaf_status(value: str | None, *, default: str = "open") -> str:
         "promoted",
         "resolved",
     }:
-        raise HTTPException(400, "work leaf status is invalid")
+        raise HTTPException(400, "Kanban leaf status is invalid")
     return status
 
 
@@ -7286,107 +7537,61 @@ def _upsert_work_issue(
     meta = _work_request_meta(body)
     clean_issue_id = _clean_work_id(issue_id or body.issue_id, "issue")
     with get_conn() as conn:
-        _work_item_or_404(conn, body.item_id)
+        parent_item = _work_item_or_404(conn, body.item_id)
         severity_id = body.severity_id or body.priority_id
         priority = _require_work_priority(conn, severity_id)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
-            raise HTTPException(400, "work issue title is required")
+            raise HTTPException(400, "Kanban issue title is required")
         body_excerpt = _body_excerpt(body.body or "", limit=4000)
+        issue_status = _clean_work_leaf_status(body.status)
         source_ref = _clean_short_text(body.source_ref, "", limit=220)
         related_task_id = _clean_short_text(body.related_task_id, "", limit=180)
-        search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_issues",
-            row_id=clean_issue_id,
+        typed_item_row, order_sync_changes = _upsert_typed_work_leaf_item(
+            conn,
             kind="issue",
+            leaf_id=clean_issue_id,
+            parent_row=parent_item,
             title=title,
-            body=body_excerpt,
-            related_refs=[ref for ref in [source_ref, related_task_id] if ref],
+            body_excerpt=body_excerpt,
+            leaf_status=issue_status,
+            priority_id=priority["priority_id"],
+            external_source_ref=source_ref,
+            related_task_id=related_task_id,
+            meta=meta,
+            now=now,
         )
-        provenance = {"issue": {"item_id": body.item_id}, **meta}
-        source_hash = _hash_json_payload(
-            {
-                "issue_id": clean_issue_id,
-                "item_id": body.item_id,
-                "title": title,
-                "body": body_excerpt,
-                "status": body.status,
-                "priority_id": priority["priority_id"],
-                "severity_id": priority["priority_id"],
-                "source_ref": source_ref,
-                "related_task_id": related_task_id,
-            }
-        )
-        previous = conn.execute(
-            "SELECT created_at FROM work_issues WHERE issue_id=?", (clean_issue_id,)
-        ).fetchone()
-        created_at = previous["created_at"] if previous and previous["created_at"] else now
-        conn.execute(
-            """
-            INSERT INTO work_issues (
-                issue_id, item_id, title, body_excerpt, status, priority_id,
-                source_ref, related_task_id, search_text, search_metadata_json,
-                embedding_ref, embedding_model, embedding_updated_at, vector_index_key,
-                provenance_json, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
-            ON CONFLICT(issue_id) DO UPDATE SET
-                item_id=excluded.item_id,
-                title=excluded.title,
-                body_excerpt=excluded.body_excerpt,
-                status=excluded.status,
-                priority_id=excluded.priority_id,
-                source_ref=excluded.source_ref,
-                related_task_id=excluded.related_task_id,
-                search_text=excluded.search_text,
-                search_metadata_json=excluded.search_metadata_json,
-                vector_index_key=excluded.vector_index_key,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                clean_issue_id,
-                body.item_id,
-                title,
-                body_excerpt,
-                _clean_work_leaf_status(body.status),
-                priority["priority_id"],
-                source_ref,
-                related_task_id,
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                created_at,
-                now,
-            ),
-        )
-        issue_row = conn.execute(
-            "SELECT * FROM work_issues WHERE issue_id=?", (clean_issue_id,)
-        ).fetchone()
+        issue_row = _work_item_or_404(conn, clean_issue_id)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action=action,
-            target_ref=f"work_issues:{clean_issue_id}",
+            target_ref=f"kanban_items:{clean_issue_id}",
             item_id=body.item_id,
             parent_item_id="",
             created_at=now,
             request_id=meta["request_id"],
             run_id=meta["run_id"],
             result="ok",
-            source_hash=source_hash,
+            source_hash=issue_row["source_hash"],
             metadata={
                 "status": issue_row["status"],
                 "priority_id": issue_row["priority_id"],
                 "severity_id": issue_row["priority_id"],
+                "item_card_ref": f"kanban_items:{typed_item_row['item_id']}",
             },
         )
-        gen = increment_gen(conn, "work-issue")
-        enqueue_for_all_peers(conn, "UPDATE", "work_issues", clean_issue_id, dict(issue_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-issue")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "kanban_items", typed_item_row["item_id"], dict(typed_item_row), gen
+        )
+        for order_action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(
+                conn, order_action, "kanban_item_order_edges", row_id, row_data, gen
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     issue = _row_to_work_issue(issue_row)
     image_associations = _associate_rich_doc_images_for_document(
         domain="kanban",
@@ -7405,12 +7610,12 @@ def _upsert_work_issue(
     }
 
 
-@router.post("/work/issues")
+@router.post("/kanban/issues")
 async def create_work_issue(body: WorkIssueUpsertRequest) -> dict[str, Any]:
     return _upsert_work_issue(body, action="create_work_issue")
 
 
-@router.patch("/work/issues/{issue_id}")
+@router.patch("/kanban/issues/{issue_id}")
 async def update_work_issue(issue_id: str, body: WorkIssueUpsertRequest) -> dict[str, Any]:
     return _upsert_work_issue(body, issue_id=issue_id, action="update_work_issue")
 
@@ -7424,102 +7629,61 @@ def _upsert_work_todo(
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
-    clean_todo_id = _clean_work_id(todo_id or body.todo_id, "work-todo")
+    clean_todo_id = _clean_work_id(todo_id or body.todo_id, "todo")
     with get_conn() as conn:
-        _work_item_or_404(conn, body.item_id)
+        parent_item = _work_item_or_404(conn, body.item_id)
         priority = _require_work_priority(conn, body.priority_id)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
-            raise HTTPException(400, "work todo title is required")
+            raise HTTPException(400, "Kanban todo title is required")
         body_excerpt = _body_excerpt(body.body or "", limit=4000)
+        todo_status = _clean_work_leaf_status(body.status)
+        due_at = _clean_short_text(body.due_at, "", limit=80) or None
         related_task_id = _clean_short_text(body.related_task_id, "", limit=180)
-        search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_todos",
-            row_id=clean_todo_id,
+        typed_item_row, order_sync_changes = _upsert_typed_work_leaf_item(
+            conn,
             kind="todo",
+            leaf_id=clean_todo_id,
+            parent_row=parent_item,
             title=title,
-            body=body_excerpt,
-            related_refs=[related_task_id] if related_task_id else [],
+            body_excerpt=body_excerpt,
+            leaf_status=todo_status,
+            priority_id=priority["priority_id"],
+            related_task_id=related_task_id,
+            due_at=due_at,
+            meta=meta,
+            now=now,
         )
-        provenance = {"todo": {"item_id": body.item_id}, **meta}
-        source_hash = _hash_json_payload(
-            {
-                "todo_id": clean_todo_id,
-                "item_id": body.item_id,
-                "title": title,
-                "body": body_excerpt,
-                "status": body.status,
-                "priority_id": priority["priority_id"],
-                "due_at": body.due_at,
-                "related_task_id": related_task_id,
-            }
-        )
-        previous = conn.execute(
-            "SELECT created_at FROM work_todos WHERE todo_id=?", (clean_todo_id,)
-        ).fetchone()
-        created_at = previous["created_at"] if previous and previous["created_at"] else now
-        conn.execute(
-            """
-            INSERT INTO work_todos (
-                todo_id, item_id, title, body_excerpt, status, priority_id, due_at,
-                related_task_id, search_text, search_metadata_json, embedding_ref,
-                embedding_model, embedding_updated_at, vector_index_key,
-                provenance_json, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
-            ON CONFLICT(todo_id) DO UPDATE SET
-                item_id=excluded.item_id,
-                title=excluded.title,
-                body_excerpt=excluded.body_excerpt,
-                status=excluded.status,
-                priority_id=excluded.priority_id,
-                due_at=excluded.due_at,
-                related_task_id=excluded.related_task_id,
-                search_text=excluded.search_text,
-                search_metadata_json=excluded.search_metadata_json,
-                vector_index_key=excluded.vector_index_key,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                clean_todo_id,
-                body.item_id,
-                title,
-                body_excerpt,
-                _clean_work_leaf_status(body.status),
-                priority["priority_id"],
-                _clean_short_text(body.due_at, "", limit=80) or None,
-                related_task_id,
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                created_at,
-                now,
-            ),
-        )
-        todo_row = conn.execute(
-            "SELECT * FROM work_todos WHERE todo_id=?", (clean_todo_id,)
-        ).fetchone()
+        todo_row = _work_item_or_404(conn, clean_todo_id)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action=action,
-            target_ref=f"work_todos:{clean_todo_id}",
+            target_ref=f"kanban_items:{clean_todo_id}",
             item_id=body.item_id,
             parent_item_id="",
             created_at=now,
             request_id=meta["request_id"],
             run_id=meta["run_id"],
             result="ok",
-            source_hash=source_hash,
-            metadata={"status": todo_row["status"], "priority_id": todo_row["priority_id"]},
+            source_hash=todo_row["source_hash"],
+            metadata={
+                "status": todo_row["status"],
+                "priority_id": todo_row["priority_id"],
+                "item_card_ref": f"kanban_items:{typed_item_row['item_id']}",
+            },
         )
-        gen = increment_gen(conn, "work-todo")
-        enqueue_for_all_peers(conn, "UPDATE", "work_todos", clean_todo_id, dict(todo_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        gen = increment_gen(conn, "kanban-todo")
+        enqueue_for_all_peers(
+            conn, "UPDATE", "kanban_items", typed_item_row["item_id"], dict(typed_item_row), gen
+        )
+        for order_action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(
+                conn, order_action, "kanban_item_order_edges", row_id, row_data, gen
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     todo = _row_to_work_todo(todo_row)
     image_associations = _associate_rich_doc_images_for_document(
         domain="kanban",
@@ -7538,12 +7702,12 @@ def _upsert_work_todo(
     }
 
 
-@router.post("/work/todos")
+@router.post("/kanban/todos")
 async def create_work_todo(body: WorkTodoUpsertRequest) -> dict[str, Any]:
     return _upsert_work_todo(body, action="create_work_todo")
 
 
-@router.patch("/work/todos/{todo_id}")
+@router.patch("/kanban/todos/{todo_id}")
 async def update_work_todo(todo_id: str, body: WorkTodoUpsertRequest) -> dict[str, Any]:
     return _upsert_work_todo(body, todo_id=todo_id, action="update_work_todo")
 
@@ -7562,11 +7726,11 @@ def _upsert_work_blocker(
         item = _work_item_or_404(conn, body.item_id)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
-            raise HTTPException(400, "work blocker title is required")
+            raise HTTPException(400, "Kanban blocker title is required")
         body_excerpt = _body_excerpt(body.body or "", limit=4000)
         blocked_by_ref = _clean_short_text(body.blocked_by_ref, "", limit=220)
         search_text, search_metadata, vector_key = _work_search_payload(
-            table_name="work_blockers",
+            table_name="kanban_blockers",
             row_id=clean_blocker_id,
             kind="blocker",
             title=title,
@@ -7585,12 +7749,12 @@ def _upsert_work_blocker(
             }
         )
         previous = conn.execute(
-            "SELECT created_at FROM work_blockers WHERE blocker_id=?", (clean_blocker_id,)
+            "SELECT created_at FROM kanban_blockers WHERE blocker_id=?", (clean_blocker_id,)
         ).fetchone()
         created_at = previous["created_at"] if previous and previous["created_at"] else now
         conn.execute(
             """
-            INSERT INTO work_blockers (
+            INSERT INTO kanban_blockers (
                 blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
                 search_text, search_metadata_json, embedding_ref, embedding_model,
                 embedding_updated_at, vector_index_key, provenance_json, created_at,
@@ -7625,7 +7789,7 @@ def _upsert_work_blocker(
             ),
         )
         blocker_row = conn.execute(
-            "SELECT * FROM work_blockers WHERE blocker_id=?", (clean_blocker_id,)
+            "SELECT * FROM kanban_blockers WHERE blocker_id=?", (clean_blocker_id,)
         ).fetchone()
         audit_row = _write_work_audit(
             conn,
@@ -7633,7 +7797,7 @@ def _upsert_work_blocker(
             actor=meta["actor"],
             source_surface=meta["source_surface"],
             action=action,
-            target_ref=f"work_blockers:{clean_blocker_id}",
+            target_ref=f"kanban_blockers:{clean_blocker_id}",
             item_id=body.item_id,
             parent_item_id=item["parent_item_id"] or "",
             created_at=now,
@@ -7646,11 +7810,11 @@ def _upsert_work_blocker(
                 "blocked_by_ref": blocker_row["blocked_by_ref"],
             },
         )
-        gen = increment_gen(conn, "work-blocker")
+        gen = increment_gen(conn, "kanban-blocker")
         enqueue_for_all_peers(
-            conn, "UPDATE", "work_blockers", clean_blocker_id, dict(blocker_row), gen
+            conn, "UPDATE", "kanban_blockers", clean_blocker_id, dict(blocker_row), gen
         )
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "blocker": _row_to_work_blocker(blocker_row),
@@ -7658,12 +7822,12 @@ def _upsert_work_blocker(
     }
 
 
-@router.post("/work/blockers")
+@router.post("/kanban/blockers")
 async def create_work_blocker(body: WorkBlockerUpsertRequest) -> dict[str, Any]:
     return _upsert_work_blocker(body, action="create_work_blocker")
 
 
-@router.patch("/work/blockers/{blocker_id}")
+@router.patch("/kanban/blockers/{blocker_id}")
 async def update_work_blocker(blocker_id: str, body: WorkBlockerUpsertRequest) -> dict[str, Any]:
     return _upsert_work_blocker(body, blocker_id=blocker_id, action="update_work_blocker")
 
@@ -7680,34 +7844,205 @@ def _promotion_source_payload(conn: Any, source_ref: str) -> dict[str, Any]:
             "title": row["title"],
             "body": row["body_excerpt"],
             "related_task_ids": [task_id],
-            "tags": [WORK_KANBAN_TAG, "task"],
+            "tags": [KANBAN_TAG, "task"],
         }
-    if source_ref.startswith("work_todos:"):
-        todo_id = source_ref.split(":", 1)[1]
-        row = conn.execute("SELECT * FROM work_todos WHERE todo_id=?", (todo_id,)).fetchone()
+    if source_ref.startswith("kanban_items:"):
+        item_id = source_ref.split(":", 1)[1]
+        row = conn.execute("SELECT * FROM kanban_items WHERE item_id=?", (item_id,)).fetchone()
         if not row:
-            raise HTTPException(404, "promotion source todo not found")
+            raise HTTPException(404, "promotion source item not found")
+        provenance = _json_value(row["provenance_json"], {})
+        kanban_meta = provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}
+        kind = row["item_type"]
+        if kind not in {"issue", "todo"}:
+            kind = _clean_short_text(kanban_meta.get("leaf_kind"), "", limit=40)
+        if kind not in {"issue", "todo"}:
+            raise HTTPException(400, "promotion source item is not an issue or todo card")
         return {
             "title": row["title"],
             "body": row["body_excerpt"],
-            "related_task_ids": [row["related_task_id"]] if row["related_task_id"] else [],
-            "tags": [WORK_KANBAN_TAG, "todo"],
-        }
-    if source_ref.startswith("work_issues:"):
-        issue_id = source_ref.split(":", 1)[1]
-        row = conn.execute("SELECT * FROM work_issues WHERE issue_id=?", (issue_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "promotion source issue not found")
-        return {
-            "title": row["title"],
-            "body": row["body_excerpt"],
-            "related_issue_ids": [issue_id],
-            "tags": [WORK_KANBAN_TAG, "issue"],
+            "related_task_ids": _json_value(row["related_task_ids_json"], []),
+            "related_issue_ids": [item_id] if kind == "issue" else [],
+            "tags": [KANBAN_TAG, kind],
+            "typed_leaf": {
+                "kind": kind,
+                "id": item_id,
+                "parent_item_id": row["parent_item_id"] or "",
+            },
         }
     raise HTTPException(400, "promotion source ref is invalid")
 
 
-@router.post("/work/promote")
+def _promote_existing_typed_leaf_item(
+    conn: Any,
+    *,
+    source_ref: str,
+    source: dict[str, Any],
+    body: WorkPromoteRequest,
+    audit_id: str,
+    now: str,
+) -> tuple[Any, dict[str, Any], list[tuple[str, str, dict[str, Any]]]] | None:
+    typed_leaf = source.get("typed_leaf")
+    if not isinstance(typed_leaf, dict):
+        return None
+    kind = _clean_short_text(typed_leaf.get("kind"), "", limit=40)
+    leaf_id = _clean_short_text(typed_leaf.get("id"), "", limit=180)
+    if kind not in {"issue", "todo"} or not leaf_id:
+        return None
+    existing = _work_typed_leaf_item_row(conn, kind, leaf_id)
+    if not existing:
+        return None
+    meta = _work_request_meta(body)
+    state = _require_work_state(conn, body.state_id)
+    priority = _require_work_priority(conn, body.priority_id)
+    new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
+    new_depth = _work_parent_depth(conn, new_parent, moving_item_id=existing["item_id"])
+    max_relative = _work_subtree_max_relative_depth(conn, existing["item_id"])
+    if new_depth + max_relative > KANBAN_DEPTH_LIMIT:
+        raise HTTPException(400, "Kanban item depth limit exceeded")
+    existing_tags = _json_value(existing["tags_json"], [])
+    tags = _work_item_tags_for_request(
+        _clean_event_list([*existing_tags, *source.get("tags", []), *body.tags], limit=32),
+        meta,
+    )
+    related_tasks = _clean_event_list(source.get("related_task_ids", []), limit=32)
+    related_issues = _clean_event_list(source.get("related_issue_ids", []), limit=32)
+    title = _clean_short_text(body.title or source.get("title", ""), "", limit=180)
+    if not title:
+        raise HTTPException(400, "Kanban item title is required")
+    body_excerpt = _body_excerpt(
+        body.body if body.body is not None else source.get("body", ""),
+        limit=4000,
+    )
+    search_text, search_metadata, vector_key = _work_search_payload(
+        table_name="kanban_items",
+        row_id=existing["item_id"],
+        kind="item",
+        title=title,
+        body=body_excerpt,
+        tags=tags,
+        related_refs=[
+            *[f"personal_time_tasks:{task_id}" for task_id in related_tasks],
+            *[f"kanban_items:{issue_id}" for issue_id in related_issues],
+            source_ref,
+        ],
+    )
+    provenance = _json_value(existing["provenance_json"], {})
+    if not isinstance(provenance, dict):
+        provenance = {}
+    provenance["kanban"] = {
+        **(provenance.get("kanban") if isinstance(provenance.get("kanban"), dict) else {}),
+        "typed_leaf_card": False,
+        "converted_from_typed_leaf": True,
+        "leaf_kind": kind,
+        "promoted_from_ref": source_ref,
+    }
+    provenance["promotion"] = {
+        "source_ref": source_ref,
+        "source_kind": kind,
+        "converted_item_id": existing["item_id"],
+    }
+    provenance["last_update"] = meta
+    payload = {
+        "item_id": existing["item_id"],
+        "parent_item_id": new_parent,
+        "title": title,
+        "body_excerpt": body_excerpt,
+        "item_type": "item",
+        "state_id": state["state_id"],
+        "priority_id": priority["priority_id"],
+        "depth": new_depth,
+        "sort_order": int(existing["sort_order"]),
+        "status": _work_status_for_state(state),
+        "promoted_from_ref": source_ref,
+        "source_type": "manual-kanban",
+        "source_ref": f"kanban_items:{existing['item_id']}",
+        "tags": tags,
+        "related_event_ids": [],
+        "related_task_ids": related_tasks,
+        "related_issue_ids": related_issues,
+        "search_text": search_text,
+        "search_metadata": search_metadata,
+        "vector_index_key": vector_key,
+        "provenance": provenance,
+    }
+    payload["source_hash"] = _hash_json_payload(payload)
+    conn.execute(
+        """
+        UPDATE kanban_items
+        SET parent_item_id=?, title=?, body_excerpt=?, item_type=?, state_id=?,
+            priority_id=?, depth=?, sort_order=?, status=?, archived_at=NULL,
+            promoted_from_ref=?, source_type=?, source_ref=?, source_hash=?,
+            tags_json=?, related_event_ids_json=?, related_task_ids_json=?,
+            related_issue_ids_json=?, search_text=?, search_metadata_json=?,
+            vector_index_key=?, provenance_json=?, updated_at=?
+        WHERE item_id=?
+        """,
+        (
+            payload["parent_item_id"],
+            payload["title"],
+            payload["body_excerpt"],
+            payload["item_type"],
+            payload["state_id"],
+            payload["priority_id"],
+            payload["depth"],
+            payload["sort_order"],
+            payload["status"],
+            payload["promoted_from_ref"],
+            payload["source_type"],
+            payload["source_ref"],
+            payload["source_hash"],
+            json.dumps(payload["tags"], ensure_ascii=True),
+            json.dumps(payload["related_event_ids"], ensure_ascii=True),
+            json.dumps(payload["related_task_ids"], ensure_ascii=True),
+            json.dumps(payload["related_issue_ids"], ensure_ascii=True),
+            payload["search_text"],
+            json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+            payload["vector_index_key"],
+            json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+            now,
+            existing["item_id"],
+        ),
+    )
+    _recompute_work_child_depths(conn, existing["item_id"], new_depth)
+    item_row = _work_item_or_404(conn, existing["item_id"])
+    _order_ids, order_sync_changes = _ensure_work_item_lane_order(
+        conn,
+        existing["item_id"],
+        prefer_top_if_new=(
+            item_row["parent_item_id"] != existing["parent_item_id"]
+            or item_row["state_id"] != existing["state_id"]
+            or item_row["priority_id"] != existing["priority_id"]
+        ),
+        now=now,
+        meta=meta,
+    )
+    audit_row = _write_work_audit(
+        conn,
+        audit_id=audit_id,
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+        action="promote_work_item",
+        target_ref=f"kanban_items:{item_row['item_id']}",
+        item_id=item_row["item_id"],
+        parent_item_id=item_row["parent_item_id"] or "",
+        created_at=now,
+        request_id=meta["request_id"],
+        run_id=meta["run_id"],
+        result="ok",
+        source_hash=payload["source_hash"],
+        metadata={
+            "state_id": item_row["state_id"],
+            "priority_id": item_row["priority_id"],
+            "depth": item_row["depth"],
+            "promoted_from_ref": source_ref,
+            "converted_typed_leaf": True,
+        },
+    )
+    return item_row, audit_row, order_sync_changes
+
+
+@router.post("/kanban/promote")
 async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
     source_ref = _clean_short_text(body.source_ref, "", limit=220)
     if not source_ref:
@@ -7716,49 +8051,45 @@ async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
     audit_id = f"audit-{uuid.uuid4().hex}"
     with get_conn() as conn:
         source = _promotion_source_payload(conn, source_ref)
-        item_body = WorkItemCreateRequest(
-            parent_item_id=body.parent_item_id,
-            title=body.title or source.get("title", ""),
-            body=body.body if body.body is not None else source.get("body", ""),
-            state_id=body.state_id,
-            priority_id=body.priority_id,
-            tags=_clean_event_list([*source.get("tags", []), *body.tags], limit=32),
-            related_task_ids=source.get("related_task_ids", []),
-            related_issue_ids=source.get("related_issue_ids", []),
-            actor=body.actor,
-            source_surface=body.source_surface,
-            request_id=body.request_id,
-            run_id=body.run_id,
+        converted = _promote_existing_typed_leaf_item(
+            conn,
+            source_ref=source_ref,
+            source=source,
+            body=body,
+            audit_id=audit_id,
+            now=now,
         )
-        payload = _work_item_payload(conn, item_body, promoted_from_ref=source_ref)
-        item_row, audit_row = _insert_work_item(
-            conn, payload, action="promote_work_item", audit_id=audit_id, now=now
-        )
-        if source_ref.startswith("work_todos:"):
-            conn.execute(
-                "UPDATE work_todos SET status='promoted', updated_at=? WHERE todo_id=?",
-                (now, source_ref.split(":", 1)[1]),
+        order_sync_changes: list[tuple[str, str, dict[str, Any]]] = []
+        if converted is not None:
+            item_row, audit_row, order_sync_changes = converted
+            sync_item_id = item_row["item_id"]
+        else:
+            item_body = WorkItemCreateRequest(
+                parent_item_id=body.parent_item_id,
+                title=body.title or source.get("title", ""),
+                body=body.body if body.body is not None else source.get("body", ""),
+                state_id=body.state_id,
+                priority_id=body.priority_id,
+                tags=_clean_event_list([*source.get("tags", []), *body.tags], limit=32),
+                related_task_ids=source.get("related_task_ids", []),
+                related_issue_ids=source.get("related_issue_ids", []),
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
             )
-        if source_ref.startswith("work_issues:"):
-            conn.execute(
-                "UPDATE work_issues SET status='promoted', updated_at=? WHERE issue_id=?",
-                (now, source_ref.split(":", 1)[1]),
+            payload = _work_item_payload(conn, item_body, promoted_from_ref=source_ref)
+            item_row, audit_row = _insert_work_item(
+                conn, payload, action="promote_work_item", audit_id=audit_id, now=now
             )
-        gen = increment_gen(conn, "work-promote")
-        enqueue_for_all_peers(conn, "UPDATE", "work_items", payload["item_id"], dict(item_row), gen)
-        if source_ref.startswith("work_todos:"):
-            todo_id = source_ref.split(":", 1)[1]
-            todo_row = conn.execute(
-                "SELECT * FROM work_todos WHERE todo_id=?", (todo_id,)
-            ).fetchone()
-            enqueue_for_all_peers(conn, "UPDATE", "work_todos", todo_id, dict(todo_row), gen)
-        if source_ref.startswith("work_issues:"):
-            issue_id = source_ref.split(":", 1)[1]
-            issue_row = conn.execute(
-                "SELECT * FROM work_issues WHERE issue_id=?", (issue_id,)
-            ).fetchone()
-            enqueue_for_all_peers(conn, "UPDATE", "work_issues", issue_id, dict(issue_row), gen)
-        enqueue_for_all_peers(conn, "UPDATE", "work_audit_log", audit_id, audit_row, gen)
+            sync_item_id = payload["item_id"]
+        gen = increment_gen(conn, "kanban-promote")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", sync_item_id, dict(item_row), gen)
+        for order_action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(
+                conn, order_action, "kanban_item_order_edges", row_id, row_data, gen
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
@@ -7832,7 +8163,7 @@ def _calendar_event_payload(
         "priority": _clean_short_text(body.priority, "", limit=40) or None,
         "privacy_level": privacy_level,
         "tags": tags,
-        "related_work_items": _clean_event_list(body.related_work_items),
+        "related_kanban_items": _clean_event_list(body.related_kanban_items),
         "related_tasks": _clean_event_list(body.related_tasks),
         "related_import_batches": _clean_event_list(body.related_import_batches),
         "provenance": provenance,
@@ -7866,7 +8197,7 @@ def _upsert_calendar_event(
             INSERT INTO personal_events (
                 event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
                 content_projection, start_at, end_at, local_date, timezone, status, priority,
-                privacy_level, tags_json, related_work_items_json, related_tasks_json,
+                privacy_level, tags_json, related_kanban_items_json, related_tasks_json,
                 related_import_batches_json, file_refs_json, db_refs_json, provenance_json,
                 projection_state, provenance_state, last_rendered_at, created_at, updated_at
             )
@@ -7887,7 +8218,7 @@ def _upsert_calendar_event(
                 priority=excluded.priority,
                 privacy_level=excluded.privacy_level,
                 tags_json=excluded.tags_json,
-                related_work_items_json=excluded.related_work_items_json,
+                related_kanban_items_json=excluded.related_kanban_items_json,
                 related_tasks_json=excluded.related_tasks_json,
                 related_import_batches_json=excluded.related_import_batches_json,
                 db_refs_json=excluded.db_refs_json,
@@ -7914,7 +8245,7 @@ def _upsert_calendar_event(
                 payload["priority"],
                 payload["privacy_level"],
                 json.dumps(payload["tags"], ensure_ascii=True),
-                json.dumps(payload["related_work_items"], ensure_ascii=True),
+                json.dumps(payload["related_kanban_items"], ensure_ascii=True),
                 json.dumps(payload["related_tasks"], ensure_ascii=True),
                 json.dumps(payload["related_import_batches"], ensure_ascii=True),
                 json.dumps([], ensure_ascii=True),
@@ -8078,10 +8409,8 @@ def _visible_day_events(
         where.append("source_type = 'git'")
     elif source_filter == "imports":
         where.append("source_type IN ('interests-ingestion', 'git')")
-    elif source_filter == "work":
-        where.append(
-            "(source_type = 'work-management' OR json_array_length(related_work_items_json) > 0)"
-        )
+    elif source_filter == "kanban":
+        where.append("(source_type = 'kanban' OR json_array_length(related_kanban_items_json) > 0)")
     elif source_filter != "all":
         raise HTTPException(400, f"unknown source filter: {source_filter}")
 
@@ -8215,7 +8544,7 @@ def _build_diary_day_payload(local_date: str, source_filter: str = "all") -> dic
             "read_model": "/api/v1/personal/diary-day",
         },
         "filters": {
-            "available": ["all", "manual", "sources", "git", "imports", "work"],
+            "available": ["all", "manual", "sources", "git", "imports", "kanban"],
             "active": source_filter,
         },
     }
