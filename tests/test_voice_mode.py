@@ -3,9 +3,20 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 
 from app import routes_voice_mode as voice_mode
+
+
+@pytest.fixture(autouse=True)
+def _isolate_wake_stt_direct_route_env(tmp_path, monkeypatch):
+    # Keep unit-test defaults independent from TB1's live Wake direct-route config.
+    monkeypatch.setenv("BLUEPRINTS_WAKE_STT_INSTANCES_FILE", str(tmp_path / "instances.json"))
+    monkeypatch.delenv("HERMES_STT_INSTANCES_FILE", raising=False)
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", raising=False)
+    monkeypatch.delenv("BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED", raising=False)
 
 
 def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
