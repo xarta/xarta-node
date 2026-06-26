@@ -58,6 +58,7 @@ from .routes_gpu_monitor import router as gpu_monitor_router
 from .routes_gui_sync import router as gui_sync_router
 from .routes_health import router as health_router
 from .routes_help import router as help_router
+from .routes_kanban_backups import router as kanban_backups_router
 from .routes_keys import router as keys_router
 from .routes_litellm import router as litellm_router
 from .routes_litellm_hook import router as litellm_hook_router
@@ -385,6 +386,7 @@ def create_app() -> FastAPI:
     application.include_router(schema_router, prefix="/api/v1")
     application.include_router(sync_router, prefix="/api/v1")
     application.include_router(backup_router, prefix="/api/v1")
+    application.include_router(kanban_backups_router, prefix="/api/v1")
     application.include_router(pfsense_dns_router, prefix="/api/v1")
     application.include_router(proxmox_config_router, prefix="/api/v1")
     application.include_router(proxmox_nets_router, prefix="/api/v1")
