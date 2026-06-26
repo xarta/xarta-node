@@ -2172,6 +2172,15 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "rollup_total": _clean_browser_page_int(kanban.get("rollup_total"), maximum=5000),
         "issue_count": _clean_browser_page_int(kanban.get("issue_count"), maximum=5000),
         "todo_count": _clean_browser_page_int(kanban.get("todo_count"), maximum=5000),
+        "backups_loaded": bool(kanban.get("backups_loaded")),
+        "backup_count": _clean_browser_page_int(kanban.get("backup_count"), maximum=1000),
+        "backups_loading": bool(kanban.get("backups_loading")),
+        "backups_error": _clean_string(kanban.get("backups_error"), "", 180),
+        "backup_busy_action": _clean_string(kanban.get("backup_busy_action"), "", 40),
+        "backup_importing_filename": _clean_string(
+            kanban.get("backup_importing_filename"), "", 240
+        ),
+        "backup_last_result": _clean_string(kanban.get("backup_last_result"), "", 240),
         "error": _clean_string(kanban.get("error"), "", 180),
     }
 

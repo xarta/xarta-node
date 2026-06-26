@@ -181,6 +181,14 @@ DB_PATH: str = os.path.join(DB_DIR, "blueprints.db")
 # Directory where local DB backups are saved.  Empty string = feature disabled.
 BACKUP_DIR: str = os.environ.get("BLUEPRINTS_BACKUP_DIR", "")
 
+# Kanban file root and Kanban-scoped backup directory.  The default backup
+# directory intentionally lives under the node-local Kanban document root.
+KANBAN_DIR: str = os.environ.get("BLUEPRINTS_KANBAN_DIR", "/xarta-node/.lone-wolf/kanban")
+KANBAN_BACKUP_DIR: str = os.environ.get(
+    "BLUEPRINTS_KANBAN_BACKUP_DIR",
+    os.path.join(KANBAN_DIR, "backups"),
+)
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 GUI_DIR: str = os.environ.get("BLUEPRINTS_GUI_DIR", "/data/gui")
 
