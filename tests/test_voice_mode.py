@@ -330,6 +330,40 @@ def test_active_browser_command_action_aliases_are_sanitized():
     )
 
 
+def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
+    cleaned = voice_mode._clean_active_browser_kanban(
+        {
+            "automation_status_loaded": True,
+            "automation_status_loading": False,
+            "automation_status_error": "ok",
+            "automation_recent_decisions": 3,
+            "automation_review_processor_status": "decision-ledger-ready",
+            "automation_commit_link_health_ok": True,
+            "automation_output_contract_schema": "xarta.kanban.review_processor.output_contract.v1",
+            "automation_output_contract_types": 4,
+            "automation_processing_policy_schema": "xarta.kanban.review_processor.policy.v1",
+            "automation_processing_policy_active_mode": "cloud-first",
+            "automation_processing_policy_local_gate": "structured-job-packets-required",
+        }
+    )
+    assert cleaned["automation_status_loaded"] is True
+    assert cleaned["automation_status_loading"] is False
+    assert cleaned["automation_status_error"] == "ok"
+    assert cleaned["automation_recent_decisions"] == 3
+    assert cleaned["automation_review_processor_status"] == "decision-ledger-ready"
+    assert cleaned["automation_commit_link_health_ok"] is True
+    assert (
+        cleaned["automation_output_contract_schema"]
+        == "xarta.kanban.review_processor.output_contract.v1"
+    )
+    assert cleaned["automation_output_contract_types"] == 4
+    assert (
+        cleaned["automation_processing_policy_schema"] == "xarta.kanban.review_processor.policy.v1"
+    )
+    assert cleaned["automation_processing_policy_active_mode"] == "cloud-first"
+    assert cleaned["automation_processing_policy_local_gate"] == "structured-job-packets-required"
+
+
 def test_voice_dev_vad_detector_actions_are_allowed():
     assert voice_mode._clean_dev_command_action("set silero vad") == "set_silero_vad"
     assert voice_mode._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
@@ -903,6 +937,17 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "backup_busy_action": "validate",
         "backup_importing_filename": "",
         "backup_last_result": "Backup package is valid.",
+        "automation_status_loaded": False,
+        "automation_status_loading": False,
+        "automation_status_error": "",
+        "automation_recent_decisions": 0,
+        "automation_review_processor_status": "",
+        "automation_commit_link_health_ok": True,
+        "automation_output_contract_schema": "",
+        "automation_output_contract_types": 0,
+        "automation_processing_policy_schema": "",
+        "automation_processing_policy_active_mode": "",
+        "automation_processing_policy_local_gate": "",
         "error": "",
     }
     assert view["body_shade"] == {
