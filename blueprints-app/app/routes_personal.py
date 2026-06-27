@@ -1014,6 +1014,7 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
         "context_packet_schema": "xarta.kanban.context_packet.v1",
         "readiness_marker_schema": "xarta.kanban.context_readiness_marker.v1",
         "readiness_check_schema": "xarta.kanban.context_readiness_check.v1",
+        "preprocessing_request_schema": "xarta.kanban.preprocessing_time_request.v1",
         "marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
         "provider_mode": {
             "active": processing_policy["active_mode"],
@@ -1070,6 +1071,11 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
                 "alias": "stale_markers",
                 "meaning": "Component names whose current hashes differ from the stored marker.",
             },
+            {
+                "field": "preprocessing_request",
+                "scope": "context_readiness_check",
+                "meaning": "Plain-language time request, blocking codes, drift summary, and inspect/mark commands emitted when readiness is not current.",
+            },
         ],
         "packet_inputs": [
             "workspace_orientation",
@@ -1107,7 +1113,7 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
         "transition_rules": [
             "Preprocessing creates or replaces context_readiness_marker after the current packet is internally sane.",
             "Implementation starts only when context readiness check returns ready=true.",
-            "A missing or stale marker requests preprocessing time instead of guessing from title words.",
+            "A missing or stale marker emits preprocessing_request.request_text; agents must request preprocessing time instead of guessing from title words.",
             "Validation failures, missing item body, and open blockers are hard readiness failures.",
             "Detail, Review, discussions, and commits are warnings by default unless the work item explicitly requires them.",
             "Audit-count changes from recording the marker do not stale the packet; real work-state component changes do.",

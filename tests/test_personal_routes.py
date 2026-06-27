@@ -3863,6 +3863,7 @@ def test_work_preprocessing_readiness_contract_endpoint():
     assert contract["context_packet_schema"] == "xarta.kanban.context_packet.v1"
     assert contract["readiness_marker_schema"] == "xarta.kanban.context_readiness_marker.v1"
     assert contract["readiness_check_schema"] == "xarta.kanban.context_readiness_check.v1"
+    assert contract["preprocessing_request_schema"] == "xarta.kanban.preprocessing_time_request.v1"
     assert contract["marker_storage"] == "kanban_agent_hints.metadata.context_readiness_marker"
     assert contract["provider_mode"]["active"] == "cloud-first"
     fields = {field["field"]: field for field in contract["required_fields"]}
@@ -3873,10 +3874,14 @@ def test_work_preprocessing_readiness_contract_endpoint():
     assert "open_questions" in fields
     assert "links" in fields
     assert "blockers" in fields
+    assert "preprocessing_request" in fields
     assert "readiness_marker_stale" in contract["readiness_states"]
     assert "workspace_orientation" in contract["packet_inputs"]
     assert "commits" in contract["packet_inputs"]
     assert any("Implementation starts only" in rule for rule in contract["transition_rules"])
+    assert any(
+        "preprocessing_request.request_text" in rule for rule in contract["transition_rules"]
+    )
 
 
 def test_work_proposal_surfaces_contract_endpoint():
