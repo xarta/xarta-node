@@ -846,8 +846,6 @@ CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_item
     ON kanban_review_processor_markers(item_id, status, document_updated_at);
 CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_status
     ON kanban_review_processor_markers(processor_kind, status, queued_at);
-CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_timeout
-    ON kanban_review_processor_markers(status, processing_expires_at);
 
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
