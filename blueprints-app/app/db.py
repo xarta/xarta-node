@@ -813,6 +813,34 @@ CREATE TABLE IF NOT EXISTS kanban_review_processor_leases (
 CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_leases_status
     ON kanban_review_processor_leases(processor_kind, status, expires_at);
 
+CREATE TABLE IF NOT EXISTS kanban_review_processor_markers (
+    marker_id                     TEXT PRIMARY KEY,
+    item_id                       TEXT NOT NULL,
+    processor_kind                TEXT NOT NULL DEFAULT 'review',
+    document_type                 TEXT NOT NULL DEFAULT 'review',
+    document_ref                  TEXT NOT NULL DEFAULT '',
+    document_updated_at           TEXT NOT NULL DEFAULT '',
+    document_source_hash          TEXT NOT NULL DEFAULT '',
+    processed_document_updated_at TEXT NOT NULL DEFAULT '',
+    processed_source_hash         TEXT NOT NULL DEFAULT '',
+    processed_at                  TEXT NOT NULL DEFAULT '',
+    queued_at                     TEXT NOT NULL DEFAULT '',
+    last_seen_at                  TEXT NOT NULL DEFAULT '',
+    status                        TEXT NOT NULL DEFAULT 'queued',
+    provider_mode                 TEXT NOT NULL DEFAULT 'cloud-first',
+    decision_id                   TEXT NOT NULL DEFAULT '',
+    source_hash                   TEXT NOT NULL DEFAULT '',
+    metadata_json                 TEXT NOT NULL DEFAULT '{}',
+    provenance_json               TEXT NOT NULL DEFAULT '{}',
+    created_at                    TEXT DEFAULT (datetime('now')),
+    updated_at                    TEXT DEFAULT (datetime('now')),
+    UNIQUE(item_id, processor_kind, document_type)
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_item
+    ON kanban_review_processor_markers(item_id, status, document_updated_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_status
+    ON kanban_review_processor_markers(processor_kind, status, queued_at);
+
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
     item_id                 TEXT NOT NULL UNIQUE,
