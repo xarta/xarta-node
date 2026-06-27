@@ -11436,6 +11436,9 @@ def _work_preprocessing_local_ai_messages(
             "recent_discussions": [
                 {
                     "discussion_id": discussion.get("discussion_id") or "",
+                    "created_at": discussion.get("created_at") or "",
+                    "updated_at": discussion.get("updated_at") or "",
+                    "author": discussion.get("author") or "",
                     "body_excerpt": _body_excerpt(
                         str((discussion.get("document") or {}).get("body") or ""),
                         limit=3000,
@@ -11454,6 +11457,7 @@ def _work_preprocessing_local_ai_messages(
             "If there are open blockers, ready must be false.",
             "Readiness is not completion.",
             "Leaves should be Doing only while actively operated on; otherwise use To Do or Blocked.",
+            "When discussions, decisions, or commits conflict, prefer the newest timestamped Kanban evidence.",
         ],
         "required_output": {
             "ready": True,
