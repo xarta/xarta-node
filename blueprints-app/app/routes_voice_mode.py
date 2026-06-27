@@ -2181,6 +2181,32 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
             kanban.get("backup_importing_filename"), "", 240
         ),
         "backup_last_result": _clean_string(kanban.get("backup_last_result"), "", 240),
+        "automation_status_loaded": bool(kanban.get("automation_status_loaded")),
+        "automation_status_loading": bool(kanban.get("automation_status_loading")),
+        "automation_status_error": _clean_string(kanban.get("automation_status_error"), "", 180),
+        "automation_recent_decisions": _clean_browser_page_int(
+            kanban.get("automation_recent_decisions"), maximum=100
+        ),
+        "automation_review_processor_status": _clean_string(
+            kanban.get("automation_review_processor_status"), "", 80
+        ),
+        "automation_commit_link_health_ok": kanban.get("automation_commit_link_health_ok")
+        is not False,
+        "automation_output_contract_schema": _clean_string(
+            kanban.get("automation_output_contract_schema"), "", 160
+        ),
+        "automation_output_contract_types": _clean_browser_page_int(
+            kanban.get("automation_output_contract_types"), maximum=100
+        ),
+        "automation_processing_policy_schema": _clean_string(
+            kanban.get("automation_processing_policy_schema"), "", 160
+        ),
+        "automation_processing_policy_active_mode": _clean_string(
+            kanban.get("automation_processing_policy_active_mode"), "", 80
+        ),
+        "automation_processing_policy_local_gate": _clean_string(
+            kanban.get("automation_processing_policy_local_gate"), "", 160
+        ),
         "error": _clean_string(kanban.get("error"), "", 180),
     }
 
