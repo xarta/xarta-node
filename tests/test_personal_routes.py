@@ -3416,6 +3416,91 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     }.issubset(sync_tables)
 
 
+def test_work_review_document_hash_only_updates_on_body_change(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    timestamps = iter(
+        [
+            "2026-06-27T03:00:00Z",
+            "2026-06-27T03:01:00Z",
+            "2026-06-27T03:02:00Z",
+            "2026-06-27T03:03:00Z",
+        ]
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_utc_now_iso",
+        lambda: next(timestamps, "2026-06-27T03:04:00Z"),
+    )
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-hash",
+                title="Review hash item",
+                body="Review hash proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-hash-item-create",
+            )
+        )
+    )
+    review_body = "Operator Review: only changed content should bump the timestamp."
+    first = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-hash",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=review_body,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-hash-write-first",
+            ),
+        )
+    )["review_document"]
+    first_source = routes_personal._review_document_source(first)
+    first_body_hash = first["metadata"]["body_hash"]
+    assert first["updated_at"] == "2026-06-27T03:01:00Z"
+    assert first_body_hash.startswith("sha256:")
+
+    same = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-hash",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=review_body,
+                actor="codex-other",
+                source_surface="pytest",
+                request_id="review-hash-write-same",
+            ),
+        )
+    )["review_document"]
+    same_source = routes_personal._review_document_source(same)
+    assert same["updated_at"] == first["updated_at"]
+    assert same["metadata"]["body_hash"] == first_body_hash
+    assert same["metadata"]["actor"] == "codex-test"
+    assert same_source["document_source_hash"] == first_source["document_source_hash"]
+
+    changed = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-hash",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=f"{review_body}\n\nA new correction changes the review source.",
+                actor="codex-other",
+                source_surface="pytest",
+                request_id="review-hash-write-changed",
+            ),
+        )
+    )["review_document"]
+    changed_source = routes_personal._review_document_source(changed)
+    assert changed["updated_at"] > first["updated_at"]
+    assert changed["metadata"]["body_hash"] != first_body_hash
+    assert changed["metadata"]["actor"] == "codex-other"
+    assert changed_source["document_source_hash"] != first_source["document_source_hash"]
+
+
 def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

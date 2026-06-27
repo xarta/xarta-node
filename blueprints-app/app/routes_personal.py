@@ -2202,6 +2202,10 @@ def _normalise_markdown_document_body(value: str | None) -> str:
     return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _kanban_document_body_hash(item_id: str, body: str) -> str:
+    return _hash_json_payload({"item_id": item_id, "body": _normalise_markdown_document_body(body)})
+
+
 def _kanban_markdown_text(schema: str, metadata: dict[str, Any], body: str) -> str:
     frontmatter = {
         "schema": schema,
@@ -6475,13 +6479,40 @@ def _write_work_item_markdown_document(
         schema = KANBAN_ITEM_DETAIL_SCHEMA
     path.parent.mkdir(parents=True, exist_ok=True)
     clean_body = _normalise_markdown_document_body(body)
+    existing_metadata: dict[str, Any] = {}
+    existing_body = ""
+    existing_exists = False
+    if document_kind == "review":
+        existing_metadata, existing_body, existing_exists = _read_kanban_markdown_document(path)
+    body_hash = _kanban_document_body_hash(item_id, clean_body)
+    existing_body_hash = (
+        _clean_short_text(existing_metadata.get("body_hash"), "", limit=120)
+        if existing_exists
+        else ""
+    )
+    existing_body_clean = _normalise_markdown_document_body(existing_body)
+    if existing_exists and not existing_body_hash:
+        existing_body_hash = _kanban_document_body_hash(item_id, existing_body_clean)
+    body_changed = not existing_exists or existing_body_hash != body_hash
+    updated_at = (
+        now
+        if document_kind != "review" or body_changed
+        else _clean_short_text(existing_metadata.get("updated_at"), "", limit=80) or now
+    )
+    metadata_actor = (
+        actor
+        if document_kind != "review" or body_changed
+        else _clean_short_text(existing_metadata.get("actor"), actor, limit=120)
+    )
     metadata = {
         "item_id": item_id,
         "root_item_id": _work_root_item(conn, item_id)["item_id"],
         "title": item["title"],
-        "actor": actor,
-        "updated_at": now,
+        "actor": metadata_actor,
+        "updated_at": updated_at,
     }
+    if document_kind == "review":
+        metadata["body_hash"] = body_hash
     path.write_text(
         _kanban_markdown_text(schema, metadata, clean_body),
         encoding="utf-8",
@@ -8450,6 +8481,8 @@ async def update_work_item_review_document(
             metadata={
                 "file_ref": document["file_ref"],
                 "body_bytes": len(clean_body.encode("utf-8")),
+                "body_hash": document["metadata"].get("body_hash") or "",
+                "document_updated_at": document["updated_at"],
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
