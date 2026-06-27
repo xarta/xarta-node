@@ -3732,6 +3732,10 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         status["processing_policy"]["schema"]
         == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
     )
+    assert (
+        status["metadata_contract"]["schema"]
+        == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
+    )
     assert status["processing_policy"]["active_mode"] == "cloud-first"
     assert status["processing_policy"]["local_processing"]["state"] == "planned-gated"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
@@ -3774,6 +3778,10 @@ def test_work_review_processor_output_contract_endpoint():
         contract["processing_policy_schema"]
         == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
     )
+    assert (
+        contract["metadata_contract_schema"]
+        == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
+    )
     assert contract["provider_mode"]["active"] == "cloud-first"
     assert contract["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
     assert contract["provider_mode"]["automatic_switch"] is False
@@ -3787,6 +3795,33 @@ def test_work_review_processor_output_contract_endpoint():
     }
     assert "current_behavior" in output_types["prompt_change"]["required_payload_fields"]
     assert "source_refs" in output_types["contradiction_check"]["required_payload_fields"]
+
+
+def test_work_review_processor_metadata_contract_endpoint():
+    result = asyncio.run(routes_personal.get_work_review_processor_metadata_contract())
+    contract = result["contract"]
+    assert result["ok"] is True
+    assert contract["schema"] == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
+    assert contract["review_document_schema"] == routes_personal.KANBAN_ITEM_REVIEW_SCHEMA
+    assert contract["marker_schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
+    assert contract["provider_mode"]["active"] == "cloud-first"
+    fields = {field["field"]: field for field in contract["required_fields"]}
+    assert fields["body_hash"]["scope"] == "review_document.metadata"
+    assert fields["updated_at"]["alias"] == "review_updated_at"
+    assert fields["processed_at"]["alias"] == "last_processed_at"
+    assert fields["status"]["allowed_values"] == [
+        "queued",
+        "processing",
+        "processed",
+        "failed",
+        "skipped",
+        "cancelled",
+    ]
+    assert fields["run_id"]["scope"] == "marker.provenance"
+    assert fields["last_error"]["scope"] == "kanban_review_processor_markers"
+    assert "metadata.cancelled_previous_status" in contract["cancellation_fields"]
+    assert any("body_hash is unchanged" in rule for rule in contract["transition_rules"])
+    assert any("review_document_deleted" in rule for rule in contract["transition_rules"])
 
 
 def test_work_review_processor_processing_policy_endpoint():
