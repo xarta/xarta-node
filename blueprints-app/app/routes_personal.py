@@ -73,6 +73,7 @@ OPENCLAW_AI_DEVELOPMENT_DOMAINS: tuple[str, ...] = ("marktechpost.com", "venture
 DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
+KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -448,6 +449,27 @@ class WorkItemCommitCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkReviewDecisionCreateRequest(BaseModel):
+    decision_id: str | None = None
+    processor_kind: str = "review"
+    decision_type: str = "decision"
+    title: str | None = None
+    summary: str
+    rationale: str = ""
+    affected_refs: list[str] = []
+    confidence: str = ""
+    uncertainty: str = ""
+    proof_refs: list[str] = []
+    commit_link_ids: list[str] = []
+    status: str = "recorded"
+    provider_mode: str = "cloud-first"
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkAgentHintsUpdateRequest(BaseModel):
     required_skills: list[str] | None = None
     routing_notes: str | None = None
@@ -692,6 +714,10 @@ def _kanban_commit_link_id(item_id: str, repo_full_name: str, sha: str) -> str:
     return f"kanban-commit-{digest[:24]}"
 
 
+def _kanban_review_decision_id() -> str:
+    return f"kanban-decision-{uuid.uuid4().hex[:16]}"
+
+
 def _kanban_agent_hints_id(item_id: str) -> str:
     digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
     return f"kanban-agent-hints-{digest[:24]}"
@@ -726,6 +752,93 @@ def _row_to_work_commit(row: Any) -> dict[str, Any]:
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _clean_review_decision_status(value: str | None) -> str:
+    status = _clean_short_text(value, "recorded", limit=80).replace("-", "_")
+    allowed = {
+        "recorded",
+        "pending",
+        "accepted",
+        "declined",
+        "superseded",
+        "failed",
+        "hook_failed",
+    }
+    return status if status in allowed else "recorded"
+
+
+def _clean_review_provider_mode(value: str | None) -> str:
+    mode = _clean_short_text(value, "cloud-first", limit=80).replace("_", "-")
+    allowed = {"cloud-first", "cloud", "local-planned", "local", "manual"}
+    return mode if mode in allowed else "cloud-first"
+
+
+def _row_to_work_review_decision(
+    row: Any, commits: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    return {
+        "schema": KANBAN_REVIEW_DECISION_SCHEMA,
+        "decision_id": row["decision_id"],
+        "item_id": row["item_id"],
+        "processor_kind": row["processor_kind"],
+        "decision_type": row["decision_type"],
+        "title": row["title"],
+        "summary": row["summary"],
+        "rationale": row["rationale"],
+        "affected_refs": _json_value(row["affected_refs_json"], []),
+        "confidence": row["confidence"],
+        "uncertainty": row["uncertainty"],
+        "proof_refs": _json_value(row["proof_refs_json"], []),
+        "commit_link_ids": _json_value(row["commit_link_ids_json"], []),
+        "commit_count": len(commits or []),
+        "commits": commits or [],
+        "status": row["status"],
+        "provider_mode": row["provider_mode"],
+        "source_hash": row["source_hash"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _work_decision_commit_rows(conn: Any, commit_link_ids: list[str]) -> list[Any]:
+    clean_ids = _clean_event_list(commit_link_ids, limit=64)
+    if not clean_ids:
+        return []
+    placeholders = ",".join("?" for _ in clean_ids)
+    rows = conn.execute(
+        f"SELECT * FROM kanban_item_commits WHERE commit_link_id IN ({placeholders})",
+        clean_ids,
+    ).fetchall()
+    by_id = {row["commit_link_id"]: row for row in rows}
+    return [by_id[commit_id] for commit_id in clean_ids if commit_id in by_id]
+
+
+def _work_decision_commit_health(rows: list[Any], conn: Any) -> dict[str, Any]:
+    missing: list[str] = []
+    linked_decisions = 0
+    hook_failures = 0
+    for row in rows:
+        commit_ids = _clean_event_list(_json_value(row["commit_link_ids_json"], []), limit=64)
+        if commit_ids:
+            linked_decisions += 1
+            found = {
+                commit["commit_link_id"] for commit in _work_decision_commit_rows(conn, commit_ids)
+            }
+            missing.extend(commit_id for commit_id in commit_ids if commit_id not in found)
+        metadata = _json_value(row["metadata_json"], {})
+        if row["status"] == "hook_failed" or str(metadata.get("hook_status") or "") == "failed":
+            hook_failures += 1
+    return {
+        "decision_count": len(rows),
+        "decisions_with_commits": linked_decisions,
+        "missing_commit_link_count": len(missing),
+        "missing_commit_link_ids": missing[:20],
+        "hook_failure_count": hook_failures,
+        "ok": not missing and hook_failures == 0,
     }
 
 
@@ -8464,6 +8577,322 @@ async def record_work_item_commit(
         "commit": _row_to_work_commit(commit_row),
         "audit": {"audit_id": audit_id, "action": "record_work_commit", "result": "ok"},
     }
+
+
+@router.get("/kanban/items/{item_id}/decisions")
+async def list_work_item_review_decisions(
+    item_id: str,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        rows = conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=?
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT ?
+            """,
+            (clean_item_id, limit),
+        ).fetchall()
+        decisions = []
+        for row in rows:
+            commit_ids = _json_value(row["commit_link_ids_json"], [])
+            commits = [
+                _row_to_work_commit(commit)
+                for commit in _work_decision_commit_rows(conn, commit_ids)
+            ]
+            decisions.append(_row_to_work_review_decision(row, commits))
+        return {
+            "ok": True,
+            "item": _row_to_work_item(item),
+            "count": len(decisions),
+            "decisions": decisions,
+            "commit_link_health": _work_decision_commit_health(rows, conn),
+        }
+
+
+@router.post("/kanban/items/{item_id}/decisions")
+async def record_work_item_review_decision(
+    item_id: str, body: WorkReviewDecisionCreateRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    decision_id = (
+        _clean_work_id(body.decision_id, "kanban-decision")
+        if body.decision_id
+        else _kanban_review_decision_id()
+    )
+    summary = _body_excerpt(body.summary, limit=8000)
+    if not summary.strip():
+        raise HTTPException(400, "Review Processor decision summary is required")
+    affected_refs = _clean_event_list(body.affected_refs, limit=64)
+    canonical_item_ref = f"kanban_items:{clean_item_id}"
+    if canonical_item_ref not in affected_refs:
+        affected_refs.insert(0, canonical_item_ref)
+    proof_refs = _clean_event_list(body.proof_refs, limit=64)
+    commit_link_ids = _clean_event_list(body.commit_link_ids, limit=64)
+    status = _clean_review_decision_status(body.status)
+    provider_mode = _clean_review_provider_mode(body.provider_mode)
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        commit_rows = _work_decision_commit_rows(conn, commit_link_ids)
+        found_commit_ids = {row["commit_link_id"] for row in commit_rows}
+        missing_commit_ids = [
+            commit_id for commit_id in commit_link_ids if commit_id not in found_commit_ids
+        ]
+        if missing_commit_ids:
+            raise HTTPException(
+                400,
+                f"Decision references unknown Kanban commit links: {', '.join(missing_commit_ids[:5])}",
+            )
+        provenance = {
+            "schema": KANBAN_REVIEW_DECISION_SCHEMA,
+            "recorded_by": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+            "run_id": meta["run_id"],
+        }
+        row = {
+            "decision_id": decision_id,
+            "item_id": clean_item_id,
+            "processor_kind": _clean_short_text(body.processor_kind, "review", limit=80),
+            "decision_type": _clean_short_text(body.decision_type, "decision", limit=80),
+            "title": _clean_short_text(body.title or "", "", limit=220),
+            "summary": summary,
+            "rationale": _body_excerpt(body.rationale, limit=12000),
+            "affected_refs_json": json.dumps(affected_refs, ensure_ascii=True),
+            "confidence": _clean_short_text(body.confidence, "", limit=80),
+            "uncertainty": _body_excerpt(body.uncertainty, limit=4000),
+            "proof_refs_json": json.dumps(proof_refs, ensure_ascii=True),
+            "commit_link_ids_json": json.dumps(commit_link_ids, ensure_ascii=True),
+            "status": status,
+            "provider_mode": provider_mode,
+            "source_hash": "",
+            "metadata_json": json.dumps(
+                dict(body.metadata or {}), ensure_ascii=True, sort_keys=True
+            ),
+            "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            "created_at": now,
+            "updated_at": now,
+        }
+        row["source_hash"] = _hash_json_payload(
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"source_hash", "created_at", "updated_at"}
+            }
+        )
+        existing = conn.execute(
+            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        if existing:
+            row["created_at"] = existing["created_at"]
+        conn.execute(
+            """
+            INSERT INTO kanban_review_decisions (
+                decision_id, item_id, processor_kind, decision_type, title, summary,
+                rationale, affected_refs_json, confidence, uncertainty, proof_refs_json,
+                commit_link_ids_json, status, provider_mode, source_hash, metadata_json,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :decision_id, :item_id, :processor_kind, :decision_type, :title,
+                :summary, :rationale, :affected_refs_json, :confidence,
+                :uncertainty, :proof_refs_json, :commit_link_ids_json, :status,
+                :provider_mode, :source_hash, :metadata_json, :provenance_json,
+                :created_at, :updated_at
+            )
+            ON CONFLICT(decision_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                processor_kind=excluded.processor_kind,
+                decision_type=excluded.decision_type,
+                title=excluded.title,
+                summary=excluded.summary,
+                rationale=excluded.rationale,
+                affected_refs_json=excluded.affected_refs_json,
+                confidence=excluded.confidence,
+                uncertainty=excluded.uncertainty,
+                proof_refs_json=excluded.proof_refs_json,
+                commit_link_ids_json=excluded.commit_link_ids_json,
+                status=excluded.status,
+                provider_mode=excluded.provider_mode,
+                source_hash=excluded.source_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        decision_row = conn.execute(
+            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="record_review_processor_decision",
+            target_ref=f"kanban_review_decisions:{decision_id}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=row["source_hash"],
+            metadata={
+                "decision_id": decision_id,
+                "status": status,
+                "provider_mode": provider_mode,
+                "commit_link_ids": commit_link_ids,
+                "affected_refs": affected_refs,
+                "upsert": "updated" if existing else "inserted",
+            },
+        )
+        gen = increment_gen(conn, "kanban-review-decision")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_decisions",
+            decision_id,
+            dict(decision_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        decision = _row_to_work_review_decision(
+            decision_row,
+            [_row_to_work_commit(commit) for commit in commit_rows],
+        )
+    return {
+        "ok": True,
+        "decision": decision,
+        "audit": {
+            "audit_id": audit_id,
+            "action": "record_review_processor_decision",
+            "result": "ok",
+        },
+    }
+
+
+@router.get("/kanban/automation/status")
+async def get_work_automation_status(
+    item_id: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    with get_conn() as conn:
+        scope_ids: list[str] = []
+        item_payload: dict[str, Any] | None = None
+        if clean_item_id:
+            item_payload = _row_to_work_item(_work_item_or_404(conn, clean_item_id))
+            scope_ids = _work_scope_item_ids(conn, clean_item_id)
+        where = ""
+        args: list[Any] = []
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            where = f"WHERE item_id IN ({placeholders})"
+            args.extend(scope_ids)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM kanban_review_decisions
+            {where}
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT ?
+            """,
+            [*args, limit],
+        ).fetchall()
+        recent_decisions = []
+        for row in rows:
+            commit_ids = _json_value(row["commit_link_ids_json"], [])
+            commit_rows = _work_decision_commit_rows(conn, commit_ids)
+            recent_decisions.append(
+                _row_to_work_review_decision(
+                    row,
+                    [_row_to_work_commit(commit) for commit in commit_rows],
+                )
+            )
+        status_rows = conn.execute(
+            f"SELECT status, COUNT(*) AS count FROM kanban_review_decisions {where} GROUP BY status",
+            args,
+        ).fetchall()
+        provider_rows = conn.execute(
+            f"SELECT provider_mode, COUNT(*) AS count FROM kanban_review_decisions {where} GROUP BY provider_mode",
+            args,
+        ).fetchall()
+        active_session = conn.execute(
+            """
+            SELECT * FROM kanban_agent_sessions
+            WHERE status='active'
+            ORDER BY updated_at DESC, started_at DESC, session_id
+            LIMIT 1
+            """
+        ).fetchone()
+        if scope_ids:
+            scoped_active_session = conn.execute(
+                f"""
+                SELECT * FROM kanban_agent_sessions
+                WHERE status='active' AND item_id IN ({",".join("?" for _ in scope_ids)})
+                ORDER BY updated_at DESC, started_at DESC, session_id
+                LIMIT 1
+                """,
+                scope_ids,
+            ).fetchone()
+            active_session = scoped_active_session or active_session
+        last_completed = conn.execute(
+            f"""
+            SELECT * FROM kanban_review_decisions
+            {where}
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT 1
+            """,
+            args,
+        ).fetchone()
+        all_decision_rows = conn.execute(
+            f"SELECT * FROM kanban_review_decisions {where}",
+            args,
+        ).fetchall()
+        return {
+            "ok": True,
+            "schema": "xarta.kanban.automation_status.v1",
+            "item": item_payload,
+            "generated_at": _utc_now_iso(),
+            "provider_mode": {
+                "active": "cloud-first",
+                "planned": "local-processing-after-structured-job-packets",
+                "by_mode": {row["provider_mode"]: int(row["count"]) for row in provider_rows},
+            },
+            "review_processor": {
+                "status": "decision-ledger-ready",
+                "queue_length": 0,
+                "active_item_id": active_session["item_id"] if active_session else "",
+                "lease_owner": active_session["agent_id"] if active_session else "",
+                "lease_updated_at": active_session["updated_at"] if active_session else "",
+                "timeout_seconds": 20 * 60,
+                "last_completed_item_id": last_completed["item_id"] if last_completed else "",
+                "last_completed_at": last_completed["updated_at"] if last_completed else "",
+                "pending_decision_count": sum(
+                    int(row["count"]) for row in status_rows if row["status"] == "pending"
+                ),
+            },
+            "preprocessing": {
+                "status": "contract-pending",
+                "queue_length": 0,
+                "active_item_id": "",
+                "last_completed_item_id": "",
+            },
+            "decisions": {
+                "count": len(all_decision_rows),
+                "by_status": {row["status"]: int(row["count"]) for row in status_rows},
+                "recent": recent_decisions,
+            },
+            "commit_link_health": _work_decision_commit_health(all_decision_rows, conn),
+        }
 
 
 @router.get("/kanban/items/{item_id}/agent-hints")
