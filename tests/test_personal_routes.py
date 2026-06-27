@@ -2914,20 +2914,42 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
             )
         )
     )["item"]
-    worker_lane_move = asyncio.run(
+    with pytest.raises(routes_personal.HTTPException) as worker_blocked_without_blocker:
+        asyncio.run(
+            routes_personal.move_work_item(
+                worker_child["item_id"],
+                routes_personal.WorkItemMoveRequest(
+                    state_id="blocked",
+                    actor="kanban-idle-worker",
+                    source_surface="kanban-automation-idle-worker",
+                    request_id="worker-child-lane-move-without-blocker",
+                    run_id="worker-parent-guard",
+                ),
+            )
+        )
+    assert worker_blocked_without_blocker.value.status_code == 409
+    assert worker_blocked_without_blocker.value.detail["error"] == (
+        "kanban_automation_blocked_leaf_requires_blocker"
+    )
+
+    worker_lane_move_result = asyncio.run(
         routes_personal.move_work_item(
             worker_child["item_id"],
             routes_personal.WorkItemMoveRequest(
                 state_id="blocked",
+                blocker_title="Worker lane move blocker",
+                blocker_body="Worker blocked moves must leave visible blocker detail.",
                 actor="kanban-idle-worker",
                 source_surface="kanban-automation-idle-worker",
                 request_id="worker-child-lane-move",
                 run_id="worker-parent-guard",
             ),
         )
-    )["item"]
+    )
+    worker_lane_move = worker_lane_move_result["item"]
     assert worker_lane_move["parent_item_id"] == worker_parent["item_id"]
     assert worker_lane_move["state_id"] == "blocked"
+    assert worker_lane_move_result["created_blocker"]["status"] == "open"
 
     with pytest.raises(routes_personal.HTTPException) as worker_reparent_blocked:
         asyncio.run(
@@ -3496,6 +3518,99 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "kanban_discussions",
         "kanban_audit_log",
     }.issubset(sync_tables)
+
+
+def test_work_preprocessing_scoped_decomposition_reparent_guard(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    for item_id, parent_item_id, title, body in [
+        (
+            "work-scoped-source",
+            None,
+            "Scoped source",
+            "Concrete implementation request. Proof path: scoped reparent stays inside subtree.",
+        ),
+        ("work-scoped-a", "work-scoped-source", "Scoped A", "Child A."),
+        ("work-scoped-b", "work-scoped-source", "Scoped B", "Child B."),
+        ("work-scoped-outside", None, "Outside", "Outside target."),
+    ]:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    parent_item_id=parent_item_id,
+                    title=title,
+                    body=body,
+                    state_id="todo",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{item_id}-create",
+                )
+            )
+        )
+
+    result = routes_personal._work_preprocessing_scoped_decomposition_reparent(
+        item_id="work-scoped-b",
+        target_parent_item_id="work-scoped-a",
+        source_item_id="work-scoped-source",
+        marker_id="marker-scoped-source",
+        actor="kanban-idle-worker",
+        request_id="scoped-reparent-allowed",
+        run_id="pytest-scoped-reparent",
+        reason="move child under the more precise decomposition parent",
+        operation_kind="preprocessing_reparent_child",
+    )
+    assert result["ok"] is True
+    assert result["item"]["parent_item_id"] == "work-scoped-a"
+    assert result["item"]["depth"] == 2
+
+    with pytest.raises(routes_personal.HTTPException) as outside_target:
+        routes_personal._work_preprocessing_scoped_decomposition_reparent(
+            item_id="work-scoped-b",
+            target_parent_item_id="work-scoped-outside",
+            source_item_id="work-scoped-source",
+            marker_id="marker-scoped-source",
+            actor="kanban-idle-worker",
+            request_id="scoped-reparent-outside",
+            run_id="pytest-scoped-reparent",
+            reason="try to move outside source subtree",
+            operation_kind="preprocessing_reparent_child",
+        )
+    assert outside_target.value.status_code == 403
+    assert outside_target.value.detail["error"] == (
+        "kanban_preprocessing_scoped_move_outside_source_subtree"
+    )
+
+    with pytest.raises(routes_personal.HTTPException) as source_move:
+        routes_personal._work_preprocessing_scoped_decomposition_reparent(
+            item_id="work-scoped-source",
+            target_parent_item_id="work-scoped-a",
+            source_item_id="work-scoped-source",
+            marker_id="marker-scoped-source",
+            actor="kanban-idle-worker",
+            request_id="scoped-reparent-source",
+            run_id="pytest-scoped-reparent",
+            reason="try to move the source item itself",
+            operation_kind="preprocessing_reparent_child",
+        )
+    assert source_move.value.status_code == 403
+    assert source_move.value.detail["error"] == "kanban_preprocessing_cannot_move_source_item"
+
+    audit = asyncio.run(
+        routes_personal.list_work_audit_log(
+            item_id="work-scoped-b",
+            action="preprocessing_decomposition_reparent_item",
+        )
+    )
+    assert audit["count"] == 1
+    metadata = audit["audit"][0]["metadata"]
+    assert metadata["schema"] == routes_personal.KANBAN_PREPROCESSING_DECOMPOSITION_MOVE_SCHEMA
+    assert metadata["marker_id"] == "marker-scoped-source"
+    assert audit["audit"][0]["rollback"]["operation"] == "move_item"
 
 
 def test_agent_completion_move_blocks_outstanding_work_but_operator_can_override(monkeypatch):
@@ -5123,6 +5238,274 @@ def test_work_preprocessing_decomposition_child_ids_retry_collisions_and_reuse_s
     assert second["existing_items"][0]["item_id"] == child["item_id"]
 
 
+def test_work_preprocessing_blocked_child_materializes_visible_blocker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-blocked-root",
+                title="Blocked child root",
+                body="Root item.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-blocked-parent",
+                parent_item_id="work-preprocess-blocked-root",
+                title="Blocked child parent",
+                body="Concrete implementation request. Proof path: child blocker row exists.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    parent_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-blocked-parent'"
+    ).fetchone()
+
+    result = asyncio.run(
+        routes_personal._work_preprocessing_create_decomposition_children(
+            parent_item=parent_row,
+            payload={
+                "decomposition_items": [
+                    {
+                        "title": "Ask operator for API route",
+                        "body": "Need a route decision before implementation.",
+                        "state_id": "blocked",
+                        "blocked_reason": "Operator must choose the API route.",
+                        "proof_path": "Visible blocker row records the question.",
+                    }
+                ]
+            },
+            holder_id="kanban-idle-worker",
+            run_id="pytest-preprocess-blocked-child",
+            marker_id="marker-preprocess-blocked-child",
+        )
+    )
+
+    assert result["created_count"] == 1
+    child = result["created_items"][0]
+    assert child["state_id"] == "blocked"
+    blockers = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE item_id=?",
+        (child["item_id"],),
+    ).fetchall()
+    assert len(blockers) == 1
+    assert blockers[0]["status"] == "open"
+    assert blockers[0]["blocked_by_ref"] == (
+        "kanban_review_processor_markers:marker-preprocess-blocked-child"
+    )
+    provenance = json.loads(blockers[0]["provenance_json"])
+    assert provenance["schema"] == routes_personal.KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "create_work_item_blocker" in audit_actions
+
+
+def test_work_preprocessing_duplicate_decomposition_titles_fail_without_children(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-duplicate-parent",
+                title="Duplicate parent",
+                body="Concrete implementation request. Proof path: no partial mutation.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    parent_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-duplicate-parent'"
+    ).fetchone()
+
+    with pytest.raises(ValueError) as duplicate:
+        asyncio.run(
+            routes_personal._work_preprocessing_create_decomposition_children(
+                parent_item=parent_row,
+                payload={
+                    "decomposition_items": [
+                        {"title": "Same child", "body": "First."},
+                        {"title": " same   child ", "body": "Duplicate."},
+                    ]
+                },
+                holder_id="kanban-idle-worker",
+                run_id="pytest-preprocess-duplicate",
+                marker_id="marker-preprocess-duplicate",
+            )
+        )
+    assert "duplicates another child title" in str(duplicate.value)
+    child_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_items
+        WHERE parent_item_id='work-preprocess-duplicate-parent'
+        """
+    ).fetchone()["count"]
+    assert child_count == 0
+
+
+def test_work_blocked_leaf_invariant_audit_and_repair_creates_blocker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-legacy-blocked-leaf",
+                title="Resolve Dependency: Legacy blocker repair",
+                body=(
+                    "Preprocessing child of work-legacy-parent.\n\n"
+                    "Blocked reason/question: Operator must choose the dependency source."
+                ),
+                state_id="blocked",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="legacy-blocked-leaf-create",
+            )
+        )
+    )
+
+    audit = asyncio.run(
+        routes_personal.audit_work_blocked_leaf_invariant(
+            item_id="work-legacy-blocked-leaf",
+            include_test_entries=True,
+            limit=20,
+        )
+    )
+    assert audit["count"] == 1
+    assert audit["findings"][0]["classification"] == "preprocessing_blocked_child"
+    assert audit["findings"][0]["action"] == "create_blocker"
+
+    dry_run = asyncio.run(
+        routes_personal.repair_work_blocked_leaf_invariant(
+            routes_personal.WorkBlockedLeafInvariantRepairRequest(
+                item_id="work-legacy-blocked-leaf",
+                apply=False,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="legacy-blocked-leaf-dry-run",
+                run_id="pytest-legacy-blocked-leaf",
+            )
+        )
+    )
+    assert dry_run["applied"] is False
+    assert dry_run["count"] == 1
+
+    repair = asyncio.run(
+        routes_personal.repair_work_blocked_leaf_invariant(
+            routes_personal.WorkBlockedLeafInvariantRepairRequest(
+                item_id="work-legacy-blocked-leaf",
+                apply=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="legacy-blocked-leaf-repair",
+                run_id="pytest-legacy-blocked-leaf",
+            )
+        )
+    )
+    assert repair["applied"] is True
+    assert repair["before_count"] == 1
+    assert repair["after_count"] == 0
+    assert repair["repaired_count"] == 1
+
+    blockers = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE item_id='work-legacy-blocked-leaf'"
+    ).fetchall()
+    assert len(blockers) == 1
+    assert blockers[0]["status"] == "open"
+    assert blockers[0]["title"].startswith("Preprocessing blocker/question:")
+    provenance = json.loads(blockers[0]["provenance_json"])
+    assert provenance["schema"] == routes_personal.KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "repair_blocked_leaf_missing_blocker" in audit_actions
+
+    repaired_audit = asyncio.run(
+        routes_personal.audit_work_blocked_leaf_invariant(
+            item_id="work-legacy-blocked-leaf",
+            include_test_entries=True,
+            limit=20,
+        )
+    )
+    assert repaired_audit["count"] == 0
+
+
+def test_work_automation_cannot_resolve_last_blocker_on_blocked_leaf(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    created = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-automation-blocked-leaf",
+                title="Automation blocked leaf",
+                body="Blocked reason/question: Needs an operator answer.",
+                state_id="blocked",
+                blocker_title="Operator answer required",
+                blocker_body="Needs an operator answer.",
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id="automation-blocked-leaf-create",
+                run_id="pytest-automation-blocked-leaf",
+            )
+        )
+    )
+    blocker = created["created_blocker"]
+    assert blocker["status"] == "open"
+
+    with pytest.raises(routes_personal.HTTPException) as blocked_resolve:
+        asyncio.run(
+            routes_personal.update_work_blocker(
+                blocker["blocker_id"],
+                routes_personal.WorkBlockerUpsertRequest(
+                    item_id="work-automation-blocked-leaf",
+                    title=blocker["title"],
+                    body=blocker["body_excerpt"],
+                    status="resolved",
+                    actor="kanban-idle-worker",
+                    source_surface="kanban-automation-idle-worker",
+                    request_id="automation-blocked-leaf-resolve",
+                    run_id="pytest-automation-blocked-leaf",
+                ),
+            )
+        )
+    assert blocked_resolve.value.status_code == 409
+    assert blocked_resolve.value.detail["error"] == (
+        "kanban_automation_cannot_resolve_last_blocker_on_blocked_leaf"
+    )
+    row = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+        (blocker["blocker_id"],),
+    ).fetchone()
+    assert row["status"] == "open"
+
+
 def test_work_automation_preprocessing_malformed_decomposition_fails_without_children(
     monkeypatch, tmp_path
 ):
@@ -5343,6 +5726,45 @@ def test_work_automation_idle_tick_does_not_claim_markers_queued_mid_tick(monkey
         """
     ).fetchone()
     assert mid_tick_marker["status"] == "queued"
+
+
+def test_work_automation_idle_tick_handles_claim_lease_race(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    conn.commit()
+
+    async def fake_claim_next_work_review_processor_marker(body):
+        raise routes_personal.HTTPException(409, "Review Processor lease is not active")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "claim_next_work_review_processor_marker",
+        fake_claim_next_work_review_processor_marker,
+    )
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            max_scan_items=1,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+    assert tick["ok"] is True
+    assert tick["lease_acquired"] is True
+    assert tick["processed_count"] == 0
+    assert tick["claim_results"] == [
+        {
+            "claimed": False,
+            "reason": "lease_not_active_during_claim",
+            "detail": "Review Processor lease is not active",
+            "marker_id": "",
+            "processor_kind": "",
+        }
+    ]
+    assert tick["release"]["released"] is True
 
 
 def test_work_preprocessing_context_ignores_processor_marker_blockers(monkeypatch, tmp_path):
@@ -5844,6 +6266,59 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
+def test_work_preprocessing_idle_scan_skips_topic_container_without_marker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-topic-container",
+                title="Topic Container",
+                body=(
+                    "Topic/container holding area for related ideas. "
+                    "Broad topic; collect related work here."
+                ),
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-topic-container-create",
+            )
+        )
+    )
+
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-topic-container'"
+    ).fetchone()
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    assert source["classification"]["classification"] == "topic_container"
+    assert source["needs_preprocessing"] is False
+    assert source["reason"] == "preprocessing_skipped_topic_container"
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-topic-container",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-topic-container-scan",
+            )
+        )
+    )
+    assert scan["scanned_count"] == 1
+    assert scan["eligible_preprocessing_count"] == 0
+    assert scan["current_ready_count"] == 1
+    assert scan["queued_count"] == 0
+    marker_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM kanban_review_processor_markers"
+    ).fetchone()["count"]
+    assert marker_count == 0
+
+
 def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -6139,6 +6614,113 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert "claim_review_processor_marker" in audit_actions
     assert "complete_review_processor_marker" in audit_actions
     assert "requeue_review_processor_timeouts" in audit_actions
+
+
+def test_work_review_processor_completion_requeues_superseded_processing_marker(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-superseded-complete",
+                title="Superseded completion",
+                body="Root item for superseded completion proof.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-superseded-complete",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review text before claim.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete-review",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-superseded-complete",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-superseded-complete",
+                item_id="work-review-superseded-complete",
+                ttl_seconds=300,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-superseded-complete",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-superseded-complete",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete-claim",
+            )
+        )
+    )
+    assert claimed["claimed"] is True
+    replacement_hash = "sha256:" + ("a" * 64)
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET document_source_hash=?, source_hash=?
+        WHERE marker_id=?
+        """,
+        (replacement_hash, replacement_hash, marker["marker_id"]),
+    )
+    conn.commit()
+
+    completed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            marker["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-superseded-complete",
+                lease_token=acquired["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="processed",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-superseded-complete",
+            ),
+        )
+    )
+    assert completed["completed"] is False
+    assert completed["reason"] == "superseded_source_hash"
+    assert completed["marker"]["status"] == "queued"
+    assert completed["marker"]["last_error"] == "superseded_source_hash"
+    assert completed["marker"]["processing_started_at"] == ""
+    assert completed["marker"]["processing_expires_at"] == ""
+    assert completed["marker"]["superseded_at"]
+    assert completed["marker"]["superseded_by_source_hash"] == replacement_hash
+    assert completed["audit"]["result"] == "superseded_source_hash"
 
 
 def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tmp_path):

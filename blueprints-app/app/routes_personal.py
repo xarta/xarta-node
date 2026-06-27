@@ -94,6 +94,11 @@ KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MO
 KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
     "xarta.kanban.processor_marker_blocker.provenance.v1"
 )
+KANBAN_PREPROCESSING_DECOMPOSITION_MOVE_SCHEMA = "xarta.kanban.preprocessing.decomposition_move.v1"
+KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA = (
+    "xarta.kanban.preprocessing.decomposition_blocker.provenance.v1"
+)
+KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA = "xarta.kanban.blocked_leaf_invariant.v1"
 KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID = "kanban-5f930fec1321"
 KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID = "kanban-203acef17b12"
 KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID = "kanban-51aaf9f7eb09"
@@ -345,6 +350,14 @@ class WorkItemCreateRequest(BaseModel):
     related_event_ids: list[str] = []
     related_task_ids: list[str] = []
     related_issue_ids: list[str] = []
+    blocker_title: str | None = None
+    blocker_body: str | None = None
+    blocked_by_ref: str | None = None
+    automation_source_item_id: str | None = None
+    automation_marker_id: str | None = None
+    automation_decision_id: str | None = None
+    automation_reason: str | None = None
+    automation_operation_kind: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -363,6 +376,9 @@ class WorkItemUpdateRequest(BaseModel):
     related_event_ids: list[str] | None = None
     related_task_ids: list[str] | None = None
     related_issue_ids: list[str] | None = None
+    blocker_title: str | None = None
+    blocker_body: str | None = None
+    blocked_by_ref: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -373,6 +389,9 @@ class WorkItemMoveRequest(BaseModel):
     parent_item_id: str | None = None
     state_id: str | None = None
     sort_order: int | None = None
+    blocker_title: str | None = None
+    blocker_body: str | None = None
+    blocked_by_ref: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -556,6 +575,17 @@ class WorkAutomationIdleTickRequest(BaseModel):
     marker_timeout_seconds: int | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-automation-status"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkBlockedLeafInvariantRepairRequest(BaseModel):
+    item_id: str | None = None
+    include_test_entries: bool = True
+    apply: bool = False
+    max_items: int = 500
+    actor: str = "codex"
+    source_surface: str = "kanban-blocked-leaf-repair"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -794,6 +824,27 @@ def _work_request_is_kanban_idle_worker(meta: dict[str, str]) -> bool:
         str(meta.get("source_surface") or "").lower() == "kanban-automation-idle-worker"
         or str(meta.get("actor") or "").lower() == "kanban-idle-worker"
     )
+
+
+def _work_request_is_automation(meta: dict[str, str]) -> bool:
+    actor = str(meta.get("actor") or "").strip().lower()
+    source_surface = str(meta.get("source_surface") or "").strip().lower()
+    automation_surfaces = {
+        "kanban-automation-idle-worker",
+        "kanban-review-processor",
+        "codex-regression-review",
+    }
+    return (
+        _work_request_is_kanban_idle_worker(meta)
+        or source_surface in automation_surfaces
+        or source_surface.startswith("kanban-automation-")
+        or source_surface.startswith("kanban-review-processor")
+        or actor in {"kanban-idle-worker", "kanban-review-processor"}
+    )
+
+
+def _work_request_requires_blocked_leaf_guard(meta: dict[str, str]) -> bool:
+    return _work_request_is_automation(meta)
 
 
 def _work_item_tags_for_request(tags: list[str] | None, meta: dict[str, str]) -> list[str]:
@@ -1928,6 +1979,92 @@ def _preprocessing_count(conn: Any, sql: str, args: tuple[Any, ...]) -> int:
     return int(row["count"] if row else 0)
 
 
+def _work_preprocessing_source_classification(
+    conn: Any,
+    item_row: Any,
+    *,
+    detail: dict[str, Any],
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    discussion_rows = conn.execute(
+        """
+        SELECT body_excerpt FROM kanban_discussions
+        WHERE item_id=? AND status!='archived'
+        ORDER BY updated_at DESC, created_at DESC, discussion_id
+        LIMIT 6
+        """,
+        (item_row["item_id"],),
+    ).fetchall()
+    context_text = "\n".join(
+        [
+            str(item_row["body_excerpt"] or ""),
+            str(detail.get("body") or ""),
+            str(review.get("body") or ""),
+            *[str(row["body_excerpt"] or "") for row in discussion_rows],
+        ]
+    ).lower()
+    title_text = str(item_row["title"] or "").lower()
+    topic_terms = (
+        "topic ancestor",
+        "holding area",
+        "holding-area",
+        "category card",
+        "umbrella",
+        "organize related",
+        "collect related",
+        "topic/container",
+        "broad topic",
+    )
+    concrete_terms = (
+        "proof path",
+        "acceptance",
+        "implement",
+        "fix ",
+        "add ",
+        "test ",
+        "api",
+        "ui",
+        "commit",
+        "deliverable",
+        "regression",
+        "bug",
+    )
+    topic_hits = [term for term in topic_terms if term in context_text]
+    concrete_hits = [term for term in concrete_terms if term in context_text]
+    title_topic_hint = any(term in title_text for term in ("topic", "ancestor", "holding"))
+    classification = "concrete_request"
+    eligible = True
+    reason = "concrete_context"
+    if topic_hits and not concrete_hits:
+        classification = "topic_container"
+        eligible = False
+        reason = "topic_context_without_concrete_proof"
+    elif topic_hits and concrete_hits:
+        classification = "ambiguous_mixed"
+        eligible = False
+        reason = "mixed_topic_and_concrete_context"
+    elif title_topic_hint and not concrete_hits and item_row["state_id"] != "todo":
+        classification = "topic_container"
+        eligible = False
+        reason = "title_topic_hint_with_non_todo_lane_and_no_concrete_context"
+    elif item_row["state_id"] == "backlog" and not concrete_hits:
+        classification = "topic_container"
+        eligible = False
+        reason = "backlog_without_concrete_context"
+    return {
+        "schema": "xarta.kanban.preprocessing.source_classification.v1",
+        "classification": classification,
+        "eligible": eligible,
+        "reason": reason,
+        "evidence": {
+            "topic_context_terms": topic_hits[:8],
+            "concrete_context_terms": concrete_hits[:8],
+            "title_topic_hint": title_topic_hint,
+            "state_id": item_row["state_id"],
+        },
+    }
+
+
 def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, Any]:
     item_id = item_row["item_id"]
     detail = _work_item_detail_document(conn, item_id)
@@ -2042,6 +2179,14 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
         reason = "readiness_marker_stale"
     else:
         reason = "ready"
+    classification = _work_preprocessing_source_classification(
+        conn,
+        item_row,
+        detail=detail,
+        review=review,
+    )
+    if not classification["eligible"] and reason != "ready":
+        reason = f"preprocessing_skipped_{classification['classification']}"
     source_payload = {
         "schema": "xarta.kanban.preprocessing.queue_source.v1",
         "item_id": item_id,
@@ -2063,6 +2208,7 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
             "missing_source_refs": missing_refs,
             "count_drift": count_drift,
         },
+        "classification": classification,
         "reason": reason,
     }
     source_hash = _hash_json_payload(source_payload)
@@ -2072,7 +2218,7 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
         "document_updated_at": max(ref["updated_at"] for ref in source_refs),
         "document_source_hash": source_hash,
         "ready": reason == "ready",
-        "needs_preprocessing": reason != "ready",
+        "needs_preprocessing": reason != "ready" and bool(classification.get("eligible", True)),
     }
 
 
@@ -7837,6 +7983,10 @@ def _write_work_audit(
     metadata: dict[str, Any],
     created_at: str,
 ) -> dict[str, Any]:
+    if _work_request_is_automation(
+        {"actor": actor, "source_surface": source_surface, "run_id": run_id}
+    ) and (not str(request_id or "").strip() or not str(run_id or "").strip()):
+        raise RuntimeError("Kanban automation audit rows require request_id and run_id")
     row = {
         "audit_id": audit_id,
         "actor": actor,
@@ -7880,6 +8030,235 @@ def _write_work_audit(
         row,
     )
     return row
+
+
+def _work_open_blocker_rows(conn: Any, item_id: str) -> list[Any]:
+    return conn.execute(
+        """
+        SELECT * FROM kanban_blockers
+        WHERE item_id=?
+          AND status NOT IN ('resolved', 'closed', 'done')
+        ORDER BY updated_at DESC, blocker_id
+        """,
+        (item_id,),
+    ).fetchall()
+
+
+def _work_open_blocker_count(conn: Any, item_id: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_blockers
+        WHERE item_id=?
+          AND status NOT IN ('resolved', 'closed', 'done')
+        """,
+        (item_id,),
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _work_item_has_non_archived_children(conn: Any, item_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM kanban_items
+        WHERE parent_item_id=? AND status != 'archived'
+        LIMIT 1
+        """,
+        (item_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _work_lane_order_snapshot(
+    conn: Any,
+    parent_item_id: str | None,
+    state_id: str,
+    priority_id: str,
+) -> list[str]:
+    rows = _work_order_group_rows(conn, parent_item_id, state_id, priority_id)
+    return [row["item_id"] for row in _order_work_priority_group(conn, rows)]
+
+
+def _work_blocked_reason_from_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for marker in (
+        "Blocked reason/question:",
+        "Blocked reason:",
+        "Blocked question:",
+        "State: Blocked",
+    ):
+        if marker in text:
+            return _body_excerpt(text.split(marker, 1)[1].strip(), limit=1600)
+    return ""
+
+
+def _work_blocker_payload_from_request(
+    body: Any,
+    *,
+    item_title: str,
+    item_body: str,
+    default_title: str = "",
+) -> dict[str, str] | None:
+    explicit_title = _clean_short_text(getattr(body, "blocker_title", None), "", limit=180)
+    explicit_body = _body_excerpt(getattr(body, "blocker_body", None) or "", limit=4000)
+    blocked_by_ref = _normalize_kanban_graph_ref(getattr(body, "blocked_by_ref", None))
+    if not blocked_by_ref:
+        blocked_by_ref = _clean_short_text(getattr(body, "blocked_by_ref", None), "", limit=220)
+    inferred_body = _work_blocked_reason_from_text(item_body)
+    if not explicit_title and not explicit_body and not inferred_body:
+        return None
+    title = explicit_title or default_title or f"Blocked: {item_title}"
+    body_text = explicit_body or inferred_body or _body_excerpt(item_body, limit=4000)
+    return {
+        "title": title,
+        "body": body_text,
+        "blocked_by_ref": blocked_by_ref,
+    }
+
+
+def _work_blocked_leaf_guard_error(
+    *,
+    item_id: str,
+    operation: str,
+    actor: str,
+    source_surface: str,
+) -> HTTPException:
+    return HTTPException(
+        409,
+        {
+            "error": "kanban_automation_blocked_leaf_requires_blocker",
+            "message": (
+                "Automation may not leave a leaf card in the blocked lane without "
+                "an open, API-visible Blocker row."
+            ),
+            "item_id": item_id,
+            "operation": operation,
+            "actor": actor,
+            "source_surface": source_surface,
+        },
+    )
+
+
+def _upsert_work_blocker_locked(
+    conn: Any,
+    *,
+    item: Any,
+    blocker_id: str | None,
+    title: str,
+    body: str,
+    status: str,
+    blocked_by_ref: str,
+    meta: dict[str, str],
+    now: str,
+    action: str,
+    provenance_extra: dict[str, Any] | None = None,
+    audit_metadata: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    clean_blocker_id = _clean_work_id(blocker_id, "blocker")
+    clean_title = _clean_short_text(title, "", limit=180)
+    if not clean_title:
+        raise HTTPException(400, "Kanban blocker title is required")
+    body_excerpt = _body_excerpt(body or "", limit=4000)
+    blocker_status = _clean_work_leaf_status(status)
+    clean_blocked_by_ref = _normalize_kanban_graph_ref(blocked_by_ref) or _clean_short_text(
+        blocked_by_ref,
+        "",
+        limit=220,
+    )
+    search_text, search_metadata, vector_key = _work_search_payload(
+        table_name="kanban_blockers",
+        row_id=clean_blocker_id,
+        kind="blocker",
+        title=clean_title,
+        body=body_excerpt,
+        related_refs=[clean_blocked_by_ref] if clean_blocked_by_ref else [],
+    )
+    provenance = {
+        "blocker": {"item_id": item["item_id"]},
+        **meta,
+    }
+    if provenance_extra:
+        provenance.update(provenance_extra)
+    source_hash = _hash_json_payload(
+        {
+            "blocker_id": clean_blocker_id,
+            "item_id": item["item_id"],
+            "title": clean_title,
+            "body": body_excerpt,
+            "status": blocker_status,
+            "blocked_by_ref": clean_blocked_by_ref,
+            "provenance_extra": provenance_extra or {},
+        }
+    )
+    previous = conn.execute(
+        "SELECT created_at FROM kanban_blockers WHERE blocker_id=?",
+        (clean_blocker_id,),
+    ).fetchone()
+    created_at = previous["created_at"] if previous and previous["created_at"] else now
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+            search_text, search_metadata_json, embedding_ref, embedding_model,
+            embedding_updated_at, vector_index_key, provenance_json, created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+        ON CONFLICT(blocker_id) DO UPDATE SET
+            item_id=excluded.item_id,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            status=excluded.status,
+            blocked_by_ref=excluded.blocked_by_ref,
+            search_text=excluded.search_text,
+            search_metadata_json=excluded.search_metadata_json,
+            vector_index_key=excluded.vector_index_key,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            clean_blocker_id,
+            item["item_id"],
+            clean_title,
+            body_excerpt,
+            blocker_status,
+            clean_blocked_by_ref,
+            search_text,
+            json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+            vector_key,
+            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            created_at,
+            now,
+        ),
+    )
+    blocker_row = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+        (clean_blocker_id,),
+    ).fetchone()
+    metadata = {
+        "status": blocker_row["status"],
+        "blocked_by_ref": blocker_row["blocked_by_ref"],
+    }
+    if audit_metadata:
+        metadata.update(audit_metadata)
+    audit_row = _write_work_audit(
+        conn,
+        audit_id=f"audit-{uuid.uuid4().hex}",
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+        action=action,
+        target_ref=f"kanban_blockers:{clean_blocker_id}",
+        item_id=item["item_id"],
+        parent_item_id=item["parent_item_id"] or "",
+        created_at=now,
+        request_id=meta["request_id"],
+        run_id=meta["run_id"],
+        result="ok",
+        source_hash=source_hash,
+        metadata=metadata,
+    )
+    return blocker_row, audit_row
 
 
 def _work_scope_item_ids(
@@ -9273,6 +9652,36 @@ def _work_item_payload(
         },
         **_work_request_meta(body),
     }
+    automation_metadata = {
+        "source_item_id": _clean_short_text(
+            getattr(body, "automation_source_item_id", None),
+            "",
+            limit=180,
+        ),
+        "marker_id": _clean_short_text(
+            getattr(body, "automation_marker_id", None),
+            "",
+            limit=180,
+        ),
+        "decision_id": _clean_short_text(
+            getattr(body, "automation_decision_id", None),
+            "",
+            limit=180,
+        ),
+        "reason": _clean_short_text(
+            getattr(body, "automation_reason", None),
+            "",
+            limit=500,
+        ),
+        "operation_kind": _clean_short_text(
+            getattr(body, "automation_operation_kind", None),
+            "",
+            limit=120,
+        ),
+    }
+    automation_metadata = {key: value for key, value in automation_metadata.items() if value}
+    if automation_metadata:
+        provenance["automation"] = automation_metadata
     payload = {
         "item_id": item_id,
         "parent_item_id": parent_id,
@@ -9351,6 +9760,18 @@ def _insert_work_item(
         ),
     )
     item_row = _work_item_or_404(conn, payload["item_id"])
+    automation_metadata = (
+        payload["provenance"].get("automation")
+        if isinstance(payload.get("provenance"), dict)
+        and isinstance(payload["provenance"].get("automation"), dict)
+        else {}
+    )
+    lane_order = _work_lane_order_snapshot(
+        conn,
+        item_row["parent_item_id"],
+        item_row["state_id"],
+        item_row["priority_id"],
+    )
     audit_row = _write_work_audit(
         conn,
         audit_id=audit_id,
@@ -9370,6 +9791,30 @@ def _insert_work_item(
             "priority_id": payload["priority_id"],
             "depth": payload["depth"],
             "promoted_from_ref": payload["promoted_from_ref"],
+            "previous": None,
+            "new": {
+                "parent_item_id": item_row["parent_item_id"] or "",
+                "depth": int(item_row["depth"] or 0),
+                "state_id": item_row["state_id"],
+                "sort_order": int(item_row["sort_order"] or 0),
+                "lane_order": lane_order,
+            },
+            "source_item_id": automation_metadata.get("source_item_id", ""),
+            "marker_id": automation_metadata.get("marker_id", ""),
+            "decision_id": automation_metadata.get("decision_id", ""),
+            "reason": automation_metadata.get("reason", ""),
+            "operation_kind": automation_metadata.get("operation_kind", action),
+            "rollback": {
+                "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                "operation": "archive_created_item",
+                "item_id": payload["item_id"],
+                "endpoint": f"/api/v1/personal/kanban/items/{payload['item_id']}/archive",
+                "method": "POST",
+                "preconditions": [
+                    "item still represents the same created card",
+                    "operator confirms archiving this created card is the intended rollback",
+                ],
+            },
         },
     )
     return item_row, audit_row
@@ -9828,8 +10273,24 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
 async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
     with get_conn() as conn:
         payload = _work_item_payload(conn, body)
+        blocker_payload = None
+        if payload["state_id"] == "blocked" and _work_request_requires_blocked_leaf_guard(meta):
+            blocker_payload = _work_blocker_payload_from_request(
+                body,
+                item_title=payload["title"],
+                item_body=payload["body_excerpt"],
+                default_title=f"Blocked: {payload['title']}",
+            )
+            if blocker_payload is None:
+                raise _work_blocked_leaf_guard_error(
+                    item_id=payload["item_id"],
+                    operation="create_work_item",
+                    actor=meta["actor"],
+                    source_surface=meta["source_surface"],
+                )
         item_row, audit_row = _insert_work_item(
             conn, payload, action="create_work_item", audit_id=audit_id, now=now
         )
@@ -9845,11 +10306,76 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
                 f"{payload['item_id']} depth={item_row['depth']!r} "
                 f"expected={payload['depth']!r}"
             )
+        blocker_row = None
+        blocker_audit_row = None
+        if blocker_payload is not None:
+            blocker_id = f"blocker-{payload['item_id']}-preprocessing"
+            blocker_row, blocker_audit_row = _upsert_work_blocker_locked(
+                conn,
+                item=item_row,
+                blocker_id=blocker_id,
+                title=blocker_payload["title"],
+                body=blocker_payload["body"],
+                status="open",
+                blocked_by_ref=blocker_payload["blocked_by_ref"]
+                or f"kanban_items:{payload['item_id']}",
+                meta=meta,
+                now=now,
+                action="create_work_item_blocker",
+                provenance_extra={
+                    "schema": KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA,
+                    "source_item_id": payload["provenance"]
+                    .get("automation", {})
+                    .get("source_item_id", ""),
+                    "marker_id": payload["provenance"]
+                    .get("automation", {})
+                    .get(
+                        "marker_id",
+                        "",
+                    ),
+                    "reason": payload["provenance"]
+                    .get("automation", {})
+                    .get(
+                        "reason",
+                        "",
+                    ),
+                },
+                audit_metadata={
+                    "schema": KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA,
+                    "created_with_item": True,
+                    "item_state_id": item_row["state_id"],
+                    "rollback": {
+                        "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                        "operation": "resolve_created_blocker",
+                        "blocker_id": blocker_id,
+                        "preconditions": [
+                            "blocked leaf invariant has an alternate open blocker or the item has moved out of blocked",
+                        ],
+                    },
+                },
+            )
         gen = increment_gen(conn, "kanban-item")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_items", payload["item_id"], dict(item_row), gen
         )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        if blocker_row is not None and blocker_audit_row is not None:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                blocker_row["blocker_id"],
+                dict(blocker_row),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                blocker_audit_row["audit_id"],
+                blocker_audit_row,
+                gen,
+            )
     image_associations = _associate_rich_doc_images_for_document(
         domain="kanban",
         markdown=payload["body_excerpt"],
@@ -9863,6 +10389,7 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
         "ok": True,
         "item": _row_to_work_item(item_row),
         "image_associations": image_associations,
+        "created_blocker": _row_to_work_blocker(blocker_row) if blocker_row is not None else None,
         "audit": {"audit_id": audit_id, "action": "create_work_item", "result": "ok"},
     }
 
@@ -9961,6 +10488,26 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             "provenance": provenance,
         }
         payload["source_hash"] = _hash_json_payload(payload)
+        blocker_payload = None
+        if (
+            payload["state_id"] == "blocked"
+            and _work_request_requires_blocked_leaf_guard(meta)
+            and not _work_item_has_non_archived_children(conn, item_id)
+            and _work_open_blocker_count(conn, item_id) <= 0
+        ):
+            blocker_payload = _work_blocker_payload_from_request(
+                body,
+                item_title=payload["title"],
+                item_body=payload["body_excerpt"],
+                default_title=f"Blocked: {payload['title']}",
+            )
+            if blocker_payload is None:
+                raise _work_blocked_leaf_guard_error(
+                    item_id=item_id,
+                    operation="update_work_item",
+                    actor=meta["actor"],
+                    source_surface=meta["source_surface"],
+                )
         conn.execute(
             """
             UPDATE kanban_items
@@ -10013,6 +10560,31 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             now=now,
             meta=meta,
         )
+        blocker_row = None
+        blocker_audit_row = None
+        if blocker_payload is not None:
+            blocker_id = f"blocker-{item_id}-blocked-leaf-guard"
+            blocker_row, blocker_audit_row = _upsert_work_blocker_locked(
+                conn,
+                item=item_row,
+                blocker_id=blocker_id,
+                title=blocker_payload["title"],
+                body=blocker_payload["body"],
+                status="open",
+                blocked_by_ref=blocker_payload["blocked_by_ref"] or f"kanban_items:{item_id}",
+                meta=meta,
+                now=now,
+                action="create_blocked_leaf_guard_blocker",
+                provenance_extra={
+                    "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                    "created_by_guard": "update_work_item",
+                },
+                audit_metadata={
+                    "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                    "created_by_guard": "update_work_item",
+                    "item_state_id": item_row["state_id"],
+                },
+            )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -10040,6 +10612,23 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         for action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        if blocker_row is not None and blocker_audit_row is not None:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                blocker_row["blocker_id"],
+                dict(blocker_row),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                blocker_audit_row["audit_id"],
+                blocker_audit_row,
+                gen,
+            )
     image_associations = (
         _associate_rich_doc_images_for_document(
             domain="kanban",
@@ -10057,6 +10646,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         "ok": True,
         "item": _row_to_work_item(item_row),
         "image_associations": image_associations,
+        "created_blocker": _row_to_work_blocker(blocker_row) if blocker_row is not None else None,
         "audit": {"audit_id": audit_id, "action": "update_work_item", "result": "ok"},
     }
 
@@ -10614,6 +11204,251 @@ async def delete_work_discussion(
     }
 
 
+def _work_subtree_contains(conn: Any, *, ancestor_item_id: str, item_id: str) -> bool:
+    if ancestor_item_id == item_id:
+        return True
+    row = conn.execute(
+        """
+        WITH RECURSIVE descendants(item_id) AS (
+            SELECT item_id FROM kanban_items WHERE item_id=?
+            UNION ALL
+            SELECT w.item_id
+            FROM kanban_items w
+            JOIN descendants ON w.parent_item_id = descendants.item_id
+            WHERE w.status != 'archived'
+        )
+        SELECT 1 FROM descendants WHERE item_id=? LIMIT 1
+        """,
+        (ancestor_item_id, item_id),
+    ).fetchone()
+    return row is not None
+
+
+def _work_preprocessing_scoped_decomposition_reparent(
+    *,
+    item_id: str,
+    target_parent_item_id: str,
+    source_item_id: str,
+    marker_id: str,
+    actor: str,
+    request_id: str,
+    run_id: str,
+    reason: str,
+    operation_kind: str,
+    decision_id: str = "",
+    confirmed_pass_item_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    clean_target_parent = _clean_short_text(target_parent_item_id, "", limit=180)
+    clean_source_item_id = _clean_short_text(source_item_id, "", limit=180)
+    clean_marker_id = _clean_short_text(marker_id, "", limit=180)
+    clean_request_id = _clean_short_text(request_id, "", limit=180)
+    clean_run_id = _clean_short_text(run_id, "", limit=180)
+    clean_reason = _clean_short_text(reason, "", limit=800)
+    clean_operation_kind = _clean_short_text(operation_kind, "", limit=120)
+    if not all(
+        [
+            clean_item_id,
+            clean_target_parent,
+            clean_source_item_id,
+            clean_marker_id,
+            clean_request_id,
+            clean_run_id,
+            clean_reason,
+            clean_operation_kind,
+        ]
+    ):
+        raise HTTPException(
+            400,
+            {
+                "error": "kanban_preprocessing_scoped_move_missing_context",
+                "message": (
+                    "Scoped preprocessing decomposition moves require item, target parent, "
+                    "source item, marker, request/run ids, reason, and operation kind."
+                ),
+            },
+        )
+    if clean_item_id == clean_source_item_id:
+        raise HTTPException(
+            403,
+            {
+                "error": "kanban_preprocessing_cannot_move_source_item",
+                "item_id": clean_item_id,
+                "source_item_id": clean_source_item_id,
+            },
+        )
+    meta = {
+        "actor": _clean_short_text(actor, "kanban-idle-worker", limit=160),
+        "source_surface": "kanban-automation-idle-worker",
+        "request_id": clean_request_id,
+        "run_id": clean_run_id,
+    }
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        source_item = _work_item_or_404(conn, clean_source_item_id)
+        moving_item = _work_item_or_404(conn, clean_item_id)
+        _work_item_or_404(conn, clean_target_parent)
+        classification = _work_preprocessing_source_classification(
+            conn,
+            source_item,
+            detail=_work_item_detail_document(conn, clean_source_item_id),
+            review=_work_item_review_document(conn, clean_source_item_id),
+        )
+        if classification["classification"] != "concrete_request":
+            raise HTTPException(
+                403,
+                {
+                    "error": "kanban_preprocessing_source_not_concrete_request",
+                    "source_item_id": clean_source_item_id,
+                    "classification": classification,
+                },
+            )
+        confirmed = set(confirmed_pass_item_ids or [])
+        moving_in_scope = (
+            _work_subtree_contains(
+                conn,
+                ancestor_item_id=clean_source_item_id,
+                item_id=clean_item_id,
+            )
+            or clean_item_id in confirmed
+        )
+        target_in_scope = _work_subtree_contains(
+            conn,
+            ancestor_item_id=clean_source_item_id,
+            item_id=clean_target_parent,
+        )
+        if not moving_in_scope or not target_in_scope:
+            raise HTTPException(
+                403,
+                {
+                    "error": "kanban_preprocessing_scoped_move_outside_source_subtree",
+                    "item_id": clean_item_id,
+                    "target_parent_item_id": clean_target_parent,
+                    "source_item_id": clean_source_item_id,
+                    "moving_in_scope": moving_in_scope,
+                    "target_in_scope": target_in_scope,
+                },
+            )
+        new_depth = _work_parent_depth(conn, clean_target_parent, moving_item_id=clean_item_id)
+        max_relative = _work_subtree_max_relative_depth(conn, clean_item_id)
+        if new_depth + max_relative > KANBAN_DEPTH_LIMIT:
+            raise HTTPException(400, "Kanban item depth limit exceeded")
+        previous_lane_order = _work_lane_order_snapshot(
+            conn,
+            moving_item["parent_item_id"],
+            moving_item["state_id"],
+            moving_item["priority_id"],
+        )
+        conn.execute(
+            """
+            UPDATE kanban_items
+            SET parent_item_id=?, depth=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (clean_target_parent, new_depth, now, clean_item_id),
+        )
+        _recompute_work_child_depths(conn, clean_item_id, new_depth)
+        moved_rows = conn.execute(
+            """
+            WITH RECURSIVE descendants(item_id) AS (
+                SELECT item_id FROM kanban_items WHERE item_id=?
+                UNION ALL
+                SELECT w.item_id
+                FROM kanban_items w
+                JOIN descendants ON w.parent_item_id = descendants.item_id
+            )
+            SELECT w.* FROM kanban_items w JOIN descendants ON descendants.item_id = w.item_id
+            """,
+            (clean_item_id,),
+        ).fetchall()
+        item_row = next(row for row in moved_rows if row["item_id"] == clean_item_id)
+        order_ids, order_sync_changes = _ensure_work_item_lane_order(
+            conn,
+            clean_item_id,
+            prefer_top_if_new=True,
+            now=now,
+            meta=meta,
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=f"audit-{uuid.uuid4().hex}",
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="preprocessing_decomposition_reparent_item",
+            target_ref=f"kanban_items:{clean_item_id}",
+            item_id=clean_item_id,
+            parent_item_id=clean_target_parent,
+            created_at=now,
+            request_id=clean_request_id,
+            run_id=clean_run_id,
+            result="ok",
+            source_hash=item_row["source_hash"],
+            metadata={
+                "schema": KANBAN_PREPROCESSING_DECOMPOSITION_MOVE_SCHEMA,
+                "source_item_id": clean_source_item_id,
+                "marker_id": clean_marker_id,
+                "decision_id": _clean_short_text(decision_id, "", limit=180),
+                "reason": clean_reason,
+                "operation_kind": clean_operation_kind,
+                "classification": classification,
+                "previous": {
+                    "parent_item_id": moving_item["parent_item_id"] or "",
+                    "depth": int(moving_item["depth"] or 0),
+                    "state_id": moving_item["state_id"],
+                    "sort_order": int(moving_item["sort_order"] or 0),
+                    "lane_order": previous_lane_order,
+                },
+                "new": {
+                    "parent_item_id": item_row["parent_item_id"] or "",
+                    "depth": int(item_row["depth"] or 0),
+                    "state_id": item_row["state_id"],
+                    "sort_order": int(item_row["sort_order"] or 0),
+                    "lane_order": order_ids,
+                },
+                "rollback": {
+                    "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                    "operation": "move_item",
+                    "item_id": clean_item_id,
+                    "parent_item_id": moving_item["parent_item_id"] or "",
+                    "state_id": moving_item["state_id"],
+                    "sort_order": int(moving_item["sort_order"] or 0),
+                    "endpoint": f"/api/v1/personal/kanban/items/{clean_item_id}/move",
+                    "method": "POST",
+                    "preconditions": [
+                        "item still represents the same moved card",
+                        "operator confirms this scoped decomposition move should be rolled back",
+                    ],
+                },
+            },
+        )
+        gen = increment_gen(conn, "kanban-preprocessing-decomposition-move")
+        for row in moved_rows:
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_items", row["item_id"], dict(row), gen)
+        for action, row_id, row_data in order_sync_changes:
+            enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_audit_log",
+            audit_row["audit_id"],
+            audit_row,
+            gen,
+        )
+    return {
+        "ok": True,
+        "schema": KANBAN_PREPROCESSING_DECOMPOSITION_MOVE_SCHEMA,
+        "item": _row_to_work_item(item_row),
+        "source_item_id": clean_source_item_id,
+        "target_parent_item_id": clean_target_parent,
+        "audit": {
+            "audit_id": audit_row["audit_id"],
+            "action": "preprocessing_decomposition_reparent_item",
+            "result": "ok",
+        },
+    }
+
+
 @router.post("/kanban/items/{item_id}/move")
 async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, Any]:
     now = _utc_now_iso()
@@ -10665,6 +11500,32 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         max_relative = _work_subtree_max_relative_depth(conn, item_id)
         if new_depth + max_relative > KANBAN_DEPTH_LIMIT:
             raise HTTPException(400, "Kanban item depth limit exceeded")
+        blocker_payload = None
+        if (
+            state["state_id"] == "blocked"
+            and _work_request_requires_blocked_leaf_guard(meta)
+            and not _work_item_has_non_archived_children(conn, item_id)
+            and _work_open_blocker_count(conn, item_id) <= 0
+        ):
+            blocker_payload = _work_blocker_payload_from_request(
+                body,
+                item_title=existing["title"],
+                item_body=existing["body_excerpt"],
+                default_title=f"Blocked: {existing['title']}",
+            )
+            if blocker_payload is None:
+                raise _work_blocked_leaf_guard_error(
+                    item_id=item_id,
+                    operation="move_work_item",
+                    actor=meta["actor"],
+                    source_surface=meta["source_surface"],
+                )
+        previous_lane_order = _work_lane_order_snapshot(
+            conn,
+            existing["parent_item_id"],
+            existing["state_id"],
+            existing["priority_id"],
+        )
         conn.execute(
             """
             UPDATE kanban_items
@@ -10707,6 +11568,31 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             now=now,
             meta=meta,
         )
+        blocker_row = None
+        blocker_audit_row = None
+        if blocker_payload is not None:
+            blocker_id = f"blocker-{item_id}-blocked-leaf-guard"
+            blocker_row, blocker_audit_row = _upsert_work_blocker_locked(
+                conn,
+                item=item_row,
+                blocker_id=blocker_id,
+                title=blocker_payload["title"],
+                body=blocker_payload["body"],
+                status="open",
+                blocked_by_ref=blocker_payload["blocked_by_ref"] or f"kanban_items:{item_id}",
+                meta=meta,
+                now=now,
+                action="create_blocked_leaf_guard_blocker",
+                provenance_extra={
+                    "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                    "created_by_guard": "move_work_item",
+                },
+                audit_metadata={
+                    "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                    "created_by_guard": "move_work_item",
+                    "item_state_id": item_row["state_id"],
+                },
+            )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -10727,6 +11613,34 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
                 "state_id": state["state_id"],
                 "depth": new_depth,
                 "lane_order": order_ids,
+                "previous": {
+                    "parent_item_id": existing["parent_item_id"] or "",
+                    "depth": int(existing["depth"] or 0),
+                    "state_id": existing["state_id"],
+                    "sort_order": int(existing["sort_order"] or 0),
+                    "lane_order": previous_lane_order,
+                },
+                "new": {
+                    "parent_item_id": item_row["parent_item_id"] or "",
+                    "depth": int(item_row["depth"] or 0),
+                    "state_id": item_row["state_id"],
+                    "sort_order": int(item_row["sort_order"] or 0),
+                    "lane_order": order_ids,
+                },
+                "rollback": {
+                    "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                    "operation": "move_item",
+                    "item_id": item_id,
+                    "parent_item_id": existing["parent_item_id"] or "",
+                    "state_id": existing["state_id"],
+                    "sort_order": int(existing["sort_order"] or 0),
+                    "endpoint": f"/api/v1/personal/kanban/items/{item_id}/move",
+                    "method": "POST",
+                    "preconditions": [
+                        "item still represents the same card",
+                        "operator confirms this move should be rolled back",
+                    ],
+                },
             },
         )
         gen = increment_gen(conn, "kanban-item")
@@ -10735,6 +11649,23 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         for action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        if blocker_row is not None and blocker_audit_row is not None:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                blocker_row["blocker_id"],
+                dict(blocker_row),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                blocker_audit_row["audit_id"],
+                blocker_audit_row,
+                gen,
+            )
     if os.getenv("PYTEST_CURRENT_TEST"):
         browser_refresh = {
             "ok": True,
@@ -10762,6 +11693,7 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         "ok": True,
         "item": _row_to_work_item(item_row),
         "audit": {"audit_id": audit_id, "action": "move_work_item", "result": "ok"},
+        "created_blocker": _row_to_work_blocker(blocker_row) if blocker_row is not None else None,
         "browser_refresh": browser_refresh,
     }
 
@@ -10910,6 +11842,485 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
 async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
+
+
+def _work_audit_rollback_recipe(row: Any) -> dict[str, Any]:
+    metadata = _json_value(row["metadata_json"], {})
+    rollback = metadata.get("rollback") if isinstance(metadata, dict) else None
+    if isinstance(rollback, dict) and rollback.get("operation"):
+        return rollback
+    action = row["action"]
+    if action == "move_work_item":
+        return {
+            "schema": "xarta.kanban.audit.rollback_recipe.v1",
+            "operation": "move_item",
+            "item_id": row["item_id"],
+            "parent_item_id": metadata.get("from_parent_item_id") or "",
+            "state_id": (metadata.get("previous") or {}).get("state_id")
+            if isinstance(metadata.get("previous"), dict)
+            else "",
+            "sort_order": (metadata.get("previous") or {}).get("sort_order")
+            if isinstance(metadata.get("previous"), dict)
+            else None,
+            "endpoint": f"/api/v1/personal/kanban/items/{row['item_id']}/move",
+            "method": "POST",
+        }
+    if action in {"create_work_item", "create_work_issue", "create_work_todo"}:
+        return {
+            "schema": "xarta.kanban.audit.rollback_recipe.v1",
+            "operation": "archive_created_item",
+            "item_id": row["item_id"],
+            "endpoint": f"/api/v1/personal/kanban/items/{row['item_id']}/archive",
+            "method": "POST",
+        }
+    return {}
+
+
+def _row_to_work_audit_export(row: Any) -> dict[str, Any]:
+    metadata = _json_value(row["metadata_json"], {})
+    return {
+        "audit_id": row["audit_id"],
+        "actor": row["actor"],
+        "source_surface": row["source_surface"],
+        "action": row["action"],
+        "target_ref": row["target_ref"],
+        "item_id": row["item_id"],
+        "parent_item_id": row["parent_item_id"],
+        "created_at": row["created_at"],
+        "request_id": row["request_id"],
+        "run_id": row["run_id"],
+        "result": row["result"],
+        "source_hash": row["source_hash"],
+        "metadata": metadata,
+        "rollback": _work_audit_rollback_recipe(row),
+    }
+
+
+@router.get("/kanban/audit")
+async def list_work_audit_log(
+    item_id: str = "",
+    run_id: str = "",
+    action: str = "",
+    target_ref: str = "",
+    actor: str = "",
+    source_surface: str = "",
+    since: str = "",
+    until: str = "",
+    limit: int = 500,
+) -> dict[str, Any]:
+    clean_limit = max(1, min(int(limit or 500), 5000))
+    clauses: list[str] = []
+    args: list[Any] = []
+    filters = {
+        "item_id": _clean_short_text(item_id, "", limit=180),
+        "run_id": _clean_short_text(run_id, "", limit=180),
+        "action": _clean_short_text(action, "", limit=180),
+        "target_ref": _clean_short_text(target_ref, "", limit=240),
+        "actor": _clean_short_text(actor, "", limit=180),
+        "source_surface": _clean_short_text(source_surface, "", limit=180),
+        "since": _clean_short_text(since, "", limit=80),
+        "until": _clean_short_text(until, "", limit=80),
+    }
+    for key in ("item_id", "run_id", "action", "target_ref", "actor", "source_surface"):
+        if filters[key]:
+            clauses.append(f"{key}=?")
+            args.append(filters[key])
+    if filters["since"]:
+        clauses.append("created_at>=?")
+        args.append(filters["since"])
+    if filters["until"]:
+        clauses.append("created_at<=?")
+        args.append(filters["until"])
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM kanban_audit_log
+            {where}
+            ORDER BY created_at DESC, audit_id DESC
+            LIMIT ?
+            """,
+            (*args, clean_limit),
+        ).fetchall()
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.audit_export.v1",
+        "filters": filters,
+        "count": len(rows),
+        "audit": [_row_to_work_audit_export(row) for row in rows],
+    }
+
+
+def _work_blocked_leaf_repair_blocker_id(item_id: str) -> str:
+    digest = hashlib.sha256(f"blocked-leaf-invariant\n{item_id}".encode("utf-8")).hexdigest()
+    return f"blocker-blocked-leaf-{digest[:24]}"
+
+
+def _work_blocked_leaf_invariant_rows(
+    conn: Any,
+    *,
+    item_id: str = "",
+    include_test_entries: bool = True,
+    limit: int = 500,
+) -> list[Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    args: list[Any] = []
+    scope_join = ""
+    scope_where = ""
+    if clean_item_id:
+        _work_item_or_404(conn, clean_item_id)
+        scope_join = """
+        WITH RECURSIVE scope(item_id) AS (
+            SELECT item_id FROM kanban_items WHERE item_id=?
+            UNION ALL
+            SELECT child.item_id
+            FROM kanban_items child
+            JOIN scope ON child.parent_item_id = scope.item_id
+            WHERE child.status != 'archived'
+        )
+        """
+        scope_where = "AND item.item_id IN (SELECT item_id FROM scope)"
+        args.append(clean_item_id)
+    rows = conn.execute(
+        f"""
+        {scope_join}
+        SELECT item.* FROM kanban_items item
+        WHERE item.status != 'archived'
+          AND item.state_id='blocked'
+          {scope_where}
+          AND NOT EXISTS (
+              SELECT 1 FROM kanban_items child
+              WHERE child.parent_item_id=item.item_id
+                AND child.status != 'archived'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM kanban_blockers blocker
+              WHERE blocker.item_id=item.item_id
+                AND blocker.status NOT IN ('resolved', 'closed', 'done')
+          )
+        ORDER BY item.updated_at ASC, item.item_id
+        LIMIT ?
+        """,
+        (*args, max(1, min(int(limit or 500), 5000))),
+    ).fetchall()
+    if include_test_entries:
+        return rows
+    visible, _hidden = _filter_work_test_rows(rows, False)
+    return visible
+
+
+def _work_blocked_leaf_repair_plan(conn: Any, row: Any) -> dict[str, Any]:
+    body = str(row["body_excerpt"] or "")
+    provenance = _json_value(row["provenance_json"], {})
+    recent_audit = conn.execute(
+        """
+        SELECT * FROM kanban_audit_log
+        WHERE item_id=? OR target_ref=?
+        ORDER BY created_at DESC, audit_id DESC
+        LIMIT 12
+        """,
+        (row["item_id"], f"kanban_items:{row['item_id']}"),
+    ).fetchall()
+    audit_surfaces = [audit["source_surface"] for audit in recent_audit]
+    preprocessing_evidence = (
+        body.startswith("Preprocessing child of ")
+        or provenance.get("source_surface") == "kanban-automation-idle-worker"
+        or "kanban-automation-idle-worker" in audit_surfaces
+    )
+    blocked_reason = _work_blocked_reason_from_text(body)
+    lower_body = body.lower()
+    dependency_evidence = any(
+        term in lower_body
+        for term in ("blocked", "operator decision", "operator input", "dependency", "waiting")
+    )
+    if preprocessing_evidence and (blocked_reason or dependency_evidence):
+        classification = "preprocessing_blocked_child"
+        action = "create_blocker"
+        reason = blocked_reason or _body_excerpt(body, limit=1200)
+        title = f"Preprocessing blocker/question: {row['title']}"
+    elif not dependency_evidence:
+        classification = "not_actually_blocked"
+        action = "move_to_todo"
+        reason = "Blocked lane has no blocker evidence in body/provenance/audit."
+        title = ""
+    else:
+        classification = "ambiguous_blocked_leaf"
+        action = "create_blocker"
+        reason = blocked_reason or _body_excerpt(body, limit=1200)
+        title = f"Blocked leaf needs visible blocker: {row['title']}"
+    return {
+        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+        "item": _row_to_work_item(row),
+        "classification": classification,
+        "action": action,
+        "reason": reason,
+        "blocker": {
+            "blocker_id": _work_blocked_leaf_repair_blocker_id(row["item_id"]),
+            "title": title,
+            "body": reason,
+            "blocked_by_ref": f"kanban_items:{row['item_id']}",
+        }
+        if action == "create_blocker"
+        else None,
+        "move": {
+            "state_id": "todo",
+            "reason": reason,
+        }
+        if action == "move_to_todo"
+        else None,
+        "evidence": {
+            "preprocessing_evidence": preprocessing_evidence,
+            "blocked_reason": blocked_reason,
+            "dependency_evidence": dependency_evidence,
+            "recent_audit": [_row_to_work_audit_export(audit) for audit in recent_audit],
+        },
+    }
+
+
+@router.get("/kanban/automation/blocked-leaf-invariant/audit")
+async def audit_work_blocked_leaf_invariant(
+    item_id: str = "",
+    include_test_entries: bool = True,
+    limit: int = 500,
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        rows = _work_blocked_leaf_invariant_rows(
+            conn,
+            item_id=item_id,
+            include_test_entries=include_test_entries,
+            limit=limit,
+        )
+        findings = [_work_blocked_leaf_repair_plan(conn, row) for row in rows]
+    return {
+        "ok": True,
+        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+        "item_id": _clean_short_text(item_id, "", limit=180),
+        "include_test_entries": include_test_entries,
+        "count": len(findings),
+        "findings": findings,
+    }
+
+
+@router.post("/kanban/automation/blocked-leaf-invariant/repair")
+async def repair_work_blocked_leaf_invariant(
+    body: WorkBlockedLeafInvariantRepairRequest,
+) -> dict[str, Any]:
+    meta = _work_request_meta(body)
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        rows = _work_blocked_leaf_invariant_rows(
+            conn,
+            item_id=_clean_short_text(body.item_id, "", limit=180),
+            include_test_entries=bool(body.include_test_entries),
+            limit=body.max_items,
+        )
+        plans = [_work_blocked_leaf_repair_plan(conn, row) for row in rows]
+        if not body.apply:
+            return {
+                "ok": True,
+                "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                "applied": False,
+                "count": len(plans),
+                "plans": plans,
+            }
+        conn.execute("BEGIN IMMEDIATE")
+        repaired: list[dict[str, Any]] = []
+        changed_blockers: list[tuple[Any, dict[str, Any]]] = []
+        changed_items: list[tuple[Any, dict[str, Any]]] = []
+        for plan in plans:
+            item_id = plan["item"]["item_id"]
+            item = _work_item_or_404(conn, item_id)
+            if (
+                item["state_id"] != "blocked"
+                or _work_item_has_non_archived_children(conn, item_id)
+                or _work_open_blocker_count(conn, item_id) > 0
+            ):
+                repaired.append({**plan, "applied": False, "skip_reason": "already_current"})
+                continue
+            if plan["action"] == "create_blocker":
+                blocker_plan = plan["blocker"] or {}
+                blocker_row, blocker_audit = _upsert_work_blocker_locked(
+                    conn,
+                    item=item,
+                    blocker_id=blocker_plan.get("blocker_id"),
+                    title=blocker_plan.get("title") or f"Blocked: {item['title']}",
+                    body="\n\n".join(
+                        part
+                        for part in [
+                            blocker_plan.get("body") or plan.get("reason") or "",
+                            (
+                                "Repair note: created because this leaf was in `blocked` "
+                                "with zero open API-visible Blocker rows."
+                            ),
+                        ]
+                        if part
+                    ),
+                    status="open",
+                    blocked_by_ref=blocker_plan.get("blocked_by_ref") or f"kanban_items:{item_id}",
+                    meta=meta,
+                    now=now,
+                    action="repair_blocked_leaf_missing_blocker",
+                    provenance_extra={
+                        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                        "repair_source_surface": meta["source_surface"],
+                        "classification": plan["classification"],
+                    },
+                    audit_metadata={
+                        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                        "classification": plan["classification"],
+                        "source_evidence": plan["evidence"],
+                        "before": {
+                            "state_id": item["state_id"],
+                            "open_blocker_count": 0,
+                            "parent_item_id": item["parent_item_id"] or "",
+                        },
+                        "after": {
+                            "state_id": item["state_id"],
+                            "open_blocker_count": 1,
+                            "blocker_id": blocker_plan.get("blocker_id"),
+                        },
+                        "rollback": {
+                            "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                            "operation": "resolve_created_blocker",
+                            "blocker_id": blocker_plan.get("blocker_id"),
+                            "preconditions": [
+                                "item is no longer blocked or has another open blocker",
+                            ],
+                        },
+                    },
+                )
+                changed_blockers.append((blocker_row, blocker_audit))
+                repaired.append({**plan, "applied": True, "blocker_id": blocker_row["blocker_id"]})
+            elif plan["action"] == "move_to_todo":
+                previous_lane_order = _work_lane_order_snapshot(
+                    conn,
+                    item["parent_item_id"],
+                    item["state_id"],
+                    item["priority_id"],
+                )
+                target_state = _require_work_state(conn, "todo")
+                conn.execute(
+                    """
+                    UPDATE kanban_items
+                    SET state_id='todo', status=?, updated_at=?
+                    WHERE item_id=?
+                    """,
+                    (_work_status_for_state(target_state), now, item_id),
+                )
+                item_row = _work_item_or_404(conn, item_id)
+                order_ids, order_sync_changes = _ensure_work_item_lane_order(
+                    conn,
+                    item_id,
+                    prefer_top_if_new=True,
+                    now=now,
+                    meta=meta,
+                )
+                audit_row = _write_work_audit(
+                    conn,
+                    audit_id=f"audit-{uuid.uuid4().hex}",
+                    actor=meta["actor"],
+                    source_surface=meta["source_surface"],
+                    action="repair_blocked_leaf_move_to_todo",
+                    target_ref=f"kanban_items:{item_id}",
+                    item_id=item_id,
+                    parent_item_id=item_row["parent_item_id"] or "",
+                    created_at=now,
+                    request_id=meta["request_id"],
+                    run_id=meta["run_id"],
+                    result="ok",
+                    source_hash=item_row["source_hash"],
+                    metadata={
+                        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+                        "classification": plan["classification"],
+                        "source_evidence": plan["evidence"],
+                        "before": {
+                            "state_id": "blocked",
+                            "open_blocker_count": 0,
+                            "lane_order": previous_lane_order,
+                        },
+                        "after": {
+                            "state_id": "todo",
+                            "lane_order": order_ids,
+                        },
+                        "rollback": {
+                            "schema": "xarta.kanban.audit.rollback_recipe.v1",
+                            "operation": "move_item",
+                            "item_id": item_id,
+                            "state_id": "blocked",
+                            "endpoint": f"/api/v1/personal/kanban/items/{item_id}/move",
+                            "method": "POST",
+                        },
+                    },
+                )
+                changed_items.append((item_row, audit_row))
+                for order_action, row_id, row_data in order_sync_changes:
+                    changed_items.append(
+                        (
+                            {"_order_action": order_action, "row_id": row_id, "row_data": row_data},
+                            {},
+                        )
+                    )
+                repaired.append({**plan, "applied": True, "state_id": "todo"})
+        gen = increment_gen(conn, "kanban-blocked-leaf-repair")
+        for blocker_row, blocker_audit in changed_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                blocker_row["blocker_id"],
+                dict(blocker_row),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                blocker_audit["audit_id"],
+                blocker_audit,
+                gen,
+            )
+        for item_row, item_audit in changed_items:
+            if isinstance(item_row, dict) and "_order_action" in item_row:
+                enqueue_for_all_peers(
+                    conn,
+                    item_row["_order_action"],
+                    "kanban_item_order_edges",
+                    item_row["row_id"],
+                    item_row["row_data"],
+                    gen,
+                )
+                continue
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_items",
+                item_row["item_id"],
+                dict(item_row),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                item_audit["audit_id"],
+                item_audit,
+                gen,
+            )
+        after_rows = _work_blocked_leaf_invariant_rows(
+            conn,
+            item_id=_clean_short_text(body.item_id, "", limit=180),
+            include_test_entries=bool(body.include_test_entries),
+            limit=body.max_items,
+        )
+    return {
+        "ok": True,
+        "schema": KANBAN_BLOCKED_LEAF_INVARIANT_SCHEMA,
+        "applied": True,
+        "before_count": len(plans),
+        "after_count": len(after_rows),
+        "repaired_count": len([entry for entry in repaired if entry.get("applied")]),
+        "repairs": repaired,
+    }
 
 
 @router.get("/kanban/items/{item_id}/issues")
@@ -12014,7 +13425,9 @@ def _work_preprocessing_normalise_decomposition_items(
             raise ValueError(f"local AI decomposition_items[{index}] missing required field: title")
         title_key = _work_preprocessing_title_key(title)
         if title_key in seen_titles:
-            continue
+            raise ValueError(
+                f"local AI decomposition_items[{index}] duplicates another child title"
+            )
         seen_titles.add(title_key)
         state_id = _clean_work_preprocessing_state(candidate.get("state_id"))
         blocked_reason = _body_excerpt(str(candidate.get("blocked_reason") or ""), limit=800)
@@ -12127,6 +13540,19 @@ async def _work_preprocessing_create_decomposition_children(
                 state_id=candidate["state_id"],
                 priority_id=candidate["priority_id"],
                 tags=candidate["tags"],
+                blocker_title=(
+                    f"Preprocessing blocker/question: {candidate['title']}"
+                    if candidate["state_id"] == "blocked"
+                    else None
+                ),
+                blocker_body=candidate["blocked_reason"] or None,
+                blocked_by_ref=f"kanban_review_processor_markers:{marker_id}",
+                automation_source_item_id=parent_item_id,
+                automation_marker_id=marker_id,
+                automation_reason=(
+                    candidate["blocked_reason"] or "preprocessing_decomposition_child"
+                ),
+                automation_operation_kind="preprocessing_create_child",
                 actor=holder_id,
                 source_surface="kanban-automation-idle-worker",
                 request_id=f"{run_id}-preprocess-child-{marker_id}-{item_id}",
@@ -12895,20 +14321,35 @@ async def run_work_kanban_automation_idle_tick(
                     run_id=run_id,
                 )
             )
-            claimed = await claim_next_work_review_processor_marker(
-                WorkReviewProcessorMarkerClaimRequest(
-                    holder_id=clean_holder_id,
-                    lease_token=lease_token,
-                    item_id=clean_item_id or None,
-                    timeout_seconds=timeout_seconds,
-                    eligible_marker_ids=eligible_marker_ids,
-                    actor=clean_holder_id,
-                    source_surface="kanban-automation-idle-worker",
-                    request_id=f"{run_id}-claim-{index}",
-                    run_id=run_id,
-                    metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            try:
+                claimed = await claim_next_work_review_processor_marker(
+                    WorkReviewProcessorMarkerClaimRequest(
+                        holder_id=clean_holder_id,
+                        lease_token=lease_token,
+                        item_id=clean_item_id or None,
+                        timeout_seconds=timeout_seconds,
+                        eligible_marker_ids=eligible_marker_ids,
+                        actor=clean_holder_id,
+                        source_surface="kanban-automation-idle-worker",
+                        request_id=f"{run_id}-claim-{index}",
+                        run_id=run_id,
+                        metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+                    )
                 )
-            )
+            except HTTPException as exc:
+                detail = str(exc.detail or "")
+                if exc.status_code == 409 and "lease" in detail.lower():
+                    claim_results.append(
+                        {
+                            "claimed": False,
+                            "reason": "lease_not_active_during_claim",
+                            "detail": detail,
+                            "marker_id": "",
+                            "processor_kind": "",
+                        }
+                    )
+                    break
+                raise
             claim_results.append(
                 {
                     "claimed": bool(claimed.get("claimed")),
@@ -13369,7 +14810,7 @@ async def trigger_work_preprocessing_idle_scan(
                 existing is not None
                 and existing["processed_source_hash"] == source["document_source_hash"]
             )
-            if source["ready"]:
+            if source["ready"] or not source.get("needs_preprocessing", True):
                 current_ready += 1
                 if existing is not None and existing["status"] in {
                     "queued",
@@ -13790,11 +15231,99 @@ async def complete_work_review_processor_marker(
                 "marker": _row_to_work_review_processor_marker(marker_row),
             }
         if expected_source_hash and expected_source_hash != marker_row["document_source_hash"]:
+            saved_row = _write_work_review_processor_marker(
+                conn,
+                _work_review_processor_marker_update_row(
+                    marker_row,
+                    updates={
+                        "status": "queued",
+                        "queued_at": now,
+                        "last_seen_at": now,
+                        "processing_started_at": "",
+                        "processing_expires_at": "",
+                        "last_error": "superseded_source_hash",
+                        "superseded_at": now,
+                        "superseded_by_source_hash": marker_row["document_source_hash"],
+                    },
+                    meta=meta,
+                    now=now,
+                    reason="superseded_source_hash_requeued",
+                    metadata={
+                        **dict(body.metadata or {}),
+                        "holder_id": holder_id,
+                        "lease_id": lease_row["lease_id"],
+                        "expected_document_source_hash": expected_source_hash,
+                        "current_document_source_hash": marker_row["document_source_hash"],
+                        "last_outcome_at": now,
+                        "last_outcome_status": "superseded_source_hash_requeued",
+                    },
+                ),
+            )
+            marker_blocker = _upsert_work_processor_marker_blocker(
+                conn,
+                saved_row,
+                meta=meta,
+                now=now,
+            )
+            audit_row = _write_work_audit(
+                conn,
+                audit_id=audit_id,
+                actor=meta["actor"],
+                source_surface=meta["source_surface"],
+                action="complete_review_processor_marker",
+                target_ref=f"kanban_review_processor_markers:{saved_row['marker_id']}",
+                item_id=saved_row["item_id"],
+                parent_item_id="",
+                created_at=now,
+                request_id=meta["request_id"],
+                run_id=meta["run_id"],
+                result="superseded_source_hash",
+                source_hash=saved_row["source_hash"],
+                metadata={
+                    "holder_id": holder_id,
+                    "lease_id": lease_row["lease_id"],
+                    "expected_document_source_hash": expected_source_hash,
+                    "current_document_source_hash": marker_row["document_source_hash"],
+                    "requeued": True,
+                },
+            )
+            gen = increment_gen(conn, "kanban-review-marker-complete-superseded")
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                saved_row["marker_id"],
+                dict(saved_row),
+                gen,
+            )
+            if marker_blocker is not None:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_blockers",
+                    marker_blocker["blocker_row"]["blocker_id"],
+                    dict(marker_blocker["blocker_row"]),
+                    gen,
+                )
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_audit_log",
+                    marker_blocker["audit_row"]["audit_id"],
+                    marker_blocker["audit_row"],
+                    gen,
+                )
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
             return {
                 "ok": True,
                 "completed": False,
                 "reason": "superseded_source_hash",
-                "marker": _row_to_work_review_processor_marker(marker_row),
+                "marker": _row_to_work_review_processor_marker(saved_row),
+                "audit": {
+                    "audit_id": audit_id,
+                    "action": "complete_review_processor_marker",
+                    "result": "superseded_source_hash",
+                },
             }
         decision_id = _clean_short_text(
             body.decision_id or marker_row["decision_id"], "", limit=180
@@ -15251,6 +16780,34 @@ def _upsert_work_blocker(
         blocked_by_ref = _normalize_kanban_graph_ref(body.blocked_by_ref) or _clean_short_text(
             body.blocked_by_ref, "", limit=220
         )
+        blocker_status = _clean_work_leaf_status(body.status)
+        previous = conn.execute(
+            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+            (clean_blocker_id,),
+        ).fetchone()
+        if (
+            previous is not None
+            and _work_request_requires_blocked_leaf_guard(meta)
+            and blocker_status in {"resolved", "closed", "done"}
+            and str(previous["status"] or "") not in {"resolved", "closed", "done"}
+            and item["state_id"] == "blocked"
+            and not _work_item_has_non_archived_children(conn, body.item_id)
+            and _work_open_blocker_count(conn, body.item_id) <= 1
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "error": "kanban_automation_cannot_resolve_last_blocker_on_blocked_leaf",
+                    "message": (
+                        "Automation may not resolve the last open blocker while "
+                        "leaving a leaf card in the blocked lane."
+                    ),
+                    "item_id": body.item_id,
+                    "blocker_id": clean_blocker_id,
+                    "actor": meta["actor"],
+                    "source_surface": meta["source_surface"],
+                },
+            )
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_blockers",
             row_id=clean_blocker_id,
@@ -15266,13 +16823,10 @@ def _upsert_work_blocker(
                 "item_id": body.item_id,
                 "title": title,
                 "body": body_excerpt,
-                "status": body.status,
+                "status": blocker_status,
                 "blocked_by_ref": blocked_by_ref,
             }
         )
-        previous = conn.execute(
-            "SELECT created_at FROM kanban_blockers WHERE blocker_id=?", (clean_blocker_id,)
-        ).fetchone()
         created_at = previous["created_at"] if previous and previous["created_at"] else now
         conn.execute(
             """
@@ -15300,7 +16854,7 @@ def _upsert_work_blocker(
                 body.item_id,
                 title,
                 body_excerpt,
-                _clean_work_leaf_status(body.status),
+                blocker_status,
                 blocked_by_ref,
                 search_text,
                 json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
