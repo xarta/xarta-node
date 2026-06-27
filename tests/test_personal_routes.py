@@ -3517,6 +3517,9 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
             "2026-06-27T04:05:00Z",
             "2026-06-27T04:06:00Z",
             "2026-06-27T04:07:00Z",
+            "2026-06-27T04:08:00Z",
+            "2026-06-27T04:09:00Z",
+            "2026-06-27T04:10:00Z",
         ]
     )
     monkeypatch.setattr(
@@ -3629,6 +3632,43 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
     assert attribution["outcome_ref"] == "discussion:outcome-one"
     assert attribution["agent_session"]["item_id"] == "work-review-feedback-child"
     assert attribution["agent_session"]["metadata"]["slice"] == "feedback-session-attribution"
+    first_processor = first["review_processor"]
+    assert first_processor["schema"] == routes_personal.KANBAN_REVIEW_SCHEDULER_SCHEMA
+    assert first_processor["action"] == "queued"
+    assert first_processor["queued"] is True
+    first_marker = first_processor["marker"]
+    assert first_marker["status"] == "queued"
+    assert first_marker["item_id"] == "work-review-feedback"
+    assert first_marker["metadata"]["reason"] == "operator_feedback_captured"
+    assert first_marker["metadata"]["feedback_id"] == "kanban-feedback-one"
+
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-feedback",
+                item_id="work-review-feedback",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-processor-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-feedback",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-feedback",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-processor-claim",
+            )
+        )
+    )
+    assert claimed["claimed"] is True
+    assert claimed["marker"]["status"] == "processing"
 
     second = asyncio.run(
         routes_personal.append_work_item_review_feedback(
@@ -3652,6 +3692,18 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
         "kanban-feedback-two",
     ]
     assert "Discussion-selected feedback also belongs in Review." in second_doc["body"]
+    second_processor = second["review_processor"]
+    assert second_processor["action"] == "queued"
+    assert second_processor["queued"] is True
+    second_marker = second_processor["marker"]
+    assert second_marker["status"] == "queued"
+    assert second_marker["attempt_count"] == 1
+    assert second_marker["last_error"] == "review_changed_during_processing"
+    assert second_marker["superseded_at"]
+    assert second_marker["superseded_by_source_hash"] == second_marker["document_source_hash"]
+    assert second_marker["metadata"]["superseded_processing_attempt"] is True
+    assert second_marker["metadata"]["feedback_id"] == "kanban-feedback-two"
+    assert second_marker["document_source_hash"] != first_marker["document_source_hash"]
 
     preserved = asyncio.run(
         routes_personal.update_work_item_review_document(
@@ -3706,6 +3758,7 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
+    assert "kanban_review_processor_markers" in sync_tables
     assert "kanban_audit_log" in sync_tables
 
 

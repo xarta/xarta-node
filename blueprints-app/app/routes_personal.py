@@ -2303,6 +2303,89 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
     ).fetchone()
 
 
+def _schedule_work_review_processor_marker_for_document(
+    conn: Any,
+    *,
+    item_id: str,
+    document: dict[str, Any],
+    meta: dict[str, str],
+    now: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    document_source = _review_document_source(document)
+    marker_id = _review_processor_marker_id(item_id)
+    existing = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+        (marker_id,),
+    ).fetchone()
+    if not document_source["has_review_text"]:
+        return {
+            "action": "skipped_empty",
+            "queued": False,
+            "marker_row": existing,
+            "document_source": document_source,
+        }
+    if existing is not None:
+        same_document = existing["document_source_hash"] == document_source["document_source_hash"]
+        already_processed = (
+            existing["processed_source_hash"] == document_source["document_source_hash"]
+        )
+        if same_document and existing["status"] in {"queued", "processing"}:
+            return {
+                "action": "unchanged_pending",
+                "queued": False,
+                "marker_row": existing,
+                "document_source": document_source,
+            }
+        if same_document and existing["status"] in {"failed", "skipped", "cancelled"}:
+            return {
+                "action": "unchanged_failed",
+                "queued": False,
+                "marker_row": existing,
+                "document_source": document_source,
+            }
+        if already_processed and existing["status"] == "processed":
+            return {
+                "action": "unchanged_current",
+                "queued": False,
+                "marker_row": existing,
+                "document_source": document_source,
+            }
+    marker_row = _work_review_processor_marker_row(
+        existing=existing,
+        item_id=item_id,
+        document=document,
+        document_source=document_source,
+        meta=meta,
+        now=now,
+        reason=reason,
+        scan_metadata=metadata,
+    )
+    saved_row = _write_work_review_processor_marker(conn, marker_row)
+    return {
+        "action": "queued",
+        "queued": True,
+        "marker_row": saved_row,
+        "document_source": document_source,
+    }
+
+
+def _row_to_work_review_processor_schedule(schedule: dict[str, Any]) -> dict[str, Any]:
+    marker_row = schedule.get("marker_row")
+    return {
+        "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+        "action": schedule.get("action") or "",
+        "queued": bool(schedule.get("queued")),
+        "document_source_hash": (schedule.get("document_source") or {}).get(
+            "document_source_hash", ""
+        ),
+        "marker": (
+            _row_to_work_review_processor_marker(marker_row) if marker_row is not None else None
+        ),
+    }
+
+
 def _work_review_processor_marker_stats(
     conn: Any,
     scope_ids: list[str],
@@ -9507,6 +9590,21 @@ async def append_work_item_review_feedback(
             now=now,
             metadata_extra=feedback_metadata,
         )
+        review_marker_schedule = _schedule_work_review_processor_marker_for_document(
+            conn,
+            item_id=clean_item_id,
+            document=document,
+            meta=meta,
+            now=now,
+            reason="operator_feedback_captured",
+            metadata={
+                "trigger": "operator_feedback_capture",
+                "feedback_id": entry["feedback_id"],
+                "feedback_hash": entry["feedback_hash"],
+                "capture_source": entry["capture_source"],
+                "session_id": entry["session_id"],
+            },
+        )
         image_associations = _associate_rich_doc_images_for_document(
             domain="kanban",
             markdown=clean_body,
@@ -9547,15 +9645,33 @@ async def append_work_item_review_feedback(
                 "body_hash": document["metadata"].get("body_hash") or "",
                 "document_updated_at": document["updated_at"],
                 "rich_doc_image_count": len(image_associations.get("images", [])),
+                "review_processor_marker_action": review_marker_schedule["action"],
+                "review_processor_marker_queued": bool(review_marker_schedule["queued"]),
+                "review_processor_marker_id": (
+                    review_marker_schedule["marker_row"]["marker_id"]
+                    if review_marker_schedule.get("marker_row") is not None
+                    else ""
+                ),
             },
         )
         gen = increment_gen(conn, "kanban-item-review-feedback")
+        if review_marker_schedule.get("queued") and review_marker_schedule.get("marker_row"):
+            marker_row = review_marker_schedule["marker_row"]
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
         "item_id": clean_item_id,
         "feedback_entry": entry,
         "review_document": document,
+        "review_processor": _row_to_work_review_processor_schedule(review_marker_schedule),
         "image_associations": image_associations,
         "audit": {
             "audit_id": audit_id,
