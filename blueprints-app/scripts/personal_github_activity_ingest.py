@@ -396,11 +396,8 @@ def work_item_id_for_arc(arc_type: str, arc_id: str) -> str:
 
 
 def git_status_to_state(status: str) -> str:
-    return (
-        "done"
-        if status.lower() in {"done", "completed", "complete", "finished", "landed"}
-        else "doing"
-    )
+    # Git Activity cards are retrospective evidence from commits, not actionable work.
+    return "done"
 
 
 def parse_list(value: str | None, default: tuple[str, ...] = ()) -> list[str]:
@@ -1502,13 +1499,13 @@ def upsert_root_work_item(conn: sqlite3.Connection, now: str) -> None:
         """
         INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
-            priority_id, depth, sort_order, status, archived_at, promoted_from_ref,
-            source_type, source_ref, source_hash, tags_json, related_event_ids_json,
-            related_task_ids_json, related_issue_ids_json, search_text,
+            priority_id, depth, sort_order, status, automation_excluded, archived_at,
+            promoted_from_ref, source_type, source_ref, source_hash, tags_json,
+            related_event_ids_json, related_task_ids_json, related_issue_ids_json, search_text,
             search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
             vector_index_key, provenance_json, created_at, updated_at
         )
-        VALUES (?, NULL, ?, ?, 'project', 'doing', 'medium', 0, 0, 'open', NULL,
+        VALUES (?, NULL, ?, ?, 'project', 'done', 'medium', 0, 0, 'done', 1, NULL,
                 NULL, 'git', ?, ?, ?, '[]', '[]', '[]', ?, ?, '', '', NULL, '', ?, ?, ?)
         ON CONFLICT(item_id) DO UPDATE SET
             title=excluded.title,
@@ -1517,6 +1514,7 @@ def upsert_root_work_item(conn: sqlite3.Connection, now: str) -> None:
             state_id=excluded.state_id,
             priority_id=excluded.priority_id,
             status=excluded.status,
+            automation_excluded=excluded.automation_excluded,
             source_type=excluded.source_type,
             source_ref=excluded.source_ref,
             source_hash=excluded.source_hash,
@@ -1622,7 +1620,7 @@ def upsert_arc_work_item(
             search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
             vector_index_key, provenance_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'medium', ?, 0, 'open', NULL, NULL,
+        VALUES (?, ?, ?, ?, ?, ?, 'medium', ?, 0, 'done', NULL, NULL,
                 'git', ?, ?, ?, '[]', '[]', '[]', ?, ?, '', '', NULL, '', ?, ?, ?)
         ON CONFLICT(item_id) DO UPDATE SET
             parent_item_id=excluded.parent_item_id,
@@ -1751,7 +1749,7 @@ def upsert_feature_work_item(conn: sqlite3.Connection, feature: FeatureRecord, n
             search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
             vector_index_key, provenance_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, 'feature', ?, 'medium', ?, 0, 'open', NULL, NULL,
+        VALUES (?, ?, ?, ?, 'feature', ?, 'medium', ?, 0, 'done', NULL, NULL,
                 'git', ?, ?, ?, '[]', '[]', '[]', ?, ?, '', '', NULL, '', ?, ?, ?)
         ON CONFLICT(item_id) DO UPDATE SET
             parent_item_id=excluded.parent_item_id,

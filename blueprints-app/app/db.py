@@ -683,6 +683,7 @@ CREATE TABLE IF NOT EXISTS kanban_items (
     sort_order                 INTEGER NOT NULL DEFAULT 0,
     status                     TEXT NOT NULL DEFAULT 'open',
     goal_flag                  INTEGER NOT NULL DEFAULT 0,
+    automation_excluded        INTEGER NOT NULL DEFAULT 0,
     archived_at                TEXT,
     promoted_from_ref          TEXT,
     source_type                TEXT NOT NULL DEFAULT 'manual-kanban',
@@ -2070,6 +2071,10 @@ def _migrate_kanban_storage(conn: sqlite3.Connection) -> None:
         columns = set(_table_columns(conn, "kanban_items"))
         if "goal_flag" not in columns:
             conn.execute("ALTER TABLE kanban_items ADD COLUMN goal_flag INTEGER NOT NULL DEFAULT 0")
+        if "automation_excluded" not in columns:
+            conn.execute(
+                "ALTER TABLE kanban_items ADD COLUMN automation_excluded INTEGER NOT NULL DEFAULT 0"
+            )
     _migrate_leaf_table_to_kanban_items(conn, table="work_issues", id_col="issue_id", kind="issue")
     _migrate_leaf_table_to_kanban_items(conn, table="work_todos", id_col="todo_id", kind="todo")
     if _table_exists(conn, "kanban_items"):

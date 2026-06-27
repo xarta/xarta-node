@@ -90,6 +90,7 @@ KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.rea
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
+KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
 KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
     "xarta.kanban.processor_marker_blocker.provenance.v1"
@@ -345,6 +346,7 @@ class WorkItemCreateRequest(BaseModel):
     state_id: str = "todo"
     priority_id: str = "medium"
     goal_flag: bool = False
+    automation_excluded: bool = False
     sort_order: int = 0
     tags: list[str] = []
     related_event_ids: list[str] = []
@@ -371,6 +373,7 @@ class WorkItemUpdateRequest(BaseModel):
     state_id: str | None = None
     priority_id: str | None = None
     goal_flag: bool | None = None
+    automation_excluded: bool | None = None
     sort_order: int | None = None
     tags: list[str] | None = None
     related_event_ids: list[str] | None = None
@@ -2313,41 +2316,111 @@ def _work_preprocessing_marker_row(
 
 def _work_preprocessing_active_rows(conn: Any, scope_ids: list[str]) -> list[Any]:
     args: list[Any] = ["preprocessing"]
-    where = "WHERE processor_kind=? AND status='processing'"
+    where = (
+        "WHERE marker.processor_kind=? AND marker.status='processing' "
+        f"AND {_work_item_automation_included_predicate('item')}"
+    )
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
-        where += f" AND item_id IN ({placeholders})"
+        where += f" AND marker.item_id IN ({placeholders})"
         args.extend(scope_ids)
     return conn.execute(
         f"""
-        SELECT * FROM kanban_review_processor_markers
+        SELECT marker.* FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
         {where}
-        ORDER BY processing_started_at ASC, queued_at ASC, marker_id
+        ORDER BY marker.processing_started_at ASC, marker.queued_at ASC, marker.marker_id
         """,
         args,
     ).fetchall()
 
 
+def _work_item_automation_included_predicate(item_alias: str = "item") -> str:
+    safe_alias = "".join(ch for ch in str(item_alias or "item") if ch.isalnum() or ch == "_")
+    if not safe_alias:
+        safe_alias = "item"
+    return f"""
+    NOT EXISTS (
+        WITH RECURSIVE ancestors(item_id, parent_item_id, automation_excluded) AS (
+            SELECT {safe_alias}.item_id,
+                   {safe_alias}.parent_item_id,
+                   COALESCE({safe_alias}.automation_excluded, 0)
+            UNION ALL
+            SELECT parent.item_id,
+                   parent.parent_item_id,
+                   COALESCE(parent.automation_excluded, 0)
+            FROM kanban_items parent
+            JOIN ancestors ON parent.item_id = ancestors.parent_item_id
+        )
+        SELECT 1 FROM ancestors WHERE COALESCE(automation_excluded, 0) != 0
+    )
+    """
+
+
+def _work_item_automation_excluded(conn: Any, item_id: str | None) -> bool:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    if not clean_item_id:
+        return False
+    row = conn.execute(
+        """
+        WITH RECURSIVE ancestors(item_id, parent_item_id, automation_excluded) AS (
+            SELECT item_id, parent_item_id, COALESCE(automation_excluded, 0)
+            FROM kanban_items
+            WHERE item_id=?
+            UNION ALL
+            SELECT parent.item_id,
+                   parent.parent_item_id,
+                   COALESCE(parent.automation_excluded, 0)
+            FROM kanban_items parent
+            JOIN ancestors ON parent.item_id = ancestors.parent_item_id
+        )
+        SELECT 1 FROM ancestors WHERE COALESCE(automation_excluded, 0) != 0 LIMIT 1
+        """,
+        (clean_item_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _raise_work_automation_excluded(
+    *,
+    operation: str,
+    item_id: str,
+    meta: dict[str, str],
+) -> None:
+    raise HTTPException(
+        409,
+        {
+            "error": "kanban_automation_excluded_branch",
+            "message": "Kanban automation idle worker may not mutate an excluded branch.",
+            "operation": operation,
+            "item_id": item_id,
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+        },
+    )
+
+
 def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
     args: list[Any] = []
-    where = "WHERE status='queued'"
+    where = f"WHERE marker.status='queued' AND {_work_item_automation_included_predicate('item')}"
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
-        where += f" AND item_id IN ({placeholders})"
+        where += f" AND marker.item_id IN ({placeholders})"
         args.extend(scope_ids)
     rows = conn.execute(
         f"""
-        SELECT marker_id FROM kanban_review_processor_markers
+        SELECT marker.marker_id FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
         {where}
         ORDER BY
-          CASE processor_kind
+          CASE marker.processor_kind
             WHEN 'review' THEN 0
             WHEN 'preprocessing' THEN 1
             ELSE 2
           END,
-          queued_at ASC,
-          document_updated_at ASC,
-          marker_id
+          marker.queued_at ASC,
+          marker.document_updated_at ASC,
+          marker.marker_id
         """,
         args,
     ).fetchall()
@@ -2614,21 +2687,28 @@ def _work_review_processor_marker_stats(
     processor_kind: str = "review",
 ) -> dict[str, Any]:
     clean_processor_kind = _clean_short_text(processor_kind, "review", limit=80)
-    where = "WHERE processor_kind=?"
+    where = f"WHERE marker.processor_kind=? AND {_work_item_automation_included_predicate('item')}"
     args: list[Any] = [clean_processor_kind]
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
-        where += f" AND item_id IN ({placeholders})"
+        where += f" AND marker.item_id IN ({placeholders})"
         args.extend(scope_ids)
     status_rows = conn.execute(
-        f"SELECT status, COUNT(*) AS count FROM kanban_review_processor_markers {where} GROUP BY status",
+        f"""
+        SELECT marker.status, COUNT(*) AS count
+        FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where}
+        GROUP BY marker.status
+        """,
         args,
     ).fetchall()
     recent_rows = conn.execute(
         f"""
-        SELECT * FROM kanban_review_processor_markers
+        SELECT marker.* FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
         {where}
-        ORDER BY updated_at DESC, queued_at DESC, marker_id
+        ORDER BY marker.updated_at DESC, marker.queued_at DESC, marker.marker_id
         LIMIT ?
         """,
         [*args, limit],
@@ -2653,17 +2733,19 @@ def _work_review_processor_marker_stats(
     now = _utc_now_iso()
     timeout_row = conn.execute(
         f"""
-        SELECT COUNT(*) AS count FROM kanban_review_processor_markers
-        {where} AND status='processing'
-          AND processing_expires_at != ''
-          AND processing_expires_at <= ?
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where} AND marker.status='processing'
+          AND marker.processing_expires_at != ''
+          AND marker.processing_expires_at <= ?
         """,
         [*args, now],
     ).fetchone()
     superseded_row = conn.execute(
         f"""
-        SELECT COUNT(*) AS count FROM kanban_review_processor_markers
-        {where} AND superseded_at != ''
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where} AND marker.superseded_at != ''
         """,
         args,
     ).fetchone()
@@ -3065,6 +3147,9 @@ def _row_to_work_item(row: Any) -> dict[str, Any]:
         "sort_order": row["sort_order"],
         "status": row["status"],
         "goal_flag": bool(row["goal_flag"]) if "goal_flag" in row_keys else False,
+        "automation_excluded": (
+            bool(row["automation_excluded"]) if "automation_excluded" in row_keys else False
+        ),
         "archived_at": row["archived_at"],
         "promoted_from_ref": row["promoted_from_ref"],
         "source": {
@@ -9627,6 +9712,7 @@ def _work_item_payload(
     tags = _work_item_tags_for_request(body.tags, _work_request_meta(body))
     item_type = _clean_work_item_type(body.item_type, "item")
     goal_flag = bool(body.goal_flag)
+    automation_excluded = bool(body.automation_excluded)
     body_excerpt = _body_excerpt(body.body or "", limit=4000)
     related_events = _clean_event_list(body.related_event_ids, limit=32)
     related_tasks = _clean_event_list(body.related_task_ids, limit=32)
@@ -9694,6 +9780,7 @@ def _work_item_payload(
         "sort_order": int(body.sort_order),
         "status": _work_status_for_state(state),
         "goal_flag": goal_flag,
+        "automation_excluded": automation_excluded,
         "promoted_from_ref": promoted_from_ref,
         "source_type": "manual-kanban",
         "source_ref": f"kanban_items:{item_id}",
@@ -9722,13 +9809,14 @@ def _insert_work_item(
         """
         INSERT INTO kanban_items (
             item_id, parent_item_id, title, body_excerpt, item_type, state_id,
-            priority_id, depth, sort_order, status, goal_flag, archived_at, promoted_from_ref,
+            priority_id, depth, sort_order, status, goal_flag, automation_excluded,
+            archived_at, promoted_from_ref,
             source_type, source_ref, source_hash, tags_json, related_event_ids_json,
             related_task_ids_json, related_issue_ids_json, search_text,
             search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
             vector_index_key, provenance_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
                 NULL, ?, ?, ?, ?)
         """,
         (
@@ -9743,6 +9831,7 @@ def _insert_work_item(
             payload["sort_order"],
             payload["status"],
             int(payload["goal_flag"]),
+            int(payload["automation_excluded"]),
             payload["promoted_from_ref"],
             payload["source_type"],
             payload["source_ref"],
@@ -9790,6 +9879,8 @@ def _insert_work_item(
             "state_id": payload["state_id"],
             "priority_id": payload["priority_id"],
             "depth": payload["depth"],
+            "goal_flag": payload["goal_flag"],
+            "automation_excluded": payload["automation_excluded"],
             "promoted_from_ref": payload["promoted_from_ref"],
             "previous": None,
             "new": {
@@ -10276,6 +10367,25 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
     meta = _work_request_meta(body)
     with get_conn() as conn:
         payload = _work_item_payload(conn, body)
+        if _work_request_is_kanban_idle_worker(meta):
+            automation_meta = (
+                payload["provenance"].get("automation")
+                if isinstance(payload.get("provenance"), dict)
+                and isinstance(payload["provenance"].get("automation"), dict)
+                else {}
+            )
+            guarded_item_ids = [
+                payload["parent_item_id"],
+                automation_meta.get("source_item_id"),
+            ]
+            if any(
+                _work_item_automation_excluded(conn, guarded_id) for guarded_id in guarded_item_ids
+            ):
+                _raise_work_automation_excluded(
+                    operation="create_work_item",
+                    item_id=payload["parent_item_id"] or payload["item_id"],
+                    meta=meta,
+                )
         blocker_payload = None
         if payload["state_id"] == "blocked" and _work_request_requires_blocked_leaf_guard(meta):
             blocker_payload = _work_blocker_payload_from_request(
@@ -10451,6 +10561,16 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             bool(existing["goal_flag"]) if "goal_flag" in existing.keys() else False
         )
         goal_flag = existing_goal_flag if body.goal_flag is None else bool(body.goal_flag)
+        existing_automation_excluded = (
+            bool(existing["automation_excluded"])
+            if "automation_excluded" in existing.keys()
+            else False
+        )
+        automation_excluded = (
+            existing_automation_excluded
+            if body.automation_excluded is None
+            else bool(body.automation_excluded)
+        )
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_items",
             row_id=item_id,
@@ -10478,6 +10598,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             ),
             "status": _work_status_for_state(state),
             "goal_flag": goal_flag,
+            "automation_excluded": automation_excluded,
             "tags": tags,
             "related_event_ids": related_events,
             "related_task_ids": related_tasks,
@@ -10512,7 +10633,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             """
             UPDATE kanban_items
             SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
-                sort_order=?, status=?, goal_flag=?, source_hash=?, tags_json=?,
+                sort_order=?, status=?, goal_flag=?, automation_excluded=?, source_hash=?, tags_json=?,
                 related_event_ids_json=?, related_task_ids_json=?,
                 related_issue_ids_json=?, search_text=?, search_metadata_json=?,
                 vector_index_key=?, provenance_json=?, updated_at=?
@@ -10527,6 +10648,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 payload["sort_order"],
                 payload["status"],
                 int(payload["goal_flag"]),
+                int(payload["automation_excluded"]),
                 payload["source_hash"],
                 json.dumps(payload["tags"], ensure_ascii=True),
                 json.dumps(payload["related_event_ids"], ensure_ascii=True),
@@ -10603,6 +10725,9 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 "state_id": item_row["state_id"],
                 "priority_id": item_row["priority_id"],
                 "goal_flag": bool(item_row["goal_flag"]),
+                "automation_excluded": bool(item_row["automation_excluded"])
+                if "automation_excluded" in item_row.keys()
+                else False,
                 "kanban_project_document": project_document,
                 "lane_order": order_ids,
             },
@@ -11289,6 +11414,13 @@ def _work_preprocessing_scoped_decomposition_reparent(
         source_item = _work_item_or_404(conn, clean_source_item_id)
         moving_item = _work_item_or_404(conn, clean_item_id)
         _work_item_or_404(conn, clean_target_parent)
+        for guarded_item_id in (clean_source_item_id, clean_item_id, clean_target_parent):
+            if _work_item_automation_excluded(conn, guarded_item_id):
+                _raise_work_automation_excluded(
+                    operation="preprocessing_decomposition_reparent_item",
+                    item_id=guarded_item_id,
+                    meta=meta,
+                )
         classification = _work_preprocessing_source_classification(
             conn,
             source_item,
@@ -11480,6 +11612,18 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         else:
             new_parent = existing["parent_item_id"]
         parent_changed = (new_parent or "") != (existing["parent_item_id"] or "")
+        if _work_request_is_kanban_idle_worker(meta):
+            guarded_item_ids = [item_id]
+            if new_parent:
+                guarded_item_ids.append(new_parent)
+            if any(
+                _work_item_automation_excluded(conn, guarded_id) for guarded_id in guarded_item_ids
+            ):
+                _raise_work_automation_excluded(
+                    operation="move_work_item",
+                    item_id=item_id,
+                    meta=meta,
+                )
         if parent_changed and _work_request_is_kanban_idle_worker(meta):
             raise HTTPException(
                 403,
@@ -13491,6 +13635,18 @@ async def _work_preprocessing_create_decomposition_children(
 ) -> dict[str, Any]:
     parent_item_id = parent_item["item_id"]
     expected_child_depth = int(parent_item["depth"] or 0) + 1
+    with get_conn() as conn:
+        if _work_item_automation_excluded(conn, parent_item_id):
+            return {
+                "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
+                "created_count": 0,
+                "existing_count": 0,
+                "total_count": 0,
+                "created_items": [],
+                "existing_items": [],
+                "items": [],
+                "skipped_reason": "automation_excluded",
+            }
     candidates = _work_preprocessing_normalise_decomposition_items(
         payload,
         parent_item=parent_item,
@@ -13656,6 +13812,36 @@ async def _process_work_preprocessing_idle_marker(
 ) -> dict[str, Any]:
     item_id = marker["item_id"]
     now = _utc_now_iso()
+    with get_conn() as conn:
+        _work_item_or_404(conn, item_id)
+        automation_excluded = _work_item_automation_excluded(conn, item_id)
+    if automation_excluded:
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=marker["document_source_hash"],
+                status="cancelled",
+                error="automation_excluded",
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-excluded-{marker['marker_id']}",
+                run_id=run_id,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "reason": "automation_excluded",
+                },
+            ),
+        )
+        return {
+            "ok": False,
+            "processor_kind": "preprocessing",
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+            "reason": "automation_excluded",
+            "status": complete.get("marker", {}).get("status", "cancelled"),
+        }
     with get_conn() as conn:
         item = _work_item_or_404(conn, item_id)
         source = _work_preprocessing_context_source(conn, item)
@@ -14451,16 +14637,19 @@ async def trigger_work_review_processor_idle_scan(
         root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
-        where = "WHERE status != 'archived'"
+        where = (
+            "WHERE item.status != 'archived' "
+            f"AND {_work_item_automation_included_predicate('item')}"
+        )
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
-            where += f" AND item_id IN ({placeholders})"
+            where += f" AND item.item_id IN ({placeholders})"
             args.extend(scope_ids)
         item_rows = conn.execute(
             f"""
-            SELECT * FROM kanban_items
+            SELECT item.* FROM kanban_items item
             {where}
-            ORDER BY updated_at DESC, item_id
+            ORDER BY item.updated_at DESC, item.item_id
             LIMIT ?
             """,
             [*args, scan_limit],
@@ -14736,9 +14925,10 @@ async def trigger_work_preprocessing_idle_scan(
             }
 
         args: list[Any] = []
-        where = """
+        where = f"""
         WHERE item.status NOT IN ('archived', 'done')
           AND item.state_id IN ('todo', 'doing', 'blocked')
+          AND {_work_item_automation_included_predicate("item")}
           AND NOT EXISTS (
               SELECT 1 FROM kanban_items child
               WHERE child.parent_item_id=item.item_id
@@ -15045,31 +15235,34 @@ async def claim_next_work_review_processor_marker(
         )
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
-        where = "WHERE status='queued'"
+        where = (
+            f"WHERE marker.status='queued' AND {_work_item_automation_included_predicate('item')}"
+        )
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
-            where += f" AND item_id IN ({placeholders})"
+            where += f" AND marker.item_id IN ({placeholders})"
             args.extend(scope_ids)
         if clean_eligible_marker_ids is not None:
             if clean_eligible_marker_ids:
                 placeholders = ",".join("?" for _ in clean_eligible_marker_ids)
-                where += f" AND marker_id IN ({placeholders})"
+                where += f" AND marker.marker_id IN ({placeholders})"
                 args.extend(clean_eligible_marker_ids)
             else:
                 where += " AND 0"
         marker_row = conn.execute(
             f"""
-            SELECT * FROM kanban_review_processor_markers
+            SELECT marker.* FROM kanban_review_processor_markers marker
+            JOIN kanban_items item ON item.item_id=marker.item_id
             {where}
             ORDER BY
-              CASE processor_kind
+              CASE marker.processor_kind
                 WHEN 'review' THEN 0
                 WHEN 'preprocessing' THEN 1
                 ELSE 2
               END,
-              queued_at ASC,
-              document_updated_at ASC,
-              marker_id
+              marker.queued_at ASC,
+              marker.document_updated_at ASC,
+              marker.marker_id
             LIMIT 1
             """,
             args,
@@ -15229,6 +15422,107 @@ async def complete_work_review_processor_marker(
                 "completed": False,
                 "reason": "marker_not_processing",
                 "marker": _row_to_work_review_processor_marker(marker_row),
+            }
+        if outcome_status != "cancelled" and _work_item_automation_excluded(
+            conn, marker_row["item_id"]
+        ):
+            decision_id = _clean_short_text(
+                body.decision_id or marker_row["decision_id"], "", limit=180
+            )
+            saved_row = _write_work_review_processor_marker(
+                conn,
+                _work_review_processor_marker_update_row(
+                    marker_row,
+                    updates={
+                        "status": "cancelled",
+                        "processing_expires_at": "",
+                        "last_seen_at": now,
+                        "decision_id": decision_id,
+                        "last_error": "automation_excluded",
+                        "processed_document_updated_at": marker_row["document_updated_at"],
+                        "processed_source_hash": marker_row["document_source_hash"],
+                        "processed_at": now,
+                    },
+                    meta=meta,
+                    now=now,
+                    reason="automation_excluded_cancelled",
+                    metadata={
+                        **dict(body.metadata or {}),
+                        "holder_id": holder_id,
+                        "lease_id": lease_row["lease_id"],
+                        "decision_id": decision_id,
+                        "outcome_status": "cancelled",
+                        "last_outcome_at": now,
+                        "last_outcome_status": "automation_excluded_cancelled",
+                        "last_error": "automation_excluded",
+                    },
+                ),
+            )
+            marker_blocker = _upsert_work_processor_marker_blocker(
+                conn,
+                saved_row,
+                meta=meta,
+                now=now,
+            )
+            audit_row = _write_work_audit(
+                conn,
+                audit_id=audit_id,
+                actor=meta["actor"],
+                source_surface=meta["source_surface"],
+                action="complete_review_processor_marker",
+                target_ref=f"kanban_review_processor_markers:{saved_row['marker_id']}",
+                item_id=saved_row["item_id"],
+                parent_item_id="",
+                created_at=now,
+                request_id=meta["request_id"],
+                run_id=meta["run_id"],
+                result="automation_excluded_cancelled",
+                source_hash=saved_row["source_hash"],
+                metadata={
+                    "holder_id": holder_id,
+                    "lease_id": lease_row["lease_id"],
+                    "decision_id": decision_id,
+                    "outcome_status": "cancelled",
+                    "reason": "automation_excluded",
+                },
+            )
+            gen = increment_gen(conn, "kanban-review-marker-complete")
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                saved_row["marker_id"],
+                dict(saved_row),
+                gen,
+            )
+            if marker_blocker is not None:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_blockers",
+                    marker_blocker["blocker_row"]["blocker_id"],
+                    dict(marker_blocker["blocker_row"]),
+                    gen,
+                )
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_audit_log",
+                    marker_blocker["audit_row"]["audit_id"],
+                    marker_blocker["audit_row"],
+                    gen,
+                )
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+            return {
+                "ok": True,
+                "completed": False,
+                "reason": "automation_excluded",
+                "marker": _row_to_work_review_processor_marker(saved_row),
+                "audit": {
+                    "audit_id": audit_id,
+                    "action": "complete_review_processor_marker",
+                    "result": "automation_excluded_cancelled",
+                },
             }
         if expected_source_hash and expected_source_hash != marker_row["document_source_hash"]:
             saved_row = _write_work_review_processor_marker(
@@ -15442,18 +15736,42 @@ async def requeue_timed_out_work_review_processor_markers(
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
         now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
-        where = "WHERE status='processing' AND processing_expires_at != ''"
+        included_predicate = _work_item_automation_included_predicate("item")
+        where = f"""
+        WHERE marker.status='processing'
+          AND marker.processing_expires_at != ''
+          AND {included_predicate}
+        """
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
-            where += f" AND item_id IN ({placeholders})"
+            where += f" AND marker.item_id IN ({placeholders})"
             args.extend(scope_ids)
         candidate_rows = conn.execute(
             f"""
-            SELECT * FROM kanban_review_processor_markers
+            SELECT marker.* FROM kanban_review_processor_markers marker
+            JOIN kanban_items item ON item.item_id=marker.item_id
             {where}
-            ORDER BY processing_expires_at ASC, marker_id
+            ORDER BY marker.processing_expires_at ASC, marker.marker_id
             """,
             args,
+        ).fetchall()
+        excluded_args = list(args)
+        excluded_where = f"""
+        WHERE marker.status='processing'
+          AND marker.processing_expires_at != ''
+          AND NOT ({included_predicate})
+        """
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            excluded_where += f" AND marker.item_id IN ({placeholders})"
+        excluded_candidate_rows = conn.execute(
+            f"""
+            SELECT marker.* FROM kanban_review_processor_markers marker
+            JOIN kanban_items item ON item.item_id=marker.item_id
+            {excluded_where}
+            ORDER BY marker.processing_expires_at ASC, marker.marker_id
+            """,
+            excluded_args,
         ).fetchall()
         rows = [
             row
@@ -15468,6 +15786,53 @@ async def requeue_timed_out_work_review_processor_markers(
             )
         )
         requeued_rows = []
+        cancelled_excluded_rows = []
+        cancelled_marker_blockers: list[dict[str, Any]] = []
+        excluded_rows = [
+            row
+            for row in excluded_candidate_rows
+            if (expires_at := _parse_utc_datetime(row["processing_expires_at"])) is not None
+            and expires_at <= now_dt
+        ]
+        excluded_rows.sort(
+            key=lambda row: (
+                _parse_utc_datetime(row["processing_expires_at"]) or now_dt,
+                row["marker_id"],
+            )
+        )
+        for row in excluded_rows:
+            updated_row = _work_review_processor_marker_update_row(
+                row,
+                updates={
+                    "status": "cancelled",
+                    "last_seen_at": now,
+                    "processing_started_at": "",
+                    "processing_expires_at": "",
+                    "last_error": "automation_excluded",
+                    "processed_document_updated_at": row["document_updated_at"],
+                    "processed_source_hash": row["document_source_hash"],
+                    "processed_at": now,
+                },
+                meta=meta,
+                now=now,
+                reason="automation_excluded_timeout_cancelled",
+                metadata={
+                    **dict(body.metadata or {}),
+                    "last_outcome_at": now,
+                    "last_outcome_status": "automation_excluded_timeout_cancelled",
+                    "last_error": "automation_excluded",
+                },
+            )
+            saved_cancelled_row = _write_work_review_processor_marker(conn, updated_row)
+            cancelled_excluded_rows.append(saved_cancelled_row)
+            marker_blocker = _upsert_work_processor_marker_blocker(
+                conn,
+                saved_cancelled_row,
+                meta=meta,
+                now=now,
+            )
+            if marker_blocker is not None:
+                cancelled_marker_blockers.append(marker_blocker)
         for row in rows:
             updated_row = _work_review_processor_marker_update_row(
                 row,
@@ -15495,7 +15860,11 @@ async def requeue_timed_out_work_review_processor_markers(
                 "action": "requeue_review_processor_timeouts",
                 "item_id": clean_item_id,
                 "requeued_count": len(requeued_rows),
+                "cancelled_excluded_count": len(cancelled_excluded_rows),
                 "marker_ids": [row["marker_id"] for row in requeued_rows],
+                "cancelled_excluded_marker_ids": [
+                    row["marker_id"] for row in cancelled_excluded_rows
+                ],
             }
         )
         audit_row = _write_work_audit(
@@ -15515,10 +15884,23 @@ async def requeue_timed_out_work_review_processor_markers(
             metadata={
                 "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
                 "requeued_count": len(requeued_rows),
+                "cancelled_excluded_count": len(cancelled_excluded_rows),
                 "marker_ids": [row["marker_id"] for row in requeued_rows],
+                "cancelled_excluded_marker_ids": [
+                    row["marker_id"] for row in cancelled_excluded_rows
+                ],
             },
         )
         gen = increment_gen(conn, "kanban-review-marker-timeout")
+        for row in cancelled_excluded_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                row["marker_id"],
+                dict(row),
+                gen,
+            )
         for row in requeued_rows:
             enqueue_for_all_peers(
                 conn,
@@ -15528,12 +15910,33 @@ async def requeue_timed_out_work_review_processor_markers(
                 dict(row),
                 gen,
             )
+        for marker_blocker in cancelled_marker_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         markers = [_row_to_work_review_processor_marker(row) for row in requeued_rows]
         return {
             "ok": True,
             "requeued_count": len(markers),
             "requeued_markers": markers,
+            "cancelled_excluded_count": len(cancelled_excluded_rows),
+            "cancelled_excluded_markers": [
+                _row_to_work_review_processor_marker(row) for row in cancelled_excluded_rows
+            ],
             "scheduler": _work_review_processor_marker_stats(conn, scope_ids),
             "audit": {
                 "audit_id": audit_id,
@@ -15984,15 +16387,43 @@ async def get_work_automation_status(
             limit=limit,
             processor_kind="preprocessing",
         )
+        exclusion_where = (
+            "WHERE item.status != 'archived' AND COALESCE(item.automation_excluded, 0) != 0"
+        )
+        exclusion_args: list[Any] = []
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            exclusion_where += f" AND item.item_id IN ({placeholders})"
+            exclusion_args.extend(scope_ids)
+        exclusion_count_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM kanban_items item
+            {exclusion_where}
+            """,
+            exclusion_args,
+        ).fetchone()
+        exclusion_rows = conn.execute(
+            f"""
+            SELECT item.* FROM kanban_items item
+            {exclusion_where}
+            ORDER BY item.updated_at DESC, item.item_id
+            LIMIT ?
+            """,
+            [*exclusion_args, limit],
+        ).fetchall()
         preprocessing_active_row = conn.execute(
             f"""
-            SELECT * FROM kanban_review_processor_markers
-            {where + (" AND" if where else "WHERE")} processor_kind='preprocessing'
-              AND status='processing'
-            ORDER BY processing_started_at ASC, queued_at ASC, marker_id
+            SELECT marker.* FROM kanban_review_processor_markers marker
+            JOIN kanban_items item ON item.item_id=marker.item_id
+            WHERE marker.processor_kind='preprocessing'
+              AND marker.status='processing'
+              AND {_work_item_automation_included_predicate("item")}
+              {"AND marker.item_id IN (" + ",".join("?" for _ in scope_ids) + ")" if scope_ids else ""}
+            ORDER BY marker.processing_started_at ASC, marker.queued_at ASC, marker.marker_id
             LIMIT 1
             """,
-            args,
+            scope_ids if scope_ids else [],
         ).fetchone()
         last_completed = conn.execute(
             f"""
@@ -16018,6 +16449,11 @@ async def get_work_automation_status(
             "processing_policy": processing_policy,
             "proposal_surfaces": _work_proposal_surfaces_contract(),
             "idle_worker": idle_worker_config,
+            "automation_exclusions": {
+                "schema": KANBAN_AUTOMATION_EXCLUSION_SCHEMA,
+                "count": int(exclusion_count_row["count"] if exclusion_count_row else 0),
+                "recent_items": [_row_to_work_item(row) for row in exclusion_rows],
+            },
             "provider_mode": {
                 "active": processing_policy["active_mode"],
                 "planned": processing_policy["local_processing"]["state"],
