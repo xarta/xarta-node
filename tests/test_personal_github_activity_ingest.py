@@ -149,6 +149,7 @@ def _conn():
             depth INTEGER,
             sort_order INTEGER,
             status TEXT,
+            automation_excluded INTEGER NOT NULL DEFAULT 0,
             archived_at TEXT,
             promoted_from_ref TEXT,
             source_type TEXT,
@@ -1246,6 +1247,14 @@ def test_apply_from_enriched_report_creates_llm_kanban_hierarchy_idempotently(mo
         for table in first_counts
     }
     assert second_counts == first_counts
+
+    root = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?",
+        (ingest.ROOT_WORK_ITEM_ID,),
+    ).fetchone()
+    assert root["state_id"] == "done"
+    assert root["status"] == "done"
+    assert root["automation_excluded"] == 1
 
     project = conn.execute(
         "SELECT * FROM kanban_items WHERE item_type='project' AND parent_item_id=?",

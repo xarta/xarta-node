@@ -353,6 +353,7 @@ def _make_conn() -> sqlite3.Connection:
             sort_order INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'open',
             goal_flag INTEGER NOT NULL DEFAULT 0,
+            automation_excluded INTEGER NOT NULL DEFAULT 0,
             archived_at TEXT,
             promoted_from_ref TEXT,
             source_type TEXT NOT NULL DEFAULT 'manual-kanban',
@@ -2775,6 +2776,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
                 state_id="todo",
                 priority_id="high",
                 goal_flag=True,
+                automation_excluded=True,
                 tags=["proof"],
                 actor="codex-test",
                 source_surface="pytest",
@@ -2787,6 +2789,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert root["depth"] == 0
     assert root["state_id"] == "todo"
     assert root["goal_flag"] is True
+    assert root["automation_excluded"] is True
     assert root["body_excerpt"] == "Root board proof\n\nSecond paragraph"
     assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
     assert root["vector"]["index_key"] == "kanban_items:work-root"
@@ -2797,6 +2800,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     )
     assert [item["item_id"] for item in todo_column["items"]] == ["work-root"]
     assert todo_column["items"][0]["goal_flag"] is True
+    assert todo_column["items"][0]["automation_excluded"] is True
 
     child = asyncio.run(
         routes_personal.create_work_item(
@@ -3426,6 +3430,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
                 title="Step 16 Root Board Renamed",
                 body="Root board proof\n\nRenamed paragraph",
                 goal_flag=False,
+                automation_excluded=False,
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="work-root-rename",
@@ -3434,11 +3439,18 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     )["item"]
     assert renamed_root["title"] == "Step 16 Root Board Renamed"
     assert renamed_root["goal_flag"] is False
+    assert renamed_root["automation_excluded"] is False
     assert renamed_root["body_excerpt"] == "Root board proof\n\nRenamed paragraph"
     assert (
         conn.execute("SELECT goal_flag FROM kanban_items WHERE item_id='work-root'").fetchone()[
             "goal_flag"
         ]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT automation_excluded FROM kanban_items WHERE item_id='work-root'"
+        ).fetchone()["automation_excluded"]
         == 0
     )
     manifest = json.loads((tmp_path / "kanban" / "projects.json").read_text(encoding="utf-8"))
@@ -4898,6 +4910,250 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
     assert "trigger_review_processor_idle_scan" in audit_actions
 
 
+def test_work_automation_exclusion_skips_review_scan_and_marker_claim(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-excluded-root",
+                title="Review excluded root",
+                body="Root import bucket for review exclusion proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-excluded-child",
+                parent_item_id="work-review-excluded-root",
+                title="Review excluded child",
+                body="Child item with Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-excluded-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Operator Review: this would normally queue.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-review-write",
+            ),
+        )
+    )
+
+    queued_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-excluded-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-scan-before",
+            )
+        )
+    )
+    assert queued_scan["queued_count"] == 1
+    marker_id = queued_scan["queued_markers"][0]["marker_id"]
+
+    excluded = asyncio.run(
+        routes_personal.update_work_item(
+            "work-review-excluded-root",
+            routes_personal.WorkItemUpdateRequest(
+                automation_excluded=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-root-update",
+            ),
+        )
+    )["item"]
+    assert excluded["automation_excluded"] is True
+
+    excluded_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-excluded-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-scan-after",
+            )
+        )
+    )
+    assert excluded_scan["scanned_count"] == 0
+    assert excluded_scan["queued_count"] == 0
+    assert excluded_scan["scheduler"]["queue_length"] == 0
+
+    scope_ids = routes_personal._work_scope_item_ids(conn, "work-review-excluded-root")
+    assert routes_personal._work_queued_processor_marker_ids(conn, scope_ids) == []
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-excluded-root")
+    )
+    assert status["automation_exclusions"]["count"] == 1
+    assert (
+        status["automation_exclusions"]["recent_items"][0]["item_id"] == "work-review-excluded-root"
+    )
+    assert status["review_processor"]["queue_length"] == 0
+
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-exclusion",
+                item_id="work-review-excluded-root",
+                lease_token="exclusion-token",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-lease",
+            )
+        )
+    )
+    assert acquired["acquired"] is True
+    claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-exclusion",
+                lease_token="exclusion-token",
+                item_id="work-review-excluded-root",
+                eligible_marker_ids=[marker_id],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-excluded-claim",
+            )
+        )
+    )
+    assert claim["claimed"] is False
+    assert claim["reason"] == "no_queued_marker"
+
+
+def test_work_review_processor_completion_cancels_claimed_marker_after_exclusion(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-claimed-excluded-root",
+                title="Claimed excluded root",
+                body="Root that becomes excluded after a marker is claimed.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-claimed-excluded-child",
+                parent_item_id="work-review-claimed-excluded-root",
+                title="Claimed excluded child",
+                body="Child with review text.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-claimed-excluded-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Operator Review: claimed before exclusion.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-claimed-excluded-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    lease = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-claimed-excluded",
+                item_id="work-review-claimed-excluded-root",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-claimed-excluded",
+                lease_token=lease["lease"]["lease_token"],
+                item_id="work-review-claimed-excluded-root",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-claim",
+            )
+        )
+    )
+    assert claimed["claimed"] is True
+
+    asyncio.run(
+        routes_personal.update_work_item(
+            "work-review-claimed-excluded-root",
+            routes_personal.WorkItemUpdateRequest(
+                automation_excluded=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="claimed-excluded-root-exclude",
+            ),
+        )
+    )
+
+    completed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            claimed["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-claimed-excluded",
+                lease_token=lease["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="processed",
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id="claimed-excluded-complete",
+            ),
+        )
+    )
+    assert completed["completed"] is False
+    assert completed["reason"] == "automation_excluded"
+    assert completed["marker"]["status"] == "cancelled"
+    assert completed["marker"]["last_error"] == "automation_excluded"
+
+
 def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -6317,6 +6573,135 @@ def test_work_preprocessing_idle_scan_skips_topic_container_without_marker(monke
         "SELECT COUNT(*) AS count FROM kanban_review_processor_markers"
     ).fetchone()["count"]
     assert marker_count == 0
+
+
+def test_work_preprocessing_idle_scan_skips_automation_excluded_subtree(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-excluded-root",
+                title="Preprocessing excluded root",
+                body="Import or topic branch that automation must not decompose.",
+                state_id="todo",
+                automation_excluded=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-excluded-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-excluded-child",
+                parent_item_id="work-preprocess-excluded-root",
+                title="Preprocessing excluded child",
+                body="Leaf card that would otherwise be considered for preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-excluded-child-create",
+            )
+        )
+    )
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-excluded-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-excluded-scan",
+            )
+        )
+    )
+    assert scan["scanned_count"] == 0
+    assert scan["eligible_preprocessing_count"] == 0
+    assert scan["queued_count"] == 0
+    assert scan["scheduler"]["queue_length"] == 0
+    marker_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM kanban_review_processor_markers"
+    ).fetchone()["count"]
+    assert marker_count == 0
+
+
+def test_work_preprocessing_create_child_skips_automation_excluded_parent(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-direct-excluded-root",
+                title="Direct excluded root",
+                body="Excluded branch.",
+                automation_excluded=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="direct-excluded-root-create",
+            )
+        )
+    )
+    parent = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-direct-excluded-parent",
+                parent_item_id="work-preprocess-direct-excluded-root",
+                title="Direct excluded parent",
+                body="Idle worker must not decompose this card.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="direct-excluded-parent-create",
+            )
+        )
+    )["item"]
+    parent_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?", (parent["item_id"],)
+    ).fetchone()
+    result = asyncio.run(
+        routes_personal._work_preprocessing_create_decomposition_children(
+            parent_item=parent_row,
+            payload={"decomposition_items": [{"title": "Generated child", "body": "Nope."}]},
+            holder_id="kanban-idle-worker",
+            run_id="direct-excluded-run",
+            marker_id="direct-excluded-marker",
+        )
+    )
+    assert result["skipped_reason"] == "automation_excluded"
+    assert result["total_count"] == 0
+    child_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_items
+        WHERE parent_item_id='work-preprocess-direct-excluded-parent'
+        """
+    ).fetchone()["count"]
+    assert child_count == 0
+
+    with pytest.raises(routes_personal.HTTPException) as blocked_create:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id="work-preprocess-direct-excluded-child",
+                    parent_item_id="work-preprocess-direct-excluded-parent",
+                    title="Directly generated child",
+                    actor="kanban-idle-worker",
+                    source_surface="kanban-automation-idle-worker",
+                    request_id="direct-excluded-child-create",
+                )
+            )
+        )
+    assert blocked_create.value.status_code == 409
+    assert blocked_create.value.detail["error"] == "kanban_automation_excluded_branch"
 
 
 def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatch, tmp_path):
