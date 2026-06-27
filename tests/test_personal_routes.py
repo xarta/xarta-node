@@ -4376,6 +4376,15 @@ def test_work_review_processor_processing_policy_endpoint(monkeypatch):
     assert any("Provider mode must be explicit" in rule for rule in policy["routing_rules"])
 
 
+def test_work_review_processor_processing_policy_uses_configured_local_model(monkeypatch):
+    monkeypatch.setenv(routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, "test-local-model")
+
+    result = asyncio.run(routes_personal.get_work_review_processor_processing_policy())
+
+    assert result["ok"] is True
+    assert result["policy"]["local_processing"]["model_alias"] == "test-local-model"
+
+
 def test_work_review_processor_lease_acquire_conflict_heartbeat_release(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -5541,6 +5550,18 @@ def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tm
     assert failed_marker["processed_document_updated_at"] == marker["document_updated_at"]
     assert failed_marker["metadata"]["last_outcome_status"] == "failed"
     assert failed_marker["metadata"]["last_processed_at"] == failed_marker["processed_at"]
+    processor_blocker = completed["processor_blocker"]
+    assert processor_blocker["item_id"] == "work-review-failed-child"
+    assert processor_blocker["status"] == "open"
+    assert (
+        processor_blocker["blocked_by_ref"]
+        == f"kanban_review_processor_markers:{failed_marker['marker_id']}"
+    )
+    assert "provider_failed" in processor_blocker["body_excerpt"]
+
+    detail = asyncio.run(routes_personal.get_work_item_detail("work-review-failed-child"))
+    assert detail["counts"]["blockers"] == 1
+    assert detail["blockers"][0]["blocker_id"] == processor_blocker["blocker_id"]
 
     same_scan = asyncio.run(
         routes_personal.trigger_work_review_processor_idle_scan(
