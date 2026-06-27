@@ -7845,6 +7845,170 @@ def _work_scope_item_ids(
     return [row["item_id"] for row in scoped_rows]
 
 
+def _work_completion_actor_is_restricted(meta: dict[str, str]) -> bool:
+    actor = str(meta.get("actor") or "").strip().lower()
+    source_surface = str(meta.get("source_surface") or "").strip().lower()
+    run_id = str(meta.get("run_id") or "").strip().lower()
+    if actor in {"blueprints-ui", "operator", "user", "dave"}:
+        return False
+    agent_tokens = ("agent", "codex", "claude", "copilot", "roo", "hermes")
+    automation_tokens = (
+        "automation",
+        "processor",
+        "preprocess",
+        "xarta-kanban-work",
+        "blueprints-work-management",
+        "skill",
+    )
+    return (
+        any(token in actor for token in agent_tokens)
+        or any(token in source_surface for token in (*agent_tokens, *automation_tokens))
+        or any(token in run_id for token in agent_tokens)
+    )
+
+
+def _work_state_is_terminal(state: Any) -> bool:
+    try:
+        return bool(state["is_terminal"])
+    except (KeyError, TypeError):
+        return False
+
+
+def _work_completion_blocker_rows(conn: Any, item_id: str) -> dict[str, Any]:
+    scope_ids = _work_scope_item_ids(conn, item_id)
+    if not scope_ids:
+        return {"scope_ids": [], "blockers": []}
+    placeholders = ",".join("?" for _ in scope_ids)
+    descendant_ids = [scope_id for scope_id in scope_ids if scope_id != item_id]
+    blockers: list[dict[str, Any]] = []
+    if descendant_ids:
+        descendant_placeholders = ",".join("?" for _ in descendant_ids)
+        open_descendant_rows = conn.execute(
+            f"""
+            SELECT item_id, title, state_id, status, parent_item_id, depth
+            FROM kanban_items
+            WHERE item_id IN ({descendant_placeholders})
+              AND status != 'archived'
+              AND status != 'done'
+            ORDER BY depth ASC, updated_at DESC, item_id
+            """,
+            descendant_ids,
+        ).fetchall()
+        if open_descendant_rows:
+            blockers.append(
+                {
+                    "code": "open_descendants",
+                    "count": len(open_descendant_rows),
+                    "items": [
+                        {
+                            "item_id": row["item_id"],
+                            "title": row["title"],
+                            "state_id": row["state_id"],
+                            "status": row["status"],
+                            "parent_item_id": row["parent_item_id"] or "",
+                            "depth": int(row["depth"] or 0),
+                        }
+                        for row in open_descendant_rows[:12]
+                    ],
+                }
+            )
+    blocker_rows = conn.execute(
+        f"""
+        SELECT blocker_id, item_id, title, status, blocked_by_ref
+        FROM kanban_blockers
+        WHERE item_id IN ({placeholders})
+          AND status NOT IN ('resolved', 'closed', 'done')
+        ORDER BY updated_at DESC, blocker_id
+        """,
+        scope_ids,
+    ).fetchall()
+    if blocker_rows:
+        blockers.append(
+            {
+                "code": "open_blockers",
+                "count": len(blocker_rows),
+                "items": [
+                    {
+                        "blocker_id": row["blocker_id"],
+                        "item_id": row["item_id"],
+                        "title": row["title"],
+                        "status": row["status"],
+                        "blocked_by_ref": row["blocked_by_ref"] or "",
+                    }
+                    for row in blocker_rows[:12]
+                ],
+            }
+        )
+    marker_rows = conn.execute(
+        f"""
+        SELECT marker_id, item_id, processor_kind, document_type, status,
+               queued_at, processing_expires_at, attempt_count, last_error
+        FROM kanban_review_processor_markers
+        WHERE item_id IN ({placeholders})
+          AND status IN ('queued', 'processing', 'failed')
+        ORDER BY queued_at ASC, marker_id
+        """,
+        scope_ids,
+    ).fetchall()
+    if marker_rows:
+        blockers.append(
+            {
+                "code": "pending_processor_markers",
+                "count": len(marker_rows),
+                "items": [
+                    {
+                        "marker_id": row["marker_id"],
+                        "item_id": row["item_id"],
+                        "processor_kind": row["processor_kind"],
+                        "document_type": row["document_type"],
+                        "status": row["status"],
+                        "queued_at": row["queued_at"] or "",
+                        "processing_expires_at": row["processing_expires_at"] or "",
+                        "attempt_count": int(row["attempt_count"] or 0),
+                        "last_error": row["last_error"] or "",
+                    }
+                    for row in marker_rows[:12]
+                ],
+            }
+        )
+    return {"scope_ids": scope_ids, "blockers": blockers}
+
+
+def _assert_agent_completion_not_blocked(
+    conn: Any,
+    *,
+    item_id: str,
+    existing: Any,
+    target_state: Any,
+    meta: dict[str, str],
+) -> None:
+    if not _work_state_is_terminal(target_state):
+        return
+    if existing["state_id"] == target_state["state_id"]:
+        return
+    if not _work_completion_actor_is_restricted(meta):
+        return
+    completion = _work_completion_blocker_rows(conn, item_id)
+    blockers = completion["blockers"]
+    if not blockers:
+        return
+    raise HTTPException(
+        409,
+        {
+            "error": "kanban_agent_completion_blocked",
+            "message": (
+                "Agent or automation completion is blocked while outstanding "
+                "Kanban work or unprocessed review/preprocessing evidence remains."
+            ),
+            "item_id": item_id,
+            "target_state_id": target_state["state_id"],
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "blockers": blockers,
+        },
+    )
+
+
 def _work_scope_item_rows(conn: Any, item_id: str, scope: str) -> list[Any]:
     clean_scope = _clean_short_text(scope, "local", limit=40).replace("-", "_")
     if clean_scope in {"local", "self"}:
@@ -9257,6 +9421,13 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
     with get_conn() as conn:
         existing = _work_item_or_404(conn, item_id)
         state = _require_work_state(conn, body.state_id or existing["state_id"])
+        _assert_agent_completion_not_blocked(
+            conn,
+            item_id=item_id,
+            existing=existing,
+            target_state=state,
+            meta=meta,
+        )
         priority = _require_work_priority(conn, body.priority_id or existing["priority_id"])
         tags = (
             _clean_event_list(body.tags, limit=32)
@@ -9990,6 +10161,13 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
     with get_conn() as conn:
         existing = _work_item_or_404(conn, item_id)
         state = _require_work_state(conn, body.state_id or existing["state_id"])
+        _assert_agent_completion_not_blocked(
+            conn,
+            item_id=item_id,
+            existing=existing,
+            target_state=state,
+            meta=meta,
+        )
         new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
         new_depth = _work_parent_depth(conn, new_parent, moving_item_id=item_id)
         max_relative = _work_subtree_max_relative_depth(conn, item_id)
