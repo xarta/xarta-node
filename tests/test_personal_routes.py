@@ -464,6 +464,12 @@ def _make_conn() -> sqlite3.Connection:
             processed_at TEXT NOT NULL DEFAULT '',
             queued_at TEXT NOT NULL DEFAULT '',
             last_seen_at TEXT NOT NULL DEFAULT '',
+            processing_started_at TEXT NOT NULL DEFAULT '',
+            processing_expires_at TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            superseded_at TEXT NOT NULL DEFAULT '',
+            superseded_by_source_hash TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'queued',
             provider_mode TEXT NOT NULL DEFAULT 'cloud-first',
             decision_id TEXT NOT NULL DEFAULT '',
@@ -3984,6 +3990,238 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "trigger_review_processor_idle_scan" in audit_actions
+
+
+def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-timeout-root",
+                title="Review timeout root",
+                body="Root item for timeout proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-timeout-child",
+                parent_item_id="work-review-timeout-root",
+                title="Review timeout child",
+                body="Child item with Review lifecycle data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-timeout-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review lifecycle pass one.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-timeout-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-timeout",
+                item_id="work-review-timeout-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-lease",
+            )
+        )
+    )
+    token = acquired["lease"]["lease_token"]
+
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-timeout",
+                lease_token=token,
+                item_id="work-review-timeout-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-claim",
+            )
+        )
+    )
+    assert claimed["claimed"] is True
+    assert claimed["marker"]["status"] == "processing"
+    assert claimed["marker"]["attempt_count"] == 1
+    assert claimed["marker"]["processing_expires_at"]
+
+    completed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            claimed["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-timeout",
+                lease_token=token,
+                document_source_hash=marker["document_source_hash"],
+                decision_id="kanban-decision-timeout-proof",
+                status="processed",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-complete",
+            ),
+        )
+    )
+    assert completed["completed"] is True
+    assert completed["marker"]["status"] == "processed"
+    assert completed["marker"]["processed_source_hash"] == marker["document_source_hash"]
+    assert completed["marker"]["processed_at"]
+
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-timeout-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review lifecycle pass two, after processed marker.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-review-change",
+            ),
+        )
+    )
+    changed_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-timeout-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-scan-changed",
+            )
+        )
+    )
+    assert changed_scan["queued_count"] == 1
+    assert changed_scan["queued_markers"][0]["status"] == "queued"
+    assert (
+        changed_scan["queued_markers"][0]["processed_source_hash"] == marker["document_source_hash"]
+    )
+
+    claimed_again = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-timeout",
+                lease_token=token,
+                item_id="work-review-timeout-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-claim-again",
+            )
+        )
+    )
+    assert claimed_again["claimed"] is True
+    assert claimed_again["marker"]["attempt_count"] == 2
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET processing_expires_at='2000-01-01T00:00:00Z'
+        WHERE marker_id=?
+        """,
+        (claimed_again["marker"]["marker_id"],),
+    )
+    conn.commit()
+    timed_out = asyncio.run(
+        routes_personal.requeue_timed_out_work_review_processor_markers(
+            routes_personal.WorkReviewProcessorTimeoutRequeueRequest(
+                item_id="work-review-timeout-root",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-requeue",
+            )
+        )
+    )
+    assert timed_out["requeued_count"] == 1
+    assert timed_out["requeued_markers"][0]["status"] == "queued"
+    assert timed_out["requeued_markers"][0]["last_error"] == "processing_timeout"
+
+    claimed_third = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-timeout",
+                lease_token=token,
+                item_id="work-review-timeout-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-claim-third",
+            )
+        )
+    )
+    assert claimed_third["marker"]["status"] == "processing"
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-timeout-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review lifecycle pass three, changed during processing.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-review-supersede",
+            ),
+        )
+    )
+    supersede_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-timeout-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-scan-supersede",
+            )
+        )
+    )
+    assert supersede_scan["queued_count"] == 1
+    superseded = supersede_scan["queued_markers"][0]
+    assert superseded["status"] == "queued"
+    assert superseded["last_error"] == "review_changed_during_processing"
+    assert superseded["superseded_at"]
+    assert superseded["superseded_by_source_hash"] == superseded["document_source_hash"]
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-timeout-root")
+    )
+    assert status["review_processor"]["scheduler"]["timeout_count"] == 0
+    assert status["review_processor"]["scheduler"]["superseded_count"] == 1
+
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "claim_review_processor_marker" in audit_actions
+    assert "complete_review_processor_marker" in audit_actions
+    assert "requeue_review_processor_timeouts" in audit_actions
 
 
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):
