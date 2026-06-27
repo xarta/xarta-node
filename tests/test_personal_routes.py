@@ -433,6 +433,24 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE kanban_review_processor_leases (
+            lease_id TEXT PRIMARY KEY,
+            processor_kind TEXT NOT NULL DEFAULT 'review',
+            holder_id TEXT NOT NULL DEFAULT '',
+            lease_token TEXT NOT NULL DEFAULT '',
+            item_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'released',
+            acquired_at TEXT NOT NULL DEFAULT '',
+            heartbeat_at TEXT NOT NULL DEFAULT '',
+            expires_at TEXT NOT NULL DEFAULT '',
+            timeout_seconds INTEGER NOT NULL DEFAULT 1200,
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE kanban_agent_hints (
             hint_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL UNIQUE,
@@ -2708,6 +2726,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_item_commits") == "commit_link_id"
     assert "kanban_review_decisions" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_review_decisions") == "decision_id"
+    assert "kanban_review_processor_leases" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_review_processor_leases") == "lease_id"
     assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
     assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
@@ -3589,6 +3609,10 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     assert status["provider_mode"]["active"] == "cloud-first"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
     assert (
+        status["review_processor"]["lease"]["schema"] == routes_personal.KANBAN_REVIEW_LEASE_SCHEMA
+    )
+    assert status["review_processor"]["lease"]["exists"] is False
+    assert (
         status["output_contract"]["schema"] == routes_personal.KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA
     )
     assert status["output_contract"]["decision_record_schema"] == "xarta.kanban.review_decision.v1"
@@ -3631,6 +3655,138 @@ def test_work_review_processor_output_contract_endpoint():
     }
     assert "current_behavior" in output_types["prompt_change"]["required_payload_fields"]
     assert "source_refs" in output_types["contradiction_check"]["required_payload_fields"]
+
+
+def test_work_review_processor_lease_acquire_conflict_heartbeat_release(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-lease",
+                title="Review Processor lease item",
+                body="Lease proof item",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-lease-item-create",
+            )
+        )
+    )
+    conn.execute("DELETE FROM sync_queue")
+    conn.commit()
+
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-a",
+                item_id="work-review-lease",
+                session_id="kanban-agent-session-lease-proof",
+                ttl_seconds=300,
+                metadata={"slice": "queue-lease"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-lease-acquire",
+            )
+        )
+    )
+    assert acquired["ok"] is True
+    assert acquired["acquired"] is True
+    assert acquired["lease"]["schema"] == routes_personal.KANBAN_REVIEW_LEASE_SCHEMA
+    assert acquired["lease"]["holder_id"] == "codex-a"
+    assert acquired["lease"]["item_id"] == "work-review-lease"
+    assert acquired["lease"]["active"] is True
+    assert acquired["lease"]["timeout_seconds"] == 300
+    assert acquired["lease"]["metadata"]["slice"] == "queue-lease"
+    token = acquired["lease"]["lease_token"]
+    assert token.startswith("lease-")
+
+    status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-review-lease"))
+    assert status["review_processor"]["status"] == "lease-active"
+    assert status["review_processor"]["active_item_id"] == "work-review-lease"
+    assert status["review_processor"]["lease_owner"] == "codex-a"
+    assert status["review_processor"]["lease"]["active"] is True
+    assert status["review_processor"]["lease"]["holder_id"] == "codex-a"
+    assert "lease_token" not in status["review_processor"]["lease"]
+
+    readback = asyncio.run(routes_personal.get_work_review_processor_lease())
+    assert readback["lease"]["active"] is True
+    assert "lease_token" not in readback["lease"]
+
+    blocked = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-b",
+                item_id="work-review-lease",
+                ttl_seconds=300,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-lease-blocked-acquire",
+            )
+        )
+    )
+    assert blocked["ok"] is True
+    assert blocked["acquired"] is False
+    assert blocked["reason"] == "active_lease"
+    assert blocked["lease"]["holder_id"] == "codex-a"
+    assert "lease_token" not in blocked["lease"]
+
+    heartbeat = asyncio.run(
+        routes_personal.heartbeat_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-a",
+                lease_token=token,
+                ttl_seconds=600,
+                metadata={"heartbeat": "tested"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-lease-heartbeat",
+            )
+        )
+    )
+    assert heartbeat["ok"] is True
+    assert heartbeat["heartbeated"] is True
+    assert heartbeat["lease"]["active"] is True
+    assert heartbeat["lease"]["timeout_seconds"] == 600
+    assert heartbeat["lease"]["metadata"]["heartbeat"] == "tested"
+    assert "lease_token" not in heartbeat["lease"]
+
+    released = asyncio.run(
+        routes_personal.release_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-a",
+                lease_token=token,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-lease-release",
+            )
+        )
+    )
+    assert released["ok"] is True
+    assert released["released"] is True
+    assert released["lease"]["status"] == "released"
+    assert released["lease"]["active"] is False
+
+    status_after = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-lease")
+    )
+    assert status_after["review_processor"]["status"] == "decision-ledger-ready"
+    assert status_after["review_processor"]["lease"]["status"] == "released"
+    assert status_after["review_processor"]["lease"]["active"] is False
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_leases" in sync_tables
+    assert "kanban_audit_log" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "acquire_review_processor_lease" in audit_actions
+    assert "heartbeat_review_processor_lease" in audit_actions
+    assert "release_review_processor_lease" in audit_actions
 
 
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):

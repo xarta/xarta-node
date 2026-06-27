@@ -792,6 +792,27 @@ CREATE INDEX IF NOT EXISTS idx_kanban_review_decisions_item
 CREATE INDEX IF NOT EXISTS idx_kanban_review_decisions_provider
     ON kanban_review_decisions(provider_mode, processor_kind, updated_at);
 
+CREATE TABLE IF NOT EXISTS kanban_review_processor_leases (
+    lease_id        TEXT PRIMARY KEY,
+    processor_kind  TEXT NOT NULL DEFAULT 'review',
+    holder_id       TEXT NOT NULL DEFAULT '',
+    lease_token     TEXT NOT NULL DEFAULT '',
+    item_id         TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'released',
+    acquired_at     TEXT NOT NULL DEFAULT '',
+    heartbeat_at    TEXT NOT NULL DEFAULT '',
+    expires_at      TEXT NOT NULL DEFAULT '',
+    timeout_seconds INTEGER NOT NULL DEFAULT 1200,
+    source_hash     TEXT NOT NULL DEFAULT '',
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_leases_status
+    ON kanban_review_processor_leases(processor_kind, status, expires_at);
+
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
     item_id                 TEXT NOT NULL UNIQUE,
