@@ -338,6 +338,13 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
             "automation_status_error": "ok",
             "automation_recent_decisions": 3,
             "automation_review_processor_status": "decision-ledger-ready",
+            "automation_review_queue_length": 7,
+            "automation_review_active_count": 2,
+            "automation_review_timeout_count": 1,
+            "automation_review_superseded_count": 4,
+            "automation_review_marker_count": 9,
+            "automation_busy_action": "scan-reviews",
+            "automation_last_result": "Review scan complete.",
             "automation_commit_link_health_ok": True,
             "automation_output_contract_schema": "xarta.kanban.review_processor.output_contract.v1",
             "automation_output_contract_types": 4,
@@ -351,6 +358,13 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
     assert cleaned["automation_status_error"] == "ok"
     assert cleaned["automation_recent_decisions"] == 3
     assert cleaned["automation_review_processor_status"] == "decision-ledger-ready"
+    assert cleaned["automation_review_queue_length"] == 7
+    assert cleaned["automation_review_active_count"] == 2
+    assert cleaned["automation_review_timeout_count"] == 1
+    assert cleaned["automation_review_superseded_count"] == 4
+    assert cleaned["automation_review_marker_count"] == 9
+    assert cleaned["automation_busy_action"] == "scan-reviews"
+    assert cleaned["automation_last_result"] == "Review scan complete."
     assert cleaned["automation_commit_link_health_ok"] is True
     assert (
         cleaned["automation_output_contract_schema"]
@@ -942,6 +956,13 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "automation_status_error": "",
         "automation_recent_decisions": 0,
         "automation_review_processor_status": "",
+        "automation_review_queue_length": 0,
+        "automation_review_active_count": 0,
+        "automation_review_timeout_count": 0,
+        "automation_review_superseded_count": 0,
+        "automation_review_marker_count": 0,
+        "automation_busy_action": "",
+        "automation_last_result": "",
         "automation_commit_link_health_ok": True,
         "automation_output_contract_schema": "",
         "automation_output_contract_types": 0,

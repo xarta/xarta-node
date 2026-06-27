@@ -2190,6 +2190,23 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "automation_review_processor_status": _clean_string(
             kanban.get("automation_review_processor_status"), "", 80
         ),
+        "automation_review_queue_length": _clean_browser_page_int(
+            kanban.get("automation_review_queue_length"), maximum=5000
+        ),
+        "automation_review_active_count": _clean_browser_page_int(
+            kanban.get("automation_review_active_count"), maximum=5000
+        ),
+        "automation_review_timeout_count": _clean_browser_page_int(
+            kanban.get("automation_review_timeout_count"), maximum=5000
+        ),
+        "automation_review_superseded_count": _clean_browser_page_int(
+            kanban.get("automation_review_superseded_count"), maximum=5000
+        ),
+        "automation_review_marker_count": _clean_browser_page_int(
+            kanban.get("automation_review_marker_count"), maximum=5000
+        ),
+        "automation_busy_action": _clean_string(kanban.get("automation_busy_action"), "", 80),
+        "automation_last_result": _clean_string(kanban.get("automation_last_result"), "", 180),
         "automation_commit_link_health_ok": kanban.get("automation_commit_link_health_ok")
         is not False,
         "automation_output_contract_schema": _clean_string(
