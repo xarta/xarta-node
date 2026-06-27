@@ -955,6 +955,16 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
                 "meaning": "Machine-readable processing, timeout, supersede, or cancellation reason.",
             },
             {
+                "field": "last_outcome_at",
+                "scope": "marker.metadata",
+                "meaning": "UTC time of the latest terminal completion or timeout requeue outcome.",
+            },
+            {
+                "field": "last_outcome_status",
+                "scope": "marker.metadata",
+                "meaning": "Latest terminal or timeout outcome such as processed, failed, skipped, cancelled, or timeout_requeued.",
+            },
+            {
                 "field": "processing_expires_at",
                 "scope": "kanban_review_processor_markers",
                 "meaning": "UTC deadline used to requeue timed-out processing markers.",
@@ -9886,7 +9896,7 @@ async def trigger_work_review_processor_idle_scan(
                 if same_document and existing["status"] in {"queued", "processing"}:
                     unchanged_pending += 1
                     continue
-                if same_document and existing["status"] in {"failed", "skipped"}:
+                if same_document and existing["status"] in {"failed", "skipped", "cancelled"}:
                     unchanged_failed += 1
                     continue
                 if already_processed and existing["status"] == "processed":
@@ -10194,15 +10204,10 @@ async def complete_work_review_processor_marker(
             "last_seen_at": now,
             "decision_id": decision_id,
             "last_error": last_error if outcome_status != "processed" else "",
+            "processed_document_updated_at": marker_row["document_updated_at"],
+            "processed_source_hash": marker_row["document_source_hash"],
+            "processed_at": now,
         }
-        if outcome_status == "processed":
-            updates.update(
-                {
-                    "processed_document_updated_at": marker_row["document_updated_at"],
-                    "processed_source_hash": marker_row["document_source_hash"],
-                    "processed_at": now,
-                }
-            )
         saved_row = _write_work_review_processor_marker(
             conn,
             _work_review_processor_marker_update_row(
@@ -10217,6 +10222,9 @@ async def complete_work_review_processor_marker(
                     "lease_id": lease_row["lease_id"],
                     "decision_id": decision_id,
                     "outcome_status": outcome_status,
+                    "last_outcome_at": now,
+                    "last_outcome_status": outcome_status,
+                    "last_processed_at": now,
                 },
             ),
         )
@@ -10305,7 +10313,12 @@ async def requeue_timed_out_work_review_processor_markers(
                 meta=meta,
                 now=now,
                 reason="processing_timeout_requeued",
-                metadata=dict(body.metadata or {}),
+                metadata={
+                    **dict(body.metadata or {}),
+                    "last_outcome_at": now,
+                    "last_outcome_status": "timeout_requeued",
+                    "last_error": "processing_timeout",
+                },
             )
             requeued_rows.append(_write_work_review_processor_marker(conn, updated_row))
         source_hash = _hash_json_payload(

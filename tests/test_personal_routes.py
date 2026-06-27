@@ -3819,6 +3819,8 @@ def test_work_review_processor_metadata_contract_endpoint():
     ]
     assert fields["run_id"]["scope"] == "marker.provenance"
     assert fields["last_error"]["scope"] == "kanban_review_processor_markers"
+    assert fields["last_outcome_at"]["scope"] == "marker.metadata"
+    assert fields["last_outcome_status"]["scope"] == "marker.metadata"
     assert "metadata.cancelled_previous_status" in contract["cancellation_fields"]
     assert any("body_hash is unchanged" in rule for rule in contract["transition_rules"])
     assert any("review_document_deleted" in rule for rule in contract["transition_rules"])
@@ -4374,6 +4376,10 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert timed_out["requeued_count"] == 1
     assert timed_out["requeued_markers"][0]["status"] == "queued"
     assert timed_out["requeued_markers"][0]["last_error"] == "processing_timeout"
+    assert timed_out["requeued_markers"][0]["metadata"]["last_outcome_status"] == (
+        "timeout_requeued"
+    )
+    assert timed_out["requeued_markers"][0]["metadata"]["last_error"] == "processing_timeout"
 
     claimed_third = asyncio.run(
         routes_personal.claim_next_work_review_processor_marker(
@@ -4429,6 +4435,127 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert "claim_review_processor_marker" in audit_actions
     assert "complete_review_processor_marker" in audit_actions
     assert "requeue_review_processor_timeouts" in audit_actions
+
+
+def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-failed-root",
+                title="Review failed root",
+                body="Root item for failed completion proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-failed-child",
+                parent_item_id="work-review-failed-root",
+                title="Review failed child",
+                body="Child item with failed Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-failed-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review failed completion pass one.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-failed-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-failed",
+                item_id="work-review-failed-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-failed-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-claim",
+            )
+        )
+    )
+    completed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            claimed["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="failed",
+                error="provider_failed",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-complete",
+            ),
+        )
+    )
+    failed_marker = completed["marker"]
+    assert failed_marker["status"] == "failed"
+    assert failed_marker["last_error"] == "provider_failed"
+    assert failed_marker["processed_at"]
+    assert failed_marker["processed_source_hash"] == marker["document_source_hash"]
+    assert failed_marker["processed_document_updated_at"] == marker["document_updated_at"]
+    assert failed_marker["metadata"]["last_outcome_status"] == "failed"
+    assert failed_marker["metadata"]["last_processed_at"] == failed_marker["processed_at"]
+
+    same_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-failed-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-scan-again",
+            )
+        )
+    )
+    assert same_scan["queued_count"] == 0
+    assert same_scan["unchanged_failed_count"] == 1
 
 
 def test_work_review_processor_archive_cancels_active_marker(monkeypatch, tmp_path):
