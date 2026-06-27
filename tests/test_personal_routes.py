@@ -3736,6 +3736,18 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         status["metadata_contract"]["schema"]
         == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     )
+    assert (
+        status["proposal_surfaces"]["schema"]
+        == routes_personal.KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA
+    )
+    assert (
+        status["proposal_surfaces"]["inbox"]["item_id"]
+        == routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID
+    )
+    assert (
+        status["proposal_surfaces"]["outbox"]["item_id"]
+        == routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID
+    )
     assert status["processing_policy"]["active_mode"] == "cloud-first"
     assert status["processing_policy"]["local_processing"]["state"] == "planned-gated"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
@@ -3832,6 +3844,40 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert "metadata.cancelled_previous_status" in contract["cancellation_fields"]
     assert any("body_hash is unchanged" in rule for rule in contract["transition_rules"])
     assert any("review_document_deleted" in rule for rule in contract["transition_rules"])
+
+
+def test_work_proposal_surfaces_contract_endpoint():
+    result = asyncio.run(routes_personal.get_work_proposal_surfaces_contract())
+    contract = result["contract"]
+    assert result["ok"] is True
+    assert contract["schema"] == routes_personal.KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA
+    assert (
+        contract["surface_root"]["item_id"]
+        == routes_personal.KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID
+    )
+    assert (
+        contract["workstream"]["item_id"]
+        == routes_personal.KANBAN_AGENT_PROPOSAL_WORKSTREAM_ITEM_ID
+    )
+    assert contract["inbox"]["item_id"] == routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID
+    assert contract["inbox"]["uri"] == "xarta-kanban:item:kanban-203acef17b12"
+    assert "approval_request" in contract["inbox"]["accepted_entry_types"]
+    assert "requested_operator_action" in contract["inbox"]["required_fields"]
+    assert any(
+        "not treat INBOX as the implementation card" in rule
+        for rule in contract["inbox"]["placement_rules"]
+    )
+    assert contract["outbox"]["item_id"] == routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID
+    assert "completed_decision" in contract["outbox"]["accepted_entry_types"]
+    assert "commit_link_ids" in contract["outbox"]["required_fields"]
+    assert any(
+        "explicit commit associations" in rule for rule in contract["outbox"]["placement_rules"]
+    )
+    assert contract["status_integration"]["automation_status_field"] == "proposal_surfaces"
+    assert any(
+        "not substitutes for implementation workstream cards" in rule
+        for rule in contract["global_rules"]
+    )
 
 
 def test_work_review_processor_processing_policy_endpoint():
