@@ -4887,16 +4887,38 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     processed = tick["processed_markers"][0]
     assert processed["processor_kind"] == "preprocessing"
     assert processed["provider_mode"] == "local"
-    assert processed["status"] == "failed"
-    assert "missing_proof" in processed["reason"]
-    assert "local_ai_reported_not_ready" in processed["reason"]
-    assert "local_ai_not_ready" not in processed["reason"]
+    assert processed["status"] == "processed"
+    assert processed["decomposition"]["total_count"] == 1
+    assert processed["decomposition"]["created_count"] == 1
 
     marker = conn.execute(
         "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-preprocess-ai-child'"
     ).fetchone()
-    assert marker["status"] == "failed"
-    assert "local_ai_reported_not_ready" in marker["last_error"]
+    assert marker["status"] == "processed"
+    assert marker["last_error"] == ""
+    child = conn.execute(
+        """
+        SELECT * FROM kanban_items
+        WHERE parent_item_id='work-preprocess-ai-child'
+          AND title='Add proof.'
+        """
+    ).fetchone()
+    assert child is not None
+    assert child["state_id"] == "todo"
+    parent = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-ai-child'"
+    ).fetchone()
+    assert parent["state_id"] == "doing"
+    decision = conn.execute(
+        """
+        SELECT * FROM kanban_review_decisions
+        WHERE item_id='work-preprocess-ai-child'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert decision["decision_type"] == "preprocessing_decomposition"
+    assert decision["status"] == "accepted"
 
 
 def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_path):
