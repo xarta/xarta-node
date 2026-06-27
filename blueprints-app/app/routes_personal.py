@@ -76,6 +76,7 @@ KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
 KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v1"
+KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata_contract.v1"
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_REVIEW_MARKER_SCHEMA = "xarta.kanban.review_processor.marker.v1"
 KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
@@ -878,14 +879,125 @@ def _work_review_processing_policy() -> dict[str, Any]:
     }
 
 
+def _work_review_processing_metadata_contract() -> dict[str, Any]:
+    processing_policy = _work_review_processing_policy()
+    return {
+        "schema": KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA,
+        "status": "active",
+        "version": "2026-06-27",
+        "review_document_schema": KANBAN_ITEM_REVIEW_SCHEMA,
+        "marker_schema": KANBAN_REVIEW_MARKER_SCHEMA,
+        "scheduler_schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+        "provider_mode": {
+            "active": processing_policy["active_mode"],
+            "local_processing_gate": processing_policy["local_processing"]["gate"],
+            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+        },
+        "storage": {
+            "review_document": "item Review markdown frontmatter",
+            "marker_table": "kanban_review_processor_markers",
+            "decision_table": "kanban_review_decisions",
+        },
+        "required_fields": [
+            {
+                "field": "body_hash",
+                "scope": "review_document.metadata",
+                "meaning": "Hash of the normalized Review markdown body.",
+                "updates_when": "Review body content changes.",
+            },
+            {
+                "field": "updated_at",
+                "scope": "review_document.metadata",
+                "alias": "review_updated_at",
+                "meaning": "UTC Review content timestamp used by the scanner.",
+                "updates_when": "body_hash changes.",
+            },
+            {
+                "field": "document_source_hash",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Stable scanner source hash for the Review document snapshot.",
+                "updates_when": "Review body, Review updated_at, schema, item id, or file ref changes.",
+            },
+            {
+                "field": "processed_source_hash",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Last Review source hash accepted as processed.",
+                "updates_when": "marker completes with processed status.",
+            },
+            {
+                "field": "processed_at",
+                "scope": "kanban_review_processor_markers",
+                "alias": "last_processed_at",
+                "meaning": "UTC time of the last processed Review snapshot.",
+                "updates_when": "marker completes with processed status.",
+            },
+            {
+                "field": "status",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Queue state for the Review processing marker.",
+                "allowed_values": [
+                    "queued",
+                    "processing",
+                    "processed",
+                    "failed",
+                    "skipped",
+                    "cancelled",
+                ],
+            },
+            {
+                "field": "run_id",
+                "scope": "marker.provenance",
+                "meaning": "Run/request provenance for the scanner, worker claim, timeout, or completion write.",
+            },
+            {
+                "field": "last_error",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Machine-readable processing, timeout, supersede, or cancellation reason.",
+            },
+            {
+                "field": "processing_expires_at",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "UTC deadline used to requeue timed-out processing markers.",
+            },
+            {
+                "field": "superseded_at",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "UTC time a processing marker was superseded by newer Review content.",
+            },
+            {
+                "field": "superseded_by_source_hash",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "New Review source hash that replaced an in-flight processing attempt.",
+            },
+        ],
+        "transition_rules": [
+            "Review saves preserve updated_at and document_source_hash when body_hash is unchanged.",
+            "Idle scan queues a marker when document_source_hash differs from processed_source_hash and no current queued/processing marker exists for the same document.",
+            "A processing marker is requeued with last_error=processing_timeout when processing_expires_at is in the past.",
+            "A processing marker is requeued with last_error=review_changed_during_processing and superseded fields when Review content changes during processing.",
+            "A queued or processing marker is cancelled with last_error=review_document_deleted when Review text is emptied or removed.",
+        ],
+        "cancellation_fields": [
+            "status=cancelled",
+            "last_error",
+            "last_seen_at",
+            "processing_started_at",
+            "processing_expires_at",
+            "metadata.cancelled_previous_status",
+        ],
+    }
+
+
 def _work_review_processor_output_contract() -> dict[str, Any]:
     processing_policy = _work_review_processing_policy()
+    metadata_contract = _work_review_processing_metadata_contract()
     return {
         "schema": KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA,
         "status": "active",
         "version": "2026-06-27",
         "decision_record_schema": KANBAN_REVIEW_DECISION_SCHEMA,
         "processing_policy_schema": processing_policy["schema"],
+        "metadata_contract_schema": metadata_contract["schema"],
         "provider_mode": {
             "active": processing_policy["active_mode"],
             "local_processing_gate": processing_policy["local_processing"]["gate"],
@@ -10190,6 +10302,14 @@ async def get_work_review_processor_processing_policy() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/review-processor/metadata-contract")
+async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract": _work_review_processing_metadata_contract(),
+    }
+
+
 @router.get("/kanban/automation/review-processor/lease")
 async def get_work_review_processor_lease() -> dict[str, Any]:
     with get_conn() as conn:
@@ -10603,6 +10723,7 @@ async def get_work_automation_status(
             "item": item_payload,
             "generated_at": generated_at,
             "output_contract": _work_review_processor_output_contract(),
+            "metadata_contract": _work_review_processing_metadata_contract(),
             "processing_policy": processing_policy,
             "provider_mode": {
                 "active": processing_policy["active_mode"],
