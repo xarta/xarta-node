@@ -80,6 +80,7 @@ KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_REVIEW_MARKER_SCHEMA = "xarta.kanban.review_processor.marker.v1"
 KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
+KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.readiness_contract.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
 KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID = "kanban-5f930fec1321"
 KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID = "kanban-203acef17b12"
@@ -1000,6 +1001,116 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             "processing_started_at",
             "processing_expires_at",
             "metadata.cancelled_previous_status",
+        ],
+    }
+
+
+def _work_preprocessing_readiness_contract() -> dict[str, Any]:
+    processing_policy = _work_review_processing_policy()
+    return {
+        "schema": KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA,
+        "status": "active",
+        "version": "2026-06-27",
+        "context_packet_schema": "xarta.kanban.context_packet.v1",
+        "readiness_marker_schema": "xarta.kanban.context_readiness_marker.v1",
+        "readiness_check_schema": "xarta.kanban.context_readiness_check.v1",
+        "marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
+        "provider_mode": {
+            "active": processing_policy["active_mode"],
+            "local_processing_gate": processing_policy["local_processing"]["gate"],
+            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+        },
+        "required_fields": [
+            {
+                "field": "context_hash",
+                "scope": "context_readiness_marker",
+                "meaning": "Stable hash of the accepted context packet component hashes.",
+                "updates_when": "Body, Detail, Review, Discussion, tree, link, blocker, commit, Issue, ToDo, count, or rollup context changes.",
+            },
+            {
+                "field": "component_hashes",
+                "scope": "context_readiness_marker",
+                "meaning": "Per-component hashes for rich_documents, work_state, and tree_state drift diagnosis.",
+            },
+            {
+                "field": "marked_at",
+                "scope": "context_readiness_marker",
+                "alias": "last_preprocessed_at",
+                "meaning": "UTC time the current packet was accepted by preprocessing.",
+            },
+            {
+                "field": "ready",
+                "scope": "context_readiness_check",
+                "alias": "readiness_state",
+                "meaning": "True only when the current packet matches the stored marker and hard validation checks pass.",
+            },
+            {
+                "field": "reason",
+                "scope": "context_readiness_check",
+                "meaning": "Machine-readable readiness result such as ready, missing_readiness_marker, readiness_marker_stale, tree_validation_failed, missing_body, or open_blockers.",
+            },
+            {
+                "field": "open_questions",
+                "scope": "context_readiness_marker.metadata",
+                "meaning": "Questions or preprocessing requests that must be answered before implementation proceeds.",
+            },
+            {
+                "field": "links",
+                "scope": "context_packet.work_state",
+                "meaning": "Kanban links considered by preprocessing, including link_count and linked item refs.",
+            },
+            {
+                "field": "blockers",
+                "scope": "context_packet.work_state",
+                "meaning": "Open blockers considered by preprocessing; open blockers fail readiness unless explicitly resolved or handled.",
+            },
+            {
+                "field": "drift_components",
+                "scope": "context_readiness_check",
+                "alias": "stale_markers",
+                "meaning": "Component names whose current hashes differ from the stored marker.",
+            },
+        ],
+        "packet_inputs": [
+            "workspace_orientation",
+            "active_private_skills",
+            "helper_commands",
+            "body",
+            "detail",
+            "review",
+            "discussions",
+            "images",
+            "tree_state",
+            "validation",
+            "open_descendants",
+            "links",
+            "blockers",
+            "commits",
+            "issues",
+            "todos",
+            "counts",
+            "rollups",
+        ],
+        "readiness_states": [
+            "ready",
+            "missing_readiness_marker",
+            "readiness_marker_stale",
+            "tree_validation_failed",
+            "tree_problem_detected",
+            "missing_body",
+            "open_blockers",
+            "missing_detail",
+            "missing_review",
+            "missing_discussions",
+            "missing_commits",
+        ],
+        "transition_rules": [
+            "Preprocessing creates or replaces context_readiness_marker after the current packet is internally sane.",
+            "Implementation starts only when context readiness check returns ready=true.",
+            "A missing or stale marker requests preprocessing time instead of guessing from title words.",
+            "Validation failures, missing item body, and open blockers are hard readiness failures.",
+            "Detail, Review, discussions, and commits are warnings by default unless the work item explicitly requires them.",
+            "Audit-count changes from recording the marker do not stale the packet; real work-state component changes do.",
         ],
     }
 
@@ -10512,6 +10623,14 @@ async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/preprocessing/readiness-contract")
+async def get_work_preprocessing_readiness_contract() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract": _work_preprocessing_readiness_contract(),
+    }
+
+
 @router.get("/kanban/automation/proposal-surfaces/contract")
 async def get_work_proposal_surfaces_contract() -> dict[str, Any]:
     return {
@@ -10934,6 +11053,7 @@ async def get_work_automation_status(
             "generated_at": generated_at,
             "output_contract": _work_review_processor_output_contract(),
             "metadata_contract": _work_review_processing_metadata_contract(),
+            "preprocessing_contract": _work_preprocessing_readiness_contract(),
             "processing_policy": processing_policy,
             "proposal_surfaces": _work_proposal_surfaces_contract(),
             "provider_mode": {
@@ -10973,10 +11093,11 @@ async def get_work_automation_status(
                 "review_markers": marker_stats["recent_markers"],
             },
             "preprocessing": {
-                "status": "contract-pending",
+                "status": "readiness-contract-ready",
                 "queue_length": 0,
                 "active_item_id": "",
                 "last_completed_item_id": "",
+                "readiness_contract": _work_preprocessing_readiness_contract(),
             },
             "decisions": {
                 "count": len(all_decision_rows),
