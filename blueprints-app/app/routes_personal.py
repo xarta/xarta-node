@@ -565,6 +565,7 @@ class WorkReviewProcessorMarkerClaimRequest(BaseModel):
     lease_token: str | None = None
     item_id: str | None = None
     timeout_seconds: int = 1200
+    eligible_marker_ids: list[str] | None = None
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -785,6 +786,13 @@ def _work_request_is_agent_working_out(meta: dict[str, str], tags: list[str]) ->
         or "active-browser-step" in request_id
         or KANBAN_PROOF_TAG in tags
         and source_surface.startswith("kanban-")
+    )
+
+
+def _work_request_is_kanban_idle_worker(meta: dict[str, str]) -> bool:
+    return (
+        str(meta.get("source_surface") or "").lower() == "kanban-automation-idle-worker"
+        or str(meta.get("actor") or "").lower() == "kanban-idle-worker"
     )
 
 
@@ -2172,6 +2180,32 @@ def _work_preprocessing_active_rows(conn: Any, scope_ids: list[str]) -> list[Any
         """,
         args,
     ).fetchall()
+
+
+def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
+    args: list[Any] = []
+    where = "WHERE status='queued'"
+    if scope_ids:
+        placeholders = ",".join("?" for _ in scope_ids)
+        where += f" AND item_id IN ({placeholders})"
+        args.extend(scope_ids)
+    rows = conn.execute(
+        f"""
+        SELECT marker_id FROM kanban_review_processor_markers
+        {where}
+        ORDER BY
+          CASE processor_kind
+            WHEN 'review' THEN 0
+            WHEN 'preprocessing' THEN 1
+            ELSE 2
+          END,
+          queued_at ASC,
+          document_updated_at ASC,
+          marker_id
+        """,
+        args,
+    ).fetchall()
+    return [row["marker_id"] for row in rows]
 
 
 def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
@@ -8193,6 +8227,133 @@ def _upsert_work_processor_marker_blocker(
     return {"blocker_row": blocker_row, "audit_row": audit_row}
 
 
+def _resolve_stale_work_processor_marker_blockers(
+    conn: Any,
+    *,
+    item_id: str,
+    source: dict[str, Any],
+    meta: dict[str, str],
+    now: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT * FROM kanban_blockers
+        WHERE item_id=?
+          AND status NOT IN ('resolved', 'closed', 'done')
+          AND COALESCE(json_extract(provenance_json, '$.schema'), '') = ?
+        ORDER BY updated_at ASC, blocker_id
+        """,
+        (item_id, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA),
+    ).fetchall()
+    resolved: list[dict[str, Any]] = []
+    current_source_hash = str(source.get("document_source_hash") or "")
+    for blocker in rows:
+        provenance = _json_value(blocker["provenance_json"], {})
+        marker_id = _clean_short_text(
+            provenance.get("marker_id")
+            or str(blocker["blocked_by_ref"] or "").removeprefix(
+                "kanban_review_processor_markers:"
+            ),
+            "",
+            limit=180,
+        )
+        if not marker_id:
+            continue
+        marker_row = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (marker_id,),
+        ).fetchone()
+        if marker_row is None:
+            stale_reason = "missing_marker"
+        elif marker_row["status"] in {"processed", "skipped", "cancelled"}:
+            stale_reason = f"marker_{marker_row['status']}"
+        elif (
+            marker_row["processor_kind"] == "preprocessing"
+            and marker_row["status"] == "failed"
+            and marker_row["document_source_hash"] != current_source_hash
+        ):
+            stale_reason = "failed_marker_source_changed"
+        else:
+            continue
+        title = "Resolved stale processor marker blocker"
+        body_excerpt = (
+            f"Processor marker `{marker_id}` is stale ({stale_reason}) for the current "
+            "preprocessing source and no longer blocks agent completion."
+        )
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="kanban_blockers",
+            row_id=blocker["blocker_id"],
+            kind="blocker",
+            title=title,
+            body=body_excerpt,
+            related_refs=[f"kanban_review_processor_markers:{marker_id}"],
+        )
+        updated_provenance = {
+            **provenance,
+            "resolved_by": meta["actor"],
+            "resolved_source_surface": meta["source_surface"],
+            "resolved_request_id": meta["request_id"],
+            "resolved_run_id": meta["run_id"],
+            "stale_reason": stale_reason,
+            "current_document_source_hash": current_source_hash,
+        }
+        conn.execute(
+            """
+            UPDATE kanban_blockers
+            SET title=?, body_excerpt=?, status='resolved', search_text=?,
+                search_metadata_json=?, vector_index_key=?, provenance_json=?,
+                updated_at=?
+            WHERE blocker_id=?
+            """,
+            (
+                title,
+                _body_excerpt(body_excerpt, limit=4000),
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(updated_provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                blocker["blocker_id"],
+            ),
+        )
+        blocker_row = conn.execute(
+            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+            (blocker["blocker_id"],),
+        ).fetchone()
+        source_hash = _hash_json_payload(
+            {
+                "blocker_id": blocker["blocker_id"],
+                "item_id": item_id,
+                "marker_id": marker_id,
+                "status": "resolved",
+                "stale_reason": stale_reason,
+                "current_document_source_hash": current_source_hash,
+            }
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=f"audit-{uuid.uuid4().hex}",
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="resolve_stale_processor_marker_blocker",
+            target_ref=f"kanban_blockers:{blocker['blocker_id']}",
+            item_id=item_id,
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="resolved",
+            source_hash=source_hash,
+            metadata={
+                "marker_id": marker_id,
+                "stale_reason": stale_reason,
+                "current_document_source_hash": current_source_hash,
+            },
+        )
+        resolved.append({"blocker_row": blocker_row, "audit_row": audit_row})
+    return resolved
+
+
 def _assert_agent_completion_not_blocked(
     conn: Any,
     *,
@@ -9672,6 +9833,18 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
         item_row, audit_row = _insert_work_item(
             conn, payload, action="create_work_item", audit_id=audit_id, now=now
         )
+        if item_row["parent_item_id"] != payload["parent_item_id"]:
+            raise RuntimeError(
+                "Kanban create invariant failed: "
+                f"{payload['item_id']} parent={item_row['parent_item_id']!r} "
+                f"expected={payload['parent_item_id']!r}"
+            )
+        if int(item_row["depth"] or 0) != int(payload["depth"] or 0):
+            raise RuntimeError(
+                "Kanban create invariant failed: "
+                f"{payload['item_id']} depth={item_row['depth']!r} "
+                f"expected={payload['depth']!r}"
+            )
         gen = increment_gen(conn, "kanban-item")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_items", payload["item_id"], dict(item_row), gen
@@ -10463,7 +10636,31 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             target_state=state,
             meta=meta,
         )
-        new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
+        raw_fields_set = getattr(body, "model_fields_set", None)
+        if raw_fields_set is None:
+            raw_fields_set = getattr(body, "__fields_set__", set())
+        fields_set = set(raw_fields_set)
+        if "parent_item_id" in fields_set:
+            new_parent = _clean_short_text(body.parent_item_id, "", limit=180) or None
+        else:
+            new_parent = existing["parent_item_id"]
+        parent_changed = (new_parent or "") != (existing["parent_item_id"] or "")
+        if parent_changed and _work_request_is_kanban_idle_worker(meta):
+            raise HTTPException(
+                403,
+                {
+                    "error": "kanban_idle_worker_parent_change_forbidden",
+                    "detail": (
+                        "Kanban automation idle worker may change item state/lane, "
+                        "but must not reparent existing cards."
+                    ),
+                    "item_id": item_id,
+                    "from_parent_item_id": existing["parent_item_id"] or "",
+                    "to_parent_item_id": new_parent or "",
+                    "source_surface": meta["source_surface"],
+                    "actor": meta["actor"],
+                },
+            )
         new_depth = _work_parent_depth(conn, new_parent, moving_item_id=item_id)
         max_relative = _work_subtree_max_relative_depth(conn, item_id)
         if new_depth + max_relative > KANBAN_DEPTH_LIMIT:
@@ -11710,12 +11907,58 @@ def _work_slug_fragment(value: str, *, limit: int = 48) -> str:
     return slug[:limit].strip("-") or "work"
 
 
-def _work_preprocessing_child_id(parent_item_id: str, title: str) -> str:
-    digest = hashlib.sha256(f"{parent_item_id}|{title}".encode("utf-8")).hexdigest()[:10]
-    return _clean_work_id(
-        f"{parent_item_id}-{_work_slug_fragment(title)}-{digest}",
-        "kanban-preprocess",
+def _work_preprocessing_title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", str(title or "").strip()).casefold()
+
+
+def _work_preprocessing_child_id(parent_item_id: str, title: str, *, attempt: int = 0) -> str:
+    digest_source = (
+        f"{parent_item_id}|{title}|{attempt}" if attempt else f"{parent_item_id}|{title}"
     )
+    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:12]
+    base = f"{parent_item_id}-{_work_slug_fragment(title, limit=64)}"
+    max_base_length = 180 - len(digest) - 1
+    base = base[:max_base_length].rstrip("-") or "kanban-preprocess"
+    return _clean_work_id(f"{base}-{digest}", "kanban-preprocess")
+
+
+def _work_preprocessing_unique_child_id(conn: Any, parent_item_id: str, title: str) -> str:
+    title_key = _work_preprocessing_title_key(title)
+    for attempt in range(50):
+        item_id = _work_preprocessing_child_id(parent_item_id, title, attempt=attempt)
+        existing = conn.execute(
+            "SELECT item_id, parent_item_id, title, status FROM kanban_items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if existing is None:
+            return item_id
+        if (
+            existing["parent_item_id"] == parent_item_id
+            and existing["status"] != "archived"
+            and _work_preprocessing_title_key(existing["title"]) == title_key
+        ):
+            return item_id
+    raise ValueError("could not generate a collision-free preprocessing child item_id")
+
+
+def _work_preprocessing_assert_child_placement(
+    item: dict[str, Any],
+    *,
+    parent_item_id: str,
+    expected_depth: int,
+) -> None:
+    if item.get("parent_item_id") != parent_item_id:
+        raise RuntimeError(
+            "preprocessing child placement invariant failed: "
+            f"{item.get('item_id', '')} parent={item.get('parent_item_id')!r} "
+            f"expected={parent_item_id!r}"
+        )
+    if int(item.get("depth") or 0) != expected_depth:
+        raise RuntimeError(
+            "preprocessing child placement invariant failed: "
+            f"{item.get('item_id', '')} depth={item.get('depth')!r} "
+            f"expected={expected_depth}"
+        )
 
 
 def _clean_work_preprocessing_state(value: Any) -> str:
@@ -11744,40 +11987,32 @@ def _work_preprocessing_normalise_decomposition_items(
     parent_tags = _json_value(parent_item["tags_json"], ["kanban"])
     if not isinstance(parent_tags, list):
         parent_tags = ["kanban"]
-    raw_items = payload.get("decomposition_items")
-    if not isinstance(raw_items, list):
+    raw_items_value = payload.get("decomposition_items")
+    if raw_items_value is None:
         raw_items = []
-    if not raw_items:
-        next_actions = payload.get("recommended_next_actions")
-        if isinstance(next_actions, list):
-            raw_items = [
-                {
-                    "title": str(action or ""),
-                    "body": "Preprocessing identified this as required follow-up work.",
-                }
-                for action in next_actions
-            ]
+    elif isinstance(raw_items_value, list):
+        raw_items = raw_items_value
+    else:
+        raise ValueError("local AI response field decomposition_items must be a list")
     normalised: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
-    for raw_item in raw_items[:24]:
+    for index, raw_item in enumerate(raw_items[:24]):
         if isinstance(raw_item, str):
-            candidate: dict[str, Any] = {"title": raw_item}
+            raise ValueError(
+                f"local AI decomposition_items[{index}] must be an object with a title"
+            )
         elif isinstance(raw_item, dict):
             candidate = raw_item
         else:
-            continue
+            raise ValueError(f"local AI decomposition_items[{index}] must be an object")
         title = _clean_short_text(
-            candidate.get("title")
-            or candidate.get("summary")
-            or candidate.get("action")
-            or candidate.get("name")
-            or "",
+            candidate.get("title") or "",
             "",
             limit=180,
         )
         if not title:
-            continue
-        title_key = title.casefold()
+            raise ValueError(f"local AI decomposition_items[{index}] missing required field: title")
+        title_key = _work_preprocessing_title_key(title)
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
@@ -11821,7 +12056,6 @@ def _work_preprocessing_normalise_decomposition_items(
             body_parts.append(f"Blocked reason/question: {blocked_reason}")
         normalised.append(
             {
-                "item_id": _work_preprocessing_child_id(parent_item_id, title),
                 "title": title,
                 "body": "\n\n".join(body_parts),
                 "state_id": state_id,
@@ -11843,6 +12077,7 @@ async def _work_preprocessing_create_decomposition_children(
     marker_id: str,
 ) -> dict[str, Any]:
     parent_item_id = parent_item["item_id"]
+    expected_child_depth = int(parent_item["depth"] or 0) + 1
     candidates = _work_preprocessing_normalise_decomposition_items(
         payload,
         parent_item=parent_item,
@@ -11851,23 +12086,40 @@ async def _work_preprocessing_create_decomposition_children(
     existing: list[dict[str, Any]] = []
     for candidate in candidates:
         with get_conn() as conn:
-            existing_row = conn.execute(
+            sibling_rows = conn.execute(
                 """
                 SELECT * FROM kanban_items
                 WHERE parent_item_id=?
                   AND status!='archived'
-                  AND lower(title)=lower(?)
                 ORDER BY created_at ASC, item_id
-                LIMIT 1
                 """,
-                (parent_item_id, candidate["title"]),
-            ).fetchone()
+                (parent_item_id,),
+            ).fetchall()
+            sibling_by_title = {
+                _work_preprocessing_title_key(row["title"]): row for row in sibling_rows
+            }
+            existing_row = sibling_by_title.get(_work_preprocessing_title_key(candidate["title"]))
+            item_id = (
+                existing_row["item_id"]
+                if existing_row is not None
+                else _work_preprocessing_unique_child_id(
+                    conn,
+                    parent_item_id,
+                    candidate["title"],
+                )
+            )
         if existing_row is not None:
-            existing.append(_row_to_work_item(existing_row))
+            existing_item = _row_to_work_item(existing_row)
+            _work_preprocessing_assert_child_placement(
+                existing_item,
+                parent_item_id=parent_item_id,
+                expected_depth=expected_child_depth,
+            )
+            existing.append(existing_item)
             continue
         result = await create_work_item(
             WorkItemCreateRequest(
-                item_id=candidate["item_id"],
+                item_id=item_id,
                 parent_item_id=parent_item_id,
                 title=candidate["title"],
                 body=candidate["body"],
@@ -11877,11 +12129,17 @@ async def _work_preprocessing_create_decomposition_children(
                 tags=candidate["tags"],
                 actor=holder_id,
                 source_surface="kanban-automation-idle-worker",
-                request_id=f"{run_id}-preprocess-child-{marker_id}-{candidate['item_id']}",
+                request_id=f"{run_id}-preprocess-child-{marker_id}-{item_id}",
                 run_id=run_id,
             )
         )
-        created.append(result["item"])
+        child_item = result["item"]
+        _work_preprocessing_assert_child_placement(
+            child_item,
+            parent_item_id=parent_item_id,
+            expected_depth=expected_child_depth,
+        )
+        created.append(child_item)
     all_items = [*existing, *created]
     if all_items:
         lines = [
@@ -12530,6 +12788,16 @@ async def run_work_kanban_automation_idle_tick(
     marker_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     config = _work_automation_idle_worker_config()
+    if not config["enabled"]:
+        return {
+            "ok": True,
+            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+            "enabled": False,
+            "reason": "idle_worker_disabled_by_configuration",
+            "processed_count": 0,
+            "processed_markers": [],
+            "claim_results": [],
+        }
     clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
     scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
     process_limit = max(1, min(int(max_process_items or config["max_process_items"]), 50))
@@ -12577,6 +12845,9 @@ async def run_work_kanban_automation_idle_tick(
             metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
         )
     )
+    with get_conn() as conn:
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        eligible_marker_ids = _work_queued_processor_marker_ids(conn, scope_ids)
     lease = await acquire_work_review_processor_lease(
         WorkReviewProcessorLeaseRequest(
             holder_id=clean_holder_id,
@@ -12603,6 +12874,8 @@ async def run_work_kanban_automation_idle_tick(
             "timeout_requeue": timeout_requeue,
             "review_scan": review_scan,
             "preprocessing_scan": preprocessing_scan,
+            "eligible_marker_count": len(eligible_marker_ids),
+            "eligible_marker_ids": eligible_marker_ids,
             "processed_count": 0,
             "processed_markers": [],
             "claim_results": [],
@@ -12628,6 +12901,7 @@ async def run_work_kanban_automation_idle_tick(
                     lease_token=lease_token,
                     item_id=clean_item_id or None,
                     timeout_seconds=timeout_seconds,
+                    eligible_marker_ids=eligible_marker_ids,
                     actor=clean_holder_id,
                     source_surface="kanban-automation-idle-worker",
                     request_id=f"{run_id}-claim-{index}",
@@ -12675,6 +12949,8 @@ async def run_work_kanban_automation_idle_tick(
         "timeout_requeue": timeout_requeue,
         "review_scan": review_scan,
         "preprocessing_scan": preprocessing_scan,
+        "eligible_marker_count": len(eligible_marker_ids),
+        "eligible_marker_ids": eligible_marker_ids,
         "processed_count": len(processed_markers),
         "processed_markers": processed_markers,
         "claim_results": claim_results,
@@ -13062,6 +13338,7 @@ async def trigger_work_preprocessing_idle_scan(
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
         cancelled_marker_blockers: list[dict[str, Any]] = []
+        stale_marker_blockers: list[dict[str, Any]] = []
         unchanged_current = 0
         unchanged_pending = 0
         unchanged_failed = 0
@@ -13070,6 +13347,15 @@ async def trigger_work_preprocessing_idle_scan(
         for entry in scan_entries:
             item_id = entry["item"]["item_id"]
             source = entry["source"]
+            stale_marker_blockers.extend(
+                _resolve_stale_work_processor_marker_blockers(
+                    conn,
+                    item_id=item_id,
+                    source=source,
+                    meta=meta,
+                    now=now,
+                )
+            )
             marker_id = _preprocessing_marker_id(item_id)
             existing = conn.execute(
                 "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
@@ -13157,6 +13443,7 @@ async def trigger_work_preprocessing_idle_scan(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
@@ -13184,6 +13471,7 @@ async def trigger_work_preprocessing_idle_scan(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
@@ -13202,6 +13490,23 @@ async def trigger_work_preprocessing_idle_scan(
                 gen,
             )
         for marker_blocker in cancelled_marker_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
+        for marker_blocker in stale_marker_blockers:
             enqueue_for_all_peers(
                 conn,
                 "UPDATE",
@@ -13249,6 +13554,7 @@ async def trigger_work_preprocessing_idle_scan(
         "eligible_preprocessing_count": eligible_preprocessing,
         "queued_count": len(queued_markers),
         "cancelled_current_count": len(cancelled_markers),
+        "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
         "current_ready_count": current_ready,
         "unchanged_current_count": unchanged_current,
         "unchanged_pending_count": unchanged_pending,
@@ -13276,6 +13582,15 @@ async def claim_next_work_review_processor_marker(
         raise HTTPException(400, "Review Processor marker holder_id is required")
     lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    clean_eligible_marker_ids: list[str] | None = None
+    if body.eligible_marker_ids is not None:
+        clean_eligible_marker_ids = [
+            _clean_short_text(marker_id, "", limit=180)
+            for marker_id in body.eligible_marker_ids[:500]
+        ]
+        clean_eligible_marker_ids = [
+            marker_id for marker_id in clean_eligible_marker_ids if marker_id
+        ]
     ttl_seconds = _clean_review_lease_ttl(body.timeout_seconds)
     processing_expires_at = _utc_iso_from_datetime(now_dt + timedelta(seconds=ttl_seconds))
     audit_id = f"audit-{uuid.uuid4().hex}"
@@ -13294,6 +13609,13 @@ async def claim_next_work_review_processor_marker(
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND item_id IN ({placeholders})"
             args.extend(scope_ids)
+        if clean_eligible_marker_ids is not None:
+            if clean_eligible_marker_ids:
+                placeholders = ",".join("?" for _ in clean_eligible_marker_ids)
+                where += f" AND marker_id IN ({placeholders})"
+                args.extend(clean_eligible_marker_ids)
+            else:
+                where += " AND 0"
         marker_row = conn.execute(
             f"""
             SELECT * FROM kanban_review_processor_markers
@@ -13318,6 +13640,9 @@ async def claim_next_work_review_processor_marker(
                     "holder_id": holder_id,
                     "item_id": clean_item_id,
                     "reason": "no_queued_marker",
+                    "eligible_marker_count": len(clean_eligible_marker_ids)
+                    if clean_eligible_marker_ids is not None
+                    else None,
                 }
             )
             audit_row = _write_work_audit(
@@ -13334,7 +13659,13 @@ async def claim_next_work_review_processor_marker(
                 run_id=meta["run_id"],
                 result="noop",
                 source_hash=source_hash,
-                metadata={"reason": "no_queued_marker", "holder_id": holder_id},
+                metadata={
+                    "reason": "no_queued_marker",
+                    "holder_id": holder_id,
+                    "eligible_marker_count": len(clean_eligible_marker_ids)
+                    if clean_eligible_marker_ids is not None
+                    else None,
+                },
             )
             gen = increment_gen(conn, "kanban-review-marker-claim")
             enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
@@ -13367,6 +13698,9 @@ async def claim_next_work_review_processor_marker(
                 "holder_id": holder_id,
                 "lease_id": lease_row["lease_id"],
                 "timeout_seconds": ttl_seconds,
+                "eligible_marker_count": len(clean_eligible_marker_ids)
+                if clean_eligible_marker_ids is not None
+                else None,
             },
         )
         saved_row = _write_work_review_processor_marker(conn, updated_row)
@@ -13389,6 +13723,9 @@ async def claim_next_work_review_processor_marker(
                 "lease_id": lease_row["lease_id"],
                 "timeout_seconds": ttl_seconds,
                 "attempt_count": int(saved_row["attempt_count"] or 0),
+                "eligible_marker_count": len(clean_eligible_marker_ids)
+                if clean_eligible_marker_ids is not None
+                else None,
             },
         )
         gen = increment_gen(conn, "kanban-review-marker-claim")
