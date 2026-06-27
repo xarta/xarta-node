@@ -75,6 +75,7 @@ KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
+KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v1"
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
@@ -791,15 +792,56 @@ def _clean_review_provider_mode(value: str | None) -> str:
     return mode if mode in allowed else "cloud-first"
 
 
+def _work_review_processing_policy() -> dict[str, Any]:
+    return {
+        "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
+        "status": "active",
+        "version": "2026-06-27",
+        "active_mode": "cloud-first",
+        "applies_to": ["review_processor", "preprocessing"],
+        "cloud_processing": {
+            "state": "active",
+            "mode": "cloud-first",
+            "provider_choice": "explicit-runtime-selection",
+        },
+        "local_processing": {
+            "state": "planned-gated",
+            "gate": "structured-job-packets-required",
+            "automatic_switch": False,
+            "switch_requires": [
+                "structured_job_packet_schema",
+                "explicit_provider_choice",
+                "lease_and_timeout_integration",
+                "operator_review_of_policy_change",
+            ],
+        },
+        "provider_choice": {
+            "required": True,
+            "default_mode": "cloud-first",
+            "allowed_modes": ["cloud-first", "cloud", "manual", "local-planned"],
+            "blocked_until_gate": ["local"],
+        },
+        "routing_rules": [
+            "Review Processor and preprocessing jobs use cloud processing while this policy is active.",
+            "Local processing remains planned and gated until structured job packets exist.",
+            "Provider mode must be explicit in queue packets and decision records.",
+            "Do not silently switch provider modes when cloud processing fails.",
+        ],
+    }
+
+
 def _work_review_processor_output_contract() -> dict[str, Any]:
+    processing_policy = _work_review_processing_policy()
     return {
         "schema": KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA,
         "status": "active",
         "version": "2026-06-27",
         "decision_record_schema": KANBAN_REVIEW_DECISION_SCHEMA,
+        "processing_policy_schema": processing_policy["schema"],
         "provider_mode": {
-            "active": "cloud-first",
-            "local_processing_gate": "structured-job-packets-required",
+            "active": processing_policy["active_mode"],
+            "local_processing_gate": processing_policy["local_processing"]["gate"],
+            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
         },
         "recording_rules": [
             "Every Review Processor output is recorded as a kanban_review_decisions row.",
@@ -9120,6 +9162,14 @@ async def get_work_review_processor_output_contract() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/review-processor/processing-policy")
+async def get_work_review_processor_processing_policy() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "policy": _work_review_processing_policy(),
+    }
+
+
 @router.get("/kanban/automation/review-processor/lease")
 async def get_work_review_processor_lease() -> dict[str, Any]:
     with get_conn() as conn:
@@ -9448,6 +9498,7 @@ async def get_work_automation_status(
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     generated_at = _utc_now_iso()
     now_dt = _parse_utc_datetime(generated_at) or datetime.now(timezone.utc)
+    processing_policy = _work_review_processing_policy()
     with get_conn() as conn:
         scope_ids: list[str] = []
         item_payload: dict[str, Any] | None = None
@@ -9531,9 +9582,12 @@ async def get_work_automation_status(
             "item": item_payload,
             "generated_at": generated_at,
             "output_contract": _work_review_processor_output_contract(),
+            "processing_policy": processing_policy,
             "provider_mode": {
-                "active": "cloud-first",
-                "planned": "local-processing-after-structured-job-packets",
+                "active": processing_policy["active_mode"],
+                "planned": processing_policy["local_processing"]["state"],
+                "local_processing_gate": processing_policy["local_processing"]["gate"],
+                "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
                 "by_mode": {row["provider_mode"]: int(row["count"]) for row in provider_rows},
             },
             "review_processor": {
