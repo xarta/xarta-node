@@ -21,6 +21,7 @@ import sqlite3
 import ssl
 import time
 import uuid
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -296,6 +297,70 @@ async def _restart_service() -> bool:
 # ── Internal helper: apply one sync action ────────────────────────────────────
 
 
+def _parse_sync_updated_at(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _should_skip_stale_kanban_item_upsert(conn, action) -> bool:
+    if action.table_name != "kanban_items" or action.action_type not in ("INSERT", "UPDATE"):
+        return False
+    data = action.row_data or {}
+    incoming_updated_at = _parse_sync_updated_at(data.get("updated_at"))
+    if incoming_updated_at is None:
+        return False
+
+    item_id = data.get("item_id") or action.row_id
+    if not item_id:
+        return False
+
+    row = conn.execute(
+        "SELECT updated_at FROM kanban_items WHERE item_id=?",
+        (item_id,),
+    ).fetchone()
+    if row is None:
+        return False
+
+    local_updated_at = _parse_sync_updated_at(row["updated_at"])
+    if local_updated_at is None:
+        return False
+
+    if incoming_updated_at < local_updated_at:
+        log.warning(
+            "stale kanban sync: skipping %s for %s (incoming updated_at=%r < local updated_at=%r)",
+            action.action_type,
+            item_id,
+            data.get("updated_at"),
+            row["updated_at"],
+        )
+        return True
+    return False
+
+
 def _apply_action(conn, action) -> None:
     """
     Replay a single peer action against the local DB.
@@ -559,6 +624,8 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                     continue
 
             try:
+                if _should_skip_stale_kanban_item_upsert(conn, action):
+                    continue
                 _apply_action(conn, action)
                 # Write source as "sync" so the gen counter tracks sync writes separately
                 _ = increment_gen(conn, "sync")

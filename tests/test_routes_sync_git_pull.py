@@ -1,8 +1,10 @@
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
@@ -202,3 +204,89 @@ def test_systemctl_restart_command_uses_transient_unit(monkeypatch):
         "restart",
         "blueprints-app",
     ]
+
+
+def _kanban_sync_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE kanban_items (
+            item_id TEXT PRIMARY KEY,
+            state_id TEXT,
+            status TEXT,
+            automation_excluded INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_items (
+            item_id, state_id, status, automation_excluded, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("work-git-github-activity", "done", "done", 1, "2026-06-27T20:10:00Z"),
+    )
+    return conn
+
+
+def test_stale_kanban_item_sync_update_is_skipped():
+    conn = _kanban_sync_conn()
+    action = SimpleNamespace(
+        action_type="UPDATE",
+        table_name="kanban_items",
+        row_id="work-git-github-activity",
+        row_data={
+            "item_id": "work-git-github-activity",
+            "state_id": "doing",
+            "status": "active",
+            "automation_excluded": 0,
+            "updated_at": "2026-06-25 18:19:57",
+        },
+    )
+
+    assert routes_sync._should_skip_stale_kanban_item_upsert(conn, action) is True
+
+    if not routes_sync._should_skip_stale_kanban_item_upsert(conn, action):
+        routes_sync._apply_action(conn, action)
+
+    row = conn.execute(
+        "SELECT state_id, status, automation_excluded FROM kanban_items WHERE item_id=?",
+        ("work-git-github-activity",),
+    ).fetchone()
+    assert dict(row) == {
+        "state_id": "done",
+        "status": "done",
+        "automation_excluded": 1,
+    }
+
+
+def test_newer_kanban_item_sync_update_is_applied():
+    conn = _kanban_sync_conn()
+    action = SimpleNamespace(
+        action_type="UPDATE",
+        table_name="kanban_items",
+        row_id="work-git-github-activity",
+        row_data={
+            "item_id": "work-git-github-activity",
+            "state_id": "doing",
+            "status": "active",
+            "automation_excluded": 0,
+            "updated_at": "2026-06-27T20:11:00Z",
+        },
+    )
+
+    assert routes_sync._should_skip_stale_kanban_item_upsert(conn, action) is False
+    routes_sync._apply_action(conn, action)
+
+    row = conn.execute(
+        "SELECT state_id, status, automation_excluded FROM kanban_items WHERE item_id=?",
+        ("work-git-github-activity",),
+    ).fetchone()
+    assert dict(row) == {
+        "state_id": "doing",
+        "status": "active",
+        "automation_excluded": 0,
+    }
