@@ -75,6 +75,7 @@ KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
+KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -471,6 +472,20 @@ class WorkReviewDecisionCreateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkReviewProcessorLeaseRequest(BaseModel):
+    holder_id: str
+    item_id: str | None = None
+    session_id: str | None = None
+    lease_token: str | None = None
+    ttl_seconds: int = 1200
+    force: bool = False
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkAgentHintsUpdateRequest(BaseModel):
     required_skills: list[str] | None = None
     routing_notes: str | None = None
@@ -855,6 +870,241 @@ def _work_review_processor_output_contract() -> dict[str, Any]:
             "metadata.output_payload",
         ],
     }
+
+
+def _review_processor_lease_id(processor_kind: str = "review") -> str:
+    kind = _clean_short_text(processor_kind, "review", limit=80).replace("_", "-")
+    return f"kanban-review-processor-lease-{kind or 'review'}"
+
+
+def _parse_utc_datetime(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _utc_iso_from_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _clean_review_lease_ttl(value: int | None) -> int:
+    try:
+        ttl = int(value or 1200)
+    except (TypeError, ValueError):
+        ttl = 1200
+    return max(60, min(ttl, 7200))
+
+
+def _review_lease_is_active(row: Any | None, now_dt: datetime | None = None) -> bool:
+    if row is None or row["status"] != "active":
+        return False
+    expires_at = _parse_utc_datetime(row["expires_at"])
+    if expires_at is None:
+        return False
+    return expires_at > (now_dt or datetime.now(timezone.utc))
+
+
+def _review_lease_owner_matches(row: Any, holder_id: str, lease_token: str = "") -> bool:
+    if row["holder_id"] != holder_id:
+        return False
+    return not lease_token or not row["lease_token"] or row["lease_token"] == lease_token
+
+
+def _row_to_work_review_processor_lease(
+    row: Any | None,
+    *,
+    now_dt: datetime | None = None,
+    include_token: bool = False,
+) -> dict[str, Any]:
+    if row is None:
+        return {
+            "schema": KANBAN_REVIEW_LEASE_SCHEMA,
+            "exists": False,
+            "lease_id": _review_processor_lease_id(),
+            "processor_kind": "review",
+            "holder_id": "",
+            "item_id": "",
+            "session_id": "",
+            "status": "missing",
+            "active": False,
+            "expired": False,
+            "acquired_at": "",
+            "heartbeat_at": "",
+            "expires_at": "",
+            "timeout_seconds": 1200,
+            "source_hash": "",
+            "metadata": {},
+            "provenance": {},
+            "created_at": None,
+            "updated_at": None,
+        }
+    now_dt = now_dt or datetime.now(timezone.utc)
+    expires_at = _parse_utc_datetime(row["expires_at"])
+    active = _review_lease_is_active(row, now_dt)
+    payload = {
+        "schema": KANBAN_REVIEW_LEASE_SCHEMA,
+        "exists": True,
+        "lease_id": row["lease_id"],
+        "processor_kind": row["processor_kind"],
+        "holder_id": row["holder_id"],
+        "item_id": row["item_id"],
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "active": active,
+        "expired": bool(
+            row["status"] == "active" and expires_at is not None and expires_at <= now_dt
+        ),
+        "acquired_at": row["acquired_at"],
+        "heartbeat_at": row["heartbeat_at"],
+        "expires_at": row["expires_at"],
+        "timeout_seconds": int(row["timeout_seconds"] or 1200),
+        "source_hash": row["source_hash"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if include_token:
+        payload["lease_token"] = row["lease_token"]
+    return payload
+
+
+def _work_review_processor_lease_row(
+    *,
+    existing: Any | None,
+    holder_id: str,
+    item_id: str,
+    session_id: str,
+    lease_token: str,
+    ttl_seconds: int,
+    status: str,
+    metadata: dict[str, Any],
+    provenance: dict[str, Any],
+    now: str,
+) -> dict[str, Any]:
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    expires_at = _utc_iso_from_datetime(now_dt + timedelta(seconds=ttl_seconds))
+    acquired_at = (
+        existing["acquired_at"]
+        if existing is not None and existing["status"] == "active" and status == "active"
+        else now
+    )
+    row = {
+        "lease_id": _review_processor_lease_id(),
+        "processor_kind": "review",
+        "holder_id": holder_id,
+        "lease_token": lease_token,
+        "item_id": item_id,
+        "session_id": session_id,
+        "status": status,
+        "acquired_at": acquired_at,
+        "heartbeat_at": now,
+        "expires_at": expires_at if status == "active" else now,
+        "timeout_seconds": ttl_seconds,
+        "source_hash": "",
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+        "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+        "created_at": existing["created_at"] if existing is not None else now,
+        "updated_at": now,
+    }
+    row["source_hash"] = _hash_json_payload(
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"source_hash", "created_at", "updated_at"}
+        }
+    )
+    return row
+
+
+def _write_work_review_processor_lease(
+    conn: Any,
+    row: dict[str, Any],
+) -> Any:
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_leases (
+            lease_id, processor_kind, holder_id, lease_token, item_id, session_id,
+            status, acquired_at, heartbeat_at, expires_at, timeout_seconds,
+            source_hash, metadata_json, provenance_json, created_at, updated_at
+        )
+        VALUES (
+            :lease_id, :processor_kind, :holder_id, :lease_token, :item_id,
+            :session_id, :status, :acquired_at, :heartbeat_at, :expires_at,
+            :timeout_seconds, :source_hash, :metadata_json, :provenance_json,
+            :created_at, :updated_at
+        )
+        ON CONFLICT(lease_id) DO UPDATE SET
+            processor_kind=excluded.processor_kind,
+            holder_id=excluded.holder_id,
+            lease_token=excluded.lease_token,
+            item_id=excluded.item_id,
+            session_id=excluded.session_id,
+            status=excluded.status,
+            acquired_at=excluded.acquired_at,
+            heartbeat_at=excluded.heartbeat_at,
+            expires_at=excluded.expires_at,
+            timeout_seconds=excluded.timeout_seconds,
+            source_hash=excluded.source_hash,
+            metadata_json=excluded.metadata_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        row,
+    )
+    return conn.execute(
+        "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+        (row["lease_id"],),
+    ).fetchone()
+
+
+def _write_work_review_processor_lease_audit(
+    conn: Any,
+    *,
+    action: str,
+    result: str,
+    meta: dict[str, str],
+    now: str,
+    item_id: str,
+    parent_item_id: str,
+    source_hash: str,
+    metadata: dict[str, Any],
+    lease_row: Any | None = None,
+) -> dict[str, Any]:
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    lease_id = lease_row["lease_id"] if lease_row is not None else _review_processor_lease_id()
+    audit_row = _write_work_audit(
+        conn,
+        audit_id=audit_id,
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+        action=action,
+        target_ref=f"kanban_review_processor_leases:{lease_id}",
+        item_id=item_id,
+        parent_item_id=parent_item_id,
+        created_at=now,
+        request_id=meta["request_id"],
+        run_id=meta["run_id"],
+        result=result,
+        source_hash=source_hash,
+        metadata=metadata,
+    )
+    gen = increment_gen(conn, "kanban-review-processor-lease")
+    if lease_row is not None:
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_processor_leases",
+            lease_row["lease_id"],
+            dict(lease_row),
+            gen,
+        )
+    enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return audit_row
 
 
 def _row_to_work_review_decision(
@@ -8870,12 +9120,334 @@ async def get_work_review_processor_output_contract() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/review-processor/lease")
+async def get_work_review_processor_lease() -> dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        return {
+            "ok": True,
+            "lease": _row_to_work_review_processor_lease(row),
+        }
+
+
+@router.post("/kanban/automation/review-processor/lease/acquire")
+async def acquire_work_review_processor_lease(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    meta = _work_request_meta(body)
+    holder_id = _clean_short_text(body.holder_id, "", limit=160)
+    if not holder_id:
+        raise HTTPException(400, "Review Processor lease holder_id is required")
+    clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    clean_session_id = _clean_work_agent_session_id(body.session_id) if body.session_id else ""
+    ttl_seconds = _clean_review_lease_ttl(body.ttl_seconds)
+    requested_token = _clean_short_text(body.lease_token or "", "", limit=220)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
+        existing = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        existing_active = _review_lease_is_active(existing, now_dt)
+        existing_owner = bool(
+            existing is not None
+            and existing_active
+            and _review_lease_owner_matches(existing, holder_id, requested_token)
+        )
+        if existing_active and not existing_owner and not body.force:
+            source_hash = _hash_json_payload(
+                {
+                    "action": "acquire_review_processor_lease",
+                    "holder_id": holder_id,
+                    "item_id": clean_item_id,
+                    "blocked_by": existing["holder_id"],
+                    "lease_id": existing["lease_id"],
+                    "reason": "active_lease",
+                    "request_id": meta["request_id"],
+                }
+            )
+            audit_row = _write_work_review_processor_lease_audit(
+                conn,
+                action="acquire_review_processor_lease",
+                result="blocked",
+                meta=meta,
+                now=now,
+                item_id=clean_item_id,
+                parent_item_id=(item["parent_item_id"] or "") if item else "",
+                source_hash=source_hash,
+                metadata={
+                    "holder_id": holder_id,
+                    "blocked_by": existing["holder_id"],
+                    "reason": "active_lease",
+                },
+            )
+            return {
+                "ok": True,
+                "acquired": False,
+                "reason": "active_lease",
+                "lease": _row_to_work_review_processor_lease(existing, now_dt=now_dt),
+                "audit": {
+                    "audit_id": audit_row["audit_id"],
+                    "action": "acquire_review_processor_lease",
+                    "result": "blocked",
+                },
+            }
+        lease_token = requested_token
+        if not lease_token:
+            lease_token = (
+                existing["lease_token"]
+                if existing_owner and existing is not None and existing["lease_token"]
+                else f"lease-{uuid.uuid4().hex}"
+            )
+        lease_item_id = clean_item_id or (
+            existing["item_id"] if existing_owner and existing is not None else ""
+        )
+        lease_session_id = clean_session_id or (
+            existing["session_id"] if existing_owner and existing is not None else ""
+        )
+        provenance = {
+            "schema": KANBAN_REVIEW_LEASE_SCHEMA,
+            "recorded_by": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+            "run_id": meta["run_id"],
+        }
+        lease_metadata = dict(body.metadata) if isinstance(body.metadata, dict) else {}
+        if body.force:
+            lease_metadata["force_acquire"] = True
+            if existing is not None:
+                lease_metadata["previous_holder_id"] = existing["holder_id"]
+        row = _work_review_processor_lease_row(
+            existing=existing,
+            holder_id=holder_id,
+            item_id=lease_item_id,
+            session_id=lease_session_id,
+            lease_token=lease_token,
+            ttl_seconds=ttl_seconds,
+            status="active",
+            metadata=lease_metadata,
+            provenance=provenance,
+            now=now,
+        )
+        lease_row = _write_work_review_processor_lease(conn, row)
+        audit_row = _write_work_review_processor_lease_audit(
+            conn,
+            action="acquire_review_processor_lease",
+            result="ok",
+            meta=meta,
+            now=now,
+            item_id=lease_item_id,
+            parent_item_id=(item["parent_item_id"] or "") if item else "",
+            source_hash=lease_row["source_hash"],
+            metadata={
+                "holder_id": holder_id,
+                "item_id": lease_item_id,
+                "session_id": lease_session_id,
+                "ttl_seconds": ttl_seconds,
+                "force": bool(body.force),
+                "upsert": "updated" if existing is not None else "inserted",
+            },
+            lease_row=lease_row,
+        )
+        return {
+            "ok": True,
+            "acquired": True,
+            "reason": "force_acquired"
+            if body.force
+            else ("refreshed" if existing_owner else "acquired"),
+            "lease": _row_to_work_review_processor_lease(
+                lease_row,
+                now_dt=now_dt,
+                include_token=True,
+            ),
+            "audit": {
+                "audit_id": audit_row["audit_id"],
+                "action": "acquire_review_processor_lease",
+                "result": "ok",
+            },
+        }
+
+
+@router.post("/kanban/automation/review-processor/lease/heartbeat")
+async def heartbeat_work_review_processor_lease(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    meta = _work_request_meta(body)
+    holder_id = _clean_short_text(body.holder_id, "", limit=160)
+    if not holder_id:
+        raise HTTPException(400, "Review Processor lease holder_id is required")
+    lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
+    ttl_seconds = _clean_review_lease_ttl(body.ttl_seconds)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        if existing is None:
+            return {
+                "ok": True,
+                "heartbeated": False,
+                "reason": "missing_lease",
+                "lease": _row_to_work_review_processor_lease(None, now_dt=now_dt),
+            }
+        if not _review_lease_is_active(existing, now_dt):
+            return {
+                "ok": True,
+                "heartbeated": False,
+                "reason": "inactive_or_expired_lease",
+                "lease": _row_to_work_review_processor_lease(existing, now_dt=now_dt),
+            }
+        if not _review_lease_owner_matches(existing, holder_id, lease_token):
+            return {
+                "ok": True,
+                "heartbeated": False,
+                "reason": "not_lease_owner",
+                "lease": _row_to_work_review_processor_lease(existing, now_dt=now_dt),
+            }
+        metadata = _json_value(existing["metadata_json"], {})
+        metadata.update(dict(body.metadata) if isinstance(body.metadata, dict) else {})
+        row = _work_review_processor_lease_row(
+            existing=existing,
+            holder_id=existing["holder_id"],
+            item_id=existing["item_id"],
+            session_id=existing["session_id"],
+            lease_token=existing["lease_token"],
+            ttl_seconds=ttl_seconds,
+            status="active",
+            metadata=metadata,
+            provenance=_json_value(existing["provenance_json"], {}),
+            now=now,
+        )
+        lease_row = _write_work_review_processor_lease(conn, row)
+        audit_row = _write_work_review_processor_lease_audit(
+            conn,
+            action="heartbeat_review_processor_lease",
+            result="ok",
+            meta=meta,
+            now=now,
+            item_id=lease_row["item_id"],
+            parent_item_id="",
+            source_hash=lease_row["source_hash"],
+            metadata={
+                "holder_id": holder_id,
+                "item_id": lease_row["item_id"],
+                "session_id": lease_row["session_id"],
+                "ttl_seconds": ttl_seconds,
+            },
+            lease_row=lease_row,
+        )
+        return {
+            "ok": True,
+            "heartbeated": True,
+            "reason": "heartbeat_recorded",
+            "lease": _row_to_work_review_processor_lease(lease_row, now_dt=now_dt),
+            "audit": {
+                "audit_id": audit_row["audit_id"],
+                "action": "heartbeat_review_processor_lease",
+                "result": "ok",
+            },
+        }
+
+
+@router.post("/kanban/automation/review-processor/lease/release")
+async def release_work_review_processor_lease(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    meta = _work_request_meta(body)
+    holder_id = _clean_short_text(body.holder_id, "", limit=160)
+    if not holder_id:
+        raise HTTPException(400, "Review Processor lease holder_id is required")
+    lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        if existing is None:
+            return {
+                "ok": True,
+                "released": False,
+                "reason": "missing_lease",
+                "lease": _row_to_work_review_processor_lease(None, now_dt=now_dt),
+            }
+        if existing["status"] != "active":
+            return {
+                "ok": True,
+                "released": False,
+                "reason": "no_active_lease",
+                "lease": _row_to_work_review_processor_lease(existing, now_dt=now_dt),
+            }
+        if not _review_lease_owner_matches(existing, holder_id, lease_token):
+            return {
+                "ok": True,
+                "released": False,
+                "reason": "not_lease_owner",
+                "lease": _row_to_work_review_processor_lease(existing, now_dt=now_dt),
+            }
+        metadata = _json_value(existing["metadata_json"], {})
+        metadata.update(dict(body.metadata) if isinstance(body.metadata, dict) else {})
+        row = _work_review_processor_lease_row(
+            existing=existing,
+            holder_id=existing["holder_id"],
+            item_id=existing["item_id"],
+            session_id=existing["session_id"],
+            lease_token=existing["lease_token"],
+            ttl_seconds=int(existing["timeout_seconds"] or 1200),
+            status="released",
+            metadata=metadata,
+            provenance=_json_value(existing["provenance_json"], {}),
+            now=now,
+        )
+        lease_row = _write_work_review_processor_lease(conn, row)
+        audit_row = _write_work_review_processor_lease_audit(
+            conn,
+            action="release_review_processor_lease",
+            result="ok",
+            meta=meta,
+            now=now,
+            item_id=lease_row["item_id"],
+            parent_item_id="",
+            source_hash=lease_row["source_hash"],
+            metadata={
+                "holder_id": holder_id,
+                "item_id": lease_row["item_id"],
+                "session_id": lease_row["session_id"],
+            },
+            lease_row=lease_row,
+        )
+        return {
+            "ok": True,
+            "released": True,
+            "reason": "released",
+            "lease": _row_to_work_review_processor_lease(lease_row, now_dt=now_dt),
+            "audit": {
+                "audit_id": audit_row["audit_id"],
+                "action": "release_review_processor_lease",
+                "result": "ok",
+            },
+        }
+
+
 @router.get("/kanban/automation/status")
 async def get_work_automation_status(
     item_id: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> dict[str, Any]:
     clean_item_id = _clean_short_text(item_id, "", limit=180)
+    generated_at = _utc_now_iso()
+    now_dt = _parse_utc_datetime(generated_at) or datetime.now(timezone.utc)
     with get_conn() as conn:
         scope_ids: list[str] = []
         item_payload: dict[str, Any] | None = None
@@ -8934,6 +9506,12 @@ async def get_work_automation_status(
                 scope_ids,
             ).fetchone()
             active_session = scoped_active_session or active_session
+        lease_row = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        lease = _row_to_work_review_processor_lease(lease_row, now_dt=now_dt)
+        lease_active = bool(lease["active"])
         last_completed = conn.execute(
             f"""
             SELECT * FROM kanban_review_decisions
@@ -8951,7 +9529,7 @@ async def get_work_automation_status(
             "ok": True,
             "schema": "xarta.kanban.automation_status.v1",
             "item": item_payload,
-            "generated_at": _utc_now_iso(),
+            "generated_at": generated_at,
             "output_contract": _work_review_processor_output_contract(),
             "provider_mode": {
                 "active": "cloud-first",
@@ -8959,12 +9537,26 @@ async def get_work_automation_status(
                 "by_mode": {row["provider_mode"]: int(row["count"]) for row in provider_rows},
             },
             "review_processor": {
-                "status": "decision-ledger-ready",
+                "status": "lease-active" if lease_active else "decision-ledger-ready",
                 "queue_length": 0,
-                "active_item_id": active_session["item_id"] if active_session else "",
-                "lease_owner": active_session["agent_id"] if active_session else "",
-                "lease_updated_at": active_session["updated_at"] if active_session else "",
-                "timeout_seconds": 20 * 60,
+                "active_item_id": (
+                    lease["item_id"]
+                    if lease_active
+                    else (active_session["item_id"] if active_session else "")
+                ),
+                "lease_owner": (
+                    lease["holder_id"]
+                    if lease_active
+                    else (active_session["agent_id"] if active_session else "")
+                ),
+                "lease_updated_at": (
+                    lease["heartbeat_at"] or lease["updated_at"]
+                    if lease_active
+                    else (active_session["updated_at"] if active_session else "")
+                ),
+                "lease_expires_at": lease["expires_at"] if lease_active else "",
+                "timeout_seconds": int(lease["timeout_seconds"] or 20 * 60),
+                "lease": lease,
                 "last_completed_item_id": last_completed["item_id"] if last_completed else "",
                 "last_completed_at": last_completed["updated_at"] if last_completed else "",
                 "pending_decision_count": sum(
