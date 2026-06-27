@@ -3501,6 +3501,136 @@ def test_work_review_document_hash_only_updates_on_body_change(monkeypatch, tmp_
     assert changed_source["document_source_hash"] != first_source["document_source_hash"]
 
 
+def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    timestamps = iter(
+        [
+            "2026-06-27T04:00:00Z",
+            "2026-06-27T04:01:00Z",
+            "2026-06-27T04:02:00Z",
+            "2026-06-27T04:03:00Z",
+        ]
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_utc_now_iso",
+        lambda: next(timestamps, "2026-06-27T04:04:00Z"),
+    )
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-feedback",
+                title="Review feedback item",
+                body="Feedback capture proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-item-create",
+            )
+        )
+    )
+
+    first = asyncio.run(
+        routes_personal.append_work_item_review_feedback(
+            "work-review-feedback",
+            routes_personal.WorkReviewFeedbackCaptureRequest(
+                feedback_id="kanban-feedback-one",
+                feedback="Proceed with confidence and do not add a fallback path.",
+                session_id="kanban-agent-session-test",
+                capture_source="explicit_command",
+                source_ref="discussion:operator-command",
+                related_refs=["xarta-kanban:item:work-parent"],
+                metadata={"operator_intent": "durable-review-input"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-capture-one",
+            ),
+        )
+    )
+    first_doc = first["review_document"]
+    assert first["feedback_entry"]["schema"] == routes_personal.KANBAN_REVIEW_FEEDBACK_SCHEMA
+    assert first["feedback_entry"]["feedback_id"] == "kanban-feedback-one"
+    assert first_doc["body"].startswith("## Operator Feedback")
+    assert "### 2026-06-27T04:01:00Z - codex-test" in first_doc["body"]
+    assert "> Proceed with confidence and do not add a fallback path." in first_doc["body"]
+    operator_feedback = first_doc["metadata"]["operator_feedback"]
+    assert operator_feedback["schema"] == routes_personal.KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA
+    assert operator_feedback["count"] == 1
+    first_entry = operator_feedback["entries"][0]
+    assert first_entry["session_id"] == "kanban-agent-session-test"
+    assert first_entry["capture_source"] == "explicit_command"
+    assert first_entry["affected_item_id"] == "work-review-feedback"
+    assert "feedback" not in first_entry
+    assert first_entry["metadata"]["operator_intent"] == "durable-review-input"
+
+    second = asyncio.run(
+        routes_personal.append_work_item_review_feedback(
+            "work-review-feedback",
+            routes_personal.WorkReviewFeedbackCaptureRequest(
+                feedback_id="kanban-feedback-two",
+                feedback="Discussion-selected feedback also belongs in Review.",
+                session_id="kanban-agent-session-test",
+                capture_source="explicit_discussion",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-capture-two",
+            ),
+        )
+    )
+    second_doc = second["review_document"]
+    entries = second_doc["metadata"]["operator_feedback"]["entries"]
+    assert second_doc["metadata"]["operator_feedback"]["count"] == 2
+    assert [entry["feedback_id"] for entry in entries] == [
+        "kanban-feedback-one",
+        "kanban-feedback-two",
+    ]
+    assert "Discussion-selected feedback also belongs in Review." in second_doc["body"]
+
+    preserved = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-feedback",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=second_doc["body"],
+                actor="codex-other",
+                source_surface="pytest",
+                request_id="review-feedback-preserve-metadata",
+            ),
+        )
+    )["review_document"]
+    assert preserved["metadata"]["operator_feedback"]["count"] == 2
+    assert preserved["metadata"]["actor"] == "codex-test"
+
+    with pytest.raises(routes_personal.HTTPException) as excinfo:
+        asyncio.run(
+            routes_personal.append_work_item_review_feedback(
+                "work-review-feedback",
+                routes_personal.WorkReviewFeedbackCaptureRequest(
+                    feedback="Sentiment alone must not become Review input.",
+                    session_id="kanban-agent-session-test",
+                    capture_source="sentiment",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="review-feedback-invalid-source",
+                ),
+            )
+        )
+    assert excinfo.value.status_code == 400
+
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "append_work_item_review_feedback" in audit_actions
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_audit_log" in sync_tables
+
+
 def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -3829,6 +3959,9 @@ def test_work_review_processor_metadata_contract_endpoint():
     fields = {field["field"]: field for field in contract["required_fields"]}
     assert fields["body_hash"]["scope"] == "review_document.metadata"
     assert fields["updated_at"]["alias"] == "review_updated_at"
+    assert fields["operator_feedback.entries"]["entry_schema"] == (
+        routes_personal.KANBAN_REVIEW_FEEDBACK_SCHEMA
+    )
     assert fields["processed_at"]["alias"] == "last_processed_at"
     assert (
         "terminal processed, failed, skipped, or cancelled"
