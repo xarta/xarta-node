@@ -1142,6 +1142,11 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
                 "scope": "context_readiness_check",
                 "meaning": "Plain-language time request, blocking codes, drift summary, and inspect/mark commands emitted when readiness is not current.",
             },
+            {
+                "field": "decomposition_items",
+                "scope": "preprocessing.local_ai_output",
+                "meaning": "Concrete child Kanban work items to create or confirm when the current card is not yet an implementation-ready leaf.",
+            },
         ],
         "packet_inputs": [
             "workspace_orientation",
@@ -1178,6 +1183,8 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
         ],
         "transition_rules": [
             "Preprocessing creates or replaces context_readiness_marker after the current packet is internally sane.",
+            "When preprocessing finds missing implementation work on an otherwise processable card, it creates or confirms child Kanban items instead of only listing recommended next actions.",
+            "A not-ready parent can still be a successfully preprocessed topic when the missing work has been decomposed into concrete open children.",
             "Implementation starts only when context readiness check returns ready=true.",
             "A missing or stale marker emits preprocessing_request.request_text; agents must request preprocessing time instead of guessing from title words.",
             "Validation failures, missing item body, and open blockers are hard readiness failures.",
@@ -11453,7 +11460,9 @@ def _work_preprocessing_local_ai_messages(
         },
         "hard_rules": [
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
-            "If the item lacks enough information to implement safely, ready must be false.",
+            "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
+            "Preprocessing prepares the Kanban tree for agents; do not only list work in prose when child cards should be created.",
+            "When missing context is really an operator question or external blocker, create a blocked decomposition item with the exact question/blocker at the smallest useful scope.",
             "If there are open blockers, ready must be false.",
             "A missing or stale context readiness marker is the scheduling reason for this preprocessing pass, not a blocker by itself.",
             "When the current documents, discussions, commits, status proof, and decisions are sufficient, set ready=true so the worker can refresh the readiness marker.",
@@ -11472,6 +11481,17 @@ def _work_preprocessing_local_ai_messages(
             "uncertainty": "remaining uncertainty",
             "blocking_codes": ["missing_cloud_api"],
             "recommended_next_actions": ["ask operator a concrete question"],
+            "decomposition_items": [
+                {
+                    "title": "short child card title",
+                    "body": "card body with proof path and why this child exists",
+                    "state_id": "todo|blocked",
+                    "priority_id": "critical|high|medium|low",
+                    "tags": ["kanban", "optional-routing-tag"],
+                    "proof_path": "how this child can be proved complete",
+                    "blocked_reason": "only when state_id is blocked",
+                }
+            ],
             "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
             "proof_refs": ["source/proof refs"],
         },
@@ -11485,13 +11505,224 @@ def _work_preprocessing_local_ai_messages(
         "readiness_marker_stale; treat that as why this pass is running, not "
         "as an automatic failure. "
         "When a required route, API, provider, proof path, or operator decision "
-        "is missing, set ready=false and describe the blocker/question. Do not "
-        "invent deterministic substitute work."
+        "is missing, set ready=false and return decomposition_items for the "
+        "smallest child work items that should be created, using blocked items "
+        "for true operator questions or external blockers. Do not invent "
+        "deterministic substitute work."
     )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
     ]
+
+
+def _work_slug_fragment(value: str, *, limit: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug[:limit].strip("-") or "work"
+
+
+def _work_preprocessing_child_id(parent_item_id: str, title: str) -> str:
+    digest = hashlib.sha256(f"{parent_item_id}|{title}".encode("utf-8")).hexdigest()[:10]
+    return _clean_work_id(
+        f"{parent_item_id}-{_work_slug_fragment(title)}-{digest}",
+        "kanban-preprocess",
+    )
+
+
+def _clean_work_preprocessing_state(value: Any) -> str:
+    state = _clean_short_text(str(value or ""), "", limit=40).lower()
+    if state in {"blocked", "blocker"}:
+        return "blocked"
+    if state in {"backlog"}:
+        return "backlog"
+    return "todo"
+
+
+def _clean_work_preprocessing_priority(value: Any, default: str) -> str:
+    priority = _clean_short_text(str(value or ""), "", limit=40).lower()
+    if priority in {"critical", "high", "medium", "low"}:
+        return priority
+    return default if default in {"critical", "high", "medium", "low"} else "medium"
+
+
+def _work_preprocessing_normalise_decomposition_items(
+    payload: dict[str, Any],
+    *,
+    parent_item: Any,
+) -> list[dict[str, Any]]:
+    parent_item_id = parent_item["item_id"]
+    parent_priority = str(parent_item["priority_id"] or "medium")
+    parent_tags = _json_value(parent_item["tags_json"], ["kanban"])
+    if not isinstance(parent_tags, list):
+        parent_tags = ["kanban"]
+    raw_items = payload.get("decomposition_items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    if not raw_items:
+        next_actions = payload.get("recommended_next_actions")
+        if isinstance(next_actions, list):
+            raw_items = [
+                {
+                    "title": str(action or ""),
+                    "body": "Preprocessing identified this as required follow-up work.",
+                }
+                for action in next_actions
+            ]
+    normalised: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
+    for raw_item in raw_items[:24]:
+        if isinstance(raw_item, str):
+            candidate: dict[str, Any] = {"title": raw_item}
+        elif isinstance(raw_item, dict):
+            candidate = raw_item
+        else:
+            continue
+        title = _clean_short_text(
+            candidate.get("title")
+            or candidate.get("summary")
+            or candidate.get("action")
+            or candidate.get("name")
+            or "",
+            "",
+            limit=180,
+        )
+        if not title:
+            continue
+        title_key = title.casefold()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        state_id = _clean_work_preprocessing_state(candidate.get("state_id"))
+        blocked_reason = _body_excerpt(str(candidate.get("blocked_reason") or ""), limit=800)
+        if blocked_reason:
+            state_id = "blocked"
+        priority_id = _clean_work_preprocessing_priority(
+            candidate.get("priority_id") or candidate.get("priority"),
+            parent_priority,
+        )
+        candidate_tags = candidate.get("tags")
+        if not isinstance(candidate_tags, list):
+            candidate_tags = []
+        tags = []
+        for tag in [*parent_tags, *candidate_tags, "preprocessing"]:
+            clean_tag = _clean_short_text(str(tag or ""), "", limit=80)
+            if clean_tag and clean_tag not in tags:
+                tags.append(clean_tag)
+        if "kanban" not in tags:
+            tags.insert(0, "kanban")
+        body_parts = [
+            f"Preprocessing child of xarta-kanban:item:{parent_item_id}.",
+        ]
+        description = _body_excerpt(
+            str(
+                candidate.get("body")
+                or candidate.get("description")
+                or candidate.get("rationale")
+                or candidate.get("summary")
+                or ""
+            ),
+            limit=1600,
+        )
+        if description:
+            body_parts.append(description)
+        proof_path = _body_excerpt(str(candidate.get("proof_path") or ""), limit=800)
+        if proof_path:
+            body_parts.append(f"Proof path: {proof_path}")
+        if blocked_reason:
+            body_parts.append(f"Blocked reason/question: {blocked_reason}")
+        normalised.append(
+            {
+                "item_id": _work_preprocessing_child_id(parent_item_id, title),
+                "title": title,
+                "body": "\n\n".join(body_parts),
+                "state_id": state_id,
+                "priority_id": priority_id,
+                "tags": tags,
+                "proof_path": proof_path,
+                "blocked_reason": blocked_reason,
+            }
+        )
+    return normalised
+
+
+async def _work_preprocessing_create_decomposition_children(
+    *,
+    parent_item: Any,
+    payload: dict[str, Any],
+    holder_id: str,
+    run_id: str,
+    marker_id: str,
+) -> dict[str, Any]:
+    parent_item_id = parent_item["item_id"]
+    candidates = _work_preprocessing_normalise_decomposition_items(
+        payload,
+        parent_item=parent_item,
+    )
+    created: list[dict[str, Any]] = []
+    existing: list[dict[str, Any]] = []
+    for candidate in candidates:
+        with get_conn() as conn:
+            existing_row = conn.execute(
+                """
+                SELECT * FROM kanban_items
+                WHERE parent_item_id=?
+                  AND status!='archived'
+                  AND lower(title)=lower(?)
+                ORDER BY created_at ASC, item_id
+                LIMIT 1
+                """,
+                (parent_item_id, candidate["title"]),
+            ).fetchone()
+        if existing_row is not None:
+            existing.append(_row_to_work_item(existing_row))
+            continue
+        result = await create_work_item(
+            WorkItemCreateRequest(
+                item_id=candidate["item_id"],
+                parent_item_id=parent_item_id,
+                title=candidate["title"],
+                body=candidate["body"],
+                item_type="item",
+                state_id=candidate["state_id"],
+                priority_id=candidate["priority_id"],
+                tags=candidate["tags"],
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-child-{marker_id}-{candidate['item_id']}",
+                run_id=run_id,
+            )
+        )
+        created.append(result["item"])
+    all_items = [*existing, *created]
+    if all_items:
+        lines = [
+            "Preprocessing decomposition created or confirmed child work items:",
+            "",
+            *[
+                f"- xarta-kanban:item:{item['item_id']} - {item['title']} ({item['state_id']})"
+                for item in all_items
+            ],
+        ]
+        await create_work_discussion(
+            parent_item_id,
+            WorkDiscussionCreateRequest(
+                body="\n".join(lines),
+                author=holder_id,
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-decomposition-note-{marker_id}",
+                run_id=run_id,
+            ),
+        )
+    return {
+        "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
+        "created_count": len(created),
+        "existing_count": len(existing),
+        "total_count": len(all_items),
+        "created_items": created,
+        "existing_items": existing,
+        "items": all_items,
+    }
 
 
 def _preprocessing_readiness_marker(
@@ -11502,10 +11733,13 @@ def _preprocessing_readiness_marker(
     actor: str,
     now: str,
     ai_payload: dict[str, Any],
+    outcome: str = "ready",
+    decomposition: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     next_actions = ai_payload.get("recommended_next_actions")
     if not isinstance(next_actions, list):
         next_actions = []
+    decomposition = decomposition if isinstance(decomposition, dict) else {}
     return {
         "schema": "xarta.kanban.context_readiness_marker.v1",
         "context_packet_schema": source["schema"],
@@ -11528,6 +11762,15 @@ def _preprocessing_readiness_marker(
         ],
         "processor_marker_id": marker["marker_id"],
         "processor_model_alias": _work_automation_idle_worker_config()["local_ai_model_alias"],
+        "preprocessing_outcome": outcome,
+        "decomposition_item_ids": [
+            str(item.get("item_id") or "")
+            for item in decomposition.get("items", [])
+            if isinstance(item, dict) and str(item.get("item_id") or "")
+        ],
+        "implementation_scope": "child_leaves"
+        if decomposition.get("total_count")
+        else "current_item",
     }
 
 
@@ -11645,7 +11888,29 @@ async def _process_work_preprocessing_idle_marker(
         hard_blocking_codes.append("open_blockers")
     if body_length <= 0:
         hard_blocking_codes.append("missing_body")
-    if not ready:
+
+    decomposition_result: dict[str, Any] = {
+        "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
+        "created_count": 0,
+        "existing_count": 0,
+        "total_count": 0,
+        "created_items": [],
+        "existing_items": [],
+        "items": [],
+    }
+    if not hard_blocking_codes and not ready:
+        decomposition_result = await _work_preprocessing_create_decomposition_children(
+            parent_item=item,
+            payload=payload,
+            holder_id=holder_id,
+            run_id=run_id,
+            marker_id=marker["marker_id"],
+        )
+        if int(decomposition_result.get("total_count") or 0) <= 0:
+            blocking_codes.append("missing_decomposition_items")
+            hard_blocking_codes.append("local_ai_reported_not_ready")
+
+    if not ready and int(decomposition_result.get("total_count") or 0) <= 0:
         hard_blocking_codes.append("local_ai_reported_not_ready")
     if hard_blocking_codes:
         all_blocking_codes = list(dict.fromkeys([*blocking_codes, *hard_blocking_codes]))
@@ -11686,6 +11951,7 @@ async def _process_work_preprocessing_idle_marker(
                     "marker_id": marker["marker_id"],
                     "document_source_hash": source["document_source_hash"],
                     "blocking_codes": all_blocking_codes,
+                    "decomposition": decomposition_result,
                     "source": source,
                     "local_ai_payload": payload,
                     "local_ai_content_excerpt": ai["content_excerpt"],
@@ -11728,6 +11994,158 @@ async def _process_work_preprocessing_idle_marker(
             "status": complete.get("marker", {}).get("status", "failed"),
             "provider_mode": "local",
             "model_alias": ai["model_alias"],
+        }
+
+    if int(decomposition_result.get("total_count") or 0) > 0:
+        parent_lane_update: dict[str, Any] | None = None
+        if str(item["state_id"] or "") == "todo":
+            parent_lane_update = await move_work_item(
+                item_id,
+                WorkItemMoveRequest(
+                    state_id="doing",
+                    actor=holder_id,
+                    source_surface="kanban-automation-idle-worker",
+                    request_id=f"{run_id}-preprocess-parent-doing-{marker['marker_id']}",
+                    run_id=run_id,
+                ),
+            )
+        with get_conn() as conn:
+            updated_item = _work_item_or_404(conn, item_id)
+            updated_source = _work_preprocessing_context_source(conn, updated_item)
+            hints_row = conn.execute(
+                "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            updated_hints = _row_to_work_agent_hints(hints_row, item_id)
+        readiness_marker = _preprocessing_readiness_marker(
+            item_id=item_id,
+            source=updated_source,
+            marker=marker,
+            actor=holder_id,
+            now=now,
+            ai_payload=payload,
+            outcome="decomposed",
+            decomposition=decomposition_result,
+        )
+        metadata = dict(updated_hints.get("metadata") or {})
+        metadata["context_readiness_marker"] = readiness_marker
+        await update_work_item_agent_hints(
+            item_id,
+            WorkAgentHintsUpdateRequest(
+                metadata=metadata,
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-decomposition-readiness-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        child_refs = [
+            f"kanban_items:{child['item_id']}"
+            for child in decomposition_result.get("items", [])
+            if isinstance(child, dict) and child.get("item_id")
+        ]
+        decision_id = _clean_work_id(
+            f"kanban-decision-idle-preprocess-decomposed-{item_id}-{updated_source['document_source_hash'][-12:]}",
+            "kanban-decision",
+        )
+        decision = await record_work_item_review_decision(
+            item_id,
+            WorkReviewDecisionCreateRequest(
+                decision_id=decision_id,
+                processor_kind="preprocessing",
+                decision_type="preprocessing_decomposition",
+                title=title,
+                summary=summary,
+                rationale=rationale,
+                affected_refs=[
+                    f"kanban_items:{item_id}",
+                    f"xarta-kanban:item:{item_id}",
+                    f"kanban_agent_hints:{item_id}",
+                    f"kanban_review_processor_markers:{marker['marker_id']}",
+                    *child_refs,
+                ],
+                confidence=confidence,
+                uncertainty=uncertainty,
+                proof_refs=_local_ai_ref_list(payload, "proof_refs")
+                or [
+                    f"kanban_review_processor_markers:{marker['marker_id']}",
+                    f"kanban_agent_hints:{item_id}",
+                    *child_refs,
+                ],
+                status="accepted",
+                provider_mode="local",
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.decomposition_decision.v1",
+                    "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+                    "processor_engine": "local-litellm-json",
+                    "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "model_alias": ai["model_alias"],
+                    "marker_id": marker["marker_id"],
+                    "document_source_hash": updated_source["document_source_hash"],
+                    "readiness_marker": readiness_marker,
+                    "decomposition": decomposition_result,
+                    "parent_lane_update": {
+                        "from_state_id": item["state_id"],
+                        "to_state_id": "doing",
+                        "reason": "preprocessing_created_child_leaves",
+                    }
+                    if parent_lane_update
+                    else None,
+                    "source_before_decomposition": source,
+                    "source_after_decomposition": updated_source,
+                    "local_ai_payload": payload,
+                    "local_ai_content_excerpt": ai["content_excerpt"],
+                },
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-decomposition-decision-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=marker["document_source_hash"],
+                decision_id=decision["decision"]["decision_id"],
+                status="processed",
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-decomposed-complete-{marker['marker_id']}",
+                run_id=run_id,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "decision_id": decision["decision"]["decision_id"],
+                    "processor_engine": "local-litellm-json",
+                    "model_alias": ai["model_alias"],
+                    "readiness_marker_context_hash": readiness_marker["context_hash"],
+                    "decomposition_total_count": decomposition_result["total_count"],
+                    "decomposition_created_count": decomposition_result["created_count"],
+                    "decomposition_existing_count": decomposition_result["existing_count"],
+                },
+            ),
+        )
+        return {
+            "ok": True,
+            "processor_kind": "preprocessing",
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+            "decision_id": decision["decision"]["decision_id"],
+            "completed": complete.get("completed", False),
+            "status": complete.get("marker", {}).get("status", ""),
+            "provider_mode": "local",
+            "model_alias": ai["model_alias"],
+            "decomposition": {
+                "total_count": decomposition_result["total_count"],
+                "created_count": decomposition_result["created_count"],
+                "existing_count": decomposition_result["existing_count"],
+                "item_ids": [
+                    child["item_id"]
+                    for child in decomposition_result.get("items", [])
+                    if isinstance(child, dict) and child.get("item_id")
+                ],
+            },
         }
 
     readiness_marker = _preprocessing_readiness_marker(
