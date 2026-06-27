@@ -976,6 +976,7 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             "A processing marker is requeued with last_error=processing_timeout when processing_expires_at is in the past.",
             "A processing marker is requeued with last_error=review_changed_during_processing and superseded fields when Review content changes during processing.",
             "A queued or processing marker is cancelled with last_error=review_document_deleted when Review text is emptied or removed.",
+            "A queued or processing marker is cancelled with last_error=item_archived when the source Kanban item is archived.",
         ],
         "cancellation_fields": [
             "status=cancelled",
@@ -1662,6 +1663,52 @@ def _work_review_processor_marker_update_row(
         }
     )
     return row
+
+
+def _cancel_work_review_processor_markers(
+    conn: Any,
+    *,
+    item_ids: list[str],
+    meta: dict[str, str],
+    now: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> list[Any]:
+    clean_item_ids = [_clean_short_text(item_id, "", limit=180) for item_id in item_ids]
+    clean_item_ids = [item_id for item_id in clean_item_ids if item_id]
+    if not clean_item_ids:
+        return []
+    placeholders = ",".join("?" for _ in clean_item_ids)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM kanban_review_processor_markers
+        WHERE item_id IN ({placeholders})
+          AND status IN ('queued', 'processing')
+        ORDER BY updated_at DESC, marker_id
+        """,
+        clean_item_ids,
+    ).fetchall()
+    cancelled_rows = []
+    for row in rows:
+        updated_row = _work_review_processor_marker_update_row(
+            row,
+            updates={
+                "status": "cancelled",
+                "last_seen_at": now,
+                "processing_started_at": "",
+                "processing_expires_at": "",
+                "last_error": reason,
+            },
+            meta=meta,
+            now=now,
+            reason=reason,
+            metadata={
+                **metadata,
+                "cancelled_previous_status": row["status"],
+            },
+        )
+        cancelled_rows.append(_write_work_review_processor_marker(conn, updated_row))
+    return cancelled_rows
 
 
 def _row_to_work_review_decision(
@@ -9110,6 +9157,17 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
             (now, now, item_id),
         )
         item_row = _work_item_or_404(conn, item_id)
+        cancelled_marker_rows = _cancel_work_review_processor_markers(
+            conn,
+            item_ids=[item_id],
+            meta=meta,
+            now=now,
+            reason="item_archived",
+            metadata={
+                "archived_at": now,
+                "archived_item_id": item_id,
+            },
+        )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -9124,14 +9182,31 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
             run_id=meta["run_id"],
             result="ok",
             source_hash=item_row["source_hash"],
-            metadata={"archived_at": now},
+            metadata={
+                "archived_at": now,
+                "cancelled_review_marker_count": len(cancelled_marker_rows),
+                "cancelled_review_marker_ids": [row["marker_id"] for row in cancelled_marker_rows],
+            },
         )
         gen = increment_gen(conn, "kanban-item")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
+        for marker_row in cancelled_marker_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        cancelled_markers = [
+            _row_to_work_review_processor_marker(row) for row in cancelled_marker_rows
+        ]
     return {
         "ok": True,
         "item": _row_to_work_item(item_row),
+        "cancelled_review_markers": cancelled_markers,
         "audit": {"audit_id": audit_id, "action": "archive_work_item", "result": "ok"},
     }
 

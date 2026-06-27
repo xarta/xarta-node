@@ -4431,6 +4431,129 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert "requeue_review_processor_timeouts" in audit_actions
 
 
+def test_work_review_processor_archive_cancels_active_marker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-archive-root",
+                title="Review archive root",
+                body="Root item for archive cancellation proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-archive-child",
+                parent_item_id="work-review-archive-root",
+                title="Review archive child",
+                body="Child item with Review cancellation data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-archive-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review archive cancellation pass one.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-archive-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-archive",
+                item_id="work-review-archive-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-archive",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-archive-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-claim",
+            )
+        )
+    )
+    assert claimed["marker"]["status"] == "processing"
+
+    archived = asyncio.run(
+        routes_personal.archive_work_item(
+            "work-review-archive-child",
+            routes_personal.WorkItemActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-archive-child-archive",
+            ),
+        )
+    )
+    assert archived["item"]["status"] == "archived"
+    assert len(archived["cancelled_review_markers"]) == 1
+    cancelled = archived["cancelled_review_markers"][0]
+    assert cancelled["marker_id"] == marker["marker_id"]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error"] == "item_archived"
+    assert cancelled["metadata"]["cancelled_previous_status"] == "processing"
+    assert cancelled["metadata"]["archived_item_id"] == "work-review-archive-child"
+    assert cancelled["processing_expires_at"] == ""
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-archive-child")
+    )
+    scheduler = status["review_processor"]["scheduler"]
+    assert scheduler["queue_length"] == 0
+    assert scheduler["active_count"] == 0
+    assert scheduler["pending_count"] == 0
+    assert scheduler["by_status"]["cancelled"] == 1
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_markers" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "archive_work_item" in audit_actions
+
+
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
