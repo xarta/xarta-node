@@ -9586,12 +9586,20 @@ async def trigger_work_review_processor_idle_scan(
             [*args, scan_limit],
         ).fetchall()
         scan_entries: list[dict[str, Any]] = []
+        skipped_empty_entries: list[dict[str, Any]] = []
         skipped_empty = 0
         for item_row in item_rows:
             document = _work_item_review_document(conn, item_row["item_id"])
             document_source = _review_document_source(document)
             if not document_source["has_review_text"] and not include_empty:
                 skipped_empty += 1
+                skipped_empty_entries.append(
+                    {
+                        "item": item_row,
+                        "document": document,
+                        "document_source": document_source,
+                    }
+                )
                 continue
             scan_entries.append(
                 {
@@ -9603,9 +9611,43 @@ async def trigger_work_review_processor_idle_scan(
 
         conn.execute("BEGIN IMMEDIATE")
         queued_rows: list[Any] = []
+        cancelled_rows: list[Any] = []
         unchanged_current = 0
         unchanged_pending = 0
         unchanged_failed = 0
+        for entry in skipped_empty_entries:
+            item_id = entry["item"]["item_id"]
+            document_source = entry["document_source"]
+            marker_id = _review_processor_marker_id(item_id)
+            existing = conn.execute(
+                "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+                (marker_id,),
+            ).fetchone()
+            if existing is None or existing["status"] not in {"queued", "processing"}:
+                continue
+            updated_row = _work_review_processor_marker_update_row(
+                existing,
+                updates={
+                    "status": "cancelled",
+                    "document_ref": document_source["document_ref"],
+                    "document_updated_at": document_source["document_updated_at"],
+                    "document_source_hash": document_source["document_source_hash"],
+                    "last_seen_at": now,
+                    "processing_started_at": "",
+                    "processing_expires_at": "",
+                    "last_error": "review_document_deleted",
+                },
+                meta=meta,
+                now=now,
+                reason="review_document_deleted",
+                metadata={
+                    **dict(body.metadata or {}),
+                    "document_exists": document_source["document_exists"],
+                    "body_bytes": document_source["body_bytes"],
+                    "cancelled_previous_status": existing["status"],
+                },
+            )
+            cancelled_rows.append(_write_work_review_processor_marker(conn, updated_row))
         for entry in scan_entries:
             item_id = entry["item"]["item_id"]
             document_source = entry["document_source"]
@@ -9652,6 +9694,7 @@ async def trigger_work_review_processor_idle_scan(
                 "eligible_review_count": len(scan_entries),
                 "queued_count": len(queued_rows),
                 "skipped_empty_count": skipped_empty,
+                "cancelled_deleted_count": len(cancelled_rows),
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
@@ -9678,6 +9721,7 @@ async def trigger_work_review_processor_idle_scan(
                 "eligible_review_count": len(scan_entries),
                 "queued_count": len(queued_rows),
                 "skipped_empty_count": skipped_empty,
+                "cancelled_deleted_count": len(cancelled_rows),
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
@@ -9685,6 +9729,15 @@ async def trigger_work_review_processor_idle_scan(
             },
         )
         gen = increment_gen(conn, "kanban-review-idle-scan")
+        for marker_row in cancelled_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
         for marker_row in queued_rows:
             enqueue_for_all_peers(
                 conn,
@@ -9699,6 +9752,9 @@ async def trigger_work_review_processor_idle_scan(
         queued_markers = [
             _row_to_work_review_processor_marker(marker_row) for marker_row in queued_rows
         ]
+        cancelled_markers = [
+            _row_to_work_review_processor_marker(marker_row) for marker_row in cancelled_rows
+        ]
     return {
         "ok": True,
         "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
@@ -9706,10 +9762,12 @@ async def trigger_work_review_processor_idle_scan(
         "eligible_review_count": len(scan_entries),
         "queued_count": len(queued_markers),
         "skipped_empty_count": skipped_empty,
+        "cancelled_deleted_count": len(cancelled_markers),
         "unchanged_current_count": unchanged_current,
         "unchanged_pending_count": unchanged_pending,
         "unchanged_failed_count": unchanged_failed,
         "queued_markers": queued_markers,
+        "cancelled_markers": cancelled_markers,
         "scheduler": marker_stats,
         "audit": {
             "audit_id": audit_id,
