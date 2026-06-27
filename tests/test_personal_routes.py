@@ -4930,6 +4930,185 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     assert decision["status"] == "accepted"
 
 
+def test_work_preprocessing_context_ignores_processor_marker_blockers(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-blocker-source",
+                title="Preprocessing blocker source",
+                body="Synthetic processor marker blockers must not block their own preprocessing.",
+                state_id="blocked",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-blocker-source-create",
+            )
+        )
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, status, blocked_by_ref, provenance_json
+        )
+        VALUES (?, ?, ?, 'open', ?, ?)
+        """,
+        (
+            "kanban-blocker-processor-self-loop",
+            "work-preprocess-blocker-source",
+            "Preprocessing context readiness marker failed",
+            "kanban_review_processor_markers:marker-preprocess-self-loop",
+            json.dumps(
+                {
+                    "schema": routes_personal.KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA,
+                    "marker_id": "marker-preprocess-self-loop",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+        ),
+    )
+    conn.commit()
+
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-blocker-source'"
+    ).fetchone()
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    assert source["counts"]["blocker_count"] == 0
+
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, status, blocked_by_ref, provenance_json
+        )
+        VALUES (?, ?, ?, 'open', '', '{}')
+        """,
+        (
+            "kanban-blocker-real-open",
+            "work-preprocess-blocker-source",
+            "Real operator blocker",
+        ),
+    )
+    conn.commit()
+
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    assert source["counts"]["blocker_count"] == 1
+
+
+def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-current-failed",
+                title="Current failed preprocessing marker",
+                body="Readiness is current, so a stale failed marker should not keep blocking.",
+                state_id="blocked",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-current-failed-create",
+            )
+        )
+    )
+
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-current-failed'"
+    ).fetchone()
+    initial_source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    current_marker = {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "context_packet_schema": "xarta.kanban.context_packet.v1",
+        "item_id": "work-preprocess-current-failed",
+        "canonical_code": "xarta-kanban:item:work-preprocess-current-failed",
+        "marked_at": "2026-06-27T04:20:00Z",
+        "marked_by": "codex-test",
+        "context_hash": initial_source["document_source_hash"],
+        "component_hashes": {},
+        "counts": initial_source["counts"],
+        "source_refs": initial_source["source_refs"],
+    }
+    asyncio.run(
+        routes_personal.update_work_item_agent_hints(
+            "work-preprocess-current-failed",
+            routes_personal.WorkAgentHintsUpdateRequest(
+                metadata={"context_readiness_marker": current_marker},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-current-failed-marker",
+            ),
+        )
+    )
+
+    meta = {
+        "actor": "codex-test",
+        "source_surface": "pytest",
+        "request_id": "preprocess-current-failed-row",
+        "run_id": "pytest-preprocess-current-failed-row",
+    }
+    failed_row = routes_personal._work_preprocessing_marker_row(
+        existing=None,
+        item_id="work-preprocess-current-failed",
+        source=initial_source,
+        meta=meta,
+        now="2026-06-27T04:21:00Z",
+        reason="test_failed_marker",
+        scan_metadata={},
+    )
+    failed_row["status"] = "failed"
+    failed_row["last_error"] = "open_blockers;local_ai_reported_not_ready"
+    saved_failed = routes_personal._write_work_review_processor_marker(conn, failed_row)
+    marker_blocker = routes_personal._upsert_work_processor_marker_blocker(
+        conn,
+        saved_failed,
+        meta=meta,
+        now="2026-06-27T04:21:00Z",
+    )
+    assert marker_blocker is not None
+    assert marker_blocker["blocker_row"]["status"] == "open"
+    conn.commit()
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-current-failed",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-current-failed-scan",
+            )
+        )
+    )
+    assert scan["queued_count"] == 0
+    assert scan["current_ready_count"] == 1
+    assert scan["cancelled_current_count"] == 1
+    cancelled = scan["cancelled_markers"][0]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error"] == "preprocessing_current"
+    assert cancelled["metadata"]["cancelled_previous_status"] == "failed"
+
+    blocker_row = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+        (marker_blocker["blocker_row"]["blocker_id"],),
+    ).fetchone()
+    assert blocker_row["status"] == "resolved"
+    assert "no longer blocks agent completion" in blocker_row["body_excerpt"]
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_markers" in sync_tables
+    assert "kanban_blockers" in sync_tables
+
+
 def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

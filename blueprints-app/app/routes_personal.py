@@ -91,6 +91,9 @@ KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
+KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
+    "xarta.kanban.processor_marker_blocker.provenance.v1"
+)
 KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID = "kanban-5f930fec1321"
 KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID = "kanban-203acef17b12"
 KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID = "kanban-51aaf9f7eb09"
@@ -1957,8 +1960,13 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
     counts = {
         "blocker_count": _preprocessing_count(
             conn,
-            "SELECT COUNT(*) AS count FROM kanban_blockers WHERE item_id=? AND status!='resolved'",
-            (item_id,),
+            """
+            SELECT COUNT(*) AS count FROM kanban_blockers
+            WHERE item_id=?
+              AND status NOT IN ('resolved', 'closed', 'done')
+              AND COALESCE(json_extract(provenance_json, '$.schema'), '') != ?
+            """,
+            (item_id, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA),
         ),
         "child_count": _preprocessing_count(
             conn,
@@ -8095,7 +8103,7 @@ def _upsert_work_processor_marker_blocker(
         related_refs=[blocked_by_ref],
     )
     provenance = {
-        "schema": "xarta.kanban.processor_marker_blocker.provenance.v1",
+        "schema": KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA,
         "marker_id": marker_row["marker_id"],
         "processor_kind": marker_row["processor_kind"],
         "document_type": marker_row["document_type"],
@@ -13053,6 +13061,7 @@ async def trigger_work_preprocessing_idle_scan(
         conn.execute("BEGIN IMMEDIATE")
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
+        cancelled_marker_blockers: list[dict[str, Any]] = []
         unchanged_current = 0
         unchanged_pending = 0
         unchanged_failed = 0
@@ -13076,7 +13085,11 @@ async def trigger_work_preprocessing_idle_scan(
             )
             if source["ready"]:
                 current_ready += 1
-                if existing is not None and existing["status"] in {"queued", "processing"}:
+                if existing is not None and existing["status"] in {
+                    "queued",
+                    "processing",
+                    "failed",
+                }:
                     cancelled_row = _work_review_processor_marker_update_row(
                         existing,
                         updates={
@@ -13098,7 +13111,16 @@ async def trigger_work_preprocessing_idle_scan(
                             "cancelled_previous_status": existing["status"],
                         },
                     )
-                    cancelled_rows.append(_write_work_review_processor_marker(conn, cancelled_row))
+                    saved_cancelled_row = _write_work_review_processor_marker(conn, cancelled_row)
+                    cancelled_rows.append(saved_cancelled_row)
+                    marker_blocker = _upsert_work_processor_marker_blocker(
+                        conn,
+                        saved_cancelled_row,
+                        meta=meta,
+                        now=now,
+                    )
+                    if marker_blocker is not None:
+                        cancelled_marker_blockers.append(marker_blocker)
                 elif already_processed and existing["status"] == "processed":
                     unchanged_current += 1
                 continue
@@ -13177,6 +13199,23 @@ async def trigger_work_preprocessing_idle_scan(
                 "kanban_review_processor_markers",
                 marker_row["marker_id"],
                 dict(marker_row),
+                gen,
+            )
+        for marker_blocker in cancelled_marker_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
                 gen,
             )
         for marker_row in queued_rows:
