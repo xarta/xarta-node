@@ -11415,6 +11415,8 @@ def _work_preprocessing_local_ai_messages(
     detail_document: dict[str, Any],
     review_document: dict[str, Any],
     discussions: list[dict[str, Any]],
+    recent_commits: list[dict[str, Any]],
+    recent_decisions: list[dict[str, Any]],
     marker: dict[str, Any],
 ) -> list[dict[str, str]]:
     context = {
@@ -11441,6 +11443,10 @@ def _work_preprocessing_local_ai_messages(
                 }
                 for discussion in discussions[:6]
             ],
+        },
+        "evidence": {
+            "recent_commits": recent_commits[:8],
+            "recent_decisions": recent_decisions[:8],
         },
         "hard_rules": [
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
@@ -11538,6 +11544,52 @@ async def _process_work_preprocessing_idle_marker(
             (item_id,),
         ).fetchall()
         discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows]
+        commit_rows = conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
+                     updated_at DESC, commit_link_id
+            LIMIT 8
+            """,
+            (item_id,),
+        ).fetchall()
+        recent_commits = [
+            {
+                "commit_link_id": row["commit_link_id"],
+                "repo_full_name": row["repo_full_name"],
+                "sha": row["sha"],
+                "short_sha": row["short_sha"],
+                "message_subject": row["message_subject"],
+                "committed_at": row["committed_at"],
+                "metadata": _json_value(row["metadata_json"], {}),
+            }
+            for row in commit_rows
+        ]
+        decision_rows = conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=?
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT 8
+            """,
+            (item_id,),
+        ).fetchall()
+        recent_decisions = [
+            {
+                "decision_id": row["decision_id"],
+                "processor_kind": row["processor_kind"],
+                "decision_type": row["decision_type"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "status": row["status"],
+                "provider_mode": row["provider_mode"],
+                "proof_refs": _json_value(row["proof_refs_json"], []),
+                "commit_link_ids": _json_value(row["commit_link_ids_json"], []),
+                "created_at": row["created_at"],
+            }
+            for row in decision_rows
+        ]
         hints_row = conn.execute(
             "SELECT * FROM kanban_agent_hints WHERE item_id=?",
             (item_id,),
@@ -11550,6 +11602,8 @@ async def _process_work_preprocessing_idle_marker(
             detail_document=detail_document,
             review_document=review_document,
             discussions=discussions,
+            recent_commits=recent_commits,
+            recent_decisions=recent_decisions,
             marker=marker,
         ),
         run_id=run_id,
