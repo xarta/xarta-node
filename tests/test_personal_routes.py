@@ -3416,6 +3416,164 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     }.issubset(sync_tables)
 
 
+def test_agent_completion_move_blocks_outstanding_work_but_operator_can_override(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-completion-parent",
+                title="Completion parent",
+                body="Parent with outstanding work",
+                state_id="doing",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="completion-parent-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-completion-child",
+                parent_item_id="work-completion-parent",
+                title="Open child",
+                body="Still open",
+                state_id="todo",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="completion-child-create",
+            )
+        )
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (blocker_id, item_id, title, status)
+        VALUES ('blocker-completion', 'work-completion-parent', 'Blocked proof', 'open')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_markers (
+            marker_id, item_id, processor_kind, document_type, status, queued_at
+        )
+        VALUES (
+            'marker-completion', 'work-completion-child', 'review', 'review',
+            'queued', '2026-06-27T10:00:00Z'
+        )
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(routes_personal.HTTPException) as raised:
+        asyncio.run(
+            routes_personal.move_work_item(
+                "work-completion-parent",
+                routes_personal.WorkItemMoveRequest(
+                    state_id="done",
+                    actor="codex",
+                    source_surface="xarta-kanban-work",
+                    request_id="agent-finish-parent",
+                ),
+            )
+        )
+    assert raised.value.status_code == 409
+    detail = raised.value.detail
+    assert detail["error"] == "kanban_agent_completion_blocked"
+    assert {blocker["code"] for blocker in detail["blockers"]} == {
+        "open_descendants",
+        "open_blockers",
+        "pending_processor_markers",
+    }
+    still_open = conn.execute(
+        "SELECT state_id, status FROM kanban_items WHERE item_id='work-completion-parent'"
+    ).fetchone()
+    assert dict(still_open) == {"state_id": "doing", "status": "active"}
+
+    operator_done = asyncio.run(
+        routes_personal.move_work_item(
+            "work-completion-parent",
+            routes_personal.WorkItemMoveRequest(
+                state_id="done",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="operator-finish-parent",
+            ),
+        )
+    )["item"]
+    assert operator_done["state_id"] == "done"
+    assert operator_done["status"] == "done"
+
+
+def test_agent_completion_update_blocks_pending_processor_markers(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-completion-marker",
+                title="Completion marker",
+                body="Pending marker should block agent Done",
+                state_id="doing",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="completion-marker-create",
+            )
+        )
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_markers (
+            marker_id, item_id, processor_kind, document_type, status, queued_at
+        )
+        VALUES (
+            'marker-preprocess-completion', 'work-completion-marker',
+            'preprocessing', 'context', 'queued', '2026-06-27T10:15:00Z'
+        )
+        """
+    )
+    conn.commit()
+
+    with pytest.raises(routes_personal.HTTPException) as raised:
+        asyncio.run(
+            routes_personal.update_work_item(
+                "work-completion-marker",
+                routes_personal.WorkItemUpdateRequest(
+                    state_id="done",
+                    actor="codex",
+                    source_surface="blueprints-work-management-skill",
+                    request_id="agent-update-done",
+                ),
+            )
+        )
+    assert raised.value.status_code == 409
+    detail = raised.value.detail
+    assert detail["error"] == "kanban_agent_completion_blocked"
+    assert [blocker["code"] for blocker in detail["blockers"]] == ["pending_processor_markers"]
+    assert detail["blockers"][0]["items"][0]["processor_kind"] == "preprocessing"
+    still_open = conn.execute(
+        "SELECT state_id, status FROM kanban_items WHERE item_id='work-completion-marker'"
+    ).fetchone()
+    assert dict(still_open) == {"state_id": "doing", "status": "active"}
+
+    operator_done = asyncio.run(
+        routes_personal.update_work_item(
+            "work-completion-marker",
+            routes_personal.WorkItemUpdateRequest(
+                state_id="done",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="operator-update-done",
+            ),
+        )
+    )["item"]
+    assert operator_done["state_id"] == "done"
+    assert operator_done["status"] == "done"
+
+
 def test_work_review_document_hash_only_updates_on_body_change(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
