@@ -2729,7 +2729,10 @@ def test_personal_graph_declared_link_keeps_inferred_under_review(monkeypatch):
     assert created["link"]["risk_level"] == "review"
     assert created["link"]["provenance"]["declared_by"] == "codex-test"
     assert "inferred input" in created["link"]["provenance"]["guard"]
-    assert conn.execute("SELECT COUNT(*) AS count FROM sync_queue").fetchone()["count"] == 1
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "personal_graph_links" in sync_tables
 
 
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
@@ -3981,6 +3984,48 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
         changed_scan["queued_markers"][0]["document_source_hash"] != marker["document_source_hash"]
     )
 
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-scan-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-review-delete",
+            ),
+        )
+    )
+    deleted_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-scan-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-trigger-deleted",
+            )
+        )
+    )
+    assert deleted_scan["queued_count"] == 0
+    assert deleted_scan["cancelled_deleted_count"] == 1
+    cancelled = deleted_scan["cancelled_markers"][0]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error"] == "review_document_deleted"
+    assert cancelled["metadata"]["cancelled_previous_status"] == "queued"
+    assert cancelled["metadata"]["document_exists"] is True
+    assert cancelled["metadata"]["body_bytes"] == 0
+
+    deleted_status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-scan-root")
+    )
+    deleted_scheduler = deleted_status["review_processor"]["scheduler"]
+    assert deleted_status["review_processor"]["queue_length"] == 0
+    assert deleted_scheduler["queue_length"] == 0
+    assert deleted_scheduler["active_count"] == 0
+    assert deleted_scheduler["pending_count"] == 0
+    assert deleted_scheduler["by_status"]["cancelled"] == 1
+    assert deleted_status["review_processor"]["review_markers"][0]["status"] == "cancelled"
+
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
     }
@@ -4081,6 +4126,48 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert claimed["marker"]["status"] == "processing"
     assert claimed["marker"]["attempt_count"] == 1
     assert claimed["marker"]["processing_expires_at"]
+
+    status_claimed = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-timeout-root")
+    )
+    claimed_scheduler = status_claimed["review_processor"]["scheduler"]
+    assert status_claimed["review_processor"]["queue_length"] == 0
+    assert claimed_scheduler["active_count"] == 1
+    assert claimed_scheduler["pending_count"] == 1
+    assert claimed_scheduler["by_status"]["processing"] == 1
+
+    with pytest.raises(routes_personal.HTTPException) as wrong_worker:
+        asyncio.run(
+            routes_personal.claim_next_work_review_processor_marker(
+                routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                    holder_id="codex-other",
+                    lease_token=token,
+                    item_id="work-review-timeout-root",
+                    timeout_seconds=120,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="review-timeout-claim-wrong-worker",
+                )
+            )
+        )
+    assert wrong_worker.value.status_code == 409
+    conn.rollback()
+
+    duplicate_claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-timeout",
+                lease_token=token,
+                item_id="work-review-timeout-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-claim-duplicate",
+            )
+        )
+    )
+    assert duplicate_claim["claimed"] is False
+    assert duplicate_claim["reason"] == "no_queued_marker"
 
     completed = asyncio.run(
         routes_personal.complete_work_review_processor_marker(
