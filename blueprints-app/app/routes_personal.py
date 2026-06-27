@@ -80,6 +80,11 @@ KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_REVIEW_MARKER_SCHEMA = "xarta.kanban.review_processor.marker.v1"
 KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
+KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
+KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID = "kanban-5f930fec1321"
+KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID = "kanban-203acef17b12"
+KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID = "kanban-51aaf9f7eb09"
+KANBAN_AGENT_PROPOSAL_WORKSTREAM_ITEM_ID = "kanban-agent-proposal-surfaces-20260627"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -1081,6 +1086,103 @@ def _work_review_processor_output_contract() -> dict[str, Any]:
             "confidence",
             "proof_refs",
             "metadata.output_payload",
+        ],
+    }
+
+
+def _kanban_item_uri(item_id: str) -> str:
+    return f"xarta-kanban:item:{item_id}"
+
+
+def _work_proposal_surfaces_contract() -> dict[str, Any]:
+    return {
+        "schema": KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA,
+        "status": "active",
+        "version": "2026-06-27",
+        "surface_root": {
+            "item_id": KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+            "uri": _kanban_item_uri(KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID),
+            "role": "operator-created human-agent sign-off area",
+        },
+        "workstream": {
+            "item_id": KANBAN_AGENT_PROPOSAL_WORKSTREAM_ITEM_ID,
+            "uri": _kanban_item_uri(KANBAN_AGENT_PROPOSAL_WORKSTREAM_ITEM_ID),
+            "role": "implementation workstream for proposal surface behavior and status UI",
+        },
+        "inbox": {
+            "item_id": KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+            "uri": _kanban_item_uri(KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID),
+            "role": "agent proposal intake",
+            "accepted_entry_types": [
+                "proposal",
+                "question",
+                "approval_request",
+                "review_processor_follow_up",
+                "operator_follow_up",
+            ],
+            "required_fields": [
+                "entry_type",
+                "title",
+                "summary",
+                "requested_operator_action",
+                "source_item_refs",
+                "actor",
+                "created_at",
+                "status",
+            ],
+            "placement_rules": [
+                "Create an INBOX child item when the entry needs its own lifecycle, decision, or follow-up.",
+                "Use an INBOX discussion note only for small status notes that do not need independent tracking.",
+                "Link each INBOX entry to the implementation card, Review document, decision, or source context that caused it.",
+                "Do not treat INBOX as the implementation card; code, docs, proof, and rollout work stay on the smallest relevant workstream leaf.",
+                "Operator-feedback-to-Review capture remains explicit command or discussion handling only.",
+            ],
+        },
+        "outbox": {
+            "item_id": KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+            "uri": _kanban_item_uri(KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID),
+            "role": "processed proposal outcome surface",
+            "accepted_entry_types": [
+                "accepted_plan",
+                "declined_proposal",
+                "completed_decision",
+                "handoff_ready_output",
+                "operator_visible_closeout",
+            ],
+            "required_fields": [
+                "entry_type",
+                "title",
+                "summary",
+                "outcome",
+                "source_inbox_refs",
+                "affected_item_refs",
+                "proof_refs",
+                "commit_link_ids",
+                "actor",
+                "created_at",
+                "status",
+            ],
+            "placement_rules": [
+                "Create an OUTBOX child item for processed proposal outcomes that should remain visible after the source work is done.",
+                "Link OUTBOX outcomes back to source INBOX entries and implementation cards.",
+                "Accepted implementation work must still carry explicit commit associations on the implementation card.",
+                "Declined proposals must say why they were declined and what evidence or operator instruction drove the decision.",
+            ],
+        },
+        "status_integration": {
+            "automation_status_field": "proposal_surfaces",
+            "operator_visible": True,
+            "expected_surfaces": [
+                "automation status modal",
+                "desktop portrait bottom-panel tab",
+                "ultrawide side-panel tab",
+            ],
+        },
+        "global_rules": [
+            "Proposal surfaces are interaction surfaces, not substitutes for implementation workstream cards.",
+            "Autonomous decisions must be written in clear natural Kanban language with affected refs and proof refs.",
+            "Code-producing outcomes are accepted only after pre-commit issues are fixed and explicit commit links exist.",
+            "Use cloud processing while the active processing policy is cloud-first.",
         ],
     }
 
@@ -10410,6 +10512,14 @@ async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/proposal-surfaces/contract")
+async def get_work_proposal_surfaces_contract() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract": _work_proposal_surfaces_contract(),
+    }
+
+
 @router.get("/kanban/automation/review-processor/lease")
 async def get_work_review_processor_lease() -> dict[str, Any]:
     with get_conn() as conn:
@@ -10825,6 +10935,7 @@ async def get_work_automation_status(
             "output_contract": _work_review_processor_output_contract(),
             "metadata_contract": _work_review_processing_metadata_contract(),
             "processing_policy": processing_policy,
+            "proposal_surfaces": _work_proposal_surfaces_contract(),
             "provider_mode": {
                 "active": processing_policy["active_mode"],
                 "planned": processing_policy["local_processing"]["state"],
