@@ -3864,6 +3864,7 @@ def test_work_preprocessing_readiness_contract_endpoint():
     assert contract["readiness_marker_schema"] == "xarta.kanban.context_readiness_marker.v1"
     assert contract["readiness_check_schema"] == "xarta.kanban.context_readiness_check.v1"
     assert contract["preprocessing_request_schema"] == "xarta.kanban.preprocessing_time_request.v1"
+    assert contract["queue_schema"] == routes_personal.KANBAN_PREPROCESSING_QUEUE_SCHEMA
     assert contract["marker_storage"] == "kanban_agent_hints.metadata.context_readiness_marker"
     assert contract["provider_mode"]["active"] == "cloud-first"
     fields = {field["field"]: field for field in contract["required_fields"]}
@@ -4249,6 +4250,224 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "trigger_review_processor_idle_scan" in audit_actions
+
+
+def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-root",
+                title="Preprocess root",
+                body="Root item for preprocessing queue proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-missing",
+                parent_item_id="work-preprocess-root",
+                title="Missing readiness child",
+                body="This child needs preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-missing-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-current",
+                parent_item_id="work-preprocess-root",
+                title="Current readiness child",
+                body="This child already has current preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-current-create",
+            )
+        )
+    )
+
+    current_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-current'"
+    ).fetchone()
+    current_source = routes_personal._work_preprocessing_context_source(conn, current_row)
+    current_marker = {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "context_packet_schema": "xarta.kanban.context_packet.v1",
+        "item_id": "work-preprocess-current",
+        "canonical_code": "xarta-kanban:item:work-preprocess-current",
+        "marked_at": "2026-06-27T04:00:00Z",
+        "marked_by": "codex-test",
+        "context_hash": current_source["document_source_hash"],
+        "component_hashes": {},
+        "counts": current_source["counts"],
+        "source_refs": current_source["source_refs"],
+    }
+    asyncio.run(
+        routes_personal.update_work_item_agent_hints(
+            "work-preprocess-current",
+            routes_personal.WorkAgentHintsUpdateRequest(
+                metadata={"context_readiness_marker": current_marker},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-current-marker",
+            ),
+        )
+    )
+    conn.execute("DELETE FROM sync_queue")
+    conn.commit()
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-scan-trigger",
+            )
+        )
+    )
+    assert scan["ok"] is True
+    assert scan["schema"] == routes_personal.KANBAN_PREPROCESSING_QUEUE_SCHEMA
+    assert scan["idle"] is True
+    assert scan["scanned_count"] == 2
+    assert scan["eligible_preprocessing_count"] == 1
+    assert scan["current_ready_count"] == 1
+    assert scan["queued_count"] == 1
+    marker = scan["queued_markers"][0]
+    assert marker["processor_kind"] == "preprocessing"
+    assert marker["document_type"] == "context_readiness"
+    assert marker["item_id"] == "work-preprocess-missing"
+    assert marker["status"] == "queued"
+    assert marker["metadata"]["reason"] == "missing_readiness_marker"
+    assert marker["metadata"]["readiness_reason"] == "missing_readiness_marker"
+    assert scan["scheduler"]["queue_length"] == 1
+
+    status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-preprocess-root"))
+    assert status["preprocessing"]["queue_length"] == 1
+    assert status["preprocessing"]["scheduler"]["queue_length"] == 1
+    assert status["preprocessing"]["markers"][0]["processor_kind"] == "preprocessing"
+    assert status["review_processor"]["queue_length"] == 0
+
+    same_scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-scan-trigger-again",
+            )
+        )
+    )
+    assert same_scan["queued_count"] == 0
+    assert same_scan["unchanged_pending_count"] == 1
+
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET status='processing',
+            processing_started_at='2026-06-27T04:05:00Z',
+            processing_expires_at='2999-01-01T00:00:00Z'
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    )
+    conn.commit()
+    active_scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-scan-active",
+            )
+        )
+    )
+    assert active_scan["idle"] is False
+    assert active_scan["reason"] == "active_preprocessing"
+    assert active_scan["blocked_by_active_count"] == 1
+    assert active_scan["queued_count"] == 0
+
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET status='queued', processing_started_at='', processing_expires_at=''
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    )
+    missing_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-missing'"
+    ).fetchone()
+    missing_source = routes_personal._work_preprocessing_context_source(conn, missing_row)
+    missing_marker = {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "context_packet_schema": "xarta.kanban.context_packet.v1",
+        "item_id": "work-preprocess-missing",
+        "canonical_code": "xarta-kanban:item:work-preprocess-missing",
+        "marked_at": "2026-06-27T04:10:00Z",
+        "marked_by": "codex-test",
+        "context_hash": missing_source["document_source_hash"],
+        "component_hashes": {},
+        "counts": missing_source["counts"],
+        "source_refs": missing_source["source_refs"],
+    }
+    asyncio.run(
+        routes_personal.update_work_item_agent_hints(
+            "work-preprocess-missing",
+            routes_personal.WorkAgentHintsUpdateRequest(
+                metadata={"context_readiness_marker": missing_marker},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-missing-marker",
+            ),
+        )
+    )
+    cancel_scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-scan-current",
+            )
+        )
+    )
+    assert cancel_scan["queued_count"] == 0
+    assert cancel_scan["cancelled_current_count"] == 1
+    assert cancel_scan["scheduler"]["queue_length"] == 0
+    cancelled = cancel_scan["cancelled_markers"][0]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error"] == "preprocessing_current"
+    assert cancelled["metadata"]["cancelled_previous_status"] == "queued"
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_markers" in sync_tables
+    assert "kanban_audit_log" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
 def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatch, tmp_path):
