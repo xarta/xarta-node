@@ -11455,6 +11455,10 @@ def _work_preprocessing_local_ai_messages(
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false.",
             "If there are open blockers, ready must be false.",
+            "A missing or stale context readiness marker is the scheduling reason for this preprocessing pass, not a blocker by itself.",
+            "When the current documents, discussions, commits, status proof, and decisions are sufficient, set ready=true so the worker can refresh the readiness marker.",
+            "Previous failed preprocessing decisions are historical evidence; do not repeat them when newer timestamped discussions, commits, or status proof resolve the cited blocker.",
+            "Background idle-worker audit/status evidence counts as autonomous-run proof when it is newer than a manual-trigger-only blocker decision.",
             "Readiness is not completion.",
             "Leaves should be Doing only while actively operated on; otherwise use To Do or Blocked.",
             "When discussions, decisions, or commits conflict, prefer the newest timestamped Kanban evidence.",
@@ -11477,6 +11481,9 @@ def _work_preprocessing_local_ai_messages(
         "local private no-think/no-protection/no-orientation endpoint. Return "
         "only one strict JSON object. Do not use markdown. Decide whether the "
         "current card context is ready for an agent to start implementation. "
+        "The queue_source reason may be missing_readiness_marker or "
+        "readiness_marker_stale; treat that as why this pass is running, not "
+        "as an automatic failure. "
         "When a required route, API, provider, proof path, or operator decision "
         "is missing, set ready=false and describe the blocker/question. Do not "
         "invent deterministic substitute work."
@@ -11639,7 +11646,7 @@ async def _process_work_preprocessing_idle_marker(
     if body_length <= 0:
         hard_blocking_codes.append("missing_body")
     if not ready:
-        hard_blocking_codes.append("local_ai_not_ready")
+        hard_blocking_codes.append("local_ai_reported_not_ready")
     if hard_blocking_codes:
         all_blocking_codes = list(dict.fromkeys([*blocking_codes, *hard_blocking_codes]))
         decision_id = _clean_work_id(

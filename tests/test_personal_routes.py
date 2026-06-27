@@ -4803,6 +4803,102 @@ def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, t
     assert marker["decision_id"] == row["decision_id"]
 
 
+def test_work_automation_preprocessing_distinguishes_marker_staleness_from_blocker(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-ai-root",
+                title="Preprocessing root",
+                body="Root item for preprocessing worker proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-ai-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-ai-child",
+                parent_item_id="work-preprocess-ai-root",
+                title="Preprocessing child",
+                body="Child needs current preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-ai-child-create",
+            )
+        )
+    )
+
+    async def fake_local_ai_json_completion(*, messages, run_id):
+        assert "missing_readiness_marker" in messages[1]["content"]
+        assert "scheduling reason for this preprocessing pass" in messages[1]["content"]
+        assert "not as an automatic failure" in messages[0]["content"]
+        return {
+            "model_alias": "TEST-KANBAN-LOCAL-AI",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                "ready": False,
+                "title": "Proof still missing",
+                "summary": "Current evidence is not enough yet.",
+                "rationale": "The card needs proof before implementation can start.",
+                "confidence": "high",
+                "uncertainty": "",
+                "blocking_codes": ["missing_proof"],
+                "recommended_next_actions": ["Add proof."],
+                "affected_refs": ["xarta-kanban:item:work-preprocess-ai-child"],
+                "proof_refs": ["kanban_items:work-preprocess-ai-child:body"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_local_ai_json_completion,
+    )
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-preprocess-ai-root",
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+
+    assert tick["ok"] is True
+    assert tick["lease_acquired"] is True
+    assert tick["processed_count"] == 1
+    processed = tick["processed_markers"][0]
+    assert processed["processor_kind"] == "preprocessing"
+    assert processed["provider_mode"] == "local"
+    assert processed["status"] == "failed"
+    assert "missing_proof" in processed["reason"]
+    assert "local_ai_reported_not_ready" in processed["reason"]
+    assert "local_ai_not_ready" not in processed["reason"]
+
+    marker = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-preprocess-ai-child'"
+    ).fetchone()
+    assert marker["status"] == "failed"
+    assert "local_ai_reported_not_ready" in marker["last_error"]
+
+
 def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
