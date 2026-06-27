@@ -74,6 +74,8 @@ DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
+KANBAN_REVIEW_FEEDBACK_SCHEMA = "xarta.kanban.operator_feedback.v1"
+KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA = "xarta.kanban.operator_feedback.collection.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
 KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v1"
 KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata_contract.v1"
@@ -407,6 +409,20 @@ class WorkPreferencesUpdateRequest(BaseModel):
 
 class WorkItemDetailDocumentUpdateRequest(BaseModel):
     body: str = ""
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkReviewFeedbackCaptureRequest(BaseModel):
+    feedback: str
+    session_id: str
+    feedback_id: str | None = None
+    capture_source: str = "explicit_command"
+    source_ref: str | None = None
+    related_refs: list[str] = []
+    metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -930,6 +946,14 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
                 "updates_when": "body_hash changes.",
             },
             {
+                "field": "operator_feedback.entries",
+                "scope": "review_document.metadata",
+                "meaning": "Explicit command/discussion feedback captures with feedback id, UTC date, actor, session id, affected item refs, capture source, source ref, and feedback hash.",
+                "updates_when": "A bounded feedback capture appends an operator-feedback section to the Review markdown.",
+                "entry_schema": KANBAN_REVIEW_FEEDBACK_SCHEMA,
+                "collection_schema": KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA,
+            },
+            {
                 "field": "document_source_hash",
                 "scope": "kanban_review_processor_markers",
                 "meaning": "Stable scanner source hash for the Review document snapshot.",
@@ -999,6 +1023,7 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
         ],
         "transition_rules": [
             "Review saves preserve updated_at and document_source_hash when body_hash is unchanged.",
+            "Explicit feedback captures append to the item Review markdown and update review_document.metadata.operator_feedback.",
             "Idle scan queues a marker when document_source_hash differs from processed_source_hash and no current queued/processing marker exists for the same document.",
             "A processing marker is requeued with last_error=processing_timeout when processing_expires_at is in the past.",
             "A processing marker is requeued with last_error=review_changed_during_processing and superseded fields when Review content changes during processing.",
@@ -1606,6 +1631,135 @@ def _review_document_source(document: dict[str, Any]) -> dict[str, Any]:
         "has_review_text": bool(body_text.strip()),
         "document_exists": bool(document.get("exists")) if isinstance(document, dict) else False,
     }
+
+
+def _kanban_review_feedback_id() -> str:
+    return f"kanban-feedback-{uuid.uuid4().hex[:12]}"
+
+
+def _clean_review_feedback_capture_source(value: str | None) -> str:
+    source = _clean_short_text(value, "explicit_command", limit=80).replace("-", "_")
+    allowed = {"explicit_command", "explicit_discussion"}
+    if source not in allowed:
+        raise HTTPException(
+            400,
+            "Review feedback capture_source must be explicit_command or explicit_discussion",
+        )
+    return source
+
+
+def _review_feedback_quote_block(feedback: str) -> str:
+    lines = _normalise_markdown_document_body(feedback).splitlines()
+    if not lines:
+        return "> "
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def _work_review_feedback_entry(
+    *,
+    item_id: str,
+    body: WorkReviewFeedbackCaptureRequest,
+    meta: dict[str, str],
+    now: str,
+) -> dict[str, Any]:
+    clean_feedback = _normalise_markdown_document_body(body.feedback).strip()
+    if not clean_feedback:
+        raise HTTPException(400, "Review feedback text is required")
+    session_id = _clean_short_text(body.session_id, "", limit=180)
+    if not session_id:
+        raise HTTPException(400, "Review feedback session_id is required")
+    feedback_id = (
+        _clean_work_id(body.feedback_id, "kanban-feedback")
+        if body.feedback_id
+        else _kanban_review_feedback_id()
+    )
+    affected_refs = [
+        f"kanban_items:{item_id}",
+        f"xarta-kanban:item:{item_id}",
+        *_clean_event_list(body.related_refs, limit=62),
+    ]
+    seen_refs: set[str] = set()
+    affected_refs = [
+        ref for ref in affected_refs if ref and not (ref in seen_refs or seen_refs.add(ref))
+    ]
+    feedback_hash = _hash_json_payload(
+        {
+            "schema": KANBAN_REVIEW_FEEDBACK_SCHEMA,
+            "item_id": item_id,
+            "feedback": clean_feedback,
+            "feedback_id": feedback_id,
+            "captured_at": now,
+        }
+    )
+    return {
+        "schema": KANBAN_REVIEW_FEEDBACK_SCHEMA,
+        "feedback_id": feedback_id,
+        "affected_item_id": item_id,
+        "affected_refs": affected_refs,
+        "captured_at": now,
+        "actor": meta["actor"],
+        "session_id": session_id,
+        "capture_source": _clean_review_feedback_capture_source(body.capture_source),
+        "source_ref": _clean_short_text(body.source_ref, "", limit=300),
+        "source_surface": meta["source_surface"],
+        "request_id": meta["request_id"],
+        "run_id": meta["run_id"],
+        "feedback_hash": feedback_hash,
+        "feedback_excerpt": _body_excerpt(clean_feedback, limit=500),
+        "feedback": clean_feedback,
+        "metadata": dict(body.metadata or {}),
+    }
+
+
+def _work_review_feedback_metadata(
+    existing_metadata: dict[str, Any],
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    existing_collection = existing_metadata.get("operator_feedback")
+    existing_entries = (
+        existing_collection.get("entries") if isinstance(existing_collection, dict) else []
+    )
+    entries = [
+        dict(item)
+        for item in existing_entries
+        if isinstance(item, dict) and item.get("feedback_id") != entry["feedback_id"]
+    ]
+    entry_metadata = {key: value for key, value in entry.items() if key != "feedback"}
+    entries.append(entry_metadata)
+    return {
+        "operator_feedback": {
+            "schema": KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA,
+            "updated_at": entry["captured_at"],
+            "count": len(entries),
+            "entries": entries,
+        }
+    }
+
+
+def _work_review_feedback_markdown(entry: dict[str, Any]) -> str:
+    lines = [
+        f"### {entry['captured_at']} - {entry['actor']}",
+        "",
+        f"- Feedback ID: `{entry['feedback_id']}`",
+        f"- Affected item: `xarta-kanban:item:{entry['affected_item_id']}`",
+        f"- Session: `{entry['session_id']}`",
+        f"- Capture source: `{entry['capture_source']}`",
+    ]
+    if entry.get("source_ref"):
+        lines.append(f"- Source ref: `{entry['source_ref']}`")
+    lines.extend(["", _review_feedback_quote_block(entry["feedback"])])
+    return "\n".join(lines).strip()
+
+
+def _append_work_review_feedback_body(existing_body: str, entry: dict[str, Any]) -> str:
+    existing = _normalise_markdown_document_body(existing_body).rstrip()
+    section_heading = "## Operator Feedback"
+    entry_markdown = _work_review_feedback_markdown(entry)
+    if not existing:
+        return f"{section_heading}\n\n{entry_markdown}\n"
+    if section_heading in existing:
+        return f"{existing}\n\n{entry_markdown}\n"
+    return f"{existing}\n\n{section_heading}\n\n{entry_markdown}\n"
 
 
 def _preprocessing_marker_id(item_id: str) -> str:
@@ -7164,6 +7318,7 @@ def _write_work_item_markdown_document(
     document_kind: str,
     actor: str,
     now: str,
+    metadata_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     item = _work_item_or_404(conn, item_id)
     if document_kind == "review":
@@ -7199,6 +7354,29 @@ def _write_work_item_markdown_document(
         if document_kind != "review" or body_changed
         else _clean_short_text(existing_metadata.get("actor"), actor, limit=120)
     )
+    protected_metadata_keys = {
+        "schema",
+        "item_id",
+        "root_item_id",
+        "title",
+        "actor",
+        "updated_at",
+        "body_hash",
+    }
+    preserved_metadata = (
+        {
+            key: value
+            for key, value in existing_metadata.items()
+            if key not in protected_metadata_keys
+        }
+        if document_kind == "review" and isinstance(existing_metadata, dict)
+        else {}
+    )
+    extra_metadata = {
+        key: value
+        for key, value in dict(metadata_extra or {}).items()
+        if key not in protected_metadata_keys
+    }
     metadata = {
         "item_id": item_id,
         "root_item_id": _work_root_item(conn, item_id)["item_id"],
@@ -7207,6 +7385,8 @@ def _write_work_item_markdown_document(
         "updated_at": updated_at,
     }
     if document_kind == "review":
+        metadata.update(preserved_metadata)
+        metadata.update(extra_metadata)
         metadata["body_hash"] = body_hash
     path.write_text(
         _kanban_markdown_text(schema, metadata, clean_body),
@@ -7242,6 +7422,7 @@ def _write_work_item_review_document(
     *,
     actor: str,
     now: str,
+    metadata_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _write_work_item_markdown_document(
         conn,
@@ -7250,6 +7431,7 @@ def _write_work_item_review_document(
         document_kind="review",
         actor=actor,
         now=now,
+        metadata_extra=metadata_extra,
     )
 
 
@@ -9189,6 +9371,94 @@ async def update_work_item_review_document(
         "review_document": document,
         "image_associations": image_associations,
         "audit": {"audit_id": audit_id, "action": "update_work_item_review", "result": "ok"},
+    }
+
+
+@router.post("/kanban/items/{item_id}/review/feedback")
+async def append_work_item_review_feedback(
+    item_id: str, body: WorkReviewFeedbackCaptureRequest
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    entry = _work_review_feedback_entry(
+        item_id=clean_item_id,
+        body=body,
+        meta=meta,
+        now=now,
+    )
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        existing_document = _work_item_review_document(conn, clean_item_id)
+        clean_body = _append_work_review_feedback_body(existing_document["body"], entry)
+        feedback_metadata = _work_review_feedback_metadata(
+            existing_document.get("metadata") or {},
+            entry,
+        )
+        document = _write_work_item_review_document(
+            conn,
+            clean_item_id,
+            clean_body,
+            actor=meta["actor"],
+            now=now,
+            metadata_extra=feedback_metadata,
+        )
+        image_associations = _associate_rich_doc_images_for_document(
+            domain="kanban",
+            markdown=clean_body,
+            document_type="item-review",
+            document_id=clean_item_id,
+            item_id=clean_item_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+        )
+        source_hash = _hash_json_payload(
+            {
+                "item_id": clean_item_id,
+                "feedback_entry": {key: value for key, value in entry.items() if key != "feedback"},
+            }
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="append_work_item_review_feedback",
+            target_ref=f"kanban_items:{clean_item_id}:review:operator_feedback:{entry['feedback_id']}",
+            item_id=clean_item_id,
+            parent_item_id=item["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "schema": KANBAN_REVIEW_FEEDBACK_SCHEMA,
+                "feedback_id": entry["feedback_id"],
+                "feedback_hash": entry["feedback_hash"],
+                "capture_source": entry["capture_source"],
+                "session_id": entry["session_id"],
+                "affected_item_id": clean_item_id,
+                "file_ref": document["file_ref"],
+                "body_hash": document["metadata"].get("body_hash") or "",
+                "document_updated_at": document["updated_at"],
+                "rich_doc_image_count": len(image_associations.get("images", [])),
+            },
+        )
+        gen = increment_gen(conn, "kanban-item-review-feedback")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "item_id": clean_item_id,
+        "feedback_entry": entry,
+        "review_document": document,
+        "image_associations": image_associations,
+        "audit": {
+            "audit_id": audit_id,
+            "action": "append_work_item_review_feedback",
+            "result": "ok",
+        },
     }
 
 
