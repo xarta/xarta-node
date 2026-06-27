@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import os
 import posixpath
 import re
@@ -28,6 +30,7 @@ from .db import get_conn, get_setting, increment_gen, set_setting
 from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/personal", tags=["personal"])
+log = logging.getLogger(__name__)
 
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
 KANBAN_ROOT = Path(os.environ.get("BLUEPRINTS_KANBAN_DIR", "/xarta-node/.lone-wolf/kanban"))
@@ -86,6 +89,8 @@ KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
 KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.readiness_contract.v1"
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
+KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
+KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
 KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID = "kanban-5f930fec1321"
 KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID = "kanban-203acef17b12"
 KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID = "kanban-51aaf9f7eb09"
@@ -496,7 +501,7 @@ class WorkReviewDecisionCreateRequest(BaseModel):
     proof_refs: list[str] = []
     commit_link_ids: list[str] = []
     status: str = "recorded"
-    provider_mode: str = "cloud-first"
+    provider_mode: str = "local"
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -535,6 +540,19 @@ class WorkPreprocessingIdleScanRequest(BaseModel):
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkAutomationIdleTickRequest(BaseModel):
+    item_id: str | None = None
+    max_scan_items: int | None = None
+    max_process_items: int | None = None
+    holder_id: str | None = None
+    lease_ttl_seconds: int | None = None
+    marker_timeout_seconds: int | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-automation-status"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -874,45 +892,50 @@ def _clean_review_decision_status(value: str | None) -> str:
 
 
 def _clean_review_provider_mode(value: str | None) -> str:
-    mode = _clean_short_text(value, "cloud-first", limit=80).replace("_", "-")
+    mode = _clean_short_text(value, "local", limit=80).replace("_", "-")
     allowed = {"cloud-first", "cloud", "local-planned", "local", "manual"}
-    return mode if mode in allowed else "cloud-first"
+    return mode if mode in allowed else "local"
+
+
+def _work_automation_local_ai_model_alias() -> str:
+    return _clean_short_text(
+        os.environ.get(KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, ""), "", limit=220
+    )
 
 
 def _work_review_processing_policy() -> dict[str, Any]:
+    local_model_alias = _work_automation_local_ai_model_alias()
     return {
         "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
         "status": "active",
         "version": "2026-06-27",
-        "active_mode": "cloud-first",
+        "active_mode": "local",
         "applies_to": ["review_processor", "preprocessing"],
         "cloud_processing": {
-            "state": "active",
-            "mode": "cloud-first",
-            "provider_choice": "explicit-runtime-selection",
+            "state": "not-configured",
+            "mode": "blocked",
+            "provider_choice": "raise_blocker_or_operator_question",
+            "blocker_policy": "Missing required cloud API wiring must be surfaced as a blocker/question, not worked around.",
         },
         "local_processing": {
-            "state": "planned-gated",
-            "gate": "structured-job-packets-required",
+            "state": "active",
+            "gate": "private_no_think_no_protection_no_orientation_endpoint_required",
             "automatic_switch": False,
-            "switch_requires": [
-                "structured_job_packet_schema",
-                "explicit_provider_choice",
-                "lease_and_timeout_integration",
-                "operator_review_of_policy_change",
-            ],
+            "model_alias": local_model_alias,
+            "failure_policy": "fail_marker_and_record_visible_error",
         },
         "provider_choice": {
             "required": True,
-            "default_mode": "cloud-first",
-            "allowed_modes": ["cloud-first", "cloud", "manual", "local-planned"],
-            "blocked_until_gate": ["local"],
+            "default_mode": "local",
+            "allowed_modes": ["local", "manual"],
+            "blocked_until_explicit_api": ["cloud-first", "cloud"],
         },
         "routing_rules": [
-            "Review Processor and preprocessing jobs use cloud processing while this policy is active.",
-            "Local processing remains planned and gated until structured job packets exist.",
+            "Review Processor and preprocessing jobs use the local private no-think/no-protection/no-orientation endpoint while this policy is active.",
+            "Do not use deterministic substitute processing when a required provider route is unavailable.",
+            "If a requested provider/API path is missing, raise a blocker or operator question instead of silently changing provider mode.",
             "Provider mode must be explicit in queue packets and decision records.",
-            "Do not silently switch provider modes when cloud processing fails.",
+            "Do not silently switch provider modes when local processing fails.",
         ],
     }
 
@@ -1342,7 +1365,7 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
             "Proposal surfaces are interaction surfaces, not substitutes for implementation workstream cards.",
             "Autonomous decisions must be written in clear natural Kanban language with affected refs and proof refs.",
             "Code-producing outcomes are accepted only after pre-commit issues are fixed and explicit commit links exist.",
-            "Use cloud processing while the active processing policy is cloud-first.",
+            "Use local AI processing while the active processing policy is local.",
         ],
     }
 
@@ -8009,6 +8032,68 @@ def _assert_agent_completion_not_blocked(
     )
 
 
+def _work_item_is_leaf(conn: Any, item_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM kanban_items
+        WHERE parent_item_id=? AND status!='archived'
+        """,
+        (item_id,),
+    ).fetchone()
+    return int(row["count"] if row else 0) == 0
+
+
+def _work_item_has_active_agent_session(conn: Any, item_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT session_id
+        FROM kanban_agent_sessions
+        WHERE item_id=? AND status='active'
+        ORDER BY updated_at DESC, started_at DESC, session_id
+        LIMIT 1
+        """,
+        (item_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _assert_agent_leaf_doing_has_active_session(
+    conn: Any,
+    *,
+    item_id: str,
+    existing: Any,
+    target_state: Any,
+    meta: dict[str, str],
+) -> None:
+    if target_state["state_id"] != "doing":
+        return
+    if existing["state_id"] == target_state["state_id"]:
+        return
+    if not _work_completion_actor_is_restricted(meta):
+        return
+    if not _work_item_is_leaf(conn, item_id):
+        return
+    if _work_item_has_active_agent_session(conn, item_id):
+        return
+    raise HTTPException(
+        409,
+        {
+            "error": "kanban_agent_leaf_doing_without_active_session",
+            "message": (
+                "Agent or automation lane movement is blocked because leaf cards "
+                "may be in Doing only while an active agent session exists for "
+                "that leaf. Use To Do for inactive unfinished leaves or Blocked "
+                "for blocked leaves."
+            ),
+            "item_id": item_id,
+            "target_state_id": target_state["state_id"],
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+        },
+    )
+
+
 def _work_scope_item_rows(conn: Any, item_id: str, scope: str) -> list[Any]:
     clean_scope = _clean_short_text(scope, "local", limit=40).replace("-", "_")
     if clean_scope in {"local", "self"}:
@@ -9428,6 +9513,13 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             target_state=state,
             meta=meta,
         )
+        _assert_agent_leaf_doing_has_active_session(
+            conn,
+            item_id=item_id,
+            existing=existing,
+            target_state=state,
+            meta=meta,
+        )
         priority = _require_work_priority(conn, body.priority_id or existing["priority_id"])
         tags = (
             _clean_event_list(body.tags, limit=32)
@@ -10162,6 +10254,13 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         existing = _work_item_or_404(conn, item_id)
         state = _require_work_state(conn, body.state_id or existing["state_id"])
         _assert_agent_completion_not_blocked(
+            conn,
+            item_id=item_id,
+            existing=existing,
+            target_state=state,
+            meta=meta,
+        )
+        _assert_agent_leaf_doing_has_active_session(
             conn,
             item_id=item_id,
             existing=existing,
@@ -10980,6 +11079,975 @@ async def record_work_item_review_decision(
     }
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _work_automation_idle_worker_config() -> dict[str, Any]:
+    local_model_alias = _work_automation_local_ai_model_alias()
+    return {
+        "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+        "enabled": _env_bool("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", True),
+        "provider_mode": "local",
+        "local_ai_model_alias": local_model_alias,
+        "local_ai_max_tokens": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MAX_TOKENS",
+            1800,
+            minimum=512,
+            maximum=8192,
+        ),
+        "root_item_id": _clean_short_text(
+            os.environ.get("BLUEPRINTS_KANBAN_AUTOMATION_ROOT_ITEM_ID", ""),
+            "",
+            limit=180,
+        ),
+        "initial_delay_seconds": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_INITIAL_DELAY_SECONDS",
+            15,
+            minimum=0,
+            maximum=3600,
+        ),
+        "interval_seconds": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_IDLE_INTERVAL_SECONDS",
+            60,
+            minimum=5,
+            maximum=86400,
+        ),
+        "max_scan_items": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS",
+            100,
+            minimum=1,
+            maximum=500,
+        ),
+        "max_process_items": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_MAX_PROCESS_ITEMS",
+            5,
+            minimum=1,
+            maximum=50,
+        ),
+        "lease_ttl_seconds": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_LEASE_TTL_SECONDS",
+            900,
+            minimum=60,
+            maximum=7200,
+        ),
+        "marker_timeout_seconds": _env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_MARKER_TIMEOUT_SECONDS",
+            900,
+            minimum=60,
+            maximum=7200,
+        ),
+        "holder_id": _clean_short_text(
+            os.environ.get("BLUEPRINTS_KANBAN_AUTOMATION_HOLDER_ID", "kanban-idle-worker"),
+            "kanban-idle-worker",
+            limit=160,
+        ),
+    }
+
+
+def _local_ai_json_object(content: str) -> dict[str, Any]:
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("local AI response did not contain a JSON object")
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"local AI response JSON was invalid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("local AI response JSON root was not an object")
+    return payload
+
+
+async def _work_automation_local_ai_json_completion(
+    *,
+    messages: list[dict[str, str]],
+    run_id: str,
+) -> dict[str, Any]:
+    config = _work_automation_idle_worker_config()
+    model_alias = config["local_ai_model_alias"]
+    if not model_alias:
+        raise ValueError(
+            f"{KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV} is required for local AI Kanban automation"
+        )
+    from .routes_litellm import _ChatBody, litellm_chat_proxy
+
+    response = await litellm_chat_proxy(
+        _ChatBody(
+            model=model_alias,
+            messages=messages,
+            max_tokens=config["local_ai_max_tokens"],
+            temperature=0,
+        )
+    )
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("local AI response did not include choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else ""
+    parsed = _local_ai_json_object(str(content or ""))
+    return {
+        "model_alias": model_alias,
+        "run_id": run_id,
+        "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
+        "payload": parsed,
+    }
+
+
+def _local_ai_required_text(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    limit: int = 6000,
+) -> str:
+    value = _body_excerpt(str(payload.get(key) or "").strip(), limit=limit)
+    if not value:
+        raise ValueError(f"local AI response missing required field: {key}")
+    return value
+
+
+def _local_ai_optional_text(
+    payload: dict[str, Any],
+    key: str,
+    default: str = "",
+    *,
+    limit: int = 6000,
+) -> str:
+    return _body_excerpt(str(payload.get(key) or default).strip(), limit=limit)
+
+
+def _local_ai_ref_list(payload: dict[str, Any], key: str) -> list[str]:
+    values = payload.get(key)
+    if not isinstance(values, list):
+        return []
+    refs = []
+    for value in values:
+        ref = _clean_short_text(str(value or ""), "", limit=260)
+        if ref:
+            refs.append(ref)
+    return refs[:40]
+
+
+def _work_review_processor_local_ai_messages(
+    *,
+    item: Any,
+    review_document: dict[str, Any],
+    marker: dict[str, Any],
+) -> list[dict[str, str]]:
+    review_text = str(review_document.get("body") or "")
+    context = {
+        "schema": "xarta.kanban.review_processor.local_ai_input.v1",
+        "item": _row_to_work_item(item),
+        "canonical_item_ref": f"xarta-kanban:item:{item['item_id']}",
+        "marker": {
+            "marker_id": marker.get("marker_id") or "",
+            "processor_kind": marker.get("processor_kind") or "review",
+            "document_ref": marker.get("document_ref") or "",
+            "document_source_hash": marker.get("document_source_hash") or "",
+            "reason": (marker.get("metadata") or {}).get("reason")
+            if isinstance(marker.get("metadata"), dict)
+            else "",
+        },
+        "review_document": {
+            "document_ref": _review_document_ref(review_document),
+            "updated_at": review_document.get("updated_at") or "",
+            "body_bytes": len(review_text.encode("utf-8")),
+            "body_excerpt": _body_excerpt(review_text, limit=16000),
+            "metadata": review_document.get("metadata") or {},
+        },
+        "processing_policy": _work_review_processing_policy(),
+        "required_output": {
+            "title": "short human title",
+            "summary": "natural language processing result",
+            "rationale": "why this decision follows from the Review data",
+            "decision_type": "short snake_case type",
+            "confidence": "low|medium|high",
+            "uncertainty": "remaining uncertainty or empty string",
+            "status": "recorded|pending|accepted|declined|failed",
+            "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
+            "proof_refs": ["source/proof refs"],
+        },
+    }
+    system = (
+        "You are the Blueprints Kanban Review Processor running on the local "
+        "private no-think/no-protection/no-orientation endpoint. Return only one "
+        "strict JSON object. Do not use markdown. Process the Review text as "
+        "future guidance and acceptance-check data. If required infrastructure "
+        "or provider wiring is missing, record that as a blocker/question rather "
+        "than substituting a different workflow. Do not claim implementation is "
+        "done unless proof in the context actually supports it."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
+    ]
+
+
+async def _process_work_review_idle_marker(
+    marker: dict[str, Any],
+    *,
+    holder_id: str,
+    lease_token: str,
+    run_id: str,
+) -> dict[str, Any]:
+    item_id = marker["item_id"]
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        review_document = _work_item_review_document(conn, item_id)
+    ai = await _work_automation_local_ai_json_completion(
+        messages=_work_review_processor_local_ai_messages(
+            item=item,
+            review_document=review_document,
+            marker=marker,
+        ),
+        run_id=run_id,
+    )
+    payload = ai["payload"]
+    title = _local_ai_required_text(payload, "title", limit=220)
+    summary = _local_ai_required_text(payload, "summary")
+    rationale = _local_ai_required_text(payload, "rationale")
+    decision_type = _clean_short_text(
+        str(payload.get("decision_type") or "review_document_processed"),
+        "review_document_processed",
+        limit=120,
+    )
+    affected_refs = _local_ai_ref_list(payload, "affected_refs") or [
+        f"kanban_items:{item_id}",
+        f"xarta-kanban:item:{item_id}",
+    ]
+    if f"kanban_review_processor_markers:{marker['marker_id']}" not in affected_refs:
+        affected_refs.append(f"kanban_review_processor_markers:{marker['marker_id']}")
+    proof_refs = _local_ai_ref_list(payload, "proof_refs") or [
+        f"kanban_review_processor_markers:{marker['marker_id']}",
+        marker.get("document_ref") or f"kanban_items:{item_id}:review",
+    ]
+    uncertainty = _local_ai_optional_text(payload, "uncertainty", limit=3000)
+    confidence = _clean_short_text(str(payload.get("confidence") or "medium"), "medium", limit=40)
+    status = _clean_review_decision_status(str(payload.get("status") or "recorded"))
+    decision_id = _clean_work_id(
+        f"kanban-decision-local-review-{item_id}-{marker['document_source_hash'][-12:]}",
+        "kanban-decision",
+    )
+    decision = await record_work_item_review_decision(
+        item_id,
+        WorkReviewDecisionCreateRequest(
+            decision_id=decision_id,
+            processor_kind="review",
+            decision_type=decision_type,
+            title=title,
+            summary=summary,
+            rationale=rationale,
+            affected_refs=affected_refs,
+            confidence=confidence,
+            uncertainty=uncertainty,
+            proof_refs=proof_refs,
+            status=status,
+            provider_mode="local",
+            metadata={
+                "schema": "xarta.kanban.review_processor.local_ai_decision.v1",
+                "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+                "processor_engine": "local-litellm-json",
+                "provider_policy": _work_review_processing_policy()["active_mode"],
+                "model_alias": ai["model_alias"],
+                "marker_id": marker["marker_id"],
+                "document_source_hash": marker["document_source_hash"],
+                "local_ai_payload": payload,
+                "local_ai_content_excerpt": ai["content_excerpt"],
+            },
+            actor=holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-decision-{marker['marker_id']}",
+            run_id=run_id,
+        ),
+    )
+    complete = await complete_work_review_processor_marker(
+        marker["marker_id"],
+        WorkReviewProcessorMarkerCompleteRequest(
+            holder_id=holder_id,
+            lease_token=lease_token,
+            document_source_hash=marker["document_source_hash"],
+            decision_id=decision["decision"]["decision_id"],
+            status="processed",
+            actor=holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-complete-{marker['marker_id']}",
+            run_id=run_id,
+            metadata={
+                "schema": "xarta.kanban.review_processor.local_ai_completion.v1",
+                "decision_id": decision["decision"]["decision_id"],
+                "processor_engine": "local-litellm-json",
+                "model_alias": ai["model_alias"],
+            },
+        ),
+    )
+    return {
+        "ok": True,
+        "processor_kind": "review",
+        "item_id": item_id,
+        "marker_id": marker["marker_id"],
+        "decision_id": decision["decision"]["decision_id"],
+        "completed": complete.get("completed", False),
+        "status": complete.get("marker", {}).get("status", ""),
+        "provider_mode": "local",
+        "model_alias": ai["model_alias"],
+    }
+
+
+def _work_preprocessing_local_ai_messages(
+    *,
+    item: Any,
+    source: dict[str, Any],
+    detail_document: dict[str, Any],
+    review_document: dict[str, Any],
+    discussions: list[dict[str, Any]],
+    marker: dict[str, Any],
+) -> list[dict[str, str]]:
+    context = {
+        "schema": "xarta.kanban.preprocessing.local_ai_input.v1",
+        "item": _row_to_work_item(item),
+        "canonical_item_ref": f"xarta-kanban:item:{item['item_id']}",
+        "marker": {
+            "marker_id": marker.get("marker_id") or "",
+            "processor_kind": marker.get("processor_kind") or "preprocessing",
+            "document_source_hash": marker.get("document_source_hash") or "",
+        },
+        "queue_source": source,
+        "documents": {
+            "body_excerpt": _body_excerpt(str(item["body_excerpt"] or ""), limit=6000),
+            "detail_excerpt": _body_excerpt(str(detail_document.get("body") or ""), limit=12000),
+            "review_excerpt": _body_excerpt(str(review_document.get("body") or ""), limit=12000),
+            "recent_discussions": [
+                {
+                    "discussion_id": discussion.get("discussion_id") or "",
+                    "body_excerpt": _body_excerpt(
+                        str((discussion.get("document") or {}).get("body") or ""),
+                        limit=3000,
+                    ),
+                }
+                for discussion in discussions[:6]
+            ],
+        },
+        "hard_rules": [
+            "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
+            "If the item lacks enough information to implement safely, ready must be false.",
+            "If there are open blockers, ready must be false.",
+            "Readiness is not completion.",
+            "Leaves should be Doing only while actively operated on; otherwise use To Do or Blocked.",
+        ],
+        "required_output": {
+            "ready": True,
+            "title": "short human title",
+            "summary": "what preprocessing concluded",
+            "rationale": "why the item is or is not ready",
+            "confidence": "low|medium|high",
+            "uncertainty": "remaining uncertainty",
+            "blocking_codes": ["missing_cloud_api"],
+            "recommended_next_actions": ["ask operator a concrete question"],
+            "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
+            "proof_refs": ["source/proof refs"],
+        },
+    }
+    system = (
+        "You are the Blueprints Kanban preprocessing processor running on the "
+        "local private no-think/no-protection/no-orientation endpoint. Return "
+        "only one strict JSON object. Do not use markdown. Decide whether the "
+        "current card context is ready for an agent to start implementation. "
+        "When a required route, API, provider, proof path, or operator decision "
+        "is missing, set ready=false and describe the blocker/question. Do not "
+        "invent deterministic substitute work."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
+    ]
+
+
+def _preprocessing_readiness_marker(
+    *,
+    item_id: str,
+    source: dict[str, Any],
+    marker: dict[str, Any],
+    actor: str,
+    now: str,
+    ai_payload: dict[str, Any],
+) -> dict[str, Any]:
+    next_actions = ai_payload.get("recommended_next_actions")
+    if not isinstance(next_actions, list):
+        next_actions = []
+    return {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "context_packet_schema": source["schema"],
+        "item_id": item_id,
+        "canonical_code": f"xarta-kanban:item:{item_id}",
+        "marked_at": now,
+        "marked_by": actor,
+        "context_hash": source["document_source_hash"],
+        "component_hashes": {
+            "preprocessing_queue_source": source["document_source_hash"],
+        },
+        "counts": source["counts"],
+        "source_refs": source["source_refs"],
+        "packet_summary": _body_excerpt(
+            str(ai_payload.get("summary") or "Local AI preprocessing accepted current context."),
+            limit=1200,
+        ),
+        "recommended_next_actions": [
+            _body_excerpt(str(action or ""), limit=300) for action in next_actions[:12]
+        ],
+        "processor_marker_id": marker["marker_id"],
+        "processor_model_alias": _work_automation_idle_worker_config()["local_ai_model_alias"],
+    }
+
+
+async def _process_work_preprocessing_idle_marker(
+    marker: dict[str, Any],
+    *,
+    holder_id: str,
+    lease_token: str,
+    run_id: str,
+) -> dict[str, Any]:
+    item_id = marker["item_id"]
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        source = _work_preprocessing_context_source(conn, item)
+        detail_document = _work_item_detail_document(conn, item_id)
+        review_document = _work_item_review_document(conn, item_id)
+        discussion_rows = conn.execute(
+            """
+            SELECT * FROM kanban_discussions
+            WHERE item_id=? AND status!='archived'
+            ORDER BY updated_at DESC, created_at DESC, discussion_id
+            LIMIT 6
+            """,
+            (item_id,),
+        ).fetchall()
+        discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows]
+        hints_row = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        hints = _row_to_work_agent_hints(hints_row, item_id)
+    ai = await _work_automation_local_ai_json_completion(
+        messages=_work_preprocessing_local_ai_messages(
+            item=item,
+            source=source,
+            detail_document=detail_document,
+            review_document=review_document,
+            discussions=discussions,
+            marker=marker,
+        ),
+        run_id=run_id,
+    )
+    payload = ai["payload"]
+    ready = bool(payload.get("ready"))
+    title = _local_ai_required_text(payload, "title", limit=220)
+    summary = _local_ai_required_text(payload, "summary")
+    rationale = _local_ai_required_text(payload, "rationale")
+    confidence = _clean_short_text(str(payload.get("confidence") or "medium"), "medium", limit=40)
+    uncertainty = _local_ai_optional_text(payload, "uncertainty", limit=3000)
+    blocking_codes = payload.get("blocking_codes")
+    if not isinstance(blocking_codes, list):
+        blocking_codes = []
+    blocking_codes = [
+        _clean_short_text(str(code or ""), "", limit=120)
+        for code in blocking_codes[:20]
+        if str(code or "").strip()
+    ]
+    blocker_count = int(source.get("counts", {}).get("blocker_count") or 0)
+    body_ref = next(
+        (ref for ref in source.get("source_refs", []) if ref.get("name") == "body"),
+        {},
+    )
+    body_length = int(body_ref.get("body_length") or 0)
+    hard_blocking_codes = []
+    if blocker_count > 0:
+        hard_blocking_codes.append("open_blockers")
+    if body_length <= 0:
+        hard_blocking_codes.append("missing_body")
+    if not ready:
+        hard_blocking_codes.append("local_ai_not_ready")
+    if hard_blocking_codes:
+        all_blocking_codes = list(dict.fromkeys([*blocking_codes, *hard_blocking_codes]))
+        decision_id = _clean_work_id(
+            f"kanban-decision-local-preprocess-blocked-{item_id}-{source['document_source_hash'][-12:]}",
+            "kanban-decision",
+        )
+        decision = await record_work_item_review_decision(
+            item_id,
+            WorkReviewDecisionCreateRequest(
+                decision_id=decision_id,
+                processor_kind="preprocessing",
+                decision_type="preprocessing_blocker_or_question",
+                title=title,
+                summary=summary,
+                rationale=rationale,
+                affected_refs=_local_ai_ref_list(payload, "affected_refs")
+                or [
+                    f"kanban_items:{item_id}",
+                    f"xarta-kanban:item:{item_id}",
+                    f"kanban_review_processor_markers:{marker['marker_id']}",
+                ],
+                confidence=confidence,
+                uncertainty=uncertainty,
+                proof_refs=_local_ai_ref_list(payload, "proof_refs")
+                or [
+                    f"kanban_review_processor_markers:{marker['marker_id']}",
+                    f"kanban_items:{item_id}:context_readiness",
+                ],
+                status="failed",
+                provider_mode="local",
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.local_ai_blocked_decision.v1",
+                    "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+                    "processor_engine": "local-litellm-json",
+                    "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "model_alias": ai["model_alias"],
+                    "marker_id": marker["marker_id"],
+                    "document_source_hash": source["document_source_hash"],
+                    "blocking_codes": all_blocking_codes,
+                    "source": source,
+                    "local_ai_payload": payload,
+                    "local_ai_content_excerpt": ai["content_excerpt"],
+                },
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-blocked-decision-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=marker["document_source_hash"],
+                status="failed",
+                decision_id=decision["decision"]["decision_id"],
+                error=";".join(all_blocking_codes),
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-failed-{marker['marker_id']}",
+                run_id=run_id,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "processor_engine": "local-litellm-json",
+                    "decision_id": decision["decision"]["decision_id"],
+                    "model_alias": ai["model_alias"],
+                    "blocking_codes": all_blocking_codes,
+                },
+            ),
+        )
+        return {
+            "ok": False,
+            "processor_kind": "preprocessing",
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+            "decision_id": decision["decision"]["decision_id"],
+            "reason": ";".join(all_blocking_codes),
+            "status": complete.get("marker", {}).get("status", "failed"),
+            "provider_mode": "local",
+            "model_alias": ai["model_alias"],
+        }
+
+    readiness_marker = _preprocessing_readiness_marker(
+        item_id=item_id,
+        source=source,
+        marker=marker,
+        actor=holder_id,
+        now=now,
+        ai_payload=payload,
+    )
+    metadata = dict(hints.get("metadata") or {})
+    metadata["context_readiness_marker"] = readiness_marker
+    await update_work_item_agent_hints(
+        item_id,
+        WorkAgentHintsUpdateRequest(
+            metadata=metadata,
+            actor=holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-readiness-{marker['marker_id']}",
+            run_id=run_id,
+        ),
+    )
+    decision_id = _clean_work_id(
+        f"kanban-decision-idle-preprocess-{item_id}-{source['document_source_hash'][-12:]}",
+        "kanban-decision",
+    )
+    decision = await record_work_item_review_decision(
+        item_id,
+        WorkReviewDecisionCreateRequest(
+            decision_id=decision_id,
+            processor_kind="preprocessing",
+            decision_type="context_readiness_marked",
+            title=title,
+            summary=summary,
+            rationale=rationale,
+            affected_refs=[
+                f"kanban_items:{item_id}",
+                f"xarta-kanban:item:{item_id}",
+                f"kanban_agent_hints:{item_id}",
+                f"kanban_review_processor_markers:{marker['marker_id']}",
+            ],
+            confidence=confidence,
+            uncertainty=uncertainty,
+            proof_refs=_local_ai_ref_list(payload, "proof_refs")
+            or [
+                f"kanban_review_processor_markers:{marker['marker_id']}",
+                f"kanban_agent_hints:{item_id}",
+            ],
+            status="accepted",
+            provider_mode="local",
+            metadata={
+                "schema": "xarta.kanban.preprocessing.local_ai_decision.v1",
+                "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+                "processor_engine": "local-litellm-json",
+                "provider_policy": _work_review_processing_policy()["active_mode"],
+                "model_alias": ai["model_alias"],
+                "marker_id": marker["marker_id"],
+                "document_source_hash": source["document_source_hash"],
+                "readiness_marker": readiness_marker,
+                "local_ai_payload": payload,
+                "local_ai_content_excerpt": ai["content_excerpt"],
+            },
+            actor=holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-preprocess-decision-{marker['marker_id']}",
+            run_id=run_id,
+        ),
+    )
+    complete = await complete_work_review_processor_marker(
+        marker["marker_id"],
+        WorkReviewProcessorMarkerCompleteRequest(
+            holder_id=holder_id,
+            lease_token=lease_token,
+            document_source_hash=marker["document_source_hash"],
+            decision_id=decision["decision"]["decision_id"],
+            status="processed",
+            actor=holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-preprocess-complete-{marker['marker_id']}",
+            run_id=run_id,
+            metadata={
+                "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                "decision_id": decision["decision"]["decision_id"],
+                "processor_engine": "local-litellm-json",
+                "model_alias": ai["model_alias"],
+                "readiness_marker_context_hash": readiness_marker["context_hash"],
+            },
+        ),
+    )
+    return {
+        "ok": True,
+        "processor_kind": "preprocessing",
+        "item_id": item_id,
+        "marker_id": marker["marker_id"],
+        "decision_id": decision["decision"]["decision_id"],
+        "completed": complete.get("completed", False),
+        "status": complete.get("marker", {}).get("status", ""),
+        "provider_mode": "local",
+        "model_alias": ai["model_alias"],
+    }
+
+
+async def _process_work_automation_claimed_marker(
+    marker: dict[str, Any],
+    *,
+    holder_id: str,
+    lease_token: str,
+    run_id: str,
+) -> dict[str, Any]:
+    processor_kind = marker.get("processor_kind") or "review"
+    try:
+        if processor_kind == "preprocessing":
+            return await _process_work_preprocessing_idle_marker(
+                marker,
+                holder_id=holder_id,
+                lease_token=lease_token,
+                run_id=run_id,
+            )
+        if processor_kind == "review":
+            return await _process_work_review_idle_marker(
+                marker,
+                holder_id=holder_id,
+                lease_token=lease_token,
+                run_id=run_id,
+            )
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=marker.get("document_source_hash") or "",
+                status="skipped",
+                error=f"unsupported_processor_kind:{processor_kind}",
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-unsupported-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        return {
+            "ok": False,
+            "processor_kind": processor_kind,
+            "item_id": marker.get("item_id") or "",
+            "marker_id": marker["marker_id"],
+            "reason": "unsupported_processor_kind",
+            "status": complete.get("marker", {}).get("status", "skipped"),
+        }
+    except Exception as exc:
+        failed_complete: dict[str, Any] | None = None
+        with suppress(Exception):
+            failed_complete = await complete_work_review_processor_marker(
+                marker["marker_id"],
+                WorkReviewProcessorMarkerCompleteRequest(
+                    holder_id=holder_id,
+                    lease_token=lease_token,
+                    document_source_hash=marker.get("document_source_hash") or "",
+                    status="failed",
+                    error=_body_excerpt(str(exc), limit=1000),
+                    actor=holder_id,
+                    source_surface="kanban-automation-idle-worker",
+                    request_id=f"{run_id}-failed-{marker['marker_id']}",
+                    run_id=run_id,
+                    metadata={
+                        "schema": "xarta.kanban.automation.idle_worker.failure.v1",
+                        "processor_kind": processor_kind,
+                        "provider_mode": "local",
+                        "model_alias": _work_automation_idle_worker_config()[
+                            "local_ai_model_alias"
+                        ],
+                    },
+                ),
+            )
+        return {
+            "ok": False,
+            "processor_kind": processor_kind,
+            "item_id": marker.get("item_id") or "",
+            "marker_id": marker["marker_id"],
+            "reason": "local_ai_processing_failed",
+            "error": _body_excerpt(str(exc), limit=1000),
+            "status": (failed_complete or {}).get("marker", {}).get("status", "failed"),
+            "provider_mode": "local",
+            "model_alias": _work_automation_idle_worker_config()["local_ai_model_alias"],
+        }
+
+
+async def run_work_kanban_automation_idle_tick(
+    *,
+    item_id: str | None = None,
+    max_scan_items: int | None = None,
+    max_process_items: int | None = None,
+    holder_id: str | None = None,
+    lease_ttl_seconds: int | None = None,
+    marker_timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    config = _work_automation_idle_worker_config()
+    clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
+    scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
+    process_limit = max(1, min(int(max_process_items or config["max_process_items"]), 50))
+    clean_holder_id = _clean_short_text(
+        holder_id or config["holder_id"],
+        config["holder_id"],
+        limit=160,
+    )
+    ttl_seconds = _clean_review_lease_ttl(lease_ttl_seconds or config["lease_ttl_seconds"])
+    timeout_seconds = _clean_review_lease_ttl(
+        marker_timeout_seconds or config["marker_timeout_seconds"]
+    )
+    run_id = f"kanban-idle-worker-{uuid.uuid4().hex[:12]}"
+
+    timeout_requeue = await requeue_timed_out_work_review_processor_markers(
+        WorkReviewProcessorTimeoutRequeueRequest(
+            item_id=clean_item_id or None,
+            actor=clean_holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-requeue-timeouts",
+            run_id=run_id,
+            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+        )
+    )
+    review_scan = await trigger_work_review_processor_idle_scan(
+        WorkReviewProcessorIdleScanRequest(
+            item_id=clean_item_id or None,
+            max_items=scan_limit,
+            include_empty=False,
+            actor=clean_holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-review-scan",
+            run_id=run_id,
+            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+        )
+    )
+    preprocessing_scan = await trigger_work_preprocessing_idle_scan(
+        WorkPreprocessingIdleScanRequest(
+            item_id=clean_item_id or None,
+            max_items=scan_limit,
+            actor=clean_holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-preprocessing-scan",
+            run_id=run_id,
+            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+        )
+    )
+    lease = await acquire_work_review_processor_lease(
+        WorkReviewProcessorLeaseRequest(
+            holder_id=clean_holder_id,
+            item_id=clean_item_id or None,
+            ttl_seconds=ttl_seconds,
+            actor=clean_holder_id,
+            source_surface="kanban-automation-idle-worker",
+            request_id=f"{run_id}-lease",
+            run_id=run_id,
+            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+        )
+    )
+    processed_markers: list[dict[str, Any]] = []
+    claim_results: list[dict[str, Any]] = []
+    release: dict[str, Any] | None = None
+    if not lease.get("acquired"):
+        return {
+            "ok": True,
+            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+            "run_id": run_id,
+            "item_id": clean_item_id,
+            "reason": lease.get("reason") or "lease_not_acquired",
+            "lease_acquired": False,
+            "timeout_requeue": timeout_requeue,
+            "review_scan": review_scan,
+            "preprocessing_scan": preprocessing_scan,
+            "processed_count": 0,
+            "processed_markers": [],
+            "claim_results": [],
+        }
+    lease_token = lease["lease"].get("lease_token") or ""
+    try:
+        for index in range(process_limit):
+            await heartbeat_work_review_processor_lease(
+                WorkReviewProcessorLeaseRequest(
+                    holder_id=clean_holder_id,
+                    item_id=clean_item_id or None,
+                    lease_token=lease_token,
+                    ttl_seconds=ttl_seconds,
+                    actor=clean_holder_id,
+                    source_surface="kanban-automation-idle-worker",
+                    request_id=f"{run_id}-heartbeat-{index}",
+                    run_id=run_id,
+                )
+            )
+            claimed = await claim_next_work_review_processor_marker(
+                WorkReviewProcessorMarkerClaimRequest(
+                    holder_id=clean_holder_id,
+                    lease_token=lease_token,
+                    item_id=clean_item_id or None,
+                    timeout_seconds=timeout_seconds,
+                    actor=clean_holder_id,
+                    source_surface="kanban-automation-idle-worker",
+                    request_id=f"{run_id}-claim-{index}",
+                    run_id=run_id,
+                    metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+                )
+            )
+            claim_results.append(
+                {
+                    "claimed": bool(claimed.get("claimed")),
+                    "reason": claimed.get("reason") or "",
+                    "marker_id": (claimed.get("marker") or {}).get("marker_id", ""),
+                    "processor_kind": (claimed.get("marker") or {}).get("processor_kind", ""),
+                }
+            )
+            if not claimed.get("claimed"):
+                break
+            processed_markers.append(
+                await _process_work_automation_claimed_marker(
+                    claimed["marker"],
+                    holder_id=clean_holder_id,
+                    lease_token=lease_token,
+                    run_id=run_id,
+                )
+            )
+    finally:
+        release = await release_work_review_processor_lease(
+            WorkReviewProcessorLeaseRequest(
+                holder_id=clean_holder_id,
+                item_id=clean_item_id or None,
+                lease_token=lease_token,
+                actor=clean_holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-release",
+                run_id=run_id,
+                metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            )
+        )
+    return {
+        "ok": True,
+        "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+        "run_id": run_id,
+        "item_id": clean_item_id,
+        "lease_acquired": True,
+        "timeout_requeue": timeout_requeue,
+        "review_scan": review_scan,
+        "preprocessing_scan": preprocessing_scan,
+        "processed_count": len(processed_markers),
+        "processed_markers": processed_markers,
+        "claim_results": claim_results,
+        "release": release,
+    }
+
+
+async def run_work_kanban_automation_idle_loop() -> None:
+    config = _work_automation_idle_worker_config()
+    if not config["enabled"]:
+        log.info("Kanban automation idle worker disabled by configuration")
+        return
+    initial_delay = int(config["initial_delay_seconds"] or 0)
+    if initial_delay > 0:
+        await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            result = await run_work_kanban_automation_idle_tick()
+            if int(result.get("processed_count") or 0) > 0:
+                log.info(
+                    "Kanban automation idle worker processed %s marker(s)",
+                    result["processed_count"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Kanban automation idle worker tick failed")
+        await asyncio.sleep(int(config["interval_seconds"] or 60))
+
+
+@router.post("/kanban/automation/idle-worker/tick")
+async def trigger_work_automation_idle_worker_tick(
+    body: WorkAutomationIdleTickRequest,
+) -> dict[str, Any]:
+    meta = _work_request_meta(body)
+    return await run_work_kanban_automation_idle_tick(
+        item_id=body.item_id,
+        max_scan_items=body.max_scan_items,
+        max_process_items=body.max_process_items,
+        holder_id=body.holder_id or meta["actor"],
+        lease_ttl_seconds=body.lease_ttl_seconds,
+        marker_timeout_seconds=body.marker_timeout_seconds,
+    )
+
+
 @router.post("/kanban/automation/review-processor/idle-scan")
 async def trigger_work_review_processor_idle_scan(
     body: WorkReviewProcessorIdleScanRequest,
@@ -11527,7 +12595,15 @@ async def claim_next_work_review_processor_marker(
             f"""
             SELECT * FROM kanban_review_processor_markers
             {where}
-            ORDER BY queued_at ASC, document_updated_at ASC, marker_id
+            ORDER BY
+              CASE processor_kind
+                WHEN 'review' THEN 0
+                WHEN 'preprocessing' THEN 1
+                ELSE 2
+              END,
+              queued_at ASC,
+              document_updated_at ASC,
+              marker_id
             LIMIT 1
             """,
             args,
@@ -12241,6 +13317,7 @@ async def get_work_automation_status(
     generated_at = _utc_now_iso()
     now_dt = _parse_utc_datetime(generated_at) or datetime.now(timezone.utc)
     processing_policy = _work_review_processing_policy()
+    idle_worker_config = _work_automation_idle_worker_config()
     with get_conn() as conn:
         scope_ids: list[str] = []
         item_payload: dict[str, Any] | None = None
@@ -12345,6 +13422,7 @@ async def get_work_automation_status(
             "preprocessing_contract": _work_preprocessing_readiness_contract(),
             "processing_policy": processing_policy,
             "proposal_surfaces": _work_proposal_surfaces_contract(),
+            "idle_worker": idle_worker_config,
             "provider_mode": {
                 "active": processing_policy["active_mode"],
                 "planned": processing_policy["local_processing"]["state"],

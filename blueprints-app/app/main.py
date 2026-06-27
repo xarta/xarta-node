@@ -80,6 +80,7 @@ from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
 from .routes_notifier_dnd import router as notifier_dnd_router
 from .routes_personal import router as personal_router
+from .routes_personal import run_work_kanban_automation_idle_loop
 from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_playwright import router as playwright_router
 from .routes_pockettts import router as pockettts_router
@@ -141,6 +142,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     terminal_reaper_task: asyncio.Task | None = None
     alarm_scheduler_task: asyncio.Task | None = None
     disks_offline_browse_reaper_task: asyncio.Task | None = None
+    kanban_automation_idle_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -188,6 +190,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Server-side alarms publish browser SSE ring events when due.
     alarm_scheduler_task = asyncio.create_task(run_alarm_scheduler())
 
+    # Review/preprocessing markers are processed by the local AI Kanban worker.
+    kanban_automation_idle_task = asyncio.create_task(run_work_kanban_automation_idle_loop())
+
     # Fan Matrix /sync updates into the existing browser SSE stream.
     await start_matrix_chat_sync_workers()
 
@@ -205,6 +210,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(terminal_reaper_task, "terminal_process_reaper")
     await _cancel_background_task(disks_offline_browse_reaper_task, "disks_offline_browse_reaper")
     await _cancel_background_task(alarm_scheduler_task, "alarm_scheduler")
+    await _cancel_background_task(kanban_automation_idle_task, "kanban_automation_idle_worker")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 

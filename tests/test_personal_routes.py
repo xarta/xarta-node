@@ -426,7 +426,7 @@ def _make_conn() -> sqlite3.Connection:
             proof_refs_json TEXT NOT NULL DEFAULT '[]',
             commit_link_ids_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'recorded',
-            provider_mode TEXT NOT NULL DEFAULT 'cloud-first',
+            provider_mode TEXT NOT NULL DEFAULT 'local',
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}',
             provenance_json TEXT NOT NULL DEFAULT '{}',
@@ -471,7 +471,7 @@ def _make_conn() -> sqlite3.Connection:
             superseded_at TEXT NOT NULL DEFAULT '',
             superseded_by_source_hash TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'queued',
-            provider_mode TEXT NOT NULL DEFAULT 'cloud-first',
+            provider_mode TEXT NOT NULL DEFAULT 'local',
             decision_id TEXT NOT NULL DEFAULT '',
             source_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -4068,6 +4068,10 @@ def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
 def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
     conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
     conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
     sha = "c" * 40
@@ -4105,7 +4109,7 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
             "work-decision-ledger",
             routes_personal.WorkReviewDecisionCreateRequest(
                 decision_id="decision-ledger-proof",
-                title="Use cloud-first decision ledger",
+                title="Use local decision ledger",
                 summary=(
                     "Decided to record autonomous Review Processor actions as "
                     "natural-language Kanban decision rows before queue code."
@@ -4118,7 +4122,7 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
                     "pytest:test_work_kanban_review_decision_ledger_links_commits_and_status"
                 ],
                 commit_link_ids=[commit["commit_link_id"]],
-                provider_mode="cloud-first",
+                provider_mode="local",
                 metadata={"hook_status": "passed"},
                 actor="codex-test",
                 source_surface="pytest",
@@ -4135,7 +4139,7 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     ]
     assert decision["commit_link_ids"] == [commit["commit_link_id"]]
     assert decision["commits"][0]["sha"] == sha
-    assert decision["provider_mode"] == "cloud-first"
+    assert decision["provider_mode"] == "local"
 
     listed = asyncio.run(routes_personal.list_work_item_review_decisions("work-decision-ledger"))
     assert listed["count"] == 1
@@ -4143,10 +4147,14 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     assert listed["decisions"][0]["commits"][0]["message_subject"] == "Add decision ledger contract"
 
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-decision-ledger"))
-    assert status["provider_mode"]["active"] == "cloud-first"
-    assert status["provider_mode"]["planned"] == "planned-gated"
-    assert status["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
+    assert status["provider_mode"]["active"] == "local"
+    assert status["provider_mode"]["planned"] == "active"
+    assert (
+        status["provider_mode"]["local_processing_gate"]
+        == "private_no_think_no_protection_no_orientation_endpoint_required"
+    )
     assert status["provider_mode"]["automatic_switch"] is False
+    assert status["idle_worker"]["local_ai_model_alias"] == "TEST-KANBAN-LOCAL-AI"
     assert (
         status["processing_policy"]["schema"]
         == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
@@ -4176,8 +4184,8 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         status["proposal_surfaces"]["outbox"]["item_id"]
         == routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID
     )
-    assert status["processing_policy"]["active_mode"] == "cloud-first"
-    assert status["processing_policy"]["local_processing"]["state"] == "planned-gated"
+    assert status["processing_policy"]["active_mode"] == "local"
+    assert status["processing_policy"]["local_processing"]["state"] == "active"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
     assert (
         status["review_processor"]["lease"]["schema"] == routes_personal.KANBAN_REVIEW_LEASE_SCHEMA
@@ -4222,8 +4230,11 @@ def test_work_review_processor_output_contract_endpoint():
         contract["metadata_contract_schema"]
         == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     )
-    assert contract["provider_mode"]["active"] == "cloud-first"
-    assert contract["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
+    assert contract["provider_mode"]["active"] == "local"
+    assert (
+        contract["provider_mode"]["local_processing_gate"]
+        == "private_no_think_no_protection_no_orientation_endpoint_required"
+    )
     assert contract["provider_mode"]["automatic_switch"] is False
     assert "metadata.output_payload" in contract["minimum_decision_fields"]
     output_types = {output["type"]: output for output in contract["output_types"]}
@@ -4244,7 +4255,7 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert contract["schema"] == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     assert contract["review_document_schema"] == routes_personal.KANBAN_ITEM_REVIEW_SCHEMA
     assert contract["marker_schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
-    assert contract["provider_mode"]["active"] == "cloud-first"
+    assert contract["provider_mode"]["active"] == "local"
     fields = {field["field"]: field for field in contract["required_fields"]}
     assert fields["body_hash"]["scope"] == "review_document.metadata"
     assert fields["updated_at"]["alias"] == "review_updated_at"
@@ -4288,7 +4299,7 @@ def test_work_preprocessing_readiness_contract_endpoint():
     assert contract["preprocessing_request_schema"] == "xarta.kanban.preprocessing_time_request.v1"
     assert contract["queue_schema"] == routes_personal.KANBAN_PREPROCESSING_QUEUE_SCHEMA
     assert contract["marker_storage"] == "kanban_agent_hints.metadata.context_readiness_marker"
-    assert contract["provider_mode"]["active"] == "cloud-first"
+    assert contract["provider_mode"]["active"] == "local"
     fields = {field["field"]: field for field in contract["required_fields"]}
     assert fields["context_hash"]["scope"] == "context_readiness_marker"
     assert fields["marked_at"]["alias"] == "last_preprocessed_at"
@@ -4341,20 +4352,27 @@ def test_work_proposal_surfaces_contract_endpoint():
     )
 
 
-def test_work_review_processor_processing_policy_endpoint():
+def test_work_review_processor_processing_policy_endpoint(monkeypatch):
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
     result = asyncio.run(routes_personal.get_work_review_processor_processing_policy())
     policy = result["policy"]
     assert result["ok"] is True
     assert policy["schema"] == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
-    assert policy["active_mode"] == "cloud-first"
+    assert policy["active_mode"] == "local"
     assert policy["applies_to"] == ["review_processor", "preprocessing"]
-    assert policy["cloud_processing"]["state"] == "active"
-    assert policy["local_processing"]["state"] == "planned-gated"
-    assert policy["local_processing"]["gate"] == "structured-job-packets-required"
+    assert policy["cloud_processing"]["state"] == "not-configured"
+    assert policy["local_processing"]["state"] == "active"
+    assert (
+        policy["local_processing"]["gate"]
+        == "private_no_think_no_protection_no_orientation_endpoint_required"
+    )
     assert policy["local_processing"]["automatic_switch"] is False
-    assert "structured_job_packet_schema" in policy["local_processing"]["switch_requires"]
-    assert policy["provider_choice"]["default_mode"] == "cloud-first"
-    assert "local" in policy["provider_choice"]["blocked_until_gate"]
+    assert policy["local_processing"]["model_alias"] == "TEST-KANBAN-LOCAL-AI"
+    assert policy["provider_choice"]["default_mode"] == "local"
+    assert "cloud" in policy["provider_choice"]["blocked_until_explicit_api"]
     assert any("Provider mode must be explicit" in rule for rule in policy["routing_rules"])
 
 
@@ -4559,7 +4577,7 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
     assert marker["schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
     assert marker["item_id"] == "work-review-scan-child"
     assert marker["status"] == "queued"
-    assert marker["provider_mode"] == "cloud-first"
+    assert marker["provider_mode"] == "local"
     assert marker["processed_source_hash"] == ""
     assert marker["metadata"]["reason"] == "new_review_document"
 
@@ -4672,6 +4690,117 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "trigger_review_processor_idle_scan" in audit_actions
+
+
+def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-local-ai-root",
+                title="Local AI root",
+                body="Root item for local AI worker proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="local-ai-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-local-ai-review",
+                parent_item_id="work-local-ai-root",
+                title="Local AI Review child",
+                body="Child item with Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="local-ai-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-local-ai-review",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body=(
+                    "Operator Review: missing required provider wiring must be raised "
+                    "as a blocker/question, not worked around."
+                ),
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="local-ai-review-write",
+            ),
+        )
+    )
+
+    async def fake_local_ai_json_completion(*, messages, run_id):
+        assert "missing required provider wiring" in messages[1]["content"]
+        return {
+            "model_alias": "TEST-KANBAN-LOCAL-AI",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                "title": "Record blocker/question guidance",
+                "summary": "Processed the operator Review as guidance against workarounds.",
+                "rationale": (
+                    "The Review states missing required provider wiring should produce "
+                    "a blocker or question instead of substitute behavior."
+                ),
+                "decision_type": "review_guidance_recorded",
+                "confidence": "high",
+                "uncertainty": "",
+                "status": "recorded",
+                "affected_refs": ["xarta-kanban:item:work-local-ai-review"],
+                "proof_refs": ["kanban_items:work-local-ai-review:review"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_local_ai_json_completion,
+    )
+    conn.execute("DELETE FROM sync_queue")
+    conn.commit()
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-local-ai-root",
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+    assert tick["ok"] is True
+    assert tick["lease_acquired"] is True
+    assert tick["processed_count"] == 1
+    processed = tick["processed_markers"][0]
+    assert processed["processor_kind"] == "review"
+    assert processed["provider_mode"] == "local"
+    assert processed["model_alias"] == "TEST-KANBAN-LOCAL-AI"
+
+    row = conn.execute(
+        "SELECT * FROM kanban_review_decisions WHERE item_id='work-local-ai-review'"
+    ).fetchone()
+    assert row["provider_mode"] == "local"
+    assert row["decision_type"] == "review_guidance_recorded"
+    marker = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-local-ai-review'"
+    ).fetchone()
+    assert marker["status"] == "processed"
+    assert marker["decision_id"] == row["decision_id"]
 
 
 def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_path):
@@ -5602,6 +5731,96 @@ def test_work_kanban_agent_sessions_api(monkeypatch, tmp_path):
     assert "update_work_agent_session" in audit_actions
 
 
+def test_work_kanban_agent_leaf_doing_requires_active_session(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-leaf-doing-guard",
+                title="Leaf Doing guard proof",
+                body="Leaf should not be Doing without an active session.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="leaf-doing-create",
+            )
+        )
+    )
+
+    with pytest.raises(routes_personal.HTTPException) as blocked:
+        asyncio.run(
+            routes_personal.move_work_item(
+                "work-leaf-doing-guard",
+                routes_personal.WorkItemMoveRequest(
+                    state_id="doing",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="leaf-doing-agent-blocked",
+                ),
+            )
+        )
+    assert blocked.value.status_code == 409
+    assert blocked.value.detail["error"] == "kanban_agent_leaf_doing_without_active_session"
+
+    operator_move = asyncio.run(
+        routes_personal.move_work_item(
+            "work-leaf-doing-guard",
+            routes_personal.WorkItemMoveRequest(
+                state_id="doing",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="leaf-doing-operator-override",
+            ),
+        )
+    )["item"]
+    assert operator_move["state_id"] == "doing"
+
+    asyncio.run(
+        routes_personal.move_work_item(
+            "work-leaf-doing-guard",
+            routes_personal.WorkItemMoveRequest(
+                state_id="todo",
+                actor="blueprints-ui",
+                source_surface="kanban-board",
+                request_id="leaf-doing-reset",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "work-leaf-doing-guard",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="leaf-doing-session",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                actor="codex-test",
+                source_surface="pytest-session",
+                request_id="leaf-doing-session-create",
+            ),
+        )
+    )
+    agent_move = asyncio.run(
+        routes_personal.move_work_item(
+            "work-leaf-doing-guard",
+            routes_personal.WorkItemMoveRequest(
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="leaf-doing-agent-allowed",
+            ),
+        )
+    )["item"]
+    assert agent_move["state_id"] == "doing"
+
+
 def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -5985,7 +6204,7 @@ def test_work_item_lane_order_uses_priority_then_relative_edges(monkeypatch):
             routes_personal.WorkItemMoveRequest(
                 parent_item_id=None,
                 state_id="doing",
-                actor="codex-test",
+                actor="blueprints-ui",
                 source_surface="pytest",
                 request_id="medium-back-to-doing",
             ),
