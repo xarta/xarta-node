@@ -3737,6 +3737,15 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     )
     assert (
+        status["preprocessing_contract"]["schema"]
+        == routes_personal.KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA
+    )
+    assert status["preprocessing"]["status"] == "readiness-contract-ready"
+    assert (
+        status["preprocessing"]["readiness_contract"]["marker_storage"]
+        == "kanban_agent_hints.metadata.context_readiness_marker"
+    )
+    assert (
         status["proposal_surfaces"]["schema"]
         == routes_personal.KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA
     )
@@ -3844,6 +3853,30 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert "metadata.cancelled_previous_status" in contract["cancellation_fields"]
     assert any("body_hash is unchanged" in rule for rule in contract["transition_rules"])
     assert any("review_document_deleted" in rule for rule in contract["transition_rules"])
+
+
+def test_work_preprocessing_readiness_contract_endpoint():
+    result = asyncio.run(routes_personal.get_work_preprocessing_readiness_contract())
+    contract = result["contract"]
+    assert result["ok"] is True
+    assert contract["schema"] == routes_personal.KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA
+    assert contract["context_packet_schema"] == "xarta.kanban.context_packet.v1"
+    assert contract["readiness_marker_schema"] == "xarta.kanban.context_readiness_marker.v1"
+    assert contract["readiness_check_schema"] == "xarta.kanban.context_readiness_check.v1"
+    assert contract["marker_storage"] == "kanban_agent_hints.metadata.context_readiness_marker"
+    assert contract["provider_mode"]["active"] == "cloud-first"
+    fields = {field["field"]: field for field in contract["required_fields"]}
+    assert fields["context_hash"]["scope"] == "context_readiness_marker"
+    assert fields["marked_at"]["alias"] == "last_preprocessed_at"
+    assert fields["ready"]["alias"] == "readiness_state"
+    assert fields["drift_components"]["alias"] == "stale_markers"
+    assert "open_questions" in fields
+    assert "links" in fields
+    assert "blockers" in fields
+    assert "readiness_marker_stale" in contract["readiness_states"]
+    assert "workspace_orientation" in contract["packet_inputs"]
+    assert "commits" in contract["packet_inputs"]
+    assert any("Implementation starts only" in rule for rule in contract["transition_rules"])
 
 
 def test_work_proposal_surfaces_contract_endpoint():
