@@ -921,15 +921,15 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             {
                 "field": "processed_source_hash",
                 "scope": "kanban_review_processor_markers",
-                "meaning": "Last Review source hash accepted as processed.",
-                "updates_when": "marker completes with processed status.",
+                "meaning": "Last terminal Review source hash recorded for duplicate-scan suppression.",
+                "updates_when": "marker completes with a terminal processed, failed, skipped, or cancelled status.",
             },
             {
                 "field": "processed_at",
                 "scope": "kanban_review_processor_markers",
                 "alias": "last_processed_at",
-                "meaning": "UTC time of the last processed Review snapshot.",
-                "updates_when": "marker completes with processed status.",
+                "meaning": "UTC time of the last terminal Review snapshot outcome.",
+                "updates_when": "marker completes with a terminal processed, failed, skipped, or cancelled status.",
             },
             {
                 "field": "status",
@@ -10284,13 +10284,13 @@ async def requeue_timed_out_work_review_processor_markers(
         conn.execute("BEGIN IMMEDIATE")
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
-        where = "WHERE status='processing' AND processing_expires_at != '' AND processing_expires_at <= ?"
-        args.append(now)
+        now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+        where = "WHERE status='processing' AND processing_expires_at != ''"
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND item_id IN ({placeholders})"
             args.extend(scope_ids)
-        rows = conn.execute(
+        candidate_rows = conn.execute(
             f"""
             SELECT * FROM kanban_review_processor_markers
             {where}
@@ -10298,6 +10298,18 @@ async def requeue_timed_out_work_review_processor_markers(
             """,
             args,
         ).fetchall()
+        rows = [
+            row
+            for row in candidate_rows
+            if (expires_at := _parse_utc_datetime(row["processing_expires_at"])) is not None
+            and expires_at <= now_dt
+        ]
+        rows.sort(
+            key=lambda row: (
+                _parse_utc_datetime(row["processing_expires_at"]) or now_dt,
+                row["marker_id"],
+            )
+        )
         requeued_rows = []
         for row in rows:
             updated_row = _work_review_processor_marker_update_row(

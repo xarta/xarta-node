@@ -3809,6 +3809,14 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert fields["body_hash"]["scope"] == "review_document.metadata"
     assert fields["updated_at"]["alias"] == "review_updated_at"
     assert fields["processed_at"]["alias"] == "last_processed_at"
+    assert (
+        "terminal processed, failed, skipped, or cancelled"
+        in fields["processed_at"]["updates_when"]
+    )
+    assert (
+        "terminal processed, failed, skipped, or cancelled"
+        in fields["processed_source_hash"]["updates_when"]
+    )
     assert fields["status"]["allowed_values"] == [
         "queued",
         "processing",
@@ -4310,6 +4318,19 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     assert completed["marker"]["status"] == "processed"
     assert completed["marker"]["processed_source_hash"] == marker["document_source_hash"]
     assert completed["marker"]["processed_at"]
+    processed_same_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-timeout-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-timeout-scan-processed-same",
+            )
+        )
+    )
+    assert processed_same_scan["queued_count"] == 0
+    assert processed_same_scan["unchanged_current_count"] == 1
 
     asyncio.run(
         routes_personal.update_work_item_review_document(
@@ -4357,12 +4378,17 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
     conn.execute(
         """
         UPDATE kanban_review_processor_markers
-        SET processing_expires_at='2000-01-01T00:00:00Z'
+        SET processing_expires_at='2026-06-27T04:00:00+01:00'
         WHERE marker_id=?
         """,
         (claimed_again["marker"]["marker_id"],),
     )
     conn.commit()
+    real_utc_now_iso = routes_personal._utc_now_iso
+    monkeypatch.setattr(routes_personal, "_utc_now_iso", lambda: "2026-06-27T03:30:00Z")
+    assert routes_personal._parse_utc_datetime("2026-06-27T04:00:00+01:00") == (
+        routes_personal._parse_utc_datetime("2026-06-27T03:00:00Z")
+    )
     timed_out = asyncio.run(
         routes_personal.requeue_timed_out_work_review_processor_markers(
             routes_personal.WorkReviewProcessorTimeoutRequeueRequest(
@@ -4380,6 +4406,7 @@ def test_work_review_processor_marker_lifecycle_timeout_and_supersede(monkeypatc
         "timeout_requeued"
     )
     assert timed_out["requeued_markers"][0]["metadata"]["last_error"] == "processing_timeout"
+    monkeypatch.setattr(routes_personal, "_utc_now_iso", real_utc_now_iso)
 
     claimed_third = asyncio.run(
         routes_personal.claim_next_work_review_processor_marker(
