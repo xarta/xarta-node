@@ -412,6 +412,27 @@ def _make_conn() -> sqlite3.Connection:
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             UNIQUE(item_id, repo_full_name, sha)
         );
+        CREATE TABLE kanban_review_decisions (
+            decision_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            processor_kind TEXT NOT NULL DEFAULT 'review',
+            decision_type TEXT NOT NULL DEFAULT 'decision',
+            title TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            rationale TEXT NOT NULL DEFAULT '',
+            affected_refs_json TEXT NOT NULL DEFAULT '[]',
+            confidence TEXT NOT NULL DEFAULT '',
+            uncertainty TEXT NOT NULL DEFAULT '',
+            proof_refs_json TEXT NOT NULL DEFAULT '[]',
+            commit_link_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'recorded',
+            provider_mode TEXT NOT NULL DEFAULT 'cloud-first',
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE kanban_agent_hints (
             hint_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL UNIQUE,
@@ -2685,6 +2706,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_items") == "item_id"
     assert "kanban_item_commits" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_item_commits") == "commit_link_id"
+    assert "kanban_review_decisions" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_review_decisions") == "decision_id"
     assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
     assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
@@ -3483,6 +3506,102 @@ def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     )
     targets = {link["target_ref"] for link in commit_links["links"]}
     assert {"kanban_items:work-commit-a", "kanban_items:work-commit-b"}.issubset(targets)
+
+
+def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    sha = "c" * 40
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-decision-ledger",
+                title="Decision ledger item",
+                body="Decision ledger proof item",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="decision-ledger-item-create",
+            )
+        )
+    )
+    commit = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-decision-ledger",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha,
+                message_subject="Add decision ledger contract",
+                branch="main",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="decision-ledger-commit",
+            ),
+        )
+    )["commit"]
+    conn.execute("DELETE FROM sync_queue")
+
+    created = asyncio.run(
+        routes_personal.record_work_item_review_decision(
+            "work-decision-ledger",
+            routes_personal.WorkReviewDecisionCreateRequest(
+                decision_id="decision-ledger-proof",
+                title="Use cloud-first decision ledger",
+                summary=(
+                    "Decided to record autonomous Review Processor actions as "
+                    "natural-language Kanban decision rows before queue code."
+                ),
+                rationale="The operator needs reconstructable decisions and explicit commit provenance.",
+                affected_refs=["xarta-kanban:item:work-decision-ledger"],
+                confidence="high",
+                uncertainty="Queue lease implementation is intentionally outside this slice.",
+                proof_refs=[
+                    "pytest:test_work_kanban_review_decision_ledger_links_commits_and_status"
+                ],
+                commit_link_ids=[commit["commit_link_id"]],
+                provider_mode="cloud-first",
+                metadata={"hook_status": "passed"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="decision-ledger-record",
+            ),
+        )
+    )
+    decision = created["decision"]
+    assert decision["decision_id"] == "decision-ledger-proof"
+    assert decision["summary"].startswith("Decided to record autonomous Review Processor")
+    assert decision["affected_refs"] == [
+        "kanban_items:work-decision-ledger",
+        "xarta-kanban:item:work-decision-ledger",
+    ]
+    assert decision["commit_link_ids"] == [commit["commit_link_id"]]
+    assert decision["commits"][0]["sha"] == sha
+    assert decision["provider_mode"] == "cloud-first"
+
+    listed = asyncio.run(routes_personal.list_work_item_review_decisions("work-decision-ledger"))
+    assert listed["count"] == 1
+    assert listed["commit_link_health"]["ok"] is True
+    assert listed["decisions"][0]["commits"][0]["message_subject"] == "Add decision ledger contract"
+
+    status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-decision-ledger"))
+    assert status["provider_mode"]["active"] == "cloud-first"
+    assert status["review_processor"]["status"] == "decision-ledger-ready"
+    assert status["decisions"]["count"] == 1
+    assert status["decisions"]["recent"][0]["decision_id"] == "decision-ledger-proof"
+    assert status["commit_link_health"]["decisions_with_commits"] == 1
+    assert status["commit_link_health"]["missing_commit_link_count"] == 0
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_decisions" in sync_tables
+    assert "kanban_audit_log" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "record_review_processor_decision" in audit_actions
 
 
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):

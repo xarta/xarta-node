@@ -50,6 +50,7 @@ KANBAN_BACKUP_TABLES: tuple[str, ...] = (
     "kanban_item_order_edges",
     "kanban_item_links",
     "kanban_item_commits",
+    "kanban_review_decisions",
     "kanban_agent_hints",
     "kanban_agent_sessions",
     "kanban_blockers",

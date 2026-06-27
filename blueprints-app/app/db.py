@@ -766,6 +766,32 @@ CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_item
 CREATE INDEX IF NOT EXISTS idx_kanban_item_commits_commit
     ON kanban_item_commits(repo_full_name, sha);
 
+CREATE TABLE IF NOT EXISTS kanban_review_decisions (
+    decision_id          TEXT PRIMARY KEY,
+    item_id              TEXT NOT NULL,
+    processor_kind       TEXT NOT NULL DEFAULT 'review',
+    decision_type        TEXT NOT NULL DEFAULT 'decision',
+    title                TEXT NOT NULL DEFAULT '',
+    summary              TEXT NOT NULL DEFAULT '',
+    rationale            TEXT NOT NULL DEFAULT '',
+    affected_refs_json   TEXT NOT NULL DEFAULT '[]',
+    confidence           TEXT NOT NULL DEFAULT '',
+    uncertainty          TEXT NOT NULL DEFAULT '',
+    proof_refs_json      TEXT NOT NULL DEFAULT '[]',
+    commit_link_ids_json TEXT NOT NULL DEFAULT '[]',
+    status               TEXT NOT NULL DEFAULT 'recorded',
+    provider_mode        TEXT NOT NULL DEFAULT 'cloud-first',
+    source_hash          TEXT NOT NULL DEFAULT '',
+    metadata_json        TEXT NOT NULL DEFAULT '{}',
+    provenance_json      TEXT NOT NULL DEFAULT '{}',
+    created_at           TEXT DEFAULT (datetime('now')),
+    updated_at           TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_decisions_item
+    ON kanban_review_decisions(item_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_decisions_provider
+    ON kanban_review_decisions(provider_mode, processor_kind, updated_at);
+
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
     item_id                 TEXT NOT NULL UNIQUE,
