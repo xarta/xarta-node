@@ -500,6 +500,41 @@ class WorkReviewProcessorIdleScanRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkReviewProcessorMarkerClaimRequest(BaseModel):
+    holder_id: str
+    lease_token: str | None = None
+    item_id: str | None = None
+    timeout_seconds: int = 1200
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkReviewProcessorMarkerCompleteRequest(BaseModel):
+    holder_id: str
+    lease_token: str | None = None
+    document_source_hash: str | None = None
+    decision_id: str | None = None
+    status: str = "processed"
+    error: str = ""
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkReviewProcessorTimeoutRequeueRequest(BaseModel):
+    item_id: str | None = None
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkAgentHintsUpdateRequest(BaseModel):
     required_skills: list[str] | None = None
     routing_notes: str | None = None
@@ -1181,6 +1216,12 @@ def _clean_review_scan_limit(value: int | None) -> int:
     return max(1, min(limit, 500))
 
 
+def _clean_review_marker_outcome_status(value: str | None) -> str:
+    status = _clean_short_text(value, "processed", limit=80).replace("-", "_")
+    allowed = {"processed", "failed", "skipped", "cancelled"}
+    return status if status in allowed else "processed"
+
+
 def _review_document_ref(document: dict[str, Any]) -> str:
     file_ref = document.get("file_ref") if isinstance(document, dict) else None
     if isinstance(file_ref, dict):
@@ -1228,6 +1269,12 @@ def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
         "processed_at": row["processed_at"],
         "queued_at": row["queued_at"],
         "last_seen_at": row["last_seen_at"],
+        "processing_started_at": row["processing_started_at"],
+        "processing_expires_at": row["processing_expires_at"],
+        "attempt_count": int(row["attempt_count"] or 0),
+        "last_error": row["last_error"],
+        "superseded_at": row["superseded_at"],
+        "superseded_by_source_hash": row["superseded_by_source_hash"],
         "status": row["status"],
         "provider_mode": row["provider_mode"],
         "decision_id": row["decision_id"],
@@ -1264,6 +1311,9 @@ def _work_review_processor_marker_row(
             existing["document_source_hash"] if existing is not None else ""
         ),
     }
+    requeued_processing_change = bool(existing is not None and existing["status"] == "processing")
+    if requeued_processing_change:
+        metadata["superseded_processing_attempt"] = True
     provenance = {
         "schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "recorded_by": meta["actor"],
@@ -1286,6 +1336,20 @@ def _work_review_processor_marker_row(
         "processed_at": existing["processed_at"] if existing is not None else "",
         "queued_at": now,
         "last_seen_at": now,
+        "processing_started_at": "",
+        "processing_expires_at": "",
+        "attempt_count": int(existing["attempt_count"] or 0) if existing is not None else 0,
+        "last_error": "review_changed_during_processing" if requeued_processing_change else "",
+        "superseded_at": (
+            now
+            if requeued_processing_change
+            else (existing["superseded_at"] if existing is not None else "")
+        ),
+        "superseded_by_source_hash": (
+            document_source["document_source_hash"]
+            if requeued_processing_change
+            else (existing["superseded_by_source_hash"] if existing is not None else "")
+        ),
         "status": "queued",
         "provider_mode": provider_mode,
         "decision_id": existing["decision_id"] if existing is not None else "",
@@ -1311,14 +1375,17 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
         INSERT INTO kanban_review_processor_markers (
             marker_id, item_id, processor_kind, document_type, document_ref,
             document_updated_at, document_source_hash, processed_document_updated_at,
-            processed_source_hash, processed_at, queued_at, last_seen_at, status,
-            provider_mode, decision_id, source_hash, metadata_json, provenance_json,
-            created_at, updated_at
+            processed_source_hash, processed_at, queued_at, last_seen_at,
+            processing_started_at, processing_expires_at, attempt_count, last_error,
+            superseded_at, superseded_by_source_hash, status, provider_mode,
+            decision_id, source_hash, metadata_json, provenance_json, created_at, updated_at
         )
         VALUES (
             :marker_id, :item_id, :processor_kind, :document_type, :document_ref,
             :document_updated_at, :document_source_hash, :processed_document_updated_at,
-            :processed_source_hash, :processed_at, :queued_at, :last_seen_at, :status,
+            :processed_source_hash, :processed_at, :queued_at, :last_seen_at,
+            :processing_started_at, :processing_expires_at, :attempt_count,
+            :last_error, :superseded_at, :superseded_by_source_hash, :status,
             :provider_mode, :decision_id, :source_hash, :metadata_json,
             :provenance_json, :created_at, :updated_at
         )
@@ -1334,6 +1401,12 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
             processed_at=excluded.processed_at,
             queued_at=excluded.queued_at,
             last_seen_at=excluded.last_seen_at,
+            processing_started_at=excluded.processing_started_at,
+            processing_expires_at=excluded.processing_expires_at,
+            attempt_count=excluded.attempt_count,
+            last_error=excluded.last_error,
+            superseded_at=excluded.superseded_at,
+            superseded_by_source_hash=excluded.superseded_by_source_hash,
             status=excluded.status,
             provider_mode=excluded.provider_mode,
             decision_id=excluded.decision_id,
@@ -1386,11 +1459,30 @@ def _work_review_processor_marker_stats(
     by_status = {row["status"]: int(row["count"]) for row in status_rows}
     queued_count = int(by_status.get("queued", 0))
     processing_count = int(by_status.get("processing", 0))
+    now = _utc_now_iso()
+    timeout_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers
+        {where + (" AND" if where else "WHERE")} status='processing'
+          AND processing_expires_at != ''
+          AND processing_expires_at <= ?
+        """,
+        [*args, now],
+    ).fetchone()
+    superseded_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers
+        {where + (" AND" if where else "WHERE")} superseded_at != ''
+        """,
+        args,
+    ).fetchone()
     return {
         "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
         "queue_length": queued_count,
         "active_count": processing_count,
         "pending_count": queued_count + processing_count,
+        "timeout_count": int(timeout_row["count"] if timeout_row else 0),
+        "superseded_count": int(superseded_row["count"] if superseded_row else 0),
         "by_status": by_status,
         "last_scan_at": last_scan["created_at"] if last_scan else "",
         "last_scan": {
@@ -1402,6 +1494,62 @@ def _work_review_processor_marker_stats(
         else None,
         "recent_markers": [_row_to_work_review_processor_marker(row) for row in recent_rows],
     }
+
+
+def _require_work_review_processor_lease_owner(
+    conn: Any,
+    *,
+    holder_id: str,
+    lease_token: str,
+    now_dt: datetime,
+) -> Any:
+    lease_row = conn.execute(
+        "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+        (_review_processor_lease_id(),),
+    ).fetchone()
+    if not _review_lease_is_active(lease_row, now_dt):
+        raise HTTPException(409, "Review Processor lease is not active")
+    if not _review_lease_owner_matches(lease_row, holder_id, lease_token):
+        raise HTTPException(409, "Review Processor lease is held by another worker")
+    return lease_row
+
+
+def _work_review_processor_marker_update_row(
+    existing: Any,
+    *,
+    updates: dict[str, Any],
+    meta: dict[str, str],
+    now: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    previous_metadata = _json_value(existing["metadata_json"], {})
+    merged_metadata = {
+        **previous_metadata,
+        **metadata,
+        "reason": reason,
+        "previous_status": existing["status"],
+    }
+    provenance = {
+        "schema": KANBAN_REVIEW_MARKER_SCHEMA,
+        "recorded_by": meta["actor"],
+        "source_surface": meta["source_surface"],
+        "request_id": meta["request_id"],
+        "run_id": meta["run_id"],
+    }
+    row = dict(existing)
+    row.update(updates)
+    row["metadata_json"] = json.dumps(merged_metadata, ensure_ascii=True, sort_keys=True)
+    row["provenance_json"] = json.dumps(provenance, ensure_ascii=True, sort_keys=True)
+    row["updated_at"] = now
+    row["source_hash"] = _hash_json_payload(
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"source_hash", "created_at", "updated_at"}
+        }
+    )
+    return row
 
 
 def _row_to_work_review_decision(
@@ -9569,6 +9717,370 @@ async def trigger_work_review_processor_idle_scan(
             "result": "ok",
         },
     }
+
+
+@router.post("/kanban/automation/review-processor/markers/claim-next")
+async def claim_next_work_review_processor_marker(
+    body: WorkReviewProcessorMarkerClaimRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    meta = _work_request_meta(body)
+    holder_id = _clean_short_text(body.holder_id, "", limit=160)
+    if not holder_id:
+        raise HTTPException(400, "Review Processor marker holder_id is required")
+    lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
+    clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    ttl_seconds = _clean_review_lease_ttl(body.timeout_seconds)
+    processing_expires_at = _utc_iso_from_datetime(now_dt + timedelta(seconds=ttl_seconds))
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        lease_row = _require_work_review_processor_lease_owner(
+            conn,
+            holder_id=holder_id,
+            lease_token=lease_token,
+            now_dt=now_dt,
+        )
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        args: list[Any] = []
+        where = "WHERE status='queued'"
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            where += f" AND item_id IN ({placeholders})"
+            args.extend(scope_ids)
+        marker_row = conn.execute(
+            f"""
+            SELECT * FROM kanban_review_processor_markers
+            {where}
+            ORDER BY queued_at ASC, document_updated_at ASC, marker_id
+            LIMIT 1
+            """,
+            args,
+        ).fetchone()
+        if marker_row is None:
+            source_hash = _hash_json_payload(
+                {
+                    "action": "claim_review_processor_marker",
+                    "holder_id": holder_id,
+                    "item_id": clean_item_id,
+                    "reason": "no_queued_marker",
+                }
+            )
+            audit_row = _write_work_audit(
+                conn,
+                audit_id=audit_id,
+                actor=meta["actor"],
+                source_surface=meta["source_surface"],
+                action="claim_review_processor_marker",
+                target_ref="kanban_review_processor_markers:claim-next",
+                item_id=clean_item_id,
+                parent_item_id="",
+                created_at=now,
+                request_id=meta["request_id"],
+                run_id=meta["run_id"],
+                result="noop",
+                source_hash=source_hash,
+                metadata={"reason": "no_queued_marker", "holder_id": holder_id},
+            )
+            gen = increment_gen(conn, "kanban-review-marker-claim")
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+            return {
+                "ok": True,
+                "claimed": False,
+                "reason": "no_queued_marker",
+                "scheduler": _work_review_processor_marker_stats(conn, scope_ids),
+                "audit": {
+                    "audit_id": audit_id,
+                    "action": "claim_review_processor_marker",
+                    "result": "noop",
+                },
+            }
+        updated_row = _work_review_processor_marker_update_row(
+            marker_row,
+            updates={
+                "status": "processing",
+                "processing_started_at": now,
+                "processing_expires_at": processing_expires_at,
+                "attempt_count": int(marker_row["attempt_count"] or 0) + 1,
+                "last_error": "",
+                "last_seen_at": now,
+            },
+            meta=meta,
+            now=now,
+            reason="claimed_for_processing",
+            metadata={
+                **dict(body.metadata or {}),
+                "holder_id": holder_id,
+                "lease_id": lease_row["lease_id"],
+                "timeout_seconds": ttl_seconds,
+            },
+        )
+        saved_row = _write_work_review_processor_marker(conn, updated_row)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="claim_review_processor_marker",
+            target_ref=f"kanban_review_processor_markers:{saved_row['marker_id']}",
+            item_id=saved_row["item_id"],
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=saved_row["source_hash"],
+            metadata={
+                "holder_id": holder_id,
+                "lease_id": lease_row["lease_id"],
+                "timeout_seconds": ttl_seconds,
+                "attempt_count": int(saved_row["attempt_count"] or 0),
+            },
+        )
+        gen = increment_gen(conn, "kanban-review-marker-claim")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_processor_markers",
+            saved_row["marker_id"],
+            dict(saved_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        marker = _row_to_work_review_processor_marker(saved_row)
+        return {
+            "ok": True,
+            "claimed": True,
+            "marker": marker,
+            "scheduler": _work_review_processor_marker_stats(conn, scope_ids),
+            "audit": {
+                "audit_id": audit_id,
+                "action": "claim_review_processor_marker",
+                "result": "ok",
+            },
+        }
+
+
+@router.post("/kanban/automation/review-processor/markers/{marker_id}/complete")
+async def complete_work_review_processor_marker(
+    marker_id: str,
+    body: WorkReviewProcessorMarkerCompleteRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    meta = _work_request_meta(body)
+    holder_id = _clean_short_text(body.holder_id, "", limit=160)
+    if not holder_id:
+        raise HTTPException(400, "Review Processor marker holder_id is required")
+    lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
+    clean_marker_id = _clean_short_text(marker_id, "", limit=180)
+    expected_source_hash = _clean_short_text(body.document_source_hash or "", "", limit=120)
+    outcome_status = _clean_review_marker_outcome_status(body.status)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        lease_row = _require_work_review_processor_lease_owner(
+            conn,
+            holder_id=holder_id,
+            lease_token=lease_token,
+            now_dt=now_dt,
+        )
+        marker_row = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (clean_marker_id,),
+        ).fetchone()
+        if marker_row is None:
+            raise HTTPException(404, "Review Processor marker not found")
+        if marker_row["status"] != "processing":
+            return {
+                "ok": True,
+                "completed": False,
+                "reason": "marker_not_processing",
+                "marker": _row_to_work_review_processor_marker(marker_row),
+            }
+        if expected_source_hash and expected_source_hash != marker_row["document_source_hash"]:
+            return {
+                "ok": True,
+                "completed": False,
+                "reason": "superseded_source_hash",
+                "marker": _row_to_work_review_processor_marker(marker_row),
+            }
+        decision_id = _clean_short_text(
+            body.decision_id or marker_row["decision_id"], "", limit=180
+        )
+        last_error = _body_excerpt(body.error, limit=4000)
+        updates: dict[str, Any] = {
+            "status": outcome_status,
+            "processing_expires_at": "",
+            "last_seen_at": now,
+            "decision_id": decision_id,
+            "last_error": last_error if outcome_status != "processed" else "",
+        }
+        if outcome_status == "processed":
+            updates.update(
+                {
+                    "processed_document_updated_at": marker_row["document_updated_at"],
+                    "processed_source_hash": marker_row["document_source_hash"],
+                    "processed_at": now,
+                }
+            )
+        saved_row = _write_work_review_processor_marker(
+            conn,
+            _work_review_processor_marker_update_row(
+                marker_row,
+                updates=updates,
+                meta=meta,
+                now=now,
+                reason=f"marker_{outcome_status}",
+                metadata={
+                    **dict(body.metadata or {}),
+                    "holder_id": holder_id,
+                    "lease_id": lease_row["lease_id"],
+                    "decision_id": decision_id,
+                    "outcome_status": outcome_status,
+                },
+            ),
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="complete_review_processor_marker",
+            target_ref=f"kanban_review_processor_markers:{saved_row['marker_id']}",
+            item_id=saved_row["item_id"],
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result=outcome_status,
+            source_hash=saved_row["source_hash"],
+            metadata={
+                "holder_id": holder_id,
+                "lease_id": lease_row["lease_id"],
+                "decision_id": decision_id,
+                "outcome_status": outcome_status,
+            },
+        )
+        gen = increment_gen(conn, "kanban-review-marker-complete")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_processor_markers",
+            saved_row["marker_id"],
+            dict(saved_row),
+            gen,
+        )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        marker = _row_to_work_review_processor_marker(saved_row)
+        return {
+            "ok": True,
+            "completed": True,
+            "marker": marker,
+            "audit": {
+                "audit_id": audit_id,
+                "action": "complete_review_processor_marker",
+                "result": outcome_status,
+            },
+        }
+
+
+@router.post("/kanban/automation/review-processor/requeue-timeouts")
+async def requeue_timed_out_work_review_processor_markers(
+    body: WorkReviewProcessorTimeoutRequeueRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        args: list[Any] = []
+        where = "WHERE status='processing' AND processing_expires_at != '' AND processing_expires_at <= ?"
+        args.append(now)
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            where += f" AND item_id IN ({placeholders})"
+            args.extend(scope_ids)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM kanban_review_processor_markers
+            {where}
+            ORDER BY processing_expires_at ASC, marker_id
+            """,
+            args,
+        ).fetchall()
+        requeued_rows = []
+        for row in rows:
+            updated_row = _work_review_processor_marker_update_row(
+                row,
+                updates={
+                    "status": "queued",
+                    "queued_at": now,
+                    "last_seen_at": now,
+                    "processing_started_at": "",
+                    "processing_expires_at": "",
+                    "last_error": "processing_timeout",
+                },
+                meta=meta,
+                now=now,
+                reason="processing_timeout_requeued",
+                metadata=dict(body.metadata or {}),
+            )
+            requeued_rows.append(_write_work_review_processor_marker(conn, updated_row))
+        source_hash = _hash_json_payload(
+            {
+                "action": "requeue_review_processor_timeouts",
+                "item_id": clean_item_id,
+                "requeued_count": len(requeued_rows),
+                "marker_ids": [row["marker_id"] for row in requeued_rows],
+            }
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="requeue_review_processor_timeouts",
+            target_ref="kanban_review_processor_markers:timeouts",
+            item_id=clean_item_id,
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+                "requeued_count": len(requeued_rows),
+                "marker_ids": [row["marker_id"] for row in requeued_rows],
+            },
+        )
+        gen = increment_gen(conn, "kanban-review-marker-timeout")
+        for row in requeued_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                row["marker_id"],
+                dict(row),
+                gen,
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        markers = [_row_to_work_review_processor_marker(row) for row in requeued_rows]
+        return {
+            "ok": True,
+            "requeued_count": len(markers),
+            "requeued_markers": markers,
+            "scheduler": _work_review_processor_marker_stats(conn, scope_ids),
+            "audit": {
+                "audit_id": audit_id,
+                "action": "requeue_review_processor_timeouts",
+                "result": "ok",
+            },
+        }
 
 
 @router.get("/kanban/automation/review-processor/output-contract")

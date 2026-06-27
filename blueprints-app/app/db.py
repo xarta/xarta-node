@@ -826,6 +826,12 @@ CREATE TABLE IF NOT EXISTS kanban_review_processor_markers (
     processed_at                  TEXT NOT NULL DEFAULT '',
     queued_at                     TEXT NOT NULL DEFAULT '',
     last_seen_at                  TEXT NOT NULL DEFAULT '',
+    processing_started_at         TEXT NOT NULL DEFAULT '',
+    processing_expires_at         TEXT NOT NULL DEFAULT '',
+    attempt_count                 INTEGER NOT NULL DEFAULT 0,
+    last_error                    TEXT NOT NULL DEFAULT '',
+    superseded_at                 TEXT NOT NULL DEFAULT '',
+    superseded_by_source_hash     TEXT NOT NULL DEFAULT '',
     status                        TEXT NOT NULL DEFAULT 'queued',
     provider_mode                 TEXT NOT NULL DEFAULT 'cloud-first',
     decision_id                   TEXT NOT NULL DEFAULT '',
@@ -840,6 +846,8 @@ CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_item
     ON kanban_review_processor_markers(item_id, status, document_updated_at);
 CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_status
     ON kanban_review_processor_markers(processor_kind, status, queued_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_timeout
+    ON kanban_review_processor_markers(status, processing_expires_at);
 
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
@@ -2236,6 +2244,17 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("manual_link_categories", "is_page", "INTEGER DEFAULT 0"),
         ("manual_link_categories", "page_label", "TEXT"),
         ("manual_link_categories", "page_sort_order", "INTEGER DEFAULT 0"),
+        # kanban_review_processor_markers: lifecycle state (2026-06-27)
+        ("kanban_review_processor_markers", "processing_started_at", "TEXT NOT NULL DEFAULT ''"),
+        ("kanban_review_processor_markers", "processing_expires_at", "TEXT NOT NULL DEFAULT ''"),
+        ("kanban_review_processor_markers", "attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("kanban_review_processor_markers", "last_error", "TEXT NOT NULL DEFAULT ''"),
+        ("kanban_review_processor_markers", "superseded_at", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "kanban_review_processor_markers",
+            "superseded_by_source_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -2248,6 +2267,10 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_manual_link_category_items_parent "
         "ON manual_link_category_items(parent_mapping_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_timeout "
+        "ON kanban_review_processor_markers(status, processing_expires_at)"
     )
 
 
