@@ -77,6 +77,8 @@ KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
 KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v1"
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
+KANBAN_REVIEW_MARKER_SCHEMA = "xarta.kanban.review_processor.marker.v1"
+KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -480,6 +482,17 @@ class WorkReviewProcessorLeaseRequest(BaseModel):
     lease_token: str | None = None
     ttl_seconds: int = 1200
     force: bool = False
+    metadata: dict[str, Any] = {}
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkReviewProcessorIdleScanRequest(BaseModel):
+    item_id: str | None = None
+    max_items: int = 100
+    include_empty: bool = False
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -1147,6 +1160,248 @@ def _write_work_review_processor_lease_audit(
         )
     enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return audit_row
+
+
+def _review_processor_marker_id(
+    item_id: str,
+    processor_kind: str = "review",
+    document_type: str = "review",
+) -> str:
+    digest = hashlib.sha256(
+        f"{item_id}\n{processor_kind}\n{document_type}".encode("utf-8")
+    ).hexdigest()
+    return f"kanban-review-marker-{digest[:24]}"
+
+
+def _clean_review_scan_limit(value: int | None) -> int:
+    try:
+        limit = int(value or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    return max(1, min(limit, 500))
+
+
+def _review_document_ref(document: dict[str, Any]) -> str:
+    file_ref = document.get("file_ref") if isinstance(document, dict) else None
+    if isinstance(file_ref, dict):
+        root = _clean_short_text(file_ref.get("root"), "kanban", limit=80)
+        path = _clean_short_text(file_ref.get("path"), "", limit=400)
+        if path:
+            return f"{root}:{path}"
+    return ""
+
+
+def _review_document_source(document: dict[str, Any]) -> dict[str, Any]:
+    body = document.get("body") if isinstance(document, dict) else ""
+    body_text = str(body or "")
+    payload = {
+        "schema": document.get("schema")
+        if isinstance(document, dict)
+        else KANBAN_ITEM_REVIEW_SCHEMA,
+        "item_id": document.get("item_id") if isinstance(document, dict) else "",
+        "updated_at": document.get("updated_at") if isinstance(document, dict) else "",
+        "file_ref": document.get("file_ref") if isinstance(document, dict) else {},
+        "body": body_text,
+    }
+    return {
+        "document_ref": _review_document_ref(document),
+        "document_updated_at": _clean_short_text(payload["updated_at"], "", limit=80),
+        "document_source_hash": _hash_json_payload(payload),
+        "body_bytes": len(body_text.encode("utf-8")),
+        "has_review_text": bool(body_text.strip()),
+        "document_exists": bool(document.get("exists")) if isinstance(document, dict) else False,
+    }
+
+
+def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
+    return {
+        "schema": KANBAN_REVIEW_MARKER_SCHEMA,
+        "marker_id": row["marker_id"],
+        "item_id": row["item_id"],
+        "processor_kind": row["processor_kind"],
+        "document_type": row["document_type"],
+        "document_ref": row["document_ref"],
+        "document_updated_at": row["document_updated_at"],
+        "document_source_hash": row["document_source_hash"],
+        "processed_document_updated_at": row["processed_document_updated_at"],
+        "processed_source_hash": row["processed_source_hash"],
+        "processed_at": row["processed_at"],
+        "queued_at": row["queued_at"],
+        "last_seen_at": row["last_seen_at"],
+        "status": row["status"],
+        "provider_mode": row["provider_mode"],
+        "decision_id": row["decision_id"],
+        "source_hash": row["source_hash"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _work_review_processor_marker_row(
+    *,
+    existing: Any | None,
+    item_id: str,
+    document: dict[str, Any],
+    document_source: dict[str, Any],
+    meta: dict[str, str],
+    now: str,
+    reason: str,
+    scan_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    provider_mode = _work_review_processing_policy()["active_mode"]
+    marker_id = _review_processor_marker_id(item_id)
+    previous_metadata = _json_value(existing["metadata_json"], {}) if existing is not None else {}
+    metadata = {
+        **previous_metadata,
+        **scan_metadata,
+        "reason": reason,
+        "document_exists": document_source["document_exists"],
+        "body_bytes": document_source["body_bytes"],
+        "previous_status": existing["status"] if existing is not None else "",
+        "previous_document_source_hash": (
+            existing["document_source_hash"] if existing is not None else ""
+        ),
+    }
+    provenance = {
+        "schema": KANBAN_REVIEW_MARKER_SCHEMA,
+        "recorded_by": meta["actor"],
+        "source_surface": meta["source_surface"],
+        "request_id": meta["request_id"],
+        "run_id": meta["run_id"],
+    }
+    row = {
+        "marker_id": marker_id,
+        "item_id": item_id,
+        "processor_kind": "review",
+        "document_type": "review",
+        "document_ref": document_source["document_ref"],
+        "document_updated_at": document_source["document_updated_at"],
+        "document_source_hash": document_source["document_source_hash"],
+        "processed_document_updated_at": (
+            existing["processed_document_updated_at"] if existing is not None else ""
+        ),
+        "processed_source_hash": existing["processed_source_hash"] if existing is not None else "",
+        "processed_at": existing["processed_at"] if existing is not None else "",
+        "queued_at": now,
+        "last_seen_at": now,
+        "status": "queued",
+        "provider_mode": provider_mode,
+        "decision_id": existing["decision_id"] if existing is not None else "",
+        "source_hash": "",
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+        "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+        "created_at": existing["created_at"] if existing is not None else now,
+        "updated_at": now,
+    }
+    row["source_hash"] = _hash_json_payload(
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"source_hash", "created_at", "updated_at"}
+        }
+    )
+    return row
+
+
+def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_markers (
+            marker_id, item_id, processor_kind, document_type, document_ref,
+            document_updated_at, document_source_hash, processed_document_updated_at,
+            processed_source_hash, processed_at, queued_at, last_seen_at, status,
+            provider_mode, decision_id, source_hash, metadata_json, provenance_json,
+            created_at, updated_at
+        )
+        VALUES (
+            :marker_id, :item_id, :processor_kind, :document_type, :document_ref,
+            :document_updated_at, :document_source_hash, :processed_document_updated_at,
+            :processed_source_hash, :processed_at, :queued_at, :last_seen_at, :status,
+            :provider_mode, :decision_id, :source_hash, :metadata_json,
+            :provenance_json, :created_at, :updated_at
+        )
+        ON CONFLICT(marker_id) DO UPDATE SET
+            item_id=excluded.item_id,
+            processor_kind=excluded.processor_kind,
+            document_type=excluded.document_type,
+            document_ref=excluded.document_ref,
+            document_updated_at=excluded.document_updated_at,
+            document_source_hash=excluded.document_source_hash,
+            processed_document_updated_at=excluded.processed_document_updated_at,
+            processed_source_hash=excluded.processed_source_hash,
+            processed_at=excluded.processed_at,
+            queued_at=excluded.queued_at,
+            last_seen_at=excluded.last_seen_at,
+            status=excluded.status,
+            provider_mode=excluded.provider_mode,
+            decision_id=excluded.decision_id,
+            source_hash=excluded.source_hash,
+            metadata_json=excluded.metadata_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        row,
+    )
+    return conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+        (row["marker_id"],),
+    ).fetchone()
+
+
+def _work_review_processor_marker_stats(
+    conn: Any,
+    scope_ids: list[str],
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    where = ""
+    args: list[Any] = []
+    if scope_ids:
+        placeholders = ",".join("?" for _ in scope_ids)
+        where = f"WHERE item_id IN ({placeholders})"
+        args.extend(scope_ids)
+    status_rows = conn.execute(
+        f"SELECT status, COUNT(*) AS count FROM kanban_review_processor_markers {where} GROUP BY status",
+        args,
+    ).fetchall()
+    recent_rows = conn.execute(
+        f"""
+        SELECT * FROM kanban_review_processor_markers
+        {where}
+        ORDER BY updated_at DESC, queued_at DESC, marker_id
+        LIMIT ?
+        """,
+        [*args, limit],
+    ).fetchall()
+    last_scan = conn.execute(
+        """
+        SELECT * FROM kanban_audit_log
+        WHERE action='trigger_review_processor_idle_scan'
+        ORDER BY created_at DESC, audit_id
+        LIMIT 1
+        """
+    ).fetchone()
+    by_status = {row["status"]: int(row["count"]) for row in status_rows}
+    queued_count = int(by_status.get("queued", 0))
+    processing_count = int(by_status.get("processing", 0))
+    return {
+        "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+        "queue_length": queued_count,
+        "active_count": processing_count,
+        "pending_count": queued_count + processing_count,
+        "by_status": by_status,
+        "last_scan_at": last_scan["created_at"] if last_scan else "",
+        "last_scan": {
+            "audit_id": last_scan["audit_id"],
+            "result": last_scan["result"],
+            "metadata": _json_value(last_scan["metadata_json"], {}),
+        }
+        if last_scan
+        else None,
+        "recent_markers": [_row_to_work_review_processor_marker(row) for row in recent_rows],
+    }
 
 
 def _row_to_work_review_decision(
@@ -9154,6 +9409,168 @@ async def record_work_item_review_decision(
     }
 
 
+@router.post("/kanban/automation/review-processor/idle-scan")
+async def trigger_work_review_processor_idle_scan(
+    body: WorkReviewProcessorIdleScanRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    scan_limit = _clean_review_scan_limit(body.max_items)
+    include_empty = bool(body.include_empty)
+    with get_conn() as conn:
+        root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        args: list[Any] = []
+        where = "WHERE status != 'archived'"
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            where += f" AND item_id IN ({placeholders})"
+            args.extend(scope_ids)
+        item_rows = conn.execute(
+            f"""
+            SELECT * FROM kanban_items
+            {where}
+            ORDER BY updated_at DESC, item_id
+            LIMIT ?
+            """,
+            [*args, scan_limit],
+        ).fetchall()
+        scan_entries: list[dict[str, Any]] = []
+        skipped_empty = 0
+        for item_row in item_rows:
+            document = _work_item_review_document(conn, item_row["item_id"])
+            document_source = _review_document_source(document)
+            if not document_source["has_review_text"] and not include_empty:
+                skipped_empty += 1
+                continue
+            scan_entries.append(
+                {
+                    "item": item_row,
+                    "document": document,
+                    "document_source": document_source,
+                }
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        queued_rows: list[Any] = []
+        unchanged_current = 0
+        unchanged_pending = 0
+        unchanged_failed = 0
+        for entry in scan_entries:
+            item_id = entry["item"]["item_id"]
+            document_source = entry["document_source"]
+            marker_id = _review_processor_marker_id(item_id)
+            existing = conn.execute(
+                "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+                (marker_id,),
+            ).fetchone()
+            if existing is not None:
+                same_document = (
+                    existing["document_source_hash"] == document_source["document_source_hash"]
+                )
+                already_processed = (
+                    existing["processed_source_hash"] == document_source["document_source_hash"]
+                )
+                if same_document and existing["status"] in {"queued", "processing"}:
+                    unchanged_pending += 1
+                    continue
+                if same_document and existing["status"] in {"failed", "skipped"}:
+                    unchanged_failed += 1
+                    continue
+                if already_processed and existing["status"] == "processed":
+                    unchanged_current += 1
+                    continue
+            reason = "new_review_document" if existing is None else "review_document_changed"
+            marker_row = _work_review_processor_marker_row(
+                existing=existing,
+                item_id=item_id,
+                document=entry["document"],
+                document_source=document_source,
+                meta=meta,
+                now=now,
+                reason=reason,
+                scan_metadata=dict(body.metadata or {}),
+            )
+            queued_rows.append(_write_work_review_processor_marker(conn, marker_row))
+
+        source_hash = _hash_json_payload(
+            {
+                "action": "trigger_review_processor_idle_scan",
+                "item_id": clean_item_id,
+                "scan_limit": scan_limit,
+                "scanned_count": len(item_rows),
+                "eligible_review_count": len(scan_entries),
+                "queued_count": len(queued_rows),
+                "skipped_empty_count": skipped_empty,
+                "unchanged_current_count": unchanged_current,
+                "unchanged_pending_count": unchanged_pending,
+                "unchanged_failed_count": unchanged_failed,
+            }
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="trigger_review_processor_idle_scan",
+            target_ref="kanban_review_processor_markers:idle-scan",
+            item_id=clean_item_id,
+            parent_item_id=(root_item["parent_item_id"] or "") if root_item else "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={
+                "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+                "scan_limit": scan_limit,
+                "scanned_count": len(item_rows),
+                "eligible_review_count": len(scan_entries),
+                "queued_count": len(queued_rows),
+                "skipped_empty_count": skipped_empty,
+                "unchanged_current_count": unchanged_current,
+                "unchanged_pending_count": unchanged_pending,
+                "unchanged_failed_count": unchanged_failed,
+                "provider_mode": _work_review_processing_policy()["active_mode"],
+            },
+        )
+        gen = increment_gen(conn, "kanban-review-idle-scan")
+        for marker_row in queued_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        marker_stats = _work_review_processor_marker_stats(conn, scope_ids)
+        queued_markers = [
+            _row_to_work_review_processor_marker(marker_row) for marker_row in queued_rows
+        ]
+    return {
+        "ok": True,
+        "schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+        "scanned_count": len(item_rows),
+        "eligible_review_count": len(scan_entries),
+        "queued_count": len(queued_markers),
+        "skipped_empty_count": skipped_empty,
+        "unchanged_current_count": unchanged_current,
+        "unchanged_pending_count": unchanged_pending,
+        "unchanged_failed_count": unchanged_failed,
+        "queued_markers": queued_markers,
+        "scheduler": marker_stats,
+        "audit": {
+            "audit_id": audit_id,
+            "action": "trigger_review_processor_idle_scan",
+            "result": "ok",
+        },
+    }
+
+
 @router.get("/kanban/automation/review-processor/output-contract")
 async def get_work_review_processor_output_contract() -> dict[str, Any]:
     return {
@@ -9563,6 +9980,7 @@ async def get_work_automation_status(
         ).fetchone()
         lease = _row_to_work_review_processor_lease(lease_row, now_dt=now_dt)
         lease_active = bool(lease["active"])
+        marker_stats = _work_review_processor_marker_stats(conn, scope_ids, limit=limit)
         last_completed = conn.execute(
             f"""
             SELECT * FROM kanban_review_decisions
@@ -9592,7 +10010,7 @@ async def get_work_automation_status(
             },
             "review_processor": {
                 "status": "lease-active" if lease_active else "decision-ledger-ready",
-                "queue_length": 0,
+                "queue_length": marker_stats["queue_length"],
                 "active_item_id": (
                     lease["item_id"]
                     if lease_active
@@ -9616,6 +10034,8 @@ async def get_work_automation_status(
                 "pending_decision_count": sum(
                     int(row["count"]) for row in status_rows if row["status"] == "pending"
                 ),
+                "scheduler": marker_stats,
+                "review_markers": marker_stats["recent_markers"],
             },
             "preprocessing": {
                 "status": "contract-pending",

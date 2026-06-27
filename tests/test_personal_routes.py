@@ -451,6 +451,28 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE kanban_review_processor_markers (
+            marker_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            processor_kind TEXT NOT NULL DEFAULT 'review',
+            document_type TEXT NOT NULL DEFAULT 'review',
+            document_ref TEXT NOT NULL DEFAULT '',
+            document_updated_at TEXT NOT NULL DEFAULT '',
+            document_source_hash TEXT NOT NULL DEFAULT '',
+            processed_document_updated_at TEXT NOT NULL DEFAULT '',
+            processed_source_hash TEXT NOT NULL DEFAULT '',
+            processed_at TEXT NOT NULL DEFAULT '',
+            queued_at TEXT NOT NULL DEFAULT '',
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'queued',
+            provider_mode TEXT NOT NULL DEFAULT 'cloud-first',
+            decision_id TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
         CREATE TABLE kanban_agent_hints (
             hint_id TEXT PRIMARY KEY,
             item_id TEXT NOT NULL UNIQUE,
@@ -2728,6 +2750,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_review_decisions") == "decision_id"
     assert "kanban_review_processor_leases" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_review_processor_leases") == "lease_id"
+    assert "kanban_review_processor_markers" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_review_processor_markers") == "marker_id"
     assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
     assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
@@ -3818,6 +3842,148 @@ def test_work_review_processor_lease_acquire_conflict_heartbeat_release(monkeypa
     assert "acquire_review_processor_lease" in audit_actions
     assert "heartbeat_review_processor_lease" in audit_actions
     assert "release_review_processor_lease" in audit_actions
+
+
+def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-scan-root",
+                title="Review scan root",
+                body="Root item for review scan proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-scan-child",
+                parent_item_id="work-review-scan-root",
+                title="Review scan child",
+                body="Child item with Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-scan-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Operator Review: proceed confidently with the queue trigger.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-review-write",
+            ),
+        )
+    )
+    conn.execute("DELETE FROM sync_queue")
+    conn.commit()
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-scan-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-trigger",
+            )
+        )
+    )
+    assert scan["ok"] is True
+    assert scan["schema"] == routes_personal.KANBAN_REVIEW_SCHEDULER_SCHEMA
+    assert scan["scanned_count"] == 2
+    assert scan["eligible_review_count"] == 1
+    assert scan["queued_count"] == 1
+    assert scan["skipped_empty_count"] == 1
+    marker = scan["queued_markers"][0]
+    assert marker["schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
+    assert marker["item_id"] == "work-review-scan-child"
+    assert marker["status"] == "queued"
+    assert marker["provider_mode"] == "cloud-first"
+    assert marker["processed_source_hash"] == ""
+    assert marker["metadata"]["reason"] == "new_review_document"
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-scan-root")
+    )
+    assert status["review_processor"]["queue_length"] == 1
+    assert status["review_processor"]["scheduler"]["queue_length"] == 1
+    assert (
+        status["review_processor"]["scheduler"]["recent_markers"][0]["item_id"]
+        == "work-review-scan-child"
+    )
+
+    same_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-scan-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-trigger-again",
+            )
+        )
+    )
+    assert same_scan["queued_count"] == 0
+    assert same_scan["unchanged_pending_count"] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) AS count FROM kanban_review_processor_markers").fetchone()[
+            "count"
+        ]
+        == 1
+    )
+
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-scan-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Operator Review: proceed confidently, and queue the changed Review doc.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-review-change",
+            ),
+        )
+    )
+    changed_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-scan-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-scan-trigger-changed",
+            )
+        )
+    )
+    assert changed_scan["queued_count"] == 1
+    assert changed_scan["queued_markers"][0]["metadata"]["reason"] == "review_document_changed"
+    assert (
+        changed_scan["queued_markers"][0]["document_source_hash"] != marker["document_source_hash"]
+    )
+
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_markers" in sync_tables
+    assert "kanban_audit_log" in sync_tables
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "trigger_review_processor_idle_scan" in audit_actions
 
 
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):

@@ -52,6 +52,7 @@ KANBAN_BACKUP_TABLES: tuple[str, ...] = (
     "kanban_item_commits",
     "kanban_review_decisions",
     "kanban_review_processor_leases",
+    "kanban_review_processor_markers",
     "kanban_agent_hints",
     "kanban_agent_sessions",
     "kanban_blockers",
