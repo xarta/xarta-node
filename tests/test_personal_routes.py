@@ -3607,6 +3607,15 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
 
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-decision-ledger"))
     assert status["provider_mode"]["active"] == "cloud-first"
+    assert status["provider_mode"]["planned"] == "planned-gated"
+    assert status["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
+    assert status["provider_mode"]["automatic_switch"] is False
+    assert (
+        status["processing_policy"]["schema"]
+        == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
+    )
+    assert status["processing_policy"]["active_mode"] == "cloud-first"
+    assert status["processing_policy"]["local_processing"]["state"] == "planned-gated"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
     assert (
         status["review_processor"]["lease"]["schema"] == routes_personal.KANBAN_REVIEW_LEASE_SCHEMA
@@ -3643,8 +3652,13 @@ def test_work_review_processor_output_contract_endpoint():
     contract = result["contract"]
     assert result["ok"] is True
     assert contract["schema"] == routes_personal.KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA
+    assert (
+        contract["processing_policy_schema"]
+        == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
+    )
     assert contract["provider_mode"]["active"] == "cloud-first"
     assert contract["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
+    assert contract["provider_mode"]["automatic_switch"] is False
     assert "metadata.output_payload" in contract["minimum_decision_fields"]
     output_types = {output["type"]: output for output in contract["output_types"]}
     assert set(output_types) == {
@@ -3655,6 +3669,23 @@ def test_work_review_processor_output_contract_endpoint():
     }
     assert "current_behavior" in output_types["prompt_change"]["required_payload_fields"]
     assert "source_refs" in output_types["contradiction_check"]["required_payload_fields"]
+
+
+def test_work_review_processor_processing_policy_endpoint():
+    result = asyncio.run(routes_personal.get_work_review_processor_processing_policy())
+    policy = result["policy"]
+    assert result["ok"] is True
+    assert policy["schema"] == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
+    assert policy["active_mode"] == "cloud-first"
+    assert policy["applies_to"] == ["review_processor", "preprocessing"]
+    assert policy["cloud_processing"]["state"] == "active"
+    assert policy["local_processing"]["state"] == "planned-gated"
+    assert policy["local_processing"]["gate"] == "structured-job-packets-required"
+    assert policy["local_processing"]["automatic_switch"] is False
+    assert "structured_job_packet_schema" in policy["local_processing"]["switch_requires"]
+    assert policy["provider_choice"]["default_mode"] == "cloud-first"
+    assert "local" in policy["provider_choice"]["blocked_until_gate"]
+    assert any("Provider mode must be explicit" in rule for rule in policy["routing_rules"])
 
 
 def test_work_review_processor_lease_acquire_conflict_heartbeat_release(monkeypatch):
