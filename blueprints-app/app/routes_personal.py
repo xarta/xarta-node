@@ -74,6 +74,7 @@ DAY_SUMMARY_SCHEMA = "xarta.diary.day_summary.v1"
 KANBAN_ITEM_DETAIL_SCHEMA = "xarta.kanban.item_detail.v1"
 KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
+KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
 KANBAN_DISCUSSION_SCHEMA = "xarta.kanban.discussion.v1"
 RICH_DOC_IMAGE_SCHEMA = "xarta.rich_document.image.v1"
 RICH_DOC_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -773,6 +774,87 @@ def _clean_review_provider_mode(value: str | None) -> str:
     mode = _clean_short_text(value, "cloud-first", limit=80).replace("_", "-")
     allowed = {"cloud-first", "cloud", "local-planned", "local", "manual"}
     return mode if mode in allowed else "cloud-first"
+
+
+def _work_review_processor_output_contract() -> dict[str, Any]:
+    return {
+        "schema": KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA,
+        "status": "active",
+        "version": "2026-06-27",
+        "decision_record_schema": KANBAN_REVIEW_DECISION_SCHEMA,
+        "provider_mode": {
+            "active": "cloud-first",
+            "local_processing_gate": "structured-job-packets-required",
+        },
+        "recording_rules": [
+            "Every Review Processor output is recorded as a kanban_review_decisions row.",
+            "decision_type identifies the emitted output kind.",
+            "Structured fields live under metadata.output_payload with output_schema and output_type.",
+            "affected_refs must include every Kanban card, Review document, proposal surface, or commit surface the output changes or evaluates.",
+            "Code-producing outputs must reference explicit kanban_item_commits rows before they are accepted.",
+            "Pre-commit hook failures are recorded as hook_failed or metadata.hook_status=failed until repaired.",
+        ],
+        "output_types": [
+            {
+                "type": "lesson",
+                "label": "Lesson",
+                "decision_type": "lesson",
+                "writes": ["kanban_review_decisions", "kanban_discussions_or_review_doc"],
+                "required_payload_fields": [
+                    "lesson",
+                    "evidence_refs",
+                    "scope_refs",
+                    "operator_impact",
+                ],
+            },
+            {
+                "type": "prompt_change",
+                "label": "Prompt Change",
+                "decision_type": "prompt_change",
+                "writes": ["kanban_review_decisions", "implementation_card"],
+                "required_payload_fields": [
+                    "target_surface",
+                    "current_behavior",
+                    "requested_behavior",
+                    "validation_refs",
+                ],
+            },
+            {
+                "type": "contradiction_check",
+                "label": "Contradiction Check",
+                "decision_type": "contradiction_check",
+                "writes": ["kanban_review_decisions"],
+                "required_payload_fields": [
+                    "claim_a",
+                    "claim_b",
+                    "resolution",
+                    "source_refs",
+                ],
+            },
+            {
+                "type": "follow_up_card",
+                "label": "Follow-up Card",
+                "decision_type": "follow_up_card",
+                "writes": ["kanban_review_decisions", "kanban_items"],
+                "required_payload_fields": [
+                    "title",
+                    "body",
+                    "parent_ref",
+                    "lane",
+                    "priority",
+                    "reason",
+                ],
+            },
+        ],
+        "minimum_decision_fields": [
+            "summary",
+            "rationale",
+            "affected_refs",
+            "confidence",
+            "proof_refs",
+            "metadata.output_payload",
+        ],
+    }
 
 
 def _row_to_work_review_decision(
@@ -8780,6 +8862,14 @@ async def record_work_item_review_decision(
     }
 
 
+@router.get("/kanban/automation/review-processor/output-contract")
+async def get_work_review_processor_output_contract() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract": _work_review_processor_output_contract(),
+    }
+
+
 @router.get("/kanban/automation/status")
 async def get_work_automation_status(
     item_id: Annotated[str | None, Query()] = None,
@@ -8862,6 +8952,7 @@ async def get_work_automation_status(
             "schema": "xarta.kanban.automation_status.v1",
             "item": item_payload,
             "generated_at": _utc_now_iso(),
+            "output_contract": _work_review_processor_output_contract(),
             "provider_mode": {
                 "active": "cloud-first",
                 "planned": "local-processing-after-structured-job-packets",

@@ -3588,6 +3588,16 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-decision-ledger"))
     assert status["provider_mode"]["active"] == "cloud-first"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
+    assert (
+        status["output_contract"]["schema"] == routes_personal.KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA
+    )
+    assert status["output_contract"]["decision_record_schema"] == "xarta.kanban.review_decision.v1"
+    assert {output_type["type"] for output_type in status["output_contract"]["output_types"]} == {
+        "lesson",
+        "prompt_change",
+        "contradiction_check",
+        "follow_up_card",
+    }
     assert status["decisions"]["count"] == 1
     assert status["decisions"]["recent"][0]["decision_id"] == "decision-ledger-proof"
     assert status["commit_link_health"]["decisions_with_commits"] == 1
@@ -3602,6 +3612,25 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "record_review_processor_decision" in audit_actions
+
+
+def test_work_review_processor_output_contract_endpoint():
+    result = asyncio.run(routes_personal.get_work_review_processor_output_contract())
+    contract = result["contract"]
+    assert result["ok"] is True
+    assert contract["schema"] == routes_personal.KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA
+    assert contract["provider_mode"]["active"] == "cloud-first"
+    assert contract["provider_mode"]["local_processing_gate"] == "structured-job-packets-required"
+    assert "metadata.output_payload" in contract["minimum_decision_fields"]
+    output_types = {output["type"]: output for output in contract["output_types"]}
+    assert set(output_types) == {
+        "lesson",
+        "prompt_change",
+        "contradiction_check",
+        "follow_up_card",
+    }
+    assert "current_behavior" in output_types["prompt_change"]["required_payload_fields"]
+    assert "source_refs" in output_types["contradiction_check"]["required_payload_fields"]
 
 
 def test_work_kanban_agent_hints_hidden_api(monkeypatch, tmp_path):
