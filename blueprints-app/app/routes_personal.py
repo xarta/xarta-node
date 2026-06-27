@@ -76,6 +76,7 @@ KANBAN_ITEM_REVIEW_SCHEMA = "xarta.kanban.item_review.v1"
 KANBAN_REVIEW_DECISION_SCHEMA = "xarta.kanban.review_decision.v1"
 KANBAN_REVIEW_FEEDBACK_SCHEMA = "xarta.kanban.operator_feedback.v1"
 KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA = "xarta.kanban.operator_feedback.collection.v1"
+KANBAN_REVIEW_FEEDBACK_ATTRIBUTION_SCHEMA = "xarta.kanban.operator_feedback.attribution.v1"
 KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA = "xarta.kanban.review_processor.output_contract.v1"
 KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v1"
 KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata_contract.v1"
@@ -422,6 +423,10 @@ class WorkReviewFeedbackCaptureRequest(BaseModel):
     capture_source: str = "explicit_command"
     source_ref: str | None = None
     related_refs: list[str] = []
+    child_item_id: str | None = None
+    proof_refs: list[str] = []
+    outcome_ref: str | None = None
+    outcome_summary: str | None = None
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -948,10 +953,11 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             {
                 "field": "operator_feedback.entries",
                 "scope": "review_document.metadata",
-                "meaning": "Explicit command/discussion feedback captures with feedback id, UTC date, actor, session id, affected item refs, capture source, source ref, and feedback hash.",
+                "meaning": "Explicit command/discussion feedback captures with feedback id, UTC date, actor, session id, affected item refs, capture source, source ref, structured session/child/proof/outcome attribution, and feedback hash.",
                 "updates_when": "A bounded feedback capture appends an operator-feedback section to the Review markdown.",
                 "entry_schema": KANBAN_REVIEW_FEEDBACK_SCHEMA,
                 "collection_schema": KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA,
+                "attribution_schema": KANBAN_REVIEW_FEEDBACK_ATTRIBUTION_SCHEMA,
             },
             {
                 "field": "document_source_hash",
@@ -1655,12 +1661,67 @@ def _review_feedback_quote_block(feedback: str) -> str:
     return "\n".join(f"> {line}" if line else ">" for line in lines)
 
 
+def _work_review_feedback_session_snapshot(agent_session: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(agent_session, dict) or not agent_session:
+        return {}
+    snapshot_keys = (
+        "session_id",
+        "item_id",
+        "agent_id",
+        "node_id",
+        "worktree_path",
+        "repo_full_name",
+        "branch",
+        "status",
+        "started_at",
+        "ended_at",
+        "last_seen_at",
+        "summary",
+    )
+    snapshot = {key: agent_session.get(key) for key in snapshot_keys}
+    metadata = agent_session.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        snapshot["metadata"] = metadata
+    return {key: value for key, value in snapshot.items() if value not in ("", None, {}, [])}
+
+
+def _work_review_feedback_attribution(
+    *,
+    body: WorkReviewFeedbackCaptureRequest,
+    session_id: str,
+    agent_session: dict[str, Any] | None,
+) -> dict[str, Any]:
+    child_item_id = _clean_short_text(body.child_item_id or "", "", limit=180)
+    proof_refs = _clean_event_list(body.proof_refs or [], limit=24)
+    outcome_ref = _clean_short_text(body.outcome_ref, "", limit=300)
+    outcome_summary = _body_excerpt(body.outcome_summary or "", limit=1000)
+    attribution: dict[str, Any] = {
+        "schema": KANBAN_REVIEW_FEEDBACK_ATTRIBUTION_SCHEMA,
+        "session_id": session_id,
+        "session_ref": f"kanban_agent_sessions:{session_id}",
+    }
+    session_snapshot = _work_review_feedback_session_snapshot(agent_session)
+    if session_snapshot:
+        attribution["agent_session"] = session_snapshot
+    if child_item_id:
+        attribution["child_item_id"] = child_item_id
+        attribution["child_ref"] = f"xarta-kanban:item:{child_item_id}"
+    if proof_refs:
+        attribution["proof_refs"] = proof_refs
+    if outcome_ref:
+        attribution["outcome_ref"] = outcome_ref
+    if outcome_summary:
+        attribution["outcome_summary"] = outcome_summary
+    return attribution
+
+
 def _work_review_feedback_entry(
     *,
     item_id: str,
     body: WorkReviewFeedbackCaptureRequest,
     meta: dict[str, str],
     now: str,
+    agent_session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_feedback = _normalise_markdown_document_body(body.feedback).strip()
     if not clean_feedback:
@@ -1673,10 +1734,23 @@ def _work_review_feedback_entry(
         if body.feedback_id
         else _kanban_review_feedback_id()
     )
+    attribution = _work_review_feedback_attribution(
+        body=body,
+        session_id=session_id,
+        agent_session=agent_session,
+    )
+    extra_refs = [attribution["session_ref"]]
+    child_item_id = attribution.get("child_item_id")
+    if child_item_id:
+        extra_refs.extend([f"kanban_items:{child_item_id}", attribution["child_ref"]])
+    extra_refs.extend(attribution.get("proof_refs") or [])
+    if attribution.get("outcome_ref"):
+        extra_refs.append(attribution["outcome_ref"])
     affected_refs = [
         f"kanban_items:{item_id}",
         f"xarta-kanban:item:{item_id}",
         *_clean_event_list(body.related_refs, limit=62),
+        *extra_refs,
     ]
     seen_refs: set[str] = set()
     affected_refs = [
@@ -1689,6 +1763,7 @@ def _work_review_feedback_entry(
             "feedback": clean_feedback,
             "feedback_id": feedback_id,
             "captured_at": now,
+            "attribution": attribution,
         }
     )
     return {
@@ -1704,6 +1779,7 @@ def _work_review_feedback_entry(
         "source_surface": meta["source_surface"],
         "request_id": meta["request_id"],
         "run_id": meta["run_id"],
+        "attribution": attribution,
         "feedback_hash": feedback_hash,
         "feedback_excerpt": _body_excerpt(clean_feedback, limit=500),
         "feedback": clean_feedback,
@@ -1737,6 +1813,7 @@ def _work_review_feedback_metadata(
 
 
 def _work_review_feedback_markdown(entry: dict[str, Any]) -> str:
+    attribution = entry.get("attribution") if isinstance(entry.get("attribution"), dict) else {}
     lines = [
         f"### {entry['captured_at']} - {entry['actor']}",
         "",
@@ -1745,6 +1822,19 @@ def _work_review_feedback_markdown(entry: dict[str, Any]) -> str:
         f"- Session: `{entry['session_id']}`",
         f"- Capture source: `{entry['capture_source']}`",
     ]
+    if attribution.get("child_ref"):
+        lines.append(f"- Child card: `{attribution['child_ref']}`")
+    agent_session = attribution.get("agent_session")
+    if isinstance(agent_session, dict) and agent_session.get("item_id"):
+        lines.append(f"- Session item: `xarta-kanban:item:{agent_session['item_id']}`")
+    if attribution.get("proof_refs"):
+        proof_text = ", ".join(f"`{ref}`" for ref in attribution["proof_refs"])
+        lines.append(f"- Proof refs: {proof_text}")
+    if attribution.get("outcome_ref"):
+        lines.append(f"- Outcome ref: `{attribution['outcome_ref']}`")
+    if attribution.get("outcome_summary"):
+        summary = _clean_short_text(attribution["outcome_summary"], "", limit=500)
+        lines.append(f"- Outcome summary: {summary}")
     if entry.get("source_ref"):
         lines.append(f"- Source ref: `{entry['source_ref']}`")
     lines.extend(["", _review_feedback_quote_block(entry["feedback"])])
@@ -9382,14 +9472,27 @@ async def append_work_item_review_feedback(
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
     clean_item_id = _clean_short_text(item_id, "", limit=180)
-    entry = _work_review_feedback_entry(
-        item_id=clean_item_id,
-        body=body,
-        meta=meta,
-        now=now,
-    )
+    clean_session_id = _clean_short_text(body.session_id, "", limit=180)
+    if not clean_session_id:
+        raise HTTPException(400, "Review feedback session_id is required")
+    clean_child_item_id = _clean_short_text(body.child_item_id or "", "", limit=180)
     with get_conn() as conn:
         item = _work_item_or_404(conn, clean_item_id)
+        session_row = conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (clean_session_id,),
+        ).fetchone()
+        if session_row is None:
+            raise HTTPException(404, "Review feedback agent session not found")
+        if clean_child_item_id:
+            _work_item_or_404(conn, clean_child_item_id)
+        entry = _work_review_feedback_entry(
+            item_id=clean_item_id,
+            body=body,
+            meta=meta,
+            now=now,
+            agent_session=_row_to_work_agent_session(session_row),
+        )
         existing_document = _work_item_review_document(conn, clean_item_id)
         clean_body = _append_work_review_feedback_body(existing_document["body"], entry)
         feedback_metadata = _work_review_feedback_metadata(

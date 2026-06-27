@@ -3513,6 +3513,10 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
             "2026-06-27T04:01:00Z",
             "2026-06-27T04:02:00Z",
             "2026-06-27T04:03:00Z",
+            "2026-06-27T04:04:00Z",
+            "2026-06-27T04:05:00Z",
+            "2026-06-27T04:06:00Z",
+            "2026-06-27T04:07:00Z",
         ]
     )
     monkeypatch.setattr(
@@ -3534,6 +3538,38 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
             )
         )
     )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-feedback-child",
+                parent_item_id="work-review-feedback",
+                title="Review feedback child",
+                body="Child card proof",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-feedback-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "work-review-feedback-child",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="kanban-agent-session-test",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                source_surface="pytest-session",
+                summary="Started explicit feedback attribution proof",
+                metadata={"slice": "feedback-session-attribution"},
+                actor="codex-test",
+                request_id="review-feedback-session-create",
+            ),
+        )
+    )
 
     first = asyncio.run(
         routes_personal.append_work_item_review_feedback(
@@ -3545,6 +3581,10 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
                 capture_source="explicit_command",
                 source_ref="discussion:operator-command",
                 related_refs=["xarta-kanban:item:work-parent"],
+                child_item_id="work-review-feedback-child",
+                proof_refs=["git_commit:xarta/xarta-node@abcdef1", "discussion:proof-one"],
+                outcome_ref="discussion:outcome-one",
+                outcome_summary="Outcome accepted with tests, hooks, and linked commits.",
                 metadata={"operator_intent": "durable-review-input"},
                 actor="codex-test",
                 source_surface="pytest",
@@ -3556,8 +3596,16 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
     assert first["feedback_entry"]["schema"] == routes_personal.KANBAN_REVIEW_FEEDBACK_SCHEMA
     assert first["feedback_entry"]["feedback_id"] == "kanban-feedback-one"
     assert first_doc["body"].startswith("## Operator Feedback")
-    assert "### 2026-06-27T04:01:00Z - codex-test" in first_doc["body"]
+    assert "### 2026-06-27T04:03:00Z - codex-test" in first_doc["body"]
     assert "> Proceed with confidence and do not add a fallback path." in first_doc["body"]
+    assert "- Child card: `xarta-kanban:item:work-review-feedback-child`" in first_doc["body"]
+    assert "- Session item: `xarta-kanban:item:work-review-feedback-child`" in first_doc["body"]
+    assert "`git_commit:xarta/xarta-node@abcdef1`" in first_doc["body"]
+    assert "- Outcome ref: `discussion:outcome-one`" in first_doc["body"]
+    assert (
+        "- Outcome summary: Outcome accepted with tests, hooks, and linked commits."
+        in first_doc["body"]
+    )
     operator_feedback = first_doc["metadata"]["operator_feedback"]
     assert operator_feedback["schema"] == routes_personal.KANBAN_REVIEW_FEEDBACK_COLLECTION_SCHEMA
     assert operator_feedback["count"] == 1
@@ -3567,6 +3615,20 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
     assert first_entry["affected_item_id"] == "work-review-feedback"
     assert "feedback" not in first_entry
     assert first_entry["metadata"]["operator_intent"] == "durable-review-input"
+    assert "kanban_agent_sessions:kanban-agent-session-test" in first_entry["affected_refs"]
+    assert "xarta-kanban:item:work-review-feedback-child" in first_entry["affected_refs"]
+    assert "git_commit:xarta/xarta-node@abcdef1" in first_entry["affected_refs"]
+    attribution = first_entry["attribution"]
+    assert attribution["schema"] == routes_personal.KANBAN_REVIEW_FEEDBACK_ATTRIBUTION_SCHEMA
+    assert attribution["session_ref"] == "kanban_agent_sessions:kanban-agent-session-test"
+    assert attribution["child_item_id"] == "work-review-feedback-child"
+    assert attribution["proof_refs"] == [
+        "git_commit:xarta/xarta-node@abcdef1",
+        "discussion:proof-one",
+    ]
+    assert attribution["outcome_ref"] == "discussion:outcome-one"
+    assert attribution["agent_session"]["item_id"] == "work-review-feedback-child"
+    assert attribution["agent_session"]["metadata"]["slice"] == "feedback-session-attribution"
 
     second = asyncio.run(
         routes_personal.append_work_item_review_feedback(
@@ -3620,6 +3682,22 @@ def test_work_review_feedback_capture_appends_markdown_and_metadata(monkeypatch,
             )
         )
     assert excinfo.value.status_code == 400
+
+    with pytest.raises(routes_personal.HTTPException) as missing_session:
+        asyncio.run(
+            routes_personal.append_work_item_review_feedback(
+                "work-review-feedback",
+                routes_personal.WorkReviewFeedbackCaptureRequest(
+                    feedback="A session label that does not exist must not be accepted.",
+                    session_id="kanban-agent-session-missing",
+                    capture_source="explicit_command",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="review-feedback-missing-session",
+                ),
+            )
+        )
+    assert missing_session.value.status_code == 404
 
     audit_actions = {
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
