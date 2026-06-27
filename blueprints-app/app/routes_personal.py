@@ -899,7 +899,9 @@ def _clean_review_provider_mode(value: str | None) -> str:
 
 def _work_automation_local_ai_model_alias() -> str:
     return _clean_short_text(
-        os.environ.get(KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, ""), "", limit=220
+        os.environ.get(KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, ""),
+        "",
+        limit=220,
     )
 
 
@@ -8004,6 +8006,185 @@ def _work_completion_blocker_rows(conn: Any, item_id: str) -> dict[str, Any]:
     return {"scope_ids": scope_ids, "blockers": blockers}
 
 
+def _work_processor_marker_blocker_id(marker_id: str) -> str:
+    digest = hashlib.sha256(str(marker_id or "").encode("utf-8")).hexdigest()[:24]
+    return f"kanban-blocker-processor-{digest}"
+
+
+def _work_processor_marker_blocker_title(marker_row: Any) -> str:
+    processor_kind = _clean_short_text(marker_row["processor_kind"], "processor", limit=80)
+    document_type = _clean_short_text(marker_row["document_type"], "document", limit=80)
+    last_error = _clean_short_text(marker_row["last_error"], "", limit=240)
+    if last_error == (
+        f"{KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV} is required for local AI Kanban automation"
+    ):
+        return "Use private local AI endpoint for Kanban preprocessing"
+    return f"{processor_kind.title()} {document_type.replace('_', ' ')} marker failed"
+
+
+def _work_processor_marker_blocker_body(marker_row: Any) -> str:
+    marker_id = marker_row["marker_id"]
+    processor_kind = marker_row["processor_kind"] or "processor"
+    document_type = marker_row["document_type"] or "document"
+    marker_status = marker_row["status"] or "failed"
+    last_error = marker_row["last_error"] or ""
+    local_model_alias = _work_automation_local_ai_model_alias()
+    local_endpoint_detail = (
+        f"`{local_model_alias}`"
+        if local_model_alias
+        else f"the configured `{KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV}` value"
+    )
+    lines = [
+        f"Processor marker `{marker_id}` is `{marker_status}` for `{processor_kind}` / `{document_type}`.",
+        "",
+        "This marker blocks agent completion until it is reprocessed, superseded, cancelled, or resolved.",
+        "",
+        f"Required local AI endpoint: {local_endpoint_detail}.",
+    ]
+    if last_error:
+        lines.extend(["", f"Last error: {last_error}"])
+    if marker_row["decision_id"]:
+        lines.extend(["", f"Decision ref: `kanban_review_decisions:{marker_row['decision_id']}`"])
+    lines.extend(["", f"Marker ref: `kanban_review_processor_markers:{marker_id}`"])
+    return "\n".join(lines)
+
+
+def _upsert_work_processor_marker_blocker(
+    conn: Any,
+    marker_row: Any,
+    *,
+    meta: dict[str, str],
+    now: str,
+) -> dict[str, Any] | None:
+    marker_status = marker_row["status"] or ""
+    open_status = marker_status in {"queued", "processing", "failed"}
+    blocker_id = _work_processor_marker_blocker_id(marker_row["marker_id"])
+    previous = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+        (blocker_id,),
+    ).fetchone()
+    if not open_status and previous is None:
+        return None
+    item = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?",
+        (marker_row["item_id"],),
+    ).fetchone()
+    if item is None:
+        return None
+    blocker_status = "open" if open_status else "resolved"
+    title = (
+        _work_processor_marker_blocker_title(marker_row)
+        if open_status
+        else f"Resolved {marker_row['processor_kind']} marker blocker"
+    )
+    body_excerpt = (
+        _work_processor_marker_blocker_body(marker_row)
+        if open_status
+        else (
+            f"Processor marker `{marker_row['marker_id']}` reached `{marker_status}` "
+            "and no longer blocks agent completion."
+        )
+    )
+    blocked_by_ref = f"kanban_review_processor_markers:{marker_row['marker_id']}"
+    search_text, search_metadata, vector_key = _work_search_payload(
+        table_name="kanban_blockers",
+        row_id=blocker_id,
+        kind="blocker",
+        title=title,
+        body=body_excerpt,
+        related_refs=[blocked_by_ref],
+    )
+    provenance = {
+        "schema": "xarta.kanban.processor_marker_blocker.provenance.v1",
+        "marker_id": marker_row["marker_id"],
+        "processor_kind": marker_row["processor_kind"],
+        "document_type": marker_row["document_type"],
+        "marker_status": marker_status,
+        "materialized_by": meta["actor"],
+        "source_surface": meta["source_surface"],
+        "request_id": meta["request_id"],
+        "run_id": meta["run_id"],
+    }
+    created_at = previous["created_at"] if previous and previous["created_at"] else now
+    source_hash = _hash_json_payload(
+        {
+            "blocker_id": blocker_id,
+            "item_id": marker_row["item_id"],
+            "title": title,
+            "body": body_excerpt,
+            "status": blocker_status,
+            "blocked_by_ref": blocked_by_ref,
+            "marker_status": marker_status,
+            "last_error": marker_row["last_error"] or "",
+            "decision_id": marker_row["decision_id"] or "",
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+            search_text, search_metadata_json, embedding_ref, embedding_model,
+            embedding_updated_at, vector_index_key, provenance_json, created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+        ON CONFLICT(blocker_id) DO UPDATE SET
+            item_id=excluded.item_id,
+            title=excluded.title,
+            body_excerpt=excluded.body_excerpt,
+            status=excluded.status,
+            blocked_by_ref=excluded.blocked_by_ref,
+            search_text=excluded.search_text,
+            search_metadata_json=excluded.search_metadata_json,
+            vector_index_key=excluded.vector_index_key,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            blocker_id,
+            marker_row["item_id"],
+            title,
+            _body_excerpt(body_excerpt, limit=4000),
+            blocker_status,
+            blocked_by_ref,
+            search_text,
+            json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+            vector_key,
+            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+            created_at,
+            now,
+        ),
+    )
+    blocker_row = conn.execute(
+        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+        (blocker_id,),
+    ).fetchone()
+    audit_row = _write_work_audit(
+        conn,
+        audit_id=f"audit-{uuid.uuid4().hex}",
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+        action="materialize_processor_marker_blocker"
+        if open_status
+        else "resolve_processor_marker_blocker",
+        target_ref=f"kanban_blockers:{blocker_id}",
+        item_id=marker_row["item_id"],
+        parent_item_id=item["parent_item_id"] or "",
+        created_at=now,
+        request_id=meta["request_id"],
+        run_id=meta["run_id"],
+        result=blocker_status,
+        source_hash=source_hash,
+        metadata={
+            "marker_id": marker_row["marker_id"],
+            "marker_status": marker_status,
+            "processor_kind": marker_row["processor_kind"],
+            "blocked_by_ref": blocked_by_ref,
+        },
+    )
+    return {"blocker_row": blocker_row, "audit_row": audit_row}
+
+
 def _assert_agent_completion_not_blocked(
     conn: Any,
     *,
@@ -13273,6 +13454,12 @@ async def complete_work_review_processor_marker(
                 },
             ),
         )
+        marker_blocker = _upsert_work_processor_marker_blocker(
+            conn,
+            saved_row,
+            meta=meta,
+            now=now,
+        )
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -13303,9 +13490,26 @@ async def complete_work_review_processor_marker(
             dict(saved_row),
             gen,
         )
+        if marker_blocker is not None:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         marker = _row_to_work_review_processor_marker(saved_row)
-        return {
+        result = {
             "ok": True,
             "completed": True,
             "marker": marker,
@@ -13315,6 +13519,9 @@ async def complete_work_review_processor_marker(
                 "result": outcome_status,
             },
         }
+        if marker_blocker is not None:
+            result["processor_blocker"] = _row_to_work_blocker(marker_blocker["blocker_row"])
+        return result
 
 
 @router.post("/kanban/automation/review-processor/requeue-timeouts")
