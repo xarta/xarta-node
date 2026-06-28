@@ -1271,6 +1271,11 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
                 "meaning": "Open blockers considered by preprocessing; open blockers fail readiness unless explicitly resolved or handled.",
             },
             {
+                "field": "ancestor_context",
+                "scope": "preprocessing.local_ai_input.evidence",
+                "meaning": "Immediate parent and recent ancestor body/detail/review excerpts plus recent decisions supplied to preprocessing, and included in source refs so parent-context changes supersede retry waits.",
+            },
+            {
                 "field": "drift_components",
                 "scope": "context_readiness_check",
                 "alias": "stale_markers",
@@ -2155,6 +2160,206 @@ def _preprocessing_count(conn: Any, sql: str, args: tuple[Any, ...]) -> int:
     return int(row["count"] if row else 0)
 
 
+def _work_preprocessing_ancestor_rows(
+    conn: Any,
+    item_row: Any,
+    *,
+    limit: int = KANBAN_DEPTH_LIMIT + 2,
+) -> list[Any]:
+    ancestors: list[Any] = []
+    seen: set[str] = set()
+    parent_item_id = _clean_short_text(item_row["parent_item_id"] or "", "", limit=180)
+    while parent_item_id and parent_item_id not in seen and len(ancestors) < limit:
+        seen.add(parent_item_id)
+        parent_row = conn.execute(
+            "SELECT * FROM kanban_items WHERE item_id=?",
+            (parent_item_id,),
+        ).fetchone()
+        if parent_row is None:
+            break
+        ancestors.append(parent_row)
+        parent_item_id = _clean_short_text(
+            parent_row["parent_item_id"] or "",
+            "",
+            limit=180,
+        )
+    return ancestors
+
+
+def _work_preprocessing_item_summary(row: Any) -> dict[str, Any]:
+    return {
+        "item_id": row["item_id"],
+        "parent_item_id": row["parent_item_id"] or "",
+        "title": row["title"],
+        "item_type": row["item_type"],
+        "state_id": row["state_id"],
+        "status": row["status"],
+        "priority_id": row["priority_id"],
+        "depth": row["depth"],
+        "tags": _json_value(row["tags_json"], []),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _work_preprocessing_ancestor_source_refs(
+    conn: Any,
+    item_row: Any,
+    *,
+    limit: int = KANBAN_DEPTH_LIMIT + 2,
+) -> list[dict[str, Any]]:
+    source_refs: list[dict[str, Any]] = []
+    for index, ancestor in enumerate(
+        _work_preprocessing_ancestor_rows(conn, item_row, limit=limit),
+        start=1,
+    ):
+        prefix = "parent" if index == 1 else f"ancestor_{index}"
+        ancestor_id = ancestor["item_id"]
+        detail = _work_item_detail_document(conn, ancestor_id)
+        review = _work_item_review_document(conn, ancestor_id)
+        source_refs.extend(
+            [
+                _preprocessing_source_ref(
+                    name=f"{prefix}_body",
+                    document_id=ancestor_id,
+                    document_type="ancestor-item-body",
+                    updated_at=ancestor["updated_at"],
+                    body=ancestor["body_excerpt"],
+                ),
+                _preprocessing_source_ref(
+                    name=f"{prefix}_detail",
+                    document_id=ancestor_id,
+                    document_type="ancestor-item-detail",
+                    updated_at=detail.get("updated_at") or ancestor["updated_at"],
+                    body=detail.get("body") or "",
+                    file_ref=detail.get("file_ref") if isinstance(detail, dict) else {},
+                ),
+                _preprocessing_source_ref(
+                    name=f"{prefix}_review",
+                    document_id=ancestor_id,
+                    document_type="ancestor-item-review",
+                    updated_at=review.get("updated_at") or ancestor["updated_at"],
+                    body=review.get("body") or "",
+                    file_ref=review.get("file_ref") if isinstance(review, dict) else {},
+                ),
+            ]
+        )
+    return source_refs
+
+
+def _work_preprocessing_ancestor_context(
+    conn: Any,
+    item_row: Any,
+    *,
+    limit: int = KANBAN_DEPTH_LIMIT + 2,
+) -> dict[str, Any]:
+    ancestors: list[dict[str, Any]] = []
+    for index, ancestor in enumerate(
+        _work_preprocessing_ancestor_rows(conn, item_row, limit=limit),
+        start=1,
+    ):
+        ancestor_id = ancestor["item_id"]
+        detail = _work_item_detail_document(conn, ancestor_id)
+        review = _work_item_review_document(conn, ancestor_id)
+        decision_rows = conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=?
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT 5
+            """,
+            (ancestor_id,),
+        ).fetchall()
+        ancestors.append(
+            {
+                "relationship": "parent" if index == 1 else f"ancestor_{index}",
+                "canonical_item_ref": f"xarta-kanban:item:{ancestor_id}",
+                "item": _work_preprocessing_item_summary(ancestor),
+                "documents": {
+                    "body_excerpt": _body_excerpt(
+                        str(ancestor["body_excerpt"] or ""),
+                        limit=5000,
+                    ),
+                    "detail_excerpt": _body_excerpt(
+                        str(detail.get("body") or ""),
+                        limit=8000,
+                    ),
+                    "review_excerpt": _body_excerpt(
+                        str(review.get("body") or ""),
+                        limit=8000,
+                    ),
+                },
+                "recent_decisions": [
+                    {
+                        "decision_id": row["decision_id"],
+                        "processor_kind": row["processor_kind"],
+                        "decision_type": row["decision_type"],
+                        "title": row["title"],
+                        "summary": row["summary"],
+                        "status": row["status"],
+                        "provider_mode": row["provider_mode"],
+                        "proof_refs": _json_value(row["proof_refs_json"], []),
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                    }
+                    for row in decision_rows
+                ],
+            }
+        )
+    return {
+        "schema": "xarta.kanban.preprocessing.ancestor_context.v1",
+        "item_id": item_row["item_id"],
+        "ancestor_count": len(ancestors),
+        "ancestors": ancestors,
+    }
+
+
+def _work_preprocessing_recent_decisions(
+    conn: Any,
+    *,
+    item_id: str,
+    current_source_hash: str,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    decision_rows = conn.execute(
+        """
+        SELECT * FROM kanban_review_decisions
+        WHERE item_id=?
+        ORDER BY updated_at DESC, created_at DESC, decision_id
+        LIMIT ?
+        """,
+        (item_id, max(limit * 2, limit)),
+    ).fetchall()
+    decisions: list[dict[str, Any]] = []
+    for row in decision_rows:
+        metadata = _json_value(row["metadata_json"], {})
+        decision_source_hash = str(metadata.get("document_source_hash") or "")
+        stale_failed_preprocessing = bool(
+            row["processor_kind"] == "preprocessing"
+            and row["status"] == "failed"
+            and decision_source_hash
+            and decision_source_hash != current_source_hash
+        )
+        if stale_failed_preprocessing:
+            continue
+        decisions.append(
+            {
+                "decision_id": row["decision_id"],
+                "processor_kind": row["processor_kind"],
+                "decision_type": row["decision_type"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "status": row["status"],
+                "provider_mode": row["provider_mode"],
+                "proof_refs": _json_value(row["proof_refs_json"], []),
+                "commit_link_ids": _json_value(row["commit_link_ids_json"], []),
+                "created_at": row["created_at"],
+            }
+        )
+        if len(decisions) >= limit:
+            break
+    return decisions
+
+
 def _work_preprocessing_source_classification(
     conn: Any,
     item_row: Any,
@@ -2278,6 +2483,7 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
             file_ref=review.get("file_ref") if isinstance(review, dict) else {},
         ),
     ]
+    source_refs.extend(_work_preprocessing_ancestor_source_refs(conn, item_row))
     counts = {
         "blocker_count": _preprocessing_count(
             conn,
@@ -2684,6 +2890,8 @@ def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[s
 
 def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
     retry_state = _work_review_marker_retry_state(row)
+    retry_active = retry_state in {"retry_waiting", "retry_due"}
+    next_retry_at = _row_value(row, "next_retry_at", "") if retry_active else ""
     return {
         "schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "marker_id": row["marker_id"],
@@ -2702,8 +2910,10 @@ def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
         "processing_expires_at": row["processing_expires_at"],
         "attempt_count": int(row["attempt_count"] or 0),
         "last_error": row["last_error"],
-        "next_retry_at": _row_value(row, "next_retry_at", ""),
-        "retry_after_seconds": int(_row_value(row, "retry_after_seconds", 0) or 0),
+        "next_retry_at": next_retry_at,
+        "retry_after_seconds": (
+            int(_row_value(row, "retry_after_seconds", 0) or 0) if retry_active else 0
+        ),
         "retry_attempt_count": int(_row_value(row, "retry_attempt_count", 0) or 0),
         "last_successful_source_hash": _row_value(row, "last_successful_source_hash", ""),
         "last_failure_event_id": _row_value(row, "last_failure_event_id", ""),
@@ -3120,12 +3330,15 @@ def _row_to_work_review_processor_schedule(schedule: dict[str, Any]) -> dict[str
 
 def _work_review_failure_event_payload(row: Any) -> dict[str, Any]:
     marker_status = _row_value(row, "marker_status", "") or row["status"]
-    marker_next_retry_at = _row_value(row, "marker_next_retry_at", "") or row["next_retry_at"]
+    raw_marker_next_retry_at = _row_value(row, "marker_next_retry_at", "")
     retry_state = _work_review_marker_retry_state(
         {
             "status": marker_status,
-            "next_retry_at": marker_next_retry_at,
+            "next_retry_at": raw_marker_next_retry_at,
         }
+    )
+    marker_next_retry_at = (
+        raw_marker_next_retry_at if retry_state in {"retry_waiting", "retry_due"} else ""
     )
     payload = _row_to_work_review_failure_event(row)
     item_id = payload["item_id"]
@@ -3135,6 +3348,8 @@ def _work_review_failure_event_payload(row: Any) -> dict[str, Any]:
             "item_ref": f"xarta-kanban:item:{item_id}" if item_id else "",
             "marker_status": marker_status,
             "marker_next_retry_at": marker_next_retry_at,
+            "raw_marker_next_retry_at": raw_marker_next_retry_at,
+            "scheduled_retry_at": payload["next_retry_at"],
             "retry_state": retry_state,
             "retry_waiting": retry_state == "retry_waiting",
             "terminal": retry_state == "terminal",
@@ -3203,6 +3418,11 @@ def _work_review_processor_failure_stats(
             row["error_class"],
         )
         payload = _work_review_failure_event_payload(row)
+        active_next_retry_at = (
+            payload["marker_next_retry_at"]
+            if payload["retry_state"] in {"retry_waiting", "retry_due"}
+            else ""
+        )
         existing = aggregates.get(key)
         failed_at = payload["failed_at"]
         if existing is None:
@@ -3222,7 +3442,8 @@ def _work_review_processor_failure_stats(
                 "last_error": payload["error_message"],
                 "provider_mode": payload["provider_mode"],
                 "model_alias": payload["model_alias"],
-                "next_retry_at": payload["marker_next_retry_at"] or payload["next_retry_at"],
+                "next_retry_at": active_next_retry_at,
+                "scheduled_retry_at": payload["next_retry_at"],
                 "retry_after_seconds": payload["retry_after_seconds"],
                 "retry_policy_version": payload["retry_policy_version"],
                 "marker_status": payload["marker_status"],
@@ -3249,7 +3470,8 @@ def _work_review_processor_failure_stats(
                     "last_error": payload["error_message"],
                     "provider_mode": payload["provider_mode"],
                     "model_alias": payload["model_alias"],
-                    "next_retry_at": payload["marker_next_retry_at"] or payload["next_retry_at"],
+                    "next_retry_at": active_next_retry_at,
+                    "scheduled_retry_at": payload["next_retry_at"],
                     "retry_after_seconds": payload["retry_after_seconds"],
                     "marker_status": payload["marker_status"],
                     "retry_state": payload["retry_state"],
@@ -3263,6 +3485,12 @@ def _work_review_processor_failure_stats(
         reverse=True,
     )
     aggregate_payloads = all_aggregate_payloads[:limit]
+    active_aggregate_payloads = [
+        entry
+        for entry in all_aggregate_payloads
+        if entry.get("retry_state") in {"retry_waiting", "retry_due"}
+        or entry.get("marker_status") == "failed"
+    ]
     waiting_retry_times = sorted(
         str(entry.get("next_retry_at") or "")
         for entry in all_aggregate_payloads
@@ -3275,9 +3503,16 @@ def _work_review_processor_failure_stats(
         "repeated_failure_count": sum(
             1 for entry in all_aggregate_payloads if int(entry["attempt_count"] or 0) > 1
         ),
+        "active_failure_count": len(active_aggregate_payloads),
         "retry_waiting_count": sum(1 for entry in all_aggregate_payloads if entry["retry_waiting"]),
+        "retry_due_count": sum(
+            1 for entry in all_aggregate_payloads if entry["retry_state"] == "retry_due"
+        ),
         "terminal_count": sum(1 for entry in all_aggregate_payloads if entry["terminal"]),
-        "last_error": aggregate_payloads[0]["last_error"] if aggregate_payloads else "",
+        "last_error": (
+            active_aggregate_payloads[0]["last_error"] if active_aggregate_payloads else ""
+        ),
+        "historical_last_error": aggregate_payloads[0]["last_error"] if aggregate_payloads else "",
         "next_retry_at": waiting_retry_times[0] if waiting_retry_times else "",
         "recent_events": [_work_review_failure_event_payload(row) for row in event_rows],
         "aggregates": aggregate_payloads,
@@ -9602,6 +9837,134 @@ def _resolve_stale_work_processor_marker_blockers(
     return resolved
 
 
+def _work_preprocessing_blocker_requests_parent_context(blocker_row: Any) -> bool:
+    provenance = _json_value(blocker_row["provenance_json"], {})
+    text = " ".join(
+        [
+            str(blocker_row["title"] or ""),
+            str(blocker_row["body_excerpt"] or ""),
+            str(provenance.get("reason") or ""),
+        ]
+    ).lower()
+    if "missing_parent_content" in text:
+        return True
+    return "parent" in text and any(
+        term in text for term in ("content", "context", "issue", "item")
+    )
+
+
+def _resolve_satisfied_work_preprocessing_parent_context_blockers(
+    conn: Any,
+    *,
+    item_row: Any,
+    meta: dict[str, str],
+    now: str,
+) -> list[dict[str, Any]]:
+    ancestor_context = _work_preprocessing_ancestor_context(conn, item_row)
+    ancestors = ancestor_context.get("ancestors") if isinstance(ancestor_context, dict) else []
+    if not isinstance(ancestors, list) or not ancestors:
+        return []
+    item_id = item_row["item_id"]
+    rows = conn.execute(
+        """
+        SELECT * FROM kanban_blockers
+        WHERE item_id=?
+          AND status NOT IN ('resolved', 'closed', 'done')
+          AND COALESCE(json_extract(provenance_json, '$.schema'), '') = ?
+        ORDER BY updated_at ASC, blocker_id
+        """,
+        (item_id, KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA),
+    ).fetchall()
+    resolved: list[dict[str, Any]] = []
+    ancestor_ids = [
+        str((ancestor.get("item") or {}).get("item_id") or "")
+        for ancestor in ancestors
+        if isinstance(ancestor, dict)
+    ]
+    ancestor_ids = [ancestor_id for ancestor_id in ancestor_ids if ancestor_id]
+    for blocker in rows:
+        if not _work_preprocessing_blocker_requests_parent_context(blocker):
+            continue
+        provenance = _json_value(blocker["provenance_json"], {})
+        title = "Resolved parent context preprocessing blocker"
+        body_excerpt = (
+            "Preprocessing now supplies parent and ancestor body/detail/review "
+            "excerpts plus recent decisions in ancestor_context, so this "
+            "automation-generated parent-context blocker no longer applies."
+        )
+        related_refs = [f"kanban_items:{ancestor_id}" for ancestor_id in ancestor_ids[:5]]
+        search_text, search_metadata, vector_key = _work_search_payload(
+            table_name="kanban_blockers",
+            row_id=blocker["blocker_id"],
+            kind="blocker",
+            title=title,
+            body=body_excerpt,
+            related_refs=related_refs,
+        )
+        updated_provenance = {
+            **provenance,
+            "resolved_by": meta["actor"],
+            "resolved_source_surface": meta["source_surface"],
+            "resolved_request_id": meta["request_id"],
+            "resolved_run_id": meta["run_id"],
+            "resolved_reason": "ancestor_context_available",
+            "ancestor_item_ids": ancestor_ids[:5],
+        }
+        conn.execute(
+            """
+            UPDATE kanban_blockers
+            SET title=?, body_excerpt=?, status='resolved', search_text=?,
+                search_metadata_json=?, vector_index_key=?, provenance_json=?,
+                updated_at=?
+            WHERE blocker_id=?
+            """,
+            (
+                title,
+                _body_excerpt(body_excerpt, limit=4000),
+                search_text,
+                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
+                vector_key,
+                json.dumps(updated_provenance, ensure_ascii=True, sort_keys=True),
+                now,
+                blocker["blocker_id"],
+            ),
+        )
+        blocker_row = conn.execute(
+            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+            (blocker["blocker_id"],),
+        ).fetchone()
+        source_hash = _hash_json_payload(
+            {
+                "blocker_id": blocker["blocker_id"],
+                "item_id": item_id,
+                "status": "resolved",
+                "resolved_reason": "ancestor_context_available",
+                "ancestor_item_ids": ancestor_ids[:5],
+            }
+        )
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=f"audit-{uuid.uuid4().hex}",
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="resolve_satisfied_preprocessing_parent_context_blocker",
+            target_ref=f"kanban_blockers:{blocker['blocker_id']}",
+            item_id=item_id,
+            parent_item_id=item_row["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="resolved",
+            source_hash=source_hash,
+            metadata={
+                "resolved_reason": "ancestor_context_available",
+                "ancestor_item_ids": ancestor_ids[:5],
+            },
+        )
+        resolved.append({"blocker_row": blocker_row, "audit_row": audit_row})
+    return resolved
+
+
 def _assert_agent_completion_not_blocked(
     conn: Any,
     *,
@@ -14234,6 +14597,7 @@ def _work_preprocessing_local_ai_messages(
     discussions: list[dict[str, Any]],
     recent_commits: list[dict[str, Any]],
     recent_decisions: list[dict[str, Any]],
+    ancestor_context: dict[str, Any],
     marker: dict[str, Any],
 ) -> list[dict[str, str]]:
     context = {
@@ -14267,15 +14631,19 @@ def _work_preprocessing_local_ai_messages(
         "evidence": {
             "recent_commits": recent_commits[:8],
             "recent_decisions": recent_decisions[:8],
+            "ancestor_context": ancestor_context,
         },
         "hard_rules": [
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
             "Preprocessing prepares the Kanban tree for agents; do not only list work in prose when child cards should be created.",
             "When missing context is really an operator question or external blocker, create a blocked decomposition item with the exact question/blocker at the smallest useful scope.",
+            "Use ancestor_context before reporting missing_parent_content or creating a child that only retrieves parent content; ancestor_context includes the rootward chain up to the Kanban depth limit, so block for parent content only when the needed parent or ancestor is absent or the supplied excerpts are insufficient.",
+            "Failed preprocessing decisions from older source hashes are durable history, not current blockers.",
             "If there are open blockers, ready must be false.",
             "A missing or stale context readiness marker is the scheduling reason for this preprocessing pass, not a blocker by itself.",
             "When the current documents, discussions, commits, status proof, and decisions are sufficient, set ready=true so the worker can refresh the readiness marker.",
+            "If a concrete leaf card is actionable by inspecting files, running commands, or doing the named investigation, set ready=true; do not mark it not ready merely because the investigation has not been performed yet.",
             "Previous failed preprocessing decisions are historical evidence; do not repeat them when newer timestamped discussions, commits, or status proof resolve the cited blocker.",
             "Background idle-worker audit/status evidence counts as autonomous-run proof when it is newer than a manual-trigger-only blocker decision.",
             "Readiness is not completion.",
@@ -14314,6 +14682,9 @@ def _work_preprocessing_local_ai_messages(
         "The queue_source reason may be missing_readiness_marker or "
         "readiness_marker_stale; treat that as why this pass is running, not "
         "as an automatic failure. "
+        "If the card is an actionable leaf whose next step is an audit, file "
+        "inspection, command run, or implementation task, mark it ready even "
+        "when that work has not been completed yet. "
         "When a required route, API, provider, proof path, or operator decision "
         "is missing, set ready=false and return decomposition_items for the "
         "smallest child work items that should be created, using blocked items "
@@ -14779,35 +15150,18 @@ async def _process_work_preprocessing_idle_marker(
             }
             for row in commit_rows
         ]
-        decision_rows = conn.execute(
-            """
-            SELECT * FROM kanban_review_decisions
-            WHERE item_id=?
-            ORDER BY updated_at DESC, created_at DESC, decision_id
-            LIMIT 8
-            """,
-            (item_id,),
-        ).fetchall()
-        recent_decisions = [
-            {
-                "decision_id": row["decision_id"],
-                "processor_kind": row["processor_kind"],
-                "decision_type": row["decision_type"],
-                "title": row["title"],
-                "summary": row["summary"],
-                "status": row["status"],
-                "provider_mode": row["provider_mode"],
-                "proof_refs": _json_value(row["proof_refs_json"], []),
-                "commit_link_ids": _json_value(row["commit_link_ids_json"], []),
-                "created_at": row["created_at"],
-            }
-            for row in decision_rows
-        ]
+        recent_decisions = _work_preprocessing_recent_decisions(
+            conn,
+            item_id=item_id,
+            current_source_hash=source["document_source_hash"],
+            limit=8,
+        )
         hints_row = conn.execute(
             "SELECT * FROM kanban_agent_hints WHERE item_id=?",
             (item_id,),
         ).fetchone()
         hints = _row_to_work_agent_hints(hints_row, item_id)
+        ancestor_context = _work_preprocessing_ancestor_context(conn, item)
     ai = await _work_automation_local_ai_json_completion(
         messages=_work_preprocessing_local_ai_messages(
             item=item,
@@ -14817,6 +15171,7 @@ async def _process_work_preprocessing_idle_marker(
             discussions=discussions,
             recent_commits=recent_commits,
             recent_decisions=recent_decisions,
+            ancestor_context=ancestor_context,
             marker=marker,
         ),
         run_id=run_id,
@@ -14861,6 +15216,8 @@ async def _process_work_preprocessing_idle_marker(
         "existing_items": [],
         "items": [],
     }
+    readiness_outcome = "ready"
+    readiness_normalization: dict[str, Any] = {}
     if not hard_blocking_codes and not ready:
         decomposition_result = await _work_preprocessing_create_decomposition_children(
             parent_item=item,
@@ -14870,10 +15227,23 @@ async def _process_work_preprocessing_idle_marker(
             marker_id=marker["marker_id"],
         )
         if int(decomposition_result.get("total_count") or 0) <= 0:
-            blocking_codes.append("missing_decomposition_items")
-            hard_blocking_codes.append("local_ai_reported_not_ready")
+            if blocking_codes:
+                blocking_codes.append("missing_decomposition_items")
+                hard_blocking_codes.append("local_ai_reported_not_ready")
+            else:
+                ready = True
+                readiness_outcome = "ready_leaf_no_decomposition"
+                readiness_normalization = {
+                    "schema": "xarta.kanban.preprocessing.readiness_normalization.v1",
+                    "reason": "model_reported_not_ready_without_blocker_or_decomposition",
+                    "model_ready": False,
+                    "model_decomposition_count": 0,
+                    "model_blocking_code_count": 0,
+                }
 
     if not ready and int(decomposition_result.get("total_count") or 0) <= 0:
+        if "missing_decomposition_items" not in blocking_codes:
+            blocking_codes.append("missing_decomposition_items")
         hard_blocking_codes.append("local_ai_reported_not_ready")
     if hard_blocking_codes:
         all_blocking_codes = list(dict.fromkeys([*blocking_codes, *hard_blocking_codes]))
@@ -15118,6 +15488,7 @@ async def _process_work_preprocessing_idle_marker(
         actor=holder_id,
         now=now,
         ai_payload=payload,
+        outcome=readiness_outcome,
     )
     metadata = dict(hints.get("metadata") or {})
     metadata["context_readiness_marker"] = readiness_marker
@@ -15168,6 +15539,7 @@ async def _process_work_preprocessing_idle_marker(
                 "marker_id": marker["marker_id"],
                 "document_source_hash": source["document_source_hash"],
                 "readiness_marker": readiness_marker,
+                "readiness_normalization": readiness_normalization or None,
                 "local_ai_payload": payload,
                 "local_ai_content_excerpt": ai["content_excerpt"],
             },
@@ -15195,6 +15567,8 @@ async def _process_work_preprocessing_idle_marker(
                 "processor_engine": "local-litellm-json",
                 "model_alias": ai["model_alias"],
                 "readiness_marker_context_hash": readiness_marker["context_hash"],
+                "readiness_outcome": readiness_outcome,
+                "readiness_normalization": readiness_normalization or None,
             },
         ),
     )
@@ -15943,6 +16317,16 @@ async def trigger_work_preprocessing_idle_scan(
             """,
             [*args, scan_limit],
         ).fetchall()
+        satisfied_parent_context_blockers: list[dict[str, Any]] = []
+        for item_row in item_rows:
+            satisfied_parent_context_blockers.extend(
+                _resolve_satisfied_work_preprocessing_parent_context_blockers(
+                    conn,
+                    item_row=item_row,
+                    meta=meta,
+                    now=now,
+                )
+            )
         scan_entries = [
             {
                 "item": item_row,
@@ -16061,6 +16445,9 @@ async def trigger_work_preprocessing_idle_scan(
                 "cancelled_current_count": len(cancelled_rows),
                 "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
+                "satisfied_parent_context_blocker_resolved_count": len(
+                    satisfied_parent_context_blockers
+                ),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
@@ -16090,6 +16477,9 @@ async def trigger_work_preprocessing_idle_scan(
                 "cancelled_current_count": len(cancelled_rows),
                 "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
+                "satisfied_parent_context_blocker_resolved_count": len(
+                    satisfied_parent_context_blockers
+                ),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
@@ -16167,6 +16557,23 @@ async def trigger_work_preprocessing_idle_scan(
                 marker_blocker["audit_row"],
                 gen,
             )
+        for marker_blocker in satisfied_parent_context_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
         for marker_row in queued_rows:
             enqueue_for_all_peers(
                 conn,
@@ -16204,6 +16611,7 @@ async def trigger_work_preprocessing_idle_scan(
         "cancelled_current_count": len(cancelled_markers),
         "cancelled_invalid_count": len(cancelled_invalid_markers),
         "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
+        "satisfied_parent_context_blocker_resolved_count": len(satisfied_parent_context_blockers),
         "current_ready_count": current_ready,
         "unchanged_current_count": unchanged_current,
         "unchanged_pending_count": unchanged_pending,

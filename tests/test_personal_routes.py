@@ -5633,9 +5633,47 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
             )
         )
     )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_decisions (
+            decision_id, item_id, processor_kind, decision_type, title, summary,
+            rationale, affected_refs_json, confidence, uncertainty, proof_refs_json,
+            commit_link_ids_json, status, provider_mode, source_hash, metadata_json,
+            provenance_json, created_at, updated_at
+        )
+        VALUES (?, ?, 'preprocessing', 'preprocessing_blocker_or_question', ?, ?, ?,
+                '[]', 'high', '', '[]', '[]', 'failed', 'local', ?, ?, '{}',
+                '2026-06-27T04:00:00Z', '2026-06-27T04:00:00Z')
+        """,
+        (
+            "kanban-decision-stale-preprocess-failure",
+            "work-preprocess-ai-child",
+            "Blocked stale parent context",
+            "Old source said parent context was missing.",
+            "This stale failed decision should not be replayed as current evidence.",
+            "sha256:stale-decision-row",
+            json.dumps(
+                {"document_source_hash": "sha256:old-pre-ancestor-context"},
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+        ),
+    )
+    conn.commit()
 
     async def fake_local_ai_json_completion(*, messages, run_id):
-        assert "missing_readiness_marker" in messages[1]["content"]
+        context = json.loads(messages[1]["content"])
+        assert context["queue_source"]["reason"] == "missing_readiness_marker"
+        assert "parent_body" in {ref["name"] for ref in context["queue_source"]["source_refs"]}
+        ancestor_context = context["evidence"]["ancestor_context"]
+        assert ancestor_context["ancestors"][0]["item"]["item_id"] == ("work-preprocess-ai-root")
+        assert (
+            ancestor_context["ancestors"][0]["documents"]["body_excerpt"]
+            == "Root item for preprocessing worker proof"
+        )
+        assert "kanban-decision-stale-preprocess-failure" not in {
+            decision["decision_id"] for decision in context["evidence"]["recent_decisions"]
+        }
         assert "scheduling reason for this preprocessing pass" in messages[1]["content"]
         assert "not as an automatic failure" in messages[0]["content"]
         return {
@@ -5896,6 +5934,112 @@ def test_work_preprocessing_blocked_child_materializes_visible_blocker(monkeypat
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "create_work_item_blocker" in audit_actions
+
+
+def test_work_preprocessing_scan_resolves_satisfied_parent_context_blocker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-parent-context-root",
+                title="Parent context root",
+                body="Parent body now supplied to child preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-parent-context-child",
+                parent_item_id="work-preprocess-parent-context-root",
+                title="Retrieve parent item content",
+                body="Fetch the parent item content before implementation.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+            provenance_json
+        )
+        VALUES (?, ?, ?, ?, 'open', ?, ?)
+        """,
+        (
+            "kanban-blocker-parent-context-satisfied",
+            "work-preprocess-parent-context-child",
+            "Preprocessing blocker/question: Fetch parent item content",
+            "Parent item content not available in current context; requires fetch.",
+            "kanban_review_processor_markers:marker-parent-context-old",
+            json.dumps(
+                {
+                    "schema": routes_personal.KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA,
+                    "marker_id": "marker-parent-context-old",
+                    "reason": "Parent item content not available in current context.",
+                    "source_item_id": "work-preprocess-parent-context-root",
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+        ),
+    )
+    conn.commit()
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-parent-context-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-parent-context-scan",
+            )
+        )
+    )
+
+    assert scan["satisfied_parent_context_blocker_resolved_count"] == 1
+    assert scan["queued_count"] == 1
+    blocker = conn.execute(
+        """
+        SELECT * FROM kanban_blockers
+        WHERE blocker_id='kanban-blocker-parent-context-satisfied'
+        """
+    ).fetchone()
+    assert blocker["status"] == "resolved"
+    assert "ancestor_context" in blocker["body_excerpt"]
+    marker = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_markers
+        WHERE item_id='work-preprocess-parent-context-child'
+        """
+    ).fetchone()
+    assert marker["status"] == "queued"
+    source = routes_personal._work_preprocessing_context_source(
+        conn,
+        conn.execute(
+            """
+            SELECT * FROM kanban_items
+            WHERE item_id='work-preprocess-parent-context-child'
+            """
+        ).fetchone(),
+    )
+    assert source["counts"]["blocker_count"] == 0
+    assert "parent_body" in {ref["name"] for ref in source["source_refs"]}
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "resolve_satisfied_preprocessing_parent_context_blocker" in audit_actions
 
 
 def test_work_preprocessing_duplicate_decomposition_titles_fail_without_children(
@@ -6210,6 +6354,136 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
         "SELECT * FROM kanban_blockers WHERE item_id='work-preprocess-malformed-child'"
     ).fetchone()
     assert blocker["status"] == "open"
+
+
+def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-actionable-root",
+                title="Actionable root",
+                body="Root item.",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-actionable-child",
+                parent_item_id="work-preprocess-actionable-root",
+                title="Audit report files",
+                body=(
+                    "Investigate docs/reports/structure-audit to identify target files. "
+                    "Proof: list candidate files and confirm active usage."
+                ),
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+
+    async def fake_local_ai_json_completion(*, messages, run_id):
+        return {
+            "model_alias": "TEST-KANBAN-LOCAL-AI",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                "ready": False,
+                "title": "Audit report files",
+                "summary": "The next action is to inspect the proof path and list files.",
+                "rationale": (
+                    "No operator question or external blocker exists; this is actionable "
+                    "investigation work for the current leaf."
+                ),
+                "confidence": "high",
+                "uncertainty": "",
+                "decomposition_items": [],
+                "recommended_next_actions": [
+                    "Scan docs/reports/structure-audit and list candidate files."
+                ],
+                "proof_refs": ["docs/reports/structure-audit"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_local_ai_json_completion,
+    )
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-preprocess-actionable-root",
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+    assert tick["processed_count"] == 1
+    processed = tick["processed_markers"][0]
+    assert processed["ok"] is True
+    assert processed["status"] == "processed"
+    marker = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_markers
+        WHERE item_id='work-preprocess-actionable-child'
+        """
+    ).fetchone()
+    assert marker["status"] == "processed"
+    assert marker["last_error"] == ""
+    assert marker["processed_source_hash"] == marker["document_source_hash"]
+    failure_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_review_processor_failure_events
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    ).fetchone()["count"]
+    assert failure_count == 0
+    blocker_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_blockers
+        WHERE item_id='work-preprocess-actionable-child' AND status='open'
+        """
+    ).fetchone()["count"]
+    assert blocker_count == 0
+    hints = asyncio.run(
+        routes_personal.get_work_item_agent_hints("work-preprocess-actionable-child")
+    )
+    readiness_marker = hints["agent_hints"]["metadata"]["context_readiness_marker"]
+    assert readiness_marker["preprocessing_outcome"] == "ready_leaf_no_decomposition"
+    assert readiness_marker["implementation_scope"] == "current_item"
+    assert "Scan docs/reports/structure-audit" in readiness_marker["recommended_next_actions"][0]
+    decision = conn.execute(
+        """
+        SELECT * FROM kanban_review_decisions
+        WHERE item_id='work-preprocess-actionable-child'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    metadata = json.loads(decision["metadata_json"])
+    assert metadata["readiness_normalization"]["reason"] == (
+        "model_reported_not_ready_without_blocker_or_decomposition"
+    )
+    assert metadata["local_ai_payload"]["ready"] is False
 
 
 def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch, tmp_path):
@@ -7897,6 +8171,168 @@ def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tm
     assert changed_marker["next_retry_at"] == ""
     assert changed_marker["retry_attempt_count"] == 0
     assert changed_marker["last_failure_event_id"] == ""
+
+
+def test_work_review_processor_status_clears_active_retry_summary_after_success(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-recovered-root",
+                title="Recovered retry root",
+                body="Root item.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-recovered-child",
+                parent_item_id="work-review-recovered-root",
+                title="Recovered retry child",
+                body="Child item with transient Review failure.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-recovered-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review content that first fails and then succeeds.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-doc",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-recovered-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    lease = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-recovered",
+                item_id="work-review-recovered-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-lease",
+            )
+        )
+    )
+    first_claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-recovered",
+                lease_token=lease["lease"]["lease_token"],
+                item_id="work-review-recovered-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-first-claim",
+            )
+        )
+    )
+    failed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            first_claim["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-recovered",
+                lease_token=lease["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="failed",
+                error="provider_failed",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-fail",
+            ),
+        )
+    )
+    failure_event = failed["failure_event"]
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET next_retry_at='2000-01-01T00:00:00Z'
+        WHERE marker_id=?
+        """,
+        (failed["marker"]["marker_id"],),
+    )
+    conn.commit()
+    retry_claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-recovered",
+                lease_token=lease["lease"]["lease_token"],
+                item_id="work-review-recovered-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-retry-claim",
+            )
+        )
+    )
+    recovered = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            retry_claim["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-recovered",
+                lease_token=lease["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="processed",
+                decision_id="kanban-decision-recovered",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-success",
+            ),
+        )
+    )
+    assert recovered["marker"]["status"] == "processed"
+    assert recovered["marker"]["last_error"] == ""
+    assert recovered["marker"]["next_retry_at"] == ""
+    assert recovered["marker"]["last_successful_source_hash"] == marker["document_source_hash"]
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-recovered-root")
+    )
+    assert status["failures"]["event_count"] == 1
+    assert status["failures"]["active_failure_count"] == 0
+    assert status["failures"]["retry_waiting_count"] == 0
+    assert status["failures"]["retry_due_count"] == 0
+    assert status["failures"]["last_error"] == ""
+    assert status["failures"]["historical_last_error"] == "provider_failed"
+    assert status["review_processor"]["retry_waiting_count"] == 0
+    assert status["review_processor"]["retry_due_count"] == 0
+    assert status["review_processor"]["last_error"] == ""
+    assert status["review_processor"]["next_retry_at"] == ""
+    aggregate = status["failures"]["aggregates"][0]
+    assert aggregate["last_error"] == "provider_failed"
+    assert aggregate["retry_state"] == "processed"
+    assert aggregate["retry_waiting"] is False
+    assert aggregate["next_retry_at"] == ""
+    assert aggregate["scheduled_retry_at"] == failure_event["next_retry_at"]
 
 
 def test_work_review_processor_failed_completion_clears_legacy_processed_hash(
