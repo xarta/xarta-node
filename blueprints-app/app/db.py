@@ -855,8 +855,6 @@ CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_item
     ON kanban_review_processor_markers(item_id, status, document_updated_at);
 CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_status
     ON kanban_review_processor_markers(processor_kind, status, queued_at);
-CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_retry
-    ON kanban_review_processor_markers(processor_kind, status, next_retry_at);
 
 CREATE TABLE IF NOT EXISTS kanban_review_processor_failure_events (
     failure_event_id    TEXT PRIMARY KEY,

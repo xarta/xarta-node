@@ -46,6 +46,7 @@ os.environ.setdefault("SEEKDB_DB", "blueprints_test")
 os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
+from app import db as app_db  # noqa: E402
 from app import routes_personal, routes_sync  # noqa: E402
 
 
@@ -649,6 +650,69 @@ def _make_conn() -> sqlite3.Connection:
     return conn
 
 
+def test_init_db_migrates_legacy_review_processor_marker_retry_columns(monkeypatch, tmp_path):
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    db_path = db_dir / "blueprints.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE kanban_review_processor_markers (
+                marker_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                processor_kind TEXT NOT NULL DEFAULT 'review',
+                document_type TEXT NOT NULL DEFAULT 'review',
+                document_ref TEXT NOT NULL DEFAULT '',
+                document_updated_at TEXT NOT NULL DEFAULT '',
+                document_source_hash TEXT NOT NULL DEFAULT '',
+                processed_document_updated_at TEXT NOT NULL DEFAULT '',
+                processed_source_hash TEXT NOT NULL DEFAULT '',
+                processed_at TEXT NOT NULL DEFAULT '',
+                queued_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                processing_started_at TEXT NOT NULL DEFAULT '',
+                processing_expires_at TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                superseded_at TEXT NOT NULL DEFAULT '',
+                superseded_by_source_hash TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                provider_mode TEXT NOT NULL DEFAULT 'local',
+                decision_id TEXT NOT NULL DEFAULT '',
+                source_hash TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(item_id, processor_kind, document_type)
+            );
+            """
+        )
+
+    monkeypatch.setattr(app_db.cfg, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(app_db.cfg, "DB_PATH", str(db_path))
+
+    app_db.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        marker_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(kanban_review_processor_markers)")
+        }
+        marker_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(kanban_review_processor_markers)")
+        }
+        failure_event_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(kanban_review_processor_failure_events)")
+        }
+
+    assert "next_retry_at" in marker_columns
+    assert "retry_attempt_count" in marker_columns
+    assert "last_successful_source_hash" in marker_columns
+    assert "idx_kanban_review_processor_markers_retry" in marker_indexes
+    assert "next_retry_at" in failure_event_columns
+
+
 @contextmanager
 def _conn_context(conn: sqlite3.Connection):
     yield conn
@@ -657,6 +721,10 @@ def _conn_context(conn: sqlite3.Connection):
 
 def _patch_conn(monkeypatch, conn: sqlite3.Connection) -> None:
     monkeypatch.setattr(routes_personal, "get_conn", lambda: _conn_context(conn))
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        routes_personal._work_automation_current_node_id(),
+    )
 
 
 def _disable_import_status_sync(monkeypatch) -> None:
@@ -2863,6 +2931,67 @@ def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp
     assert marker["status"] == "processed"
 
 
+def test_kanban_idle_worker_skips_non_owner_node(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "owner-node",
+    )
+    monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV, raising=False)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV,
+        str(tmp_path / "missing-kanban-automation-override"),
+    )
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+
+    assert tick["ok"] is True
+    assert tick["enabled"] is True
+    assert tick["effective_enabled"] is False
+    assert tick["runs_on_this_node"] is False
+    assert tick["current_node_id"] == "test-node"
+    assert tick["owner_node_id"] == "owner-node"
+    assert tick["reason"] == "idle_worker_not_owner_node"
+    assert tick["lease_acquired"] is False
+    assert tick["processed_count"] == 0
+    assert tick["eligible_marker_count"] == 0
+
+
+def test_kanban_idle_worker_singleton_override_allows_non_owner_node(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    override_path = tmp_path / "kanban-automation-override"
+    override_path.write_text("operator approved failover\n", encoding="utf-8")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "owner-node",
+    )
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV,
+        str(override_path),
+    )
+    monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV, raising=False)
+
+    config = routes_personal._work_automation_idle_worker_config()
+
+    assert config["current_node_id"] == "test-node"
+    assert config["owner_node_id"] == "owner-node"
+    assert config["singleton_owner_match"] is False
+    assert config["singleton_override"]["file"]["exists"] is True
+    assert config["singleton_override"]["active"] is True
+    assert config["runs_on_this_node"] is True
+    assert config["effective_enabled"] is True
+
+
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -4493,6 +4622,11 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     )
     assert status["provider_mode"]["automatic_switch"] is False
     assert status["idle_worker"]["local_ai_model_alias"] == "TEST-KANBAN-LOCAL-AI"
+    assert status["idle_worker"]["current_node_id"] == "test-node"
+    assert status["idle_worker"]["owner_node_id"] == "test-node"
+    assert status["idle_worker"]["owner_node_source"] == "owner_node_env"
+    assert status["idle_worker"]["runs_on_this_node"] is True
+    assert status["idle_worker"]["effective_enabled"] is True
     assert (
         status["idle_worker_contract"]["schema"]
         == routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA
@@ -4607,6 +4741,13 @@ def test_work_automation_idle_worker_contract_endpoint():
     assert result["ok"] is True
     assert contract["schema"] == routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA
     assert contract["source_of_truth"] is True
+    assert contract["singleton_guard"]["owner_node_env"] == (
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV
+    )
+    assert contract["singleton_guard"]["default_owner_source"] == "primary_flag_env"
+    assert contract["singleton_guard"]["primary_flag_env"] == (
+        routes_personal.KANBAN_AUTOMATION_PRIMARY_FLAG_ENV
+    )
     assert contract["scope_model"]["automatic_by_default"] is True
     assert contract["scope_model"]["background_root_scope_required"] is False
     assert contract["scope_model"]["exclusion_field"] == "kanban_items.automation_excluded"

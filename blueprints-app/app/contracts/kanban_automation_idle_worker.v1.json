@@ -4,7 +4,19 @@
   "version": "2026-06-28",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
-  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff.",
+  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards, but only the nominated singleton owner node should run it. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff.",
+  "singleton_guard": {
+    "required": true,
+    "owner_node_env": "BLUEPRINTS_KANBAN_AUTOMATION_OWNER_NODE_ID",
+    "default_owner_source": "primary_flag_env",
+    "current_node_source": "BLUEPRINTS_NODE_ID",
+    "primary_flag_env": "SYSTEM_BRIDGE_NOTIFIER_BLUEPRINTS_PRIMARY",
+    "override_env": "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE",
+    "override_path_env": "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH",
+    "default_override_path": "/etc/xarta-kanban-automation-singleton-override",
+    "rule": "Automatic background loop and idle-worker tick processing run only when current_node_id equals an explicit owner_node_id, or when no explicit owner is set and this node's private primary flag is active, unless an operator-created override env/file is active.",
+    "non_owner_result": "Return idle_worker_not_owner_node without scanning, queueing, requeueing timeouts, acquiring a lease, claiming markers, or processing work."
+  },
   "provider_mode": {
     "active": "local",
     "required_model_env": "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL",
@@ -134,7 +146,7 @@
       }
     ]
   },
-  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
+  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> B2{Current node is owner or override?}\n  B2 -- no --> Z2[Skip without scan/lease/claim]\n  B2 -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
   "must_pass_tests": [
     "No root env var set: idle worker still scans automatically.",
     "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
@@ -147,6 +159,7 @@
     "Missing or unavailable local AI model fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
     "Retryable Review Processor/preprocessing failure does not update processed_source_hash.",
     "Automation Status exposes failure events, repeated failure aggregates, attempt count, last error, next retry time, and retry-waiting/due state.",
-    "Source changes supersede retry wait and queue fresh work for the new source hash."
+    "Source changes supersede retry wait and queue fresh work for the new source hash.",
+    "A non-owner node returns idle_worker_not_owner_node and does not scan, queue, requeue, lease, claim, or process idle work."
   ]
 }
