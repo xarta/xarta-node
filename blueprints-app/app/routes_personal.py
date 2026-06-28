@@ -3257,22 +3257,28 @@ def _work_review_processor_failure_stats(
                     "terminal": payload["terminal"],
                 }
             )
-    aggregate_payloads = sorted(
+    all_aggregate_payloads = sorted(
         aggregates.values(),
         key=lambda entry: (entry["last_failed_at"], entry["marker_id"]),
         reverse=True,
-    )[:limit]
+    )
+    aggregate_payloads = all_aggregate_payloads[:limit]
+    waiting_retry_times = sorted(
+        str(entry.get("next_retry_at") or "")
+        for entry in all_aggregate_payloads
+        if entry.get("retry_waiting") and entry.get("next_retry_at")
+    )
     return {
         "schema": KANBAN_REVIEW_FAILURE_EVENT_SCHEMA,
         "processor_kind": clean_processor_kind or "all",
         "event_count": len(aggregate_rows),
         "repeated_failure_count": sum(
-            1 for entry in aggregate_payloads if int(entry["attempt_count"] or 0) > 1
+            1 for entry in all_aggregate_payloads if int(entry["attempt_count"] or 0) > 1
         ),
-        "retry_waiting_count": sum(1 for entry in aggregate_payloads if entry["retry_waiting"]),
-        "terminal_count": sum(1 for entry in aggregate_payloads if entry["terminal"]),
+        "retry_waiting_count": sum(1 for entry in all_aggregate_payloads if entry["retry_waiting"]),
+        "terminal_count": sum(1 for entry in all_aggregate_payloads if entry["terminal"]),
         "last_error": aggregate_payloads[0]["last_error"] if aggregate_payloads else "",
-        "next_retry_at": aggregate_payloads[0]["next_retry_at"] if aggregate_payloads else "",
+        "next_retry_at": waiting_retry_times[0] if waiting_retry_times else "",
         "recent_events": [_work_review_failure_event_payload(row) for row in event_rows],
         "aggregates": aggregate_payloads,
     }
@@ -3367,6 +3373,17 @@ def _work_review_processor_marker_stats(
         """,
         [*args, now],
     ).fetchone()
+    next_retry_row = conn.execute(
+        f"""
+        SELECT MIN(marker.next_retry_at) AS next_retry_at
+        FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where} AND marker.status='failed'
+          AND marker.next_retry_at != ''
+          AND marker.next_retry_at > ?
+        """,
+        [*args, now],
+    ).fetchone()
     failure_stats = _work_review_processor_failure_stats(
         conn,
         scope_ids,
@@ -3393,7 +3410,11 @@ def _work_review_processor_marker_stats(
         "failure_event_count": failure_stats["event_count"],
         "repeated_failure_count": failure_stats["repeated_failure_count"],
         "last_error": failure_stats["last_error"],
-        "next_retry_at": failure_stats["next_retry_at"],
+        "next_retry_at": (
+            next_retry_row["next_retry_at"]
+            if next_retry_row and next_retry_row["next_retry_at"]
+            else failure_stats["next_retry_at"]
+        ),
         "by_status": by_status,
         "last_scan_at": last_scan["created_at"] if last_scan else "",
         "last_scan": {
