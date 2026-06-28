@@ -7,8 +7,8 @@ Startup sequence:
   3. Run PRAGMA integrity_check — mark node as degraded if it fails.
   4. Register all API routers.
   5. Start async queue-drain background task.
-  6. Schedule boot catch-up task: compare gen with known peers; if behind or
-     degraded, pull a full backup from the highest-gen available peer.
+  6. Schedule boot catch-up task: if degraded, pull a full backup from a
+     trusted peer. Gen values are not used as cross-node freshness proof.
   7. Load nodes from .nodes.json into the DB.
   8. Serve /data/gui as static files at /ui.
 """

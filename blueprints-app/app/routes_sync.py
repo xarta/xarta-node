@@ -361,6 +361,11 @@ def _should_skip_stale_kanban_item_upsert(conn, action) -> bool:
     return False
 
 
+def _full_restore_allowed(*, force_restore: bool, integrity_ok: bool) -> bool:
+    """Full DB replacement is recovery-only unless explicitly forced."""
+    return bool(force_restore or not integrity_ok)
+
+
 def _apply_action(conn, action) -> None:
     """
     Replay a single peer action against the local DB.
@@ -846,7 +851,8 @@ async def receive_restore(request: Request) -> Response:
       - the zipped DB backup (bytes)
       - SHA-256 hex in X-Blueprints-Checksum header
 
-    Verifies the checksum then atomically replaces the local DB.
+    Verifies the checksum then atomically replaces the local DB only for
+    degraded-node recovery or explicit force restore.
     """
     sha256_hex = request.headers.get("x-blueprints-checksum", "")
     if not sha256_hex:
@@ -859,31 +865,23 @@ async def receive_restore(request: Request) -> Response:
     if not zip_bytes:
         raise HTTPException(400, "empty restore payload")
 
-    # Generation guard — reject stale backups from nodes with lower gen.
-    # A healthy node with gen=N should never be overwritten by a backup with
-    # gen<=N. This prevents a fresh empty node from wiping an established one.
-    # Nodes that are degraded (integrity_ok=false) always accept any backup.
-    sender_gen_str = request.headers.get("x-blueprints-gen", "")
-    if not force_restore and sender_gen_str:
-        try:
-            sender_gen = int(sender_gen_str)
-            with get_conn() as conn:
-                my_gen = get_gen(conn)
-                integrity_ok = get_meta(conn, "integrity_ok") == "true"
-            if integrity_ok and sender_gen <= my_gen:
-                log.info(
-                    "receive_restore: rejecting stale backup (sender gen=%d <= my gen=%d)",
-                    sender_gen,
-                    my_gen,
-                )
-                raise HTTPException(
-                    409,
-                    f"stale backup rejected: sender gen={sender_gen} <= my gen={my_gen}",
-                )
-        except HTTPException:
-            raise
-        except (ValueError, TypeError):
-            pass  # unparseable gen header — allow (backwards compat)
+    with get_conn() as conn:
+        integrity_ok = get_meta(conn, "integrity_ok") == "true"
+        my_gen = get_gen(conn)
+
+    if not _full_restore_allowed(force_restore=force_restore, integrity_ok=integrity_ok):
+        sender_gen = request.headers.get("x-blueprints-gen", "")
+        log.warning(
+            "receive_restore: rejecting unforced full DB restore on healthy node "
+            "(sender_gen=%s, my_gen=%d)",
+            sender_gen or "missing",
+            my_gen,
+        )
+        raise HTTPException(
+            409,
+            "full DB restore is recovery-only on healthy nodes; use explicit force restore "
+            "for operator-authorized fleet replacement",
+        )
 
     ok = await apply_restore(zip_bytes, sha256_hex)
     if not ok:

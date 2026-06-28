@@ -5,8 +5,8 @@ Wakes every 1–20 seconds (random jitter per the spec), checks for peers with
 pending actions, and POSTs them in batches to each peer's /api/v1/sync/actions
 endpoint.
 
-If a peer's queue depth is at or above SYNC_QUEUE_MAX_DEPTH, a full DB backup
-is sent instead (via the Layer 1 restore endpoint) and the queue is cleared.
+Full-DB restore is deliberately not a queue pressure relief path: normal
+catch-up must flow through row actions so per-row conflict guards still apply.
 
 The drain task is started once at application startup via start_drain_loop().
 """
@@ -22,7 +22,7 @@ import httpx
 
 from .. import config as cfg
 from ..auth import compute_token
-from ..db import get_conn, get_gen, get_meta
+from ..db import get_conn, get_meta
 from ..sync.queue import (
     get_peer_urls,
     get_peers_with_pending,
@@ -30,13 +30,11 @@ from ..sync.queue import (
     get_queue_depth,
     mark_sent,
 )
-from ..sync.restore import make_full_backup
 
 log = logging.getLogger(__name__)
 
 _drain_task: asyncio.Task | None = None
 _last_guid_cleanup: float = 0.0
-_full_backup_rejected_overflow_peers: set[str] = set()
 
 
 # ── mTLS client factory ──────────────────────────────────────────────────────
@@ -173,40 +171,21 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     fallback second).  Stops at the first successful connection.  If all
     addresses fail the peer is left queued and retried on the next drain cycle.
 
-    If the depth is at/above SYNC_QUEUE_MAX_DEPTH, send a full backup instead
-    and mark all pending items as sent (they will be covered by the backup).
+    If the depth is at/above SYNC_QUEUE_MAX_DEPTH, log the condition but keep
+    sending row actions. A generation counter is not a whole-database freshness
+    proof, so queue overflow must never trigger a DB replacement.
     """
     depth = get_queue_depth(node_id)
     log.debug("draining peer %s: %d pending actions", node_id, depth)
 
-    if depth < cfg.SYNC_QUEUE_MAX_DEPTH:
-        _full_backup_rejected_overflow_peers.discard(node_id)
-
     if depth >= cfg.SYNC_QUEUE_MAX_DEPTH:
-        if node_id in _full_backup_rejected_overflow_peers:
-            log.debug(
-                "queue overflow for peer %s (depth=%d) — full backup skipped until "
-                "depth falls below %d",
-                node_id,
-                depth,
-                cfg.SYNC_QUEUE_MAX_DEPTH,
-            )
-        else:
-            log.warning(
-                "queue overflow for peer %s (depth=%d) — sending full backup",
-                node_id,
-                depth,
-            )
-            if await _send_full_backup(node_id, peer_urls):
-                _full_backup_rejected_overflow_peers.discard(node_id)
-                return
-            _full_backup_rejected_overflow_peers.add(node_id)
-            log.warning(
-                "full backup path not accepted for peer %s — falling back to batched action "
-                "drain and suppressing full backup retries until depth falls below %d",
-                node_id,
-                cfg.SYNC_QUEUE_MAX_DEPTH,
-            )
+        log.warning(
+            "queue overflow for peer %s (depth=%d >= %d) — continuing batched row drain; "
+            "full DB restore is recovery-only",
+            node_id,
+            depth,
+            cfg.SYNC_QUEUE_MAX_DEPTH,
+        )
 
     actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
     if not actions:
@@ -274,59 +253,3 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
             except Exception:
                 log.exception("error draining to peer %s at %s", node_id, url)
         log.debug("peer %s unreachable on all addresses — will retry next cycle", node_id)
-
-
-async def _send_full_backup(node_id: str, peer_urls: list[str]) -> bool:
-    """Send a full DB backup zip to a peer's Layer 1 restore endpoint.
-
-    Tries each URL in peer_urls in order, stopping at the first successful
-    delivery.  Returns True on success; False when not delivered.
-    """
-    try:
-        with get_conn() as conn:
-            current_gen = get_gen(conn)
-        zip_bytes, sha256_hex = make_full_backup()
-    except Exception:
-        log.exception("failed to create full backup for peer %s", node_id)
-        return False
-
-    _restore_headers = {
-        "content-type": "application/octet-stream",
-        "x-blueprints-checksum": sha256_hex,
-        "x-blueprints-gen": str(current_gen),
-    }
-    if cfg.SYNC_SECRET:
-        _restore_headers["x-api-token"] = compute_token(cfg.SYNC_SECRET)
-
-    async with _make_sync_client(60.0) as client:
-        for url in peer_urls:
-            try:
-                resp = await client.post(
-                    f"{url}/api/v1/sync/restore",
-                    content=zip_bytes,
-                    headers=_restore_headers,
-                )
-                if resp.status_code == 204:
-                    log.info("full backup sent to peer %s via %s", node_id, url)
-                    # Mark all pending actions as sent — the backup supersedes them
-                    with get_conn() as conn:
-                        conn.execute(
-                            "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
-                            (node_id,),
-                        )
-                    return True
-                else:
-                    log.warning(
-                        "peer %s rejected full backup via %s: HTTP %d — trying next address",
-                        node_id,
-                        url,
-                        resp.status_code,
-                    )
-            except httpx.ConnectError:
-                log.debug(
-                    "peer %s unreachable at %s for full backup — trying next address", node_id, url
-                )
-            except Exception:
-                log.exception("error sending full backup to peer %s at %s", node_id, url)
-        log.debug("peer %s unreachable on all addresses for full backup — will retry", node_id)
-    return False

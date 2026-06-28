@@ -63,24 +63,16 @@ class _FakeClient:
         return _Response(self._status_code)
 
 
-def test_full_backup_rejection_suppressed_until_queue_leaves_overflow(monkeypatch):
-    backup_attempts = []
+def test_queue_overflow_continues_batched_row_drain(monkeypatch):
     action_posts = []
     marked_sent = []
-    depth = {"value": 3}
 
-    async def fake_send_full_backup(node_id, peer_urls):
-        backup_attempts.append((node_id, tuple(peer_urls)))
-        return False
-
-    monkeypatch.setattr(drain, "_full_backup_rejected_overflow_peers", set())
     monkeypatch.setattr(drain.cfg, "NODE_ID", "test-node")
     monkeypatch.setattr(drain.cfg, "COMMIT_TS", 123)
     monkeypatch.setattr(drain.cfg, "SYNC_SECRET", "")
     monkeypatch.setattr(drain.cfg, "SYNC_QUEUE_MAX_DEPTH", 2)
     monkeypatch.setattr(drain.cfg, "SYNC_BATCH_SIZE", 1)
-    monkeypatch.setattr(drain, "get_queue_depth", lambda node_id: depth["value"])
-    monkeypatch.setattr(drain, "_send_full_backup", fake_send_full_backup)
+    monkeypatch.setattr(drain, "get_queue_depth", lambda node_id: 3)
     monkeypatch.setattr(
         drain,
         "get_pending_actions",
@@ -102,21 +94,8 @@ def test_full_backup_rejection_suppressed_until_queue_leaves_overflow(monkeypatc
     asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
     asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
 
-    assert len(backup_attempts) == 1
     assert len(action_posts) == 2
     assert marked_sent == [[10], [10]]
-
-    depth["value"] = 1
-    asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
-
-    assert len(backup_attempts) == 1
-    assert len(action_posts) == 3
-
-    depth["value"] = 3
-    asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
-
-    assert len(backup_attempts) == 2
-    assert len(action_posts) == 4
 
 
 def test_action_commit_guard_rejection_keeps_actions_queued(monkeypatch):
