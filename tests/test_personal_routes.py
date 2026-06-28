@@ -469,12 +469,44 @@ def _make_conn() -> sqlite3.Connection:
             processing_expires_at TEXT NOT NULL DEFAULT '',
             attempt_count INTEGER NOT NULL DEFAULT 0,
             last_error TEXT NOT NULL DEFAULT '',
+            next_retry_at TEXT NOT NULL DEFAULT '',
+            retry_after_seconds INTEGER NOT NULL DEFAULT 0,
+            retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_successful_source_hash TEXT NOT NULL DEFAULT '',
+            last_failure_event_id TEXT NOT NULL DEFAULT '',
+            last_failure_source_hash TEXT NOT NULL DEFAULT '',
+            last_error_class TEXT NOT NULL DEFAULT '',
+            retry_policy_version TEXT NOT NULL DEFAULT '',
             superseded_at TEXT NOT NULL DEFAULT '',
             superseded_by_source_hash TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'queued',
             provider_mode TEXT NOT NULL DEFAULT 'local',
             decision_id TEXT NOT NULL DEFAULT '',
             source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
+        );
+        CREATE TABLE kanban_review_processor_failure_events (
+            failure_event_id TEXT PRIMARY KEY,
+            marker_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            processor_kind TEXT NOT NULL DEFAULT 'review',
+            document_type TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            error_class TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            provider_mode TEXT NOT NULL DEFAULT 'local',
+            model_alias TEXT NOT NULL DEFAULT '',
+            attempt_number INTEGER NOT NULL DEFAULT 0,
+            failed_at TEXT NOT NULL DEFAULT '',
+            next_retry_at TEXT NOT NULL DEFAULT '',
+            retry_after_seconds INTEGER NOT NULL DEFAULT 0,
+            retry_policy_version TEXT NOT NULL DEFAULT '',
+            retryable INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'retry_waiting',
+            event_hash TEXT NOT NULL DEFAULT '',
             metadata_json TEXT NOT NULL DEFAULT '{}',
             provenance_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
@@ -2857,6 +2889,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_review_processor_leases") == "lease_id"
     assert "kanban_review_processor_markers" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_review_processor_markers") == "marker_id"
+    assert "kanban_review_processor_failure_events" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_review_processor_failure_events") == "failure_event_id"
     assert "kanban_agent_hints" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
     assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
@@ -4598,13 +4632,18 @@ def test_work_review_processor_metadata_contract_endpoint():
     )
     assert fields["processed_at"]["alias"] == "last_processed_at"
     assert (
-        "terminal processed, failed, skipped, or cancelled"
+        "retryable failed outcomes never update this field"
         in fields["processed_at"]["updates_when"]
     )
     assert (
-        "terminal processed, failed, skipped, or cancelled"
+        "retryable failed outcomes never update this field"
         in fields["processed_source_hash"]["updates_when"]
     )
+    assert fields["last_successful_source_hash"]["scope"] == "kanban_review_processor_markers"
+    assert fields["next_retry_at"]["scope"] == "kanban_review_processor_markers"
+    assert fields["retry_attempt_count"]["scope"] == "kanban_review_processor_markers"
+    assert contract["failure_event_schema"] == routes_personal.KANBAN_REVIEW_FAILURE_EVENT_SCHEMA
+    assert contract["retry_policy_version"] == routes_personal.KANBAN_REVIEW_RETRY_POLICY_VERSION
     assert fields["status"]["allowed_values"] == [
         "queued",
         "processing",
@@ -4620,6 +4659,32 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert "metadata.cancelled_previous_status" in contract["cancellation_fields"]
     assert any("body_hash is unchanged" in rule for rule in contract["transition_rules"])
     assert any("review_document_deleted" in rule for rule in contract["transition_rules"])
+
+
+def test_work_review_processor_retry_backoff_schedule_and_cap():
+    expected = [
+        5 * 60,
+        20 * 60,
+        60 * 60,
+        4 * 60 * 60,
+        12 * 60 * 60,
+        24 * 60 * 60,
+        2 * 24 * 60 * 60,
+        4 * 24 * 60 * 60,
+        6 * 24 * 60 * 60,
+    ]
+    assert [
+        routes_personal._work_review_retry_after_seconds(attempt)
+        for attempt in range(1, len(expected) + 1)
+    ] == expected
+    assert routes_personal._work_review_retry_after_seconds(99) == 6 * 24 * 60 * 60
+    assert routes_personal._work_review_retry_after_seconds(99) < 7 * 24 * 60 * 60
+    assert routes_personal._work_review_retry_next_at("2026-06-28T10:00:00Z", 1) == (
+        "2026-06-28T10:05:00Z"
+    )
+    assert routes_personal._work_review_retry_next_at("2026-06-28T10:00:00Z", 9) == (
+        "2026-07-04T10:00:00Z"
+    )
 
 
 def test_work_preprocessing_readiness_contract_endpoint():
@@ -5980,10 +6045,120 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
         """
     ).fetchone()
     assert marker["status"] == "failed"
+    assert marker["processed_source_hash"] == ""
+    assert marker["processed_at"] == ""
+    assert marker["retry_attempt_count"] == 1
+    assert marker["retry_after_seconds"] == 5 * 60
+    assert marker["next_retry_at"]
+    assert marker["last_error_class"] == "local_ai_response_validation"
+    event = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_failure_events
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    ).fetchone()
+    assert event["processor_kind"] == "preprocessing"
+    assert event["source_hash"] == marker["document_source_hash"]
+    assert event["error_class"] == "local_ai_response_validation"
+    assert event["attempt_number"] == 1
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-preprocess-malformed-root")
+    )
+    assert status["preprocessing"]["retry_waiting_count"] == 1
+    assert status["preprocessing"]["failure_aggregates"][0]["processor_kind"] == "preprocessing"
+    assert status["failures"]["recent_events"][0]["processor_kind"] == "preprocessing"
     blocker = conn.execute(
         "SELECT * FROM kanban_blockers WHERE item_id='work-preprocess-malformed-child'"
     ).fetchone()
     assert blocker["status"] == "open"
+
+
+def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, raising=False)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-missing-model-root",
+                title="Missing model root",
+                body="Root item.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-missing-model-child",
+                parent_item_id="work-review-missing-model-root",
+                title="Missing model child",
+                body="This item has Review data but no local model alias.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-missing-model-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review work requiring local AI.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-missing-model-doc",
+            ),
+        )
+    )
+
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-review-missing-model-root",
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+    assert tick["processed_count"] == 1
+    processed = tick["processed_markers"][0]
+    assert processed["ok"] is False
+    assert processed["status"] == "failed"
+    assert routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV in processed["error"]
+    marker = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_markers
+        WHERE item_id='work-review-missing-model-child'
+        """
+    ).fetchone()
+    assert marker["status"] == "failed"
+    assert marker["processed_source_hash"] == ""
+    assert marker["processed_at"] == ""
+    assert marker["retry_attempt_count"] == 1
+    assert marker["next_retry_at"]
+    assert marker["last_error_class"] == "local_ai_configuration"
+    event = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_failure_events
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    ).fetchone()
+    assert event["error_class"] == "local_ai_configuration"
+    assert event["provider_mode"] == "local"
+    assert event["model_alias"] == ""
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-missing-model-root")
+    )
+    assert status["failures"]["recent_events"][0]["error_class"] == "local_ai_configuration"
+    assert status["review_processor"]["retry_waiting_count"] == 1
 
 
 def test_work_automation_idle_tick_does_not_claim_markers_queued_mid_tick(monkeypatch, tmp_path):
@@ -7410,11 +7585,36 @@ def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tm
     failed_marker = completed["marker"]
     assert failed_marker["status"] == "failed"
     assert failed_marker["last_error"] == "provider_failed"
-    assert failed_marker["processed_at"]
-    assert failed_marker["processed_source_hash"] == marker["document_source_hash"]
-    assert failed_marker["processed_document_updated_at"] == marker["document_updated_at"]
+    assert failed_marker["processed_at"] == ""
+    assert failed_marker["processed_source_hash"] == ""
+    assert failed_marker["processed_document_updated_at"] == ""
+    assert failed_marker["last_successful_source_hash"] == ""
+    assert failed_marker["retry_state"] == "retry_waiting"
+    assert failed_marker["retry_waiting"] is True
+    assert failed_marker["retry_attempt_count"] == 1
+    assert failed_marker["retry_after_seconds"] == 5 * 60
+    assert failed_marker["next_retry_at"]
+    assert failed_marker["last_failure_event_id"]
+    assert failed_marker["last_failure_source_hash"] == marker["document_source_hash"]
+    assert (
+        failed_marker["retry_policy_version"] == routes_personal.KANBAN_REVIEW_RETRY_POLICY_VERSION
+    )
     assert failed_marker["metadata"]["last_outcome_status"] == "failed"
-    assert failed_marker["metadata"]["last_processed_at"] == failed_marker["processed_at"]
+    assert failed_marker["metadata"]["retryable"] is True
+    assert failed_marker["metadata"]["failure_attempt"] == 1
+    failure_event = completed["failure_event"]
+    assert failure_event["failure_event_id"] == failed_marker["last_failure_event_id"]
+    assert failure_event["item_id"] == "work-review-failed-child"
+    assert failure_event["marker_id"] == failed_marker["marker_id"]
+    assert failure_event["processor_kind"] == "review"
+    assert failure_event["source_hash"] == marker["document_source_hash"]
+    assert failure_event["error_message"] == "provider_failed"
+    assert failure_event["attempt_number"] == 1
+    assert failure_event["retry_after_seconds"] == 5 * 60
+    assert failure_event["next_retry_at"] == failed_marker["next_retry_at"]
+    assert (
+        failure_event["retry_policy_version"] == routes_personal.KANBAN_REVIEW_RETRY_POLICY_VERSION
+    )
     processor_blocker = completed["processor_blocker"]
     assert processor_blocker["item_id"] == "work-review-failed-child"
     assert processor_blocker["status"] == "open"
@@ -7441,6 +7641,124 @@ def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tm
     )
     assert same_scan["queued_count"] == 0
     assert same_scan["unchanged_failed_count"] == 1
+
+    early_claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-failed-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-early-retry-claim",
+            )
+        )
+    )
+    assert early_claim["claimed"] is False
+    assert early_claim["reason"] == "no_queued_marker"
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-failed-root")
+    )
+    assert status["review_processor"]["retry_waiting_count"] == 1
+    assert status["review_processor"]["scheduler"]["failure_event_count"] == 1
+    assert (
+        status["failures"]["recent_events"][0]["failure_event_id"]
+        == failure_event["failure_event_id"]
+    )
+    aggregate = status["failures"]["aggregates"][0]
+    assert aggregate["item_title"] == "Review failed child"
+    assert aggregate["processor_kind"] == "review"
+    assert aggregate["attempt_count"] == 1
+    assert aggregate["last_error"] == "provider_failed"
+    assert aggregate["retry_waiting"] is True
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert "kanban_review_processor_failure_events" in sync_tables
+
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET next_retry_at='2000-01-01T00:00:00Z'
+        WHERE marker_id=?
+        """,
+        (failed_marker["marker_id"],),
+    )
+    conn.commit()
+    retry_claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-failed-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-retry-claim",
+            )
+        )
+    )
+    assert retry_claim["claimed"] is True
+    retry_complete = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            retry_claim["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="failed",
+                error="provider_failed_again",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-retry-complete",
+            ),
+        )
+    )
+    assert retry_complete["marker"]["processed_source_hash"] == ""
+    assert retry_complete["marker"]["retry_attempt_count"] == 2
+    assert retry_complete["marker"]["retry_after_seconds"] == 20 * 60
+    assert retry_complete["failure_event"]["attempt_number"] == 2
+
+    repeated_status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-failed-root")
+    )
+    assert repeated_status["failures"]["repeated_failure_count"] == 1
+    repeated_aggregate = repeated_status["failures"]["aggregates"][0]
+    assert repeated_aggregate["attempt_count"] == 2
+    assert repeated_aggregate["last_error"] == "provider_failed_again"
+
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-failed-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review failed completion pass two supersedes retry wait.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-review-change",
+            ),
+        )
+    )
+    changed_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-failed-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-failed-scan-changed",
+            )
+        )
+    )
+    assert changed_scan["queued_count"] == 1
+    changed_marker = changed_scan["queued_markers"][0]
+    assert changed_marker["status"] == "queued"
+    assert changed_marker["document_source_hash"] != marker["document_source_hash"]
+    assert changed_marker["processed_source_hash"] == ""
+    assert changed_marker["next_retry_at"] == ""
+    assert changed_marker["retry_attempt_count"] == 0
+    assert changed_marker["last_failure_event_id"] == ""
 
 
 def test_work_review_processor_archive_cancels_active_marker(monkeypatch, tmp_path):

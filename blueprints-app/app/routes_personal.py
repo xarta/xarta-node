@@ -85,7 +85,20 @@ KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA = "xarta.kanban.review_processor.policy.v
 KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA = "xarta.kanban.review_processor.metadata_contract.v1"
 KANBAN_REVIEW_LEASE_SCHEMA = "xarta.kanban.review_processor.lease.v1"
 KANBAN_REVIEW_MARKER_SCHEMA = "xarta.kanban.review_processor.marker.v1"
+KANBAN_REVIEW_FAILURE_EVENT_SCHEMA = "xarta.kanban.review_processor.failure_event.v1"
 KANBAN_REVIEW_SCHEDULER_SCHEMA = "xarta.kanban.review_processor.scheduler.v1"
+KANBAN_REVIEW_RETRY_POLICY_VERSION = "xarta.kanban.review_processor.retry_policy.v1"
+KANBAN_REVIEW_RETRY_BACKOFF_SECONDS = (
+    5 * 60,
+    20 * 60,
+    60 * 60,
+    4 * 60 * 60,
+    12 * 60 * 60,
+    24 * 60 * 60,
+    2 * 24 * 60 * 60,
+    4 * 24 * 60 * 60,
+    6 * 24 * 60 * 60,
+)
 KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.readiness_contract.v1"
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
@@ -979,7 +992,7 @@ def _work_review_processing_policy() -> dict[str, Any]:
     return {
         "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
         "status": "active",
-        "version": "2026-06-27",
+        "version": "2026-06-28",
         "active_mode": "local",
         "applies_to": ["review_processor", "preprocessing"],
         "cloud_processing": {
@@ -993,7 +1006,7 @@ def _work_review_processing_policy() -> dict[str, Any]:
             "gate": "private_no_think_no_protection_no_orientation_endpoint_required",
             "automatic_switch": False,
             "model_alias": local_model_alias,
-            "failure_policy": "fail_marker_and_record_visible_error",
+            "failure_policy": "record_retryable_failure_event_and_backoff",
         },
         "provider_choice": {
             "required": True,
@@ -1025,10 +1038,13 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
     return {
         "schema": KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA,
         "status": "active",
-        "version": "2026-06-27",
+        "version": "2026-06-28",
         "review_document_schema": KANBAN_ITEM_REVIEW_SCHEMA,
         "marker_schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "scheduler_schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
+        "failure_event_schema": KANBAN_REVIEW_FAILURE_EVENT_SCHEMA,
+        "retry_policy_version": KANBAN_REVIEW_RETRY_POLICY_VERSION,
+        "retry_backoff_seconds": list(KANBAN_REVIEW_RETRY_BACKOFF_SECONDS),
         "provider_mode": {
             "active": processing_policy["active_mode"],
             "local_processing_gate": processing_policy["local_processing"]["gate"],
@@ -1037,6 +1053,7 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
         "storage": {
             "review_document": "item Review markdown frontmatter",
             "marker_table": "kanban_review_processor_markers",
+            "failure_event_table": "kanban_review_processor_failure_events",
             "decision_table": "kanban_review_decisions",
         },
         "required_fields": [
@@ -1071,15 +1088,45 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             {
                 "field": "processed_source_hash",
                 "scope": "kanban_review_processor_markers",
-                "meaning": "Last terminal Review source hash recorded for duplicate-scan suppression.",
-                "updates_when": "marker completes with a terminal processed, failed, skipped, or cancelled status.",
+                "meaning": "Last non-retryable processed source hash recorded for duplicate-scan suppression.",
+                "updates_when": "marker completes with processed success or a terminal non-retryable skipped/cancelled outcome; retryable failed outcomes never update this field.",
             },
             {
                 "field": "processed_at",
                 "scope": "kanban_review_processor_markers",
                 "alias": "last_processed_at",
-                "meaning": "UTC time of the last terminal Review snapshot outcome.",
-                "updates_when": "marker completes with a terminal processed, failed, skipped, or cancelled status.",
+                "meaning": "UTC time of the last non-retryable processed source outcome.",
+                "updates_when": "marker completes with processed success or a terminal non-retryable skipped/cancelled outcome; retryable failed outcomes never update this field.",
+            },
+            {
+                "field": "last_successful_source_hash",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Last source hash that completed with processed success.",
+                "updates_when": "marker completes with processed status.",
+            },
+            {
+                "field": "next_retry_at",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "UTC time when a retryable failed marker becomes claimable again.",
+                "updates_when": "marker completes with failed status under the retry policy, then clears when claimed, superseded, cancelled, or processed.",
+            },
+            {
+                "field": "retry_attempt_count",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Source-specific failed attempt count for the current retry series.",
+                "updates_when": "marker completes with failed status for the current document_source_hash; reset when source changes or succeeds.",
+            },
+            {
+                "field": "last_failure_event_id",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Pointer to the latest durable failure event for the current retry series.",
+                "updates_when": "marker completes with failed status.",
+            },
+            {
+                "field": "last_error_class",
+                "scope": "kanban_review_processor_markers",
+                "meaning": "Machine-readable class for the latest retryable failure.",
+                "updates_when": "marker completes with failed status.",
             },
             {
                 "field": "status",
@@ -1134,6 +1181,8 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             "Review saves preserve updated_at and document_source_hash when body_hash is unchanged.",
             "Explicit feedback captures append to the item Review markdown and update review_document.metadata.operator_feedback.",
             "Idle scan queues a marker when document_source_hash differs from processed_source_hash and no current queued/processing marker exists for the same document.",
+            "A retryable failed marker records a kanban_review_processor_failure_events row, sets next_retry_at using capped exponential backoff, and does not update processed_source_hash.",
+            "A failed marker becomes claimable again after next_retry_at unless the source is superseded, the item is archived/deleted/excluded, or the operator cancels/disables the work.",
             "A processing marker is requeued with last_error=processing_timeout when processing_expires_at is in the past.",
             "A processing marker is requeued with last_error=review_changed_during_processing and superseded fields when Review content changes during processing.",
             "A queued or processing marker is cancelled with last_error=review_document_deleted when Review text is emptied or removed.",
@@ -1717,6 +1766,107 @@ def _clean_review_marker_outcome_status(value: str | None) -> str:
     return status if status in allowed else "processed"
 
 
+def _row_value(row: Any | None, key: str, default: Any = "") -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    with suppress(Exception):
+        if hasattr(row, "keys") and key not in row.keys():
+            return default
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _work_review_retry_after_seconds(attempt_number: int | str | None) -> int:
+    try:
+        attempt = int(attempt_number or 1)
+    except (TypeError, ValueError):
+        attempt = 1
+    attempt = max(1, attempt)
+    index = min(attempt - 1, len(KANBAN_REVIEW_RETRY_BACKOFF_SECONDS) - 1)
+    return int(KANBAN_REVIEW_RETRY_BACKOFF_SECONDS[index])
+
+
+def _work_review_retry_next_at(now: str, attempt_number: int | str | None) -> str:
+    now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
+    return _utc_iso_from_datetime(
+        now_dt + timedelta(seconds=_work_review_retry_after_seconds(attempt_number))
+    )
+
+
+def _work_review_marker_retry_state(row: Any | None, *, now: str | None = None) -> str:
+    status = _clean_short_text(_row_value(row, "status", ""), "", limit=80)
+    if status != "failed":
+        if status in {"skipped", "cancelled"}:
+            return "terminal"
+        return status or "unknown"
+    next_retry_at = _clean_short_text(_row_value(row, "next_retry_at", ""), "", limit=80)
+    if not next_retry_at:
+        return "retry_due"
+    now_dt = _parse_utc_datetime(now or _utc_now_iso()) or datetime.now(timezone.utc)
+    retry_dt = _parse_utc_datetime(next_retry_at)
+    if retry_dt is not None and retry_dt > now_dt:
+        return "retry_waiting"
+    return "retry_due"
+
+
+def _work_processor_marker_claimable_state_predicate(marker_alias: str = "marker") -> str:
+    safe_marker_alias = "".join(
+        ch for ch in str(marker_alias or "marker") if ch.isalnum() or ch == "_"
+    )
+    if not safe_marker_alias:
+        safe_marker_alias = "marker"
+    return f"""
+    (
+        {safe_marker_alias}.status='queued'
+        OR (
+            {safe_marker_alias}.status='failed'
+            AND (
+                COALESCE({safe_marker_alias}.next_retry_at, '')=''
+                OR {safe_marker_alias}.next_retry_at <= ?
+            )
+        )
+    )
+    """
+
+
+def _work_review_failure_event_id(
+    marker_id: str,
+    source_hash: str,
+    attempt_number: int,
+    failed_at: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{marker_id}\n{source_hash}\n{attempt_number}\n{failed_at}".encode("utf-8")
+    ).hexdigest()
+    return f"kanban-review-failure-{digest[:24]}"
+
+
+def _work_review_failure_error_class(error: str, metadata: dict[str, Any]) -> str:
+    explicit = _clean_short_text(
+        str(metadata.get("error_class") or metadata.get("exception_class") or ""),
+        "",
+        limit=120,
+    )
+    if explicit:
+        return explicit
+    message = str(error or "")
+    lower = message.lower()
+    if KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV.lower() in lower and "required" in lower:
+        return "local_ai_configuration"
+    if "local ai response missing required field" in lower or "missing required field" in lower:
+        return "local_ai_response_validation"
+    if "timeout" in lower:
+        return "processing_timeout"
+    if "local_ai" in lower or "local ai" in lower:
+        return "local_ai_processing"
+    return "processing_error"
+
+
 def _review_document_ref(document: dict[str, Any]) -> str:
     file_ref = document.get("file_ref") if isinstance(document, dict) else None
     if isinstance(file_ref, dict):
@@ -2267,6 +2417,17 @@ def _work_preprocessing_marker_row(
     requeued_processing_change = bool(existing is not None and existing["status"] == "processing")
     if requeued_processing_change:
         metadata["superseded_processing_attempt"] = True
+    last_successful_source_hash = _clean_short_text(
+        _row_value(existing, "last_successful_source_hash", ""),
+        "",
+        limit=120,
+    )
+    if not last_successful_source_hash and _row_value(existing, "status", "") == "processed":
+        last_successful_source_hash = _clean_short_text(
+            _row_value(existing, "processed_source_hash", ""),
+            "",
+            limit=120,
+        )
     row = {
         "marker_id": marker_id,
         "item_id": item_id,
@@ -2288,6 +2449,14 @@ def _work_preprocessing_marker_row(
         "last_error": "preprocessing_changed_during_processing"
         if requeued_processing_change
         else "",
+        "next_retry_at": "",
+        "retry_after_seconds": 0,
+        "retry_attempt_count": 0,
+        "last_successful_source_hash": last_successful_source_hash,
+        "last_failure_event_id": "",
+        "last_failure_source_hash": "",
+        "last_error_class": "",
+        "retry_policy_version": "",
         "superseded_at": (
             now
             if requeued_processing_change
@@ -2457,8 +2626,12 @@ def _raise_work_automation_excluded(
 
 
 def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
-    args: list[Any] = []
-    where = f"WHERE marker.status='queued' AND {_work_processor_marker_claimable_predicate()}"
+    now = _utc_now_iso()
+    args: list[Any] = [now]
+    where = (
+        f"WHERE {_work_processor_marker_claimable_state_predicate()} "
+        f"AND {_work_processor_marker_claimable_predicate()}"
+    )
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
         where += f" AND marker.item_id IN ({placeholders})"
@@ -2484,6 +2657,7 @@ def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[s
 
 
 def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
+    retry_state = _work_review_marker_retry_state(row)
     return {
         "schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "marker_id": row["marker_id"],
@@ -2502,6 +2676,16 @@ def _row_to_work_review_processor_marker(row: Any) -> dict[str, Any]:
         "processing_expires_at": row["processing_expires_at"],
         "attempt_count": int(row["attempt_count"] or 0),
         "last_error": row["last_error"],
+        "next_retry_at": _row_value(row, "next_retry_at", ""),
+        "retry_after_seconds": int(_row_value(row, "retry_after_seconds", 0) or 0),
+        "retry_attempt_count": int(_row_value(row, "retry_attempt_count", 0) or 0),
+        "last_successful_source_hash": _row_value(row, "last_successful_source_hash", ""),
+        "last_failure_event_id": _row_value(row, "last_failure_event_id", ""),
+        "last_failure_source_hash": _row_value(row, "last_failure_source_hash", ""),
+        "last_error_class": _row_value(row, "last_error_class", ""),
+        "retry_policy_version": _row_value(row, "retry_policy_version", ""),
+        "retry_state": retry_state,
+        "retry_waiting": retry_state == "retry_waiting",
         "superseded_at": row["superseded_at"],
         "superseded_by_source_hash": row["superseded_by_source_hash"],
         "status": row["status"],
@@ -2543,6 +2727,17 @@ def _work_review_processor_marker_row(
     requeued_processing_change = bool(existing is not None and existing["status"] == "processing")
     if requeued_processing_change:
         metadata["superseded_processing_attempt"] = True
+    last_successful_source_hash = _clean_short_text(
+        _row_value(existing, "last_successful_source_hash", ""),
+        "",
+        limit=120,
+    )
+    if not last_successful_source_hash and _row_value(existing, "status", "") == "processed":
+        last_successful_source_hash = _clean_short_text(
+            _row_value(existing, "processed_source_hash", ""),
+            "",
+            limit=120,
+        )
     provenance = {
         "schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "recorded_by": meta["actor"],
@@ -2569,6 +2764,14 @@ def _work_review_processor_marker_row(
         "processing_expires_at": "",
         "attempt_count": int(existing["attempt_count"] or 0) if existing is not None else 0,
         "last_error": "review_changed_during_processing" if requeued_processing_change else "",
+        "next_retry_at": "",
+        "retry_after_seconds": 0,
+        "retry_attempt_count": 0,
+        "last_successful_source_hash": last_successful_source_hash,
+        "last_failure_event_id": "",
+        "last_failure_source_hash": "",
+        "last_error_class": "",
+        "retry_policy_version": "",
         "superseded_at": (
             now
             if requeued_processing_change
@@ -2606,16 +2809,23 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
             document_updated_at, document_source_hash, processed_document_updated_at,
             processed_source_hash, processed_at, queued_at, last_seen_at,
             processing_started_at, processing_expires_at, attempt_count, last_error,
+            next_retry_at, retry_after_seconds, retry_attempt_count,
+            last_successful_source_hash, last_failure_event_id,
+            last_failure_source_hash, last_error_class, retry_policy_version,
             superseded_at, superseded_by_source_hash, status, provider_mode,
-            decision_id, source_hash, metadata_json, provenance_json, created_at, updated_at
+            decision_id, source_hash, metadata_json, provenance_json, created_at,
+            updated_at
         )
         VALUES (
             :marker_id, :item_id, :processor_kind, :document_type, :document_ref,
             :document_updated_at, :document_source_hash, :processed_document_updated_at,
             :processed_source_hash, :processed_at, :queued_at, :last_seen_at,
             :processing_started_at, :processing_expires_at, :attempt_count,
-            :last_error, :superseded_at, :superseded_by_source_hash, :status,
-            :provider_mode, :decision_id, :source_hash, :metadata_json,
+            :last_error, :next_retry_at, :retry_after_seconds,
+            :retry_attempt_count, :last_successful_source_hash,
+            :last_failure_event_id, :last_failure_source_hash, :last_error_class,
+            :retry_policy_version, :superseded_at, :superseded_by_source_hash,
+            :status, :provider_mode, :decision_id, :source_hash, :metadata_json,
             :provenance_json, :created_at, :updated_at
         )
         ON CONFLICT(marker_id) DO UPDATE SET
@@ -2634,6 +2844,14 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
             processing_expires_at=excluded.processing_expires_at,
             attempt_count=excluded.attempt_count,
             last_error=excluded.last_error,
+            next_retry_at=excluded.next_retry_at,
+            retry_after_seconds=excluded.retry_after_seconds,
+            retry_attempt_count=excluded.retry_attempt_count,
+            last_successful_source_hash=excluded.last_successful_source_hash,
+            last_failure_event_id=excluded.last_failure_event_id,
+            last_failure_source_hash=excluded.last_failure_source_hash,
+            last_error_class=excluded.last_error_class,
+            retry_policy_version=excluded.retry_policy_version,
             superseded_at=excluded.superseded_at,
             superseded_by_source_hash=excluded.superseded_by_source_hash,
             status=excluded.status,
@@ -2649,6 +2867,148 @@ def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
     return conn.execute(
         "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
         (row["marker_id"],),
+    ).fetchone()
+
+
+def _row_to_work_review_failure_event(row: Any) -> dict[str, Any]:
+    return {
+        "schema": KANBAN_REVIEW_FAILURE_EVENT_SCHEMA,
+        "failure_event_id": row["failure_event_id"],
+        "marker_id": row["marker_id"],
+        "item_id": row["item_id"],
+        "processor_kind": row["processor_kind"],
+        "document_type": row["document_type"],
+        "source_hash": row["source_hash"],
+        "error_class": row["error_class"],
+        "error_message": row["error_message"],
+        "provider_mode": row["provider_mode"],
+        "model_alias": row["model_alias"],
+        "attempt_number": int(row["attempt_number"] or 0),
+        "failed_at": row["failed_at"],
+        "next_retry_at": row["next_retry_at"],
+        "retry_after_seconds": int(row["retry_after_seconds"] or 0),
+        "retry_policy_version": row["retry_policy_version"],
+        "retryable": bool(row["retryable"]),
+        "status": row["status"],
+        "event_hash": row["event_hash"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _work_review_failure_event_row(
+    marker_row: Any,
+    *,
+    meta: dict[str, str],
+    now: str,
+    error_class: str,
+    error_message: str,
+    provider_mode: str,
+    model_alias: str,
+    attempt_number: int,
+    next_retry_at: str,
+    retry_after_seconds: int,
+    retryable: bool,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    source_hash = _clean_short_text(marker_row["document_source_hash"], "", limit=120)
+    failure_event_id = _work_review_failure_event_id(
+        marker_row["marker_id"],
+        source_hash,
+        attempt_number,
+        now,
+    )
+    row = {
+        "failure_event_id": failure_event_id,
+        "marker_id": marker_row["marker_id"],
+        "item_id": marker_row["item_id"],
+        "processor_kind": marker_row["processor_kind"],
+        "document_type": marker_row["document_type"],
+        "source_hash": source_hash,
+        "error_class": error_class,
+        "error_message": error_message,
+        "provider_mode": provider_mode,
+        "model_alias": model_alias,
+        "attempt_number": attempt_number,
+        "failed_at": now,
+        "next_retry_at": next_retry_at,
+        "retry_after_seconds": retry_after_seconds,
+        "retry_policy_version": KANBAN_REVIEW_RETRY_POLICY_VERSION,
+        "retryable": 1 if retryable else 0,
+        "status": "retry_waiting" if retryable else "terminal",
+        "event_hash": "",
+        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+        "provenance_json": json.dumps(
+            {
+                "schema": KANBAN_REVIEW_FAILURE_EVENT_SCHEMA,
+                "recorded_by": meta["actor"],
+                "source_surface": meta["source_surface"],
+                "request_id": meta["request_id"],
+                "run_id": meta["run_id"],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        "created_at": now,
+        "updated_at": now,
+    }
+    row["event_hash"] = _hash_json_payload(
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"event_hash", "created_at", "updated_at"}
+        }
+    )
+    return row
+
+
+def _write_work_review_failure_event(conn: Any, row: dict[str, Any]) -> Any:
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_failure_events (
+            failure_event_id, marker_id, item_id, processor_kind, document_type,
+            source_hash, error_class, error_message, provider_mode, model_alias,
+            attempt_number, failed_at, next_retry_at, retry_after_seconds,
+            retry_policy_version, retryable, status, event_hash, metadata_json,
+            provenance_json, created_at, updated_at
+        )
+        VALUES (
+            :failure_event_id, :marker_id, :item_id, :processor_kind,
+            :document_type, :source_hash, :error_class, :error_message,
+            :provider_mode, :model_alias, :attempt_number, :failed_at,
+            :next_retry_at, :retry_after_seconds, :retry_policy_version,
+            :retryable, :status, :event_hash, :metadata_json, :provenance_json,
+            :created_at, :updated_at
+        )
+        ON CONFLICT(failure_event_id) DO UPDATE SET
+            marker_id=excluded.marker_id,
+            item_id=excluded.item_id,
+            processor_kind=excluded.processor_kind,
+            document_type=excluded.document_type,
+            source_hash=excluded.source_hash,
+            error_class=excluded.error_class,
+            error_message=excluded.error_message,
+            provider_mode=excluded.provider_mode,
+            model_alias=excluded.model_alias,
+            attempt_number=excluded.attempt_number,
+            failed_at=excluded.failed_at,
+            next_retry_at=excluded.next_retry_at,
+            retry_after_seconds=excluded.retry_after_seconds,
+            retry_policy_version=excluded.retry_policy_version,
+            retryable=excluded.retryable,
+            status=excluded.status,
+            event_hash=excluded.event_hash,
+            metadata_json=excluded.metadata_json,
+            provenance_json=excluded.provenance_json,
+            updated_at=excluded.updated_at
+        """,
+        row,
+    )
+    return conn.execute(
+        "SELECT * FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
+        (row["failure_event_id"],),
     ).fetchone()
 
 
@@ -2679,6 +3039,8 @@ def _schedule_work_review_processor_marker_for_document(
         same_document = existing["document_source_hash"] == document_source["document_source_hash"]
         already_processed = (
             existing["processed_source_hash"] == document_source["document_source_hash"]
+            or _row_value(existing, "last_successful_source_hash", "")
+            == document_source["document_source_hash"]
         )
         if same_document and existing["status"] in {"queued", "processing"}:
             return {
@@ -2732,6 +3094,166 @@ def _row_to_work_review_processor_schedule(schedule: dict[str, Any]) -> dict[str
         "marker": (
             _row_to_work_review_processor_marker(marker_row) if marker_row is not None else None
         ),
+    }
+
+
+def _work_review_failure_event_payload(row: Any) -> dict[str, Any]:
+    marker_status = _row_value(row, "marker_status", "") or row["status"]
+    marker_next_retry_at = _row_value(row, "marker_next_retry_at", "") or row["next_retry_at"]
+    retry_state = _work_review_marker_retry_state(
+        {
+            "status": marker_status,
+            "next_retry_at": marker_next_retry_at,
+        }
+    )
+    payload = _row_to_work_review_failure_event(row)
+    item_id = payload["item_id"]
+    payload.update(
+        {
+            "item_title": _row_value(row, "item_title", ""),
+            "item_ref": f"xarta-kanban:item:{item_id}" if item_id else "",
+            "marker_status": marker_status,
+            "marker_next_retry_at": marker_next_retry_at,
+            "retry_state": retry_state,
+            "retry_waiting": retry_state == "retry_waiting",
+            "terminal": retry_state == "terminal",
+        }
+    )
+    return payload
+
+
+def _work_review_processor_failure_stats(
+    conn: Any,
+    scope_ids: list[str],
+    *,
+    limit: int = 10,
+    processor_kind: str | None = None,
+) -> dict[str, Any]:
+    where = "WHERE 1=1"
+    args: list[Any] = []
+    clean_processor_kind = _clean_short_text(processor_kind, "", limit=80)
+    if clean_processor_kind:
+        where += " AND event.processor_kind=?"
+        args.append(clean_processor_kind)
+    if scope_ids:
+        placeholders = ",".join("?" for _ in scope_ids)
+        where += f" AND event.item_id IN ({placeholders})"
+        args.extend(scope_ids)
+    event_rows = conn.execute(
+        f"""
+        SELECT event.*,
+               item.title AS item_title,
+               marker.status AS marker_status,
+               marker.next_retry_at AS marker_next_retry_at,
+               marker.retry_attempt_count AS marker_retry_attempt_count,
+               marker.last_error AS marker_last_error
+        FROM kanban_review_processor_failure_events event
+        LEFT JOIN kanban_items item ON item.item_id=event.item_id
+        LEFT JOIN kanban_review_processor_markers marker ON marker.marker_id=event.marker_id
+        {where}
+        ORDER BY event.failed_at DESC, event.attempt_number DESC, event.failure_event_id DESC
+        LIMIT ?
+        """,
+        [*args, limit],
+    ).fetchall()
+    aggregate_rows = conn.execute(
+        f"""
+        SELECT event.*,
+               item.title AS item_title,
+               marker.status AS marker_status,
+               marker.next_retry_at AS marker_next_retry_at,
+               marker.retry_attempt_count AS marker_retry_attempt_count,
+               marker.last_error AS marker_last_error
+        FROM kanban_review_processor_failure_events event
+        LEFT JOIN kanban_items item ON item.item_id=event.item_id
+        LEFT JOIN kanban_review_processor_markers marker ON marker.marker_id=event.marker_id
+        {where}
+        ORDER BY event.failed_at DESC, event.attempt_number DESC, event.failure_event_id DESC
+        LIMIT ?
+        """,
+        [*args, max(100, limit * 20)],
+    ).fetchall()
+    aggregates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in aggregate_rows:
+        key = (
+            row["item_id"],
+            row["processor_kind"],
+            row["source_hash"],
+            row["error_class"],
+        )
+        payload = _work_review_failure_event_payload(row)
+        existing = aggregates.get(key)
+        failed_at = payload["failed_at"]
+        if existing is None:
+            existing = {
+                "schema": "xarta.kanban.review_processor.failure_aggregate.v1",
+                "item_id": payload["item_id"],
+                "item_title": payload["item_title"],
+                "item_ref": payload["item_ref"],
+                "marker_id": payload["marker_id"],
+                "processor_kind": payload["processor_kind"],
+                "source_hash": payload["source_hash"],
+                "error_class": payload["error_class"],
+                "attempt_count": 0,
+                "event_count": 0,
+                "first_failed_at": failed_at,
+                "last_failed_at": failed_at,
+                "last_error": payload["error_message"],
+                "provider_mode": payload["provider_mode"],
+                "model_alias": payload["model_alias"],
+                "next_retry_at": payload["marker_next_retry_at"] or payload["next_retry_at"],
+                "retry_after_seconds": payload["retry_after_seconds"],
+                "retry_policy_version": payload["retry_policy_version"],
+                "marker_status": payload["marker_status"],
+                "retry_state": payload["retry_state"],
+                "retry_waiting": payload["retry_waiting"],
+                "terminal": payload["terminal"],
+            }
+            aggregates[key] = existing
+        existing["event_count"] += 1
+        existing["attempt_count"] = max(
+            int(existing["attempt_count"] or 0),
+            int(payload["attempt_number"] or 0),
+            int(existing["event_count"] or 0),
+        )
+        if failed_at < existing["first_failed_at"]:
+            existing["first_failed_at"] = failed_at
+        if failed_at > existing["last_failed_at"] or (
+            failed_at == existing["last_failed_at"]
+            and int(payload["attempt_number"] or 0) >= int(existing["attempt_count"] or 0)
+        ):
+            existing.update(
+                {
+                    "last_failed_at": failed_at,
+                    "last_error": payload["error_message"],
+                    "provider_mode": payload["provider_mode"],
+                    "model_alias": payload["model_alias"],
+                    "next_retry_at": payload["marker_next_retry_at"] or payload["next_retry_at"],
+                    "retry_after_seconds": payload["retry_after_seconds"],
+                    "marker_status": payload["marker_status"],
+                    "retry_state": payload["retry_state"],
+                    "retry_waiting": payload["retry_waiting"],
+                    "terminal": payload["terminal"],
+                }
+            )
+    aggregate_payloads = sorted(
+        aggregates.values(),
+        key=lambda entry: (entry["last_failed_at"], entry["marker_id"]),
+        reverse=True,
+    )[:limit]
+    return {
+        "schema": KANBAN_REVIEW_FAILURE_EVENT_SCHEMA,
+        "processor_kind": clean_processor_kind or "all",
+        "event_count": len(aggregate_rows),
+        "repeated_failure_count": sum(
+            1 for entry in aggregate_payloads if int(entry["attempt_count"] or 0) > 1
+        ),
+        "retry_waiting_count": sum(1 for entry in aggregate_payloads if entry["retry_waiting"]),
+        "terminal_count": sum(1 for entry in aggregate_payloads if entry["terminal"]),
+        "last_error": aggregate_payloads[0]["last_error"] if aggregate_payloads else "",
+        "next_retry_at": aggregate_payloads[0]["next_retry_at"] if aggregate_payloads else "",
+        "recent_events": [_work_review_failure_event_payload(row) for row in event_rows],
+        "aggregates": aggregate_payloads,
     }
 
 
@@ -2805,6 +3327,33 @@ def _work_review_processor_marker_stats(
         """,
         args,
     ).fetchone()
+    retry_waiting_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where} AND marker.status='failed'
+          AND marker.next_retry_at != ''
+          AND marker.next_retry_at > ?
+        """,
+        [*args, now],
+    ).fetchone()
+    retry_due_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count FROM kanban_review_processor_markers marker
+        JOIN kanban_items item ON item.item_id=marker.item_id
+        {where} AND marker.status='failed'
+          AND (marker.next_retry_at='' OR marker.next_retry_at <= ?)
+        """,
+        [*args, now],
+    ).fetchone()
+    failure_stats = _work_review_processor_failure_stats(
+        conn,
+        scope_ids,
+        limit=limit,
+        processor_kind=clean_processor_kind,
+    )
+    retry_waiting_count = int(retry_waiting_row["count"] if retry_waiting_row else 0)
+    retry_due_count = int(retry_due_row["count"] if retry_due_row else 0)
     return {
         "schema": (
             KANBAN_PREPROCESSING_QUEUE_SCHEMA
@@ -2814,9 +3363,16 @@ def _work_review_processor_marker_stats(
         "processor_kind": clean_processor_kind,
         "queue_length": queued_count,
         "active_count": processing_count,
-        "pending_count": queued_count + processing_count,
+        "claimable_failed_count": retry_due_count,
+        "retry_waiting_count": retry_waiting_count,
+        "retry_due_count": retry_due_count,
+        "pending_count": queued_count + processing_count + retry_due_count,
         "timeout_count": int(timeout_row["count"] if timeout_row else 0),
         "superseded_count": int(superseded_row["count"] if superseded_row else 0),
+        "failure_event_count": failure_stats["event_count"],
+        "repeated_failure_count": failure_stats["repeated_failure_count"],
+        "last_error": failure_stats["last_error"],
+        "next_retry_at": failure_stats["next_retry_at"],
         "by_status": by_status,
         "last_scan_at": last_scan["created_at"] if last_scan else "",
         "last_scan": {
@@ -2827,6 +3383,9 @@ def _work_review_processor_marker_stats(
         if last_scan
         else None,
         "recent_markers": [_row_to_work_review_processor_marker(row) for row in recent_rows],
+        "failure_events": failure_stats["recent_events"],
+        "failure_aggregates": failure_stats["aggregates"],
+        "failures": failure_stats,
     }
 
 
@@ -2872,6 +3431,14 @@ def _work_review_processor_marker_update_row(
         "run_id": meta["run_id"],
     }
     row = dict(existing)
+    row.setdefault("next_retry_at", "")
+    row.setdefault("retry_after_seconds", 0)
+    row.setdefault("retry_attempt_count", 0)
+    row.setdefault("last_successful_source_hash", "")
+    row.setdefault("last_failure_event_id", "")
+    row.setdefault("last_failure_source_hash", "")
+    row.setdefault("last_error_class", "")
+    row.setdefault("retry_policy_version", "")
     row.update(updates)
     row["metadata_json"] = json.dumps(merged_metadata, ensure_ascii=True, sort_keys=True)
     row["provenance_json"] = json.dumps(provenance, ensure_ascii=True, sort_keys=True)
@@ -2904,7 +3471,7 @@ def _cancel_work_review_processor_markers(
         f"""
         SELECT * FROM kanban_review_processor_markers
         WHERE item_id IN ({placeholders})
-          AND status IN ('queued', 'processing')
+          AND status IN ('queued', 'processing', 'failed')
         ORDER BY updated_at DESC, marker_id
         """,
         clean_item_ids,
@@ -2918,6 +3485,13 @@ def _cancel_work_review_processor_markers(
                 "last_seen_at": now,
                 "processing_started_at": "",
                 "processing_expires_at": "",
+                "next_retry_at": "",
+                "retry_after_seconds": 0,
+                "retry_attempt_count": 0,
+                "last_failure_event_id": "",
+                "last_failure_source_hash": "",
+                "last_error_class": "",
+                "retry_policy_version": "",
                 "last_error": reason,
             },
             meta=meta,
@@ -2972,7 +3546,7 @@ def _cancel_invalid_work_preprocessing_markers(
     candidate_predicate = _work_preprocessing_candidate_predicate("item")
     where = f"""
     WHERE marker.processor_kind='preprocessing'
-      AND marker.status IN ('queued', 'processing')
+      AND marker.status IN ('queued', 'processing', 'failed')
       AND NOT (item.item_id IS NOT NULL AND {candidate_predicate})
     """
     if scope_ids:
@@ -3005,6 +3579,13 @@ def _cancel_invalid_work_preprocessing_markers(
                 "last_seen_at": now,
                 "processing_started_at": "",
                 "processing_expires_at": "",
+                "next_retry_at": "",
+                "retry_after_seconds": 0,
+                "retry_attempt_count": 0,
+                "last_failure_event_id": "",
+                "last_failure_source_hash": "",
+                "last_error_class": "",
+                "retry_policy_version": "",
                 "last_error": reason,
                 "processed_document_updated_at": row["document_updated_at"],
                 "processed_source_hash": row["document_source_hash"],
@@ -14546,6 +15127,7 @@ async def _process_work_automation_claimed_marker(
         }
     except Exception as exc:
         failed_complete: dict[str, Any] | None = None
+        error_class = _work_review_failure_error_class(str(exc), {})
         with suppress(Exception):
             failed_complete = await complete_work_review_processor_marker(
                 marker["marker_id"],
@@ -14566,6 +15148,7 @@ async def _process_work_automation_claimed_marker(
                         "model_alias": _work_automation_idle_worker_config()[
                             "local_ai_model_alias"
                         ],
+                        "error_class": error_class,
                     },
                 ),
             )
@@ -14923,6 +15506,8 @@ async def trigger_work_review_processor_idle_scan(
                 )
                 already_processed = (
                     existing["processed_source_hash"] == document_source["document_source_hash"]
+                    or _row_value(existing, "last_successful_source_hash", "")
+                    == document_source["document_source_hash"]
                 )
                 if same_document and existing["status"] in {"queued", "processing"}:
                     unchanged_pending += 1
@@ -15226,6 +15811,11 @@ async def trigger_work_preprocessing_idle_scan(
             already_processed = bool(
                 existing is not None
                 and existing["processed_source_hash"] == source["document_source_hash"]
+                or (
+                    existing is not None
+                    and _row_value(existing, "last_successful_source_hash", "")
+                    == source["document_source_hash"]
+                )
             )
             if source["ready"] or not source.get("needs_preprocessing", True):
                 current_ready += 1
@@ -15495,8 +16085,11 @@ async def claim_next_work_review_processor_marker(
             now_dt=now_dt,
         )
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
-        args: list[Any] = []
-        where = f"WHERE marker.status='queued' AND {_work_processor_marker_claimable_predicate()}"
+        args: list[Any] = [now]
+        where = (
+            f"WHERE {_work_processor_marker_claimable_state_predicate()} "
+            f"AND {_work_processor_marker_claimable_predicate()}"
+        )
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND marker.item_id IN ({placeholders})"
@@ -15581,6 +16174,8 @@ async def claim_next_work_review_processor_marker(
                 "processing_expires_at": processing_expires_at,
                 "attempt_count": int(marker_row["attempt_count"] or 0) + 1,
                 "last_error": "",
+                "next_retry_at": "",
+                "retry_after_seconds": 0,
                 "last_seen_at": now,
             },
             meta=meta,
@@ -15794,6 +16389,13 @@ async def complete_work_review_processor_marker(
                         "last_seen_at": now,
                         "processing_started_at": "",
                         "processing_expires_at": "",
+                        "next_retry_at": "",
+                        "retry_after_seconds": 0,
+                        "retry_attempt_count": 0,
+                        "last_failure_event_id": "",
+                        "last_failure_source_hash": "",
+                        "last_error_class": "",
+                        "retry_policy_version": "",
                         "last_error": "superseded_source_hash",
                         "superseded_at": now,
                         "superseded_by_source_hash": marker_row["document_source_hash"],
@@ -15882,16 +16484,117 @@ async def complete_work_review_processor_marker(
             body.decision_id or marker_row["decision_id"], "", limit=180
         )
         last_error = _body_excerpt(body.error, limit=4000)
+        body_metadata = dict(body.metadata or {})
+        failure_event_row: Any | None = None
+        failure_event_payload: dict[str, Any] | None = None
         updates: dict[str, Any] = {
             "status": outcome_status,
+            "processing_started_at": "",
             "processing_expires_at": "",
             "last_seen_at": now,
             "decision_id": decision_id,
             "last_error": last_error if outcome_status != "processed" else "",
-            "processed_document_updated_at": marker_row["document_updated_at"],
-            "processed_source_hash": marker_row["document_source_hash"],
-            "processed_at": now,
         }
+        completion_metadata = {
+            **body_metadata,
+            "holder_id": holder_id,
+            "lease_id": lease_row["lease_id"],
+            "decision_id": decision_id,
+            "outcome_status": outcome_status,
+            "last_outcome_at": now,
+            "last_outcome_status": outcome_status,
+        }
+        if outcome_status == "failed":
+            previous_failure_count = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM kanban_review_processor_failure_events
+                WHERE marker_id=? AND source_hash=?
+                """,
+                (marker_row["marker_id"], marker_row["document_source_hash"]),
+            ).fetchone()
+            failure_attempt = (
+                int(previous_failure_count["count"] if previous_failure_count else 0) + 1
+            )
+            retry_after_seconds = _work_review_retry_after_seconds(failure_attempt)
+            next_retry_at = _work_review_retry_next_at(now, failure_attempt)
+            provider_mode = _clean_short_text(
+                str(body_metadata.get("provider_mode") or marker_row["provider_mode"] or "local"),
+                "local",
+                limit=80,
+            )
+            model_alias = _clean_short_text(
+                str(
+                    body_metadata.get("model_alias")
+                    or _work_automation_idle_worker_config()["local_ai_model_alias"]
+                    or ""
+                ),
+                "",
+                limit=180,
+            )
+            error_class = _work_review_failure_error_class(last_error, body_metadata)
+            failure_event_row = _work_review_failure_event_row(
+                marker_row,
+                meta=meta,
+                now=now,
+                error_class=error_class,
+                error_message=last_error,
+                provider_mode=provider_mode,
+                model_alias=model_alias,
+                attempt_number=failure_attempt,
+                next_retry_at=next_retry_at,
+                retry_after_seconds=retry_after_seconds,
+                retryable=True,
+                metadata={
+                    **body_metadata,
+                    "holder_id": holder_id,
+                    "lease_id": lease_row["lease_id"],
+                    "decision_id": decision_id,
+                    "marker_attempt_count": int(marker_row["attempt_count"] or 0),
+                    "retryable": True,
+                },
+            )
+            updates.update(
+                {
+                    "next_retry_at": next_retry_at,
+                    "retry_after_seconds": retry_after_seconds,
+                    "retry_attempt_count": failure_attempt,
+                    "last_failure_event_id": failure_event_row["failure_event_id"],
+                    "last_failure_source_hash": marker_row["document_source_hash"],
+                    "last_error_class": error_class,
+                    "retry_policy_version": KANBAN_REVIEW_RETRY_POLICY_VERSION,
+                }
+            )
+            completion_metadata.update(
+                {
+                    "retryable": True,
+                    "failure_event_id": failure_event_row["failure_event_id"],
+                    "failure_attempt": failure_attempt,
+                    "retry_after_seconds": retry_after_seconds,
+                    "next_retry_at": next_retry_at,
+                    "retry_policy_version": KANBAN_REVIEW_RETRY_POLICY_VERSION,
+                    "last_error": last_error,
+                    "last_error_class": error_class,
+                }
+            )
+        else:
+            updates.update(
+                {
+                    "processed_document_updated_at": marker_row["document_updated_at"],
+                    "processed_source_hash": marker_row["document_source_hash"],
+                    "processed_at": now,
+                    "next_retry_at": "",
+                    "retry_after_seconds": 0,
+                    "retry_attempt_count": 0,
+                    "last_failure_event_id": "",
+                    "last_failure_source_hash": "",
+                    "last_error_class": "",
+                    "retry_policy_version": "",
+                }
+            )
+            completion_metadata["last_processed_at"] = now
+            if outcome_status == "processed":
+                updates["last_successful_source_hash"] = marker_row["document_source_hash"]
         saved_row = _write_work_review_processor_marker(
             conn,
             _work_review_processor_marker_update_row(
@@ -15900,18 +16603,12 @@ async def complete_work_review_processor_marker(
                 meta=meta,
                 now=now,
                 reason=f"marker_{outcome_status}",
-                metadata={
-                    **dict(body.metadata or {}),
-                    "holder_id": holder_id,
-                    "lease_id": lease_row["lease_id"],
-                    "decision_id": decision_id,
-                    "outcome_status": outcome_status,
-                    "last_outcome_at": now,
-                    "last_outcome_status": outcome_status,
-                    "last_processed_at": now,
-                },
+                metadata=completion_metadata,
             ),
         )
+        if failure_event_row is not None:
+            failure_event_row = _write_work_review_failure_event(conn, failure_event_row)
+            failure_event_payload = _row_to_work_review_failure_event(failure_event_row)
         marker_blocker = _upsert_work_processor_marker_blocker(
             conn,
             saved_row,
@@ -15937,6 +16634,9 @@ async def complete_work_review_processor_marker(
                 "lease_id": lease_row["lease_id"],
                 "decision_id": decision_id,
                 "outcome_status": outcome_status,
+                "failure_event_id": failure_event_row["failure_event_id"]
+                if failure_event_row is not None
+                else "",
             },
         )
         gen = increment_gen(conn, "kanban-review-marker-complete")
@@ -15948,6 +16648,15 @@ async def complete_work_review_processor_marker(
             dict(saved_row),
             gen,
         )
+        if failure_event_row is not None:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_failure_events",
+                failure_event_row["failure_event_id"],
+                dict(failure_event_row),
+                gen,
+            )
         if marker_blocker is not None:
             enqueue_for_all_peers(
                 conn,
@@ -15979,6 +16688,8 @@ async def complete_work_review_processor_marker(
         }
         if marker_blocker is not None:
             result["processor_blocker"] = _row_to_work_blocker(marker_blocker["blocker_row"])
+        if failure_event_payload is not None:
+            result["failure_event"] = failure_event_payload
         return result
 
 
@@ -16654,6 +17365,7 @@ async def get_work_automation_status(
             limit=limit,
             processor_kind="preprocessing",
         )
+        failure_stats = _work_review_processor_failure_stats(conn, scope_ids, limit=limit)
         exclusion_where = (
             "WHERE item.status != 'archived' AND COALESCE(item.automation_excluded, 0) != 0"
         )
@@ -16722,6 +17434,7 @@ async def get_work_automation_status(
                 "count": int(exclusion_count_row["count"] if exclusion_count_row else 0),
                 "recent_items": [_row_to_work_item(row) for row in exclusion_rows],
             },
+            "failures": failure_stats,
             "provider_mode": {
                 "active": processing_policy["active_mode"],
                 "planned": processing_policy["local_processing"]["state"],
@@ -16757,6 +17470,13 @@ async def get_work_automation_status(
                 ),
                 "scheduler": marker_stats,
                 "review_markers": marker_stats["recent_markers"],
+                "failure_events": marker_stats["failure_events"],
+                "failure_aggregates": marker_stats["failure_aggregates"],
+                "repeated_failure_count": marker_stats["repeated_failure_count"],
+                "retry_waiting_count": marker_stats["retry_waiting_count"],
+                "retry_due_count": marker_stats["retry_due_count"],
+                "last_error": marker_stats["last_error"],
+                "next_retry_at": marker_stats["next_retry_at"],
             },
             "preprocessing": {
                 "status": (
@@ -16776,6 +17496,13 @@ async def get_work_automation_status(
                 "readiness_contract": _work_preprocessing_readiness_contract(),
                 "scheduler": preprocessing_marker_stats,
                 "markers": preprocessing_marker_stats["recent_markers"],
+                "failure_events": preprocessing_marker_stats["failure_events"],
+                "failure_aggregates": preprocessing_marker_stats["failure_aggregates"],
+                "repeated_failure_count": preprocessing_marker_stats["repeated_failure_count"],
+                "retry_waiting_count": preprocessing_marker_stats["retry_waiting_count"],
+                "retry_due_count": preprocessing_marker_stats["retry_due_count"],
+                "last_error": preprocessing_marker_stats["last_error"],
+                "next_retry_at": preprocessing_marker_stats["next_retry_at"],
             },
             "decisions": {
                 "count": len(all_decision_rows),
