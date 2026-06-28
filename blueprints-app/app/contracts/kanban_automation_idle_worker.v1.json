@@ -1,0 +1,110 @@
+{
+  "schema": "xarta.kanban.automation.idle_worker.contract.v1",
+  "status": "active",
+  "version": "2026-06-28",
+  "title": "Kanban automation idle worker contract",
+  "source_of_truth": true,
+  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates.",
+  "provider_mode": {
+    "active": "local",
+    "required_model_env": "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL",
+    "local_processing_gate": "private_no_think_no_protection_no_orientation_endpoint_required",
+    "fallback_processing_allowed": false
+  },
+  "scope_model": {
+    "automatic_by_default": true,
+    "background_root_scope_required": false,
+    "root_item_id_meaning": "Optional scan narrowing for manual or configured scoped runs. Empty root means scan all eligible non-excluded Kanban items.",
+    "exclusion_field": "kanban_items.automation_excluded",
+    "exclusion_rule": "An item is excluded when the item itself or any ancestor has automation_excluded=true.",
+    "excluded_branch_actions": [
+      "do_not_scan",
+      "do_not_queue",
+      "do_not_claim",
+      "do_not_process",
+      "cancel_existing_markers"
+    ]
+  },
+  "review_processor": {
+    "processor_kind": "review",
+    "candidate_rule": {
+      "item_status": "not archived",
+      "automation_excluded": false,
+      "requires_review_text": true,
+      "source_change_required": true
+    },
+    "source_change_fields": [
+      "review body hash",
+      "review updated_at",
+      "review document_source_hash"
+    ],
+    "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last terminal processed source hash, unless a current queued or processing marker already exists.",
+    "completion_rule": "Record a kanban_review_decisions row, complete the marker, and store processed source hash/date."
+  },
+  "preprocessing_processor": {
+    "processor_kind": "preprocessing",
+    "candidate_rule": {
+      "item_type": "item",
+      "item_status": "open or active, not archived or done",
+      "state_id": "todo",
+      "leaf_required": true,
+      "automation_excluded": false
+    },
+    "source_change_fields": [
+      "body",
+      "detail",
+      "review",
+      "discussions",
+      "tree_state",
+      "links",
+      "blockers",
+      "commits",
+      "issues",
+      "todos",
+      "counts",
+      "rollups"
+    ],
+    "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
+    "queue_rule": "Queue when the readiness marker is missing or stale for an eligible ToDo leaf, unless a current queued or processing marker already exists.",
+    "ready_result": "Write a fresh context_readiness_marker and complete the marker.",
+    "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
+    "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly."
+  },
+  "queue_cleanup": {
+    "runs_before_claiming": true,
+    "rules": [
+      {
+        "condition": "item missing, archived, or done",
+        "action": "cancel marker"
+      },
+      {
+        "condition": "item or ancestor automation_excluded=true",
+        "action": "cancel marker"
+      },
+      {
+        "condition": "queued or processing marker source is stale",
+        "action": "re-scan and requeue current source or cancel old marker"
+      },
+      {
+        "condition": "current readiness marker is already fresh",
+        "action": "cancel preprocessing marker as current"
+      },
+      {
+        "condition": "provider model/env is missing",
+        "action": "fail marker visibly; do not perform deterministic substitute processing"
+      }
+    ]
+  },
+  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n",
+  "must_pass_tests": [
+    "No root env var set: idle worker still scans automatically.",
+    "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
+    "GitHub Activity marked automation_excluded: no blockers, ToDos, or preprocessing markers are created there.",
+    "New ToDo leaf with missing readiness marker: preprocessing marker is queued and processed.",
+    "Backlog, Doing, Blocked, Done, archived, and non-leaf cards are not preprocessing candidates.",
+    "Fresh readiness marker and unchanged source hashes: no reprocessing.",
+    "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
+    "Old queued marker from invalid/global bad run is cancelled instead of processed.",
+    "Missing or unavailable local AI model fails visibly; deterministic substitute processing is forbidden."
+  ]
+}
