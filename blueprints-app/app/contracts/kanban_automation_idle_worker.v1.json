@@ -102,6 +102,7 @@
     "max_backoff_seconds": 518400,
     "cap_below_one_week": true,
     "status_summary_rule": "Automation Status summary fields last_error, next_retry_at, retry_waiting_count, and retry_due_count describe active failed/retry markers only. Historical failure events and aggregates remain durable proof and expose scheduled_retry_at/historical_last_error where needed, but recovered processed markers must not present old retry times as active work.",
+    "retention_rule": "Failure events are retained for diagnostics until an operator deliberately prunes them. POST /api/v1/personal/kanban/automation/failures/prune previews by default and, when apply=true, deletes matched inactive/recovered failure events while skipping active retry markers unless include_active=true is explicitly supplied.",
     "retry_until": [
       "success",
       "source_superseded",

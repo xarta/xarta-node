@@ -609,6 +609,21 @@ class WorkAutomationIdleTickRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkAutomationFailurePruneRequest(BaseModel):
+    item_id: str | None = None
+    marker_id: str | None = None
+    processor_kind: str | None = None
+    error_class: str | None = None
+    before_failed_at: str | None = None
+    include_active: bool = False
+    apply: bool = False
+    limit: int = 500
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-automation-status"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkBlockedLeafInvariantRepairRequest(BaseModel):
     item_id: str | None = None
     include_test_entries: bool = True
@@ -18095,6 +18110,172 @@ async def get_work_automation_status(
             },
             "commit_link_health": _work_decision_commit_health(all_decision_rows, conn),
         }
+
+
+@router.post("/kanban/automation/failures/prune")
+async def prune_work_automation_failure_events(
+    body: WorkAutomationFailurePruneRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(body.item_id, "", limit=180)
+    clean_marker_id = _clean_short_text(body.marker_id, "", limit=180)
+    clean_processor_kind = _clean_short_text(body.processor_kind or "", "", limit=80)
+    clean_error_class = _clean_short_text(body.error_class or "", "", limit=120)
+    before_failed_at = _clean_short_text(body.before_failed_at or "", "", limit=80)
+    try:
+        limit = max(1, min(int(body.limit or 500), 5000))
+    except (TypeError, ValueError):
+        limit = 500
+    with get_conn() as conn:
+        scope_ids: list[str] = []
+        item_row = None
+        if clean_item_id:
+            item_row = _work_item_or_404(conn, clean_item_id)
+            scope_ids = _work_scope_item_ids(conn, clean_item_id)
+        where = "WHERE 1=1"
+        args: list[Any] = []
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            where += f" AND event.item_id IN ({placeholders})"
+            args.extend(scope_ids)
+        if clean_marker_id:
+            where += " AND event.marker_id=?"
+            args.append(clean_marker_id)
+        if clean_processor_kind:
+            where += " AND event.processor_kind=?"
+            args.append(clean_processor_kind)
+        if clean_error_class:
+            where += " AND event.error_class=?"
+            args.append(clean_error_class)
+        if before_failed_at:
+            where += " AND event.failed_at < ?"
+            args.append(before_failed_at)
+        rows = conn.execute(
+            f"""
+            SELECT event.*,
+                   item.title AS item_title,
+                   marker.status AS marker_status,
+                   marker.next_retry_at AS marker_next_retry_at,
+                   marker.retry_attempt_count AS marker_retry_attempt_count,
+                   marker.last_error AS marker_last_error
+            FROM kanban_review_processor_failure_events event
+            LEFT JOIN kanban_items item ON item.item_id=event.item_id
+            LEFT JOIN kanban_review_processor_markers marker ON marker.marker_id=event.marker_id
+            {where}
+            ORDER BY event.failed_at DESC, event.attempt_number DESC, event.failure_event_id DESC
+            LIMIT ?
+            """,
+            [*args, limit],
+        ).fetchall()
+        candidates: list[Any] = []
+        skipped_active: list[str] = []
+        for row in rows:
+            marker_status = _row_value(row, "marker_status", "")
+            marker_retry_state = _work_review_marker_retry_state(
+                {
+                    "status": marker_status,
+                    "next_retry_at": _row_value(row, "marker_next_retry_at", ""),
+                }
+            )
+            active_retry = marker_status == "failed" and marker_retry_state in {
+                "retry_waiting",
+                "retry_due",
+            }
+            if active_retry and not body.include_active:
+                skipped_active.append(row["failure_event_id"])
+                continue
+            candidates.append(row)
+        event_payloads = [_work_review_failure_event_payload(row) for row in candidates[:50]]
+        pruned_ids = [row["failure_event_id"] for row in candidates]
+        source_hash = _hash_json_payload(
+            {
+                "item_id": clean_item_id,
+                "marker_id": clean_marker_id,
+                "processor_kind": clean_processor_kind,
+                "error_class": clean_error_class,
+                "before_failed_at": before_failed_at,
+                "include_active": bool(body.include_active),
+                "limit": limit,
+                "matched_ids": pruned_ids,
+            }
+        )
+        audit_metadata = {
+            "schema": "xarta.kanban.automation.failure_prune.v1",
+            "apply": bool(body.apply),
+            "item_id": clean_item_id,
+            "marker_id": clean_marker_id,
+            "processor_kind": clean_processor_kind,
+            "error_class": clean_error_class,
+            "before_failed_at": before_failed_at,
+            "include_active": bool(body.include_active),
+            "limit": limit,
+            "matched_count": len(candidates),
+            "skipped_active_count": len(skipped_active),
+            "pruned_event_ids": pruned_ids[:100],
+            "skipped_active_event_ids": skipped_active[:100],
+        }
+        deleted_count = 0
+        if body.apply and candidates:
+            gen = increment_gen(conn, "kanban-review-failure-prune")
+            for row in candidates:
+                conn.execute(
+                    "DELETE FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
+                    (row["failure_event_id"],),
+                )
+                enqueue_for_all_peers(
+                    conn,
+                    "DELETE",
+                    "kanban_review_processor_failure_events",
+                    row["failure_event_id"],
+                    {},
+                    gen,
+                )
+                deleted_count += 1
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="prune_automation_failure_events",
+            target_ref="kanban_review_processor_failure_events",
+            item_id=clean_item_id,
+            parent_item_id=(item_row["parent_item_id"] or "") if item_row is not None else "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=source_hash,
+            metadata={**audit_metadata, "deleted_count": deleted_count},
+        )
+        gen = increment_gen(conn, "kanban-audit")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.automation.failure_prune.v1",
+        "apply": bool(body.apply),
+        "matched_count": len(candidates),
+        "deleted_count": deleted_count,
+        "skipped_active_count": len(skipped_active),
+        "pruned_event_ids": pruned_ids,
+        "skipped_active_event_ids": skipped_active,
+        "events": event_payloads,
+        "filters": {
+            "item_id": clean_item_id,
+            "marker_id": clean_marker_id,
+            "processor_kind": clean_processor_kind,
+            "error_class": clean_error_class,
+            "before_failed_at": before_failed_at,
+            "include_active": bool(body.include_active),
+            "limit": limit,
+        },
+        "audit": {
+            "audit_id": audit_id,
+            "action": "prune_automation_failure_events",
+            "result": "ok",
+        },
+    }
 
 
 @router.get("/kanban/items/{item_id}/agent-hints")
