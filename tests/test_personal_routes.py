@@ -4465,18 +4465,13 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     )
     assert status["idle_worker_contract"]["source_of_truth"] is True
     assert status["idle_worker_contract"]["scope_model"]["automatic_by_default"] is True
-    assert (
-        status["idle_worker_contract"]["scope_model"]["background_root_scope_required"]
-        is False
-    )
+    assert status["idle_worker_contract"]["scope_model"]["background_root_scope_required"] is False
     assert (
         status["idle_worker_contract"]["preprocessing_processor"]["candidate_rule"]["state_id"]
         == "todo"
     )
     assert (
-        status["idle_worker_contract"]["preprocessing_processor"]["candidate_rule"][
-            "leaf_required"
-        ]
+        status["idle_worker_contract"]["preprocessing_processor"]["candidate_rule"]["leaf_required"]
         is True
     )
     assert (
@@ -6652,9 +6647,7 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
-def test_work_preprocessing_idle_scan_cancels_non_todo_pending_marker(
-    monkeypatch, tmp_path
-):
+def test_work_preprocessing_idle_scan_cancels_non_todo_pending_marker(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
