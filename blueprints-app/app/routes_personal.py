@@ -25,6 +25,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 
+from . import config as cfg
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
 from .sync.queue import enqueue_for_all_peers
@@ -106,6 +107,15 @@ KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
+KANBAN_AUTOMATION_OWNER_NODE_ID_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_OWNER_NODE_ID"
+KANBAN_AUTOMATION_PRIMARY_FLAG_ENV = "SYSTEM_BRIDGE_NOTIFIER_BLUEPRINTS_PRIMARY"
+KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE"
+KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV = (
+    "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH"
+)
+KANBAN_AUTOMATION_SINGLETON_OVERRIDE_DEFAULT_PATH = (
+    "/etc/xarta-kanban-automation-singleton-override"
+)
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
     Path(__file__).resolve().parent / "contracts" / "kanban_automation_idle_worker.v1.json"
 )
@@ -13784,11 +13794,96 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def _work_automation_current_node_id() -> str:
+    return _clean_short_text(
+        getattr(cfg, "NODE_ID", "") or os.environ.get("BLUEPRINTS_NODE_ID", ""),
+        "",
+        limit=120,
+    )
+
+
+def _work_automation_owner_node_state(current_node_id: str) -> tuple[str, dict[str, Any]]:
+    explicit_owner = _clean_short_text(
+        os.environ.get(KANBAN_AUTOMATION_OWNER_NODE_ID_ENV, ""),
+        "",
+        limit=120,
+    )
+    primary_flag_active = _env_bool(KANBAN_AUTOMATION_PRIMARY_FLAG_ENV, False)
+    if explicit_owner:
+        owner_node_id = explicit_owner
+        source = "owner_node_env"
+    elif primary_flag_active and current_node_id:
+        owner_node_id = current_node_id
+        source = "primary_flag_current_node"
+    else:
+        owner_node_id = ""
+        source = "unset"
+    return _clean_short_text(
+        owner_node_id,
+        "",
+        limit=120,
+    ), {
+        "source": source,
+        "primary_flag_env": KANBAN_AUTOMATION_PRIMARY_FLAG_ENV,
+        "primary_flag_active": primary_flag_active,
+    }
+
+
+def _work_automation_singleton_override_path() -> str:
+    return _clean_short_text(
+        os.environ.get(
+            KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV,
+            KANBAN_AUTOMATION_SINGLETON_OVERRIDE_DEFAULT_PATH,
+        ),
+        KANBAN_AUTOMATION_SINGLETON_OVERRIDE_DEFAULT_PATH,
+        limit=4096,
+    )
+
+
+def _work_automation_singleton_override_state() -> dict[str, Any]:
+    override_path = _work_automation_singleton_override_path()
+    path_exists = False
+    if override_path:
+        with suppress(OSError):
+            path_exists = Path(override_path).exists()
+    env_override = _env_bool(KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV, False)
+    return {
+        "active": bool(env_override or path_exists),
+        "env": {
+            "name": KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV,
+            "active": bool(env_override),
+        },
+        "file": {
+            "env": KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV,
+            "path": override_path,
+            "exists": bool(path_exists),
+        },
+    }
+
+
 def _work_automation_idle_worker_config() -> dict[str, Any]:
     local_model_alias = _work_automation_local_ai_model_alias()
+    enabled = _env_bool("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", True)
+    current_node_id = _work_automation_current_node_id()
+    owner_node_id, owner_node_state = _work_automation_owner_node_state(current_node_id)
+    override_state = _work_automation_singleton_override_state()
+    owner_match = bool(current_node_id and owner_node_id and current_node_id == owner_node_id)
+    runs_on_this_node = bool(owner_match or override_state["active"])
     return {
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-        "enabled": _env_bool("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", True),
+        "enabled": enabled,
+        "effective_enabled": bool(enabled and runs_on_this_node),
+        "current_node_id": current_node_id,
+        "owner_node_id": owner_node_id,
+        "owner_node_env": KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "owner_node_source": owner_node_state["source"],
+        "primary_flag_env": owner_node_state["primary_flag_env"],
+        "primary_flag_active": owner_node_state["primary_flag_active"],
+        "singleton_required": True,
+        "singleton_owner_match": owner_match,
+        "singleton_override": override_state,
+        "runs_on_this_node": runs_on_this_node,
+        "skip_reason": "" if runs_on_this_node else "idle_worker_not_owner_node",
         "provider_mode": "local",
         "local_ai_model_alias": local_model_alias,
         "local_ai_max_tokens": _env_int(
@@ -15180,10 +15275,34 @@ async def run_work_kanban_automation_idle_tick(
             "ok": True,
             "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
             "enabled": False,
+            "effective_enabled": False,
+            "runs_on_this_node": bool(config.get("runs_on_this_node")),
+            "current_node_id": config.get("current_node_id", ""),
+            "owner_node_id": config.get("owner_node_id", ""),
+            "singleton_override": config.get("singleton_override", {}),
             "reason": "idle_worker_disabled_by_configuration",
+            "lease_acquired": False,
             "processed_count": 0,
             "processed_markers": [],
             "claim_results": [],
+        }
+    if not config["runs_on_this_node"]:
+        return {
+            "ok": True,
+            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+            "enabled": True,
+            "effective_enabled": False,
+            "runs_on_this_node": False,
+            "current_node_id": config["current_node_id"],
+            "owner_node_id": config["owner_node_id"],
+            "singleton_override": config["singleton_override"],
+            "reason": "idle_worker_not_owner_node",
+            "lease_acquired": False,
+            "processed_count": 0,
+            "processed_markers": [],
+            "claim_results": [],
+            "eligible_marker_count": 0,
+            "eligible_marker_ids": [],
         }
     clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
     scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
@@ -15256,6 +15375,12 @@ async def run_work_kanban_automation_idle_tick(
             "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
             "run_id": run_id,
             "item_id": clean_item_id,
+            "enabled": True,
+            "effective_enabled": True,
+            "runs_on_this_node": True,
+            "current_node_id": config["current_node_id"],
+            "owner_node_id": config["owner_node_id"],
+            "singleton_override": config["singleton_override"],
             "reason": lease.get("reason") or "lease_not_acquired",
             "lease_acquired": False,
             "timeout_requeue": timeout_requeue,
@@ -15347,6 +15472,12 @@ async def run_work_kanban_automation_idle_tick(
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
         "run_id": run_id,
         "item_id": clean_item_id,
+        "enabled": True,
+        "effective_enabled": True,
+        "runs_on_this_node": True,
+        "current_node_id": config["current_node_id"],
+        "owner_node_id": config["owner_node_id"],
+        "singleton_override": config["singleton_override"],
         "lease_acquired": True,
         "timeout_requeue": timeout_requeue,
         "review_scan": review_scan,
@@ -15364,6 +15495,13 @@ async def run_work_kanban_automation_idle_loop() -> None:
     config = _work_automation_idle_worker_config()
     if not config["enabled"]:
         log.info("Kanban automation idle worker disabled by configuration")
+        return
+    if not config["runs_on_this_node"]:
+        log.info(
+            "Kanban automation idle worker not started on %s; owner node is %s",
+            config["current_node_id"] or "unknown-node",
+            config["owner_node_id"] or "unknown-owner",
+        )
         return
     initial_delay = int(config["initial_delay_seconds"] or 0)
     if initial_delay > 0:
