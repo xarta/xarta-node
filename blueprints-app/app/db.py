@@ -831,6 +831,14 @@ CREATE TABLE IF NOT EXISTS kanban_review_processor_markers (
     processing_expires_at         TEXT NOT NULL DEFAULT '',
     attempt_count                 INTEGER NOT NULL DEFAULT 0,
     last_error                    TEXT NOT NULL DEFAULT '',
+    next_retry_at                 TEXT NOT NULL DEFAULT '',
+    retry_after_seconds           INTEGER NOT NULL DEFAULT 0,
+    retry_attempt_count           INTEGER NOT NULL DEFAULT 0,
+    last_successful_source_hash   TEXT NOT NULL DEFAULT '',
+    last_failure_event_id         TEXT NOT NULL DEFAULT '',
+    last_failure_source_hash      TEXT NOT NULL DEFAULT '',
+    last_error_class              TEXT NOT NULL DEFAULT '',
+    retry_policy_version          TEXT NOT NULL DEFAULT '',
     superseded_at                 TEXT NOT NULL DEFAULT '',
     superseded_by_source_hash     TEXT NOT NULL DEFAULT '',
     status                        TEXT NOT NULL DEFAULT 'queued',
@@ -847,6 +855,39 @@ CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_item
     ON kanban_review_processor_markers(item_id, status, document_updated_at);
 CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_status
     ON kanban_review_processor_markers(processor_kind, status, queued_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_retry
+    ON kanban_review_processor_markers(processor_kind, status, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS kanban_review_processor_failure_events (
+    failure_event_id    TEXT PRIMARY KEY,
+    marker_id           TEXT NOT NULL,
+    item_id             TEXT NOT NULL,
+    processor_kind      TEXT NOT NULL DEFAULT 'review',
+    document_type       TEXT NOT NULL DEFAULT '',
+    source_hash         TEXT NOT NULL DEFAULT '',
+    error_class         TEXT NOT NULL DEFAULT '',
+    error_message       TEXT NOT NULL DEFAULT '',
+    provider_mode       TEXT NOT NULL DEFAULT 'local',
+    model_alias         TEXT NOT NULL DEFAULT '',
+    attempt_number      INTEGER NOT NULL DEFAULT 0,
+    failed_at           TEXT NOT NULL DEFAULT '',
+    next_retry_at       TEXT NOT NULL DEFAULT '',
+    retry_after_seconds INTEGER NOT NULL DEFAULT 0,
+    retry_policy_version TEXT NOT NULL DEFAULT '',
+    retryable           INTEGER NOT NULL DEFAULT 1,
+    status              TEXT NOT NULL DEFAULT 'retry_waiting',
+    event_hash          TEXT NOT NULL DEFAULT '',
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    provenance_json     TEXT NOT NULL DEFAULT '{}',
+    created_at          TEXT DEFAULT (datetime('now')),
+    updated_at          TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_marker
+    ON kanban_review_processor_failure_events(marker_id, source_hash, failed_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_status
+    ON kanban_review_processor_failure_events(processor_kind, status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_item
+    ON kanban_review_processor_failure_events(item_id, processor_kind, failed_at);
 
 CREATE TABLE IF NOT EXISTS kanban_agent_hints (
     hint_id                 TEXT PRIMARY KEY,
@@ -2258,6 +2299,39 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             "superseded_by_source_hash",
             "TEXT NOT NULL DEFAULT ''",
         ),
+        # kanban_review_processor_markers: retryable failure state (2026-06-28)
+        ("kanban_review_processor_markers", "next_retry_at", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "kanban_review_processor_markers",
+            "retry_after_seconds",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "kanban_review_processor_markers",
+            "retry_attempt_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "kanban_review_processor_markers",
+            "last_successful_source_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "kanban_review_processor_markers",
+            "last_failure_event_id",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "kanban_review_processor_markers",
+            "last_failure_source_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
+        ("kanban_review_processor_markers", "last_error_class", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "kanban_review_processor_markers",
+            "retry_policy_version",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:
@@ -2274,6 +2348,50 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_timeout "
         "ON kanban_review_processor_markers(status, processing_expires_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_markers_retry "
+        "ON kanban_review_processor_markers(processor_kind, status, next_retry_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_review_processor_failure_events (
+            failure_event_id    TEXT PRIMARY KEY,
+            marker_id           TEXT NOT NULL,
+            item_id             TEXT NOT NULL,
+            processor_kind      TEXT NOT NULL DEFAULT 'review',
+            document_type       TEXT NOT NULL DEFAULT '',
+            source_hash         TEXT NOT NULL DEFAULT '',
+            error_class         TEXT NOT NULL DEFAULT '',
+            error_message       TEXT NOT NULL DEFAULT '',
+            provider_mode       TEXT NOT NULL DEFAULT 'local',
+            model_alias         TEXT NOT NULL DEFAULT '',
+            attempt_number      INTEGER NOT NULL DEFAULT 0,
+            failed_at           TEXT NOT NULL DEFAULT '',
+            next_retry_at       TEXT NOT NULL DEFAULT '',
+            retry_after_seconds INTEGER NOT NULL DEFAULT 0,
+            retry_policy_version TEXT NOT NULL DEFAULT '',
+            retryable           INTEGER NOT NULL DEFAULT 1,
+            status              TEXT NOT NULL DEFAULT 'retry_waiting',
+            event_hash          TEXT NOT NULL DEFAULT '',
+            metadata_json       TEXT NOT NULL DEFAULT '{}',
+            provenance_json     TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT DEFAULT (datetime('now')),
+            updated_at          TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_marker "
+        "ON kanban_review_processor_failure_events(marker_id, source_hash, failed_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_status "
+        "ON kanban_review_processor_failure_events(processor_kind, status, next_retry_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_item "
+        "ON kanban_review_processor_failure_events(item_id, processor_kind, failed_at)"
     )
 
 

@@ -4,7 +4,7 @@
   "version": "2026-06-28",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
-  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates.",
+  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff.",
   "provider_mode": {
     "active": "local",
     "required_model_env": "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL",
@@ -38,8 +38,8 @@
       "review updated_at",
       "review document_source_hash"
     ],
-    "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last terminal processed source hash, unless a current queued or processing marker already exists.",
-    "completion_rule": "Record a kanban_review_decisions row, complete the marker, and store processed source hash/date."
+    "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last successful/non-retryable processed source hash, unless a current queued, processing, or retry-waiting marker already exists for the same source.",
+    "completion_rule": "Record a kanban_review_decisions row on success, complete the marker, and store successful processed source hash/date. Retryable failed completion records a failure event and next_retry_at without updating processed_source_hash."
   },
   "preprocessing_processor": {
     "processor_kind": "preprocessing",
@@ -68,7 +68,46 @@
     "queue_rule": "Queue when the readiness marker is missing or stale for an eligible ToDo leaf, unless a current queued or processing marker already exists.",
     "ready_result": "Write a fresh context_readiness_marker and complete the marker.",
     "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
-    "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly."
+    "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly as retryable queue state unless the operator/work state makes it terminal."
+  },
+  "retry_policy": {
+    "schema": "xarta.kanban.review_processor.retry_policy.v1",
+    "failure_event_table": "kanban_review_processor_failure_events",
+    "marker_table": "kanban_review_processor_markers",
+    "processed_source_hash_rule": "Retryable failed attempts must not update processed_source_hash or last_successful_source_hash.",
+    "backoff_seconds": [
+      300,
+      1200,
+      3600,
+      14400,
+      43200,
+      86400,
+      172800,
+      345600,
+      518400
+    ],
+    "max_backoff_seconds": 518400,
+    "cap_below_one_week": true,
+    "retry_until": [
+      "success",
+      "source_superseded",
+      "item_archived_deleted_or_excluded",
+      "operator_cancelled_or_disabled"
+    ],
+    "failure_event_fields": [
+      "item_id",
+      "marker_id",
+      "processor_kind",
+      "source_hash",
+      "error_class",
+      "error_message",
+      "provider_mode",
+      "model_alias",
+      "attempt_number",
+      "failed_at",
+      "next_retry_at",
+      "retry_policy_version"
+    ]
   },
   "queue_cleanup": {
     "runs_before_claiming": true,
@@ -82,7 +121,7 @@
         "action": "cancel marker"
       },
       {
-        "condition": "queued or processing marker source is stale",
+        "condition": "queued, processing, or failed marker source is stale",
         "action": "re-scan and requeue current source or cancel old marker"
       },
       {
@@ -91,11 +130,11 @@
       },
       {
         "condition": "provider model/env is missing",
-        "action": "fail marker visibly; do not perform deterministic substitute processing"
+        "action": "record retryable failure event; do not perform deterministic substitute processing"
       }
     ]
   },
-  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n",
+  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
   "must_pass_tests": [
     "No root env var set: idle worker still scans automatically.",
     "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
@@ -105,6 +144,9 @@
     "Fresh readiness marker and unchanged source hashes: no reprocessing.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
     "Old queued marker from invalid/global bad run is cancelled instead of processed.",
-    "Missing or unavailable local AI model fails visibly; deterministic substitute processing is forbidden."
+    "Missing or unavailable local AI model fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
+    "Retryable Review Processor/preprocessing failure does not update processed_source_hash.",
+    "Automation Status exposes failure events, repeated failure aggregates, attempt count, last error, next retry time, and retry-waiting/due state.",
+    "Source changes supersede retry wait and queue fresh work for the new source hash."
   ]
 }
