@@ -1098,15 +1098,15 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
             {
                 "field": "processed_source_hash",
                 "scope": "kanban_review_processor_markers",
-                "meaning": "Last non-retryable processed source hash recorded for duplicate-scan suppression.",
-                "updates_when": "marker completes with processed success or a terminal non-retryable skipped/cancelled outcome; retryable failed outcomes never update this field.",
+                "meaning": "Legacy last processed source hash retained for marker history; duplicate-scan suppression uses last_successful_source_hash and only falls back to this field on processed markers migrated before the success-only field existed.",
+                "updates_when": "marker completes with processed success. Retryable failed outcomes clear this field when it matches the failed source so failures cannot masquerade as successful processing.",
             },
             {
                 "field": "processed_at",
                 "scope": "kanban_review_processor_markers",
                 "alias": "last_processed_at",
-                "meaning": "UTC time of the last non-retryable processed source outcome.",
-                "updates_when": "marker completes with processed success or a terminal non-retryable skipped/cancelled outcome; retryable failed outcomes never update this field.",
+                "meaning": "UTC time of the last processed success retained for marker history.",
+                "updates_when": "marker completes with processed success. Retryable failed outcomes clear this field when the legacy processed source hash matches the failed source.",
             },
             {
                 "field": "last_successful_source_hash",
@@ -2427,17 +2427,16 @@ def _work_preprocessing_marker_row(
     requeued_processing_change = bool(existing is not None and existing["status"] == "processing")
     if requeued_processing_change:
         metadata["superseded_processing_attempt"] = True
-    last_successful_source_hash = _clean_short_text(
-        _row_value(existing, "last_successful_source_hash", ""),
-        "",
-        limit=120,
-    )
-    if not last_successful_source_hash and _row_value(existing, "status", "") == "processed":
-        last_successful_source_hash = _clean_short_text(
-            _row_value(existing, "processed_source_hash", ""),
-            "",
-            limit=120,
-        )
+    last_successful_source_hash = _work_marker_successful_source_hash(existing)
+    processed_document_updated_at = ""
+    processed_at = ""
+    if (
+        existing is not None
+        and last_successful_source_hash
+        and _row_value(existing, "processed_source_hash", "") == last_successful_source_hash
+    ):
+        processed_document_updated_at = existing["processed_document_updated_at"]
+        processed_at = existing["processed_at"]
     row = {
         "marker_id": marker_id,
         "item_id": item_id,
@@ -2446,11 +2445,9 @@ def _work_preprocessing_marker_row(
         "document_ref": source["document_ref"],
         "document_updated_at": source["document_updated_at"],
         "document_source_hash": source["document_source_hash"],
-        "processed_document_updated_at": (
-            existing["processed_document_updated_at"] if existing is not None else ""
-        ),
-        "processed_source_hash": existing["processed_source_hash"] if existing is not None else "",
-        "processed_at": existing["processed_at"] if existing is not None else "",
+        "processed_document_updated_at": processed_document_updated_at,
+        "processed_source_hash": last_successful_source_hash,
+        "processed_at": processed_at,
         "queued_at": now,
         "last_seen_at": now,
         "processing_started_at": "",
@@ -2635,6 +2632,25 @@ def _raise_work_automation_excluded(
     )
 
 
+def _work_marker_successful_source_hash(existing: Any | None) -> str:
+    if existing is None:
+        return ""
+    successful_source_hash = _clean_short_text(
+        _row_value(existing, "last_successful_source_hash", ""),
+        "",
+        limit=120,
+    )
+    if successful_source_hash:
+        return successful_source_hash
+    if _row_value(existing, "status", "") == "processed":
+        return _clean_short_text(
+            _row_value(existing, "processed_source_hash", ""),
+            "",
+            limit=120,
+        )
+    return ""
+
+
 def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
     now = _utc_now_iso()
     args: list[Any] = [now]
@@ -2737,17 +2753,16 @@ def _work_review_processor_marker_row(
     requeued_processing_change = bool(existing is not None and existing["status"] == "processing")
     if requeued_processing_change:
         metadata["superseded_processing_attempt"] = True
-    last_successful_source_hash = _clean_short_text(
-        _row_value(existing, "last_successful_source_hash", ""),
-        "",
-        limit=120,
-    )
-    if not last_successful_source_hash and _row_value(existing, "status", "") == "processed":
-        last_successful_source_hash = _clean_short_text(
-            _row_value(existing, "processed_source_hash", ""),
-            "",
-            limit=120,
-        )
+    last_successful_source_hash = _work_marker_successful_source_hash(existing)
+    processed_document_updated_at = ""
+    processed_at = ""
+    if (
+        existing is not None
+        and last_successful_source_hash
+        and _row_value(existing, "processed_source_hash", "") == last_successful_source_hash
+    ):
+        processed_document_updated_at = existing["processed_document_updated_at"]
+        processed_at = existing["processed_at"]
     provenance = {
         "schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "recorded_by": meta["actor"],
@@ -2763,11 +2778,9 @@ def _work_review_processor_marker_row(
         "document_ref": document_source["document_ref"],
         "document_updated_at": document_source["document_updated_at"],
         "document_source_hash": document_source["document_source_hash"],
-        "processed_document_updated_at": (
-            existing["processed_document_updated_at"] if existing is not None else ""
-        ),
-        "processed_source_hash": existing["processed_source_hash"] if existing is not None else "",
-        "processed_at": existing["processed_at"] if existing is not None else "",
+        "processed_document_updated_at": processed_document_updated_at,
+        "processed_source_hash": last_successful_source_hash,
+        "processed_at": processed_at,
         "queued_at": now,
         "last_seen_at": now,
         "processing_started_at": "",
@@ -3048,9 +3061,7 @@ def _schedule_work_review_processor_marker_for_document(
     if existing is not None:
         same_document = existing["document_source_hash"] == document_source["document_source_hash"]
         already_processed = (
-            existing["processed_source_hash"] == document_source["document_source_hash"]
-            or _row_value(existing, "last_successful_source_hash", "")
-            == document_source["document_source_hash"]
+            _work_marker_successful_source_hash(existing) == document_source["document_source_hash"]
         )
         if same_document and existing["status"] in {"queued", "processing"}:
             return {
@@ -14791,7 +14802,11 @@ async def _process_work_preprocessing_idle_marker(
     )
     payload = ai["payload"]
     ready = bool(payload.get("ready"))
-    title = _local_ai_required_text(payload, "title", limit=220)
+    title = _local_ai_optional_text(payload, "title", limit=220) or _clean_short_text(
+        str(item["title"] or ""),
+        "Preprocessing result",
+        limit=220,
+    )
     summary = _local_ai_required_text(payload, "summary")
     rationale = _local_ai_required_text(payload, "rationale")
     confidence = _clean_short_text(str(payload.get("confidence") or "medium"), "medium", limit=40)
@@ -15643,8 +15658,7 @@ async def trigger_work_review_processor_idle_scan(
                     existing["document_source_hash"] == document_source["document_source_hash"]
                 )
                 already_processed = (
-                    existing["processed_source_hash"] == document_source["document_source_hash"]
-                    or _row_value(existing, "last_successful_source_hash", "")
+                    _work_marker_successful_source_hash(existing)
                     == document_source["document_source_hash"]
                 )
                 if same_document and existing["status"] in {"queued", "processing"}:
@@ -15948,12 +15962,7 @@ async def trigger_work_preprocessing_idle_scan(
             )
             already_processed = bool(
                 existing is not None
-                and existing["processed_source_hash"] == source["document_source_hash"]
-                or (
-                    existing is not None
-                    and _row_value(existing, "last_successful_source_hash", "")
-                    == source["document_source_hash"]
-                )
+                and _work_marker_successful_source_hash(existing) == source["document_source_hash"]
             )
             if source["ready"] or not source.get("needs_preprocessing", True):
                 current_ready += 1
@@ -16703,6 +16712,14 @@ async def complete_work_review_processor_marker(
                     "retry_policy_version": KANBAN_REVIEW_RETRY_POLICY_VERSION,
                 }
             )
+            if marker_row["processed_source_hash"] == marker_row["document_source_hash"]:
+                updates.update(
+                    {
+                        "processed_document_updated_at": "",
+                        "processed_source_hash": "",
+                        "processed_at": "",
+                    }
+                )
             completion_metadata.update(
                 {
                     "retryable": True,
