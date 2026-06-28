@@ -1000,7 +1000,14 @@ def _clean_review_decision_status(value: str | None) -> str:
 
 def _clean_review_provider_mode(value: str | None) -> str:
     mode = _clean_short_text(value, "local", limit=80).replace("_", "-")
-    allowed = {"cloud-first", "cloud", "local-planned", "local", "manual"}
+    allowed = {
+        "cloud-first",
+        "cloud",
+        "local-planned",
+        "local",
+        "manual",
+        "required-hermes-kanban-llm",
+    }
     return mode if mode in allowed else "local"
 
 

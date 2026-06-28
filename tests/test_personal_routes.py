@@ -4704,6 +4704,17 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     assert "record_review_processor_decision" in audit_actions
 
 
+def test_work_review_provider_mode_preserves_hermes_kanban_llm_route():
+    assert (
+        routes_personal._clean_review_provider_mode("required-hermes-kanban-llm")
+        == "required-hermes-kanban-llm"
+    )
+    assert (
+        routes_personal._clean_review_provider_mode("required_hermes_kanban_llm")
+        == "required-hermes-kanban-llm"
+    )
+
+
 def test_work_review_processor_output_contract_endpoint():
     result = asyncio.run(routes_personal.get_work_review_processor_output_contract())
     contract = result["contract"]
