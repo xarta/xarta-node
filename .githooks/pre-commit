@@ -4,6 +4,27 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT"
 
+ACTION_HINTS_SCRIPT="/root/xarta-node/.xarta/.claude/skills/docs-operations/scripts/pre-commit-action-hints.sh"
+if [[ -f "$ACTION_HINTS_SCRIPT" ]]; then
+  # shellcheck source=/dev/null
+  source "$ACTION_HINTS_SCRIPT"
+fi
+
+print_root_script_hints() {
+  local reason="$1"
+  local script="$2"
+  local bash_path
+  bash_path="$(command -v bash 2>/dev/null || printf 'bash')"
+  if declare -F xarta_precommit_print_common_context >/dev/null 2>&1; then
+    xarta_precommit_print_common_context "$reason"
+    echo "  tool paths:" >&2
+    xarta_precommit_print_tool_paths
+    xarta_precommit_print_path_status "script" "$script"
+    echo "  rerun command:" >&2
+    xarta_precommit_print_command "$bash_path" "$script"
+  fi
+}
+
 is_env_backup_name() {
   local name="$1"
   case "$name" in
@@ -48,11 +69,23 @@ if [[ ${#TRACKED_HITS[@]} -gt 0 || ${#STAGED_HITS[@]} -gt 0 ]]; then
 fi
 
 echo "[pre-commit] Running public leak check..."
-bash "$REPO_ROOT/check-for-leaks.sh"
+if ! bash "$REPO_ROOT/check-for-leaks.sh"; then
+  echo "[pre-commit] BLOCKED: public leak check failed." >&2
+  print_root_script_hints "public leak check failed" "$REPO_ROOT/check-for-leaks.sh"
+  exit 1
+fi
 
 if [[ -x "$REPO_ROOT/check-caddy-route-parity.sh" ]]; then
   echo "[pre-commit] Running Caddy route parity check..."
-  bash "$REPO_ROOT/check-caddy-route-parity.sh"
+  if ! bash "$REPO_ROOT/check-caddy-route-parity.sh"; then
+    echo "[pre-commit] BLOCKED: Caddy route parity check failed." >&2
+    if declare -F xarta_precommit_print_caddy_hints >/dev/null 2>&1; then
+      xarta_precommit_print_caddy_hints "Caddy route parity failed"
+    else
+      print_root_script_hints "Caddy route parity failed" "$REPO_ROOT/check-caddy-route-parity.sh"
+    fi
+    exit 1
+  fi
 fi
 
 run_active_browser_live_checks() {
@@ -71,11 +104,24 @@ run_active_browser_live_checks() {
 
   if [[ ! -x "$runner" ]]; then
     echo "[pre-commit] BLOCKED: Active Browser pre-commit runner not found at $runner" >&2
+    print_root_script_hints "Active Browser runner missing" "$runner"
     exit 1
   fi
 
   echo "[pre-commit] Running Active Browser live automation checks..."
-  python3 "$runner"
+  if ! python3 "$runner"; then
+    echo "[pre-commit] BLOCKED: Active Browser live automation checks failed." >&2
+    if declare -F xarta_precommit_print_common_context >/dev/null 2>&1; then
+      python_path="$(command -v python3 2>/dev/null || printf 'python3')"
+      xarta_precommit_print_common_context "Active Browser live automation checks failed"
+      echo "  tool paths:" >&2
+      xarta_precommit_print_tool_paths
+      xarta_precommit_print_path_status "Active Browser pre-commit runner" "$runner"
+      echo "  rerun command:" >&2
+      xarta_precommit_print_command "$python_path" "$runner"
+    fi
+    exit 1
+  fi
 }
 
 run_active_browser_live_checks
@@ -86,18 +132,27 @@ mapfile -t STAGED_PY < <(git diff --cached --name-only --diff-filter=ACMR | grep
 if [[ ${#STAGED_PY[@]} -gt 0 ]]; then
   if ! command -v ruff >/dev/null 2>&1; then
     echo "[pre-commit] BLOCKED: ruff not found. Run: bash setup-python-dev-tools.sh" >&2
+    if declare -F xarta_precommit_print_ruff_hints >/dev/null 2>&1; then
+      xarta_precommit_print_ruff_hints "ruff not found" "${STAGED_PY[@]}"
+    fi
     exit 1
   fi
 
   echo "[pre-commit] Running ruff check on ${#STAGED_PY[@]} staged Python file(s)..."
   ruff check "${STAGED_PY[@]}" || {
     echo "[pre-commit] BLOCKED: ruff found lint errors. Fix them or use 'git commit --no-verify' to skip." >&2
+    if declare -F xarta_precommit_print_ruff_hints >/dev/null 2>&1; then
+      xarta_precommit_print_ruff_hints "ruff check failed" "${STAGED_PY[@]}"
+    fi
     exit 1
   }
 
   echo "[pre-commit] Running ruff format check on ${#STAGED_PY[@]} staged Python file(s)..."
   ruff format --check "${STAGED_PY[@]}" || {
     echo "[pre-commit] BLOCKED: ruff found formatting drift. Fix it or use 'git commit --no-verify' to skip." >&2
+    if declare -F xarta_precommit_print_ruff_hints >/dev/null 2>&1; then
+      xarta_precommit_print_ruff_hints "ruff format check failed" "${STAGED_PY[@]}"
+    fi
     exit 1
   }
 fi
