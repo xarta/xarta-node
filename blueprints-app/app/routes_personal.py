@@ -14445,6 +14445,62 @@ def _local_ai_ref_list(payload: dict[str, Any], key: str) -> list[str]:
     return refs[:40]
 
 
+KANBAN_PROMPT_ROOT = (
+    Path(
+        os.environ.get(
+            "BLUEPRINTS_HERMES_LOCAL_STACK", "/xarta-node/.lone-wolf/stacks/hermes-local"
+        )
+    )
+    / "config/prompts"
+)
+REVIEW_PROCESSOR_SYSTEM_PROMPT = (
+    "You are the Blueprints Kanban Review Processor running on the local "
+    "private no-think/no-protection/no-orientation endpoint. Return only one "
+    "strict JSON object. Do not use markdown. Process the Review text as "
+    "future guidance and acceptance-check data. If required infrastructure "
+    "or provider wiring is missing, record that as a blocker/question rather "
+    "than substituting a different workflow. Do not claim implementation is "
+    "done unless proof in the context actually supports it."
+)
+PREPROCESSING_SYSTEM_PROMPT = (
+    "You are the Blueprints Kanban preprocessing processor running on the "
+    "local private no-think/no-protection/no-orientation endpoint. Return "
+    "only one strict JSON object. Do not use markdown. Decide whether the "
+    "current card context is ready for an agent to start implementation. "
+    "The queue_source reason may be missing_readiness_marker or "
+    "readiness_marker_stale; treat that as why this pass is running, not "
+    "as an automatic failure. "
+    "If the card is an actionable leaf whose next step is an audit, file "
+    "inspection, command run, or implementation task, mark it ready even "
+    "when that work has not been completed yet. "
+    "When a required route, API, provider, proof path, or operator decision "
+    "is missing, set ready=false and return decomposition_items for the "
+    "smallest child work items that should be created, using blocked items "
+    "for true operator questions or external blockers. Do not invent "
+    "deterministic substitute work."
+)
+REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH = Path(
+    os.environ.get(
+        "BLUEPRINTS_KANBAN_REVIEW_PROCESSOR_PROMPT",
+        str(KANBAN_PROMPT_ROOT / "kanban-review-processor-system.md"),
+    )
+)
+PREPROCESSING_SYSTEM_PROMPT_PATH = Path(
+    os.environ.get(
+        "BLUEPRINTS_KANBAN_PREPROCESSING_PROMPT",
+        str(KANBAN_PROMPT_ROOT / "kanban-preprocessing-system.md"),
+    )
+)
+
+
+def _load_work_prompt(path: Path, fallback: str) -> str:
+    try:
+        prompt = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    return prompt or fallback
+
+
 def _work_review_processor_local_ai_messages(
     *,
     item: Any,
@@ -14485,15 +14541,7 @@ def _work_review_processor_local_ai_messages(
             "proof_refs": ["source/proof refs"],
         },
     }
-    system = (
-        "You are the Blueprints Kanban Review Processor running on the local "
-        "private no-think/no-protection/no-orientation endpoint. Return only one "
-        "strict JSON object. Do not use markdown. Process the Review text as "
-        "future guidance and acceptance-check data. If required infrastructure "
-        "or provider wiring is missing, record that as a blocker/question rather "
-        "than substituting a different workflow. Do not claim implementation is "
-        "done unless proof in the context actually supports it."
-    )
+    system = _load_work_prompt(REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH, REVIEW_PROCESSOR_SYSTEM_PROMPT)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
@@ -14696,23 +14744,7 @@ def _work_preprocessing_local_ai_messages(
             "proof_refs": ["source/proof refs"],
         },
     }
-    system = (
-        "You are the Blueprints Kanban preprocessing processor running on the "
-        "local private no-think/no-protection/no-orientation endpoint. Return "
-        "only one strict JSON object. Do not use markdown. Decide whether the "
-        "current card context is ready for an agent to start implementation. "
-        "The queue_source reason may be missing_readiness_marker or "
-        "readiness_marker_stale; treat that as why this pass is running, not "
-        "as an automatic failure. "
-        "If the card is an actionable leaf whose next step is an audit, file "
-        "inspection, command run, or implementation task, mark it ready even "
-        "when that work has not been completed yet. "
-        "When a required route, API, provider, proof path, or operator decision "
-        "is missing, set ready=false and return decomposition_items for the "
-        "smallest child work items that should be created, using blocked items "
-        "for true operator questions or external blockers. Do not invent "
-        "deterministic substitute work."
-    )
+    system = _load_work_prompt(PREPROCESSING_SYSTEM_PROMPT_PATH, PREPROCESSING_SYSTEM_PROMPT)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
