@@ -79,6 +79,7 @@
     "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
     "queue_rule": "Queue when the readiness marker is missing or stale for an eligible ToDo leaf, unless a current queued or processing marker already exists.",
     "ready_result": "Write a fresh context_readiness_marker and complete the marker.",
+    "ready_leaf_no_decomposition_rule": "If local AI returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
     "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
     "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly as retryable queue state unless the operator/work state makes it terminal."
   },
@@ -100,6 +101,7 @@
     ],
     "max_backoff_seconds": 518400,
     "cap_below_one_week": true,
+    "status_summary_rule": "Automation Status summary fields last_error, next_retry_at, retry_waiting_count, and retry_due_count describe active failed/retry markers only. Historical failure events and aggregates remain durable proof and expose scheduled_retry_at/historical_last_error where needed, but recovered processed markers must not present old retry times as active work.",
     "retry_until": [
       "success",
       "source_superseded",
@@ -154,11 +156,13 @@
     "New ToDo leaf with missing readiness marker: preprocessing marker is queued and processed.",
     "Backlog, Doing, Blocked, Done, archived, and non-leaf cards are not preprocessing candidates.",
     "Fresh readiness marker and unchanged source hashes: no reprocessing.",
+    "Actionable leaf with no blocker/question/decomposition from local AI is marked ready_leaf_no_decomposition, not failed.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
     "Old queued marker from invalid/global bad run is cancelled instead of processed.",
     "Missing or unavailable local AI model fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
     "Retryable Review Processor/preprocessing failure does not update last_successful_source_hash and clears processed_source_hash if it matches the failed source.",
     "Automation Status exposes failure events, repeated failure aggregates, attempt count, last error, next retry time, and retry-waiting/due state.",
+    "After a retry succeeds, Automation Status keeps historical failure events but clears active retry summary fields.",
     "Source changes supersede retry wait and queue fresh work for the new source hash.",
     "A non-owner node returns idle_worker_not_owner_node and does not scan, queue, requeue, lease, claim, or process idle work."
   ]
