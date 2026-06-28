@@ -81,6 +81,7 @@ from .routes_nodes import router as nodes_router
 from .routes_notifier_dnd import router as notifier_dnd_router
 from .routes_personal import router as personal_router
 from .routes_personal import run_work_kanban_automation_idle_loop
+from .routes_personal_prompts import router as personal_prompts_router
 from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_playwright import router as playwright_router
 from .routes_pockettts import router as pockettts_router
@@ -447,6 +448,7 @@ def create_app() -> FastAPI:
     application.include_router(playwright_router, prefix="/api/v1")
     application.include_router(events_router, prefix="/api/v1")
     application.include_router(personal_router, prefix="/api/v1")
+    application.include_router(personal_prompts_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)
     async def favicon() -> Response:
