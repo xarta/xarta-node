@@ -90,9 +90,7 @@ KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.rea
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
-KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = (
-    "xarta.kanban.automation.idle_worker.contract.v1"
-)
+KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
@@ -1017,8 +1015,7 @@ def _work_automation_idle_worker_contract() -> dict[str, Any]:
     contract = json.loads(KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH.read_text())
     if contract.get("schema") != KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA:
         raise RuntimeError(
-            "Kanban idle worker contract schema mismatch: "
-            f"{contract.get('schema')!r}"
+            f"Kanban idle worker contract schema mismatch: {contract.get('schema')!r}"
         )
     return contract
 
@@ -2994,10 +2991,13 @@ def _cancel_invalid_work_preprocessing_markers(
     cancelled_rows = []
     marker_blockers: list[dict[str, Any]] = []
     for row in rows:
-        reason = _work_preprocessing_pending_ineligible_reason(
-            conn,
-            row,
-        ) or "preprocessing_not_candidate"
+        reason = (
+            _work_preprocessing_pending_ineligible_reason(
+                conn,
+                row,
+            )
+            or "preprocessing_not_candidate"
+        )
         updated_row = _work_review_processor_marker_update_row(
             row,
             updates={
