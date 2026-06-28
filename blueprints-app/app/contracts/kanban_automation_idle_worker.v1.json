@@ -51,7 +51,7 @@
       "review document_source_hash"
     ],
     "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last successful/non-retryable processed source hash, unless a current queued, processing, or retry-waiting marker already exists for the same source.",
-    "completion_rule": "Record a kanban_review_decisions row on success, complete the marker, and store successful processed source hash/date. Retryable failed completion records a failure event and next_retry_at without updating processed_source_hash."
+    "completion_rule": "Record a kanban_review_decisions row on success, complete the marker, and store successful processed source hash/date. Retryable failed completion records a failure event and next_retry_at without updating last_successful_source_hash, and clears legacy processed_source_hash/date fields when they match the failed source."
   },
   "preprocessing_processor": {
     "processor_kind": "preprocessing",
@@ -86,7 +86,7 @@
     "schema": "xarta.kanban.review_processor.retry_policy.v1",
     "failure_event_table": "kanban_review_processor_failure_events",
     "marker_table": "kanban_review_processor_markers",
-    "processed_source_hash_rule": "Retryable failed attempts must not update processed_source_hash or last_successful_source_hash.",
+    "processed_source_hash_rule": "Retryable failed attempts must not update last_successful_source_hash and must not leave processed_source_hash equal to the failed source.",
     "backoff_seconds": [
       300,
       1200,
@@ -157,7 +157,7 @@
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
     "Old queued marker from invalid/global bad run is cancelled instead of processed.",
     "Missing or unavailable local AI model fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
-    "Retryable Review Processor/preprocessing failure does not update processed_source_hash.",
+    "Retryable Review Processor/preprocessing failure does not update last_successful_source_hash and clears processed_source_hash if it matches the failed source.",
     "Automation Status exposes failure events, repeated failure aggregates, attempt count, last error, next retry time, and retry-waiting/due state.",
     "Source changes supersede retry wait and queue fresh work for the new source hash.",
     "A non-owner node returns idle_worker_not_owner_node and does not scan, queue, requeue, lease, claim, or process idle work."

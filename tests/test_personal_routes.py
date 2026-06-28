@@ -4772,12 +4772,9 @@ def test_work_review_processor_metadata_contract_endpoint():
         routes_personal.KANBAN_REVIEW_FEEDBACK_SCHEMA
     )
     assert fields["processed_at"]["alias"] == "last_processed_at"
+    assert "Retryable failed outcomes clear this field" in fields["processed_at"]["updates_when"]
     assert (
-        "retryable failed outcomes never update this field"
-        in fields["processed_at"]["updates_when"]
-    )
-    assert (
-        "retryable failed outcomes never update this field"
+        "failures cannot masquerade as successful processing"
         in fields["processed_source_hash"]["updates_when"]
     )
     assert fields["last_successful_source_hash"]["scope"] == "kanban_review_processor_markers"
@@ -5647,7 +5644,6 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
             "content_excerpt": "{}",
             "payload": {
                 "ready": False,
-                "title": "Proof still missing",
                 "summary": "Current evidence is not enough yet.",
                 "rationale": "The card needs proof before implementation can start.",
                 "confidence": "high",
@@ -5723,6 +5719,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     ).fetchone()
     assert decision["decision_type"] == "preprocessing_decomposition"
     assert decision["status"] == "accepted"
+    assert decision["title"] == "Preprocessing child"
 
 
 def test_work_preprocessing_decomposition_child_ids_retry_collisions_and_reuse_siblings(
@@ -7900,6 +7897,130 @@ def test_work_review_processor_failed_completion_records_outcome(monkeypatch, tm
     assert changed_marker["next_retry_at"] == ""
     assert changed_marker["retry_attempt_count"] == 0
     assert changed_marker["last_failure_event_id"] == ""
+
+
+def test_work_review_processor_failed_completion_clears_legacy_processed_hash(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-legacy-failed-root",
+                title="Review legacy failed root",
+                body="Root item for legacy processed hash failure proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-legacy-failed-child",
+                parent_item_id="work-review-legacy-failed-root",
+                title="Review legacy failed child",
+                body="Child item with Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-legacy-failed-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review legacy processed hash should not survive retry failure.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-legacy-failed-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-scan",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-legacy-failed",
+                item_id="work-review-legacy-failed-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-lease",
+            )
+        )
+    )
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-legacy-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                item_id="work-review-legacy-failed-root",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-claim",
+            )
+        )
+    )
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET processed_document_updated_at=document_updated_at,
+            processed_source_hash=document_source_hash,
+            processed_at='2026-06-28T10:00:00Z',
+            last_successful_source_hash=''
+        WHERE marker_id=?
+        """,
+        (claimed["marker"]["marker_id"],),
+    )
+    conn.commit()
+
+    completed = asyncio.run(
+        routes_personal.complete_work_review_processor_marker(
+            claimed["marker"]["marker_id"],
+            routes_personal.WorkReviewProcessorMarkerCompleteRequest(
+                holder_id="codex-legacy-failed",
+                lease_token=acquired["lease"]["lease_token"],
+                document_source_hash=marker["document_source_hash"],
+                status="failed",
+                error="provider_failed",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-legacy-failed-complete",
+            ),
+        )
+    )
+
+    failed_marker = completed["marker"]
+    assert failed_marker["status"] == "failed"
+    assert failed_marker["processed_document_updated_at"] == ""
+    assert failed_marker["processed_source_hash"] == ""
+    assert failed_marker["processed_at"] == ""
+    assert failed_marker["last_successful_source_hash"] == ""
+    assert failed_marker["retry_attempt_count"] == 1
+    assert failed_marker["last_failure_source_hash"] == marker["document_source_hash"]
 
 
 def test_work_review_processor_archive_cancels_active_marker(monkeypatch, tmp_path):

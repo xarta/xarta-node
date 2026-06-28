@@ -2828,6 +2828,25 @@ def _seed_manual_link_categories_from_groups(conn: sqlite3.Connection) -> None:
     )
 
 
+def _repair_failed_kanban_marker_processed_hashes(conn: sqlite3.Connection) -> None:
+    cur = conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET processed_document_updated_at='',
+            processed_source_hash='',
+            processed_at=''
+        WHERE status='failed'
+          AND COALESCE(processed_source_hash, '') != ''
+          AND processed_source_hash=document_source_hash
+        """
+    )
+    if cur.rowcount and cur.rowcount > 0:
+        log.info(
+            "migration: cleared legacy processed hashes from %s failed kanban marker(s)",
+            cur.rowcount,
+        )
+
+
 def init_db() -> None:
     """Create schema, run migrations, and seed sync_meta on first use."""
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -2846,6 +2865,7 @@ def init_db() -> None:
         _seed_manual_links_ai_assignment(conn)
         _seed_personal_search_ai_assignments(conn)
         _seed_manual_link_categories_from_groups(conn)
+        _repair_failed_kanban_marker_processed_hashes(conn)
     log.info("database initialised at %s", cfg.DB_PATH)
 
 
