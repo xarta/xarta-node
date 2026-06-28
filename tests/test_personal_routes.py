@@ -8272,6 +8272,31 @@ def test_work_review_processor_status_clears_active_retry_summary_after_success(
         )
     )
     failure_event = failed["failure_event"]
+    active_prune = asyncio.run(
+        routes_personal.prune_work_automation_failure_events(
+            routes_personal.WorkAutomationFailurePruneRequest(
+                item_id="work-review-recovered-root",
+                apply=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-active-prune",
+            )
+        )
+    )
+    assert active_prune["deleted_count"] == 0
+    assert active_prune["matched_count"] == 0
+    assert active_prune["skipped_active_count"] == 1
+    assert active_prune["skipped_active_event_ids"] == [failure_event["failure_event_id"]]
+    assert (
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM kanban_review_processor_failure_events
+            WHERE failure_event_id=?
+            """,
+            (failure_event["failure_event_id"],),
+        ).fetchone()["count"]
+        == 1
+    )
     conn.execute(
         """
         UPDATE kanban_review_processor_markers
@@ -8333,6 +8358,62 @@ def test_work_review_processor_status_clears_active_retry_summary_after_success(
     assert aggregate["retry_waiting"] is False
     assert aggregate["next_retry_at"] == ""
     assert aggregate["scheduled_retry_at"] == failure_event["next_retry_at"]
+
+    prune_preview = asyncio.run(
+        routes_personal.prune_work_automation_failure_events(
+            routes_personal.WorkAutomationFailurePruneRequest(
+                item_id="work-review-recovered-root",
+                apply=False,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-prune-preview",
+            )
+        )
+    )
+    assert prune_preview["apply"] is False
+    assert prune_preview["matched_count"] == 1
+    assert prune_preview["deleted_count"] == 0
+    assert prune_preview["skipped_active_count"] == 0
+    assert prune_preview["events"][0]["failure_event_id"] == failure_event["failure_event_id"]
+
+    conn.execute("DELETE FROM sync_queue")
+    prune_apply = asyncio.run(
+        routes_personal.prune_work_automation_failure_events(
+            routes_personal.WorkAutomationFailurePruneRequest(
+                item_id="work-review-recovered-root",
+                apply=True,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-recovered-prune-apply",
+            )
+        )
+    )
+    assert prune_apply["apply"] is True
+    assert prune_apply["matched_count"] == 1
+    assert prune_apply["deleted_count"] == 1
+    assert prune_apply["pruned_event_ids"] == [failure_event["failure_event_id"]]
+    assert (
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM kanban_review_processor_failure_events
+            WHERE failure_event_id=?
+            """,
+            (failure_event["failure_event_id"],),
+        ).fetchone()["count"]
+        == 0
+    )
+    pruned_status = asyncio.run(
+        routes_personal.get_work_automation_status(item_id="work-review-recovered-root")
+    )
+    assert pruned_status["failures"]["event_count"] == 0
+    assert pruned_status["failures"]["aggregates"] == []
+    delete_sync_tables = {
+        row["table_name"]
+        for row in conn.execute(
+            "SELECT table_name FROM sync_queue WHERE action_type='DELETE'"
+        ).fetchall()
+    }
+    assert "kanban_review_processor_failure_events" in delete_sync_tables
 
 
 def test_work_review_processor_failed_completion_clears_legacy_processed_hash(
