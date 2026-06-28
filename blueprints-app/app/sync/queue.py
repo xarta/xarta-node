@@ -6,9 +6,8 @@ they live in the same WAL-mode DB as the main data. The drain loop marks
 rows as sent=1 on success; rows are never deleted (provides an audit trail
 and allows re-inspection; the index keeps queries fast).
 
-Queue overflow: if pending depth for a peer reaches SYNC_QUEUE_MAX_DEPTH,
-the drain loop is responsible for switching to a full-DB backup send (handled
-in drain.py). The queue functions here are pure enqueue/query helpers.
+Queue overflow is handled by throttled row-action drain. Full-DB restore is a
+separate recovery or explicit force-restore path, not a queue relief mechanism.
 """
 
 import json
@@ -79,9 +78,8 @@ def enqueue_for_all_peers(
     across all per-peer queue entries — this lets receiving nodes deduplicate
     forwarded copies via sync_seen_guids.
 
-    exclude_node_id: optionally skip one node (e.g. when registering that node
-    itself — the new node will receive a full backup instead of incremental
-    actions).
+    exclude_node_id: optionally skip one node when a caller has a separate,
+    explicit plan for seeding or recovering that node.
     """
     shared_guid = guid if guid is not None else uuid.uuid4().hex
     try:

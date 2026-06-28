@@ -2736,6 +2736,23 @@ def test_personal_graph_declared_link_keeps_inferred_under_review(monkeypatch):
     assert "personal_graph_links" in sync_tables
 
 
+def test_full_db_restore_policy_is_recovery_or_force_only():
+    assert routes_sync._full_restore_allowed(force_restore=False, integrity_ok=True) is False
+    assert routes_sync._full_restore_allowed(force_restore=False, integrity_ok=False) is True
+    assert routes_sync._full_restore_allowed(force_restore=True, integrity_ok=True) is True
+
+
+def test_kanban_idle_worker_requires_root_scope(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.delenv("BLUEPRINTS_KANBAN_AUTOMATION_ROOT_ITEM_ID", raising=False)
+
+    result = asyncio.run(routes_personal.run_work_kanban_automation_idle_tick())
+
+    assert result["reason"] == "idle_worker_root_item_required"
+    assert result["processed_count"] == 0
+    assert result["eligible_marker_count"] == 0
+
+
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

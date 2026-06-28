@@ -14423,6 +14423,28 @@ async def run_work_kanban_automation_idle_tick(
         marker_timeout_seconds or config["marker_timeout_seconds"]
     )
     run_id = f"kanban-idle-worker-{uuid.uuid4().hex[:12]}"
+    if not clean_item_id:
+        return {
+            "ok": True,
+            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+            "run_id": run_id,
+            "item_id": "",
+            "enabled": True,
+            "reason": "idle_worker_root_item_required",
+            "message": (
+                "Kanban automation idle worker requires a root item scope; "
+                "manual ticks may still pass item_id explicitly."
+            ),
+            "lease_acquired": False,
+            "timeout_requeue": {"ok": True, "requeued_count": 0, "cancelled_excluded_count": 0},
+            "review_scan": {"ok": True, "queued_count": 0, "scanned_count": 0},
+            "preprocessing_scan": {"ok": True, "queued_count": 0, "scanned_count": 0},
+            "eligible_marker_count": 0,
+            "eligible_marker_ids": [],
+            "processed_count": 0,
+            "processed_markers": [],
+            "claim_results": [],
+        }
 
     timeout_requeue = await requeue_timed_out_work_review_processor_markers(
         WorkReviewProcessorTimeoutRequeueRequest(
