@@ -19,6 +19,7 @@ import os
 import shlex
 import sqlite3
 import ssl
+import subprocess as _sp
 import time
 import uuid
 from datetime import datetime, timezone
@@ -133,6 +134,34 @@ def _repo_pull_targets() -> dict[str, tuple[str, bool]]:
     }
 
 
+def _git_head_sync(repo_path: str, label: str) -> str | None:
+    if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
+        return None
+    try:
+        return _sp.check_output(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            stderr=_sp.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        log.warning("git head [%s] failed during runtime snapshot", label)
+        return None
+
+
+def _capture_runtime_repo_heads() -> dict[str, str]:
+    heads: dict[str, str] = {}
+    for label, (repo_path, restart_service) in _repo_pull_targets().items():
+        if not restart_service:
+            continue
+        head = _git_head_sync(repo_path, label)
+        if head:
+            heads[label] = head
+    return heads
+
+
+_RUNNING_RUNTIME_REPO_HEADS = _capture_runtime_repo_heads()
+
+
 def _ordered_git_scopes(scopes) -> list[str]:
     wanted = {scope for scope in scopes if scope in _GIT_PULL_SCOPE_ORDER}
     return [scope for scope in _GIT_PULL_SCOPE_ORDER if scope in wanted]
@@ -195,15 +224,15 @@ async def _runtime_repo_is_stale(repo_path: str, label: str) -> bool:
     if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
         return False
     head = await _git_head(repo_path, label)
-    running = cfg.COMMIT_HASH
+    running = _RUNNING_RUNTIME_REPO_HEADS.get(label)
     if not head or not running:
         return False
-    stale = not head.startswith(running)
+    stale = head != running
     if stale:
         log.info(
             "runtime repo [%s] is newer than process: running=%s disk=%s",
             label,
-            running,
+            running[:12],
             head[:12],
         )
     return stale
