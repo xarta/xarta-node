@@ -147,6 +147,41 @@ def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
     assert restarts == ["restart"]
 
 
+def test_runtime_stale_check_uses_scope_specific_running_head(monkeypatch):
+    async def fake_git_head(repo_path, label):
+        assert repo_path == "/repo/inner"
+        assert label == "inner"
+        return "inner-private-head"
+
+    monkeypatch.setattr(routes_sync.os.path, "isdir", lambda path: path == "/repo/inner/.git")
+    monkeypatch.setattr(routes_sync, "_git_head", fake_git_head)
+    monkeypatch.setattr(routes_sync.cfg, "COMMIT_HASH", "outer-public-head")
+    monkeypatch.setattr(
+        routes_sync,
+        "_RUNNING_RUNTIME_REPO_HEADS",
+        {"inner": "inner-private-head", "outer": "outer-public-head"},
+    )
+
+    assert asyncio.run(routes_sync._runtime_repo_is_stale("/repo/inner", "inner")) is False
+
+
+def test_runtime_stale_check_detects_scope_specific_head_change(monkeypatch):
+    async def fake_git_head(repo_path, label):
+        assert repo_path == "/repo/inner"
+        assert label == "inner"
+        return "inner-new-head"
+
+    monkeypatch.setattr(routes_sync.os.path, "isdir", lambda path: path == "/repo/inner/.git")
+    monkeypatch.setattr(routes_sync, "_git_head", fake_git_head)
+    monkeypatch.setattr(
+        routes_sync,
+        "_RUNNING_RUNTIME_REPO_HEADS",
+        {"inner": "inner-old-head"},
+    )
+
+    assert asyncio.run(routes_sync._runtime_repo_is_stale("/repo/inner", "inner")) is True
+
+
 def test_git_pull_batch_skips_when_restart_is_pending(monkeypatch):
     calls = []
 
