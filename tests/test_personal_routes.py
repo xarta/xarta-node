@@ -2742,15 +2742,93 @@ def test_full_db_restore_policy_is_recovery_or_force_only():
     assert routes_sync._full_restore_allowed(force_restore=True, integrity_ok=True) is True
 
 
-def test_kanban_idle_worker_requires_root_scope(monkeypatch):
+def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
     monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
     monkeypatch.delenv("BLUEPRINTS_KANBAN_AUTOMATION_ROOT_ITEM_ID", raising=False)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
 
-    result = asyncio.run(routes_personal.run_work_kanban_automation_idle_tick())
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-auto-root",
+                title="Automatic root",
+                body="Root item should not be a preprocessing leaf once it has children.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-auto-todo-leaf",
+                parent_item_id="work-auto-root",
+                title="Automatic ToDo leaf",
+                body="This ToDo leaf needs preprocessing.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
 
-    assert result["reason"] == "idle_worker_root_item_required"
-    assert result["processed_count"] == 0
-    assert result["eligible_marker_count"] == 0
+    async def fake_local_ai_json_completion(*, messages, run_id):
+        assert "work-auto-todo-leaf" in messages[1]["content"]
+        return {
+            "model_alias": "TEST-KANBAN-LOCAL-AI",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                "ready": True,
+                "title": "Context ready",
+                "summary": "The automatic ToDo leaf was preprocessed.",
+                "rationale": "The card has enough context for this proof.",
+                "confidence": "high",
+                "uncertainty": "",
+                "blocking_codes": [],
+                "recommended_next_actions": [],
+                "decomposition_items": [],
+                "affected_refs": ["xarta-kanban:item:work-auto-todo-leaf"],
+                "proof_refs": ["kanban_items:work-auto-todo-leaf:body"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_local_ai_json_completion,
+    )
+
+    result = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["item_id"] == ""
+    assert result["lease_acquired"] is True
+    assert result["preprocessing_scan"]["queued_count"] == 1
+    assert result["eligible_marker_count"] == 1
+    assert result["processed_count"] == 1
+    assert result["processed_markers"][0]["processor_kind"] == "preprocessing"
+    assert result["processed_markers"][0]["item_id"] == "work-auto-todo-leaf"
+
+    marker = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-auto-todo-leaf'"
+    ).fetchone()
+    assert marker["status"] == "processed"
 
 
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
@@ -4382,6 +4460,26 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     assert status["provider_mode"]["automatic_switch"] is False
     assert status["idle_worker"]["local_ai_model_alias"] == "TEST-KANBAN-LOCAL-AI"
     assert (
+        status["idle_worker_contract"]["schema"]
+        == routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA
+    )
+    assert status["idle_worker_contract"]["source_of_truth"] is True
+    assert status["idle_worker_contract"]["scope_model"]["automatic_by_default"] is True
+    assert (
+        status["idle_worker_contract"]["scope_model"]["background_root_scope_required"]
+        is False
+    )
+    assert (
+        status["idle_worker_contract"]["preprocessing_processor"]["candidate_rule"]["state_id"]
+        == "todo"
+    )
+    assert (
+        status["idle_worker_contract"]["preprocessing_processor"]["candidate_rule"][
+            "leaf_required"
+        ]
+        is True
+    )
+    assert (
         status["processing_policy"]["schema"]
         == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
     )
@@ -4472,6 +4570,21 @@ def test_work_review_processor_output_contract_endpoint():
     }
     assert "current_behavior" in output_types["prompt_change"]["required_payload_fields"]
     assert "source_refs" in output_types["contradiction_check"]["required_payload_fields"]
+
+
+def test_work_automation_idle_worker_contract_endpoint():
+    result = asyncio.run(routes_personal.get_work_automation_idle_worker_contract())
+    contract = result["contract"]
+    assert result["ok"] is True
+    assert contract["schema"] == routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA
+    assert contract["source_of_truth"] is True
+    assert contract["scope_model"]["automatic_by_default"] is True
+    assert contract["scope_model"]["background_root_scope_required"] is False
+    assert contract["scope_model"]["exclusion_field"] == "kanban_items.automation_excluded"
+    assert contract["preprocessing_processor"]["candidate_rule"]["state_id"] == "todo"
+    assert contract["preprocessing_processor"]["candidate_rule"]["leaf_required"] is True
+    assert "flowchart TD" in contract["flowchart_mermaid"]
+    assert any("No root env var set" in test for test in contract["must_pass_tests"])
 
 
 def test_work_review_processor_metadata_contract_endpoint():
@@ -6124,7 +6237,7 @@ def test_work_preprocessing_idle_scan_resolves_stale_self_marker_blocker_only(
                 item_id="work-preprocess-stale-marker-blocker",
                 title="Stale marker blocker",
                 body="A stale processor marker blocker should be cleared safely.",
-                state_id="blocked",
+                state_id="todo",
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="preprocess-stale-marker-blocker-create",
@@ -6224,7 +6337,7 @@ def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(mon
                 item_id="work-preprocess-current-failed",
                 title="Current failed preprocessing marker",
                 body="Readiness is current, so a stale failed marker should not keep blocking.",
-                state_id="blocked",
+                state_id="todo",
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="preprocess-current-failed-create",
@@ -6537,6 +6650,85 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "trigger_preprocessing_idle_scan" in audit_actions
+
+
+def test_work_preprocessing_idle_scan_cancels_non_todo_pending_marker(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-old-backlog",
+                title="Old queued backlog preprocessing",
+                body="This old pending preprocessing marker is no longer eligible.",
+                state_id="backlog",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-old-backlog-create",
+            )
+        )
+    )
+
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-old-backlog'"
+    ).fetchone()
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    marker_row = routes_personal._work_preprocessing_marker_row(
+        existing=None,
+        item_id="work-preprocess-old-backlog",
+        source=source,
+        meta={
+            "actor": "codex-test",
+            "source_surface": "pytest",
+            "request_id": "preprocess-old-backlog-marker",
+            "run_id": "pytest-preprocess-old-backlog-marker",
+        },
+        now="2026-06-28T08:01:17Z",
+        reason="old_global_preprocessing_run",
+        scan_metadata={"worker_schema": routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+    )
+    saved_marker = routes_personal._write_work_review_processor_marker(conn, marker_row)
+    conn.commit()
+
+    assert saved_marker["status"] == "queued"
+    assert routes_personal._work_queued_processor_marker_ids(conn, []) == []
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-old-backlog-scan",
+            )
+        )
+    )
+
+    assert scan["ok"] is True
+    assert scan["cancelled_invalid_count"] == 1
+    assert scan["queued_count"] == 0
+    assert scan["scheduler"]["queue_length"] == 0
+    cancelled = scan["cancelled_invalid_markers"][0]
+    assert cancelled["marker_id"] == saved_marker["marker_id"]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["last_error"] == "preprocessing_not_todo"
+    assert cancelled["metadata"]["contract_schema"] == (
+        routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA
+    )
+
+    marker = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+        (saved_marker["marker_id"],),
+    ).fetchone()
+    assert marker["status"] == "cancelled"
+    assert marker["last_error"] == "preprocessing_not_todo"
+    assert routes_personal._work_queued_processor_marker_ids(conn, []) == []
 
 
 def test_work_preprocessing_idle_scan_skips_topic_container_without_marker(monkeypatch, tmp_path):

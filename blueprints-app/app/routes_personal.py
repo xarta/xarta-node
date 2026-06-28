@@ -90,8 +90,14 @@ KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.rea
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
+KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = (
+    "xarta.kanban.automation.idle_worker.contract.v1"
+)
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
+KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
+    Path(__file__).resolve().parent / "contracts" / "kanban_automation_idle_worker.v1.json"
+)
 KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
     "xarta.kanban.processor_marker_blocker.provenance.v1"
 )
@@ -1005,6 +1011,16 @@ def _work_review_processing_policy() -> dict[str, Any]:
             "Do not silently switch provider modes when local processing fails.",
         ],
     }
+
+
+def _work_automation_idle_worker_contract() -> dict[str, Any]:
+    contract = json.loads(KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH.read_text())
+    if contract.get("schema") != KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA:
+        raise RuntimeError(
+            "Kanban idle worker contract schema mismatch: "
+            f"{contract.get('schema')!r}"
+        )
+    return contract
 
 
 def _work_review_processing_metadata_contract() -> dict[str, Any]:
@@ -2318,7 +2334,7 @@ def _work_preprocessing_active_rows(conn: Any, scope_ids: list[str]) -> list[Any
     args: list[Any] = ["preprocessing"]
     where = (
         "WHERE marker.processor_kind=? AND marker.status='processing' "
-        f"AND {_work_item_automation_included_predicate('item')}"
+        f"AND {_work_preprocessing_candidate_predicate('item')}"
     )
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
@@ -2353,6 +2369,49 @@ def _work_item_automation_included_predicate(item_alias: str = "item") -> str:
             JOIN ancestors ON parent.item_id = ancestors.parent_item_id
         )
         SELECT 1 FROM ancestors WHERE COALESCE(automation_excluded, 0) != 0
+    )
+    """
+
+
+def _work_preprocessing_candidate_predicate(
+    item_alias: str = "item",
+    *,
+    include_automation: bool = True,
+) -> str:
+    safe_alias = "".join(ch for ch in str(item_alias or "item") if ch.isalnum() or ch == "_")
+    if not safe_alias:
+        safe_alias = "item"
+    predicates = [
+        f"COALESCE({safe_alias}.item_type, '')='item'",
+        f"{safe_alias}.status NOT IN ('archived', 'done')",
+        f"{safe_alias}.state_id='todo'",
+        f"""
+        NOT EXISTS (
+            SELECT 1 FROM kanban_items child
+            WHERE child.parent_item_id={safe_alias}.item_id
+              AND child.status != 'archived'
+        )
+        """,
+    ]
+    if include_automation:
+        predicates.append(_work_item_automation_included_predicate(safe_alias))
+    return "(" + " AND ".join(f"({predicate})" for predicate in predicates) + ")"
+
+
+def _work_processor_marker_claimable_predicate(
+    marker_alias: str = "marker",
+    item_alias: str = "item",
+) -> str:
+    safe_marker_alias = "".join(
+        ch for ch in str(marker_alias or "marker") if ch.isalnum() or ch == "_"
+    )
+    if not safe_marker_alias:
+        safe_marker_alias = "marker"
+    return f"""
+    ({_work_item_automation_included_predicate(item_alias)})
+    AND (
+        {safe_marker_alias}.processor_kind != 'preprocessing'
+        OR {_work_preprocessing_candidate_predicate(item_alias, include_automation=False)}
     )
     """
 
@@ -2402,7 +2461,7 @@ def _raise_work_automation_excluded(
 
 def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
     args: list[Any] = []
-    where = f"WHERE marker.status='queued' AND {_work_item_automation_included_predicate('item')}"
+    where = f"WHERE marker.status='queued' AND {_work_processor_marker_claimable_predicate()}"
     if scope_ids:
         placeholders = ",".join("?" for _ in scope_ids)
         where += f" AND marker.item_id IN ({placeholders})"
@@ -2874,6 +2933,108 @@ def _cancel_work_review_processor_markers(
         )
         cancelled_rows.append(_write_work_review_processor_marker(conn, updated_row))
     return cancelled_rows
+
+
+def _work_preprocessing_pending_ineligible_reason(conn: Any, marker_row: Any) -> str:
+    item = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?",
+        (marker_row["item_id"],),
+    ).fetchone()
+    if item is None:
+        return "preprocessing_item_missing"
+    if _work_item_automation_excluded(conn, marker_row["item_id"]):
+        return "automation_excluded"
+    if str(item["status"] or "") in {"archived", "done"}:
+        return "preprocessing_item_closed"
+    if str(item["item_type"] or "") != "item":
+        return "preprocessing_non_item_type"
+    if str(item["state_id"] or "") != "todo":
+        return "preprocessing_not_todo"
+    child = conn.execute(
+        """
+        SELECT 1 FROM kanban_items
+        WHERE parent_item_id=? AND status!='archived'
+        LIMIT 1
+        """,
+        (marker_row["item_id"],),
+    ).fetchone()
+    if child is not None:
+        return "preprocessing_not_leaf"
+    return ""
+
+
+def _cancel_invalid_work_preprocessing_markers(
+    conn: Any,
+    *,
+    scope_ids: list[str],
+    meta: dict[str, str],
+    now: str,
+    metadata: dict[str, Any],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    args: list[Any] = []
+    candidate_predicate = _work_preprocessing_candidate_predicate("item")
+    where = f"""
+    WHERE marker.processor_kind='preprocessing'
+      AND marker.status IN ('queued', 'processing')
+      AND NOT (item.item_id IS NOT NULL AND {candidate_predicate})
+    """
+    if scope_ids:
+        placeholders = ",".join("?" for _ in scope_ids)
+        where += f" AND marker.item_id IN ({placeholders})"
+        args.extend(scope_ids)
+    rows = conn.execute(
+        f"""
+        SELECT marker.* FROM kanban_review_processor_markers marker
+        LEFT JOIN kanban_items item ON item.item_id=marker.item_id
+        {where}
+        ORDER BY marker.queued_at ASC, marker.updated_at ASC, marker.marker_id
+        """,
+        args,
+    ).fetchall()
+    cancelled_rows = []
+    marker_blockers: list[dict[str, Any]] = []
+    for row in rows:
+        reason = _work_preprocessing_pending_ineligible_reason(
+            conn,
+            row,
+        ) or "preprocessing_not_candidate"
+        updated_row = _work_review_processor_marker_update_row(
+            row,
+            updates={
+                "status": "cancelled",
+                "last_seen_at": now,
+                "processing_started_at": "",
+                "processing_expires_at": "",
+                "last_error": reason,
+                "processed_document_updated_at": row["document_updated_at"],
+                "processed_source_hash": row["document_source_hash"],
+                "processed_at": now,
+            },
+            meta=meta,
+            now=now,
+            reason="preprocessing_not_candidate_cancelled",
+            metadata={
+                **metadata,
+                "contract_schema": KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA,
+                "candidate_state_id": "todo",
+                "candidate_leaf_required": True,
+                "cancelled_previous_status": row["status"],
+                "last_outcome_at": now,
+                "last_outcome_status": "preprocessing_not_candidate_cancelled",
+                "last_error": reason,
+            },
+        )
+        saved_row = _write_work_review_processor_marker(conn, updated_row)
+        cancelled_rows.append(saved_row)
+        marker_blocker = _upsert_work_processor_marker_blocker(
+            conn,
+            saved_row,
+            meta=meta,
+            now=now,
+        )
+        if marker_blocker is not None:
+            marker_blockers.append(marker_blocker)
+    return cancelled_rows, marker_blockers
 
 
 def _row_to_work_review_decision(
@@ -13813,8 +13974,8 @@ async def _process_work_preprocessing_idle_marker(
     item_id = marker["item_id"]
     now = _utc_now_iso()
     with get_conn() as conn:
-        _work_item_or_404(conn, item_id)
-        automation_excluded = _work_item_automation_excluded(conn, item_id)
+        ineligible_reason = _work_preprocessing_pending_ineligible_reason(conn, marker)
+        automation_excluded = ineligible_reason == "automation_excluded"
     if automation_excluded:
         complete = await complete_work_review_processor_marker(
             marker["marker_id"],
@@ -13840,6 +14001,37 @@ async def _process_work_preprocessing_idle_marker(
             "item_id": item_id,
             "marker_id": marker["marker_id"],
             "reason": "automation_excluded",
+            "status": complete.get("marker", {}).get("status", "cancelled"),
+        }
+    if ineligible_reason:
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=marker["document_source_hash"],
+                status="cancelled",
+                error=ineligible_reason,
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-preprocess-not-candidate-{marker['marker_id']}",
+                run_id=run_id,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "contract_schema": KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA,
+                    "reason": "preprocessing_not_candidate_cancelled",
+                    "last_error": ineligible_reason,
+                    "candidate_state_id": "todo",
+                    "candidate_leaf_required": True,
+                },
+            ),
+        )
+        return {
+            "ok": False,
+            "processor_kind": "preprocessing",
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+            "reason": ineligible_reason,
             "status": complete.get("marker", {}).get("status", "cancelled"),
         }
     with get_conn() as conn:
@@ -14423,28 +14615,6 @@ async def run_work_kanban_automation_idle_tick(
         marker_timeout_seconds or config["marker_timeout_seconds"]
     )
     run_id = f"kanban-idle-worker-{uuid.uuid4().hex[:12]}"
-    if not clean_item_id:
-        return {
-            "ok": True,
-            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-            "run_id": run_id,
-            "item_id": "",
-            "enabled": True,
-            "reason": "idle_worker_root_item_required",
-            "message": (
-                "Kanban automation idle worker requires a root item scope; "
-                "manual ticks may still pass item_id explicitly."
-            ),
-            "lease_acquired": False,
-            "timeout_requeue": {"ok": True, "requeued_count": 0, "cancelled_excluded_count": 0},
-            "review_scan": {"ok": True, "queued_count": 0, "scanned_count": 0},
-            "preprocessing_scan": {"ok": True, "queued_count": 0, "scanned_count": 0},
-            "eligible_marker_count": 0,
-            "eligible_marker_ids": [],
-            "processed_count": 0,
-            "processed_markers": [],
-            "claim_results": [],
-        }
 
     timeout_requeue = await requeue_timed_out_work_review_processor_markers(
         WorkReviewProcessorTimeoutRequeueRequest(
@@ -14880,9 +15050,19 @@ async def trigger_work_preprocessing_idle_scan(
     with get_conn() as conn:
         root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        conn.execute("BEGIN IMMEDIATE")
+        (
+            cancelled_invalid_rows,
+            cancelled_invalid_marker_blockers,
+        ) = _cancel_invalid_work_preprocessing_markers(
+            conn,
+            scope_ids=scope_ids,
+            meta=meta,
+            now=now,
+            metadata=dict(body.metadata or {}),
+        )
         active_rows = _work_preprocessing_active_rows(conn, scope_ids)
         if active_rows:
-            conn.execute("BEGIN IMMEDIATE")
             source_hash = _hash_json_payload(
                 {
                     "action": "trigger_preprocessing_idle_scan",
@@ -14890,6 +15070,7 @@ async def trigger_work_preprocessing_idle_scan(
                     "reason": "active_preprocessing",
                     "active_count": len(active_rows),
                     "active_item_ids": [row["item_id"] for row in active_rows],
+                    "cancelled_invalid_count": len(cancelled_invalid_rows),
                 }
             )
             audit_row = _write_work_audit(
@@ -14911,11 +15092,41 @@ async def trigger_work_preprocessing_idle_scan(
                     "reason": "active_preprocessing",
                     "active_count": len(active_rows),
                     "active_item_ids": [row["item_id"] for row in active_rows],
+                    "cancelled_invalid_count": len(cancelled_invalid_rows),
                     "provider_mode": _work_review_processing_policy()["active_mode"],
                 },
             )
             gen = increment_gen(conn, "kanban-preprocessing-idle-scan")
+            for marker_row in cancelled_invalid_rows:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_review_processor_markers",
+                    marker_row["marker_id"],
+                    dict(marker_row),
+                    gen,
+                )
+            for marker_blocker in cancelled_invalid_marker_blockers:
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_blockers",
+                    marker_blocker["blocker_row"]["blocker_id"],
+                    dict(marker_blocker["blocker_row"]),
+                    gen,
+                )
+                enqueue_for_all_peers(
+                    conn,
+                    "UPDATE",
+                    "kanban_audit_log",
+                    marker_blocker["audit_row"]["audit_id"],
+                    marker_blocker["audit_row"],
+                    gen,
+                )
             enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+            cancelled_invalid_markers = [
+                _row_to_work_review_processor_marker(row) for row in cancelled_invalid_rows
+            ]
             return {
                 "ok": True,
                 "schema": KANBAN_PREPROCESSING_QUEUE_SCHEMA,
@@ -14929,11 +15140,13 @@ async def trigger_work_preprocessing_idle_scan(
                 "eligible_preprocessing_count": 0,
                 "queued_count": 0,
                 "cancelled_current_count": 0,
+                "cancelled_invalid_count": len(cancelled_invalid_markers),
                 "unchanged_current_count": 0,
                 "unchanged_pending_count": 0,
                 "unchanged_failed_count": 0,
                 "queued_markers": [],
                 "cancelled_markers": [],
+                "cancelled_invalid_markers": cancelled_invalid_markers,
                 "scheduler": _work_review_processor_marker_stats(
                     conn,
                     scope_ids,
@@ -14948,14 +15161,7 @@ async def trigger_work_preprocessing_idle_scan(
 
         args: list[Any] = []
         where = f"""
-        WHERE item.status NOT IN ('archived', 'done')
-          AND item.state_id IN ('todo', 'doing', 'blocked')
-          AND {_work_item_automation_included_predicate("item")}
-          AND NOT EXISTS (
-              SELECT 1 FROM kanban_items child
-              WHERE child.parent_item_id=item.item_id
-                AND child.status != 'archived'
-          )
+        WHERE {_work_preprocessing_candidate_predicate("item")}
         """
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
@@ -14987,7 +15193,6 @@ async def trigger_work_preprocessing_idle_scan(
             for item_row in item_rows
         ]
 
-        conn.execute("BEGIN IMMEDIATE")
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
         cancelled_marker_blockers: list[dict[str, Any]] = []
@@ -15096,6 +15301,7 @@ async def trigger_work_preprocessing_idle_scan(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
@@ -15124,6 +15330,7 @@ async def trigger_work_preprocessing_idle_scan(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "current_ready_count": current_ready,
                 "unchanged_current_count": unchanged_current,
@@ -15133,6 +15340,15 @@ async def trigger_work_preprocessing_idle_scan(
             },
         )
         gen = increment_gen(conn, "kanban-preprocessing-idle-scan")
+        for marker_row in cancelled_invalid_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
         for marker_row in cancelled_rows:
             enqueue_for_all_peers(
                 conn,
@@ -15143,6 +15359,23 @@ async def trigger_work_preprocessing_idle_scan(
                 gen,
             )
         for marker_blocker in cancelled_marker_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
+        for marker_blocker in cancelled_invalid_marker_blockers:
             enqueue_for_all_peers(
                 conn,
                 "UPDATE",
@@ -15192,6 +15425,10 @@ async def trigger_work_preprocessing_idle_scan(
         cancelled_markers = [
             _row_to_work_review_processor_marker(marker_row) for marker_row in cancelled_rows
         ]
+        cancelled_invalid_markers = [
+            _row_to_work_review_processor_marker(marker_row)
+            for marker_row in cancelled_invalid_rows
+        ]
         scheduler = _work_review_processor_marker_stats(
             conn,
             scope_ids,
@@ -15207,6 +15444,7 @@ async def trigger_work_preprocessing_idle_scan(
         "eligible_preprocessing_count": eligible_preprocessing,
         "queued_count": len(queued_markers),
         "cancelled_current_count": len(cancelled_markers),
+        "cancelled_invalid_count": len(cancelled_invalid_markers),
         "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
         "current_ready_count": current_ready,
         "unchanged_current_count": unchanged_current,
@@ -15214,6 +15452,7 @@ async def trigger_work_preprocessing_idle_scan(
         "unchanged_failed_count": unchanged_failed,
         "queued_markers": queued_markers,
         "cancelled_markers": cancelled_markers,
+        "cancelled_invalid_markers": cancelled_invalid_markers,
         "scheduler": scheduler,
         "audit": {
             "audit_id": audit_id,
@@ -15257,9 +15496,7 @@ async def claim_next_work_review_processor_marker(
         )
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
-        where = (
-            f"WHERE marker.status='queued' AND {_work_item_automation_included_predicate('item')}"
-        )
+        where = f"WHERE marker.status='queued' AND {_work_processor_marker_claimable_predicate()}"
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND marker.item_id IN ({placeholders})"
@@ -15984,6 +16221,14 @@ async def get_work_review_processor_processing_policy() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/idle-worker/contract")
+async def get_work_automation_idle_worker_contract() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract": _work_automation_idle_worker_contract(),
+    }
+
+
 @router.get("/kanban/automation/review-processor/metadata-contract")
 async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
     return {
@@ -16470,6 +16715,7 @@ async def get_work_automation_status(
             "preprocessing_contract": _work_preprocessing_readiness_contract(),
             "processing_policy": processing_policy,
             "proposal_surfaces": _work_proposal_surfaces_contract(),
+            "idle_worker_contract": _work_automation_idle_worker_contract(),
             "idle_worker": idle_worker_config,
             "automation_exclusions": {
                 "schema": KANBAN_AUTOMATION_EXCLUSION_SCHEMA,
