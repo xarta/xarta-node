@@ -21,6 +21,7 @@ HERMES_LOCAL_ROOT = Path(
 )
 ALLOWED_PROMPT_ROOTS = (HERMES_LOCAL_ROOT / "config",)
 MAX_PROMPT_BYTES = 512 * 1024
+HERMES_PROFILE_APPLY_PREFIX = "hermes-profile:"
 
 
 @dataclass(frozen=True)
@@ -58,12 +59,34 @@ PROMPT_REGISTRY: dict[str, PromptSpec] = {
         apply_strategy="write-file",
         restart_label="No restart required",
     ),
+    "hermes-kanban-preprocessor-soul": PromptSpec(
+        prompt_id="hermes-kanban-preprocessor-soul",
+        label="Preprocessor SOUL.md",
+        surface="kanban",
+        group="Hermes Kanban Processors",
+        description="Profile-level SOUL prompt for the hermes-kanban-preprocessor gateway.",
+        path=HERMES_LOCAL_ROOT / "config/profiles/hermes-kanban-preprocessor/SOUL.md",
+        apply_strategy="hermes-profile:hermes-kanban-preprocessor",
+        live_path=HERMES_LOCAL_ROOT / "data/profiles/hermes-kanban-preprocessor/SOUL.md",
+        restart_label="Refresh hermes-kanban-preprocessor profile gateway",
+    ),
+    "hermes-kanban-review-processor-soul": PromptSpec(
+        prompt_id="hermes-kanban-review-processor-soul",
+        label="Review Processor SOUL.md",
+        surface="kanban",
+        group="Hermes Kanban Processors",
+        description="Profile-level SOUL prompt for the hermes-kanban-review-processor gateway.",
+        path=HERMES_LOCAL_ROOT / "config/profiles/hermes-kanban-review-processor/SOUL.md",
+        apply_strategy="hermes-profile:hermes-kanban-review-processor",
+        live_path=HERMES_LOCAL_ROOT / "data/profiles/hermes-kanban-review-processor/SOUL.md",
+        restart_label="Refresh hermes-kanban-review-processor profile gateway",
+    ),
     "kanban-review-processor-system": PromptSpec(
         prompt_id="kanban-review-processor-system",
         label="Review Processor system prompt",
         surface="kanban",
-        group="Kanban Automation",
-        description="System prompt used by the Kanban Review Processor local-AI marker worker.",
+        group="Hermes Kanban Processors",
+        description="Runtime system prompt read by the profile-backed Kanban Review Processor marker worker.",
         path=HERMES_LOCAL_ROOT / "config/prompts/kanban-review-processor-system.md",
         apply_strategy="write-file",
         restart_label="No restart required; next marker uses latest prompt",
@@ -72,8 +95,8 @@ PROMPT_REGISTRY: dict[str, PromptSpec] = {
         prompt_id="kanban-preprocessing-system",
         label="Preprocessor system prompt",
         surface="kanban",
-        group="Kanban Automation",
-        description="System prompt used by the Kanban ToDo-leaf preprocessing local-AI worker.",
+        group="Hermes Kanban Processors",
+        description="Runtime system prompt read by the profile-backed Kanban ToDo-leaf preprocessing worker.",
         path=HERMES_LOCAL_ROOT / "config/prompts/kanban-preprocessing-system.md",
         apply_strategy="write-file",
         restart_label="No restart required; next marker uses latest prompt",
@@ -204,22 +227,25 @@ def _prompt_summary(spec: PromptSpec) -> dict[str, Any]:
 
 
 def _apply_prompt(spec: PromptSpec, restart: bool) -> list[dict[str, Any]]:
-    if spec.apply_strategy != "hermes-kanban-profile":
+    profile = ""
+    if spec.apply_strategy == "hermes-kanban-profile":
+        profile = "hermes-kanban"
+    elif spec.apply_strategy.startswith(HERMES_PROFILE_APPLY_PREFIX):
+        profile = spec.apply_strategy.removeprefix(HERMES_PROFILE_APPLY_PREFIX).strip()
+    if not profile:
         return []
 
-    actions = [
-        _run_command(
-            [
-                "docker",
-                "exec",
-                "hermes-local",
-                "/opt/data/scripts/install_hermes_kanban_profile.py",
-                "--force",
-                "--json",
-            ],
-            timeout=90,
-        )
+    install_command = [
+        "docker",
+        "exec",
+        "hermes-local",
+        "/opt/data/scripts/install_hermes_kanban_profile.py",
+        "--force",
+        "--json",
     ]
+    if profile != "hermes-kanban":
+        install_command[4:4] = ["--profile", profile]
+    actions = [_run_command(install_command, timeout=90)]
     if restart and actions[-1].get("ok"):
         actions.append(
             _run_command(
@@ -229,7 +255,7 @@ def _apply_prompt(spec: PromptSpec, restart: bool) -> list[dict[str, Any]]:
                     "hermes-local",
                     "/command/s6-svc",
                     "-t",
-                    "/run/service/gateway-hermes-kanban",
+                    f"/run/service/gateway-{profile}",
                 ],
                 timeout=20,
             )

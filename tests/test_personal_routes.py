@@ -2931,7 +2931,7 @@ def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id):
+    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
         assert "work-auto-todo-leaf" in messages[1]["content"]
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
@@ -4664,13 +4664,19 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
     assert listed["decisions"][0]["commits"][0]["message_subject"] == "Add decision ledger contract"
 
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-decision-ledger"))
-    assert status["provider_mode"]["active"] == "local"
+    assert (
+        status["provider_mode"]["active"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
     assert status["provider_mode"]["planned"] == "active"
     assert (
         status["provider_mode"]["local_processing_gate"]
-        == "private_no_think_no_protection_no_orientation_endpoint_required"
+        == "hermes_profile_configured_fallback_only"
     )
     assert status["provider_mode"]["automatic_switch"] is False
+    assert (
+        status["provider_mode"]["profile_processing"]["routes"]["review"]["profile"]
+        == "hermes-kanban-review-processor"
+    )
     assert status["idle_worker"]["local_ai_model_alias"] == "TEST-KANBAN-LOCAL-AI"
     assert status["idle_worker"]["current_node_id"] == "test-node"
     assert status["idle_worker"]["owner_node_id"] == "test-node"
@@ -4778,10 +4784,13 @@ def test_work_review_processor_output_contract_endpoint():
         contract["metadata_contract_schema"]
         == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     )
-    assert contract["provider_mode"]["active"] == "local"
+    assert (
+        contract["provider_mode"]["active"]
+        == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
     assert (
         contract["provider_mode"]["local_processing_gate"]
-        == "private_no_think_no_protection_no_orientation_endpoint_required"
+        == "hermes_profile_configured_fallback_only"
     )
     assert contract["provider_mode"]["automatic_switch"] is False
     assert "metadata.output_payload" in contract["minimum_decision_fields"]
@@ -4825,7 +4834,10 @@ def test_work_review_processor_metadata_contract_endpoint():
     assert contract["schema"] == routes_personal.KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA
     assert contract["review_document_schema"] == routes_personal.KANBAN_ITEM_REVIEW_SCHEMA
     assert contract["marker_schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
-    assert contract["provider_mode"]["active"] == "local"
+    assert (
+        contract["provider_mode"]["active"]
+        == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
     fields = {field["field"]: field for field in contract["required_fields"]}
     assert fields["body_hash"]["scope"] == "review_document.metadata"
     assert fields["updated_at"]["alias"] == "review_updated_at"
@@ -4897,7 +4909,10 @@ def test_work_preprocessing_readiness_contract_endpoint():
     assert contract["preprocessing_request_schema"] == "xarta.kanban.preprocessing_time_request.v1"
     assert contract["queue_schema"] == routes_personal.KANBAN_PREPROCESSING_QUEUE_SCHEMA
     assert contract["marker_storage"] == "kanban_agent_hints.metadata.context_readiness_marker"
-    assert contract["provider_mode"]["active"] == "local"
+    assert (
+        contract["provider_mode"]["active"]
+        == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
     fields = {field["field"]: field for field in contract["required_fields"]}
     assert fields["context_hash"]["scope"] == "context_readiness_marker"
     assert fields["marked_at"]["alias"] == "last_preprocessed_at"
@@ -4959,18 +4974,21 @@ def test_work_review_processor_processing_policy_endpoint(monkeypatch):
     policy = result["policy"]
     assert result["ok"] is True
     assert policy["schema"] == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
-    assert policy["active_mode"] == "local"
+    assert policy["active_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
     assert policy["applies_to"] == ["review_processor", "preprocessing"]
-    assert policy["cloud_processing"]["state"] == "not-configured"
-    assert policy["local_processing"]["state"] == "active"
-    assert (
-        policy["local_processing"]["gate"]
-        == "private_no_think_no_protection_no_orientation_endpoint_required"
+    assert policy["profile_processing"]["state"] == "active"
+    assert policy["profile_processing"]["routes"]["review"]["profile"] == (
+        "hermes-kanban-review-processor"
     )
-    assert policy["local_processing"]["automatic_switch"] is False
-    assert policy["local_processing"]["model_alias"] == "TEST-KANBAN-LOCAL-AI"
-    assert policy["provider_choice"]["default_mode"] == "local"
-    assert "cloud" in policy["provider_choice"]["blocked_until_explicit_api"]
+    assert policy["profile_processing"]["routes"]["preprocessing"]["profile"] == (
+        "hermes-kanban-preprocessor"
+    )
+    assert policy["local_processing"]["state"] == "fallback-model-only"
+    assert policy["local_processing"]["gate"] == "hermes_profile_configured_fallback_only"
+    assert policy["local_processing"]["substitute_decisions_allowed"] is False
+    assert policy["provider_choice"]["default_mode"] == (
+        routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
     assert any("Provider mode must be explicit" in rule for rule in policy["routing_rules"])
 
 
@@ -4980,7 +4998,9 @@ def test_work_review_processor_processing_policy_uses_configured_local_model(mon
     result = asyncio.run(routes_personal.get_work_review_processor_processing_policy())
 
     assert result["ok"] is True
-    assert result["policy"]["local_processing"]["model_alias"] == "test-local-model"
+    assert result["policy"]["local_processing"]["fallback_model"] == (
+        "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION"
+    )
 
 
 def test_work_review_processor_lease_acquire_conflict_heartbeat_release(monkeypatch):
@@ -5184,7 +5204,7 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
     assert marker["schema"] == routes_personal.KANBAN_REVIEW_MARKER_SCHEMA
     assert marker["item_id"] == "work-review-scan-child"
     assert marker["status"] == "queued"
-    assert marker["provider_mode"] == "local"
+    assert marker["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
     assert marker["processed_source_hash"] == ""
     assert marker["metadata"]["reason"] == "new_review_document"
 
@@ -5543,7 +5563,7 @@ def test_work_review_processor_completion_cancels_claimed_marker_after_exclusion
     assert completed["marker"]["last_error"] == "automation_excluded"
 
 
-def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, tmp_path):
+def test_work_automation_idle_tick_processes_review_with_profile_llm(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setenv(
@@ -5558,8 +5578,8 @@ def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, t
         routes_personal.create_work_item(
             routes_personal.WorkItemCreateRequest(
                 item_id="work-local-ai-root",
-                title="Local AI root",
-                body="Root item for local AI worker proof",
+                title="Profile LLM root",
+                body="Root item for profile-backed worker proof",
                 state_id="todo",
                 actor="codex-test",
                 source_surface="pytest",
@@ -5572,7 +5592,7 @@ def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, t
             routes_personal.WorkItemCreateRequest(
                 item_id="work-local-ai-review",
                 parent_item_id="work-local-ai-root",
-                title="Local AI Review child",
+                title="Profile Review child",
                 body="Child item with Review data",
                 state_id="todo",
                 actor="codex-test",
@@ -5596,7 +5616,7 @@ def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, t
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id):
+    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
         assert "missing required provider wiring" in messages[1]["content"]
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
@@ -5639,13 +5659,14 @@ def test_work_automation_idle_tick_processes_review_with_local_ai(monkeypatch, t
     assert tick["processed_count"] == 1
     processed = tick["processed_markers"][0]
     assert processed["processor_kind"] == "review"
-    assert processed["provider_mode"] == "local"
+    assert processed["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    assert processed["profile"] == "hermes-kanban-review-processor"
     assert processed["model_alias"] == "TEST-KANBAN-LOCAL-AI"
 
     row = conn.execute(
         "SELECT * FROM kanban_review_decisions WHERE item_id='work-local-ai-review'"
     ).fetchone()
-    assert row["provider_mode"] == "local"
+    assert row["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
     assert row["decision_type"] == "review_guidance_recorded"
     marker = conn.execute(
         "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-local-ai-review'"
@@ -5722,7 +5743,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     )
     conn.commit()
 
-    async def fake_local_ai_json_completion(*, messages, run_id):
+    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
         context = json.loads(messages[1]["content"])
         assert context["queue_source"]["reason"] == "missing_readiness_marker"
         assert "parent_body" in {ref["name"] for ref in context["queue_source"]["source_refs"]}
@@ -5783,7 +5804,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     assert tick["processed_count"] == 1
     processed = tick["processed_markers"][0]
     assert processed["processor_kind"] == "preprocessing"
-    assert processed["provider_mode"] == "local"
+    assert processed["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
     assert processed["status"] == "processed"
     assert processed["decomposition"]["total_count"] == 1
     assert processed["decomposition"]["created_count"] == 1
@@ -6334,7 +6355,7 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id):
+    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
             "run_id": run_id,
@@ -6393,7 +6414,7 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
     assert marker["retry_attempt_count"] == 1
     assert marker["retry_after_seconds"] == 5 * 60
     assert marker["next_retry_at"]
-    assert marker["last_error_class"] == "local_ai_response_validation"
+    assert marker["last_error_class"] == "llm_response_validation"
     event = conn.execute(
         """
         SELECT * FROM kanban_review_processor_failure_events
@@ -6403,7 +6424,7 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
     ).fetchone()
     assert event["processor_kind"] == "preprocessing"
     assert event["source_hash"] == marker["document_source_hash"]
-    assert event["error_class"] == "local_ai_response_validation"
+    assert event["error_class"] == "llm_response_validation"
     assert event["attempt_number"] == 1
     status = asyncio.run(
         routes_personal.get_work_automation_status(item_id="work-preprocess-malformed-root")
@@ -6460,7 +6481,7 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id):
+    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
             "run_id": run_id,
@@ -6544,13 +6565,16 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
     assert metadata["readiness_normalization"]["reason"] == (
         "model_reported_not_ready_without_blocker_or_decomposition"
     )
-    assert metadata["local_ai_payload"]["ready"] is False
+    assert metadata["llm_payload"]["ready"] is False
 
 
-def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch, tmp_path):
+def test_work_automation_missing_profile_api_key_is_retryable_failure(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
-    monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV, raising=False)
+    monkeypatch.setenv(
+        "BLUEPRINTS_KANBAN_REVIEW_PROCESSOR_API_KEY_FILE",
+        str(tmp_path / "missing-review-profile.env"),
+    )
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
     conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
     conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
@@ -6572,8 +6596,8 @@ def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch
             routes_personal.WorkItemCreateRequest(
                 item_id="work-review-missing-model-child",
                 parent_item_id="work-review-missing-model-root",
-                title="Missing model child",
-                body="This item has Review data but no local model alias.",
+                title="Missing profile key child",
+                body="This item has Review data but no profile API key.",
                 state_id="todo",
                 actor="codex-test",
                 source_surface="pytest",
@@ -6584,7 +6608,7 @@ def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch
         routes_personal.update_work_item_review_document(
             "work-review-missing-model-child",
             routes_personal.WorkItemDetailDocumentUpdateRequest(
-                body="Review work requiring local AI.",
+                body="Review work requiring the Hermes profile route.",
                 actor="codex-test",
                 source_surface="pytest",
                 request_id="review-missing-model-doc",
@@ -6604,7 +6628,7 @@ def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch
     processed = tick["processed_markers"][0]
     assert processed["ok"] is False
     assert processed["status"] == "failed"
-    assert routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV in processed["error"]
+    assert "api_server_key" in processed["error"].lower()
     marker = conn.execute(
         """
         SELECT * FROM kanban_review_processor_markers
@@ -6616,7 +6640,7 @@ def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch
     assert marker["processed_at"] == ""
     assert marker["retry_attempt_count"] == 1
     assert marker["next_retry_at"]
-    assert marker["last_error_class"] == "local_ai_configuration"
+    assert marker["last_error_class"] == "hermes_profile_configuration"
     event = conn.execute(
         """
         SELECT * FROM kanban_review_processor_failure_events
@@ -6624,13 +6648,13 @@ def test_work_automation_missing_local_ai_model_is_retryable_failure(monkeypatch
         """,
         (marker["marker_id"],),
     ).fetchone()
-    assert event["error_class"] == "local_ai_configuration"
-    assert event["provider_mode"] == "local"
-    assert event["model_alias"] == ""
+    assert event["error_class"] == "hermes_profile_configuration"
+    assert event["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    assert event["model_alias"] == ("hermes-kanban-review-processor:openai-codex/gpt-5.5")
     status = asyncio.run(
         routes_personal.get_work_automation_status(item_id="work-review-missing-model-root")
     )
-    assert status["failures"]["recent_events"][0]["error_class"] == "local_ai_configuration"
+    assert status["failures"]["recent_events"][0]["error_class"] == ("hermes_profile_configuration")
     assert status["review_processor"]["retry_waiting_count"] == 1
 
 
@@ -6908,7 +6932,7 @@ def test_work_preprocessing_idle_scan_resolves_stale_self_marker_blocker_only(
         scan_metadata={},
     )
     failed_row["status"] = "failed"
-    failed_row["last_error"] = "open_blockers;local_ai_reported_not_ready"
+    failed_row["last_error"] = "open_blockers;llm_reported_not_ready"
     saved_failed = routes_personal._write_work_review_processor_marker(conn, failed_row)
     marker_blocker = routes_personal._upsert_work_processor_marker_blocker(
         conn,
@@ -7032,7 +7056,7 @@ def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(mon
         scan_metadata={},
     )
     failed_row["status"] = "failed"
-    failed_row["last_error"] = "open_blockers;local_ai_reported_not_ready"
+    failed_row["last_error"] = "open_blockers;llm_reported_not_ready"
     saved_failed = routes_personal._write_work_review_processor_marker(conn, failed_row)
     marker_blocker = routes_personal._upsert_work_processor_marker_blocker(
         conn,

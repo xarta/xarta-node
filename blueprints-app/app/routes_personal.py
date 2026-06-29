@@ -13,6 +13,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -21,6 +23,7 @@ from typing import Annotated, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from starlette.responses import FileResponse
@@ -107,6 +110,43 @@ KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
+KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE = "required-hermes-kanban-llm"
+KANBAN_AUTOMATION_PROFILE_ENGINE = "hermes-profile-openai-compatible-json"
+KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT = "configured-local-litellm"
+KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT = "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION"
+HERMES_LOCAL_STACK_ROOT = Path(
+    os.environ.get("BLUEPRINTS_HERMES_LOCAL_STACK", "/xarta-node/.lone-wolf/stacks/hermes-local")
+)
+HERMES_PROFILE_DATA_ROOT = Path(
+    os.environ.get(
+        "BLUEPRINTS_HERMES_PROFILE_DATA_ROOT",
+        str(HERMES_LOCAL_STACK_ROOT / "data/profiles"),
+    )
+)
+KANBAN_PROCESSOR_PROFILE_SPECS: dict[str, dict[str, Any]] = {
+    "preprocessing": {
+        "profile": "hermes-kanban-preprocessor",
+        "api_base_env": "BLUEPRINTS_KANBAN_PREPROCESSOR_API_BASE",
+        "api_key_file_env": "BLUEPRINTS_KANBAN_PREPROCESSOR_API_KEY_FILE",
+        "api_base": "http://127.0.0.1:8649",
+        "api_key_file": str(HERMES_PROFILE_DATA_ROOT / "hermes-kanban-preprocessor/.env"),
+        "primary_provider": "openai-codex",
+        "primary_model": "gpt-5.5",
+        "fallback_provider": KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT,
+        "fallback_model": KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT,
+    },
+    "review": {
+        "profile": "hermes-kanban-review-processor",
+        "api_base_env": "BLUEPRINTS_KANBAN_REVIEW_PROCESSOR_API_BASE",
+        "api_key_file_env": "BLUEPRINTS_KANBAN_REVIEW_PROCESSOR_API_KEY_FILE",
+        "api_base": "http://127.0.0.1:8650",
+        "api_key_file": str(HERMES_PROFILE_DATA_ROOT / "hermes-kanban-review-processor/.env"),
+        "primary_provider": "openai-codex",
+        "primary_model": "gpt-5.5",
+        "fallback_provider": KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT,
+        "fallback_model": KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT,
+    },
+}
 KANBAN_AUTOMATION_OWNER_NODE_ID_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_OWNER_NODE_ID"
 KANBAN_AUTOMATION_PRIMARY_FLAG_ENV = "SYSTEM_BRIDGE_NOTIFIER_BLUEPRINTS_PRIMARY"
 KANBAN_AUTOMATION_SINGLETON_OVERRIDE_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE"
@@ -1019,39 +1059,213 @@ def _work_automation_local_ai_model_alias() -> str:
     )
 
 
+def _read_env_file_value(path: Path, name: str) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{name}="
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or not line.startswith(prefix):
+            continue
+        return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _work_automation_processor_profile_spec(processor_kind: str) -> dict[str, Any]:
+    clean_kind = _clean_short_text(processor_kind or "review", "review", limit=80)
+    spec = KANBAN_PROCESSOR_PROFILE_SPECS.get(clean_kind)
+    if not spec:
+        raise ValueError(f"unsupported Kanban processor profile kind: {clean_kind}")
+    return spec
+
+
+def _work_automation_processor_model_alias(processor_kind: str) -> str:
+    route = _work_automation_processor_profile_route(processor_kind)
+    return f"{route['profile']}:{route['primary_provider']}/{route['primary_model']}"
+
+
+def _work_automation_processor_profile_config(
+    profile: str,
+    *,
+    template_path: Path | None = None,
+    live_path: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    template_path = (
+        template_path or HERMES_LOCAL_STACK_ROOT / "config/profiles" / profile / "config.yaml"
+    )
+    live_path = live_path or HERMES_PROFILE_DATA_ROOT / profile / "config.yaml"
+    config_path = live_path if live_path.exists() else template_path
+    if not config_path.exists():
+        return config_path, {}
+    try:
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return config_path, {}
+    return config_path, loaded if isinstance(loaded, dict) else {}
+
+
+def _work_automation_processor_profile_fallback(
+    parsed: dict[str, Any],
+    *,
+    default_provider: str,
+    default_model: str,
+) -> tuple[str, str]:
+    fallbacks = parsed.get("fallback_providers") if isinstance(parsed, dict) else []
+    if isinstance(fallbacks, list):
+        for item in fallbacks:
+            if not isinstance(item, dict):
+                continue
+            provider = _clean_short_text(item.get("provider"), "", limit=160)
+            model = _clean_short_text(item.get("model"), "", limit=200)
+            if provider and model:
+                return provider, model
+    return default_provider, default_model
+
+
+def _work_automation_processor_profile_route(processor_kind: str) -> dict[str, Any]:
+    spec = _work_automation_processor_profile_spec(processor_kind)
+    profile = str(spec["profile"])
+    template_config_path = HERMES_LOCAL_STACK_ROOT / "config/profiles" / profile / "config.yaml"
+    live_config_path = HERMES_PROFILE_DATA_ROOT / profile / "config.yaml"
+    _config_path, parsed_config = _work_automation_processor_profile_config(
+        profile,
+        template_path=template_config_path,
+        live_path=live_config_path,
+    )
+    fallback_provider, fallback_model = _work_automation_processor_profile_fallback(
+        parsed_config,
+        default_provider=str(spec["fallback_provider"]),
+        default_model=str(spec["fallback_model"]),
+    )
+    api_base = _clean_short_text(
+        os.environ.get(str(spec["api_base_env"]), str(spec["api_base"])),
+        str(spec["api_base"]),
+        limit=260,
+    ).rstrip("/")
+    api_key_file = Path(os.environ.get(str(spec["api_key_file_env"]), str(spec["api_key_file"])))
+    return {
+        "schema": "xarta.kanban.processor_profile.route.v1",
+        "processor_kind": processor_kind,
+        "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+        "processor_engine": KANBAN_AUTOMATION_PROFILE_ENGINE,
+        "profile": profile,
+        "api_base": api_base,
+        "api_key_file": str(api_key_file),
+        "api_key_present": bool(_read_env_file_value(api_key_file, "API_SERVER_KEY")),
+        "primary_provider": str(spec["primary_provider"]),
+        "primary_model": str(spec["primary_model"]),
+        "fallback_provider": fallback_provider,
+        "fallback_model": fallback_model,
+        "model_alias": f"{profile}:{spec['primary_provider']}/{spec['primary_model']}",
+        "template_config_path": str(template_config_path),
+        "live_config_path": str(live_config_path),
+    }
+
+
+def _work_automation_processor_profile_drift(processor_kind: str) -> dict[str, Any]:
+    route = _work_automation_processor_profile_route(processor_kind)
+    profile = route["profile"]
+    template_path = Path(route["template_config_path"])
+    live_path = Path(route["live_config_path"])
+    config_path = live_path if live_path.exists() else template_path
+    problems: list[str] = []
+    warnings: list[str] = []
+    parsed: dict[str, Any] = {}
+    if not config_path.exists():
+        problems.append("profile_config_missing")
+    else:
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            parsed = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            problems.append("profile_config_unreadable")
+            parsed = {}
+    model = parsed.get("model") if isinstance(parsed, dict) else {}
+    primary_provider = str(model.get("provider") or "") if isinstance(model, dict) else ""
+    primary_model = str(model.get("default") or "") if isinstance(model, dict) else ""
+    if primary_provider != route["primary_provider"]:
+        problems.append("primary_provider_drift")
+    if primary_model != route["primary_model"]:
+        problems.append("primary_model_drift")
+    fallbacks = parsed.get("fallback_providers") if isinstance(parsed, dict) else []
+    fallback_ok = any(
+        isinstance(item, dict)
+        and item.get("provider") == route["fallback_provider"]
+        and item.get("model") == route["fallback_model"]
+        for item in (fallbacks if isinstance(fallbacks, list) else [])
+    )
+    if not fallback_ok:
+        warnings.append("fallback_model_drift")
+    if not route["api_key_present"]:
+        problems.append("api_server_key_missing")
+    return {
+        "schema": "xarta.kanban.processor_profile.auth_drift.v1",
+        "profile": profile,
+        "processor_kind": processor_kind,
+        "ok": not problems,
+        "config_path": str(config_path),
+        "live_config_used": config_path == live_path,
+        "expected": {
+            "primary_provider": route["primary_provider"],
+            "primary_model": route["primary_model"],
+            "fallback_provider": route["fallback_provider"],
+            "fallback_model": route["fallback_model"],
+        },
+        "observed": {
+            "primary_provider": primary_provider,
+            "primary_model": primary_model,
+            "api_key_present": route["api_key_present"],
+        },
+        "problems": problems,
+        "warnings": warnings,
+    }
+
+
 def _work_review_processing_policy() -> dict[str, Any]:
-    local_model_alias = _work_automation_local_ai_model_alias()
+    processor_routes = {
+        kind: _work_automation_processor_profile_route(kind) for kind in ("review", "preprocessing")
+    }
+    auth_drift = {
+        kind: _work_automation_processor_profile_drift(kind) for kind in ("review", "preprocessing")
+    }
     return {
         "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
         "status": "active",
-        "version": "2026-06-28",
-        "active_mode": "local",
+        "version": "2026-06-29",
+        "active_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
         "applies_to": ["review_processor", "preprocessing"],
-        "cloud_processing": {
-            "state": "not-configured",
-            "mode": "blocked",
-            "provider_choice": "raise_blocker_or_operator_question",
-            "blocker_policy": "Missing required cloud API wiring must be surfaced as a blocker/question, not worked around.",
+        "profile_processing": {
+            "state": "active",
+            "required": True,
+            "automatic_switch": False,
+            "routes": processor_routes,
+            "auth_drift": auth_drift,
+            "failure_policy": "record_retryable_failure_event_and_backoff",
         },
         "local_processing": {
-            "state": "active",
-            "gate": "private_no_think_no_protection_no_orientation_endpoint_required",
+            "state": "fallback-model-only",
+            "gate": "hermes_profile_configured_fallback_only",
             "automatic_switch": False,
-            "model_alias": local_model_alias,
-            "failure_policy": "record_retryable_failure_event_and_backoff",
+            "fallback_model": processor_routes["review"]["fallback_model"],
+            "fallback_provider": processor_routes["review"]["fallback_provider"],
+            "substitute_decisions_allowed": False,
         },
         "provider_choice": {
             "required": True,
-            "default_mode": "local",
-            "allowed_modes": ["local", "manual"],
-            "blocked_until_explicit_api": ["cloud-first", "cloud"],
+            "default_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+            "allowed_modes": [KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE, "manual"],
+            "blocked_until_explicit_api": [],
         },
         "routing_rules": [
-            "Review Processor and preprocessing jobs use the local private no-think/no-protection/no-orientation endpoint while this policy is active.",
+            "Review Processor and preprocessing jobs call their dedicated Hermes profile gateway while this policy is active.",
+            "Primary model for both profiles is openai-codex/gpt-5.5 through the Codex subscription/auth path.",
+            "Configured local fallback is a model fallback only; deterministic substitute decisions are forbidden.",
             "Do not use deterministic substitute processing when a required provider route is unavailable.",
-            "If a requested provider/API path is missing, raise a blocker or operator question instead of silently changing provider mode.",
+            "If a requested provider/API path is missing, record retryable failure/backoff instead of silently changing provider mode.",
             "Provider mode must be explicit in queue packets and decision records.",
-            "Do not silently switch provider modes when local processing fails.",
+            "Do not silently switch provider modes when profile processing fails.",
         ],
     }
 
@@ -1070,7 +1284,7 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
     return {
         "schema": KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA,
         "status": "active",
-        "version": "2026-06-28",
+        "version": "2026-06-29",
         "review_document_schema": KANBAN_ITEM_REVIEW_SCHEMA,
         "marker_schema": KANBAN_REVIEW_MARKER_SCHEMA,
         "scheduler_schema": KANBAN_REVIEW_SCHEDULER_SCHEMA,
@@ -1079,8 +1293,9 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
         "retry_backoff_seconds": list(KANBAN_REVIEW_RETRY_BACKOFF_SECONDS),
         "provider_mode": {
             "active": processing_policy["active_mode"],
+            "profile_processing": processing_policy["profile_processing"],
             "local_processing_gate": processing_policy["local_processing"]["gate"],
-            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+            "automatic_switch": processing_policy["profile_processing"]["automatic_switch"],
         },
         "storage": {
             "review_document": "item Review markdown frontmatter",
@@ -1236,7 +1451,7 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
     return {
         "schema": KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA,
         "status": "active",
-        "version": "2026-06-27",
+        "version": "2026-06-29",
         "context_packet_schema": "xarta.kanban.context_packet.v1",
         "readiness_marker_schema": "xarta.kanban.context_readiness_marker.v1",
         "readiness_check_schema": "xarta.kanban.context_readiness_check.v1",
@@ -1245,8 +1460,9 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
         "marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
         "provider_mode": {
             "active": processing_policy["active_mode"],
+            "profile_processing": processing_policy["profile_processing"],
             "local_processing_gate": processing_policy["local_processing"]["gate"],
-            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+            "automatic_switch": processing_policy["profile_processing"]["automatic_switch"],
         },
         "required_fields": [
             {
@@ -1294,7 +1510,7 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
             },
             {
                 "field": "ancestor_context",
-                "scope": "preprocessing.local_ai_input.evidence",
+                "scope": "preprocessing.hermes_profile_input.evidence",
                 "meaning": "Immediate parent and recent ancestor body/detail/review excerpts plus recent decisions supplied to preprocessing, and included in source refs so parent-context changes supersede retry waits.",
             },
             {
@@ -1310,7 +1526,7 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
             },
             {
                 "field": "decomposition_items",
-                "scope": "preprocessing.local_ai_output",
+                "scope": "preprocessing.hermes_profile_output",
                 "meaning": "Concrete child Kanban work items to create or confirm when the current card is not yet an implementation-ready leaf.",
             },
         ],
@@ -1372,8 +1588,9 @@ def _work_review_processor_output_contract() -> dict[str, Any]:
         "metadata_contract_schema": metadata_contract["schema"],
         "provider_mode": {
             "active": processing_policy["active_mode"],
+            "profile_processing": processing_policy["profile_processing"],
             "local_processing_gate": processing_policy["local_processing"]["gate"],
-            "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+            "automatic_switch": processing_policy["profile_processing"]["automatic_switch"],
         },
         "recording_rules": [
             "Every Review Processor output is recorded as a kanban_review_decisions row.",
@@ -1893,14 +2110,14 @@ def _work_review_failure_error_class(error: str, metadata: dict[str, Any]) -> st
         return explicit
     message = str(error or "")
     lower = message.lower()
-    if KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV.lower() in lower and "required" in lower:
-        return "local_ai_configuration"
-    if "local ai response missing required field" in lower or "missing required field" in lower:
-        return "local_ai_response_validation"
+    if "api_server_key" in lower or "auth/config drift" in lower or "profile api" in lower:
+        return "hermes_profile_configuration"
+    if "llm response missing required field" in lower or "missing required field" in lower:
+        return "llm_response_validation"
     if "timeout" in lower:
         return "processing_timeout"
-    if "local_ai" in lower or "local ai" in lower:
-        return "local_ai_processing"
+    if "profile" in lower or "llm" in lower:
+        return "hermes_profile_processing"
     return "processing_error"
 
 
@@ -14301,7 +14518,11 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
         "singleton_override": override_state,
         "runs_on_this_node": runs_on_this_node,
         "skip_reason": "" if runs_on_this_node else "idle_worker_not_owner_node",
-        "provider_mode": "local",
+        "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+        "processor_profiles": {
+            kind: _work_automation_processor_profile_route(kind)
+            for kind in ("review", "preprocessing")
+        },
         "local_ai_model_alias": local_model_alias,
         "local_ai_max_tokens": _env_int(
             "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MAX_TOKENS",
@@ -14376,39 +14597,144 @@ def _local_ai_json_object(content: str) -> dict[str, Any]:
     return payload
 
 
+def _sha256_text(content: str) -> str:
+    return "sha256:" + hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
+
+
 async def _work_automation_local_ai_json_completion(
     *,
     messages: list[dict[str, str]],
     run_id: str,
+    processor_kind: str = "review",
+) -> dict[str, Any]:
+    return await _work_automation_processor_profile_json_completion(
+        messages=messages,
+        run_id=run_id,
+        processor_kind=processor_kind,
+    )
+
+
+def _work_automation_profile_completion_sync(
+    *,
+    route: dict[str, Any],
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    api_key = _read_env_file_value(Path(route["api_key_file"]), "API_SERVER_KEY")
+    if not api_key:
+        raise ValueError(
+            f"{route['profile']} API_SERVER_KEY is required in {route['api_key_file']}"
+        )
+    request_body = json.dumps(
+        {
+            "model": route["profile"],
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{route['api_base']}/v1/chat/completions",
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise RuntimeError(
+            f"{route['profile']} profile API returned HTTP {exc.code}: {_body_excerpt(body, limit=800)}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"{route['profile']} profile API unavailable: {exc}") from exc
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{route['profile']} profile API returned invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{route['profile']} profile API response root was not an object")
+    return parsed
+
+
+async def _work_automation_processor_profile_json_completion(
+    *,
+    messages: list[dict[str, str]],
+    run_id: str,
+    processor_kind: str,
 ) -> dict[str, Any]:
     config = _work_automation_idle_worker_config()
-    model_alias = config["local_ai_model_alias"]
-    if not model_alias:
+    route = _work_automation_processor_profile_route(processor_kind)
+    drift = _work_automation_processor_profile_drift(processor_kind)
+    if not drift["ok"]:
         raise ValueError(
-            f"{KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV} is required for local AI Kanban automation"
+            f"{route['profile']} auth/config drift blocks processor route: "
+            + ",".join(drift["problems"])
         )
-    from .routes_litellm import _ChatBody, litellm_chat_proxy
-
-    response = await litellm_chat_proxy(
-        _ChatBody(
-            model=model_alias,
-            messages=messages,
-            max_tokens=config["local_ai_max_tokens"],
-            temperature=0,
-        )
+    response = await asyncio.to_thread(
+        _work_automation_profile_completion_sync,
+        route=route,
+        messages=messages,
+        max_tokens=config["local_ai_max_tokens"],
+        timeout_seconds=_env_int(
+            "BLUEPRINTS_KANBAN_AUTOMATION_PROFILE_TIMEOUT_SECONDS",
+            1800,
+            minimum=30,
+            maximum=3600,
+        ),
     )
     choices = response.get("choices") if isinstance(response, dict) else None
     if not isinstance(choices, list) or not choices:
-        raise ValueError("local AI response did not include choices")
+        raise ValueError(f"{route['profile']} profile response did not include choices")
     message = choices[0].get("message") if isinstance(choices[0], dict) else None
     content = message.get("content") if isinstance(message, dict) else ""
     parsed = _local_ai_json_object(str(content or ""))
+    prompt_content = messages[0].get("content", "") if messages else ""
     return {
-        "model_alias": model_alias,
+        "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+        "processor_engine": KANBAN_AUTOMATION_PROFILE_ENGINE,
+        "profile": route["profile"],
+        "primary_provider": route["primary_provider"],
+        "primary_model": route["primary_model"],
+        "fallback_provider": route["fallback_provider"],
+        "fallback_model": route["fallback_model"],
+        "model_alias": route["model_alias"],
         "run_id": run_id,
+        "api_base": route["api_base"],
+        "response_model": _clean_short_text(str(response.get("model") or ""), "", limit=180),
+        "prompt_sha256": _sha256_text(prompt_content),
         "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
         "payload": parsed,
     }
+
+
+def _work_automation_processor_ai_defaults(
+    ai: dict[str, Any],
+    processor_kind: str,
+) -> dict[str, Any]:
+    route = _work_automation_processor_profile_route(processor_kind)
+    merged = {
+        "provider_mode": route["provider_mode"],
+        "processor_engine": route["processor_engine"],
+        "profile": route["profile"],
+        "primary_provider": route["primary_provider"],
+        "primary_model": route["primary_model"],
+        "fallback_provider": route["fallback_provider"],
+        "fallback_model": route["fallback_model"],
+        "model_alias": route["model_alias"],
+        "api_base": route["api_base"],
+        "response_model": "",
+        "prompt_sha256": "",
+        "content_excerpt": "",
+        "payload": {},
+    }
+    merged.update(ai if isinstance(ai, dict) else {})
+    return merged
 
 
 def _local_ai_required_text(
@@ -14509,7 +14835,7 @@ def _work_review_processor_local_ai_messages(
 ) -> list[dict[str, str]]:
     review_text = str(review_document.get("body") or "")
     context = {
-        "schema": "xarta.kanban.review_processor.local_ai_input.v1",
+        "schema": "xarta.kanban.review_processor.hermes_profile_input.v1",
         "item": _row_to_work_item(item),
         "canonical_item_ref": f"xarta-kanban:item:{item['item_id']}",
         "marker": {
@@ -14566,7 +14892,9 @@ async def _process_work_review_idle_marker(
             marker=marker,
         ),
         run_id=run_id,
+        processor_kind="review",
     )
+    ai = _work_automation_processor_ai_defaults(ai, "review")
     payload = ai["payload"]
     title = _local_ai_required_text(payload, "title", limit=220)
     summary = _local_ai_required_text(payload, "summary")
@@ -14590,7 +14918,7 @@ async def _process_work_review_idle_marker(
     confidence = _clean_short_text(str(payload.get("confidence") or "medium"), "medium", limit=40)
     status = _clean_review_decision_status(str(payload.get("status") or "recorded"))
     decision_id = _clean_work_id(
-        f"kanban-decision-local-review-{item_id}-{marker['document_source_hash'][-12:]}",
+        f"kanban-decision-hermes-review-{item_id}-{marker['document_source_hash'][-12:]}",
         "kanban-decision",
     )
     decision = await record_work_item_review_decision(
@@ -14607,17 +14935,26 @@ async def _process_work_review_idle_marker(
             uncertainty=uncertainty,
             proof_refs=proof_refs,
             status=status,
-            provider_mode="local",
+            provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
             metadata={
-                "schema": "xarta.kanban.review_processor.local_ai_decision.v1",
+                "schema": "xarta.kanban.review_processor.hermes_profile_decision.v1",
                 "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-                "processor_engine": "local-litellm-json",
+                "processor_engine": ai["processor_engine"],
                 "provider_policy": _work_review_processing_policy()["active_mode"],
+                "provider_mode": ai["provider_mode"],
+                "profile": ai["profile"],
+                "primary_provider": ai["primary_provider"],
+                "primary_model": ai["primary_model"],
+                "fallback_provider": ai["fallback_provider"],
+                "fallback_model": ai["fallback_model"],
                 "model_alias": ai["model_alias"],
+                "response_model": ai["response_model"],
+                "api_base": ai["api_base"],
+                "prompt_sha256": ai["prompt_sha256"],
                 "marker_id": marker["marker_id"],
                 "document_source_hash": marker["document_source_hash"],
-                "local_ai_payload": payload,
-                "local_ai_content_excerpt": ai["content_excerpt"],
+                "llm_payload": payload,
+                "llm_content_excerpt": ai["content_excerpt"],
             },
             actor=holder_id,
             source_surface="kanban-automation-idle-worker",
@@ -14638,10 +14975,15 @@ async def _process_work_review_idle_marker(
             request_id=f"{run_id}-complete-{marker['marker_id']}",
             run_id=run_id,
             metadata={
-                "schema": "xarta.kanban.review_processor.local_ai_completion.v1",
+                "schema": "xarta.kanban.review_processor.hermes_profile_completion.v1",
                 "decision_id": decision["decision"]["decision_id"],
-                "processor_engine": "local-litellm-json",
+                "processor_engine": ai["processor_engine"],
+                "provider_mode": ai["provider_mode"],
+                "profile": ai["profile"],
+                "primary_provider": ai["primary_provider"],
+                "primary_model": ai["primary_model"],
                 "model_alias": ai["model_alias"],
+                "prompt_sha256": ai["prompt_sha256"],
             },
         ),
     )
@@ -14653,7 +14995,10 @@ async def _process_work_review_idle_marker(
         "decision_id": decision["decision"]["decision_id"],
         "completed": complete.get("completed", False),
         "status": complete.get("marker", {}).get("status", ""),
-        "provider_mode": "local",
+        "provider_mode": ai["provider_mode"],
+        "profile": ai["profile"],
+        "primary_provider": ai["primary_provider"],
+        "primary_model": ai["primary_model"],
         "model_alias": ai["model_alias"],
     }
 
@@ -14671,7 +15016,7 @@ def _work_preprocessing_local_ai_messages(
     marker: dict[str, Any],
 ) -> list[dict[str, str]]:
     context = {
-        "schema": "xarta.kanban.preprocessing.local_ai_input.v1",
+        "schema": "xarta.kanban.preprocessing.hermes_profile_input.v1",
         "item": _row_to_work_item(item),
         "canonical_item_ref": f"xarta-kanban:item:{item['item_id']}",
         "marker": {
@@ -15056,6 +15401,7 @@ def _preprocessing_readiness_marker(
     actor: str,
     now: str,
     ai_payload: dict[str, Any],
+    processor_route: dict[str, Any] | None = None,
     outcome: str = "ready",
     decomposition: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -15063,6 +15409,11 @@ def _preprocessing_readiness_marker(
     if not isinstance(next_actions, list):
         next_actions = []
     decomposition = decomposition if isinstance(decomposition, dict) else {}
+    route = (
+        processor_route
+        if isinstance(processor_route, dict)
+        else _work_automation_processor_profile_route("preprocessing")
+    )
     return {
         "schema": "xarta.kanban.context_readiness_marker.v1",
         "context_packet_schema": source["schema"],
@@ -15084,7 +15435,13 @@ def _preprocessing_readiness_marker(
             _body_excerpt(str(action or ""), limit=300) for action in next_actions[:12]
         ],
         "processor_marker_id": marker["marker_id"],
-        "processor_model_alias": _work_automation_idle_worker_config()["local_ai_model_alias"],
+        "processor_profile": route.get("profile", ""),
+        "processor_provider_mode": route.get(
+            "provider_mode", KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+        ),
+        "processor_model_alias": route.get("model_alias", ""),
+        "processor_primary_provider": route.get("primary_provider", ""),
+        "processor_primary_model": route.get("primary_model", ""),
         "preprocessing_outcome": outcome,
         "decomposition_item_ids": [
             str(item.get("item_id") or "")
@@ -15123,7 +15480,7 @@ async def _process_work_preprocessing_idle_marker(
                 request_id=f"{run_id}-preprocess-excluded-{marker['marker_id']}",
                 run_id=run_id,
                 metadata={
-                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_completion.v1",
                     "reason": "automation_excluded",
                 },
             ),
@@ -15150,7 +15507,7 @@ async def _process_work_preprocessing_idle_marker(
                 request_id=f"{run_id}-preprocess-not-candidate-{marker['marker_id']}",
                 run_id=run_id,
                 metadata={
-                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_completion.v1",
                     "contract_schema": KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA,
                     "reason": "preprocessing_not_candidate_cancelled",
                     "last_error": ineligible_reason,
@@ -15229,7 +15586,9 @@ async def _process_work_preprocessing_idle_marker(
             marker=marker,
         ),
         run_id=run_id,
+        processor_kind="preprocessing",
     )
+    ai = _work_automation_processor_ai_defaults(ai, "preprocessing")
     payload = ai["payload"]
     ready = bool(payload.get("ready"))
     title = _local_ai_optional_text(payload, "title", limit=220) or _clean_short_text(
@@ -15283,7 +15642,7 @@ async def _process_work_preprocessing_idle_marker(
         if int(decomposition_result.get("total_count") or 0) <= 0:
             if blocking_codes:
                 blocking_codes.append("missing_decomposition_items")
-                hard_blocking_codes.append("local_ai_reported_not_ready")
+                hard_blocking_codes.append("llm_reported_not_ready")
             else:
                 ready = True
                 readiness_outcome = "ready_leaf_no_decomposition"
@@ -15298,11 +15657,11 @@ async def _process_work_preprocessing_idle_marker(
     if not ready and int(decomposition_result.get("total_count") or 0) <= 0:
         if "missing_decomposition_items" not in blocking_codes:
             blocking_codes.append("missing_decomposition_items")
-        hard_blocking_codes.append("local_ai_reported_not_ready")
+        hard_blocking_codes.append("llm_reported_not_ready")
     if hard_blocking_codes:
         all_blocking_codes = list(dict.fromkeys([*blocking_codes, *hard_blocking_codes]))
         decision_id = _clean_work_id(
-            f"kanban-decision-local-preprocess-blocked-{item_id}-{source['document_source_hash'][-12:]}",
+            f"kanban-decision-hermes-preprocess-blocked-{item_id}-{source['document_source_hash'][-12:]}",
             "kanban-decision",
         )
         decision = await record_work_item_review_decision(
@@ -15328,20 +15687,29 @@ async def _process_work_preprocessing_idle_marker(
                     f"kanban_items:{item_id}:context_readiness",
                 ],
                 status="failed",
-                provider_mode="local",
+                provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                 metadata={
-                    "schema": "xarta.kanban.preprocessing.local_ai_blocked_decision.v1",
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_blocked_decision.v1",
                     "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-                    "processor_engine": "local-litellm-json",
+                    "processor_engine": ai["processor_engine"],
                     "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "provider_mode": ai["provider_mode"],
+                    "profile": ai["profile"],
+                    "primary_provider": ai["primary_provider"],
+                    "primary_model": ai["primary_model"],
+                    "fallback_provider": ai["fallback_provider"],
+                    "fallback_model": ai["fallback_model"],
                     "model_alias": ai["model_alias"],
+                    "response_model": ai["response_model"],
+                    "api_base": ai["api_base"],
+                    "prompt_sha256": ai["prompt_sha256"],
                     "marker_id": marker["marker_id"],
                     "document_source_hash": source["document_source_hash"],
                     "blocking_codes": all_blocking_codes,
                     "decomposition": decomposition_result,
                     "source": source,
-                    "local_ai_payload": payload,
-                    "local_ai_content_excerpt": ai["content_excerpt"],
+                    "llm_payload": payload,
+                    "llm_content_excerpt": ai["content_excerpt"],
                 },
                 actor=holder_id,
                 source_surface="kanban-automation-idle-worker",
@@ -15363,10 +15731,15 @@ async def _process_work_preprocessing_idle_marker(
                 request_id=f"{run_id}-preprocess-failed-{marker['marker_id']}",
                 run_id=run_id,
                 metadata={
-                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
-                    "processor_engine": "local-litellm-json",
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_completion.v1",
+                    "processor_engine": ai["processor_engine"],
                     "decision_id": decision["decision"]["decision_id"],
+                    "provider_mode": ai["provider_mode"],
+                    "profile": ai["profile"],
+                    "primary_provider": ai["primary_provider"],
+                    "primary_model": ai["primary_model"],
                     "model_alias": ai["model_alias"],
+                    "prompt_sha256": ai["prompt_sha256"],
                     "blocking_codes": all_blocking_codes,
                 },
             ),
@@ -15379,7 +15752,10 @@ async def _process_work_preprocessing_idle_marker(
             "decision_id": decision["decision"]["decision_id"],
             "reason": ";".join(all_blocking_codes),
             "status": complete.get("marker", {}).get("status", "failed"),
-            "provider_mode": "local",
+            "provider_mode": ai["provider_mode"],
+            "profile": ai["profile"],
+            "primary_provider": ai["primary_provider"],
+            "primary_model": ai["primary_model"],
             "model_alias": ai["model_alias"],
         }
 
@@ -15411,6 +15787,7 @@ async def _process_work_preprocessing_idle_marker(
             actor=holder_id,
             now=now,
             ai_payload=payload,
+            processor_route=ai,
             outcome="decomposed",
             decomposition=decomposition_result,
         )
@@ -15460,13 +15837,22 @@ async def _process_work_preprocessing_idle_marker(
                     *child_refs,
                 ],
                 status="accepted",
-                provider_mode="local",
+                provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                 metadata={
                     "schema": "xarta.kanban.preprocessing.decomposition_decision.v1",
                     "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-                    "processor_engine": "local-litellm-json",
+                    "processor_engine": ai["processor_engine"],
                     "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "provider_mode": ai["provider_mode"],
+                    "profile": ai["profile"],
+                    "primary_provider": ai["primary_provider"],
+                    "primary_model": ai["primary_model"],
+                    "fallback_provider": ai["fallback_provider"],
+                    "fallback_model": ai["fallback_model"],
                     "model_alias": ai["model_alias"],
+                    "response_model": ai["response_model"],
+                    "api_base": ai["api_base"],
+                    "prompt_sha256": ai["prompt_sha256"],
                     "marker_id": marker["marker_id"],
                     "document_source_hash": updated_source["document_source_hash"],
                     "readiness_marker": readiness_marker,
@@ -15480,8 +15866,8 @@ async def _process_work_preprocessing_idle_marker(
                     else None,
                     "source_before_decomposition": source,
                     "source_after_decomposition": updated_source,
-                    "local_ai_payload": payload,
-                    "local_ai_content_excerpt": ai["content_excerpt"],
+                    "llm_payload": payload,
+                    "llm_content_excerpt": ai["content_excerpt"],
                 },
                 actor=holder_id,
                 source_surface="kanban-automation-idle-worker",
@@ -15502,10 +15888,15 @@ async def _process_work_preprocessing_idle_marker(
                 request_id=f"{run_id}-preprocess-decomposed-complete-{marker['marker_id']}",
                 run_id=run_id,
                 metadata={
-                    "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_completion.v1",
                     "decision_id": decision["decision"]["decision_id"],
-                    "processor_engine": "local-litellm-json",
+                    "processor_engine": ai["processor_engine"],
+                    "provider_mode": ai["provider_mode"],
+                    "profile": ai["profile"],
+                    "primary_provider": ai["primary_provider"],
+                    "primary_model": ai["primary_model"],
                     "model_alias": ai["model_alias"],
+                    "prompt_sha256": ai["prompt_sha256"],
                     "readiness_marker_context_hash": readiness_marker["context_hash"],
                     "decomposition_total_count": decomposition_result["total_count"],
                     "decomposition_created_count": decomposition_result["created_count"],
@@ -15521,7 +15912,10 @@ async def _process_work_preprocessing_idle_marker(
             "decision_id": decision["decision"]["decision_id"],
             "completed": complete.get("completed", False),
             "status": complete.get("marker", {}).get("status", ""),
-            "provider_mode": "local",
+            "provider_mode": ai["provider_mode"],
+            "profile": ai["profile"],
+            "primary_provider": ai["primary_provider"],
+            "primary_model": ai["primary_model"],
             "model_alias": ai["model_alias"],
             "decomposition": {
                 "total_count": decomposition_result["total_count"],
@@ -15542,6 +15936,7 @@ async def _process_work_preprocessing_idle_marker(
         actor=holder_id,
         now=now,
         ai_payload=payload,
+        processor_route=ai,
         outcome=readiness_outcome,
     )
     metadata = dict(hints.get("metadata") or {})
@@ -15557,7 +15952,7 @@ async def _process_work_preprocessing_idle_marker(
         ),
     )
     decision_id = _clean_work_id(
-        f"kanban-decision-idle-preprocess-{item_id}-{source['document_source_hash'][-12:]}",
+        f"kanban-decision-hermes-preprocess-{item_id}-{source['document_source_hash'][-12:]}",
         "kanban-decision",
     )
     decision = await record_work_item_review_decision(
@@ -15583,19 +15978,28 @@ async def _process_work_preprocessing_idle_marker(
                 f"kanban_agent_hints:{item_id}",
             ],
             status="accepted",
-            provider_mode="local",
+            provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
             metadata={
-                "schema": "xarta.kanban.preprocessing.local_ai_decision.v1",
+                "schema": "xarta.kanban.preprocessing.hermes_profile_decision.v1",
                 "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-                "processor_engine": "local-litellm-json",
+                "processor_engine": ai["processor_engine"],
                 "provider_policy": _work_review_processing_policy()["active_mode"],
+                "provider_mode": ai["provider_mode"],
+                "profile": ai["profile"],
+                "primary_provider": ai["primary_provider"],
+                "primary_model": ai["primary_model"],
+                "fallback_provider": ai["fallback_provider"],
+                "fallback_model": ai["fallback_model"],
                 "model_alias": ai["model_alias"],
+                "response_model": ai["response_model"],
+                "api_base": ai["api_base"],
+                "prompt_sha256": ai["prompt_sha256"],
                 "marker_id": marker["marker_id"],
                 "document_source_hash": source["document_source_hash"],
                 "readiness_marker": readiness_marker,
                 "readiness_normalization": readiness_normalization or None,
-                "local_ai_payload": payload,
-                "local_ai_content_excerpt": ai["content_excerpt"],
+                "llm_payload": payload,
+                "llm_content_excerpt": ai["content_excerpt"],
             },
             actor=holder_id,
             source_surface="kanban-automation-idle-worker",
@@ -15616,10 +16020,15 @@ async def _process_work_preprocessing_idle_marker(
             request_id=f"{run_id}-preprocess-complete-{marker['marker_id']}",
             run_id=run_id,
             metadata={
-                "schema": "xarta.kanban.preprocessing.local_ai_completion.v1",
+                "schema": "xarta.kanban.preprocessing.hermes_profile_completion.v1",
                 "decision_id": decision["decision"]["decision_id"],
-                "processor_engine": "local-litellm-json",
+                "processor_engine": ai["processor_engine"],
+                "provider_mode": ai["provider_mode"],
+                "profile": ai["profile"],
+                "primary_provider": ai["primary_provider"],
+                "primary_model": ai["primary_model"],
                 "model_alias": ai["model_alias"],
+                "prompt_sha256": ai["prompt_sha256"],
                 "readiness_marker_context_hash": readiness_marker["context_hash"],
                 "readiness_outcome": readiness_outcome,
                 "readiness_normalization": readiness_normalization or None,
@@ -15634,7 +16043,10 @@ async def _process_work_preprocessing_idle_marker(
         "decision_id": decision["decision"]["decision_id"],
         "completed": complete.get("completed", False),
         "status": complete.get("marker", {}).get("status", ""),
-        "provider_mode": "local",
+        "provider_mode": ai["provider_mode"],
+        "profile": ai["profile"],
+        "primary_provider": ai["primary_provider"],
+        "primary_model": ai["primary_model"],
         "model_alias": ai["model_alias"],
     }
 
@@ -15687,6 +16099,9 @@ async def _process_work_automation_claimed_marker(
     except Exception as exc:
         failed_complete: dict[str, Any] | None = None
         error_class = _work_review_failure_error_class(str(exc), {})
+        route = _work_automation_processor_profile_route(
+            processor_kind if processor_kind in KANBAN_PROCESSOR_PROFILE_SPECS else "review"
+        )
         with suppress(Exception):
             failed_complete = await complete_work_review_processor_marker(
                 marker["marker_id"],
@@ -15703,10 +16118,12 @@ async def _process_work_automation_claimed_marker(
                     metadata={
                         "schema": "xarta.kanban.automation.idle_worker.failure.v1",
                         "processor_kind": processor_kind,
-                        "provider_mode": "local",
-                        "model_alias": _work_automation_idle_worker_config()[
-                            "local_ai_model_alias"
-                        ],
+                        "provider_mode": route["provider_mode"],
+                        "processor_engine": route["processor_engine"],
+                        "profile": route["profile"],
+                        "primary_provider": route["primary_provider"],
+                        "primary_model": route["primary_model"],
+                        "model_alias": route["model_alias"],
                         "error_class": error_class,
                     },
                 ),
@@ -15716,11 +16133,14 @@ async def _process_work_automation_claimed_marker(
             "processor_kind": processor_kind,
             "item_id": marker.get("item_id") or "",
             "marker_id": marker["marker_id"],
-            "reason": "local_ai_processing_failed",
+            "reason": "hermes_profile_processing_failed",
             "error": _body_excerpt(str(exc), limit=1000),
             "status": (failed_complete or {}).get("marker", {}).get("status", "failed"),
-            "provider_mode": "local",
-            "model_alias": _work_automation_idle_worker_config()["local_ai_model_alias"],
+            "provider_mode": route["provider_mode"],
+            "profile": route["profile"],
+            "primary_provider": route["primary_provider"],
+            "primary_model": route["primary_model"],
+            "model_alias": route["model_alias"],
         }
 
 
@@ -17148,17 +17568,23 @@ async def complete_work_review_processor_marker(
             )
             retry_after_seconds = _work_review_retry_after_seconds(failure_attempt)
             next_retry_at = _work_review_retry_next_at(now, failure_attempt)
+            marker_processor_kind = str(marker_row["processor_kind"] or "review")
+            route = _work_automation_processor_profile_route(
+                marker_processor_kind
+                if marker_processor_kind in KANBAN_PROCESSOR_PROFILE_SPECS
+                else "review"
+            )
             provider_mode = _clean_short_text(
-                str(body_metadata.get("provider_mode") or marker_row["provider_mode"] or "local"),
-                "local",
+                str(
+                    body_metadata.get("provider_mode")
+                    or marker_row["provider_mode"]
+                    or route["provider_mode"]
+                ),
+                route["provider_mode"],
                 limit=80,
             )
             model_alias = _clean_short_text(
-                str(
-                    body_metadata.get("model_alias")
-                    or _work_automation_idle_worker_config()["local_ai_model_alias"]
-                    or ""
-                ),
+                str(body_metadata.get("model_alias") or route["model_alias"] or ""),
                 "",
                 limit=180,
             )
@@ -18075,9 +18501,11 @@ async def get_work_automation_status(
             "failures": failure_stats,
             "provider_mode": {
                 "active": processing_policy["active_mode"],
-                "planned": processing_policy["local_processing"]["state"],
+                "planned": processing_policy["profile_processing"]["state"],
+                "profile_processing": processing_policy["profile_processing"],
+                "auth_drift": processing_policy["profile_processing"]["auth_drift"],
                 "local_processing_gate": processing_policy["local_processing"]["gate"],
-                "automatic_switch": processing_policy["local_processing"]["automatic_switch"],
+                "automatic_switch": processing_policy["profile_processing"]["automatic_switch"],
                 "by_mode": {row["provider_mode"]: int(row["count"]) for row in provider_rows},
             },
             "review_processor": {

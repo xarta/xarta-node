@@ -92,6 +92,50 @@ def test_hermes_profile_apply_runs_installer_and_restart(
     assert calls[1][0][-2:] == ["-t", "/run/service/gateway-hermes-kanban"]
 
 
+def test_processor_profile_apply_runs_target_installer_and_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configure_registry(
+        monkeypatch,
+        tmp_path,
+        apply_strategy="hermes-profile:hermes-kanban-preprocessor",
+    )
+    calls: list[tuple[list[str], int]] = []
+
+    def fake_run(command: list[str], timeout: int = 60) -> dict:
+        calls.append((command, timeout))
+        return {"ok": True, "command": command, "timeout": timeout}
+
+    monkeypatch.setattr(prompts, "_run_command", fake_run)
+
+    result = prompts.apply_prompt(
+        "test-prompt",
+        prompts.PromptApplyRequest(content="profile prompt\n", restart=True),
+    )
+
+    assert result["ok"] is True
+    assert len(calls) == 2
+    assert calls[0][0][3:7] == [
+        "/opt/data/scripts/install_hermes_kanban_profile.py",
+        "--profile",
+        "hermes-kanban-preprocessor",
+        "--force",
+    ]
+    assert calls[1][0][-2:] == ["-t", "/run/service/gateway-hermes-kanban-preprocessor"]
+
+
+def test_kanban_prompt_registry_includes_processor_runtime_sources() -> None:
+    assert {
+        "hermes-kanban-preprocessor-soul",
+        "hermes-kanban-review-processor-soul",
+        "kanban-preprocessing-system",
+        "kanban-review-processor-system",
+    }.issubset(prompts.PROMPT_REGISTRY)
+    assert prompts.PROMPT_REGISTRY["kanban-preprocessing-system"].apply_strategy == "write-file"
+    assert prompts.PROMPT_REGISTRY["kanban-review-processor-system"].apply_strategy == "write-file"
+
+
 def test_unknown_prompt_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     configure_registry(monkeypatch, tmp_path)
 

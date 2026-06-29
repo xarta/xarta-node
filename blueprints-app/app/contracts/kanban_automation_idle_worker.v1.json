@@ -1,7 +1,7 @@
 {
   "schema": "xarta.kanban.automation.idle_worker.contract.v1",
   "status": "active",
-  "version": "2026-06-28",
+  "version": "2026-06-29",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
   "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards, but only the nominated singleton owner node should run it. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff.",
@@ -18,9 +18,14 @@
     "non_owner_result": "Return idle_worker_not_owner_node without scanning, queueing, requeueing timeouts, acquiring a lease, claiming markers, or processing work."
   },
   "provider_mode": {
-    "active": "local",
-    "required_model_env": "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL",
-    "local_processing_gate": "private_no_think_no_protection_no_orientation_endpoint_required",
+    "active": "required-hermes-kanban-llm",
+    "review_profile": "hermes-kanban-review-processor",
+    "preprocessing_profile": "hermes-kanban-preprocessor",
+    "primary_provider": "openai-codex",
+    "primary_model": "gpt-5.5",
+    "local_processing_gate": "hermes_profile_configured_fallback_only",
+    "local_fallback_provider": "configured-by-hermes-profile",
+    "local_fallback_model": "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION",
     "fallback_processing_allowed": false
   },
   "scope_model": {
@@ -79,7 +84,7 @@
     "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
     "queue_rule": "Queue when the readiness marker is missing or stale for an eligible ToDo leaf, unless a current queued or processing marker already exists.",
     "ready_result": "Write a fresh context_readiness_marker and complete the marker.",
-    "ready_leaf_no_decomposition_rule": "If local AI returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
+    "ready_leaf_no_decomposition_rule": "If the configured LLM route returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
     "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
     "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly as retryable queue state unless the operator/work state makes it terminal."
   },
@@ -144,12 +149,12 @@
         "action": "cancel preprocessing marker as current"
       },
       {
-        "condition": "provider model/env is missing",
+        "condition": "Hermes processor profile, auth, or model route is missing/unavailable",
         "action": "record retryable failure event; do not perform deterministic substitute processing"
       }
     ]
   },
-  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> B2{Current node is owner or override?}\n  B2 -- no --> Z2[Skip without scan/lease/claim]\n  B2 -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker with local AI]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker with local AI]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
+  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> B2{Current node is owner or override?}\n  B2 -- no --> Z2[Skip without scan/lease/claim]\n  B2 -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker through hermes-kanban-review-processor]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker through hermes-kanban-preprocessor]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
   "must_pass_tests": [
     "No root env var set: idle worker still scans automatically.",
     "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
@@ -160,7 +165,7 @@
     "Actionable leaf with no blocker/question/decomposition from local AI is marked ready_leaf_no_decomposition, not failed.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
     "Old queued marker from invalid/global bad run is cancelled instead of processed.",
-    "Missing or unavailable local AI model fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
+    "Missing or unavailable Hermes processor profile/auth/model route fails visibly as retryable failure state; deterministic substitute processing is forbidden.",
     "Retryable Review Processor/preprocessing failure does not update last_successful_source_hash and clears processed_source_hash if it matches the failed source.",
     "Automation Status exposes failure events, repeated failure aggregates, attempt count, last error, next retry time, and retry-waiting/due state.",
     "After a retry succeeds, Automation Status keeps historical failure events but clears active retry summary fields.",
