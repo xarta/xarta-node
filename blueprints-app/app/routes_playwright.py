@@ -50,6 +50,22 @@ _RUNTIME_DIR = Path(
 _LEASE_FILE = _RUNTIME_DIR / "last-used"
 
 
+def _playwright_autostart_available() -> bool:
+    return _START_HELPER.exists() and os.access(_START_HELPER, os.X_OK)
+
+
+def _playwright_unreachable_payload(url: str, error: str) -> dict[str, Any]:
+    autostart_available = _playwright_autostart_available()
+    return {
+        "present": autostart_available,
+        "reachable": False,
+        "url": url,
+        "autostart_available": autostart_available,
+        "lifecycle": "stopped_or_unreachable" if autostart_available else "unavailable",
+        "error": error,
+    }
+
+
 class _BrowserBody(BaseModel):
     url: str
     viewport: dict[str, Any] | None = None
@@ -180,6 +196,7 @@ def _stack_browser_payload(body: _BrowserBody) -> dict[str, Any]:
 async def playwright_health() -> dict:
     """Check if the Playwright stack is reachable and return its health status."""
     url = _base_url()
+    autostart_available = _playwright_autostart_available()
     try:
         async with httpx.AsyncClient(timeout=_CONNECT_TIMEOUT) as client:
             r = await client.get(f"{url}/health")
@@ -188,15 +205,10 @@ async def playwright_health() -> dict:
                 body = r.json()
             except Exception:
                 body = {}
-            return {"present": True, "url": url, **body}
-        return {
-            "present": True,
-            "reachable": False,
-            "url": url,
-            "error": f"HTTP {r.status_code}",
-        }
+            return {"present": True, "autostart_available": autostart_available, "url": url, **body}
+        return _playwright_unreachable_payload(url, f"HTTP {r.status_code}")
     except Exception as exc:
-        return {"present": False, "reachable": False, "url": url, "error": str(exc)}
+        return _playwright_unreachable_payload(url, str(exc))
 
 
 @router.get("/tools")
