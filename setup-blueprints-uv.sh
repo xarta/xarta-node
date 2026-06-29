@@ -223,10 +223,14 @@ echo "    ok"
 #  2. Resolve dependencies from pyproject.toml
 #  3. Use uv.lock for exact versions (must be committed)
 #  4. Install all packages
+# Keep production Blueprints pinned to the host-supported Python 3.11 runtime.
+# A generic `uv sync` may select a newer compatible Python from `>=3.11` and
+# leave systemd pointing at an unusable mixed-layout venv if that interpreter is
+# not actually installed on the host.
 
 echo "--- installing dependencies with uv..."
 cd "$SCRIPT_DIR"
-uv sync --frozen
+UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --frozen --python /usr/bin/python3.11
 cd - >/dev/null
 echo "    ok: dependencies installed from uv.lock"
 
