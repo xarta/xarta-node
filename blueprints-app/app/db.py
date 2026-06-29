@@ -1788,6 +1788,8 @@ _KANBAN_REF_REPLACEMENTS = (
     ('"kind":"work"', '"kind":"item"'),
 )
 
+_KANBAN_REF_REWRITE_MARKER = "kanban_ref_text_rewrite_2026_06_29"
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return bool(
@@ -2036,6 +2038,13 @@ def _migrate_leaf_table_to_kanban_items(
 
 
 def _rewrite_kanban_ref_text(conn: sqlite3.Connection) -> None:
+    done = conn.execute(
+        "SELECT value FROM sync_meta WHERE key=?",
+        (_KANBAN_REF_REWRITE_MARKER,),
+    ).fetchone()
+    if done and done[0] == "complete":
+        return
+
     ref_columns = {
         "kanban_items": (
             "promoted_from_ref",
@@ -2099,6 +2108,10 @@ def _rewrite_kanban_ref_text(conn: sqlite3.Connection) -> None:
         for old, new in _KANBAN_TABLE_RENAMES:
             conn.execute("UPDATE sync_queue SET table_name=? WHERE table_name=?", (new, old))
         conn.execute("DELETE FROM sync_queue WHERE table_name IN ('work_issues', 'work_todos')")
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_meta(key, value) VALUES (?, 'complete')",
+        (_KANBAN_REF_REWRITE_MARKER,),
+    )
 
 
 def _migrate_kanban_storage(conn: sqlite3.Connection) -> None:

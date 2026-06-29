@@ -713,6 +713,56 @@ def test_init_db_migrates_legacy_review_processor_marker_retry_columns(monkeypat
     assert "next_retry_at" in failure_event_columns
 
 
+def test_kanban_ref_rewrite_records_completion_marker():
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE personal_search_documents (
+            document_id TEXT,
+            record_type TEXT,
+            record_table TEXT,
+            record_id TEXT,
+            source_type TEXT,
+            source_ref TEXT,
+            search_text TEXT,
+            related_refs_json TEXT,
+            page_ref_json TEXT,
+            source_refs_json TEXT,
+            provenance_json TEXT,
+            vector_index_key TEXT
+        );
+        INSERT INTO personal_search_documents (
+            document_id, record_type, record_table, record_id, source_type,
+            source_ref, search_text, related_refs_json, page_ref_json,
+            source_refs_json, provenance_json, vector_index_key
+        )
+        VALUES (
+            'work_items:legacy', 'work_item', 'work_items', 'legacy',
+            'manual-work', 'work_items:legacy', 'work_items:legacy',
+            '["work_items:legacy"]', '{}', '["work_items:legacy"]',
+            '{"table": "work_items"}', 'work_items:legacy'
+        );
+        """
+    )
+
+    app_db._rewrite_kanban_ref_text(conn)
+
+    marker = conn.execute(
+        "SELECT value FROM sync_meta WHERE key=?",
+        (app_db._KANBAN_REF_REWRITE_MARKER,),
+    ).fetchone()
+    rewritten = conn.execute("SELECT source_ref FROM personal_search_documents").fetchone()[0]
+    assert marker == ("complete",)
+    assert rewritten == "kanban_items:legacy"
+
+    conn.execute("UPDATE personal_search_documents SET source_ref='work_items:after-marker'")
+    app_db._rewrite_kanban_ref_text(conn)
+
+    skipped = conn.execute("SELECT source_ref FROM personal_search_documents").fetchone()[0]
+    assert skipped == "work_items:after-marker"
+
+
 @contextmanager
 def _conn_context(conn: sqlite3.Connection):
     yield conn
