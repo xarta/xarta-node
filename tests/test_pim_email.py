@@ -170,6 +170,35 @@ def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch)
     assert message["views"]["plain"] == "Opened body"
 
 
+def test_imap_folder_select_quotes_mailbox_names_with_spaces(monkeypatch):
+    class SpaceFolderIMAP(FakeIMAP):
+        selected_args = []
+
+        def select(self, folder, readonly=False):
+            assert readonly is True
+            self.__class__.selected_args.append(folder)
+            return "OK", [b"17"]
+
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", SpaceFolderIMAP)
+    mailbox = _mailbox()
+
+    rows = pim_email.list_folder_messages_sync(
+        mailbox,
+        folder="INBOX/__ MORE 01/ethosdentalcare",
+        limit=1,
+    )
+
+    assert SpaceFolderIMAP.selected_args == ['"INBOX/__ MORE 01/ethosdentalcare"']
+    assert [row["folder"] for row in rows] == ["INBOX/__ MORE 01/ethosdentalcare"]
+
+
+def test_imap_folder_select_arg_escapes_quoted_mailbox_names():
+    assert (
+        pim_email._imap_mailbox_select_arg('INBOX/Needs "quotes" and \\ slash')
+        == '"INBOX/Needs \\"quotes\\" and \\\\ slash"'
+    )
+
+
 class FakeSMTP:
     sent_messages = []
 
