@@ -140,11 +140,29 @@ def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     assert parsed["headers"]["subject"] == "Hello ✓"
     assert parsed["views"]["plain"] == "Plain body"
     assert parsed["views"]["markdown"] == "Plain body"
+    assert parsed["views_available"] == {"plain": True, "html": True, "markdown": False}
     assert "Subject: =?utf-8?q?Hello_=E2=9C=93?=" in parsed["views"]["raw"]
     assert "<script>" not in parsed["views"]["html"]
     assert "<p>HTML body</p>" in parsed["views"]["html"]
     assert parsed["html_security"]["sandbox"] == "srcdoc-no-scripts-no-same-origin"
     assert parsed["html_security"]["image_proxy"] == "same-site-jpeg-transform"
+
+
+def test_parse_message_marks_real_markdown_view_available():
+    raw = (
+        b"Subject: Markdown\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: user@example.test\r\n"
+        b"Message-ID: <m-markdown@example.test>\r\n"
+        b"Content-Type: text/markdown; charset=utf-8\r\n\r\n"
+        b"# Heading\r\n\r\nMarkdown body\r\n"
+    )
+
+    parsed = pim_email.parse_message(raw, folder="INBOX", uid="43")
+
+    assert parsed["views"]["plain"] == "# Heading\n\nMarkdown body"
+    assert parsed["views"]["markdown"] == "# Heading\n\nMarkdown body"
+    assert parsed["views_available"] == {"plain": True, "html": False, "markdown": True}
 
 
 def test_parse_message_raw_view_omits_attachment_payloads_but_keeps_security_headers():

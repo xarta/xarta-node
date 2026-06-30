@@ -648,14 +648,18 @@ def _first_fetch_bytes(fetch_data: Any) -> bytes:
 def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[str, Any]:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     plain = _first_text_part(msg, "plain")
+    raw_markdown = _first_text_part(msg, "markdown")
     raw_html = _first_text_part(msg, "html")
     html_result = (
         sanitize_email_html_with_report(raw_html, inline_images=_inline_image_sources(msg))
         if raw_html
         else EmailHtmlSanitizeResult("")
     )
-    default_text = plain.strip() if plain.strip() else html_to_text(html_result.html)
-    markdown = text_to_markdown(default_text)
+    markdown_text = text_to_markdown(raw_markdown) if raw_markdown.strip() else ""
+    default_text = (
+        plain.strip() if plain.strip() else markdown_text or html_to_text(html_result.html)
+    )
+    markdown = markdown_text if markdown_text else text_to_markdown(default_text)
     return {
         "uid": uid,
         "folder": folder,
@@ -671,6 +675,11 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
             "html": html_result.html,
             "markdown": markdown,
             "raw": safe_raw_email_view(raw),
+        },
+        "views_available": {
+            "plain": bool(default_text),
+            "html": bool(html_result.html),
+            "markdown": bool(markdown_text),
         },
         "html_security": html_result.public_dict(),
         "attachments": _attachment_summaries(msg),
