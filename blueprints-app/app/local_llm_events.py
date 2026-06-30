@@ -139,6 +139,9 @@ async def publish_local_llm_offline_event(
         message="Local Large Language Model is offline.",
         source="blueprints-local-llm",
         payload={
+            "notification_key": "local.llm.offline",
+            "toast_dedupe_key": "local.llm.offline",
+            "dedupe_key": dedupe_key,
             "operation": operation,
             "model": model or "",
             "base_url": safe_base,
@@ -190,6 +193,9 @@ async def publish_local_llm_recovered_event(
         message="Local Large Language Model is back online.",
         source="blueprints-local-llm",
         payload={
+            "notification_key": "local.llm.recovered",
+            "toast_dedupe_key": "local.llm.recovered",
+            "dedupe_key": dedupe_key,
             "operation": operation,
             "model": model or "",
             "base_url": safe_base,

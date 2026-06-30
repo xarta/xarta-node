@@ -14,7 +14,7 @@ from .system_notifier import notifier_primary_enabled, post_notifier_event
 
 log = logging.getLogger(__name__)
 
-_GIB = 1024 ** 3
+_GIB = 1024**3
 _DEFAULT_CHECK_INTERVAL_SECS = 15.0
 _DEFAULT_WARN_GIB = 28.0
 _DEFAULT_CRITICAL_GIB = 31.0
@@ -94,6 +94,7 @@ def _level_for(sample: MemorySample, warn_gib: float, critical_gib: float) -> st
 async def _publish_memory_warning(level: str, sample: MemorySample) -> None:
     node_name = _node_speech_name()
     critical = level == "critical"
+    notification_key = f"system.memory.warning:{level}"
     message = (
         f"Warning: {node_name} likely crashing due to insufficient RAM"
         if critical
@@ -102,6 +103,9 @@ async def _publish_memory_warning(level: str, sample: MemorySample) -> None:
     event_type = "system.memory.warning"
     severity = "error" if critical else "warn"
     payload = {
+        "notification_key": notification_key,
+        "toast_dedupe_key": notification_key,
+        "dedupe_key": notification_key,
         "node_id": cfg.NODE_ID,
         "node_name": cfg.NODE_NAME,
         "level": level,
@@ -119,6 +123,7 @@ async def _publish_memory_warning(level: str, sample: MemorySample) -> None:
         tags=["blueprints", "system", "memory"],
         data=payload,
         importance="neutral",
+        dedupe_key=notification_key,
     )
     if notifier_primary_enabled() and notifier_ok:
         log.warning(
@@ -153,7 +158,9 @@ async def run_memory_monitor() -> None:
     warn_gib = _env_float("BLUEPRINTS_RAM_WARN_GIB", _DEFAULT_WARN_GIB)
     critical_gib = _env_float("BLUEPRINTS_RAM_CRITICAL_GIB", _DEFAULT_CRITICAL_GIB)
     warn_repeat = _env_float("BLUEPRINTS_RAM_WARN_REPEAT_SECS", _DEFAULT_WARN_REPEAT_SECS)
-    critical_repeat = _env_float("BLUEPRINTS_RAM_CRITICAL_REPEAT_SECS", _DEFAULT_CRITICAL_REPEAT_SECS)
+    critical_repeat = _env_float(
+        "BLUEPRINTS_RAM_CRITICAL_REPEAT_SECS", _DEFAULT_CRITICAL_REPEAT_SECS
+    )
 
     last_level = "ok"
     last_sent_at: dict[str, float] = {"warn": 0.0, "critical": 0.0}
@@ -172,12 +179,8 @@ async def run_memory_monitor() -> None:
             level = _level_for(sample, warn_gib, critical_gib)
             now = loop.time()
             repeat_after = critical_repeat if level == "critical" else warn_repeat
-            should_send = (
-                level in {"warn", "critical"}
-                and (
-                    level != last_level
-                    or now - last_sent_at.get(level, 0.0) >= repeat_after
-                )
+            should_send = level in {"warn", "critical"} and (
+                level != last_level or now - last_sent_at.get(level, 0.0) >= repeat_after
             )
             if should_send:
                 await _publish_memory_warning(level, sample)
