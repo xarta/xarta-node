@@ -261,12 +261,19 @@ echo "    ok"
 echo "--- enabling + starting blueprints-app..."
 systemctl enable blueprints-app
 systemctl restart blueprints-app
-sleep 3
 
 # ── 6. Health check ───────────────────────────────────────────────────────────
 echo ""
 echo "--- health check..."
-if curl -sf http://127.0.0.1:8080/health | python3 -m json.tool; then
+HEALTH_JSON=""
+for _attempt in $(seq 1 30); do
+    if HEALTH_JSON="$(curl -sf http://127.0.0.1:8080/health 2>/dev/null)"; then
+        break
+    fi
+    sleep 1
+done
+
+if [[ -n "$HEALTH_JSON" ]] && printf '%s\n' "$HEALTH_JSON" | python3 -m json.tool; then
     echo ""
     echo "=== setup complete (uv-based) ==="
     echo ""
