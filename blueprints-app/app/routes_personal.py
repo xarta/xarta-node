@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
 KANBAN_ROOT = Path(os.environ.get("BLUEPRINTS_KANBAN_DIR", "/xarta-node/.lone-wolf/kanban"))
+KANBAN_PRIORITY_SCOPE_ID = "kanban"
 XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xarta/.agents/lib"))
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
@@ -477,6 +478,27 @@ class WorkItemOrderRequest(BaseModel):
 
 
 class WorkItemActionRequest(BaseModel):
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkPriorityRecommendationInput(BaseModel):
+    item_id: str
+    title: str | None = None
+    summary: str | None = None
+    reason: str | None = None
+    priority_id: str | None = None
+    state_id: str | None = None
+    score: float | None = None
+    metadata: dict[str, Any] = {}
+
+
+class WorkPriorityRecommendationsReplaceRequest(BaseModel):
+    recommendations: list[WorkPriorityRecommendationInput] = []
+    strategy_version: str = "skill-managed-v1"
+    generated_at: str | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -4434,6 +4456,84 @@ def _row_to_work_item(row: Any) -> dict[str, Any]:
         "provenance": _json_value(row["provenance_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def _work_priority_recommendation_id(scope_id: str, rank: int) -> str:
+    digest = hashlib.sha256(f"{scope_id}\n{rank}".encode("utf-8")).hexdigest()
+    return f"kanban-priority-{digest[:24]}"
+
+
+def _row_to_work_priority_recommendation(conn: Any, row: Any) -> dict[str, Any]:
+    item = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?",
+        (row["item_id"],),
+    ).fetchone()
+    title = item["title"] if item is not None else row["title"]
+    state_id = item["state_id"] if item is not None else row["state_id"]
+    priority_id = item["priority_id"] if item is not None else row["priority_id"]
+    breadcrumbs = _work_breadcrumbs(conn, row["item_id"]) if item is not None else []
+    return {
+        "recommendation_id": row["recommendation_id"],
+        "scope_id": row["scope_id"],
+        "rank": int(row["rank"] or 0),
+        "item_id": row["item_id"],
+        "canonical_code": f"xarta-kanban:item:{row['item_id']}",
+        "title": title,
+        "saved_title": row["title"],
+        "summary": row["summary"],
+        "reason": row["reason"],
+        "priority_id": priority_id,
+        "saved_priority_id": row["priority_id"],
+        "state_id": state_id,
+        "saved_state_id": row["state_id"],
+        "score": float(row["score"] or 0),
+        "strategy_version": row["strategy_version"],
+        "source_surface": row["source_surface"],
+        "metadata": _json_value(row["metadata_json"], {}),
+        "provenance": _json_value(row["provenance_json"], {}),
+        "generated_at": row["generated_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "item_missing": item is None,
+        "breadcrumbs": breadcrumbs,
+        "path": " / ".join(item_row["title"] or item_row["item_id"] for item_row in breadcrumbs),
+        "href": f"blueprints://kanban/items/{row['item_id']}",
+    }
+
+
+def _work_priority_recommendations_payload(
+    conn: Any,
+    *,
+    scope_id: str = KANBAN_PRIORITY_SCOPE_ID,
+    limit: int = 10,
+) -> dict[str, Any]:
+    clean_scope_id = _clean_short_text(scope_id, KANBAN_PRIORITY_SCOPE_ID, limit=120)
+    clean_limit = max(1, min(int(limit or 10), 50))
+    rows = conn.execute(
+        """
+        SELECT * FROM kanban_priority_recommendations
+        WHERE scope_id=?
+        ORDER BY rank ASC, updated_at DESC, recommendation_id
+        LIMIT ?
+        """,
+        (clean_scope_id, clean_limit),
+    ).fetchall()
+    recommendations = [_row_to_work_priority_recommendation(conn, row) for row in rows]
+    source = "managed" if recommendations else "empty"
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.priority_recommendations.v1",
+        "source": source,
+        "empty_reason": ""
+        if recommendations
+        else "No saved Kanban priority list has been recorded yet.",
+        "scope_id": clean_scope_id,
+        "limit": clean_limit,
+        "count": len(recommendations),
+        "strategy_version": recommendations[0]["strategy_version"] if recommendations else "",
+        "generated_at": recommendations[0]["generated_at"] if recommendations else "",
+        "recommendations": recommendations,
     }
 
 
@@ -11744,6 +11844,202 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 "review": 1 if (review_document.get("body") or "").strip() else 0,
             },
         }
+
+
+@router.get("/kanban/priorities")
+async def get_work_priorities(
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_priority_recommendations_payload(conn, limit=limit)
+
+
+@router.put("/kanban/priorities")
+async def replace_work_priorities(
+    body: WorkPriorityRecommendationsReplaceRequest,
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    meta = _work_request_meta(body)
+    if len(body.recommendations) > 10:
+        raise HTTPException(400, "Kanban priority recommendations are limited to top 10")
+    strategy_version = _clean_short_text(body.strategy_version, "skill-managed-v1", limit=120)
+    generated_at = _clean_short_text(body.generated_at, now, limit=80)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    scope_id = KANBAN_PRIORITY_SCOPE_ID
+    with get_conn() as conn:
+        seen_items: set[str] = set()
+        existing_rows = conn.execute(
+            "SELECT * FROM kanban_priority_recommendations WHERE scope_id=?",
+            (scope_id,),
+        ).fetchall()
+        wanted_ids: set[str] = set()
+        upserted_rows: list[Any] = []
+        for index, entry in enumerate(body.recommendations, start=1):
+            target_item_id = _clean_short_text(entry.item_id, "", limit=180)
+            if not target_item_id:
+                raise HTTPException(400, "Kanban priority recommendation item_id is required")
+            if target_item_id in seen_items:
+                raise HTTPException(
+                    400, "Kanban priority recommendations cannot repeat the same item"
+                )
+            seen_items.add(target_item_id)
+            target = _work_item_or_404(conn, target_item_id)
+            priority_id = (
+                _require_work_priority(conn, entry.priority_id)["priority_id"]
+                if entry.priority_id
+                else target["priority_id"]
+            )
+            state_id = (
+                _require_work_state(conn, entry.state_id)["state_id"]
+                if entry.state_id
+                else target["state_id"]
+            )
+            recommendation_id = _work_priority_recommendation_id(scope_id, index)
+            title = _clean_short_text(entry.title, target["title"], limit=180)
+            summary = _clean_short_text(entry.summary, target["body_excerpt"] or "", limit=800)
+            reason = _clean_short_text(entry.reason, "", limit=1200)
+            metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+            provenance = {
+                "schema": "xarta.kanban.priority_recommendation.provenance.v1",
+                "actor": meta["actor"],
+                "source_surface": meta["source_surface"],
+                "request_id": meta["request_id"],
+                "run_id": meta["run_id"],
+                "scope_id": scope_id,
+                "item_id": target_item_id,
+                "rank": index,
+                "strategy_version": strategy_version,
+            }
+            source_hash = _hash_json_payload(
+                {
+                    "scope_id": scope_id,
+                    "rank": index,
+                    "item_id": target_item_id,
+                    "title": title,
+                    "summary": summary,
+                    "reason": reason,
+                    "priority_id": priority_id,
+                    "state_id": state_id,
+                    "score": entry.score,
+                    "strategy_version": strategy_version,
+                    "metadata": metadata,
+                }
+            )
+            conn.execute(
+                """
+                INSERT INTO kanban_priority_recommendations (
+                    recommendation_id, scope_id, rank, item_id, title, summary,
+                    reason, priority_id, state_id, score, strategy_version,
+                    source_surface, source_hash, metadata_json, provenance_json,
+                    generated_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(recommendation_id) DO UPDATE SET
+                    scope_id=excluded.scope_id,
+                    rank=excluded.rank,
+                    item_id=excluded.item_id,
+                    title=excluded.title,
+                    summary=excluded.summary,
+                    reason=excluded.reason,
+                    priority_id=excluded.priority_id,
+                    state_id=excluded.state_id,
+                    score=excluded.score,
+                    strategy_version=excluded.strategy_version,
+                    source_surface=excluded.source_surface,
+                    source_hash=excluded.source_hash,
+                    metadata_json=excluded.metadata_json,
+                    provenance_json=excluded.provenance_json,
+                    generated_at=excluded.generated_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    recommendation_id,
+                    scope_id,
+                    index,
+                    target_item_id,
+                    title,
+                    summary,
+                    reason,
+                    priority_id,
+                    state_id,
+                    float(entry.score or 0),
+                    strategy_version,
+                    meta["source_surface"],
+                    source_hash,
+                    json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                    json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                    generated_at,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM kanban_priority_recommendations WHERE recommendation_id=?",
+                (recommendation_id,),
+            ).fetchone()
+            wanted_ids.add(recommendation_id)
+            upserted_rows.append(row)
+
+        deleted_rows = [row for row in existing_rows if row["recommendation_id"] not in wanted_ids]
+        for row in deleted_rows:
+            conn.execute(
+                "DELETE FROM kanban_priority_recommendations WHERE recommendation_id=?",
+                (row["recommendation_id"],),
+            )
+
+        audit_metadata = {
+            "schema": "xarta.kanban.priority_recommendations.replace.v1",
+            "scope_id": scope_id,
+            "recommendation_ids": [row["recommendation_id"] for row in upserted_rows],
+            "deleted_recommendation_ids": [row["recommendation_id"] for row in deleted_rows],
+            "strategy_version": strategy_version,
+            "generated_at": generated_at,
+            "count": len(upserted_rows),
+        }
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="replace_priority_recommendations",
+            target_ref=f"kanban_priorities:{scope_id}",
+            item_id="",
+            parent_item_id="",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=_hash_json_payload(audit_metadata),
+            metadata=audit_metadata,
+        )
+        gen = increment_gen(conn, "kanban-priority-recommendations")
+        for row in upserted_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_priority_recommendations",
+                row["recommendation_id"],
+                dict(row),
+                gen,
+            )
+        for row in deleted_rows:
+            enqueue_for_all_peers(
+                conn,
+                "DELETE",
+                "kanban_priority_recommendations",
+                row["recommendation_id"],
+                {},
+                gen,
+            )
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        payload = _work_priority_recommendations_payload(conn, scope_id=scope_id, limit=10)
+        payload["audit"] = {
+            "audit_id": audit_id,
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+        }
+        return payload
 
 
 @router.post("/kanban/items")
