@@ -253,6 +253,12 @@ wheels = [
 ]
 
 [[package]]
+name = "authres"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/29/e28209b5d3d56c102845cca5a4a3abaf2724f79e83476a52b94d775ecce6/authres-1.2.0.tar.gz", hash = "sha256:93d1b995ad7ce21e62db649f361048125dd6022563a0ae8a23909465f1fd25b7", size = 23226, upload-time = "2019-08-03T19:38:00.494Z" }
+
+[[package]]
 name = "base58"
 version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -269,12 +275,17 @@ dependencies = [
     { name = "aiofiles" },
     { name = "aiosqlite" },
     { name = "asyncpg" },
+    { name = "authres" },
+    { name = "dkimpy" },
+    { name = "dnspython" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "mautrix", extra = ["encryption"] },
     { name = "pillow" },
+    { name = "publicsuffix2" },
     { name = "pydantic" },
     { name = "pyseekdb" },
+    { name = "pyspf" },
     { name = "python-multipart" },
     { name = "ruamel-yaml" },
     { name = "uvicorn", extra = ["standard"] },
@@ -293,13 +304,18 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=24.0.0" },
     { name = "aiosqlite", specifier = ">=0.22.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
+    { name = "authres", specifier = ">=1.2.0" },
+    { name = "dkimpy", specifier = ">=1.1.8" },
+    { name = "dnspython", specifier = ">=2.8.0" },
     { name = "fastapi", specifier = "==0.115.6" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28.0" },
     { name = "mautrix", extras = ["encryption"], specifier = "==0.21.0" },
     { name = "pillow", specifier = ">=10.0.0" },
+    { name = "publicsuffix2", specifier = ">=2.20191221" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pyseekdb", specifier = "==1.1.0.post3" },
+    { name = "pyspf", specifier = ">=2.0.14" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
@@ -478,6 +494,24 @@ nvrtc = [
 ]
 nvtx = [
     { name = "nvidia-nvtx", marker = "(python_full_version >= '3.14' and sys_platform == 'linux') or (python_full_version >= '3.14' and sys_platform == 'win32')" },
+]
+
+[[package]]
+name = "dkimpy"
+version = "1.1.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dnspython" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f0/6f/84e91828186bbfcedd7f9385ef5e0d369632444195c20e08951b7ffe0481/dkimpy-1.1.8.tar.gz", hash = "sha256:b5f60fb47bbf5d8d762f134bcea0c388eba6b498342a682a21f1686545094b77", size = 66979, upload-time = "2024-07-04T22:16:38.321Z" }
+
+[[package]]
+name = "dnspython"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/8b/57666417c0f90f08bcafa776861060426765fdb422eb10212086fb811d26/dnspython-2.8.0.tar.gz", hash = "sha256:181d3c6996452cb1189c4046c61599b84a5a86e099562ffde77d26984ff26d0f", size = 368251, upload-time = "2025-09-07T18:58:00.022Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/5a/18ad964b0086c6e62e2e7500f7edc89e3faa45033c71c1893d34eed2b2de/dnspython-2.8.0-py3-none-any.whl", hash = "sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af", size = 331094, upload-time = "2025-09-07T18:57:58.071Z" },
 ]
 
 [[package]]
@@ -1539,6 +1573,15 @@ wheels = [
 ]
 
 [[package]]
+name = "publicsuffix2"
+version = "2.20191221"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/04/1759906c4c5b67b2903f546de234a824d4028ef24eb0b1122daa43376c20/publicsuffix2-2.20191221.tar.gz", hash = "sha256:00f8cc31aa8d0d5592a5ced19cccba7de428ebca985db26ac852d920ddd6fe7b", size = 99592, upload-time = "2019-12-21T11:30:44.863Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/16/053c2945c5e3aebeefb4ccd5c5e7639e38bc30ad1bdc7ce86c6d01707726/publicsuffix2-2.20191221-py2.py3-none-any.whl", hash = "sha256:786b5e36205b88758bd3518725ec8cfe7a8173f5269354641f581c6b80a99893", size = 89033, upload-time = "2019-12-21T11:30:41.744Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1744,6 +1787,12 @@ dependencies = [
 wheels = [
     { url = "https://files.pythonhosted.org/packages/58/6e/2373239ab80c35a17aa14e8219727f06567e91d3b7f1b8c36d28ce94d04b/pyseekdb-1.1.0.post3-py3-none-any.whl", hash = "sha256:0437c9a4de72be44eb24b070b2b8099086467c08af10a57191498a61257a4bfb", size = 110985, upload-time = "2026-02-12T14:19:05.402Z" },
 ]
+
+[[package]]
+name = "pyspf"
+version = "2.0.14"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d4/dc/5b3838ff90474e21fe0914920c53430f73402e07d6598ea228e61b74963e/pyspf-2.0.14.tar.gz", hash = "sha256:57a7ef01bda090173aafb6af0106251686ed73f03db4e911fcd34c57fc347186", size = 69446, upload-time = "2020-01-02T02:54:37.109Z" }
 
 [[package]]
 name = "pytest"

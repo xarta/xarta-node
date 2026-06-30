@@ -24,12 +24,17 @@ from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from io import BytesIO
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import asyncpg
 import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from .pim_email_security import (
+    EmailSecurityUnavailableError,
+    check_email_security_sync,
+)
 
 DEFAULT_MAILBOX_ID = "default"
 DEFAULT_IMAP_PORT = 993
@@ -39,6 +44,7 @@ MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_IMAGE_DIMENSIONS = (1800, 2400)
+MAX_RAW_VIEW_TEXT_CHARS = 200_000
 EMAIL_IMAGE_PROXY_PATH = "/api/v1/personal/email/image-proxy"
 SAFE_INLINE_IMAGE_TYPES = {
     "image/gif",
@@ -227,6 +233,30 @@ class PgEmailStore:
                 );
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_security_checks (
+                    security_check_id TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    folder TEXT NOT NULL,
+                    uid TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    raw_sha256 TEXT NOT NULL,
+                    aggregate_status TEXT NOT NULL,
+                    aggregate_score INTEGER NOT NULL DEFAULT 0,
+                    llm_called BOOLEAN NOT NULL DEFAULT false,
+                    result_json JSONB NOT NULL,
+                    checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (mailbox_id, folder, uid, raw_sha256)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_security_checks_message
+                ON pim_email_security_checks(mailbox_id, folder, uid, checked_at DESC);
+                """
+            )
         finally:
             await conn.close()
 
@@ -324,6 +354,52 @@ class PgEmailStore:
         finally:
             await conn.close()
         return [_mailbox_row_public(row) for row in rows]
+
+    async def record_security_result(self, message: dict[str, Any], *, mailbox_id: str) -> None:
+        security = message.get("security") if isinstance(message, dict) else None
+        if not isinstance(security, dict) or not security.get("available"):
+            raise EmailOperationError(
+                "Email security result is missing and message view is blocked"
+            )
+        await self.ensure_schema()
+        aggregate = security.get("aggregate") if isinstance(security.get("aggregate"), dict) else {}
+        raw_sha256 = str(security.get("raw_sha256") or "")
+        folder = clean_folder_name(str(message.get("folder") or "INBOX"))
+        uid = clean_uid_value(str(message.get("uid") or ""))
+        message_id = str((message.get("headers") or {}).get("message_id") or "")
+        check_id = hashlib.sha256(
+            f"{mailbox_id}\n{folder}\n{uid}\n{raw_sha256}".encode("utf-8")
+        ).hexdigest()
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_security_checks (
+                    security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
+                    aggregate_status, aggregate_score, llm_called, result_json, checked_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
+                ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                    message_id = EXCLUDED.message_id,
+                    aggregate_status = EXCLUDED.aggregate_status,
+                    aggregate_score = EXCLUDED.aggregate_score,
+                    llm_called = EXCLUDED.llm_called,
+                    result_json = EXCLUDED.result_json,
+                    checked_at = now();
+                """,
+                check_id,
+                mailbox_id,
+                folder,
+                uid,
+                message_id,
+                raw_sha256,
+                str(aggregate.get("status") or "amber"),
+                int(aggregate.get("score") or aggregate.get("risk_score") or 0),
+                bool(aggregate.get("llm_called") or (security.get("llm") or {}).get("called")),
+                json.dumps(security, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
 
 
 def _mailbox_row_public(row: Any) -> dict[str, Any]:
@@ -460,7 +536,13 @@ def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str,
     return list_folder_messages_sync(mailbox, folder="INBOX", limit=limit)
 
 
-def fetch_message_sync(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[str, Any]:
+def fetch_message_sync(
+    mailbox: EmailMailbox,
+    *,
+    folder: str,
+    uid: str,
+    security_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     clean_folder = clean_folder_name(folder)
     clean_uid = clean_uid_value(uid)
     client = _connect_imap(mailbox)
@@ -472,7 +554,51 @@ def fetch_message_sync(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[
         raw = _first_fetch_bytes(fetch_data)
         if not raw:
             raise EmailOperationError("IMAP message body was empty")
-        return parse_message(raw, folder=clean_folder, uid=clean_uid)
+        message = parse_message(raw, folder=clean_folder, uid=clean_uid)
+        try:
+            message["security"] = check_email_security_sync(
+                raw,
+                body_text=str((message.get("views") or {}).get("plain") or ""),
+                progress_callback=security_progress_callback,
+            )
+        except EmailSecurityUnavailableError as exc:
+            raise EmailConfigError(
+                "Email security checks are unavailable, so message viewing is blocked"
+            ) from exc
+        return message
+    finally:
+        _logout_imap(client)
+
+
+def fetch_message_security_sync(
+    mailbox: EmailMailbox,
+    *,
+    folder: str,
+    uid: str,
+    security_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    clean_folder = clean_folder_name(folder)
+    clean_uid = clean_uid_value(uid)
+    client = _connect_imap(mailbox)
+    try:
+        _select_imap_folder(client, clean_folder)
+        status, fetch_data = client.uid("fetch", clean_uid, "(RFC822)")
+        if status != "OK":
+            raise EmailOperationError("IMAP message fetch failed")
+        raw = _first_fetch_bytes(fetch_data)
+        if not raw:
+            raise EmailOperationError("IMAP message body was empty")
+        parsed = parse_message(raw, folder=clean_folder, uid=clean_uid)
+        try:
+            return check_email_security_sync(
+                raw,
+                body_text=str((parsed.get("views") or {}).get("plain") or ""),
+                progress_callback=security_progress_callback,
+            )
+        except EmailSecurityUnavailableError as exc:
+            raise EmailConfigError(
+                "Email security checks are unavailable, so message viewing is blocked"
+            ) from exc
     finally:
         _logout_imap(client)
 
@@ -544,6 +670,7 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
             "plain": default_text,
             "html": html_result.html,
             "markdown": markdown,
+            "raw": safe_raw_email_view(raw),
         },
         "html_security": html_result.public_dict(),
         "attachments": _attachment_summaries(msg),
@@ -580,6 +707,93 @@ def _first_text_part(message: Message, subtype: str) -> str:
             payload = message.get_payload(decode=True) or b""
             return payload.decode(message.get_content_charset() or "utf-8", "replace")
     return ""
+
+
+def safe_raw_email_view(raw: bytes) -> str:
+    """Return a raw-message view with attachment and binary payload bodies omitted."""
+    msg = BytesParser(policy=policy.default).parsebytes(bytes(raw or b""))
+    lines: list[str] = []
+    _append_raw_headers(lines, msg)
+    lines.append("")
+    if msg.is_multipart():
+        _append_raw_multipart_payload(lines, msg)
+    else:
+        _append_raw_part_payload(lines, msg)
+    return "\n".join(lines).replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+
+
+def _append_raw_headers(lines: list[str], message: Message) -> None:
+    for name, value in message.raw_items():
+        clean_value = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        value_lines = clean_value.split("\n") or [""]
+        lines.append(f"{name}: {value_lines[0]}")
+        lines.extend(f" {line}" for line in value_lines[1:])
+
+
+def _message_parts(message: Message) -> list[Message]:
+    payload = message.get_payload()
+    return list(payload) if isinstance(payload, list) else []
+
+
+def _append_raw_multipart_payload(lines: list[str], message: Message) -> None:
+    boundary = message.get_boundary() or "xarta-safe-raw-boundary"
+    for part in _message_parts(message):
+        lines.append(f"--{boundary}")
+        _append_raw_headers(lines, part)
+        lines.append("")
+        if part.is_multipart():
+            _append_raw_multipart_payload(lines, part)
+        else:
+            _append_raw_part_payload(lines, part)
+    lines.append(f"--{boundary}--")
+
+
+def _append_raw_part_payload(lines: list[str], part: Message) -> None:
+    if not _raw_view_part_can_show_payload(part):
+        lines.append(_raw_view_omitted_part_marker(part))
+        return
+    payload = part.get_payload(decode=False)
+    if isinstance(payload, bytes):
+        text = payload.decode(part.get_content_charset() or "utf-8", "replace")
+    else:
+        text = str(payload or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > MAX_RAW_VIEW_TEXT_CHARS:
+        text = (
+            text[:MAX_RAW_VIEW_TEXT_CHARS]
+            + f"\n[xarta raw view truncated text part at {MAX_RAW_VIEW_TEXT_CHARS} characters]"
+        )
+    lines.extend(text.split("\n"))
+
+
+def _raw_view_part_can_show_payload(part: Message) -> bool:
+    disposition = (part.get_content_disposition() or "").lower()
+    if disposition == "attachment" or part.get_filename():
+        return False
+    return part.get_content_maintype() == "text"
+
+
+def _raw_view_payload_size(part: Message) -> int:
+    decoded = part.get_payload(decode=True)
+    if decoded is not None:
+        return len(decoded)
+    payload = part.get_payload(decode=False)
+    if isinstance(payload, bytes):
+        return len(payload)
+    return len(str(payload or "").encode("utf-8", "replace"))
+
+
+def _raw_view_omitted_part_marker(part: Message) -> str:
+    filename = _decode_header_value(part.get_filename("") or "")
+    disposition = (part.get_content_disposition() or "").lower() or "inline"
+    fields = [
+        f"content_type={part.get_content_type()}",
+        f"disposition={disposition}",
+        f"bytes={_raw_view_payload_size(part)}",
+    ]
+    if filename:
+        fields.append(f"filename={filename}")
+    return f"[xarta raw view omitted MIME part body: {'; '.join(fields)}]"
 
 
 def _attachment_summaries(message: Message) -> list[dict[str, str]]:
@@ -1063,8 +1277,36 @@ async def list_folder_messages(
     return await asyncio.to_thread(list_folder_messages_sync, mailbox, folder=folder, limit=limit)
 
 
-async def fetch_message(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[str, Any]:
-    return await asyncio.to_thread(fetch_message_sync, mailbox, folder=folder, uid=uid)
+async def fetch_message(
+    mailbox: EmailMailbox,
+    *,
+    folder: str,
+    uid: str,
+    security_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        fetch_message_sync,
+        mailbox,
+        folder=folder,
+        uid=uid,
+        security_progress_callback=security_progress_callback,
+    )
+
+
+async def fetch_message_security(
+    mailbox: EmailMailbox,
+    *,
+    folder: str,
+    uid: str,
+    security_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        fetch_message_security_sync,
+        mailbox,
+        folder=folder,
+        uid=uid,
+        security_progress_callback=security_progress_callback,
+    )
 
 
 def smtp_self_send_sync(mailbox: EmailMailbox, *, recipient: str) -> dict[str, Any]:

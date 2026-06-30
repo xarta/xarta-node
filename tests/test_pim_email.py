@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -10,7 +11,7 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from app import pim_email, routes_pim_email  # noqa: E402
+from app import pim_email, pim_email_security, routes_pim_email  # noqa: E402
 
 
 def _mailbox(password: str = "test-password-123") -> pim_email.EmailMailbox:
@@ -26,6 +27,26 @@ def _mailbox(password: str = "test-password-123") -> pim_email.EmailMailbox:
         smtp_starttls=False,
         password=password,
     )
+
+
+def _security_result(status: str = "green") -> dict:
+    return {
+        "schema": "xarta.pim_email.security_check.v1",
+        "available": True,
+        "raw_sha256": "sha256-test",
+        "aggregate": {
+            "status": status,
+            "score": 0,
+            "risk_score": 0,
+            "summary": "test security result",
+            "llm_called": True,
+        },
+        "llm": {"called": True, "model": "PRIMARY-LOCAL-TEST"},
+        "dkim": {"signature_count": 1},
+        "spf": {"result": "pass"},
+        "dmarc": {"result": "pass"},
+        "findings": [],
+    }
 
 
 def test_password_envelope_is_encrypted_and_authenticated(monkeypatch):
@@ -98,10 +119,42 @@ def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     assert parsed["headers"]["subject"] == "Hello ✓"
     assert parsed["views"]["plain"] == "Plain body"
     assert parsed["views"]["markdown"] == "Plain body"
+    assert "Subject: =?utf-8?q?Hello_=E2=9C=93?=" in parsed["views"]["raw"]
     assert "<script>" not in parsed["views"]["html"]
     assert "<p>HTML body</p>" in parsed["views"]["html"]
     assert parsed["html_security"]["sandbox"] == "srcdoc-no-scripts-no-same-origin"
     assert parsed["html_security"]["image_proxy"] == "same-site-jpeg-transform"
+
+
+def test_parse_message_raw_view_omits_attachment_payloads_but_keeps_security_headers():
+    attachment_payload = b"UEsDBAoAAAAAAGF0dGFjaG1lbnQtYnl0ZXM="
+    raw = (
+        b"Subject: Raw proof\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: user@example.test\r\n"
+        b"Authentication-Results: mx.example.test; dkim=pass header.d=example.test; spf=pass smtp.mailfrom=example.test; dmarc=pass\r\n"
+        b"Received-SPF: pass (example.test: domain designates 203.0.113.8 as permitted sender)\r\n"
+        b"DKIM-Signature: v=1; a=rsa-sha256; d=example.test; s=s1; bh=abc; b=def\r\n"
+        b"Content-Type: multipart/mixed; boundary=outer\r\n\r\n"
+        b"--outer\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Visible body\r\n"
+        b"--outer\r\n"
+        b"Content-Type: application/pdf; name=invoice.pdf\r\n"
+        b"Content-Disposition: attachment; filename=invoice.pdf\r\n"
+        b"Content-Transfer-Encoding: base64\r\n\r\n" + attachment_payload + b"\r\n--outer--\r\n"
+    )
+
+    parsed = pim_email.parse_message(raw, folder="INBOX", uid="99")
+    raw_view = parsed["views"]["raw"]
+
+    assert "Authentication-Results: mx.example.test;" in raw_view
+    assert "Received-SPF: pass" in raw_view
+    assert "DKIM-Signature: v=1;" in raw_view
+    assert "Visible body" in raw_view
+    assert "filename=invoice.pdf" in raw_view
+    assert "omitted MIME part body" in raw_view
+    assert attachment_payload.decode() not in raw_view
 
 
 class FakeIMAP:
@@ -155,6 +208,9 @@ class FakeIMAP:
 
 def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch):
     monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", FakeIMAP)
+    monkeypatch.setattr(
+        pim_email, "check_email_security_sync", lambda *args, **kwargs: _security_result()
+    )
     mailbox = _mailbox()
 
     folders = pim_email.list_folders_sync(mailbox)
@@ -168,6 +224,19 @@ def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch)
     assert [row["folder"] for row in archive] == ["Archive"]
     assert [row["uid"] for row in archive] == ["42"]
     assert message["views"]["plain"] == "Opened body"
+    assert message["security"]["aggregate"]["status"] == "green"
+
+
+def test_message_open_blocks_when_security_service_is_unavailable(monkeypatch):
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", FakeIMAP)
+
+    def offline(*args, **kwargs):
+        raise pim_email.EmailSecurityUnavailableError("security deps missing")
+
+    monkeypatch.setattr(pim_email, "check_email_security_sync", offline)
+
+    with pytest.raises(pim_email.EmailConfigError):
+        pim_email.fetch_message_sync(_mailbox(), folder="INBOX", uid="42")
 
 
 def test_imap_folder_select_quotes_mailbox_names_with_spaces(monkeypatch):
@@ -180,6 +249,9 @@ def test_imap_folder_select_quotes_mailbox_names_with_spaces(monkeypatch):
             return "OK", [b"17"]
 
     monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", SpaceFolderIMAP)
+    monkeypatch.setattr(
+        pim_email, "check_email_security_sync", lambda *args, **kwargs: _security_result()
+    )
     mailbox = _mailbox()
 
     rows = pim_email.list_folder_messages_sync(
@@ -247,6 +319,7 @@ def test_router_exposes_no_delete_or_general_send_capability():
     assert not any(path.endswith("/send") for _, path in routes)
     assert ("GET", "/personal/email/folder-messages") in routes
     assert ("GET", "/personal/email/image-proxy") in routes
+    assert ("GET", "/personal/email/messages/{uid}/security") in routes
     assert ("POST", "/personal/email/smtp-self-test") in routes
 
 
@@ -278,3 +351,114 @@ def test_status_route_reports_disabled_send_delete_capabilities(monkeypatch):
     assert response["capabilities"]["smtp_general_send"] is False
     assert response["capabilities"]["delete"] is False
     assert response["capabilities"]["ai_send"] is False
+    assert response["capabilities"]["security_checks"]["message_view_requires_security"] is True
+
+
+def test_security_service_calls_local_llm_with_json_contract(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", "http://local-email-test.invalid")
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", "LOCAL-EMAIL-TEST")
+    calls = []
+    progress = []
+
+    def fake_llm(payload):
+        calls.append(payload)
+        return json.dumps(
+            {
+                "verdict": "safe",
+                "confidence": 0.8,
+                "risk_score": 4,
+                "scam_traits": [],
+                "rationale": "Routine message shape.",
+                "needs_human_review": False,
+            }
+        )
+
+    raw = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Subject: Hello\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Hello from the test mailbox.\r\n"
+    )
+
+    result = pim_email_security.check_email_security_sync(
+        raw,
+        body_text="Hello from the test mailbox.",
+        llm_client=fake_llm,
+        dns_txt_lookup=lambda name: [],
+        progress_callback=progress.append,
+    )
+
+    assert result["llm"]["called"] is True
+    assert calls, "the local LLM client must be called"
+    assert calls[0]["messages"][1]["content"].startswith("/no-think\n")
+    assert "tools" not in calls[0]
+    assert any(item["code"] == "LLM_SCAM_TRAITS_CLEAR" for item in result["findings"])
+    assert result["progress"]["schema"] == pim_email_security.SECURITY_PROGRESS_SCHEMA
+    assert [segment["id"] for segment in result["progress"]["segments"]] == [
+        "service",
+        "parse",
+        "authres_provider",
+        "dkim_crypto",
+        "spf_protocol",
+        "dmarc_policy",
+        "llm_input",
+        "llm_json",
+        "llm_judgement",
+        "aggregate",
+    ]
+    assert {item["stage_id"] for item in progress} >= {
+        "service",
+        "parse",
+        "authres_provider",
+        "dkim_crypto",
+        "spf_protocol",
+        "dmarc_policy",
+        "llm_input",
+        "llm_json",
+        "llm_judgement",
+        "aggregate",
+    }
+    assert progress[-1]["stage_id"] == "aggregate"
+    assert progress[-1]["segments"][-1]["tone"] == result["aggregate"]["status"]
+
+
+def test_security_service_gates_invalid_llm_json_as_suspicious(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", "http://local-email-test.invalid")
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", "LOCAL-EMAIL-TEST")
+    raw = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Subject: Bad JSON proof\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Plain body\r\n"
+    )
+
+    result = pim_email_security.check_email_security_sync(
+        raw,
+        body_text="Plain body",
+        llm_client=lambda payload: "I refuse to return JSON",
+        dns_txt_lookup=lambda name: [],
+    )
+
+    codes = {item["code"] for item in result["findings"]}
+    assert "LLM_JSON_INVALID" in codes
+    assert result["aggregate"]["status"] == "red"
+    assert result["llm"]["called"] is True
+
+
+def test_spf_source_ip_uses_newest_public_received_hop_for_srs_forwarding():
+    headers = [
+        (
+            "from mout.kundenserver.de ([217.72.192.73]) by mx.kundenserver.de "
+            "(mxeue003 [212.227.15.41]) with ESMTPS for <user@example.test>"
+        ),
+        (
+            "from c132-110.smtp-out.eu-west-2.amazonses.com ([76.223.132.110]) "
+            "by mx.kundenserver.de (mxeue101 [217.72.192.67]) with ESMTPS"
+        ),
+    ]
+
+    source = pim_email_security._extract_source_ip(headers)
+
+    assert source == {"ip": "217.72.192.73", "helo": "mout.kundenserver.de"}
