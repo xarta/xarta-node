@@ -1,8 +1,10 @@
 import asyncio
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
@@ -39,22 +41,44 @@ def test_password_envelope_is_encrypted_and_authenticated(monkeypatch):
         pim_email.decrypt_password(tampered)
 
 
-def test_email_html_sanitizer_removes_active_and_remote_content():
-    sanitized = pim_email.sanitize_email_html(
+def test_email_html_sanitizer_removes_active_and_proxies_remote_content(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_API_SECRET", "test-secret")
+    result = pim_email.sanitize_email_html_with_report(
         """
         <div onclick="steal()">Hello<script>alert(1)</script>
         <img src="https://tracker.example/pixel.png">
+        <img src="cid:hero-image" alt="Hero">
         <a href="javascript:alert(1)">bad</a>
         <a href="https://example.test/page" style="color:red">good</a></div>
-        """
+        """,
+        inline_images={"hero-image": "data:image/jpeg;base64,abc"},
     )
+    sanitized = result.html
 
     assert "script" not in sanitized.lower()
     assert "onclick" not in sanitized.lower()
-    assert "tracker.example" not in sanitized
     assert "javascript:" not in sanitized.lower()
+    assert 'src="/api/v1/personal/email/image-proxy?' in sanitized
+    assert 'class="email-image-original" href="https://tracker.example/pixel.png"' in sanitized
+    assert '<img src="data:image/jpeg;base64,abc" alt="Hero">' in sanitized
     assert 'href="https://example.test/page"' in sanitized
     assert "rel=" in sanitized
+    assert result.remote_images_proxied == 1
+    assert result.remote_images_blocked == 0
+    assert result.tracking_images_blocked == 1
+    assert result.inline_images_rendered == 1
+    assert result.active_content_blocked == 1
+    assert result.unsafe_links_blocked == 1
+
+
+def test_image_transform_reencodes_inline_images_to_jpeg():
+    source = BytesIO()
+    Image.new("RGBA", (1, 1), (255, 0, 0, 128)).save(source, format="PNG")
+
+    jpeg = pim_email.transform_image_to_jpeg(source.getvalue())
+
+    assert jpeg.startswith(b"\xff\xd8\xff")
+    assert len(jpeg) > 20
 
 
 def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
@@ -76,6 +100,8 @@ def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     assert parsed["views"]["markdown"] == "Plain body"
     assert "<script>" not in parsed["views"]["html"]
     assert "<p>HTML body</p>" in parsed["views"]["html"]
+    assert parsed["html_security"]["sandbox"] == "srcdoc-no-scripts-no-same-origin"
+    assert parsed["html_security"]["image_proxy"] == "same-site-jpeg-transform"
 
 
 class FakeIMAP:
@@ -133,11 +159,14 @@ def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch)
 
     folders = pim_email.list_folders_sync(mailbox)
     inbox = pim_email.list_inbox_sync(mailbox, limit=2)
+    archive = pim_email.list_folder_messages_sync(mailbox, folder="Archive", limit=1)
     message = pim_email.fetch_message_sync(mailbox, folder="INBOX", uid="42")
 
     assert [folder["name"] for folder in folders] == ["INBOX", "Archive"]
     assert [row["uid"] for row in inbox] == ["42", "41"]
     assert inbox[0]["subject"] == "Message 42"
+    assert [row["folder"] for row in archive] == ["Archive"]
+    assert [row["uid"] for row in archive] == ["42"]
     assert message["views"]["plain"] == "Opened body"
 
 
@@ -179,11 +208,27 @@ def test_smtp_self_send_gate_rejects_all_other_recipients(monkeypatch):
 
 
 def test_router_exposes_no_delete_or_general_send_capability():
-    routes = {(next(iter(route.methods)), route.path) for route in routes_pim_email.router.routes}
+    routes = {
+        (method, route.path)
+        for route in routes_pim_email.router.routes
+        for method in getattr(route, "methods", set())
+    }
 
     assert not any(method == "DELETE" for method, _ in routes)
     assert not any(path.endswith("/send") for _, path in routes)
+    assert ("GET", "/personal/email/folder-messages") in routes
+    assert ("GET", "/personal/email/image-proxy") in routes
     assert ("POST", "/personal/email/smtp-self-test") in routes
+
+
+def test_email_image_proxy_signature_is_required(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_API_SECRET", "test-secret")
+    source = "https://images.example.test/banner.png?track=1"
+
+    signature = pim_email.sign_email_image_url(source)
+
+    assert pim_email.verify_email_image_signature(source, signature)
+    assert not pim_email.verify_email_image_signature(source, "bad")
 
 
 def test_status_route_reports_disabled_send_delete_capabilities(monkeypatch):
