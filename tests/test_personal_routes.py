@@ -386,6 +386,27 @@ def _make_conn() -> sqlite3.Connection:
             created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
             updated_at TEXT DEFAULT '2026-06-18T10:00:00Z'
         );
+        CREATE TABLE kanban_priority_recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL DEFAULT 'kanban',
+            rank INTEGER NOT NULL DEFAULT 0,
+            item_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            priority_id TEXT NOT NULL DEFAULT 'medium',
+            state_id TEXT NOT NULL DEFAULT '',
+            score REAL NOT NULL DEFAULT 0,
+            strategy_version TEXT NOT NULL DEFAULT 'skill-managed-v1',
+            source_surface TEXT NOT NULL DEFAULT '',
+            source_hash TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            generated_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            updated_at TEXT DEFAULT '2026-06-18T10:00:00Z',
+            UNIQUE(scope_id, rank)
+        );
         CREATE TABLE kanban_item_links (
             link_id TEXT PRIMARY KEY,
             source_item_id TEXT NOT NULL,
@@ -3074,6 +3095,8 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert routes_sync._pk_for_table("kanban_agent_hints") == "hint_id"
     assert "kanban_agent_sessions" in routes_sync._ALLOWED_TABLES
     assert routes_sync._pk_for_table("kanban_agent_sessions") == "session_id"
+    assert "kanban_priority_recommendations" in routes_sync._ALLOWED_TABLES
+    assert routes_sync._pk_for_table("kanban_priority_recommendations") == "recommendation_id"
 
     created = asyncio.run(
         routes_personal.create_work_item(
@@ -3101,6 +3124,43 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert root["body_excerpt"] == "Root board proof\n\nSecond paragraph"
     assert root["search"]["metadata"]["vector"]["turbo_vec_ready"] is True
     assert root["vector"]["index_key"] == "kanban_items:work-root"
+
+    empty_priorities = asyncio.run(routes_personal.get_work_priorities())
+    assert empty_priorities["source"] == "empty"
+    assert empty_priorities["scope_id"] == "kanban"
+    assert empty_priorities["recommendations"] == []
+
+    saved_priorities = asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[
+                    routes_personal.WorkPriorityRecommendationInput(
+                        item_id="work-root",
+                        title="Board priority proof",
+                        summary="Use managed recommendations only.",
+                        reason="Priority recommendations are skill/profile-managed, not computed as a substitute manager decision.",
+                        score=98.0,
+                        metadata={"proof": "pytest"},
+                    )
+                ],
+                strategy_version="codex-skill-managed-test-v1",
+                generated_at="2026-06-18T10:15:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="priority-replace",
+            ),
+        )
+    )
+    assert saved_priorities["source"] == "managed"
+    assert saved_priorities["scope_id"] == "kanban"
+    assert saved_priorities["count"] == 1
+    assert saved_priorities["recommendations"][0]["canonical_code"] == (
+        "xarta-kanban:item:work-root"
+    )
+    assert saved_priorities["recommendations"][0]["metadata"] == {"proof": "pytest"}
+    root_detail_after_priorities = asyncio.run(routes_personal.get_work_item_detail("work-root"))
+    assert "priorities" not in root_detail_after_priorities
+    assert "priorities" not in root_detail_after_priorities["counts"]
 
     board = asyncio.run(routes_personal.get_work_root_board())
     todo_column = next(
@@ -3827,6 +3887,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "create_work_discussion",
         "update_work_discussion",
         "delete_work_discussion",
+        "replace_priority_recommendations",
     }.issubset(audit_actions)
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
@@ -3837,6 +3898,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "kanban_blockers",
         "kanban_discussions",
         "kanban_audit_log",
+        "kanban_priority_recommendations",
     }.issubset(sync_tables)
 
 

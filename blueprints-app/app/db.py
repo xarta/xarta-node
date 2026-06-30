@@ -729,6 +729,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kanban_item_order_edges_unique
 CREATE INDEX IF NOT EXISTS idx_kanban_item_order_edges_lane
     ON kanban_item_order_edges(parent_item_id, state_id, priority_id);
 
+CREATE TABLE IF NOT EXISTS kanban_priority_recommendations (
+    recommendation_id TEXT PRIMARY KEY,
+    scope_id          TEXT NOT NULL DEFAULT 'kanban',
+    rank              INTEGER NOT NULL DEFAULT 0,
+    item_id           TEXT NOT NULL,
+    title             TEXT NOT NULL DEFAULT '',
+    summary           TEXT NOT NULL DEFAULT '',
+    reason            TEXT NOT NULL DEFAULT '',
+    priority_id       TEXT NOT NULL DEFAULT 'medium',
+    state_id          TEXT NOT NULL DEFAULT '',
+    score             REAL NOT NULL DEFAULT 0,
+    strategy_version  TEXT NOT NULL DEFAULT 'skill-managed-v1',
+    source_surface    TEXT NOT NULL DEFAULT '',
+    source_hash       TEXT NOT NULL DEFAULT '',
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    provenance_json   TEXT NOT NULL DEFAULT '{}',
+    generated_at      TEXT NOT NULL DEFAULT '',
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now')),
+    UNIQUE(scope_id, rank)
+);
+CREATE INDEX IF NOT EXISTS idx_kanban_priority_recommendations_item
+    ON kanban_priority_recommendations(item_id, updated_at);
+
 CREATE TABLE IF NOT EXISTS kanban_item_links (
     link_id        TEXT PRIMARY KEY,
     source_item_id TEXT NOT NULL,
@@ -1819,6 +1843,76 @@ def _copy_then_drop_table(conn: sqlite3.Connection, old_table: str, new_table: s
     log.info("migration: renamed %s into %s", old_table, new_table)
 
 
+def _migrate_kanban_priority_recommendations_scope(conn: sqlite3.Connection) -> None:
+    table = "kanban_priority_recommendations"
+    if not _table_exists(conn, table):
+        return
+    cols = set(_table_columns(conn, table))
+    if "scope_id" in cols or "root_item_id" not in cols:
+        return
+
+    old_table = "_kanban_priority_recommendations_root_item_old"
+    conn.execute(f"DROP TABLE IF EXISTS {old_table}")
+    conn.execute(f"ALTER TABLE {table} RENAME TO {old_table}")
+    conn.execute(
+        """
+        CREATE TABLE kanban_priority_recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            scope_id          TEXT NOT NULL DEFAULT 'kanban',
+            rank              INTEGER NOT NULL DEFAULT 0,
+            item_id           TEXT NOT NULL,
+            title             TEXT NOT NULL DEFAULT '',
+            summary           TEXT NOT NULL DEFAULT '',
+            reason            TEXT NOT NULL DEFAULT '',
+            priority_id       TEXT NOT NULL DEFAULT 'medium',
+            state_id          TEXT NOT NULL DEFAULT '',
+            score             REAL NOT NULL DEFAULT 0,
+            strategy_version  TEXT NOT NULL DEFAULT 'skill-managed-v1',
+            source_surface    TEXT NOT NULL DEFAULT '',
+            source_hash       TEXT NOT NULL DEFAULT '',
+            metadata_json     TEXT NOT NULL DEFAULT '{}',
+            provenance_json   TEXT NOT NULL DEFAULT '{}',
+            generated_at      TEXT NOT NULL DEFAULT '',
+            created_at        TEXT DEFAULT (datetime('now')),
+            updated_at        TEXT DEFAULT (datetime('now')),
+            UNIQUE(scope_id, rank)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO {table} (
+            recommendation_id, scope_id, rank, item_id, title, summary, reason,
+            priority_id, state_id, score, strategy_version, source_surface,
+            source_hash, metadata_json, provenance_json, generated_at,
+            created_at, updated_at
+        )
+        SELECT
+            recommendation_id,
+            COALESCE(NULLIF(root_item_id, ''), 'kanban'),
+            rank,
+            item_id,
+            title,
+            summary,
+            reason,
+            priority_id,
+            state_id,
+            score,
+            strategy_version,
+            source_surface,
+            source_hash,
+            metadata_json,
+            provenance_json,
+            generated_at,
+            created_at,
+            updated_at
+        FROM {old_table}
+        """
+    )
+    conn.execute(f"DROP TABLE {old_table}")
+    log.info("migration: rebuilt kanban_priority_recommendations with scope_id")
+
+
 def _load_json_dict(value: str | None) -> dict[str, object]:
     if not value:
         return {}
@@ -2393,6 +2487,32 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_priority_recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            scope_id          TEXT NOT NULL DEFAULT 'kanban',
+            rank              INTEGER NOT NULL DEFAULT 0,
+            item_id           TEXT NOT NULL,
+            title             TEXT NOT NULL DEFAULT '',
+            summary           TEXT NOT NULL DEFAULT '',
+            reason            TEXT NOT NULL DEFAULT '',
+            priority_id       TEXT NOT NULL DEFAULT 'medium',
+            state_id          TEXT NOT NULL DEFAULT '',
+            score             REAL NOT NULL DEFAULT 0,
+            strategy_version  TEXT NOT NULL DEFAULT 'skill-managed-v1',
+            source_surface    TEXT NOT NULL DEFAULT '',
+            source_hash       TEXT NOT NULL DEFAULT '',
+            metadata_json     TEXT NOT NULL DEFAULT '{}',
+            provenance_json   TEXT NOT NULL DEFAULT '{}',
+            generated_at      TEXT NOT NULL DEFAULT '',
+            created_at        TEXT DEFAULT (datetime('now')),
+            updated_at        TEXT DEFAULT (datetime('now')),
+            UNIQUE(scope_id, rank)
+        )
+        """
+    )
+    _migrate_kanban_priority_recommendations_scope(conn)
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_marker "
         "ON kanban_review_processor_failure_events(marker_id, source_hash, failed_at)"
     )
@@ -2403,6 +2523,14 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_kanban_review_processor_failure_events_item "
         "ON kanban_review_processor_failure_events(item_id, processor_kind, failed_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_priority_recommendations_scope "
+        "ON kanban_priority_recommendations(scope_id, rank)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kanban_priority_recommendations_item "
+        "ON kanban_priority_recommendations(item_id, updated_at)"
     )
 
 
