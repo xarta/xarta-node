@@ -92,6 +92,27 @@ def test_email_html_sanitizer_removes_active_and_proxies_remote_content(monkeypa
     assert result.unsafe_links_blocked == 1
 
 
+def test_html_to_text_skips_inserted_image_original_helpers_and_compacts_gaps():
+    text = pim_email.html_to_text(
+        """
+        <p>Intro</p>
+        <span class="email-image-wrap">
+          <img src="/api/v1/personal/email/image-proxy?source=x" alt="">
+          <a class="email-image-original" href="https://example.test/image.png">original</a>
+        </span>
+
+
+        <div>
+          Useful body
+        </div>
+        <p>Done</p>
+        """
+    )
+
+    assert text == "Intro\n\nUseful body\n\nDone"
+    assert "original" not in text
+
+
 def test_image_transform_reencodes_inline_images_to_jpeg():
     source = BytesIO()
     Image.new("RGBA", (1, 1), (255, 0, 0, 128)).save(source, format="PNG")
