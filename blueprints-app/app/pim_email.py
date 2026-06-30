@@ -1232,16 +1232,31 @@ class _HtmlTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self.skip_text_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "li":
+        tag = tag.lower()
+        if self.skip_text_depth:
+            self.skip_text_depth += 1
+            return
+        attrs_by_name = {str(name or "").lower(): str(value or "") for name, value in attrs}
+        class_names = set(attrs_by_name.get("class", "").lower().split())
+        if tag == "a" and "email-image-original" in class_names:
+            self.skip_text_depth = 1
+            return
+        if tag == "li":
             self.parts.append("\n- ")
 
     def handle_endtag(self, tag: str) -> None:
+        if self.skip_text_depth:
+            self.skip_text_depth -= 1
+            return
         if tag.lower() in self.block_tags:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
+        if self.skip_text_depth:
+            return
         self.parts.append(data)
 
 
@@ -1251,6 +1266,7 @@ def html_to_text(value: str) -> str:
     parser.close()
     text = "".join(parser.parts)
     text = re.sub(r"[ \t]+", " ", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
