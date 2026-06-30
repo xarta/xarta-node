@@ -429,9 +429,7 @@ def list_folder_messages_sync(
     safe_limit = max(1, min(int(limit), 100))
     client = _connect_imap(mailbox)
     try:
-        status, _ = client.select(clean_folder, readonly=True)
-        if status != "OK":
-            raise EmailOperationError("IMAP folder select failed")
+        _select_imap_folder(client, clean_folder)
         status, search_data = client.uid("search", None, "ALL")
         if status != "OK" or not search_data:
             raise EmailOperationError("IMAP folder search failed")
@@ -467,9 +465,7 @@ def fetch_message_sync(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[
     clean_uid = clean_uid_value(uid)
     client = _connect_imap(mailbox)
     try:
-        status, _ = client.select(clean_folder, readonly=True)
-        if status != "OK":
-            raise EmailOperationError("IMAP folder select failed")
+        _select_imap_folder(client, clean_folder)
         status, fetch_data = client.uid("fetch", clean_uid, "(RFC822)")
         if status != "OK":
             raise EmailOperationError("IMAP message fetch failed")
@@ -486,6 +482,23 @@ def clean_folder_name(value: str) -> str:
     if len(clean) > 180 or any(ch in clean for ch in ("\r", "\n", "\x00")):
         raise EmailOperationError("Invalid IMAP folder name")
     return clean
+
+
+def _imap_mailbox_select_arg(folder: str) -> str:
+    clean = clean_folder_name(folder)
+    if re.fullmatch(r"[A-Za-z0-9._/-]+", clean):
+        return clean
+    escaped = clean.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _select_imap_folder(client: imaplib.IMAP4, folder: str) -> None:
+    try:
+        status, _ = client.select(_imap_mailbox_select_arg(folder), readonly=True)
+    except imaplib.IMAP4.error as exc:
+        raise EmailOperationError("IMAP folder select failed") from exc
+    if status != "OK":
+        raise EmailOperationError("IMAP folder select failed")
 
 
 def clean_uid_value(value: str) -> str:
