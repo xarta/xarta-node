@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from .pim_email import (
@@ -13,9 +13,12 @@ from .pim_email import (
     EmailOperationError,
     PgEmailStore,
     fetch_message,
+    fetch_remote_image_as_jpeg,
+    list_folder_messages,
     list_folders,
     list_inbox,
     smtp_self_send,
+    verify_email_image_signature,
 )
 
 router = APIRouter(prefix="/personal/email", tags=["personal-email"])
@@ -93,6 +96,26 @@ async def email_inbox(
         raise _http_error(exc) from exc
 
 
+@router.get("/folder-messages")
+async def email_folder_messages(
+    folder: str = Query("INBOX", min_length=1, max_length=180),
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(25, ge=1, le=100),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(mailbox_id)
+        messages = await list_folder_messages(mailbox, folder=folder, limit=limit)
+        return {
+            "ok": True,
+            "mailbox": mailbox.public_dict(),
+            "folder": folder,
+            "messages": messages,
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/messages/{uid}")
 async def email_message(
     uid: str,
@@ -106,6 +129,27 @@ async def email_message(
         return {"ok": True, "mailbox": mailbox.public_dict(), "message": message}
     except Exception as exc:
         raise _http_error(exc) from exc
+
+
+@router.get("/image-proxy")
+async def email_image_proxy(
+    src: str = Query(..., min_length=8, max_length=4096),
+    sig: str = Query(..., min_length=32, max_length=128),
+) -> Response:
+    if not verify_email_image_signature(src, sig):
+        raise HTTPException(status_code=403, detail="image proxy signature is invalid")
+    try:
+        jpeg = await fetch_remote_image_as_jpeg(src)
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "private, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except EmailOperationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/smtp-self-test")

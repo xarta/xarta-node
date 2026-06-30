@@ -8,11 +8,13 @@ import hashlib
 import hmac
 import html
 import imaplib
+import ipaddress
 import json
 import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,14 +23,31 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from html.parser import HTMLParser
+from io import BytesIO
 from typing import Any
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import asyncpg
+import httpx
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 DEFAULT_MAILBOX_ID = "default"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_SMTP_PORT = 465
 ENVELOPE_PURPOSE = b"xarta-pim-email-password-v1"
+MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_PIXELS = 12_000_000
+MAX_IMAGE_DIMENSIONS = (1800, 2400)
+EMAIL_IMAGE_PROXY_PATH = "/api/v1/personal/email/image-proxy"
+SAFE_INLINE_IMAGE_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 class EmailConfigError(RuntimeError):
@@ -71,6 +90,33 @@ class EmailMailbox:
                 "ssl": self.smtp_ssl,
                 "starttls": self.smtp_starttls,
             },
+        }
+
+
+@dataclass
+class EmailHtmlSanitizeResult:
+    html: str
+    remote_images_blocked: int = 0
+    remote_images_proxied: int = 0
+    tracking_images_blocked: int = 0
+    inline_images_rendered: int = 0
+    inline_images_blocked: int = 0
+    active_content_blocked: int = 0
+    unsafe_links_blocked: int = 0
+    allowed_links: int = 0
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "remote_images_blocked": self.remote_images_blocked,
+            "remote_images_proxied": self.remote_images_proxied,
+            "tracking_images_blocked": self.tracking_images_blocked,
+            "inline_images_rendered": self.inline_images_rendered,
+            "inline_images_blocked": self.inline_images_blocked,
+            "active_content_blocked": self.active_content_blocked,
+            "unsafe_links_blocked": self.unsafe_links_blocked,
+            "allowed_links": self.allowed_links,
+            "image_proxy": "same-site-jpeg-transform",
+            "sandbox": "srcdoc-no-scripts-no-same-origin",
         }
 
 
@@ -376,16 +422,19 @@ def list_folders_sync(mailbox: EmailMailbox) -> list[dict[str, Any]]:
         _logout_imap(client)
 
 
-def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str, Any]]:
+def list_folder_messages_sync(
+    mailbox: EmailMailbox, *, folder: str = "INBOX", limit: int = 25
+) -> list[dict[str, Any]]:
+    clean_folder = clean_folder_name(folder)
     safe_limit = max(1, min(int(limit), 100))
     client = _connect_imap(mailbox)
     try:
-        status, _ = client.select("INBOX", readonly=True)
+        status, _ = client.select(clean_folder, readonly=True)
         if status != "OK":
-            raise EmailOperationError("IMAP INBOX select failed")
+            raise EmailOperationError("IMAP folder select failed")
         status, search_data = client.uid("search", None, "ALL")
         if status != "OK" or not search_data:
-            raise EmailOperationError("IMAP INBOX search failed")
+            raise EmailOperationError("IMAP folder search failed")
         uids = search_data[0].split()[-safe_limit:]
         messages: list[dict[str, Any]] = []
         for uid in reversed(uids):
@@ -397,7 +446,7 @@ def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str,
             messages.append(
                 {
                     "uid": uid.decode("ascii", "replace"),
-                    "folder": "INBOX",
+                    "folder": clean_folder,
                     "subject": _decode_header_value(msg.get("subject", "")),
                     "from": _decode_header_value(msg.get("from", "")),
                     "date": _decode_header_value(msg.get("date", "")),
@@ -407,6 +456,10 @@ def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str,
         return messages
     finally:
         _logout_imap(client)
+
+
+def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str, Any]]:
+    return list_folder_messages_sync(mailbox, folder="INBOX", limit=limit)
 
 
 def fetch_message_sync(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[str, Any]:
@@ -457,8 +510,12 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     plain = _first_text_part(msg, "plain")
     raw_html = _first_text_part(msg, "html")
-    sanitized_html = sanitize_email_html(raw_html) if raw_html else ""
-    default_text = plain.strip() if plain.strip() else html_to_text(sanitized_html)
+    html_result = (
+        sanitize_email_html_with_report(raw_html, inline_images=_inline_image_sources(msg))
+        if raw_html
+        else EmailHtmlSanitizeResult("")
+    )
+    default_text = plain.strip() if plain.strip() else html_to_text(html_result.html)
     markdown = text_to_markdown(default_text)
     return {
         "uid": uid,
@@ -472,9 +529,10 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
         },
         "views": {
             "plain": default_text,
-            "html": sanitized_html,
+            "html": html_result.html,
             "markdown": markdown,
         },
+        "html_security": html_result.public_dict(),
         "attachments": _attachment_summaries(msg),
     }
 
@@ -526,6 +584,191 @@ def _attachment_summaries(message: Message) -> list[dict[str, str]]:
     return attachments
 
 
+def _normalize_cid(value: str | None) -> str:
+    clean = str(value or "").strip().strip("<>").strip()
+    if clean.lower().startswith("cid:"):
+        clean = clean[4:]
+    return unquote(clean).strip().lower()
+
+
+def _inline_image_sources(message: Message) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        if part.is_multipart() or part.get_content_maintype() != "image":
+            continue
+        content_type = str(part.get_content_type() or "").lower()
+        if content_type not in SAFE_INLINE_IMAGE_TYPES:
+            continue
+        cid = _normalize_cid(part.get("content-id", ""))
+        if not cid:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if not payload or len(payload) > MAX_INLINE_IMAGE_BYTES:
+            continue
+        try:
+            jpeg = transform_image_to_jpeg(payload)
+        except EmailOperationError:
+            continue
+        sources[cid] = f"data:image/jpeg;base64,{base64.b64encode(jpeg).decode('ascii')}"
+    return sources
+
+
+def _image_proxy_secret() -> bytes:
+    secret = (
+        os.environ.get("BLUEPRINTS_EMAIL_IMAGE_PROXY_SECRET", "")
+        or os.environ.get("BLUEPRINTS_API_SECRET", "")
+        or os.environ.get("BLUEPRINTS_SYNC_SECRET", "")
+    ).strip()
+    return secret.encode("utf-8")
+
+
+def _canonical_remote_image_url(source: str) -> str:
+    clean = str(source or "").strip()
+    if not clean or len(clean) > 4096 or re.search(r"[\x00-\x20]", clean):
+        return ""
+    if clean.startswith("//"):
+        clean = f"https:{clean}"
+    parsed = urlparse(clean)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if parsed.username or parsed.password or not parsed.hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if port and port not in {80, 443}:
+        return ""
+    try:
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return ""
+    scheme = parsed.scheme.lower()
+    netloc = host
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+    path = parsed.path or "/"
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+def sign_email_image_url(source: str) -> str:
+    canonical = _canonical_remote_image_url(source)
+    secret = _image_proxy_secret()
+    if not canonical or not secret:
+        return ""
+    return hmac.new(secret, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_email_image_signature(source: str, signature: str) -> bool:
+    expected = sign_email_image_url(source)
+    clean = str(signature or "").strip()
+    return bool(expected and clean and hmac.compare_digest(expected, clean))
+
+
+def email_image_proxy_path(source: str) -> str:
+    canonical = _canonical_remote_image_url(source)
+    signature = sign_email_image_url(canonical)
+    if not canonical or not signature:
+        return ""
+    return f"{EMAIL_IMAGE_PROXY_PATH}?src={quote(canonical, safe='')}&sig={signature}"
+
+
+def _blocked_proxy_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+def _assert_public_remote_image_url(source: str) -> str:
+    canonical = _canonical_remote_image_url(source)
+    if not canonical:
+        raise EmailOperationError("image URL is not an allowed http(s) URL")
+    parsed = urlparse(canonical)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise EmailOperationError("image host could not be resolved") from exc
+    resolved = {item[4][0] for item in addresses}
+    if not resolved or any(_blocked_proxy_ip(address) for address in resolved):
+        raise EmailOperationError("image host resolved to a private or unsafe address")
+    return canonical
+
+
+def transform_image_to_jpeg(content: bytes) -> bytes:
+    if not content or len(content) > MAX_REMOTE_IMAGE_BYTES:
+        raise EmailOperationError("image payload is empty or too large")
+    try:
+        with Image.open(BytesIO(content)) as opened:
+            opened.seek(0)
+            image = ImageOps.exif_transpose(opened)
+            if image.mode in {"RGBA", "LA", "P"}:
+                rgba = image.convert("RGBA")
+                flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+                flattened.paste(rgba, mask=rgba.getchannel("A"))
+                image = flattened
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            image.thumbnail(MAX_IMAGE_DIMENSIONS, Image.Resampling.LANCZOS)
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=85, optimize=True, progressive=True)
+            return output.getvalue()
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError) as exc:
+        raise EmailOperationError("image could not be decoded safely") from exc
+
+
+def fetch_remote_image_as_jpeg_sync(source: str) -> bytes:
+    current = _assert_public_remote_image_url(source)
+    headers = {
+        "Accept": "image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8",
+        "User-Agent": "BlueprintsEmailImageProxy/1.0",
+    }
+    with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+        for _ in range(4):
+            current = _assert_public_remote_image_url(current)
+            with client.stream("GET", current, headers=headers) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location", "").strip()
+                    if not location:
+                        raise EmailOperationError("image redirect was missing a location")
+                    current = urljoin(current, location)
+                    continue
+                if response.status_code >= 400:
+                    raise EmailOperationError(
+                        f"image fetch failed with HTTP {response.status_code}"
+                    )
+                content_type = (
+                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                )
+                if content_type and not content_type.startswith("image/"):
+                    raise EmailOperationError("image fetch did not return an image")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_REMOTE_IMAGE_BYTES:
+                        raise EmailOperationError("image payload is too large")
+                    chunks.append(chunk)
+                return transform_image_to_jpeg(b"".join(chunks))
+        raise EmailOperationError("image redirect chain is too long")
+
+
+async def fetch_remote_image_as_jpeg(source: str) -> bytes:
+    return await asyncio.to_thread(fetch_remote_image_as_jpeg_sync, source)
+
+
 class _SafeHtmlParser(HTMLParser):
     allowed_tags = {
         "a",
@@ -556,20 +799,34 @@ class _SafeHtmlParser(HTMLParser):
         "tr",
         "th",
         "td",
+        "img",
     }
     skip_tags = {"script", "style", "iframe", "object", "embed", "svg", "math"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, inline_images: dict[str, str] | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.skip_depth = 0
+        self.inline_images = inline_images or {}
+        self.remote_images_blocked = 0
+        self.remote_images_proxied = 0
+        self.tracking_images_blocked = 0
+        self.inline_images_rendered = 0
+        self.inline_images_blocked = 0
+        self.active_content_blocked = 0
+        self.unsafe_links_blocked = 0
+        self.allowed_links = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         if tag in self.skip_tags:
             self.skip_depth += 1
+            self.active_content_blocked += 1
             return
         if self.skip_depth or tag not in self.allowed_tags:
+            return
+        if tag == "img":
+            self._append_img(attrs)
             return
         safe_attrs = self._safe_attrs(tag, attrs)
         attr_text = "".join(
@@ -582,7 +839,7 @@ class _SafeHtmlParser(HTMLParser):
         if tag in self.skip_tags and self.skip_depth:
             self.skip_depth -= 1
             return
-        if self.skip_depth or tag not in self.allowed_tags or tag == "br":
+        if self.skip_depth or tag not in self.allowed_tags or tag in {"br", "img"}:
             return
         self.parts.append(f"</{tag}>")
 
@@ -612,17 +869,134 @@ class _SafeHtmlParser(HTMLParser):
                     safe.append(("href", clean_value.strip()))
                     safe.append(("rel", "noreferrer noopener"))
                     safe.append(("target", "_blank"))
+                    self.allowed_links += 1
+                else:
+                    self.unsafe_links_blocked += 1
                 continue
             if clean_name in {"title", "colspan", "rowspan"}:
                 safe.append((clean_name, clean_value[:160]))
         return safe
 
+    def _append_img(self, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_by_name = {str(name or "").lower(): str(value or "") for name, value in attrs}
+        source = attrs_by_name.get("src", "").strip()
+        alt = attrs_by_name.get("alt", "").strip()[:160]
+        title = attrs_by_name.get("title", "").strip()[:160]
+        original = _canonical_remote_image_url(source)
+        safe_source = self._safe_image_source(source, attrs_by_name)
+        if not safe_source:
+            label = alt or "Remote image blocked"
+            self.parts.append(
+                '<span class="email-image-blocked" title="Remote image blocked">'
+                f"{html.escape(label, quote=False)}</span>"
+            )
+            return
+        safe_attrs: list[tuple[str, str]] = [("src", safe_source), ("alt", alt)]
+        if title:
+            safe_attrs.append(("title", title))
+        for dim in ("width", "height"):
+            value = attrs_by_name.get(dim, "").strip()
+            if re.fullmatch(r"[0-9]{1,4}", value):
+                safe_attrs.append((dim, value))
+        attr_text = "".join(
+            f' {name}="{html.escape(value, quote=True)}"' for name, value in safe_attrs
+        )
+        image_html = f"<img{attr_text}>"
+        if original:
+            self.parts.append(
+                '<span class="email-image-wrap">'
+                f"{image_html}"
+                f'<a class="email-image-original" href="{html.escape(original, quote=True)}" '
+                'rel="noreferrer noopener">original</a>'
+                "</span>"
+            )
+        else:
+            self.parts.append(image_html)
 
-def sanitize_email_html(value: str) -> str:
-    parser = _SafeHtmlParser()
+    def _safe_image_source(self, source: str, attrs: dict[str, str]) -> str:
+        clean = str(source or "").strip()
+        lowered = clean.lower()
+        if not clean:
+            self.inline_images_blocked += 1
+            return ""
+        if lowered.startswith(("http://", "https://", "//")):
+            if _looks_like_tracking_image(clean, attrs):
+                self.tracking_images_blocked += 1
+            proxy = email_image_proxy_path(clean)
+            if proxy:
+                self.remote_images_proxied += 1
+                return proxy
+            self.remote_images_blocked += 1
+            return ""
+        if lowered.startswith("cid:"):
+            resolved = self.inline_images.get(_normalize_cid(clean), "")
+            if resolved:
+                self.inline_images_rendered += 1
+                return resolved
+            self.inline_images_blocked += 1
+            return ""
+        if _is_safe_data_image(clean):
+            self.inline_images_rendered += 1
+            return clean
+        self.inline_images_blocked += 1
+        return ""
+
+
+def _looks_like_tracking_image(source: str, attrs: dict[str, str]) -> bool:
+    parsed = urlparse(source if not source.startswith("//") else f"https:{source}")
+    haystack = " ".join(
+        [
+            parsed.netloc,
+            parsed.path,
+            parsed.query,
+            attrs.get("alt", ""),
+            attrs.get("title", ""),
+        ]
+    ).lower()
+    if any(
+        term in haystack
+        for term in ("track", "tracker", "pixel", "beacon", "open", "analytics", "click")
+    ):
+        return True
+    return attrs.get("width", "").strip() == "1" and attrs.get("height", "").strip() == "1"
+
+
+def _is_safe_data_image(source: str) -> bool:
+    match = re.match(r"^data:(image/[a-z0-9.+-]+);base64,(.*)$", source, re.I | re.S)
+    if not match:
+        return False
+    content_type = match.group(1).lower()
+    if content_type == "image/jpg":
+        content_type = "image/jpeg"
+    if content_type not in SAFE_INLINE_IMAGE_TYPES:
+        return False
+    payload = re.sub(r"\s+", "", match.group(2))
+    return bool(payload) and re.fullmatch(r"[A-Za-z0-9+/=]+", payload) is not None
+
+
+def sanitize_email_html_with_report(
+    value: str,
+    *,
+    inline_images: dict[str, str] | None = None,
+) -> EmailHtmlSanitizeResult:
+    parser = _SafeHtmlParser(inline_images=inline_images)
     parser.feed(value or "")
     parser.close()
-    return "".join(parser.parts).strip()
+    return EmailHtmlSanitizeResult(
+        html="".join(parser.parts).strip(),
+        remote_images_blocked=parser.remote_images_blocked,
+        remote_images_proxied=parser.remote_images_proxied,
+        tracking_images_blocked=parser.tracking_images_blocked,
+        inline_images_rendered=parser.inline_images_rendered,
+        inline_images_blocked=parser.inline_images_blocked,
+        active_content_blocked=parser.active_content_blocked,
+        unsafe_links_blocked=parser.unsafe_links_blocked,
+        allowed_links=parser.allowed_links,
+    )
+
+
+def sanitize_email_html(value: str) -> str:
+    return sanitize_email_html_with_report(value).html
 
 
 class _HtmlTextParser(HTMLParser):
@@ -668,6 +1042,12 @@ async def list_folders(mailbox: EmailMailbox) -> list[dict[str, Any]]:
 
 async def list_inbox(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str, Any]]:
     return await asyncio.to_thread(list_inbox_sync, mailbox, limit=limit)
+
+
+async def list_folder_messages(
+    mailbox: EmailMailbox, *, folder: str = "INBOX", limit: int = 25
+) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_folder_messages_sync, mailbox, folder=folder, limit=limit)
 
 
 async def fetch_message(mailbox: EmailMailbox, *, folder: str, uid: str) -> dict[str, Any]:

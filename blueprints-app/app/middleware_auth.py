@@ -51,6 +51,7 @@ _TOKEN_EXEMPT_PREFIXES = (
     "/favicon.ico",
     "/api/v1/pwa/manifest",
     "/api/v1/personal/rich-doc/images/file/",
+    "/api/v1/personal/email/image-proxy",
 )
 # Exact API paths that require NO token (IP allowlist still applies). Keep this
 # intentionally narrow: these are lookup/research surfaces advertised to local
