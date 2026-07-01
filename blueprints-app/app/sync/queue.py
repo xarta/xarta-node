@@ -3,8 +3,8 @@ sync/queue.py — persistent FIFO action queue backed by SQLite.
 
 One queue row per (target_node_id, action). Queues survive crashes because
 they live in the same WAL-mode DB as the main data. The drain loop marks
-rows as sent=1 on success; rows are never deleted (provides an audit trail
-and allows re-inspection; the index keeps queries fast).
+rows as sent=1 on success. Sent rows may be pruned by explicit maintenance
+after backup/proof; unsent rows are never pruned by retention helpers.
 
 Queue overflow is handled by throttled row-action drain. Full-DB restore is a
 separate recovery or explicit force-restore path, not a queue relief mechanism.
@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .. import config as cfg
@@ -22,6 +23,178 @@ from ..db import get_conn
 log = logging.getLogger(__name__)
 
 _SYSTEM_ACTION_TYPES = ("sync_git_outer", "sync_git_non_root", "sync_git_inner")
+
+
+def _utc_sqlite_now() -> str:
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sync_queue_columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(sync_queue)").fetchall()}
+
+
+def _sent_time_expr(conn: sqlite3.Connection) -> str:
+    columns = _sync_queue_columns(conn)
+    if "sent_at" in columns:
+        return "COALESCE(NULLIF(sent_at, ''), created_at)"
+    return "created_at"
+
+
+def _queue_table_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN sent=0 THEN 1 ELSE 0 END), 0) AS unsent,
+            COALESCE(SUM(CASE WHEN sent=1 THEN 1 ELSE 0 END), 0) AS sent,
+            MIN(created_at) AS oldest_created_at,
+            MAX(created_at) AS newest_created_at
+        FROM sync_queue
+        """
+    ).fetchone()
+    per_target_rows = conn.execute(
+        """
+        SELECT target_node_id, sent, COUNT(*) AS row_count
+        FROM sync_queue
+        GROUP BY target_node_id, sent
+        ORDER BY target_node_id, sent
+        """
+    ).fetchall()
+    return {
+        "total": int(row["total"] or 0),
+        "unsent": int(row["unsent"] or 0),
+        "sent": int(row["sent"] or 0),
+        "oldest_created_at": row["oldest_created_at"] or "",
+        "newest_created_at": row["newest_created_at"] or "",
+        "per_target": [
+            {
+                "target_node_id": target["target_node_id"],
+                "sent": int(target["sent"] or 0),
+                "row_count": int(target["row_count"] or 0),
+            }
+            for target in per_target_rows
+        ],
+    }
+
+
+def _eligible_sent_where(
+    conn: sqlite3.Connection,
+    *,
+    older_than_hours: int,
+) -> tuple[str, list[Any], str | None]:
+    if older_than_hours < 0:
+        raise ValueError("older_than_hours must be >= 0")
+    where = ["sent=1"]
+    params: list[Any] = []
+    cutoff_at: str | None = None
+    if older_than_hours > 0:
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=older_than_hours)
+        cutoff_at = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        where.append(f"datetime({_sent_time_expr(conn)}) <= datetime(?)")
+        params.append(cutoff_at)
+    return " AND ".join(where), params, cutoff_at
+
+
+def _sent_queue_retention_summary_for_conn(
+    conn: sqlite3.Connection,
+    *,
+    older_than_hours: int,
+    limit: int,
+) -> dict[str, Any]:
+    where_sql, params, cutoff_at = _eligible_sent_where(
+        conn,
+        older_than_hours=older_than_hours,
+    )
+    eligible_row = conn.execute(
+        f"SELECT COUNT(*) FROM sync_queue WHERE {where_sql}",
+        params,
+    ).fetchone()
+    eligible_count = int(eligible_row[0] if eligible_row else 0)
+    stats = _queue_table_stats(conn)
+    has_sent_at = "sent_at" in _sync_queue_columns(conn)
+    selected_count = min(eligible_count, limit) if limit else eligible_count
+    return {
+        "schema": "xarta.sync_queue.retention_status.v1",
+        "older_than_hours": older_than_hours,
+        "cutoff_at": cutoff_at or "",
+        "limit": limit,
+        "has_sent_at": has_sent_at,
+        "eligible_sent_rows": eligible_count,
+        "selected_sent_rows": selected_count,
+        "would_delete": selected_count,
+        "queue": stats,
+    }
+
+
+def get_sent_queue_retention_summary(
+    *,
+    older_than_hours: int = 24,
+    limit: int = 0,
+) -> dict[str, Any]:
+    """Return queue-retention status without deleting rows."""
+    if limit < 0:
+        raise ValueError("limit must be >= 0")
+    with get_conn() as conn:
+        return _sent_queue_retention_summary_for_conn(
+            conn,
+            older_than_hours=older_than_hours,
+            limit=limit,
+        )
+
+
+def prune_sent_actions(
+    *,
+    older_than_hours: int = 24,
+    limit: int = 0,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Delete only sent sync_queue rows that match the retention window."""
+    if limit < 0:
+        raise ValueError("limit must be >= 0")
+    with get_conn() as conn:
+        before = _sent_queue_retention_summary_for_conn(
+            conn,
+            older_than_hours=older_than_hours,
+            limit=limit,
+        )
+        deleted = 0
+        if apply and before["selected_sent_rows"]:
+            where_sql, params, _cutoff_at = _eligible_sent_where(
+                conn,
+                older_than_hours=older_than_hours,
+            )
+            if limit:
+                cur = conn.execute(
+                    f"""
+                    DELETE FROM sync_queue
+                    WHERE queue_id IN (
+                        SELECT queue_id
+                        FROM sync_queue
+                        WHERE {where_sql}
+                        ORDER BY queue_id
+                        LIMIT ?
+                    )
+                    """,
+                    [*params, limit],
+                )
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM sync_queue WHERE {where_sql}",
+                    params,
+                )
+            deleted = int(cur.rowcount or 0)
+        after = _sent_queue_retention_summary_for_conn(
+            conn,
+            older_than_hours=older_than_hours,
+            limit=limit,
+        )
+    return {
+        "schema": "xarta.sync_queue.prune_sent.v1",
+        "apply": apply,
+        "deleted_rows": deleted,
+        "before": before,
+        "after": after,
+    }
 
 
 # ── Enqueue ───────────────────────────────────────────────────────────────────
@@ -159,10 +332,18 @@ def mark_sent(queue_ids: list[int]) -> None:
         return
     placeholders = ", ".join("?" * len(queue_ids))
     with get_conn() as conn:
-        conn.execute(
-            f"UPDATE sync_queue SET sent=1 WHERE queue_id IN ({placeholders})",
-            queue_ids,
-        )
+        try:
+            conn.execute(
+                f"UPDATE sync_queue SET sent=1, sent_at=? WHERE queue_id IN ({placeholders})",
+                [_utc_sqlite_now(), *queue_ids],
+            )
+        except sqlite3.OperationalError as exc:
+            if "sent_at" not in str(exc):
+                raise
+            conn.execute(
+                f"UPDATE sync_queue SET sent=1 WHERE queue_id IN ({placeholders})",
+                queue_ids,
+            )
 
 
 def get_peers_with_pending() -> list[str]:

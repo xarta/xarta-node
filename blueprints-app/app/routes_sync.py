@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import sqlite3
 import ssl
@@ -33,8 +34,15 @@ from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, increment_gen
 from .events import bus as events_bus
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
-from .sync.queue import enqueue, enqueue_for_all_peers, get_queue_depths
+from .sync.queue import (
+    enqueue,
+    enqueue_for_all_peers,
+    get_queue_depths,
+    get_sent_queue_retention_summary,
+    prune_sent_actions,
+)
 from .sync.restore import apply_restore, make_full_backup
+from .sync.sqlite_maintenance import sqlite_file_stats
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +50,7 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 
 _FORCE_RESTORE_HEADER = "x-blueprints-force-restore"
 _RESTORE_OP_HEADER = "x-blueprints-restore-op"
+_SAFE_BACKUP_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-blueprints\.db\.tar\.gz$")
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
 # NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
@@ -1110,6 +1119,103 @@ async def sync_status() -> SyncStatus:
         queue_depths=queue_depths,
         peer_count=len(peer_ids),
     )
+
+
+def _validated_backup_confirmation(filename: str) -> dict:
+    if not filename:
+        raise HTTPException(
+            409,
+            "backup_filename is required before applying sent sync_queue pruning",
+        )
+    if not _SAFE_BACKUP_NAME.match(filename):
+        raise HTTPException(400, "Invalid backup filename.")
+    if not cfg.BACKUP_DIR:
+        raise HTTPException(503, "BLUEPRINTS_BACKUP_DIR is not configured on this node.")
+    path = os.path.join(cfg.BACKUP_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(409, f"Confirmed backup was not found: {filename}")
+    return {
+        "filename": filename,
+        "path": path,
+        "size_bytes": os.path.getsize(path),
+    }
+
+
+@router.get("/queue-maintenance/status")
+async def sync_queue_maintenance_status(
+    older_than_hours: int = Query(
+        default=24,
+        ge=0,
+        description="Sent rows older than this are eligible; 0 selects all sent rows.",
+    ),
+    limit: int = Query(default=0, ge=0, description="Maximum rows to select; 0 means no limit."),
+) -> dict:
+    """Preview sent sync_queue retention without mutating queue rows."""
+    try:
+        retention = get_sent_queue_retention_summary(
+            older_than_hours=older_than_hours,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "schema": "xarta.sync_queue.maintenance_status.v1",
+        "retention": retention,
+        "database": sqlite_file_stats(cfg.DB_PATH),
+        "backup_required_for_apply": True,
+    }
+
+
+@router.post("/queue-maintenance/prune-sent")
+async def prune_sent_sync_queue(
+    apply: bool = Query(default=False, description="When false, only preview the delete set."),
+    older_than_hours: int = Query(
+        default=24,
+        ge=0,
+        description="Sent rows older than this are eligible; 0 selects all sent rows.",
+    ),
+    limit: int = Query(default=0, ge=0, description="Maximum rows to select; 0 means no limit."),
+    backup_filename: str = Query(
+        default="",
+        description="Existing /api/v1/backup filename required when apply=true.",
+    ),
+    require_backup: bool = Query(
+        default=True,
+        description="Keep true for operator use; tests may disable this for isolated DBs.",
+    ),
+) -> dict:
+    """
+    Prune only sent sync_queue rows.
+
+    Unsent rows are never eligible, so incremental drain reliability is
+    preserved. Live file shrink still requires a separate SQLite compaction
+    step after pruning.
+    """
+    confirmed_backup = None
+    if apply and require_backup:
+        confirmed_backup = _validated_backup_confirmation(backup_filename)
+    try:
+        result = prune_sent_actions(
+            older_than_hours=older_than_hours,
+            limit=limit,
+            apply=apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if apply:
+        log.info(
+            "sync_queue sent-row prune applied: deleted=%d older_than_hours=%d limit=%d backup=%s",
+            result["deleted_rows"],
+            older_than_hours,
+            limit,
+            backup_filename or "",
+        )
+    return {
+        "schema": "xarta.sync_queue.prune_sent_response.v1",
+        "backup": confirmed_backup,
+        "database": sqlite_file_stats(cfg.DB_PATH),
+        **result,
+    }
 
 
 # ── Diagnostic probe endpoints ────────────────────────────────────────────────

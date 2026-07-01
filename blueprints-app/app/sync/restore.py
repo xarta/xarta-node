@@ -19,9 +19,11 @@ import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import zipfile
 
 from .. import config as cfg
+from .sqlite_maintenance import clone_without_sync_queue
 
 log = logging.getLogger(__name__)
 
@@ -30,9 +32,15 @@ _DB_ENTRY_NAME = "blueprints.db"
 
 # ── Backup creation ───────────────────────────────────────────────────────────
 
+
 def make_full_backup() -> tuple[bytes, str]:
     """
-    Create an in-memory zip containing the current DB file.
+    Create an in-memory zip containing a compact copy of the current DB.
+
+    The outbound sync_queue is cleared in the copy before packaging. Queue
+    rows are node-local drain state, not restore truth, and keeping them in
+    full-DB exports makes boot catch-up and force-restore payloads needlessly
+    huge.
 
     Returns (zip_bytes, sha256_hex).
     Raises if the DB file does not exist.
@@ -40,15 +48,28 @@ def make_full_backup() -> tuple[bytes, str]:
     if not os.path.exists(cfg.DB_PATH):
         raise FileNotFoundError(f"DB not found at {cfg.DB_PATH}")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(cfg.DB_PATH, arcname=_DB_ENTRY_NAME)
-    zip_bytes = buf.getvalue()
+    db_dir = os.path.dirname(cfg.DB_PATH)
+    with tempfile.NamedTemporaryFile(
+        dir=db_dir,
+        suffix=".export_tmp",
+        delete=False,
+    ) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        clone_without_sync_queue(cfg.DB_PATH, tmp_path, vacuum=True)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(tmp_path, arcname=_DB_ENTRY_NAME)
+        zip_bytes = buf.getvalue()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     sha256_hex = hashlib.sha256(zip_bytes).hexdigest()
-    log.debug(
-        "created full backup: %d bytes, sha256=%s", len(zip_bytes), sha256_hex[:16]
-    )
+    log.debug("created full backup: %d bytes, sha256=%s", len(zip_bytes), sha256_hex[:16])
     return zip_bytes, sha256_hex
 
 
@@ -85,6 +106,7 @@ def post_restore_housekeeping() -> bool:
 
 
 # ── Restore ───────────────────────────────────────────────────────────────────
+
 
 async def apply_restore(zip_bytes: bytes, expected_sha256: str) -> bool:
     """
