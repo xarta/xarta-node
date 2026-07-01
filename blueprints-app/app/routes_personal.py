@@ -31,6 +31,12 @@ from starlette.responses import FileResponse
 from . import config as cfg
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
+from .kanban_store import (
+    KanbanItemCycleError,
+    KanbanItemNotFound,
+    KanbanPriorityRecommendationRead,
+    SQLiteKanbanStore,
+)
 from .sync.queue import enqueue_for_all_peers
 
 router = APIRouter(prefix="/personal", tags=["personal"])
@@ -240,6 +246,25 @@ PERSONAL_FILTER_COLORS = {
     "grey",
     "gold",
 }
+
+
+def _kanban_store(conn: Any) -> SQLiteKanbanStore:
+    return SQLiteKanbanStore(
+        conn,
+        depth_limit=KANBAN_DEPTH_LIMIT,
+        show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
+        agent_working_out_tag=KANBAN_AGENT_WORKING_OUT_TAG,
+    )
+
+
+def _raise_kanban_store_error(exc: Exception) -> None:
+    if isinstance(exc, KanbanItemNotFound):
+        raise HTTPException(404, str(exc)) from exc
+    if isinstance(exc, KanbanItemCycleError):
+        raise HTTPException(400, str(exc)) from exc
+    raise exc
+
+
 PERSONAL_FILTER_SHAPES = {
     "circle",
     "square",
@@ -4464,15 +4489,15 @@ def _work_priority_recommendation_id(scope_id: str, rank: int) -> str:
     return f"kanban-priority-{digest[:24]}"
 
 
-def _row_to_work_priority_recommendation(conn: Any, row: Any) -> dict[str, Any]:
-    item = conn.execute(
-        "SELECT * FROM kanban_items WHERE item_id=?",
-        (row["item_id"],),
-    ).fetchone()
+def _row_to_work_priority_recommendation(
+    read: KanbanPriorityRecommendationRead,
+) -> dict[str, Any]:
+    row = read.recommendation
+    item = read.item
     title = item["title"] if item is not None else row["title"]
     state_id = item["state_id"] if item is not None else row["state_id"]
     priority_id = item["priority_id"] if item is not None else row["priority_id"]
-    breadcrumbs = _work_breadcrumbs(conn, row["item_id"]) if item is not None else []
+    breadcrumbs = [_row_to_work_item(item_row) for item_row in read.breadcrumbs]
     return {
         "recommendation_id": row["recommendation_id"],
         "scope_id": row["scope_id"],
@@ -4510,16 +4535,11 @@ def _work_priority_recommendations_payload(
 ) -> dict[str, Any]:
     clean_scope_id = _clean_short_text(scope_id, KANBAN_PRIORITY_SCOPE_ID, limit=120)
     clean_limit = max(1, min(int(limit or 10), 50))
-    rows = conn.execute(
-        """
-        SELECT * FROM kanban_priority_recommendations
-        WHERE scope_id=?
-        ORDER BY rank ASC, updated_at DESC, recommendation_id
-        LIMIT ?
-        """,
-        (clean_scope_id, clean_limit),
-    ).fetchall()
-    recommendations = [_row_to_work_priority_recommendation(conn, row) for row in rows]
+    reads = _kanban_store(conn).priority_recommendations(
+        scope_id=clean_scope_id,
+        limit=clean_limit,
+    )
+    recommendations = [_row_to_work_priority_recommendation(read) for read in reads]
     source = "managed" if recommendations else "empty"
     return {
         "ok": True,
@@ -11114,68 +11134,35 @@ def _work_board_payload(
     *,
     show_test_entries: bool | None = None,
 ) -> dict[str, Any]:
-    parent_id = _clean_short_text(parent_item_id, "", limit=180) or None
-    parent = _work_item_or_404(conn, parent_id) if parent_id else None
-    preferences = _kanban_preferences(conn)
-    if show_test_entries is None:
-        show_test_entries = bool(preferences["show_test_entries"])
-    else:
-        preferences["show_test_entries"] = bool(show_test_entries)
-    breadcrumbs = _work_breadcrumbs(conn, parent_id)
-    remaining_depth = (
-        max(0, KANBAN_DEPTH_LIMIT - int(parent["depth"]))
-        if parent is not None
-        else KANBAN_DEPTH_LIMIT
-    )
-    states = conn.execute(
-        "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id"
-    ).fetchall()
-    if parent_id:
-        rows = conn.execute(
-            """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id=? AND status != 'archived'
-            ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
-            """,
-            (parent_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id IS NULL AND status != 'archived'
-            ORDER BY state_id, priority_id, sort_order, updated_at DESC, item_id
-            """
-        ).fetchall()
-    rows, hidden_test_items = _filter_work_test_rows(rows, bool(show_test_entries))
-    raw_items_by_state: dict[str, list[Any]] = {row["state_id"]: [] for row in states}
-    for row in rows:
-        raw_items_by_state.setdefault(row["state_id"], []).append(row)
-    items_by_state = {
-        state_id: [_row_to_work_item(row) for row in _sort_kanban_items_for_lane(conn, state_rows)]
-        for state_id, state_rows in raw_items_by_state.items()
-    }
+    try:
+        read = _kanban_store(conn).board(
+            parent_item_id,
+            show_test_entries=show_test_entries,
+        )
+    except (KanbanItemNotFound, KanbanItemCycleError) as exc:
+        _raise_kanban_store_error(exc)
     return {
         "ok": True,
         "board": {
-            "parent": _row_to_work_item(parent) if parent else None,
+            "parent": _row_to_work_item(read.parent) if read.parent else None,
             "depth_limit": KANBAN_DEPTH_LIMIT,
-            "remaining_depth": remaining_depth,
-            "breadcrumbs": breadcrumbs,
+            "remaining_depth": read.remaining_depth,
+            "breadcrumbs": [_row_to_work_item(row) for row in read.breadcrumbs],
             "columns": [
-                {"state": _row_to_work_state(state), "items": items_by_state[state["state_id"]]}
-                for state in states
+                {
+                    "state": _row_to_work_state(state),
+                    "items": [
+                        _row_to_work_item(row) for row in read.items_by_state[state["state_id"]]
+                    ],
+                }
+                for state in read.states
             ],
-            "rollup": _work_rollup(
-                conn,
-                parent_id,
-                show_test_entries=bool(show_test_entries),
-            ),
-            "preferences": preferences,
-            "hidden_test_items": hidden_test_items,
+            "rollup": read.rollup,
+            "preferences": read.preferences,
+            "hidden_test_items": read.hidden_test_items,
             "test_entries": {
-                "show": bool(show_test_entries),
-                "hidden": hidden_test_items,
+                "show": read.show_test_entries,
+                "hidden": read.hidden_test_items,
             },
         },
     }
@@ -11653,19 +11640,13 @@ def _upsert_typed_work_leaf_item(
 @router.get("/kanban/config")
 async def get_work_config() -> dict[str, Any]:
     with get_conn() as conn:
-        states = conn.execute(
-            "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id"
-        ).fetchall()
-        priorities = conn.execute(
-            "SELECT * FROM kanban_item_priorities ORDER BY sort_order, priority_id"
-        ).fetchall()
-        preferences = _kanban_preferences(conn)
+        read = _kanban_store(conn).config()
     return {
         "ok": True,
-        "depth_limit": KANBAN_DEPTH_LIMIT,
-        "states": [_row_to_work_state(row) for row in states],
-        "priorities": [_row_to_work_priority(row) for row in priorities],
-        "preferences": preferences,
+        "depth_limit": read.depth_limit,
+        "states": [_row_to_work_state(row) for row in read.states],
+        "priorities": [_row_to_work_priority(row) for row in read.priorities],
+        "preferences": read.preferences,
     }
 
 
@@ -11725,88 +11706,25 @@ async def get_work_child_board(item_id: str) -> dict[str, Any]:
 @router.get("/kanban/items/{item_id}")
 async def get_work_item_detail(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
-        item = _work_item_or_404(conn, item_id)
-        children = conn.execute(
-            """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id=? AND status != 'archived'
-            ORDER BY state_id, sort_order, updated_at DESC, item_id
-            """,
-            (item_id,),
-        ).fetchall()
-        issues = conn.execute(
-            """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id=? AND item_type='issue' AND status != 'archived'
-            ORDER BY updated_at DESC, item_id
-            """,
-            (item_id,),
-        ).fetchall()
-        todos = conn.execute(
-            """
-            SELECT w.* FROM kanban_items w
-            WHERE w.parent_item_id=?
-              AND w.state_id='todo'
-              AND w.status != 'archived'
-              AND w.item_type != 'issue'
-              AND NOT EXISTS (
-                  SELECT 1 FROM kanban_items child
-                  WHERE child.parent_item_id=w.item_id
-                    AND child.status != 'archived'
-              )
-            ORDER BY COALESCE(json_extract(w.provenance_json, '$.todo.due_at'), w.updated_at), w.item_id
-            """,
-            (item_id,),
-        ).fetchall()
-        blockers = conn.execute(
-            "SELECT * FROM kanban_blockers WHERE item_id=? ORDER BY updated_at DESC, blocker_id",
-            (item_id,),
-        ).fetchall()
-        discussions = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE item_id=? ORDER BY created_at ASC, discussion_id",
-            (item_id,),
-        ).fetchall()
-        links = conn.execute(
-            """
-            SELECT * FROM kanban_item_links
-            WHERE source_item_id=? OR target_item_id=?
-            ORDER BY link_type, updated_at DESC, link_id
-            """,
-            (item_id, item_id),
-        ).fetchall()
-        commits = conn.execute(
-            """
-            SELECT * FROM kanban_item_commits
-            WHERE item_id=?
-            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
-                     repo_full_name, sha
-            """,
-            (item_id,),
-        ).fetchall()
-        audit = conn.execute(
-            """
-            SELECT * FROM kanban_audit_log
-            WHERE item_id=?
-            ORDER BY created_at DESC
-            LIMIT 20
-            """,
-            (item_id,),
-        ).fetchall()
+        try:
+            read = _kanban_store(conn).item_detail(item_id)
+        except (KanbanItemNotFound, KanbanItemCycleError) as exc:
+            _raise_kanban_store_error(exc)
         detail_document = _work_item_detail_document(conn, item_id)
         review_document = _work_item_review_document(conn, item_id)
         return {
             "ok": True,
-            "item": _row_to_work_item(item),
+            "item": _row_to_work_item(read.item),
             "detail_document": detail_document,
             "review_document": review_document,
-            "breadcrumbs": _work_breadcrumbs(conn, item_id),
-            "depth_limit": KANBAN_DEPTH_LIMIT,
-            "remaining_depth": max(0, KANBAN_DEPTH_LIMIT - int(item["depth"])),
-            "children": [_row_to_work_item(row) for row in children],
-            "issues": [_row_to_work_issue(row) for row in issues],
-            "todos": [_row_to_work_todo(row) for row in todos],
-            "blockers": [_row_to_work_blocker(row) for row in blockers],
-            "discussions": [_row_to_work_discussion(row, conn) for row in discussions],
+            "breadcrumbs": [_row_to_work_item(row) for row in read.breadcrumbs],
+            "depth_limit": read.depth_limit,
+            "remaining_depth": read.remaining_depth,
+            "children": [_row_to_work_item(row) for row in read.children],
+            "issues": [_row_to_work_issue(row) for row in read.issues],
+            "todos": [_row_to_work_todo(row) for row in read.todos],
+            "blockers": [_row_to_work_blocker(row) for row in read.blockers],
+            "discussions": [_row_to_work_discussion(row, conn) for row in read.discussions],
             "links": [
                 {
                     "link_id": row["link_id"],
@@ -11817,9 +11735,9 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                 }
-                for row in links
+                for row in read.links
             ],
-            "commits": [_row_to_work_commit(row) for row in commits],
+            "commits": [_row_to_work_commit(row) for row in read.commits],
             "audit": [
                 {
                     "audit_id": row["audit_id"],
@@ -11829,18 +11747,18 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                     "created_at": row["created_at"],
                     "metadata": _json_value(row["metadata_json"], {}),
                 }
-                for row in audit
+                for row in read.audit
             ],
-            "rollup": _work_rollup(conn, item_id),
+            "rollup": read.rollup,
             "counts": {
-                "children": len(children),
-                "issues": len(issues),
-                "todos": len(todos),
-                "blockers": len(blockers),
-                "links": len(links),
-                "commits": len(commits),
-                "audit": len(audit),
-                "discussions": len(discussions),
+                "children": len(read.children),
+                "issues": len(read.issues),
+                "todos": len(read.todos),
+                "blockers": len(read.blockers),
+                "links": len(read.links),
+                "commits": len(read.commits),
+                "audit": len(read.audit),
+                "discussions": len(read.discussions),
                 "review": 1 if (review_document.get("body") or "").strip() else 0,
             },
         }
