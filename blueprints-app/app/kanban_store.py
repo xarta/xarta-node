@@ -92,7 +92,7 @@ def _bool_setting_value(value: str | None, default: bool = True) -> bool:
 
 
 class SQLiteKanbanStore:
-    """Repository facade for Kanban reads backed by the Blueprints SQLite DB."""
+    """Repository facade for Kanban reads and writes backed by SQLite."""
 
     def __init__(
         self,
@@ -303,6 +303,196 @@ class SQLiteKanbanStore:
                 )
             )
         return reads
+
+    def priority_recommendation_rows(self, *, scope_id: str) -> list[Any]:
+        clean_scope_id = self._clean_id(scope_id, fallback="kanban", limit=120)
+        return self.conn.execute(
+            "SELECT * FROM kanban_priority_recommendations WHERE scope_id=?",
+            (clean_scope_id,),
+        ).fetchall()
+
+    def upsert_priority_recommendation(
+        self,
+        payload: dict[str, Any],
+        *,
+        now: str,
+    ) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_priority_recommendations (
+                recommendation_id, scope_id, rank, item_id, title, summary,
+                reason, priority_id, state_id, score, strategy_version,
+                source_surface, source_hash, metadata_json, provenance_json,
+                generated_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(recommendation_id) DO UPDATE SET
+                scope_id=excluded.scope_id,
+                rank=excluded.rank,
+                item_id=excluded.item_id,
+                title=excluded.title,
+                summary=excluded.summary,
+                reason=excluded.reason,
+                priority_id=excluded.priority_id,
+                state_id=excluded.state_id,
+                score=excluded.score,
+                strategy_version=excluded.strategy_version,
+                source_surface=excluded.source_surface,
+                source_hash=excluded.source_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                generated_at=excluded.generated_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["recommendation_id"],
+                payload["scope_id"],
+                payload["rank"],
+                payload["item_id"],
+                payload["title"],
+                payload["summary"],
+                payload["reason"],
+                payload["priority_id"],
+                payload["state_id"],
+                float(payload["score"] or 0),
+                payload["strategy_version"],
+                payload["source_surface"],
+                payload["source_hash"],
+                json.dumps(payload["metadata"], ensure_ascii=True, sort_keys=True),
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                payload["generated_at"],
+                now,
+                now,
+            ),
+        )
+        return self.conn.execute(
+            "SELECT * FROM kanban_priority_recommendations WHERE recommendation_id=?",
+            (payload["recommendation_id"],),
+        ).fetchone()
+
+    def delete_priority_recommendation(self, recommendation_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM kanban_priority_recommendations WHERE recommendation_id=?",
+            (recommendation_id,),
+        )
+
+    def insert_item_row(self, payload: dict[str, Any], *, now: str) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_items (
+                item_id, parent_item_id, title, body_excerpt, item_type, state_id,
+                priority_id, depth, sort_order, status, goal_flag, automation_excluded,
+                archived_at, promoted_from_ref,
+                source_type, source_ref, source_hash, tags_json, related_event_ids_json,
+                related_task_ids_json, related_issue_ids_json, search_text,
+                search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+                vector_index_key, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+                    NULL, ?, ?, ?, ?)
+            """,
+            (
+                payload["item_id"],
+                payload["parent_item_id"],
+                payload["title"],
+                payload["body_excerpt"],
+                payload["item_type"],
+                payload["state_id"],
+                payload["priority_id"],
+                payload["depth"],
+                payload["sort_order"],
+                payload["status"],
+                int(payload["goal_flag"]),
+                int(payload["automation_excluded"]),
+                payload["promoted_from_ref"],
+                payload["source_type"],
+                payload["source_ref"],
+                payload["source_hash"],
+                json.dumps(payload["tags"], ensure_ascii=True),
+                json.dumps(payload["related_event_ids"], ensure_ascii=True),
+                json.dumps(payload["related_task_ids"], ensure_ascii=True),
+                json.dumps(payload["related_issue_ids"], ensure_ascii=True),
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        return self.item_or_raise(payload["item_id"])
+
+    def update_item_row(self, item_id: str, payload: dict[str, Any], *, now: str) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_items
+            SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
+                sort_order=?, status=?, goal_flag=?, automation_excluded=?, source_hash=?, tags_json=?,
+                related_event_ids_json=?, related_task_ids_json=?,
+                related_issue_ids_json=?, search_text=?, search_metadata_json=?,
+                vector_index_key=?, provenance_json=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (
+                payload["title"],
+                payload["body_excerpt"],
+                payload["item_type"],
+                payload["state_id"],
+                payload["priority_id"],
+                payload["sort_order"],
+                payload["status"],
+                int(payload["goal_flag"]),
+                int(payload["automation_excluded"]),
+                payload["source_hash"],
+                json.dumps(payload["tags"], ensure_ascii=True),
+                json.dumps(payload["related_event_ids"], ensure_ascii=True),
+                json.dumps(payload["related_task_ids"], ensure_ascii=True),
+                json.dumps(payload["related_issue_ids"], ensure_ascii=True),
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                now,
+                item_id,
+            ),
+        )
+        return self.item_or_raise(item_id)
+
+    def move_item_row(
+        self,
+        item_id: str,
+        *,
+        parent_item_id: str | None,
+        state_id: str,
+        status: str,
+        depth: int,
+        sort_order: int,
+        now: str,
+    ) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_items
+            SET parent_item_id=?, state_id=?, status=?, depth=?, sort_order=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (
+                parent_item_id,
+                state_id,
+                status,
+                depth,
+                sort_order,
+                now,
+                item_id,
+            ),
+        )
+        return self.item_or_raise(item_id)
+
+    def archive_item_row(self, item_id: str, *, archived_at: str) -> Any:
+        self.conn.execute(
+            "UPDATE kanban_items SET status='archived', archived_at=?, updated_at=? WHERE item_id=?",
+            (archived_at, archived_at, item_id),
+        )
+        return self.item_or_raise(item_id)
 
     def item(self, item_id: str | None) -> Any | None:
         clean_item_id = self._clean_id(item_id)

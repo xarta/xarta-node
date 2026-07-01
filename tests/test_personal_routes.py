@@ -4042,6 +4042,203 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
     }
 
 
+def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    calls = {
+        "insert_item_row": 0,
+        "update_item_row": 0,
+        "move_item_row": 0,
+        "archive_item_row": 0,
+        "priority_recommendation_rows": 0,
+        "upsert_priority_recommendation": 0,
+        "delete_priority_recommendation": 0,
+    }
+    original_insert = routes_personal.SQLiteKanbanStore.insert_item_row
+    original_update = routes_personal.SQLiteKanbanStore.update_item_row
+    original_move = routes_personal.SQLiteKanbanStore.move_item_row
+    original_archive = routes_personal.SQLiteKanbanStore.archive_item_row
+    original_priority_rows = routes_personal.SQLiteKanbanStore.priority_recommendation_rows
+    original_upsert_priority = routes_personal.SQLiteKanbanStore.upsert_priority_recommendation
+    original_delete_priority = routes_personal.SQLiteKanbanStore.delete_priority_recommendation
+
+    def spy_insert(self, *args, **kwargs):
+        calls["insert_item_row"] += 1
+        return original_insert(self, *args, **kwargs)
+
+    def spy_update(self, *args, **kwargs):
+        calls["update_item_row"] += 1
+        return original_update(self, *args, **kwargs)
+
+    def spy_move(self, *args, **kwargs):
+        calls["move_item_row"] += 1
+        return original_move(self, *args, **kwargs)
+
+    def spy_archive(self, *args, **kwargs):
+        calls["archive_item_row"] += 1
+        return original_archive(self, *args, **kwargs)
+
+    def spy_priority_rows(self, *args, **kwargs):
+        calls["priority_recommendation_rows"] += 1
+        return original_priority_rows(self, *args, **kwargs)
+
+    def spy_upsert_priority(self, *args, **kwargs):
+        calls["upsert_priority_recommendation"] += 1
+        return original_upsert_priority(self, *args, **kwargs)
+
+    def spy_delete_priority(self, *args, **kwargs):
+        calls["delete_priority_recommendation"] += 1
+        return original_delete_priority(self, *args, **kwargs)
+
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "insert_item_row", spy_insert)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "update_item_row", spy_update)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "move_item_row", spy_move)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "archive_item_row", spy_archive)
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "priority_recommendation_rows",
+        spy_priority_rows,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "upsert_priority_recommendation",
+        spy_upsert_priority,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "delete_priority_recommendation",
+        spy_delete_priority,
+    )
+
+    sync_before = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+    create_payload = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="write-boundary-root",
+                title="Write boundary root",
+                body="Core write boundary proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-create",
+            )
+        )
+    )
+    assert create_payload["item"]["item_id"] == "write-boundary-root"
+
+    update_payload = asyncio.run(
+        routes_personal.update_work_item(
+            "write-boundary-root",
+            routes_personal.WorkItemUpdateRequest(
+                title="Write boundary root updated",
+                body="Updated through the core write boundary.",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-update",
+            ),
+        )
+    )
+    assert update_payload["item"]["title"] == "Write boundary root updated"
+    assert update_payload["item"]["priority_id"] == "high"
+
+    move_payload = asyncio.run(
+        routes_personal.move_work_item(
+            "write-boundary-root",
+            routes_personal.WorkItemMoveRequest(
+                state_id="backlog",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-move",
+            ),
+        )
+    )
+    assert move_payload["item"]["state_id"] == "backlog"
+
+    priorities_payload = asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[
+                    routes_personal.WorkPriorityRecommendationInput(
+                        item_id="write-boundary-root",
+                        title="Write boundary priority",
+                        summary="Priority writes should pass through the store.",
+                        reason="Store-boundary proof",
+                        score=91.0,
+                    )
+                ],
+                strategy_version="write-boundary-test-v1",
+                generated_at="2026-07-01T10:45:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-priority-upsert",
+            )
+        )
+    )
+    assert priorities_payload["recommendations"][0]["item_id"] == "write-boundary-root"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_priority_recommendations WHERE item_id=?",
+            ("write-boundary-root",),
+        ).fetchone()[0]
+        == 1
+    )
+
+    empty_priorities_payload = asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[],
+                strategy_version="write-boundary-test-v1",
+                generated_at="2026-07-01T10:46:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-priority-delete",
+            )
+        )
+    )
+    assert empty_priorities_payload["recommendations"] == []
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_priority_recommendations WHERE item_id=?",
+            ("write-boundary-root",),
+        ).fetchone()[0]
+        == 0
+    )
+
+    archive_payload = asyncio.run(
+        routes_personal.archive_work_item(
+            "write-boundary-root",
+            routes_personal.WorkItemActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="write-boundary-archive",
+            ),
+        )
+    )
+    assert archive_payload["item"]["status"] == "archived"
+    assert calls == {
+        "insert_item_row": 1,
+        "update_item_row": 1,
+        "move_item_row": 1,
+        "archive_item_row": 1,
+        "priority_recommendation_rows": 2,
+        "upsert_priority_recommendation": 1,
+        "delete_priority_recommendation": 1,
+    }
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] > sync_before
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {"kanban_items", "kanban_priority_recommendations", "kanban_audit_log"}.issubset(
+        sync_tables
+    )
+
+
 def test_work_kanban_read_selector_shadow_candidate_parity_and_rollback(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

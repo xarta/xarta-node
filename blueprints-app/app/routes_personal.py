@@ -264,6 +264,10 @@ def _kanban_store(conn: Any) -> SQLiteKanbanStore:
     )
 
 
+def _kanban_write_store(conn: Any) -> SQLiteKanbanStore:
+    return _kanban_store(conn)
+
+
 @contextmanager
 def _kanban_read_store(conn: Any) -> Any:
     candidate_conn = None
@@ -11311,50 +11315,7 @@ def _insert_work_item(
     audit_id: str,
     now: str,
 ) -> tuple[Any, dict[str, Any]]:
-    conn.execute(
-        """
-        INSERT INTO kanban_items (
-            item_id, parent_item_id, title, body_excerpt, item_type, state_id,
-            priority_id, depth, sort_order, status, goal_flag, automation_excluded,
-            archived_at, promoted_from_ref,
-            source_type, source_ref, source_hash, tags_json, related_event_ids_json,
-            related_task_ids_json, related_issue_ids_json, search_text,
-            search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
-            vector_index_key, provenance_json, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
-                NULL, ?, ?, ?, ?)
-        """,
-        (
-            payload["item_id"],
-            payload["parent_item_id"],
-            payload["title"],
-            payload["body_excerpt"],
-            payload["item_type"],
-            payload["state_id"],
-            payload["priority_id"],
-            payload["depth"],
-            payload["sort_order"],
-            payload["status"],
-            int(payload["goal_flag"]),
-            int(payload["automation_excluded"]),
-            payload["promoted_from_ref"],
-            payload["source_type"],
-            payload["source_ref"],
-            payload["source_hash"],
-            json.dumps(payload["tags"], ensure_ascii=True),
-            json.dumps(payload["related_event_ids"], ensure_ascii=True),
-            json.dumps(payload["related_task_ids"], ensure_ascii=True),
-            json.dumps(payload["related_issue_ids"], ensure_ascii=True),
-            payload["search_text"],
-            json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
-            payload["vector_index_key"],
-            json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
-            now,
-            now,
-        ),
-    )
-    item_row = _work_item_or_404(conn, payload["item_id"])
+    item_row = _kanban_write_store(conn).insert_item_row(payload, now=now)
     automation_metadata = (
         payload["provenance"].get("automation")
         if isinstance(payload.get("provenance"), dict)
@@ -11868,11 +11829,9 @@ async def replace_work_priorities(
     audit_id = f"audit-{uuid.uuid4().hex}"
     scope_id = KANBAN_PRIORITY_SCOPE_ID
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         seen_items: set[str] = set()
-        existing_rows = conn.execute(
-            "SELECT * FROM kanban_priority_recommendations WHERE scope_id=?",
-            (scope_id,),
-        ).fetchall()
+        existing_rows = store.priority_recommendation_rows(scope_id=scope_id)
         wanted_ids: set[str] = set()
         upserted_rows: list[Any] = []
         for index, entry in enumerate(body.recommendations, start=1):
@@ -11926,67 +11885,33 @@ async def replace_work_priorities(
                     "metadata": metadata,
                 }
             )
-            conn.execute(
-                """
-                INSERT INTO kanban_priority_recommendations (
-                    recommendation_id, scope_id, rank, item_id, title, summary,
-                    reason, priority_id, state_id, score, strategy_version,
-                    source_surface, source_hash, metadata_json, provenance_json,
-                    generated_at, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(recommendation_id) DO UPDATE SET
-                    scope_id=excluded.scope_id,
-                    rank=excluded.rank,
-                    item_id=excluded.item_id,
-                    title=excluded.title,
-                    summary=excluded.summary,
-                    reason=excluded.reason,
-                    priority_id=excluded.priority_id,
-                    state_id=excluded.state_id,
-                    score=excluded.score,
-                    strategy_version=excluded.strategy_version,
-                    source_surface=excluded.source_surface,
-                    source_hash=excluded.source_hash,
-                    metadata_json=excluded.metadata_json,
-                    provenance_json=excluded.provenance_json,
-                    generated_at=excluded.generated_at,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    recommendation_id,
-                    scope_id,
-                    index,
-                    target_item_id,
-                    title,
-                    summary,
-                    reason,
-                    priority_id,
-                    state_id,
-                    float(entry.score or 0),
-                    strategy_version,
-                    meta["source_surface"],
-                    source_hash,
-                    json.dumps(metadata, ensure_ascii=True, sort_keys=True),
-                    json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                    generated_at,
-                    now,
-                    now,
-                ),
+            row = store.upsert_priority_recommendation(
+                {
+                    "recommendation_id": recommendation_id,
+                    "scope_id": scope_id,
+                    "rank": index,
+                    "item_id": target_item_id,
+                    "title": title,
+                    "summary": summary,
+                    "reason": reason,
+                    "priority_id": priority_id,
+                    "state_id": state_id,
+                    "score": entry.score,
+                    "strategy_version": strategy_version,
+                    "source_surface": meta["source_surface"],
+                    "source_hash": source_hash,
+                    "metadata": metadata,
+                    "provenance": provenance,
+                    "generated_at": generated_at,
+                },
+                now=now,
             )
-            row = conn.execute(
-                "SELECT * FROM kanban_priority_recommendations WHERE recommendation_id=?",
-                (recommendation_id,),
-            ).fetchone()
             wanted_ids.add(recommendation_id)
             upserted_rows.append(row)
 
         deleted_rows = [row for row in existing_rows if row["recommendation_id"] not in wanted_ids]
         for row in deleted_rows:
-            conn.execute(
-                "DELETE FROM kanban_priority_recommendations WHERE recommendation_id=?",
-                (row["recommendation_id"],),
-            )
+            store.delete_priority_recommendation(row["recommendation_id"])
 
         audit_metadata = {
             "schema": "xarta.kanban.priority_recommendations.replace.v1",
@@ -12312,40 +12237,7 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                     actor=meta["actor"],
                     source_surface=meta["source_surface"],
                 )
-        conn.execute(
-            """
-            UPDATE kanban_items
-            SET title=?, body_excerpt=?, item_type=?, state_id=?, priority_id=?,
-                sort_order=?, status=?, goal_flag=?, automation_excluded=?, source_hash=?, tags_json=?,
-                related_event_ids_json=?, related_task_ids_json=?,
-                related_issue_ids_json=?, search_text=?, search_metadata_json=?,
-                vector_index_key=?, provenance_json=?, updated_at=?
-            WHERE item_id=?
-            """,
-            (
-                payload["title"],
-                payload["body_excerpt"],
-                payload["item_type"],
-                payload["state_id"],
-                payload["priority_id"],
-                payload["sort_order"],
-                payload["status"],
-                int(payload["goal_flag"]),
-                int(payload["automation_excluded"]),
-                payload["source_hash"],
-                json.dumps(payload["tags"], ensure_ascii=True),
-                json.dumps(payload["related_event_ids"], ensure_ascii=True),
-                json.dumps(payload["related_task_ids"], ensure_ascii=True),
-                json.dumps(payload["related_issue_ids"], ensure_ascii=True),
-                payload["search_text"],
-                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
-                payload["vector_index_key"],
-                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
-                now,
-                item_id,
-            ),
-        )
-        item_row = _work_item_or_404(conn, item_id)
+        item_row = _kanban_write_store(conn).update_item_row(item_id, payload, now=now)
         project_document = None
         if not existing["parent_item_id"] and title != existing["title"]:
             project_document = _sync_kanban_root_project_title(
@@ -13353,21 +13245,16 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             existing["state_id"],
             existing["priority_id"],
         )
-        conn.execute(
-            """
-            UPDATE kanban_items
-            SET parent_item_id=?, state_id=?, status=?, depth=?, sort_order=?, updated_at=?
-            WHERE item_id=?
-            """,
-            (
-                new_parent,
-                state["state_id"],
-                _work_status_for_state(state),
-                new_depth,
-                int(body.sort_order if body.sort_order is not None else existing["sort_order"]),
-                now,
-                item_id,
+        _kanban_write_store(conn).move_item_row(
+            item_id,
+            parent_item_id=new_parent,
+            state_id=state["state_id"],
+            status=_work_status_for_state(state),
+            depth=new_depth,
+            sort_order=int(
+                body.sort_order if body.sort_order is not None else existing["sort_order"]
             ),
+            now=now,
         )
         _recompute_work_child_depths(conn, item_id, new_depth)
         moved_rows = conn.execute(
@@ -13606,11 +13493,7 @@ async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[s
     meta = _work_request_meta(body)
     with get_conn() as conn:
         existing = _work_item_or_404(conn, item_id)
-        conn.execute(
-            "UPDATE kanban_items SET status='archived', archived_at=?, updated_at=? WHERE item_id=?",
-            (now, now, item_id),
-        )
-        item_row = _work_item_or_404(conn, item_id)
+        item_row = _kanban_write_store(conn).archive_item_row(item_id, archived_at=now)
         cancelled_marker_rows = _cancel_work_review_processor_markers(
             conn,
             item_ids=[item_id],
