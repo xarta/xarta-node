@@ -251,6 +251,28 @@ def _copy_support_settings(
     return copied
 
 
+def kanban_shadow_candidate_connection(
+    live_conn: sqlite3.Connection,
+    *,
+    support_setting_keys: tuple[str, ...] = (),
+) -> sqlite3.Connection:
+    """Return an in-memory candidate loaded from live Kanban tables.
+
+    The caller owns the returned connection and must close it. This is for
+    proof-read mode only; it does not make the candidate a persistent datastore.
+    """
+
+    table_data = _collect_table_data(live_conn)
+    candidate = _create_shadow_schema(live_conn)
+    try:
+        _insert_table_data(candidate, table_data)
+        _copy_support_settings(live_conn, candidate, setting_keys=support_setting_keys)
+    except Exception:
+        candidate.close()
+        raise
+    return candidate
+
+
 def _row_subset(row: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return {field: row[field] for field in fields if field in row.keys()}
 

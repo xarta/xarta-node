@@ -17,11 +17,14 @@ KANBAN_DATASTORE_STATUS_SCHEMA = "xarta.kanban.datastore.status.v1"
 KANBAN_DATASTORE_BOOTSTRAP_SCHEMA = "xarta.kanban.datastore.bootstrap.v1"
 
 KANBAN_DATASTORE_MODE_ENV = "BLUEPRINTS_KANBAN_DATASTORE_MODE"
+KANBAN_READ_STORE_ENV = "BLUEPRINTS_KANBAN_READ_STORE"
 KANBAN_CANDIDATE_BACKEND_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND"
 KANBAN_CANDIDATE_DATABASE_URL_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL"
 
 ACTIVE_STORE_SQLITE = "sqlite"
+CANDIDATE_READ_STORE_SHADOW = "candidate-shadow"
 SUPPORTED_ACTIVE_STORES = {ACTIVE_STORE_SQLITE}
+SUPPORTED_READ_STORES = {ACTIVE_STORE_SQLITE, CANDIDATE_READ_STORE_SHADOW}
 SUPPORTED_CANDIDATE_BACKENDS = {"postgres"}
 
 KANBAN_DATASTORE_TABLES: tuple[str, ...] = (
@@ -51,6 +54,7 @@ class KanbanDatastoreConfigError(RuntimeError):
 @dataclass(frozen=True)
 class KanbanDatastoreConfig:
     active_store: str
+    read_store: str
     candidate_backend: str
     candidate_database_url_configured: bool
 
@@ -73,6 +77,14 @@ def load_kanban_datastore_config(
             f"Supported live Kanban datastore modes in this slice: {supported}."
         )
 
+    read_store = _clean_env_value(source.get(KANBAN_READ_STORE_ENV), ACTIVE_STORE_SQLITE)
+    if read_store not in SUPPORTED_READ_STORES:
+        supported = ", ".join(sorted(SUPPORTED_READ_STORES))
+        raise KanbanDatastoreConfigError(
+            f"{KANBAN_READ_STORE_ENV}={read_store!r} is invalid. "
+            f"Supported Kanban read stores in this slice: {supported}."
+        )
+
     candidate_backend = _clean_env_value(
         source.get(KANBAN_CANDIDATE_BACKEND_ENV),
         "postgres",
@@ -86,6 +98,7 @@ def load_kanban_datastore_config(
 
     return KanbanDatastoreConfig(
         active_store=active_store,
+        read_store=read_store,
         candidate_backend=candidate_backend,
         candidate_database_url_configured=bool(
             str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip()
@@ -102,8 +115,12 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         "config_schema": KANBAN_DATASTORE_CONFIG_SCHEMA,
         "active_store": config.active_store,
         "reads": {
-            "store": ACTIVE_STORE_SQLITE,
-            "candidate_enabled": False,
+            "store": config.read_store,
+            "candidate_enabled": config.read_store != ACTIVE_STORE_SQLITE,
+            "candidate_mode": "sqlite-shadow"
+            if config.read_store == CANDIDATE_READ_STORE_SHADOW
+            else "disabled",
+            "read_store_env": KANBAN_READ_STORE_ENV,
         },
         "writes": {
             "store": ACTIVE_STORE_SQLITE,
@@ -117,11 +134,13 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
             "backend_env": KANBAN_CANDIDATE_BACKEND_ENV,
             "bootstrap_dry_run_supported": True,
             "bootstrap_apply_supported": False,
+            "read_shadow_supported": True,
+            "read_shadow_persistent": False,
         },
         "safety": {
             "destructive": False,
             "sqlite_rows_retained": True,
-            "sqlite_reads_retained": True,
+            "sqlite_reads_retained": config.read_store == ACTIVE_STORE_SQLITE,
             "sqlite_writes_retained": True,
             "cutover_requires_separate_backup_parity_and_rollback_proof": True,
         },
