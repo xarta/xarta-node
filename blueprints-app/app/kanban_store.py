@@ -1,4 +1,4 @@
-"""Kanban storage boundary for the current SQLite-backed implementation."""
+"""Kanban storage boundary shared by DB-API-compatible Kanban stores."""
 
 from __future__ import annotations
 
@@ -102,7 +102,12 @@ def _bool_setting_value(value: str | None, default: bool = True) -> bool:
 
 
 class SQLiteKanbanStore:
-    """Repository facade for Kanban reads and writes backed by SQLite."""
+    """Repository facade for Kanban reads and writes.
+
+    The class name is retained for compatibility with the original SQLite
+    implementation, but active Postgres mode supplies a Postgres-backed
+    DB-API-compatible connection.
+    """
 
     def __init__(
         self,
