@@ -48,7 +48,7 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import db as app_db  # noqa: E402
-from app import routes_kanban_backups, routes_personal, routes_sync  # noqa: E402
+from app import kanban_parity, routes_kanban_backups, routes_personal, routes_sync  # noqa: E402
 from app.kanban_datastore import (  # noqa: E402
     KanbanDatastoreConfigError,
     load_kanban_datastore_config,
@@ -4126,6 +4126,226 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
 
     with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})
+
+
+def _seed_kanban_shadow_parity_dataset(monkeypatch, tmp_path) -> tuple[sqlite3.Connection, Path]:
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    kanban_root = _patch_kanban_backup_env(monkeypatch, tmp_path, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", kanban_root)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="parity-root",
+                title="Parity Root",
+                body="Root parity proof",
+                state_id="doing",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="parity-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="parity-child",
+                parent_item_id="parity-root",
+                title="Parity Child",
+                body="Child board parity proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="parity-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_discussion(
+            "parity-root",
+            routes_personal.WorkDiscussionCreateRequest(
+                discussion_id="discussion-parity-root",
+                body="Discussion parity proof",
+                author="codex-test",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="parity-discussion-create",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[
+                    routes_personal.WorkPriorityRecommendationInput(
+                        item_id="parity-root",
+                        title="Parity priority",
+                        summary="Priority parity proof",
+                        reason="Shadow store should hydrate the recommendation item.",
+                        score=91.0,
+                    )
+                ],
+                strategy_version="shadow-parity-test-v1",
+                generated_at="2026-07-01T10:00:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="parity-priorities-replace",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "parity-root",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="session-parity-root",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                source_surface="pytest-session",
+                summary="Parity session proof",
+                actor="codex-test",
+                request_id="parity-session-create",
+            ),
+        )
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_decisions (
+            decision_id, item_id, processor_kind, decision_type, title, summary,
+            status, provider_mode
+        )
+        VALUES (
+            'decision-parity-root', 'parity-root', 'review', 'decision',
+            'Review parity', 'Decision parity proof', 'recorded', 'local'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_markers (
+            marker_id, item_id, processor_kind, document_type, document_ref,
+            status, provider_mode, decision_id, source_hash
+        )
+        VALUES (
+            'marker-parity-root', 'parity-root', 'preprocessing', 'item-body',
+            'kanban_items:parity-root', 'ready', 'local',
+            'decision-parity-root', 'sha256:parity-marker'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_failure_events (
+            failure_event_id, marker_id, item_id, processor_kind, document_type,
+            error_class, error_message, provider_mode, status
+        )
+        VALUES (
+            'failure-parity-root', 'marker-parity-root', 'parity-root',
+            'preprocessing', 'item-body', 'TransientParityError',
+            'covered by shadow parity', 'local', 'superseded'
+        )
+        """
+    )
+    routes_kanban_backups.create_kanban_backup(kind="manual")
+    return conn, kanban_root
+
+
+def test_work_kanban_datastore_shadow_parity_reports_api_shapes(monkeypatch, tmp_path):
+    conn, kanban_root = _seed_kanban_shadow_parity_dataset(monkeypatch, tmp_path)
+    before_sync_rows = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+
+    report = asyncio.run(routes_personal.get_work_kanban_datastore_parity(sample_limit=5))
+
+    assert report["ok"] is True, {
+        "failed_comparisons": report["failed_comparisons"],
+        "hash_mismatches": report["tables"]["hash_mismatches"],
+        "postload_totals": report["migration"]["postload_preview"]["totals"],
+        "safety": report["safety"],
+    }
+    assert report["candidate"]["shadow_backend"] == "sqlite-shadow"
+    assert report["candidate"]["live_reads_enabled"] is False
+    assert report["candidate"]["live_writes_enabled"] is False
+    assert report["safety"]["live_reads_changed"] is False
+    assert report["safety"]["live_writes_changed"] is False
+    assert report["safety"]["sync_queue_rows_created"] is False
+    assert report["safety"]["sync_queue_count_before"] == before_sync_rows
+    assert report["safety"]["sync_queue_count_after"] == before_sync_rows
+    assert report["migration"]["preload_preview"]["totals"]["inserted"] == sum(
+        report["tables"]["live_counts"].values()
+    )
+    assert report["migration"]["preload_preview"]["totals"]["conflicts"] == 0
+    assert report["migration"]["postload_preview"]["idempotent"] is True
+    assert report["migration"]["postload_preview"]["totals"]["unchanged"] == sum(
+        report["tables"]["live_counts"].values()
+    )
+    assert report["tables"]["hash_mismatches"] == []
+    assert "sync_queue" not in report["tables"]["included"]
+    assert report["tables"]["live_counts"]["kanban_review_processor_markers"] == 1
+    assert report["tables"]["live_counts"]["kanban_review_processor_failure_events"] == 1
+    assert report["tables"]["live_counts"]["kanban_agent_sessions"] == 1
+    assert report["coverage"]["backup_package_count"] == 1
+    assert report["coverage"]["kanban_file_count"] >= 1
+    assert report["coverage"]["automation_marker_count"] == 1
+    assert report["coverage"]["automation_failure_event_count"] == 1
+    assert report["coverage"]["agent_session_count"] == 1
+    assert report["coverage"]["review_decision_count"] == 1
+    assert "parity-root" in report["samples"]["item_ids"]
+    assert report["samples"]["child_board_parent_id"] == "parity-root"
+    assert set(report["coverage"]["api_shapes"]).issuperset(
+        {
+            "config",
+            "root_board",
+            "child_board",
+            "item_detail:parity-root",
+            "priorities",
+            "automation_markers",
+            "automation_failure_events",
+            "agent_sessions",
+            "review_decisions",
+            "backup_packages",
+            "file_backed_docs",
+        }
+    )
+    assert all(comparison["ok"] for comparison in report["api_comparisons"])
+    assert kanban_root.exists()
+
+
+def test_work_kanban_datastore_shadow_parity_detects_candidate_drift(monkeypatch, tmp_path):
+    conn, kanban_root = _seed_kanban_shadow_parity_dataset(monkeypatch, tmp_path)
+
+    def drift_candidate(candidate: sqlite3.Connection) -> None:
+        candidate.execute(
+            "UPDATE kanban_items SET title='Candidate Drift' WHERE item_id='parity-root'"
+        )
+
+    report = kanban_parity.kanban_shadow_parity_report(
+        conn,
+        depth_limit=routes_personal.KANBAN_DEPTH_LIMIT,
+        show_test_entries_setting=routes_personal.KANBAN_SHOW_TEST_ENTRIES_SETTING,
+        agent_working_out_tag=routes_personal.KANBAN_AGENT_WORKING_OUT_TAG,
+        kanban_root=kanban_root,
+        backup_dir=Path(routes_personal.cfg.KANBAN_BACKUP_DIR),
+        candidate_backend=routes_personal.cfg.KANBAN_DATASTORE_CONFIG.candidate_backend,
+        sample_limit=5,
+        candidate_mutator=drift_candidate,
+    )
+
+    assert report["ok"] is False
+    assert "kanban_items" in report["tables"]["hash_mismatches"]
+    assert report["migration"]["postload_preview"]["tables"]["kanban_items"]["updated"] == 1
+    assert report["migration"]["postload_preview"]["totals"]["conflicts"] == 1
+    assert "root_board" in report["failed_comparisons"]
+    assert "item_detail:parity-root" in report["failed_comparisons"]
+    assert report["safety"]["live_reads_changed"] is False
+    assert report["safety"]["live_writes_changed"] is False
+    assert report["safety"]["sync_queue_rows_created"] is False
 
 
 def test_work_kanban_backup_package_covers_datastore_tables_and_file_hashes(monkeypatch, tmp_path):

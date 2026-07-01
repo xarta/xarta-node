@@ -254,7 +254,7 @@ class SQLiteKanbanStore:
             """
             SELECT * FROM kanban_audit_log
             WHERE item_id=?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, audit_id
             LIMIT 20
             """,
             (clean_item_id,),
