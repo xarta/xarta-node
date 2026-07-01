@@ -39,6 +39,7 @@ from .sync.queue import (
     enqueue_for_all_peers,
     get_queue_depths,
     get_sent_queue_retention_summary,
+    kanban_table_fleet_sync_disabled,
     prune_sent_actions,
 )
 from .sync.restore import apply_restore, make_full_backup
@@ -671,6 +672,14 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
                     continue
 
             try:
+                if kanban_table_fleet_sync_disabled(action.table_name):
+                    log.debug(
+                        "skipping incoming Kanban SQLite mirror sync action for %s/%s "
+                        "while active_store=postgres",
+                        action.table_name,
+                        action.row_id,
+                    )
+                    continue
                 if _should_skip_stale_kanban_item_upsert(conn, action):
                     continue
                 _apply_action(conn, action)

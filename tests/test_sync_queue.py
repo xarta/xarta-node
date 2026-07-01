@@ -63,6 +63,15 @@ def _make_queue_db() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE nodes (
+            node_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-1')")
     return conn
 
 
@@ -196,3 +205,30 @@ def test_sent_queue_retention_preview_and_apply_preserves_unsent(monkeypatch):
     assert remaining[recent_sent_id] == 1
     assert remaining[unsent_id] == 0
     assert result["after"]["queue"]["unsent"] == 1
+
+
+def test_active_postgres_skips_kanban_table_enqueue(monkeypatch):
+    conn = _make_queue_db()
+    config = type("Config", (), {"active_store": "postgres"})()
+
+    monkeypatch.setattr(queue.cfg, "KANBAN_DATASTORE_CONFIG", config)
+
+    queue.enqueue_for_all_peers(
+        conn,
+        "UPDATE",
+        "kanban_audit_log",
+        "audit-1",
+        {"audit_id": "audit-1"},
+        10,
+    )
+    queue.enqueue_for_all_peers(
+        conn,
+        "UPDATE",
+        "settings",
+        "setting-1",
+        {"key": "setting-1"},
+        10,
+    )
+
+    rows = conn.execute("SELECT table_name, row_id FROM sync_queue ORDER BY queue_id").fetchall()
+    assert [dict(row) for row in rows] == [{"table_name": "settings", "row_id": "setting-1"}]

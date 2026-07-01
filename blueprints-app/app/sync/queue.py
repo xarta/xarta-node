@@ -19,14 +19,25 @@ from typing import Any
 
 from .. import config as cfg
 from ..db import get_conn
+from ..kanban_datastore import ACTIVE_STORE_POSTGRES, KANBAN_DATASTORE_TABLES
 
 log = logging.getLogger(__name__)
 
 _SYSTEM_ACTION_TYPES = ("sync_git_outer", "sync_git_non_root", "sync_git_inner")
+_KANBAN_FLEET_SYNC_TABLES = frozenset(KANBAN_DATASTORE_TABLES)
 
 
 def _utc_sqlite_now() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def kanban_table_fleet_sync_disabled(table_name: str) -> bool:
+    """Return True when active Postgres makes Kanban SQLite row sync obsolete."""
+    config = getattr(cfg, "KANBAN_DATASTORE_CONFIG", None)
+    return (
+        str(table_name or "") in _KANBAN_FLEET_SYNC_TABLES
+        and getattr(config, "active_store", None) == ACTIVE_STORE_POSTGRES
+    )
 
 
 def _sync_queue_columns(conn: sqlite3.Connection) -> set[str]:
@@ -214,6 +225,14 @@ def enqueue(
     Append one action to a peer's queue within an open transaction.
     Must be called from inside a get_conn() context after a write.
     """
+    if kanban_table_fleet_sync_disabled(table_name):
+        log.debug(
+            "skipping Kanban SQLite mirror sync enqueue for %s/%s while active_store=%s",
+            table_name,
+            row_id,
+            ACTIVE_STORE_POSTGRES,
+        )
+        return
     if guid is None:
         guid = uuid.uuid4().hex
     conn.execute(
@@ -254,6 +273,14 @@ def enqueue_for_all_peers(
     exclude_node_id: optionally skip one node when a caller has a separate,
     explicit plan for seeding or recovering that node.
     """
+    if kanban_table_fleet_sync_disabled(table_name):
+        log.debug(
+            "skipping Kanban SQLite mirror sync fanout for %s/%s while active_store=%s",
+            table_name,
+            row_id,
+            ACTIVE_STORE_POSTGRES,
+        )
+        return
     shared_guid = guid if guid is not None else uuid.uuid4().hex
     try:
         peer_rows = conn.execute(
