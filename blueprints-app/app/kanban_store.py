@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .db import get_setting
 
@@ -101,11 +101,19 @@ class SQLiteKanbanStore:
         depth_limit: int,
         show_test_entries_setting: str,
         agent_working_out_tag: str,
+        item_detail_document_reader: Callable[[Any, str], dict[str, Any]] | None = None,
+        item_review_document_reader: Callable[[Any, str], dict[str, Any]] | None = None,
+        item_detail_document_writer: Callable[..., dict[str, Any]] | None = None,
+        item_review_document_writer: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.conn = conn
         self.depth_limit = depth_limit
         self.show_test_entries_setting = show_test_entries_setting
         self.agent_working_out_tag = agent_working_out_tag
+        self._item_detail_document_reader = item_detail_document_reader
+        self._item_review_document_reader = item_review_document_reader
+        self._item_detail_document_writer = item_detail_document_writer
+        self._item_review_document_writer = item_review_document_writer
 
     def config(self) -> KanbanConfigRead:
         return KanbanConfigRead(
@@ -575,6 +583,60 @@ class SQLiteKanbanStore:
             (discussion_id,),
         )
 
+    def item_detail_document(self, item_id: str) -> dict[str, Any]:
+        reader = self._require_document_reader(
+            self._item_detail_document_reader, "item detail document reader"
+        )
+        clean_item_id = self._clean_id(item_id)
+        self.item_or_raise(clean_item_id)
+        return reader(self.conn, clean_item_id)
+
+    def item_review_document(self, item_id: str) -> dict[str, Any]:
+        reader = self._require_document_reader(
+            self._item_review_document_reader, "item review document reader"
+        )
+        clean_item_id = self._clean_id(item_id)
+        self.item_or_raise(clean_item_id)
+        return reader(self.conn, clean_item_id)
+
+    def write_item_detail_document(
+        self,
+        item_id: str,
+        body: str,
+        *,
+        actor: str,
+        now: str,
+    ) -> dict[str, Any]:
+        writer = self._require_document_writer(
+            self._item_detail_document_writer, "item detail document writer"
+        )
+        clean_item_id = self._clean_id(item_id)
+        self.item_or_raise(clean_item_id)
+        return writer(self.conn, clean_item_id, body, actor=actor, now=now)
+
+    def write_item_review_document(
+        self,
+        item_id: str,
+        body: str,
+        *,
+        actor: str,
+        now: str,
+        metadata_extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        writer = self._require_document_writer(
+            self._item_review_document_writer, "item review document writer"
+        )
+        clean_item_id = self._clean_id(item_id)
+        self.item_or_raise(clean_item_id)
+        return writer(
+            self.conn,
+            clean_item_id,
+            body,
+            actor=actor,
+            now=now,
+            metadata_extra=metadata_extra,
+        )
+
     def item(self, item_id: str | None) -> Any | None:
         clean_item_id = self._clean_id(item_id)
         if not clean_item_id:
@@ -929,3 +991,21 @@ class SQLiteKanbanStore:
         if not text:
             return ""
         return text[:limit]
+
+    @staticmethod
+    def _require_document_reader(
+        callback: Callable[[Any, str], dict[str, Any]] | None,
+        label: str,
+    ) -> Callable[[Any, str], dict[str, Any]]:
+        if callback is None:
+            raise KanbanStoreError(f"Kanban store missing {label}")
+        return callback
+
+    @staticmethod
+    def _require_document_writer(
+        callback: Callable[..., dict[str, Any]] | None,
+        label: str,
+    ) -> Callable[..., dict[str, Any]]:
+        if callback is None:
+            raise KanbanStoreError(f"Kanban store missing {label}")
+        return callback
