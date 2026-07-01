@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -47,7 +48,7 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import db as app_db  # noqa: E402
-from app import routes_personal, routes_sync  # noqa: E402
+from app import routes_kanban_backups, routes_personal, routes_sync  # noqa: E402
 from app.kanban_datastore import (  # noqa: E402
     KanbanDatastoreConfigError,
     load_kanban_datastore_config,
@@ -800,6 +801,18 @@ def _patch_conn(monkeypatch, conn: sqlite3.Connection) -> None:
         routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
         routes_personal._work_automation_current_node_id(),
     )
+
+
+def _patch_kanban_backup_env(monkeypatch, tmp_path: Path, conn: sqlite3.Connection) -> Path:
+    kanban_root = tmp_path / "kanban"
+    backup_dir = kanban_root / "backups"
+    backup_dir.mkdir(parents=True)
+    monkeypatch.setattr(routes_kanban_backups, "get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(routes_kanban_backups.cfg, "KANBAN_DIR", str(kanban_root))
+    monkeypatch.setattr(routes_kanban_backups.cfg, "KANBAN_BACKUP_DIR", str(backup_dir))
+    monkeypatch.setattr(routes_kanban_backups.cfg, "NODE_ID", "test-node")
+    monkeypatch.setattr(routes_kanban_backups.cfg, "NODE_NAME", "Test Node")
+    return kanban_root
 
 
 def _disable_import_status_sync(monkeypatch) -> None:
@@ -4113,6 +4126,128 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
 
     with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})
+
+
+def test_work_kanban_backup_package_covers_datastore_tables_and_file_hashes(monkeypatch, tmp_path):
+    conn = _make_conn()
+    kanban_root = _patch_kanban_backup_env(monkeypatch, tmp_path, conn)
+    detail_path = kanban_root / "database-topic-ancestor" / "items" / "backup-item" / "detail.md"
+    detail_path.parent.mkdir(parents=True)
+    detail_path.write_text("# Backup Item\n\nProof file.\n", encoding="utf-8")
+    (kanban_root / "backups" / "ignored.txt").write_text("exclude me", encoding="utf-8")
+    conn.execute(
+        """
+        INSERT INTO kanban_items (item_id, title, state_id, status)
+        VALUES ('backup-item', 'Backup Item', 'todo', 'open')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_failure_events (
+            failure_event_id, marker_id, item_id, error_class, error_message
+        )
+        VALUES ('failure-1', 'marker-1', 'backup-item', 'test', 'covered')
+        """
+    )
+
+    created = routes_kanban_backups.create_kanban_backup(kind="manual")
+    manifest = created["manifest"]
+
+    assert manifest["purpose"] == "kanban-datastore-migration-export"
+    assert manifest["sync_queue_included"] is False
+    assert "sync_queue" not in manifest["included_tables"]
+    assert "kanban_review_processor_failure_events" in manifest["included_tables"]
+    assert manifest["table_counts"]["kanban_review_processor_failure_events"] == 1
+    assert manifest["table_data_sha256"]
+    assert manifest["table_hashes"]["kanban_review_processor_failure_events"]
+    assert manifest["file_count"] == 1
+    rel_detail = "database-topic-ancestor/items/backup-item/detail.md"
+    assert (
+        manifest["file_hashes"][rel_detail] == hashlib.sha256(detail_path.read_bytes()).hexdigest()
+    )
+
+    listed = routes_kanban_backups.list_kanban_backups()
+    assert listed["backups"][0].filename == created["backup"].filename
+    assert listed["backups"][0].sha256 == ""
+    listed_with_hashes = routes_kanban_backups.list_kanban_backups(include_hashes=True)
+    assert listed_with_hashes["backups"][0].sha256
+
+    validation = routes_kanban_backups.validate_kanban_backup(created["backup"].filename)
+    assert validation["ok"] is True
+    assert validation["dry_run"]["idempotent"] is True
+    assert validation["dry_run"]["sync_queue_included"] is False
+
+
+def test_work_kanban_backup_import_dry_run_reports_conflicts_and_restore(monkeypatch, tmp_path):
+    conn = _make_conn()
+    kanban_root = _patch_kanban_backup_env(monkeypatch, tmp_path, conn)
+    detail_path = kanban_root / "database-topic-ancestor" / "items" / "backup-item" / "detail.md"
+    detail_path.parent.mkdir(parents=True)
+    detail_path.write_text("original detail\n", encoding="utf-8")
+    conn.execute(
+        """
+        INSERT INTO kanban_items (item_id, title, state_id, status)
+        VALUES ('backup-item', 'Original Title', 'todo', 'open')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_review_processor_failure_events (
+            failure_event_id, marker_id, item_id, error_class, error_message
+        )
+        VALUES ('failure-1', 'marker-1', 'backup-item', 'test', 'covered')
+        """
+    )
+    created = routes_kanban_backups.create_kanban_backup(kind="manual")
+    filename = created["backup"].filename
+
+    detail_path.write_text("changed detail\n", encoding="utf-8")
+    conn.execute("UPDATE kanban_items SET title='Changed Title' WHERE item_id='backup-item'")
+    conn.execute(
+        """
+        INSERT INTO kanban_items (item_id, title, state_id, status)
+        VALUES ('post-export-item', 'Post Export', 'todo', 'open')
+        """
+    )
+    conn.execute(
+        "DELETE FROM kanban_review_processor_failure_events WHERE failure_event_id='failure-1'"
+    )
+    before_sync_rows = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+
+    dry_run = routes_kanban_backups.import_kanban_backup(filename, apply=False)
+    assert dry_run["applied"] is False
+    assert dry_run["dry_run"]["tables"]["kanban_items"]["updated"] == 1
+    assert dry_run["dry_run"]["tables"]["kanban_items"]["deleted"] == 1
+    assert dry_run["dry_run"]["tables"]["kanban_items"]["conflicts"] == 2
+    assert dry_run["dry_run"]["tables"]["kanban_review_processor_failure_events"]["inserted"] == 1
+    assert dry_run["dry_run"]["sync_queue_rows_created"] is False
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] == before_sync_rows
+
+    applied = routes_kanban_backups.import_kanban_backup(
+        filename,
+        apply=True,
+        restore_files=True,
+        backup_before_import=False,
+    )
+    assert applied["ok"] is True
+    assert applied["applied"] is True
+    assert applied["dry_run"]["tables"]["kanban_items"]["conflicts"] == 2
+    restored = conn.execute("SELECT title FROM kanban_items WHERE item_id='backup-item'").fetchone()
+    assert restored["title"] == "Original Title"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_items WHERE item_id='post-export-item'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_review_processor_failure_events "
+            "WHERE failure_event_id='failure-1'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert detail_path.read_text(encoding="utf-8") == "original detail\n"
 
 
 def test_work_preprocessing_scoped_decomposition_reparent_guard(monkeypatch, tmp_path):

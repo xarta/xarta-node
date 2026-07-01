@@ -27,6 +27,7 @@ from starlette.responses import FileResponse
 
 from . import config as cfg
 from .db import get_conn, get_gen, increment_gen
+from .kanban_datastore import KANBAN_DATASTORE_TABLES
 from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
@@ -43,22 +44,8 @@ _MANIFEST_MEMBER = "manifest.json"
 _FILES_PREFIX = "files/kanban/"
 _PRESERVE_KANBAN_ROOT_NAMES = {"backups", ".stfolder", ".stversions"}
 
-KANBAN_BACKUP_TABLES: tuple[str, ...] = (
-    "kanban_item_states",
-    "kanban_item_priorities",
-    "kanban_items",
-    "kanban_item_order_edges",
-    "kanban_item_links",
-    "kanban_item_commits",
-    "kanban_review_decisions",
-    "kanban_review_processor_leases",
-    "kanban_review_processor_markers",
-    "kanban_agent_hints",
-    "kanban_agent_sessions",
-    "kanban_blockers",
-    "kanban_discussions",
-    "kanban_audit_log",
-)
+KANBAN_BACKUP_TABLES: tuple[str, ...] = (*KANBAN_DATASTORE_TABLES,)
+KANBAN_BACKUP_EXCLUDED_TABLES: tuple[str, ...] = ("sync_queue",)
 
 
 class KanbanBackupEntry(BaseModel):
@@ -92,6 +79,7 @@ class KanbanBackupValidationResponse(BaseModel):
     manifest: dict[str, Any]
     table_counts: dict[str, int]
     file_count: int
+    dry_run: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -104,6 +92,7 @@ class KanbanBackupImportResponse(BaseModel):
     gen_after: int
     table_counts: dict[str, int]
     file_count: int
+    dry_run: dict[str, Any] = Field(default_factory=dict)
     pre_import_backup: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
@@ -144,6 +133,23 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256_json(payload: Any) -> str:
+    return _sha256_bytes(_json_bytes(payload))
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     if not rows:
@@ -165,13 +171,17 @@ def _collect_table_data(conn: sqlite3.Connection) -> dict[str, Any]:
     tables: dict[str, Any] = {}
     for table in KANBAN_BACKUP_TABLES:
         columns = _table_columns(conn, table)
-        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        pk = _table_pk(conn, table)
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY {pk}").fetchall()
         tables[table] = {
             "columns": columns,
+            "primary_key": pk,
             "rows": [{col: row[col] for col in columns} for row in rows],
         }
     return {
         "schema": BACKUP_TABLE_SCHEMA,
+        "excluded_tables": list(KANBAN_BACKUP_EXCLUDED_TABLES),
+        "sync_queue_included": False,
         "tables": tables,
     }
 
@@ -188,6 +198,54 @@ def _iter_kanban_files(root: Path) -> list[Path]:
             continue
         files.append(path)
     return sorted(files)
+
+
+def _file_manifest(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for path in files:
+        stat = path.stat()
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "size_bytes": stat.st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+    return entries
+
+
+def _table_hashes(table_data: dict[str, Any]) -> dict[str, str]:
+    tables = table_data.get("tables") or {}
+    return {table: _sha256_json(tables[table]) for table in KANBAN_BACKUP_TABLES}
+
+
+def _load_backup_manifest(path: Path) -> dict[str, Any]:
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            try:
+                manifest_file = tar.extractfile(_MANIFEST_MEMBER)
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=422, detail=f"Backup package missing {exc.args[0]}"
+                ) from exc
+            if manifest_file is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Backup package manifest is not readable.",
+                )
+            manifest = json.loads(manifest_file.read().decode("utf-8"))
+    except tarfile.TarError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid Kanban backup package: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid Kanban backup package JSON: {exc}"
+        ) from exc
+
+    if manifest.get("schema") != BACKUP_SCHEMA:
+        raise HTTPException(status_code=422, detail="Kanban backup package schema mismatch.")
+    return manifest
 
 
 def _load_backup_package(path: Path) -> tuple[dict[str, Any], dict[str, Any], int]:
@@ -209,9 +267,17 @@ def _load_backup_package(path: Path) -> tuple[dict[str, Any], dict[str, Any], in
             manifest = json.loads(manifest_file.read().decode("utf-8"))
             table_data = json.loads(table_file.read().decode("utf-8"))
             file_count = 0
+            actual_file_hashes: dict[str, str] = {}
             for member in tar.getmembers():
                 if member.name.startswith(_FILES_PREFIX) and member.isfile():
-                    _safe_package_member_rel(member.name)
+                    rel = _safe_package_member_rel(member.name).as_posix()
+                    source = tar.extractfile(member)
+                    if source is None:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"Unreadable backup package member: {member.name}",
+                        )
+                    actual_file_hashes[rel] = _sha256_bytes(source.read())
                     file_count += 1
                 elif member.name.startswith(_FILES_PREFIX) and not member.isdir():
                     warnings.append(f"ignored non-file package member: {member.name}")
@@ -233,6 +299,33 @@ def _load_backup_package(path: Path) -> tuple[dict[str, Any], dict[str, Any], in
         raise HTTPException(
             status_code=422, detail=f"Backup package missing Kanban tables: {', '.join(missing)}"
         )
+    forbidden = [
+        table for table in KANBAN_BACKUP_EXCLUDED_TABLES if table in table_data.get("tables", {})
+    ]
+    if forbidden:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Backup package includes excluded tables: {', '.join(forbidden)}",
+        )
+    expected_table_hashes = manifest.get("table_hashes") or {}
+    if expected_table_hashes:
+        actual_table_hashes = _table_hashes(table_data)
+        for table in KANBAN_BACKUP_TABLES:
+            if str(expected_table_hashes.get(table) or "") != actual_table_hashes.get(table):
+                warnings.append(f"manifest table hash mismatch: {table}")
+    expected_table_data_hash = str(manifest.get("table_data_sha256") or "")
+    if expected_table_data_hash and expected_table_data_hash != _sha256_json(table_data):
+        warnings.append("manifest table_data_sha256 differs from backup table data")
+    expected_file_hashes = manifest.get("file_hashes") or {}
+    if expected_file_hashes:
+        for rel, expected_hash in sorted(expected_file_hashes.items()):
+            actual_hash = actual_file_hashes.get(str(rel))
+            if actual_hash is None:
+                warnings.append(f"manifest file missing from package: {rel}")
+            elif str(expected_hash) != actual_hash:
+                warnings.append(f"manifest file hash mismatch: {rel}")
+        for rel in sorted(set(actual_file_hashes) - {str(key) for key in expected_file_hashes}):
+            warnings.append(f"package file missing from manifest hashes: {rel}")
     if warnings:
         manifest.setdefault("warnings", []).extend(warnings)
     return manifest, table_data, file_count
@@ -247,21 +340,24 @@ def _safe_package_member_rel(member_name: str) -> PurePosixPath:
     return rel
 
 
-def _backup_entry(path: Path) -> KanbanBackupEntry:
+def _backup_entry(path: Path, *, include_sha256: bool = False) -> KanbanBackupEntry:
     stat = path.stat()
     backup_id = ""
     kind = ""
     db_gen: int | None = None
     table_counts: dict[str, int] = {}
     file_count: int | None = None
+    sha256 = ""
     try:
-        manifest, _table_data, counted_files = _load_backup_package(path)
+        manifest = _load_backup_manifest(path)
         backup_id = str(manifest.get("backup_id") or "")
         kind = str(manifest.get("kind") or "")
         db_gen_raw = manifest.get("db_gen")
         db_gen = int(db_gen_raw) if db_gen_raw is not None else None
         table_counts = {str(k): int(v) for k, v in (manifest.get("table_counts") or {}).items()}
-        file_count = int(manifest.get("file_count", counted_files))
+        file_count = int(manifest.get("file_count", 0))
+        if include_sha256:
+            sha256 = _sha256_file(path)
     except Exception:
         log.debug("could not read Kanban backup package manifest: %s", path.name, exc_info=True)
     return KanbanBackupEntry(
@@ -273,7 +369,7 @@ def _backup_entry(path: Path) -> KanbanBackupEntry:
         db_gen=db_gen,
         table_counts=table_counts,
         file_count=file_count,
-        sha256=_sha256_file(path),
+        sha256=sha256,
     )
 
 
@@ -291,18 +387,28 @@ def _create_backup_file(kind: str = "manual") -> KanbanBackupEntry:
 
     table_counts = {table: len(payload["rows"]) for table, payload in table_data["tables"].items()}
     files = _iter_kanban_files(root)
+    file_manifest = _file_manifest(root, files)
     manifest = {
         "schema": BACKUP_SCHEMA,
         "backup_id": backup_id,
         "kind": clean_kind,
+        "purpose": "kanban-datastore-migration-export",
         "created_at": _utc_now(),
         "node_id": cfg.NODE_ID,
         "node_name": cfg.NODE_NAME,
         "app_commit": getattr(cfg, "COMMIT_HASH", ""),
         "db_gen": db_gen,
         "kanban_root": str(root),
+        "tables_schema": BACKUP_TABLE_SCHEMA,
+        "included_tables": list(KANBAN_BACKUP_TABLES),
+        "excluded_tables": list(KANBAN_BACKUP_EXCLUDED_TABLES),
+        "sync_queue_included": False,
         "table_counts": table_counts,
+        "table_hashes": _table_hashes(table_data),
+        "table_data_sha256": _sha256_json(table_data),
         "file_count": len(files),
+        "files": file_manifest,
+        "file_hashes": {entry["path"]: entry["sha256"] for entry in file_manifest},
         "excluded_root_names": sorted(_PRESERVE_KANBAN_ROOT_NAMES),
     }
 
@@ -327,6 +433,82 @@ def _table_counts(table_data: dict[str, Any]) -> dict[str, int]:
     return {
         table: len(payload.get("rows") or [])
         for table, payload in table_data.get("tables", {}).items()
+    }
+
+
+def _rows_by_primary_key(
+    conn: sqlite3.Connection, table: str
+) -> tuple[str, list[str], dict[str, dict[str, Any]]]:
+    columns = _table_columns(conn, table)
+    pk = _table_pk(conn, table)
+    rows = {
+        str(row[pk]): {col: row[col] for col in columns}
+        for row in conn.execute(f"SELECT * FROM {table}").fetchall()
+    }
+    return pk, columns, rows
+
+
+def _row_hash(row: dict[str, Any], columns: list[str]) -> str:
+    return _sha256_json({col: row.get(col) for col in columns})
+
+
+def _import_dry_run_report(
+    conn: sqlite3.Connection,
+    table_data: dict[str, Any],
+) -> dict[str, Any]:
+    table_reports: dict[str, Any] = {}
+    totals = {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "deleted": 0,
+        "conflicts": 0,
+    }
+    for table in KANBAN_BACKUP_TABLES:
+        _pk, db_columns, current_rows = _rows_by_primary_key(conn, table)
+        payload = table_data["tables"][table]
+        backup_columns = [col for col in payload.get("columns", []) if col in db_columns]
+        backup_rows = {
+            str(row.get(payload.get("primary_key") or _pk)): row
+            for row in payload.get("rows") or []
+        }
+        inserted_ids = sorted(set(backup_rows) - set(current_rows))
+        deleted_ids = sorted(set(current_rows) - set(backup_rows))
+        shared_ids = sorted(set(current_rows) & set(backup_rows))
+        updated_ids = [
+            row_id
+            for row_id in shared_ids
+            if _row_hash(current_rows[row_id], backup_columns)
+            != _row_hash(backup_rows[row_id], backup_columns)
+        ]
+        unchanged_ids = [row_id for row_id in shared_ids if row_id not in set(updated_ids)]
+        conflicts = len(updated_ids) + len(deleted_ids)
+        table_reports[table] = {
+            "primary_key": payload.get("primary_key") or _pk,
+            "inserted": len(inserted_ids),
+            "updated": len(updated_ids),
+            "unchanged": len(unchanged_ids),
+            "deleted": len(deleted_ids),
+            "conflicts": conflicts,
+            "sample_inserted_ids": inserted_ids[:10],
+            "sample_updated_ids": updated_ids[:10],
+            "sample_deleted_ids": deleted_ids[:10],
+        }
+        totals["inserted"] += len(inserted_ids)
+        totals["updated"] += len(updated_ids)
+        totals["unchanged"] += len(unchanged_ids)
+        totals["deleted"] += len(deleted_ids)
+        totals["conflicts"] += conflicts
+
+    return {
+        "schema": "xarta.kanban.backup.import_preview.v1",
+        "table_count": len(KANBAN_BACKUP_TABLES),
+        "tables": table_reports,
+        "totals": totals,
+        "idempotent": not (totals["inserted"] or totals["updated"] or totals["deleted"]),
+        "sync_queue_included": "sync_queue" in (table_data.get("tables") or {}),
+        "sync_queue_rows_created": False,
+        "excluded_tables": list(KANBAN_BACKUP_EXCLUDED_TABLES),
     }
 
 
@@ -465,10 +647,12 @@ def _import_table_rows(
 
 
 @router.get("", response_model=KanbanBackupListResponse)
-def list_kanban_backups() -> KanbanBackupListResponse:
+def list_kanban_backups(
+    include_hashes: bool = False,
+) -> KanbanBackupListResponse:
     backup_dir = _backup_dir()
     backups = [
-        _backup_entry(path)
+        _backup_entry(path, include_sha256=include_hashes)
         for path in sorted(backup_dir.glob("*-kanban-*.tar.gz"), reverse=True)
         if _SAFE_BACKUP_NAME.match(path.name)
     ]
@@ -506,12 +690,15 @@ def validate_kanban_backup(filename: str) -> KanbanBackupValidationResponse:
         warnings.append("manifest table counts differ from backup table data")
     if int(manifest.get("file_count", file_count)) != file_count:
         warnings.append("manifest file_count differs from backup package members")
+    with get_conn() as conn:
+        dry_run = _import_dry_run_report(conn, table_data)
     return {
         "ok": not warnings,
         "filename": path.name,
         "manifest": manifest,
         "table_counts": actual_counts,
         "file_count": file_count,
+        "dry_run": dry_run,
         "warnings": warnings,
     }
 
@@ -536,6 +723,7 @@ def import_kanban_backup(
 
     with get_conn() as conn:
         gen_before = get_gen(conn)
+        dry_run = _import_dry_run_report(conn, table_data)
     gen_after = gen_before
     pre_import_backup: str | None = None
     applied_file_count = file_count
@@ -550,6 +738,7 @@ def import_kanban_backup(
             "gen_after": gen_after,
             "table_counts": table_counts,
             "file_count": file_count,
+            "dry_run": dry_run,
             "pre_import_backup": None,
             "warnings": warnings,
         }
@@ -588,6 +777,7 @@ def import_kanban_backup(
                     "restore_files": restore_files,
                     "file_count": file_count,
                     "table_counts": table_counts,
+                    "dry_run_totals": dry_run.get("totals", {}),
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -614,6 +804,7 @@ def import_kanban_backup(
         "gen_after": gen_after,
         "table_counts": table_counts,
         "file_count": applied_file_count if restore_files else file_count,
+        "dry_run": dry_run,
         "pre_import_backup": pre_import_backup,
         "warnings": warnings,
     }
