@@ -637,6 +637,146 @@ class SQLiteKanbanStore:
             metadata_extra=metadata_extra,
         )
 
+    def create_item_link_row(self, payload: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_item_links (
+                link_id, source_item_id, target_item_id, link_type, metadata_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["link_id"],
+                payload["source_item_id"],
+                payload["target_item_id"],
+                payload["link_type"],
+                json.dumps(payload["metadata"], ensure_ascii=True, sort_keys=True),
+                payload["created_at"],
+                payload["updated_at"],
+            ),
+        )
+        return self.conn.execute(
+            "SELECT * FROM kanban_item_links WHERE link_id=?",
+            (payload["link_id"],),
+        ).fetchone()
+
+    def blocker_row(self, blocker_id: str) -> Any | None:
+        clean_blocker_id = self._clean_id(blocker_id)
+        if not clean_blocker_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
+            (clean_blocker_id,),
+        ).fetchone()
+
+    def upsert_blocker_row(self, payload: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_blockers (
+                blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+                search_text, search_metadata_json, embedding_ref, embedding_model,
+                embedding_updated_at, vector_index_key, provenance_json, created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+            ON CONFLICT(blocker_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                title=excluded.title,
+                body_excerpt=excluded.body_excerpt,
+                status=excluded.status,
+                blocked_by_ref=excluded.blocked_by_ref,
+                search_text=excluded.search_text,
+                search_metadata_json=excluded.search_metadata_json,
+                vector_index_key=excluded.vector_index_key,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["blocker_id"],
+                payload["item_id"],
+                payload["title"],
+                payload["body_excerpt"],
+                payload["status"],
+                payload["blocked_by_ref"],
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                payload["created_at"],
+                payload["updated_at"],
+            ),
+        )
+        return self.blocker_row(payload["blocker_id"])
+
+    def item_commit_row_for_ref(
+        self,
+        *,
+        item_id: str,
+        repo_full_name: str,
+        sha: str,
+    ) -> Any | None:
+        return self.conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=? AND repo_full_name=? AND sha=?
+            """,
+            (item_id, repo_full_name, sha),
+        ).fetchone()
+
+    def upsert_item_commit_row(self, payload: dict[str, Any]) -> tuple[Any, bool]:
+        existing = self.item_commit_row_for_ref(
+            item_id=payload["item_id"],
+            repo_full_name=payload["repo_full_name"],
+            sha=payload["sha"],
+        )
+        self.conn.execute(
+            """
+            INSERT INTO kanban_item_commits (
+                commit_link_id, item_id, repo_full_name, sha, short_sha, html_url,
+                author_login, author_name, committed_at, message_subject, message_body,
+                branch, metadata_json, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, repo_full_name, sha) DO UPDATE SET
+                short_sha=excluded.short_sha,
+                html_url=excluded.html_url,
+                author_login=excluded.author_login,
+                author_name=excluded.author_name,
+                committed_at=excluded.committed_at,
+                message_subject=excluded.message_subject,
+                message_body=excluded.message_body,
+                branch=excluded.branch,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                payload["commit_link_id"],
+                payload["item_id"],
+                payload["repo_full_name"],
+                payload["sha"],
+                payload["short_sha"],
+                payload["html_url"],
+                payload["author_login"],
+                payload["author_name"],
+                payload["committed_at"],
+                payload["message_subject"],
+                payload["message_body"],
+                payload["branch"],
+                json.dumps(payload["metadata"], ensure_ascii=True, sort_keys=True),
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                payload["created_at"],
+                payload["updated_at"],
+            ),
+        )
+        commit_link_id = existing["commit_link_id"] if existing else payload["commit_link_id"]
+        row = self.conn.execute(
+            "SELECT * FROM kanban_item_commits WHERE commit_link_id=?",
+            (commit_link_id,),
+        ).fetchone()
+        return row, existing is not None
+
     def item(self, item_id: str | None) -> Any | None:
         clean_item_id = self._clean_id(item_id)
         if not clean_item_id:

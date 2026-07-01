@@ -9658,6 +9658,7 @@ def _upsert_work_blocker_locked(
     provenance_extra: dict[str, Any] | None = None,
     audit_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    store = _kanban_write_store(conn)
     clean_blocker_id = _clean_work_id(blocker_id, "blocker")
     clean_title = _clean_short_text(title, "", limit=180)
     if not clean_title:
@@ -9694,51 +9695,24 @@ def _upsert_work_blocker_locked(
             "provenance_extra": provenance_extra or {},
         }
     )
-    previous = conn.execute(
-        "SELECT created_at FROM kanban_blockers WHERE blocker_id=?",
-        (clean_blocker_id,),
-    ).fetchone()
+    previous = store.blocker_row(clean_blocker_id)
     created_at = previous["created_at"] if previous and previous["created_at"] else now
-    conn.execute(
-        """
-        INSERT INTO kanban_blockers (
-            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
-            search_text, search_metadata_json, embedding_ref, embedding_model,
-            embedding_updated_at, vector_index_key, provenance_json, created_at,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
-        ON CONFLICT(blocker_id) DO UPDATE SET
-            item_id=excluded.item_id,
-            title=excluded.title,
-            body_excerpt=excluded.body_excerpt,
-            status=excluded.status,
-            blocked_by_ref=excluded.blocked_by_ref,
-            search_text=excluded.search_text,
-            search_metadata_json=excluded.search_metadata_json,
-            vector_index_key=excluded.vector_index_key,
-            provenance_json=excluded.provenance_json,
-            updated_at=excluded.updated_at
-        """,
-        (
-            clean_blocker_id,
-            item["item_id"],
-            clean_title,
-            body_excerpt,
-            blocker_status,
-            clean_blocked_by_ref,
-            search_text,
-            json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-            vector_key,
-            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-            created_at,
-            now,
-        ),
+    blocker_row = store.upsert_blocker_row(
+        {
+            "blocker_id": clean_blocker_id,
+            "item_id": item["item_id"],
+            "title": clean_title,
+            "body_excerpt": body_excerpt,
+            "status": blocker_status,
+            "blocked_by_ref": clean_blocked_by_ref,
+            "search_text": search_text,
+            "search_metadata": search_metadata,
+            "vector_index_key": vector_key,
+            "provenance": provenance,
+            "created_at": created_at,
+            "updated_at": now,
+        }
     )
-    blocker_row = conn.execute(
-        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-        (clean_blocker_id,),
-    ).fetchone()
     metadata = {
         "status": blocker_row["status"],
         "blocked_by_ref": blocker_row["blocked_by_ref"],
@@ -14136,24 +14110,20 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
     }
     source_hash = _hash_json_payload(row)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         source = _work_item_or_404(conn, source_item_id)
         _work_item_or_404(conn, target_item_id)
-        conn.execute(
-            """
-            INSERT INTO kanban_item_links (
-                link_id, source_item_id, target_item_id, link_type, metadata_json,
-                created_at, updated_at
-            )
-            VALUES (
-                :link_id, :source_item_id, :target_item_id, :link_type,
-                :metadata_json, :created_at, :updated_at
-            )
-            """,
-            row,
+        link_row = store.create_item_link_row(
+            {
+                "link_id": link_id,
+                "source_item_id": source_item_id,
+                "target_item_id": target_item_id,
+                "link_type": link_type,
+                "metadata": metadata,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        link_row = conn.execute(
-            "SELECT * FROM kanban_item_links WHERE link_id=?", (link_id,)
-        ).fetchone()
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -14226,6 +14196,7 @@ async def record_work_item_commit(
     metadata = dict(body.metadata) if isinstance(body.metadata, dict) else {}
     link_id = _kanban_commit_link_id(clean_item_id, repo_full_name, sha)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
         git_row = None
         with suppress(sqlite3.OperationalError):
@@ -14248,6 +14219,14 @@ async def record_work_item_commit(
         )
         if not html_url:
             html_url = _github_commit_url(repo_full_name, sha)
+        provenance = {
+            "commit_ref": _git_commit_ref(repo_full_name, sha),
+            "recorded_by": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+            "run_id": meta["run_id"],
+            "personal_git_commit_id": git_row["commit_id"] if git_row else "",
+        }
         row = {
             "commit_link_id": link_id,
             "item_id": clean_item_id,
@@ -14283,61 +14262,31 @@ async def record_work_item_commit(
             ),
             "branch": _clean_short_text(body.branch or "", "", limit=160),
             "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
-            "provenance_json": json.dumps(
-                {
-                    "commit_ref": _git_commit_ref(repo_full_name, sha),
-                    "recorded_by": meta["actor"],
-                    "source_surface": meta["source_surface"],
-                    "request_id": meta["request_id"],
-                    "run_id": meta["run_id"],
-                    "personal_git_commit_id": git_row["commit_id"] if git_row else "",
-                },
-                ensure_ascii=True,
-                sort_keys=True,
-            ),
+            "provenance_json": json.dumps(provenance, ensure_ascii=True, sort_keys=True),
             "created_at": now,
             "updated_at": now,
         }
         source_hash = _hash_json_payload(row)
-        existing = conn.execute(
-            """
-            SELECT * FROM kanban_item_commits
-            WHERE item_id=? AND repo_full_name=? AND sha=?
-            """,
-            (clean_item_id, repo_full_name, sha),
-        ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO kanban_item_commits (
-                commit_link_id, item_id, repo_full_name, sha, short_sha, html_url,
-                author_login, author_name, committed_at, message_subject, message_body,
-                branch, metadata_json, provenance_json, created_at, updated_at
-            )
-            VALUES (
-                :commit_link_id, :item_id, :repo_full_name, :sha, :short_sha,
-                :html_url, :author_login, :author_name, :committed_at,
-                :message_subject, :message_body, :branch, :metadata_json,
-                :provenance_json, :created_at, :updated_at
-            )
-            ON CONFLICT(item_id, repo_full_name, sha) DO UPDATE SET
-                short_sha=excluded.short_sha,
-                html_url=excluded.html_url,
-                author_login=excluded.author_login,
-                author_name=excluded.author_name,
-                committed_at=excluded.committed_at,
-                message_subject=excluded.message_subject,
-                message_body=excluded.message_body,
-                branch=excluded.branch,
-                metadata_json=excluded.metadata_json,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            row,
+        commit_row, updated_existing = store.upsert_item_commit_row(
+            {
+                "commit_link_id": link_id,
+                "item_id": clean_item_id,
+                "repo_full_name": repo_full_name,
+                "sha": sha,
+                "short_sha": short_sha,
+                "html_url": html_url,
+                "author_login": row["author_login"],
+                "author_name": row["author_name"],
+                "committed_at": row["committed_at"],
+                "message_subject": row["message_subject"],
+                "message_body": row["message_body"],
+                "branch": row["branch"],
+                "metadata": metadata,
+                "provenance": provenance,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        commit_row = conn.execute(
-            "SELECT * FROM kanban_item_commits WHERE commit_link_id=?",
-            (existing["commit_link_id"] if existing else link_id,),
-        ).fetchone()
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -14357,7 +14306,7 @@ async def record_work_item_commit(
                 "sha": sha,
                 "commit_ref": _git_commit_ref(repo_full_name, sha),
                 "html_url": html_url,
-                "upsert": "updated" if existing else "inserted",
+                "upsert": "updated" if updated_existing else "inserted",
             },
         )
         gen = increment_gen(conn, "kanban-item-commit")
@@ -19600,6 +19549,7 @@ def _upsert_work_blocker(
     meta = _work_request_meta(body)
     clean_blocker_id = _clean_work_id(blocker_id or body.blocker_id, "blocker")
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, body.item_id)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
@@ -19609,10 +19559,7 @@ def _upsert_work_blocker(
             body.blocked_by_ref, "", limit=220
         )
         blocker_status = _clean_work_leaf_status(body.status)
-        previous = conn.execute(
-            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-            (clean_blocker_id,),
-        ).fetchone()
+        previous = store.blocker_row(clean_blocker_id)
         if (
             previous is not None
             and _work_request_requires_blocked_leaf_guard(meta)
@@ -19656,45 +19603,22 @@ def _upsert_work_blocker(
             }
         )
         created_at = previous["created_at"] if previous and previous["created_at"] else now
-        conn.execute(
-            """
-            INSERT INTO kanban_blockers (
-                blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
-                search_text, search_metadata_json, embedding_ref, embedding_model,
-                embedding_updated_at, vector_index_key, provenance_json, created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
-            ON CONFLICT(blocker_id) DO UPDATE SET
-                item_id=excluded.item_id,
-                title=excluded.title,
-                body_excerpt=excluded.body_excerpt,
-                status=excluded.status,
-                blocked_by_ref=excluded.blocked_by_ref,
-                search_text=excluded.search_text,
-                search_metadata_json=excluded.search_metadata_json,
-                vector_index_key=excluded.vector_index_key,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                clean_blocker_id,
-                body.item_id,
-                title,
-                body_excerpt,
-                blocker_status,
-                blocked_by_ref,
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                created_at,
-                now,
-            ),
+        blocker_row = store.upsert_blocker_row(
+            {
+                "blocker_id": clean_blocker_id,
+                "item_id": body.item_id,
+                "title": title,
+                "body_excerpt": body_excerpt,
+                "status": blocker_status,
+                "blocked_by_ref": blocked_by_ref,
+                "search_text": search_text,
+                "search_metadata": search_metadata,
+                "vector_index_key": vector_key,
+                "provenance": provenance,
+                "created_at": created_at,
+                "updated_at": now,
+            }
         )
-        blocker_row = conn.execute(
-            "SELECT * FROM kanban_blockers WHERE blocker_id=?", (clean_blocker_id,)
-        ).fetchone()
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
