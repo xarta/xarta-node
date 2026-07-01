@@ -2176,41 +2176,7 @@ def _write_work_review_processor_lease(
     conn: Any,
     row: dict[str, Any],
 ) -> Any:
-    conn.execute(
-        """
-        INSERT INTO kanban_review_processor_leases (
-            lease_id, processor_kind, holder_id, lease_token, item_id, session_id,
-            status, acquired_at, heartbeat_at, expires_at, timeout_seconds,
-            source_hash, metadata_json, provenance_json, created_at, updated_at
-        )
-        VALUES (
-            :lease_id, :processor_kind, :holder_id, :lease_token, :item_id,
-            :session_id, :status, :acquired_at, :heartbeat_at, :expires_at,
-            :timeout_seconds, :source_hash, :metadata_json, :provenance_json,
-            :created_at, :updated_at
-        )
-        ON CONFLICT(lease_id) DO UPDATE SET
-            processor_kind=excluded.processor_kind,
-            holder_id=excluded.holder_id,
-            lease_token=excluded.lease_token,
-            item_id=excluded.item_id,
-            session_id=excluded.session_id,
-            status=excluded.status,
-            acquired_at=excluded.acquired_at,
-            heartbeat_at=excluded.heartbeat_at,
-            expires_at=excluded.expires_at,
-            timeout_seconds=excluded.timeout_seconds,
-            source_hash=excluded.source_hash,
-            metadata_json=excluded.metadata_json,
-            provenance_json=excluded.provenance_json,
-            updated_at=excluded.updated_at
-        """,
-        row,
-    )
-    return conn.execute(
-        "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
-        (row["lease_id"],),
-    ).fetchone()
+    return _kanban_write_store(conn).upsert_review_processor_lease_row(row)
 
 
 def _write_work_review_processor_lease_audit(
@@ -3537,72 +3503,7 @@ def _work_review_processor_marker_row(
 
 
 def _write_work_review_processor_marker(conn: Any, row: dict[str, Any]) -> Any:
-    conn.execute(
-        """
-        INSERT INTO kanban_review_processor_markers (
-            marker_id, item_id, processor_kind, document_type, document_ref,
-            document_updated_at, document_source_hash, processed_document_updated_at,
-            processed_source_hash, processed_at, queued_at, last_seen_at,
-            processing_started_at, processing_expires_at, attempt_count, last_error,
-            next_retry_at, retry_after_seconds, retry_attempt_count,
-            last_successful_source_hash, last_failure_event_id,
-            last_failure_source_hash, last_error_class, retry_policy_version,
-            superseded_at, superseded_by_source_hash, status, provider_mode,
-            decision_id, source_hash, metadata_json, provenance_json, created_at,
-            updated_at
-        )
-        VALUES (
-            :marker_id, :item_id, :processor_kind, :document_type, :document_ref,
-            :document_updated_at, :document_source_hash, :processed_document_updated_at,
-            :processed_source_hash, :processed_at, :queued_at, :last_seen_at,
-            :processing_started_at, :processing_expires_at, :attempt_count,
-            :last_error, :next_retry_at, :retry_after_seconds,
-            :retry_attempt_count, :last_successful_source_hash,
-            :last_failure_event_id, :last_failure_source_hash, :last_error_class,
-            :retry_policy_version, :superseded_at, :superseded_by_source_hash,
-            :status, :provider_mode, :decision_id, :source_hash, :metadata_json,
-            :provenance_json, :created_at, :updated_at
-        )
-        ON CONFLICT(marker_id) DO UPDATE SET
-            item_id=excluded.item_id,
-            processor_kind=excluded.processor_kind,
-            document_type=excluded.document_type,
-            document_ref=excluded.document_ref,
-            document_updated_at=excluded.document_updated_at,
-            document_source_hash=excluded.document_source_hash,
-            processed_document_updated_at=excluded.processed_document_updated_at,
-            processed_source_hash=excluded.processed_source_hash,
-            processed_at=excluded.processed_at,
-            queued_at=excluded.queued_at,
-            last_seen_at=excluded.last_seen_at,
-            processing_started_at=excluded.processing_started_at,
-            processing_expires_at=excluded.processing_expires_at,
-            attempt_count=excluded.attempt_count,
-            last_error=excluded.last_error,
-            next_retry_at=excluded.next_retry_at,
-            retry_after_seconds=excluded.retry_after_seconds,
-            retry_attempt_count=excluded.retry_attempt_count,
-            last_successful_source_hash=excluded.last_successful_source_hash,
-            last_failure_event_id=excluded.last_failure_event_id,
-            last_failure_source_hash=excluded.last_failure_source_hash,
-            last_error_class=excluded.last_error_class,
-            retry_policy_version=excluded.retry_policy_version,
-            superseded_at=excluded.superseded_at,
-            superseded_by_source_hash=excluded.superseded_by_source_hash,
-            status=excluded.status,
-            provider_mode=excluded.provider_mode,
-            decision_id=excluded.decision_id,
-            source_hash=excluded.source_hash,
-            metadata_json=excluded.metadata_json,
-            provenance_json=excluded.provenance_json,
-            updated_at=excluded.updated_at
-        """,
-        row,
-    )
-    return conn.execute(
-        "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
-        (row["marker_id"],),
-    ).fetchone()
+    return _kanban_write_store(conn).upsert_review_processor_marker_row(row)
 
 
 def _row_to_work_review_failure_event(row: Any) -> dict[str, Any]:
@@ -3700,51 +3601,7 @@ def _work_review_failure_event_row(
 
 
 def _write_work_review_failure_event(conn: Any, row: dict[str, Any]) -> Any:
-    conn.execute(
-        """
-        INSERT INTO kanban_review_processor_failure_events (
-            failure_event_id, marker_id, item_id, processor_kind, document_type,
-            source_hash, error_class, error_message, provider_mode, model_alias,
-            attempt_number, failed_at, next_retry_at, retry_after_seconds,
-            retry_policy_version, retryable, status, event_hash, metadata_json,
-            provenance_json, created_at, updated_at
-        )
-        VALUES (
-            :failure_event_id, :marker_id, :item_id, :processor_kind,
-            :document_type, :source_hash, :error_class, :error_message,
-            :provider_mode, :model_alias, :attempt_number, :failed_at,
-            :next_retry_at, :retry_after_seconds, :retry_policy_version,
-            :retryable, :status, :event_hash, :metadata_json, :provenance_json,
-            :created_at, :updated_at
-        )
-        ON CONFLICT(failure_event_id) DO UPDATE SET
-            marker_id=excluded.marker_id,
-            item_id=excluded.item_id,
-            processor_kind=excluded.processor_kind,
-            document_type=excluded.document_type,
-            source_hash=excluded.source_hash,
-            error_class=excluded.error_class,
-            error_message=excluded.error_message,
-            provider_mode=excluded.provider_mode,
-            model_alias=excluded.model_alias,
-            attempt_number=excluded.attempt_number,
-            failed_at=excluded.failed_at,
-            next_retry_at=excluded.next_retry_at,
-            retry_after_seconds=excluded.retry_after_seconds,
-            retry_policy_version=excluded.retry_policy_version,
-            retryable=excluded.retryable,
-            status=excluded.status,
-            event_hash=excluded.event_hash,
-            metadata_json=excluded.metadata_json,
-            provenance_json=excluded.provenance_json,
-            updated_at=excluded.updated_at
-        """,
-        row,
-    )
-    return conn.execute(
-        "SELECT * FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
-        (row["failure_event_id"],),
-    ).fetchone()
+    return _kanban_write_store(conn).upsert_review_failure_event_row(row)
 
 
 def _schedule_work_review_processor_marker_for_document(
@@ -10131,13 +9988,11 @@ def _upsert_work_processor_marker_blocker(
     meta: dict[str, str],
     now: str,
 ) -> dict[str, Any] | None:
+    store = _kanban_write_store(conn)
     marker_status = marker_row["status"] or ""
     open_status = marker_status in {"queued", "processing", "failed"}
     blocker_id = _work_processor_marker_blocker_id(marker_row["marker_id"])
-    previous = conn.execute(
-        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-        (blocker_id,),
-    ).fetchone()
+    previous = store.blocker_row(blocker_id)
     if not open_status and previous is None:
         return None
     item = conn.execute(
@@ -10194,46 +10049,22 @@ def _upsert_work_processor_marker_blocker(
             "decision_id": marker_row["decision_id"] or "",
         }
     )
-    conn.execute(
-        """
-        INSERT INTO kanban_blockers (
-            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
-            search_text, search_metadata_json, embedding_ref, embedding_model,
-            embedding_updated_at, vector_index_key, provenance_json, created_at,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
-        ON CONFLICT(blocker_id) DO UPDATE SET
-            item_id=excluded.item_id,
-            title=excluded.title,
-            body_excerpt=excluded.body_excerpt,
-            status=excluded.status,
-            blocked_by_ref=excluded.blocked_by_ref,
-            search_text=excluded.search_text,
-            search_metadata_json=excluded.search_metadata_json,
-            vector_index_key=excluded.vector_index_key,
-            provenance_json=excluded.provenance_json,
-            updated_at=excluded.updated_at
-        """,
-        (
-            blocker_id,
-            marker_row["item_id"],
-            title,
-            _body_excerpt(body_excerpt, limit=4000),
-            blocker_status,
-            blocked_by_ref,
-            search_text,
-            json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-            vector_key,
-            json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-            created_at,
-            now,
-        ),
+    blocker_row = store.upsert_blocker_row(
+        {
+            "blocker_id": blocker_id,
+            "item_id": marker_row["item_id"],
+            "title": title,
+            "body_excerpt": _body_excerpt(body_excerpt, limit=4000),
+            "status": blocker_status,
+            "blocked_by_ref": blocked_by_ref,
+            "search_text": search_text,
+            "search_metadata": search_metadata,
+            "vector_index_key": vector_key,
+            "provenance": provenance,
+            "created_at": created_at,
+            "updated_at": now,
+        }
     )
-    blocker_row = conn.execute(
-        "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-        (blocker_id,),
-    ).fetchone()
     audit_row = _write_work_audit(
         conn,
         audit_id=f"audit-{uuid.uuid4().hex}",
@@ -10268,6 +10099,7 @@ def _resolve_stale_work_processor_marker_blockers(
     meta: dict[str, str],
     now: str,
 ) -> list[dict[str, Any]]:
+    store = _kanban_write_store(conn)
     rows = conn.execute(
         """
         SELECT * FROM kanban_blockers
@@ -10330,29 +10162,19 @@ def _resolve_stale_work_processor_marker_blockers(
             "stale_reason": stale_reason,
             "current_document_source_hash": current_source_hash,
         }
-        conn.execute(
-            """
-            UPDATE kanban_blockers
-            SET title=?, body_excerpt=?, status='resolved', search_text=?,
-                search_metadata_json=?, vector_index_key=?, provenance_json=?,
-                updated_at=?
-            WHERE blocker_id=?
-            """,
-            (
-                title,
-                _body_excerpt(body_excerpt, limit=4000),
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(updated_provenance, ensure_ascii=True, sort_keys=True),
-                now,
-                blocker["blocker_id"],
-            ),
+        blocker_row = store.update_blocker_row(
+            blocker["blocker_id"],
+            {
+                "title": title,
+                "body_excerpt": _body_excerpt(body_excerpt, limit=4000),
+                "status": "resolved",
+                "search_text": search_text,
+                "search_metadata": search_metadata,
+                "vector_index_key": vector_key,
+                "provenance": updated_provenance,
+                "updated_at": now,
+            },
         )
-        blocker_row = conn.execute(
-            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-            (blocker["blocker_id"],),
-        ).fetchone()
         source_hash = _hash_json_payload(
             {
                 "blocker_id": blocker["blocker_id"],
@@ -10410,6 +10232,7 @@ def _resolve_satisfied_work_preprocessing_parent_context_blockers(
     meta: dict[str, str],
     now: str,
 ) -> list[dict[str, Any]]:
+    store = _kanban_write_store(conn)
     ancestor_context = _work_preprocessing_ancestor_context(conn, item_row)
     ancestors = ancestor_context.get("ancestors") if isinstance(ancestor_context, dict) else []
     if not isinstance(ancestors, list) or not ancestors:
@@ -10460,29 +10283,19 @@ def _resolve_satisfied_work_preprocessing_parent_context_blockers(
             "resolved_reason": "ancestor_context_available",
             "ancestor_item_ids": ancestor_ids[:5],
         }
-        conn.execute(
-            """
-            UPDATE kanban_blockers
-            SET title=?, body_excerpt=?, status='resolved', search_text=?,
-                search_metadata_json=?, vector_index_key=?, provenance_json=?,
-                updated_at=?
-            WHERE blocker_id=?
-            """,
-            (
-                title,
-                _body_excerpt(body_excerpt, limit=4000),
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(updated_provenance, ensure_ascii=True, sort_keys=True),
-                now,
-                blocker["blocker_id"],
-            ),
+        blocker_row = store.update_blocker_row(
+            blocker["blocker_id"],
+            {
+                "title": title,
+                "body_excerpt": _body_excerpt(body_excerpt, limit=4000),
+                "status": "resolved",
+                "search_text": search_text,
+                "search_metadata": search_metadata,
+                "vector_index_key": vector_key,
+                "provenance": updated_provenance,
+                "updated_at": now,
+            },
         )
-        blocker_row = conn.execute(
-            "SELECT * FROM kanban_blockers WHERE blocker_id=?",
-            (blocker["blocker_id"],),
-        ).fetchone()
         source_hash = _hash_json_payload(
             {
                 "blocker_id": blocker["blocker_id"],
@@ -14581,6 +14394,7 @@ async def record_work_item_review_decision(
     status = _clean_review_decision_status(body.status)
     provider_mode = _clean_review_provider_mode(body.provider_mode)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
         commit_rows = _work_decision_commit_rows(conn, commit_link_ids)
         found_commit_ids = {row["commit_link_id"] for row in commit_rows}
@@ -14629,52 +14443,10 @@ async def record_work_item_review_decision(
                 if key not in {"source_hash", "created_at", "updated_at"}
             }
         )
-        existing = conn.execute(
-            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
-            (decision_id,),
-        ).fetchone()
+        existing = store.review_decision_row(decision_id)
         if existing:
             row["created_at"] = existing["created_at"]
-        conn.execute(
-            """
-            INSERT INTO kanban_review_decisions (
-                decision_id, item_id, processor_kind, decision_type, title, summary,
-                rationale, affected_refs_json, confidence, uncertainty, proof_refs_json,
-                commit_link_ids_json, status, provider_mode, source_hash, metadata_json,
-                provenance_json, created_at, updated_at
-            )
-            VALUES (
-                :decision_id, :item_id, :processor_kind, :decision_type, :title,
-                :summary, :rationale, :affected_refs_json, :confidence,
-                :uncertainty, :proof_refs_json, :commit_link_ids_json, :status,
-                :provider_mode, :source_hash, :metadata_json, :provenance_json,
-                :created_at, :updated_at
-            )
-            ON CONFLICT(decision_id) DO UPDATE SET
-                item_id=excluded.item_id,
-                processor_kind=excluded.processor_kind,
-                decision_type=excluded.decision_type,
-                title=excluded.title,
-                summary=excluded.summary,
-                rationale=excluded.rationale,
-                affected_refs_json=excluded.affected_refs_json,
-                confidence=excluded.confidence,
-                uncertainty=excluded.uncertainty,
-                proof_refs_json=excluded.proof_refs_json,
-                commit_link_ids_json=excluded.commit_link_ids_json,
-                status=excluded.status,
-                provider_mode=excluded.provider_mode,
-                source_hash=excluded.source_hash,
-                metadata_json=excluded.metadata_json,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            row,
-        )
-        decision_row = conn.execute(
-            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
-            (decision_id,),
-        ).fetchone()
+        decision_row = store.upsert_review_decision_row(row)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -18995,12 +18767,10 @@ async def prune_work_automation_failure_events(
         }
         deleted_count = 0
         if body.apply and candidates:
+            store = _kanban_write_store(conn)
             gen = increment_gen(conn, "kanban-review-failure-prune")
             for row in candidates:
-                conn.execute(
-                    "DELETE FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
-                    (row["failure_event_id"],),
-                )
+                store.delete_review_failure_event_row(row["failure_event_id"])
                 enqueue_for_all_peers(
                     conn,
                     "DELETE",
@@ -19081,11 +18851,9 @@ async def update_work_item_agent_hints(
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     hint_id = _kanban_agent_hints_id(clean_item_id)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
-        existing = conn.execute(
-            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
-            (clean_item_id,),
-        ).fetchone()
+        existing = store.agent_hints_row_for_item(clean_item_id)
         required_skills = (
             _clean_work_agent_skills(body.required_skills)
             if body.required_skills is not None
@@ -19141,34 +18909,7 @@ async def update_work_item_agent_hints(
             "updated_at": now,
         }
         source_hash = _hash_json_payload(row)
-        conn.execute(
-            """
-            INSERT INTO kanban_agent_hints (
-                hint_id, item_id, required_skills_json, routing_notes,
-                commit_attribution_json, visibility, status, metadata_json,
-                provenance_json, created_at, updated_at
-            )
-            VALUES (
-                :hint_id, :item_id, :required_skills_json, :routing_notes,
-                :commit_attribution_json, :visibility, :status, :metadata_json,
-                :provenance_json, :created_at, :updated_at
-            )
-            ON CONFLICT(item_id) DO UPDATE SET
-                required_skills_json=excluded.required_skills_json,
-                routing_notes=excluded.routing_notes,
-                commit_attribution_json=excluded.commit_attribution_json,
-                visibility=excluded.visibility,
-                status=excluded.status,
-                metadata_json=excluded.metadata_json,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            row,
-        )
-        hint_row = conn.execute(
-            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
-            (clean_item_id,),
-        ).fetchone()
+        hint_row = store.upsert_agent_hints_row(row)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -19246,6 +18987,7 @@ async def create_work_item_agent_session(
     last_seen_at = _clean_short_text(body.last_seen_at or started_at, started_at, limit=80)
     status = _clean_work_agent_session_status(body.status)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
         row = {
             "session_id": session_id,
@@ -19284,51 +19026,12 @@ async def create_work_item_agent_session(
         if not row["agent_id"]:
             raise HTTPException(400, "Kanban agent session agent_id is required")
         source_hash = _hash_json_payload(row)
-        existing = conn.execute(
-            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
-            (session_id,),
-        ).fetchone()
+        existing = store.agent_session_row(session_id)
         if existing is not None and existing["item_id"] != clean_item_id:
             raise HTTPException(409, "Kanban agent session belongs to another item")
         if existing is not None:
             row["created_at"] = existing["created_at"]
-        conn.execute(
-            """
-            INSERT INTO kanban_agent_sessions (
-                session_id, item_id, agent_id, node_id, worktree_path,
-                repo_full_name, branch, status, started_at, ended_at,
-                last_seen_at, request_hash, source_surface, summary,
-                metadata_json, provenance_json, created_at, updated_at
-            )
-            VALUES (
-                :session_id, :item_id, :agent_id, :node_id, :worktree_path,
-                :repo_full_name, :branch, :status, :started_at, :ended_at,
-                :last_seen_at, :request_hash, :source_surface, :summary,
-                :metadata_json, :provenance_json, :created_at, :updated_at
-            )
-            ON CONFLICT(session_id) DO UPDATE SET
-                agent_id=excluded.agent_id,
-                node_id=excluded.node_id,
-                worktree_path=excluded.worktree_path,
-                repo_full_name=excluded.repo_full_name,
-                branch=excluded.branch,
-                status=excluded.status,
-                started_at=excluded.started_at,
-                ended_at=excluded.ended_at,
-                last_seen_at=excluded.last_seen_at,
-                request_hash=excluded.request_hash,
-                source_surface=excluded.source_surface,
-                summary=excluded.summary,
-                metadata_json=excluded.metadata_json,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            row,
-        )
-        session_row = conn.execute(
-            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
-            (session_id,),
-        ).fetchone()
+        session_row = store.upsert_agent_session_row(row)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -19378,10 +19081,8 @@ async def update_work_agent_session(
     meta = _work_request_meta(body)
     clean_session_id = _clean_work_agent_session_id(session_id)
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
-            (clean_session_id,),
-        ).fetchone()
+        store = _kanban_write_store(conn)
+        existing = store.agent_session_row(clean_session_id)
         if existing is None:
             raise HTTPException(404, "Kanban agent session not found")
         item = _work_item_or_404(conn, existing["item_id"])
@@ -19467,32 +19168,7 @@ async def update_work_agent_session(
         if not row["agent_id"]:
             raise HTTPException(400, "Kanban agent session agent_id is required")
         source_hash = _hash_json_payload(row)
-        conn.execute(
-            """
-            UPDATE kanban_agent_sessions SET
-                agent_id=:agent_id,
-                node_id=:node_id,
-                worktree_path=:worktree_path,
-                repo_full_name=:repo_full_name,
-                branch=:branch,
-                status=:status,
-                started_at=:started_at,
-                ended_at=:ended_at,
-                last_seen_at=:last_seen_at,
-                request_hash=:request_hash,
-                source_surface=:source_surface,
-                summary=:summary,
-                metadata_json=:metadata_json,
-                provenance_json=:provenance_json,
-                updated_at=:updated_at
-            WHERE session_id=:session_id
-            """,
-            row,
-        )
-        session_row = conn.execute(
-            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
-            (clean_session_id,),
-        ).fetchone()
+        session_row = store.update_agent_session_row(row)
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,

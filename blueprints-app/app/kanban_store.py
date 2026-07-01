@@ -709,6 +709,359 @@ class SQLiteKanbanStore:
         )
         return self.blocker_row(payload["blocker_id"])
 
+    def update_blocker_row(self, blocker_id: str, payload: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_blockers
+            SET title=?, body_excerpt=?, status=?, search_text=?,
+                search_metadata_json=?, vector_index_key=?, provenance_json=?,
+                updated_at=?
+            WHERE blocker_id=?
+            """,
+            (
+                payload["title"],
+                payload["body_excerpt"],
+                payload["status"],
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                payload["updated_at"],
+                blocker_id,
+            ),
+        )
+        return self.blocker_row(blocker_id)
+
+    def review_processor_lease_row(self, lease_id: str) -> Any | None:
+        clean_lease_id = self._clean_id(lease_id)
+        if not clean_lease_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (clean_lease_id,),
+        ).fetchone()
+
+    def upsert_review_processor_lease_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_review_processor_leases (
+                lease_id, processor_kind, holder_id, lease_token, item_id, session_id,
+                status, acquired_at, heartbeat_at, expires_at, timeout_seconds,
+                source_hash, metadata_json, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :lease_id, :processor_kind, :holder_id, :lease_token, :item_id,
+                :session_id, :status, :acquired_at, :heartbeat_at, :expires_at,
+                :timeout_seconds, :source_hash, :metadata_json, :provenance_json,
+                :created_at, :updated_at
+            )
+            ON CONFLICT(lease_id) DO UPDATE SET
+                processor_kind=excluded.processor_kind,
+                holder_id=excluded.holder_id,
+                lease_token=excluded.lease_token,
+                item_id=excluded.item_id,
+                session_id=excluded.session_id,
+                status=excluded.status,
+                acquired_at=excluded.acquired_at,
+                heartbeat_at=excluded.heartbeat_at,
+                expires_at=excluded.expires_at,
+                timeout_seconds=excluded.timeout_seconds,
+                source_hash=excluded.source_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.review_processor_lease_row(row["lease_id"])
+
+    def review_processor_marker_row(self, marker_id: str) -> Any | None:
+        clean_marker_id = self._clean_id(marker_id)
+        if not clean_marker_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (clean_marker_id,),
+        ).fetchone()
+
+    def upsert_review_processor_marker_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_review_processor_markers (
+                marker_id, item_id, processor_kind, document_type, document_ref,
+                document_updated_at, document_source_hash, processed_document_updated_at,
+                processed_source_hash, processed_at, queued_at, last_seen_at,
+                processing_started_at, processing_expires_at, attempt_count, last_error,
+                next_retry_at, retry_after_seconds, retry_attempt_count,
+                last_successful_source_hash, last_failure_event_id,
+                last_failure_source_hash, last_error_class, retry_policy_version,
+                superseded_at, superseded_by_source_hash, status, provider_mode,
+                decision_id, source_hash, metadata_json, provenance_json, created_at,
+                updated_at
+            )
+            VALUES (
+                :marker_id, :item_id, :processor_kind, :document_type, :document_ref,
+                :document_updated_at, :document_source_hash, :processed_document_updated_at,
+                :processed_source_hash, :processed_at, :queued_at, :last_seen_at,
+                :processing_started_at, :processing_expires_at, :attempt_count,
+                :last_error, :next_retry_at, :retry_after_seconds,
+                :retry_attempt_count, :last_successful_source_hash,
+                :last_failure_event_id, :last_failure_source_hash, :last_error_class,
+                :retry_policy_version, :superseded_at, :superseded_by_source_hash,
+                :status, :provider_mode, :decision_id, :source_hash, :metadata_json,
+                :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(marker_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                processor_kind=excluded.processor_kind,
+                document_type=excluded.document_type,
+                document_ref=excluded.document_ref,
+                document_updated_at=excluded.document_updated_at,
+                document_source_hash=excluded.document_source_hash,
+                processed_document_updated_at=excluded.processed_document_updated_at,
+                processed_source_hash=excluded.processed_source_hash,
+                processed_at=excluded.processed_at,
+                queued_at=excluded.queued_at,
+                last_seen_at=excluded.last_seen_at,
+                processing_started_at=excluded.processing_started_at,
+                processing_expires_at=excluded.processing_expires_at,
+                attempt_count=excluded.attempt_count,
+                last_error=excluded.last_error,
+                next_retry_at=excluded.next_retry_at,
+                retry_after_seconds=excluded.retry_after_seconds,
+                retry_attempt_count=excluded.retry_attempt_count,
+                last_successful_source_hash=excluded.last_successful_source_hash,
+                last_failure_event_id=excluded.last_failure_event_id,
+                last_failure_source_hash=excluded.last_failure_source_hash,
+                last_error_class=excluded.last_error_class,
+                retry_policy_version=excluded.retry_policy_version,
+                superseded_at=excluded.superseded_at,
+                superseded_by_source_hash=excluded.superseded_by_source_hash,
+                status=excluded.status,
+                provider_mode=excluded.provider_mode,
+                decision_id=excluded.decision_id,
+                source_hash=excluded.source_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.review_processor_marker_row(row["marker_id"])
+
+    def review_failure_event_row(self, failure_event_id: str) -> Any | None:
+        clean_failure_event_id = self._clean_id(failure_event_id)
+        if not clean_failure_event_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
+            (clean_failure_event_id,),
+        ).fetchone()
+
+    def upsert_review_failure_event_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_review_processor_failure_events (
+                failure_event_id, marker_id, item_id, processor_kind, document_type,
+                source_hash, error_class, error_message, provider_mode, model_alias,
+                attempt_number, failed_at, next_retry_at, retry_after_seconds,
+                retry_policy_version, retryable, status, event_hash, metadata_json,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :failure_event_id, :marker_id, :item_id, :processor_kind,
+                :document_type, :source_hash, :error_class, :error_message,
+                :provider_mode, :model_alias, :attempt_number, :failed_at,
+                :next_retry_at, :retry_after_seconds, :retry_policy_version,
+                :retryable, :status, :event_hash, :metadata_json, :provenance_json,
+                :created_at, :updated_at
+            )
+            ON CONFLICT(failure_event_id) DO UPDATE SET
+                marker_id=excluded.marker_id,
+                item_id=excluded.item_id,
+                processor_kind=excluded.processor_kind,
+                document_type=excluded.document_type,
+                source_hash=excluded.source_hash,
+                error_class=excluded.error_class,
+                error_message=excluded.error_message,
+                provider_mode=excluded.provider_mode,
+                model_alias=excluded.model_alias,
+                attempt_number=excluded.attempt_number,
+                failed_at=excluded.failed_at,
+                next_retry_at=excluded.next_retry_at,
+                retry_after_seconds=excluded.retry_after_seconds,
+                retry_policy_version=excluded.retry_policy_version,
+                retryable=excluded.retryable,
+                status=excluded.status,
+                event_hash=excluded.event_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.review_failure_event_row(row["failure_event_id"])
+
+    def delete_review_failure_event_row(self, failure_event_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM kanban_review_processor_failure_events WHERE failure_event_id=?",
+            (failure_event_id,),
+        )
+
+    def review_decision_row(self, decision_id: str) -> Any | None:
+        clean_decision_id = self._clean_id(decision_id)
+        if not clean_decision_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
+            (clean_decision_id,),
+        ).fetchone()
+
+    def upsert_review_decision_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_review_decisions (
+                decision_id, item_id, processor_kind, decision_type, title, summary,
+                rationale, affected_refs_json, confidence, uncertainty, proof_refs_json,
+                commit_link_ids_json, status, provider_mode, source_hash, metadata_json,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :decision_id, :item_id, :processor_kind, :decision_type, :title,
+                :summary, :rationale, :affected_refs_json, :confidence,
+                :uncertainty, :proof_refs_json, :commit_link_ids_json, :status,
+                :provider_mode, :source_hash, :metadata_json, :provenance_json,
+                :created_at, :updated_at
+            )
+            ON CONFLICT(decision_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                processor_kind=excluded.processor_kind,
+                decision_type=excluded.decision_type,
+                title=excluded.title,
+                summary=excluded.summary,
+                rationale=excluded.rationale,
+                affected_refs_json=excluded.affected_refs_json,
+                confidence=excluded.confidence,
+                uncertainty=excluded.uncertainty,
+                proof_refs_json=excluded.proof_refs_json,
+                commit_link_ids_json=excluded.commit_link_ids_json,
+                status=excluded.status,
+                provider_mode=excluded.provider_mode,
+                source_hash=excluded.source_hash,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.review_decision_row(row["decision_id"])
+
+    def agent_hints_row_for_item(self, item_id: str) -> Any | None:
+        clean_item_id = self._clean_id(item_id)
+        if not clean_item_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (clean_item_id,),
+        ).fetchone()
+
+    def upsert_agent_hints_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_agent_hints (
+                hint_id, item_id, required_skills_json, routing_notes,
+                commit_attribution_json, visibility, status, metadata_json,
+                provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :hint_id, :item_id, :required_skills_json, :routing_notes,
+                :commit_attribution_json, :visibility, :status, :metadata_json,
+                :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(item_id) DO UPDATE SET
+                required_skills_json=excluded.required_skills_json,
+                routing_notes=excluded.routing_notes,
+                commit_attribution_json=excluded.commit_attribution_json,
+                visibility=excluded.visibility,
+                status=excluded.status,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.agent_hints_row_for_item(row["item_id"])
+
+    def agent_session_row(self, session_id: str) -> Any | None:
+        clean_session_id = self._clean_id(session_id)
+        if not clean_session_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
+            (clean_session_id,),
+        ).fetchone()
+
+    def upsert_agent_session_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_agent_sessions (
+                session_id, item_id, agent_id, node_id, worktree_path,
+                repo_full_name, branch, status, started_at, ended_at,
+                last_seen_at, request_hash, source_surface, summary,
+                metadata_json, provenance_json, created_at, updated_at
+            )
+            VALUES (
+                :session_id, :item_id, :agent_id, :node_id, :worktree_path,
+                :repo_full_name, :branch, :status, :started_at, :ended_at,
+                :last_seen_at, :request_hash, :source_surface, :summary,
+                :metadata_json, :provenance_json, :created_at, :updated_at
+            )
+            ON CONFLICT(session_id) DO UPDATE SET
+                agent_id=excluded.agent_id,
+                node_id=excluded.node_id,
+                worktree_path=excluded.worktree_path,
+                repo_full_name=excluded.repo_full_name,
+                branch=excluded.branch,
+                status=excluded.status,
+                started_at=excluded.started_at,
+                ended_at=excluded.ended_at,
+                last_seen_at=excluded.last_seen_at,
+                request_hash=excluded.request_hash,
+                source_surface=excluded.source_surface,
+                summary=excluded.summary,
+                metadata_json=excluded.metadata_json,
+                provenance_json=excluded.provenance_json,
+                updated_at=excluded.updated_at
+            """,
+            row,
+        )
+        return self.agent_session_row(row["session_id"])
+
+    def update_agent_session_row(self, row: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_agent_sessions SET
+                agent_id=:agent_id,
+                node_id=:node_id,
+                worktree_path=:worktree_path,
+                repo_full_name=:repo_full_name,
+                branch=:branch,
+                status=:status,
+                started_at=:started_at,
+                ended_at=:ended_at,
+                last_seen_at=:last_seen_at,
+                request_hash=:request_hash,
+                source_surface=:source_surface,
+                summary=:summary,
+                metadata_json=:metadata_json,
+                provenance_json=:provenance_json,
+                updated_at=:updated_at
+            WHERE session_id=:session_id
+            """,
+            row,
+        )
+        return self.agent_session_row(row["session_id"])
+
     def item_commit_row_for_ref(
         self,
         *,
