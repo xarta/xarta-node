@@ -4239,6 +4239,146 @@ def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeyp
     )
 
 
+def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    calls = {
+        "create_discussion_row": 0,
+        "update_discussion_row": 0,
+        "update_discussion_provenance": 0,
+        "delete_discussion_row": 0,
+    }
+    original_create = routes_personal.SQLiteKanbanStore.create_discussion_row
+    original_update = routes_personal.SQLiteKanbanStore.update_discussion_row
+    original_update_provenance = routes_personal.SQLiteKanbanStore.update_discussion_provenance
+    original_delete = routes_personal.SQLiteKanbanStore.delete_discussion_row
+
+    def spy_create(self, *args, **kwargs):
+        calls["create_discussion_row"] += 1
+        return original_create(self, *args, **kwargs)
+
+    def spy_update(self, *args, **kwargs):
+        calls["update_discussion_row"] += 1
+        return original_update(self, *args, **kwargs)
+
+    def spy_update_provenance(self, *args, **kwargs):
+        calls["update_discussion_provenance"] += 1
+        return original_update_provenance(self, *args, **kwargs)
+
+    def spy_delete(self, *args, **kwargs):
+        calls["delete_discussion_row"] += 1
+        return original_delete(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "create_discussion_row",
+        spy_create,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "update_discussion_row",
+        spy_update,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "update_discussion_provenance",
+        spy_update_provenance,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "delete_discussion_row",
+        spy_delete,
+    )
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="discussion-boundary-root",
+                title="Discussion boundary root",
+                body="Discussion write boundary proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-boundary-root-create",
+            )
+        )
+    )
+
+    sync_before = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+    created = asyncio.run(
+        routes_personal.create_work_discussion(
+            "discussion-boundary-root",
+            routes_personal.WorkDiscussionCreateRequest(
+                discussion_id="discussion-boundary-proof",
+                body="Initial discussion body\n\n- keep markdown",
+                author="codex-test",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-boundary-create",
+            ),
+        )
+    )
+    assert created["discussion"]["body"] == "Initial discussion body\n\n- keep markdown"
+    assert created["discussion"]["document"]["file_ref"]["path"].endswith(
+        "/discussions/discussion-boundary-proof.md"
+    )
+
+    updated = asyncio.run(
+        routes_personal.update_work_discussion(
+            "discussion-boundary-proof",
+            routes_personal.WorkDiscussionUpdateRequest(
+                body="Edited discussion body\n\n```text\nstill markdown\n```",
+                status="done",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-boundary-update",
+            ),
+        )
+    )
+    assert updated["discussion"]["status"] == "done"
+    assert "still markdown" in updated["discussion"]["body"]
+
+    deleted = asyncio.run(
+        routes_personal.delete_work_discussion(
+            "discussion-boundary-proof",
+            routes_personal.WorkItemActionRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="discussion-boundary-delete",
+            ),
+        )
+    )
+    assert deleted["ok"] is True
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_discussions WHERE discussion_id=?",
+            ("discussion-boundary-proof",),
+        ).fetchone()[0]
+        == 0
+    )
+    assert not (
+        tmp_path
+        / "kanban"
+        / "discussion-boundary-root/items/discussion-boundary-root/discussions/discussion-boundary-proof.md"
+    ).exists()
+    assert calls == {
+        "create_discussion_row": 1,
+        "update_discussion_row": 1,
+        "update_discussion_provenance": 2,
+        "delete_discussion_row": 1,
+    }
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] > sync_before
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {"kanban_discussions", "kanban_audit_log"}.issubset(sync_tables)
+
+
 def test_work_kanban_read_selector_shadow_candidate_parity_and_rollback(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

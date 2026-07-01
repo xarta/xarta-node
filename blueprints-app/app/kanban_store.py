@@ -494,6 +494,87 @@ class SQLiteKanbanStore:
         )
         return self.item_or_raise(item_id)
 
+    def discussion_row(self, discussion_id: str) -> Any | None:
+        clean_discussion_id = self._clean_id(discussion_id)
+        if not clean_discussion_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?",
+            (clean_discussion_id,),
+        ).fetchone()
+
+    def create_discussion_row(self, payload: dict[str, Any]) -> Any:
+        self.conn.execute(
+            """
+            INSERT INTO kanban_discussions (
+                discussion_id, item_id, author, body_excerpt, status, search_text,
+                search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
+                vector_index_key, provenance_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', '', NULL, ?, ?, ?, ?)
+            """,
+            (
+                payload["discussion_id"],
+                payload["item_id"],
+                payload["author"],
+                payload["body_excerpt"],
+                payload["status"],
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                payload["created_at"],
+                payload["updated_at"],
+            ),
+        )
+        return self.discussion_row(payload["discussion_id"])
+
+    def update_discussion_row(
+        self,
+        discussion_id: str,
+        payload: dict[str, Any],
+        *,
+        now: str,
+    ) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_discussions
+            SET author=?, body_excerpt=?, status=?, search_text=?, search_metadata_json=?,
+                vector_index_key=?, provenance_json=?, updated_at=?
+            WHERE discussion_id=?
+            """,
+            (
+                payload["author"],
+                payload["body_excerpt"],
+                payload["status"],
+                payload["search_text"],
+                json.dumps(payload["search_metadata"], ensure_ascii=True, sort_keys=True),
+                payload["vector_index_key"],
+                json.dumps(payload["provenance"], ensure_ascii=True, sort_keys=True),
+                now,
+                discussion_id,
+            ),
+        )
+        return self.discussion_row(discussion_id)
+
+    def update_discussion_provenance(
+        self,
+        discussion_id: str,
+        *,
+        provenance: dict[str, Any],
+    ) -> Any:
+        self.conn.execute(
+            "UPDATE kanban_discussions SET provenance_json=? WHERE discussion_id=?",
+            (json.dumps(provenance, ensure_ascii=True, sort_keys=True), discussion_id),
+        )
+        return self.discussion_row(discussion_id)
+
+    def delete_discussion_row(self, discussion_id: str) -> None:
+        self.conn.execute(
+            "DELETE FROM kanban_discussions WHERE discussion_id=?",
+            (discussion_id,),
+        )
+
     def item(self, item_id: str | None) -> Any | None:
         clean_item_id = self._clean_id(item_id)
         if not clean_item_id:
