@@ -36,6 +36,7 @@ from .kanban_datastore import (
     kanban_datastore_bootstrap_plan,
     kanban_datastore_status,
 )
+from .kanban_parity import kanban_shadow_parity_report
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
@@ -11677,6 +11678,25 @@ async def bootstrap_work_kanban_datastore(
             "run_id": body.run_id or "",
         },
     }
+
+
+@router.get("/kanban/datastore/parity")
+async def get_work_kanban_datastore_parity(
+    sample_limit: Annotated[int, Query(ge=1, le=20)] = 5,
+    include_backups: bool = True,
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        return kanban_shadow_parity_report(
+            conn,
+            depth_limit=KANBAN_DEPTH_LIMIT,
+            show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
+            agent_working_out_tag=KANBAN_AGENT_WORKING_OUT_TAG,
+            kanban_root=Path(cfg.KANBAN_DIR),
+            backup_dir=Path(cfg.KANBAN_BACKUP_DIR),
+            candidate_backend=cfg.KANBAN_DATASTORE_CONFIG.candidate_backend,
+            sample_limit=sample_limit,
+            include_backups=include_backups,
+        )
 
 
 @router.get("/kanban/config")
