@@ -4861,6 +4861,18 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     assert status["candidate"]["read_postgres_supported"] is True
     assert status["candidate"]["read_postgres_persistent"] is True
     assert status["safety"]["sqlite_rows_retained"] is True
+    assert status["distribution"]["schema"] == "xarta.kanban.postgres_distribution.v1"
+    assert status["distribution"]["current_node_id"] == "test-node"
+    assert status["distribution"]["owner_node_id"] == ""
+    assert status["distribution"]["this_node_role"] == "sqlite-peer"
+    assert status["distribution"]["authority"]["multi_writer_supported"] is False
+    assert status["distribution"]["authority"]["writes_authoritative_postgres"] is False
+    assert (
+        status["distribution"]["fleet"]["kanban_sqlite_row_sync"]
+        == "normal-sqlite-sync-queue-while-sqlite-active"
+    )
+    assert status["distribution"]["fleet"]["expected_peer_active_store"] == "sqlite"
+    assert status["distribution"]["operator_safety"]["old_sqlite_rows_deletion_allowed"] is False
     assert {
         "kanban_items",
         "kanban_priority_recommendations",
@@ -4968,6 +4980,7 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
         {
             "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
             "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+            "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID": "test-node",
         }
     )
     monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
@@ -5014,6 +5027,18 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
     assert status["writes"]["store"] == "postgres"
     assert status["safety"]["sqlite_writes_retained"] is False
     assert status["safety"]["sqlite_archive_mirror_retained"] is True
+    assert status["distribution"]["owner_node_id"] == "test-node"
+    assert status["distribution"]["this_node_role"] == "postgres-owner"
+    assert status["distribution"]["authority"]["this_node_is_owner"] is True
+    assert status["distribution"]["authority"]["reads_authoritative_postgres"] is True
+    assert status["distribution"]["authority"]["writes_authoritative_postgres"] is True
+    assert (
+        status["distribution"]["fleet"]["kanban_sqlite_row_sync"]
+        == "disabled-for-kanban-tables-while-owner-postgres-active"
+    )
+    assert status["distribution"]["fleet"]["peer_postgres_required_now"] is False
+    assert status["distribution"]["rollback"]["sqlite_archive_mirror_retained"] is True
+    assert status["distribution"]["operator_safety"]["old_sqlite_rows_deletion_allowed"] is False
 
     asyncio.run(
         routes_personal.create_work_item(
