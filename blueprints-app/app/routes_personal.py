@@ -9457,17 +9457,18 @@ def _work_subtree_max_relative_depth(conn: Any, item_id: str) -> int:
     return int(row["max_depth"] if row else 0)
 
 
-def _recompute_work_child_depths(conn: Any, item_id: str, depth: int) -> None:
-    rows = conn.execute(
-        "SELECT item_id FROM kanban_items WHERE parent_item_id=?", (item_id,)
-    ).fetchall()
-    for row in rows:
-        child_depth = depth + 1
-        conn.execute(
-            "UPDATE kanban_items SET depth=?, updated_at=? WHERE item_id=?",
-            (child_depth, _utc_now_iso(), row["item_id"]),
-        )
-        _recompute_work_child_depths(conn, row["item_id"], child_depth)
+def _recompute_work_child_depths(
+    conn: Any,
+    item_id: str,
+    depth: int,
+    *,
+    now: str | None = None,
+) -> None:
+    _kanban_write_store(conn).recompute_child_depths(
+        item_id,
+        depth,
+        now=now or _utc_now_iso(),
+    )
 
 
 def _work_search_payload(
@@ -9611,8 +9612,7 @@ def _work_lane_order_snapshot(
     state_id: str,
     priority_id: str,
 ) -> list[str]:
-    rows = _work_order_group_rows(conn, parent_item_id, state_id, priority_id)
-    return [row["item_id"] for row in _order_work_priority_group(conn, rows)]
+    return _kanban_write_store(conn).lane_order_snapshot(parent_item_id, state_id, priority_id)
 
 
 def _work_blocked_reason_from_text(value: str | None) -> str:
@@ -10874,22 +10874,7 @@ def _work_order_group_rows(
     state_id: str,
     priority_id: str,
 ) -> list[Any]:
-    parent_key = _work_lane_parent_key(parent_item_id)
-    if parent_key:
-        return conn.execute(
-            """
-            SELECT * FROM kanban_items
-            WHERE parent_item_id=? AND state_id=? AND priority_id=? AND status != 'archived'
-            """,
-            (parent_key, state_id, priority_id),
-        ).fetchall()
-    return conn.execute(
-        """
-        SELECT * FROM kanban_items
-        WHERE parent_item_id IS NULL AND state_id=? AND priority_id=? AND status != 'archived'
-        """,
-        (state_id, priority_id),
-    ).fetchall()
+    return _kanban_write_store(conn).order_group_rows(parent_item_id, state_id, priority_id)
 
 
 def _work_order_edges_for_group(
@@ -10899,98 +10884,20 @@ def _work_order_edges_for_group(
     priority_id: str,
     item_ids: set[str],
 ) -> list[Any]:
-    if not item_ids:
-        return []
-    rows = conn.execute(
-        """
-        SELECT * FROM kanban_item_order_edges
-        WHERE parent_item_id=? AND state_id=? AND priority_id=?
-        ORDER BY updated_at DESC, edge_id
-        """,
-        (_work_lane_parent_key(parent_item_id), state_id, priority_id),
-    ).fetchall()
-    return [
-        row
-        for row in rows
-        if row["before_item_id"] in item_ids
-        and row["after_item_id"] in item_ids
-        and row["before_item_id"] != row["after_item_id"]
-    ]
+    return _kanban_write_store(conn)._order_edges_for_group(
+        parent_item_id,
+        state_id,
+        priority_id,
+        item_ids,
+    )
 
 
 def _order_work_priority_group(conn: Any, rows: list[Any]) -> list[Any]:
-    if len(rows) <= 1:
-        return list(rows)
-    fallback = sorted(
-        rows,
-        key=lambda row: (
-            int(row["sort_order"] or 0),
-            str(row["created_at"] or ""),
-            row["item_id"],
-        ),
-    )
-    fallback_index = {row["item_id"]: index for index, row in enumerate(fallback)}
-    row_by_id = {row["item_id"]: row for row in fallback}
-    item_ids = set(row_by_id)
-    first = fallback[0]
-    edges = _work_order_edges_for_group(
-        conn,
-        first["parent_item_id"],
-        first["state_id"],
-        first["priority_id"],
-        item_ids,
-    )
-    if not edges:
-        return fallback
-    adjacency: dict[str, set[str]] = {item_id: set() for item_id in item_ids}
-    indegree: dict[str, int] = {item_id: 0 for item_id in item_ids}
-    seen_pairs: set[tuple[str, str]] = set()
-    for edge in edges:
-        before = edge["before_item_id"]
-        after = edge["after_item_id"]
-        pair = (before, after)
-        if pair in seen_pairs or after in adjacency[before]:
-            continue
-        seen_pairs.add(pair)
-        adjacency[before].add(after)
-        indegree[after] += 1
-    ready = sorted(
-        [item_id for item_id, value in indegree.items() if value == 0],
-        key=lambda item_id: fallback_index[item_id],
-    )
-    ordered_ids: list[str] = []
-    while ready:
-        item_id = ready.pop(0)
-        ordered_ids.append(item_id)
-        for after in sorted(adjacency[item_id], key=lambda value: fallback_index[value]):
-            indegree[after] -= 1
-            if indegree[after] == 0:
-                ready.append(after)
-                ready.sort(key=lambda value: fallback_index[value])
-    if len(ordered_ids) < len(item_ids):
-        ordered_ids.extend(row["item_id"] for row in fallback if row["item_id"] not in ordered_ids)
-    return [row_by_id[item_id] for item_id in ordered_ids]
+    return _kanban_write_store(conn).order_priority_group(rows)
 
 
 def _sort_kanban_items_for_lane(conn: Any, rows: list[Any]) -> list[Any]:
-    if len(rows) <= 1:
-        return list(rows)
-    priorities = _work_priority_sort_map(conn)
-    groups: dict[str, list[Any]] = {}
-    for row in rows:
-        groups.setdefault(row["priority_id"] or "medium", []).append(row)
-    priority_ids = sorted(
-        groups,
-        key=lambda priority_id: (
-            -priorities.get(priority_id, {}).get("weight", 0),
-            -priorities.get(priority_id, {}).get("sort_order", 0),
-            priority_id,
-        ),
-    )
-    ordered: list[Any] = []
-    for priority_id in priority_ids:
-        ordered.extend(_order_work_priority_group(conn, groups[priority_id]))
-    return ordered
+    return _kanban_write_store(conn).sort_items_for_lane(rows)
 
 
 def _work_item_has_order_relation(
@@ -11000,16 +10907,12 @@ def _work_item_has_order_relation(
     priority_id: str,
     item_id: str,
 ) -> bool:
-    row = conn.execute(
-        """
-        SELECT 1 FROM kanban_item_order_edges
-        WHERE parent_item_id=? AND state_id=? AND priority_id=?
-          AND (before_item_id=? OR after_item_id=?)
-        LIMIT 1
-        """,
-        (_work_lane_parent_key(parent_item_id), state_id, priority_id, item_id, item_id),
-    ).fetchone()
-    return bool(row)
+    return _kanban_write_store(conn).item_has_order_relation(
+        parent_item_id,
+        state_id,
+        priority_id,
+        item_id,
+    )
 
 
 def _replace_kanban_item_order_edges(
@@ -11022,77 +10925,14 @@ def _replace_kanban_item_order_edges(
     now: str,
     meta: dict[str, str],
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    parent_key = _work_lane_parent_key(parent_item_id)
-    clean_ids = [item_id for item_id in ordered_ids if item_id]
-    wanted_pairs = list(zip(clean_ids, clean_ids[1:]))
-    wanted_edge_ids = {
-        _work_order_edge_id(parent_key, state_id, priority_id, before, after)
-        for before, after in wanted_pairs
-    }
-    sync_changes: list[tuple[str, str, dict[str, Any]]] = []
-    existing = conn.execute(
-        """
-        SELECT * FROM kanban_item_order_edges
-        WHERE parent_item_id=? AND state_id=? AND priority_id=?
-        """,
-        (parent_key, state_id, priority_id),
-    ).fetchall()
-    for row in existing:
-        if row["edge_id"] in wanted_edge_ids:
-            continue
-        conn.execute("DELETE FROM kanban_item_order_edges WHERE edge_id=?", (row["edge_id"],))
-        sync_changes.append(("DELETE", row["edge_id"], {}))
-    for before, after in wanted_pairs:
-        edge_id = _work_order_edge_id(parent_key, state_id, priority_id, before, after)
-        provenance = {
-            "actor": meta["actor"],
-            "source_surface": meta["source_surface"],
-            "request_id": meta["request_id"],
-            "before_item_id": before,
-            "after_item_id": after,
-        }
-        payload = {
-            "edge_id": edge_id,
-            "parent_item_id": parent_key,
-            "state_id": state_id,
-            "priority_id": priority_id,
-            "before_item_id": before,
-            "after_item_id": after,
-            "provenance": provenance,
-        }
-        source_hash = _hash_json_payload(payload)
-        conn.execute(
-            """
-            INSERT INTO kanban_item_order_edges (
-                edge_id, parent_item_id, state_id, priority_id, before_item_id,
-                after_item_id, source_hash, provenance_json, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(edge_id) DO UPDATE SET
-                before_item_id=excluded.before_item_id,
-                after_item_id=excluded.after_item_id,
-                source_hash=excluded.source_hash,
-                provenance_json=excluded.provenance_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                edge_id,
-                parent_key,
-                state_id,
-                priority_id,
-                before,
-                after,
-                source_hash,
-                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                now,
-                now,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM kanban_item_order_edges WHERE edge_id=?", (edge_id,)
-        ).fetchone()
-        sync_changes.append(("UPDATE", edge_id, dict(row)))
-    return sync_changes
+    return _kanban_write_store(conn).replace_item_order_edges(
+        parent_item_id=parent_item_id,
+        state_id=state_id,
+        priority_id=priority_id,
+        ordered_ids=ordered_ids,
+        now=now,
+        meta=meta,
+    )
 
 
 def _ensure_work_item_lane_order(
@@ -11103,33 +10943,12 @@ def _ensure_work_item_lane_order(
     now: str,
     meta: dict[str, str],
 ) -> tuple[list[str], list[tuple[str, str, dict[str, Any]]]]:
-    item = _work_item_or_404(conn, item_id)
-    rows = _work_order_group_rows(
-        conn, item["parent_item_id"], item["state_id"], item["priority_id"]
-    )
-    ordered_ids = [row["item_id"] for row in _order_work_priority_group(conn, rows)]
-    if (
-        item_id in ordered_ids
-        and prefer_top_if_new
-        and not _work_item_has_order_relation(
-            conn,
-            item["parent_item_id"],
-            item["state_id"],
-            item["priority_id"],
-            item_id,
-        )
-    ):
-        ordered_ids = [item_id, *[value for value in ordered_ids if value != item_id]]
-    sync_changes = _replace_kanban_item_order_edges(
-        conn,
-        parent_item_id=item["parent_item_id"],
-        state_id=item["state_id"],
-        priority_id=item["priority_id"],
-        ordered_ids=ordered_ids,
+    return _kanban_write_store(conn).ensure_item_lane_order(
+        item_id,
+        prefer_top_if_new=prefer_top_if_new,
         now=now,
         meta=meta,
     )
-    return ordered_ids, sync_changes
 
 
 def _work_board_payload(
@@ -11582,7 +11401,7 @@ def _upsert_typed_work_leaf_item(
         ),
     )
     if existing:
-        _recompute_work_child_depths(conn, clean_leaf_id, depth)
+        _recompute_work_child_depths(conn, clean_leaf_id, depth, now=now)
     item_row = _work_item_or_404(conn, clean_leaf_id)
     _order_ids, order_sync_changes = _ensure_work_item_lane_order(
         conn,
@@ -13018,28 +12837,15 @@ def _work_preprocessing_scoped_decomposition_reparent(
             moving_item["state_id"],
             moving_item["priority_id"],
         )
-        conn.execute(
-            """
-            UPDATE kanban_items
-            SET parent_item_id=?, depth=?, updated_at=?
-            WHERE item_id=?
-            """,
-            (clean_target_parent, new_depth, now, clean_item_id),
+        store = _kanban_write_store(conn)
+        store.update_item_parent_depth(
+            clean_item_id,
+            parent_item_id=clean_target_parent,
+            depth=new_depth,
+            now=now,
         )
-        _recompute_work_child_depths(conn, clean_item_id, new_depth)
-        moved_rows = conn.execute(
-            """
-            WITH RECURSIVE descendants(item_id) AS (
-                SELECT item_id FROM kanban_items WHERE item_id=?
-                UNION ALL
-                SELECT w.item_id
-                FROM kanban_items w
-                JOIN descendants ON w.parent_item_id = descendants.item_id
-            )
-            SELECT w.* FROM kanban_items w JOIN descendants ON descendants.item_id = w.item_id
-            """,
-            (clean_item_id,),
-        ).fetchall()
+        _recompute_work_child_depths(conn, clean_item_id, new_depth, now=now)
+        moved_rows = store.subtree_rows(clean_item_id)
         item_row = next(row for row in moved_rows if row["item_id"] == clean_item_id)
         order_ids, order_sync_changes = _ensure_work_item_lane_order(
             conn,
@@ -13227,20 +13033,8 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
             ),
             now=now,
         )
-        _recompute_work_child_depths(conn, item_id, new_depth)
-        moved_rows = conn.execute(
-            """
-            WITH RECURSIVE descendants(item_id) AS (
-                SELECT item_id FROM kanban_items WHERE item_id=?
-                UNION ALL
-                SELECT w.item_id
-                FROM kanban_items w
-                JOIN descendants ON w.parent_item_id = descendants.item_id
-            )
-            SELECT w.* FROM kanban_items w JOIN descendants ON descendants.item_id = w.item_id
-            """,
-            (item_id,),
-        ).fetchall()
+        _recompute_work_child_depths(conn, item_id, new_depth, now=now)
+        moved_rows = _kanban_write_store(conn).subtree_rows(item_id)
         item_row = next(row for row in moved_rows if row["item_id"] == item_id)
         order_ids, order_sync_changes = _ensure_work_item_lane_order(
             conn,
@@ -13880,15 +13674,12 @@ async def repair_work_blocked_leaf_invariant(
                     item["priority_id"],
                 )
                 target_state = _require_work_state(conn, "todo")
-                conn.execute(
-                    """
-                    UPDATE kanban_items
-                    SET state_id='todo', status=?, updated_at=?
-                    WHERE item_id=?
-                    """,
-                    (_work_status_for_state(target_state), now, item_id),
+                item_row = _kanban_write_store(conn).update_item_state(
+                    item_id,
+                    state_id="todo",
+                    status=_work_status_for_state(target_state),
+                    now=now,
                 )
-                item_row = _work_item_or_404(conn, item_id)
                 order_ids, order_sync_changes = _ensure_work_item_lane_order(
                     conn,
                     item_id,
@@ -19707,7 +19498,7 @@ def _promote_existing_typed_leaf_item(
             existing["item_id"],
         ),
     )
-    _recompute_work_child_depths(conn, existing["item_id"], new_depth)
+    _recompute_work_child_depths(conn, existing["item_id"], new_depth, now=now)
     item_row = _work_item_or_404(conn, existing["item_id"])
     _order_ids, order_sync_changes = _ensure_work_item_lane_order(
         conn,
