@@ -1,8 +1,8 @@
-"""Disabled Kanban datastore configuration and bootstrap planning.
+"""Kanban datastore configuration and guarded candidate bootstrap.
 
-This module is intentionally conservative: live Kanban reads and writes remain
-on the current Blueprints SQLite tables until later cutover cards prove export,
-parity, rollback, and helper/browser behavior.
+Live Kanban writes remain on the current Blueprints SQLite tables.  A
+persistent Postgres candidate can be bootstrapped and selected for reads only
+after backup/parity/rollback proof.
 """
 
 from __future__ import annotations
@@ -23,8 +23,13 @@ KANBAN_CANDIDATE_DATABASE_URL_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL"
 
 ACTIVE_STORE_SQLITE = "sqlite"
 CANDIDATE_READ_STORE_SHADOW = "candidate-shadow"
+CANDIDATE_READ_STORE_POSTGRES = "candidate-postgres"
 SUPPORTED_ACTIVE_STORES = {ACTIVE_STORE_SQLITE}
-SUPPORTED_READ_STORES = {ACTIVE_STORE_SQLITE, CANDIDATE_READ_STORE_SHADOW}
+SUPPORTED_READ_STORES = {
+    ACTIVE_STORE_SQLITE,
+    CANDIDATE_READ_STORE_SHADOW,
+    CANDIDATE_READ_STORE_POSTGRES,
+}
 SUPPORTED_CANDIDATE_BACKENDS = {"postgres"}
 
 KANBAN_DATASTORE_TABLES: tuple[str, ...] = (
@@ -57,6 +62,7 @@ class KanbanDatastoreConfig:
     read_store: str
     candidate_backend: str
     candidate_database_url_configured: bool
+    candidate_database_url: str = ""
 
 
 def _clean_env_value(value: str | None, default: str) -> str:
@@ -103,11 +109,19 @@ def load_kanban_datastore_config(
         candidate_database_url_configured=bool(
             str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip()
         ),
+        candidate_database_url=str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip(),
     )
 
 
 def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
     """Return operator/agent-visible status without exposing connection secrets."""
+
+    if config.read_store == CANDIDATE_READ_STORE_SHADOW:
+        candidate_mode = "sqlite-shadow"
+    elif config.read_store == CANDIDATE_READ_STORE_POSTGRES:
+        candidate_mode = "postgres"
+    else:
+        candidate_mode = "disabled"
 
     return {
         "ok": True,
@@ -117,9 +131,7 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         "reads": {
             "store": config.read_store,
             "candidate_enabled": config.read_store != ACTIVE_STORE_SQLITE,
-            "candidate_mode": "sqlite-shadow"
-            if config.read_store == CANDIDATE_READ_STORE_SHADOW
-            else "disabled",
+            "candidate_mode": candidate_mode,
             "read_store_env": KANBAN_READ_STORE_ENV,
         },
         "writes": {
@@ -133,9 +145,11 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
             "database_url_env": KANBAN_CANDIDATE_DATABASE_URL_ENV,
             "backend_env": KANBAN_CANDIDATE_BACKEND_ENV,
             "bootstrap_dry_run_supported": True,
-            "bootstrap_apply_supported": False,
+            "bootstrap_apply_supported": config.candidate_database_url_configured,
             "read_shadow_supported": True,
             "read_shadow_persistent": False,
+            "read_postgres_supported": True,
+            "read_postgres_persistent": True,
         },
         "safety": {
             "destructive": False,
@@ -160,6 +174,24 @@ def _postgres_bootstrap_sql(sql: str) -> str:
 
     statement = sql.strip().rstrip(";")
     statement = re.sub(
+        r"^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)",
+        "CREATE TABLE IF NOT EXISTS ",
+        statement,
+        flags=re.IGNORECASE,
+    )
+    statement = re.sub(
+        r"^CREATE\s+UNIQUE\s+INDEX\s+(?!IF\s+NOT\s+EXISTS)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ",
+        statement,
+        flags=re.IGNORECASE,
+    )
+    statement = re.sub(
+        r"^CREATE\s+INDEX\s+(?!IF\s+NOT\s+EXISTS)",
+        "CREATE INDEX IF NOT EXISTS ",
+        statement,
+        flags=re.IGNORECASE,
+    )
+    statement = re.sub(
         r"DEFAULT\s+\(datetime\('now'\)\)",
         "DEFAULT (CURRENT_TIMESTAMP::text)",
         statement,
@@ -169,18 +201,25 @@ def _postgres_bootstrap_sql(sql: str) -> str:
     return f"{statement};"
 
 
-def _kanban_schema_rows(conn: Any) -> list[Any]:
+def _kanban_schema_rows(conn: Any, *, support_tables: tuple[str, ...] = ()) -> list[Any]:
+    support_filter = ""
+    params: tuple[str, ...] = ()
+    if support_tables:
+        placeholders = ",".join("?" for _ in support_tables)
+        support_filter = f" OR name IN ({placeholders}) OR tbl_name IN ({placeholders})"
+        params = (*support_tables, *support_tables)
     return conn.execute(
-        """
+        f"""
         SELECT type, name, tbl_name, sql
         FROM sqlite_master
         WHERE sql IS NOT NULL
           AND type IN ('table', 'index')
-          AND (name LIKE 'kanban_%' OR tbl_name LIKE 'kanban_%')
+          AND (name LIKE 'kanban_%' OR tbl_name LIKE 'kanban_%'{support_filter})
         ORDER BY
           CASE type WHEN 'table' THEN 0 ELSE 1 END,
           name
-        """
+        """,
+        params,
     ).fetchall()
 
 
@@ -189,16 +228,12 @@ def kanban_datastore_bootstrap_plan(
     config: KanbanDatastoreConfig,
     *,
     apply: bool = False,
+    support_setting_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Build a candidate-store schema plan without mutating live or candidate data."""
+    """Build or apply a guarded Postgres candidate-store schema/data bootstrap."""
 
-    if apply:
-        raise KanbanDatastoreConfigError(
-            "Kanban candidate datastore bootstrap apply is disabled until the cutover "
-            "cards prove backup, parity, rollback, API, helper, and browser behavior."
-        )
-
-    schema_rows = _kanban_schema_rows(conn)
+    support_tables = ("settings",) if support_setting_keys else ()
+    schema_rows = _kanban_schema_rows(conn, support_tables=support_tables)
     tables = sorted(
         str(_row_get(row, "name")) for row in schema_rows if str(_row_get(row, "type")) == "table"
     )
@@ -221,27 +256,52 @@ def kanban_datastore_bootstrap_plan(
         warnings.append(
             f"{KANBAN_CANDIDATE_DATABASE_URL_ENV} is not configured; returning dry-run SQL only."
         )
+    apply_supported = config.candidate_database_url_configured
+
+    applied_result: dict[str, Any] | None = None
+    if apply:
+        if not apply_supported:
+            raise KanbanDatastoreConfigError(
+                f"{KANBAN_CANDIDATE_DATABASE_URL_ENV} is not configured; cannot apply "
+                "Kanban Postgres candidate bootstrap."
+            )
+        try:
+            from .kanban_postgres import bootstrap_postgres_candidate
+
+            applied_result = bootstrap_postgres_candidate(
+                conn,
+                database_url=config.candidate_database_url,
+                statements=statements,
+                support_setting_keys=support_setting_keys,
+            )
+        except Exception as exc:
+            raise KanbanDatastoreConfigError(
+                f"Kanban Postgres candidate bootstrap failed: {exc}"
+            ) from exc
 
     return {
         "ok": True,
         "schema": KANBAN_DATASTORE_BOOTSTRAP_SCHEMA,
-        "applied": False,
-        "dry_run": True,
+        "applied": applied_result is not None,
+        "dry_run": applied_result is None,
         "active_store": config.active_store,
         "candidate_backend": config.candidate_backend,
         "candidate_database_url_configured": config.candidate_database_url_configured,
-        "apply_supported": False,
+        "apply_supported": apply_supported,
         "tables": tables,
         "expected_tables": list(KANBAN_DATASTORE_TABLES),
+        "support_tables": list(support_tables),
         "missing_tables": missing_tables,
         "statement_count": len(statements),
         "statements": statements,
         "warnings": warnings,
+        "result": applied_result or {},
         "safety": {
             "destructive": False,
             "live_reads_changed": False,
             "live_writes_changed": False,
             "sqlite_rows_retained": True,
+            "candidate_data_replaced": applied_result is not None,
             "sync_queue_rows_created": False,
         },
     }

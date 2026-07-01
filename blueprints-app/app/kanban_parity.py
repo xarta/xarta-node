@@ -11,7 +11,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .kanban_datastore import KANBAN_DATASTORE_TABLES
+from .kanban_datastore import (
+    CANDIDATE_READ_STORE_POSTGRES,
+    KANBAN_DATASTORE_TABLES,
+    KanbanDatastoreConfig,
+)
+from .kanban_postgres import postgres_candidate_connection
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
@@ -873,6 +878,143 @@ def kanban_shadow_parity_report(
             "support_settings_copied": support_settings_copied,
             "idempotent_after_load": postload_preview["idempotent"],
             "conflicts_after_load": postload_preview["totals"]["conflicts"],
+        },
+        "samples": {
+            "sample_limit": clean_sample_limit,
+            "item_ids": sample_item_ids,
+            "child_board_parent_id": child_parent_id,
+        },
+        "coverage": coverage,
+        "api_comparisons": comparisons,
+        "failed_comparisons": failed_comparisons,
+        "safety": safety,
+    }
+
+
+def kanban_postgres_parity_report(
+    live_conn: sqlite3.Connection,
+    *,
+    depth_limit: int,
+    show_test_entries_setting: str,
+    agent_working_out_tag: str,
+    kanban_root: Path,
+    backup_dir: Path,
+    datastore_config: KanbanDatastoreConfig,
+    sample_limit: int = 5,
+    include_backups: bool = True,
+) -> dict[str, Any]:
+    """Compare live SQLite Kanban payloads with the persistent Postgres candidate."""
+
+    if not datastore_config.candidate_database_url_configured:
+        raise KanbanShadowParityError("Postgres candidate database URL is not configured")
+
+    clean_sample_limit = max(1, min(int(sample_limit or 5), 20))
+    store_config = {
+        "depth_limit": depth_limit,
+        "show_test_entries_setting": show_test_entries_setting,
+        "agent_working_out_tag": agent_working_out_tag,
+    }
+    sync_before = live_conn.execute("SELECT COUNT(*) AS count FROM sync_queue").fetchone()["count"]
+    live_table_data = _collect_table_data(live_conn)
+    live_table_hashes = _table_hashes(live_table_data)
+    live_table_counts = _table_counts(live_table_data)
+    sample_item_ids = _sample_item_ids(live_conn, clean_sample_limit)
+    child_parent_id = _child_board_parent_id(live_conn)
+    live_payloads = _snapshot_payloads(
+        live_conn,
+        store_config,
+        sample_item_ids=sample_item_ids,
+        child_parent_id=child_parent_id,
+        sample_limit=clean_sample_limit,
+        kanban_root=kanban_root,
+        backup_dir=backup_dir,
+        include_backups=include_backups,
+    )
+
+    candidate = postgres_candidate_connection(datastore_config.candidate_database_url)
+    try:
+        candidate_table_data = _collect_table_data(candidate)  # type: ignore[arg-type]
+        candidate_table_hashes = _table_hashes(candidate_table_data)
+        candidate_table_counts = _table_counts(candidate_table_data)
+        candidate_payloads = _snapshot_payloads(
+            candidate,  # type: ignore[arg-type]
+            store_config,
+            sample_item_ids=sample_item_ids,
+            child_parent_id=child_parent_id,
+            sample_limit=clean_sample_limit,
+            kanban_root=kanban_root,
+            backup_dir=backup_dir,
+            include_backups=include_backups,
+        )
+    finally:
+        candidate.close()
+
+    sync_after = live_conn.execute("SELECT COUNT(*) AS count FROM sync_queue").fetchone()["count"]
+    table_hash_mismatches = [
+        table
+        for table in KANBAN_DATASTORE_TABLES
+        if live_table_hashes.get(table) != candidate_table_hashes.get(table)
+    ]
+    comparisons = [
+        _comparison(name, live_payloads[name], candidate_payloads.get(name))
+        for name in sorted(live_payloads)
+    ]
+    failed_comparisons = [comparison["name"] for comparison in comparisons if not comparison["ok"]]
+    coverage = {
+        "schema": "xarta.kanban.datastore.postgres_parity.coverage.v1",
+        "api_shapes": sorted(live_payloads),
+        "sampled_item_detail_count": len(
+            [name for name in live_payloads if name.startswith("item_detail:")]
+        ),
+        "backup_package_count": int(live_payloads.get("backup_packages", {}).get("count") or 0),
+        "kanban_file_count": int(live_payloads.get("file_backed_docs", {}).get("file_count") or 0),
+        "automation_marker_count": int(
+            live_payloads.get("automation_markers", {}).get("count") or 0
+        ),
+        "automation_failure_event_count": int(
+            live_payloads.get("automation_failure_events", {}).get("count") or 0
+        ),
+        "agent_session_count": int(live_payloads.get("agent_sessions", {}).get("count") or 0),
+        "review_decision_count": int(live_payloads.get("review_decisions", {}).get("count") or 0),
+    }
+    safety = {
+        "destructive": False,
+        "candidate_storage": "postgres",
+        "live_reads_enabled": datastore_config.read_store == CANDIDATE_READ_STORE_POSTGRES,
+        "live_writes_enabled": False,
+        "sqlite_rows_retained": True,
+        "sync_queue_rows_created": False,
+        "sync_queue_count_before": int(sync_before or 0),
+        "sync_queue_count_after": int(sync_after or 0),
+        "sync_queue_count_changed": int(sync_before or 0) != int(sync_after or 0),
+    }
+    ok = (
+        not table_hash_mismatches
+        and not failed_comparisons
+        and not safety["sync_queue_count_changed"]
+    )
+    return {
+        "ok": ok,
+        "schema": "xarta.kanban.datastore.postgres_parity.v1",
+        "candidate": {
+            "backend": datastore_config.candidate_backend,
+            "storage": "postgres",
+            "live_reads_enabled": datastore_config.read_store == CANDIDATE_READ_STORE_POSTGRES,
+            "live_writes_enabled": False,
+            "database_url_configured": datastore_config.candidate_database_url_configured,
+        },
+        "tables": {
+            "included": list(KANBAN_DATASTORE_TABLES),
+            "support_tables": list(_SUPPORT_TABLES),
+            "excluded": ["sync_queue"],
+            "live_counts": live_table_counts,
+            "candidate_counts": candidate_table_counts,
+            "hash_mismatches": table_hash_mismatches,
+        },
+        "migration": {
+            "schema": "xarta.kanban.datastore.postgres_migration_observation.v1",
+            "idempotent_after_load": not table_hash_mismatches,
+            "conflicts_after_load": len(table_hash_mismatches),
         },
         "samples": {
             "sample_limit": clean_sample_limit,
