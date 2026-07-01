@@ -48,6 +48,27 @@ _EXPOSURE_FILENAMES = (
 _VALID_ACTIONS = {"start", "stop", "restart"}
 _OPENAPI_CANDIDATES = ("openapi.json", "swagger.json", "api/openapi.json", "api/swagger.json")
 _DOCS_CANDIDATES = ("docs", "redoc", "swagger", "api/docs")
+_HTTP_PROBE_KINDS = {
+    "caddy-api",
+    "caddy-web",
+    "localhost-api",
+    "localhost-web",
+    "tailnet-api",
+    "tailnet-web",
+}
+_NON_HTTP_SERVICE_TOKENS = {
+    "database",
+    "db",
+    "mariadb",
+    "mongo",
+    "mongodb",
+    "mysql",
+    "postgres",
+    "postgresql",
+    "rabbitmq",
+    "redis",
+    "valkey",
+}
 _NODE_LOCAL_ROOT = Path("/xarta-node") / ".lone-wolf"
 _LOCAL_DOCKGE_SPEECH_CACHE_ROOT = _NODE_LOCAL_ROOT / "doc-speech-local-dockge-cache"
 _LOCAL_DOCKGE_SPEECH_PROMPT_VERSION = "20260510-purpose-context-speech-v2"
@@ -363,10 +384,23 @@ def _infer_kind(service: str, route: dict | None, ports: list[dict]) -> str:
         if "api" in service_l or route.get("path", "").lower().startswith("/api"):
             return "caddy-api"
         return "caddy-web"
+    service_tokens = {token for token in re.split(r"[^a-z0-9]+", service_l) if token}
+    if service_tokens & _NON_HTTP_SERVICE_TOKENS:
+        return "internal"
     host_ports = [port for port in ports if port.get("published")]
     if host_ports:
         return "localhost-api" if "api" in service_l else "localhost-web"
     return "internal"
+
+
+def _kind_supports_http_probes(kind: str | None) -> bool:
+    return str(kind or "").strip().lower() in _HTTP_PROBE_KINDS
+
+
+def _http_url(value: str | None) -> str:
+    url = str(value or "").strip()
+    parsed = urlparse(url)
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else ""
 
 
 def _base_exposures(
@@ -385,7 +419,7 @@ def _base_exposures(
         route = _route_for_ports(ports, caddy_routes)
         kind = _infer_kind(service, route, ports)
         url = route.get("url") if route else None
-        if not url and ports:
+        if not url and _kind_supports_http_probes(kind) and ports:
             first = next((port for port in ports if port.get("published")), None)
             if first:
                 url = f"http://127.0.0.1:{first['published']}/"
@@ -1702,7 +1736,8 @@ def _list_local_dockge_stacks_sync() -> dict:
 @router.get("/stacks/{stack_name}/services/{service_name}/info", status_code=200)
 async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
     stack, exposure = await asyncio.to_thread(_find_service_exposure, stack_name, service_name)
-    base_url = exposure.get("url") or ""
+    probe_http = _kind_supports_http_probes(exposure.get("kind"))
+    base_url = _http_url(exposure.get("url")) if probe_http else ""
     openapi_candidates = []
     if exposure.get("openapi_url"):
         openapi_candidates.append(exposure["openapi_url"])
@@ -1726,29 +1761,32 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
     openapi_checks = []
     docs_checks = []
     home_check = None
-    async with httpx.AsyncClient(timeout=3.0, follow_redirects=True, verify=False) as client:
-        if base_url:
-            home_check = await _probe_text(client, base_url)
-            home_check.pop("text", None)
-        for url in openapi_candidates:
-            check = await _probe_text(client, url, accept="application/json")
-            text = check.pop("text", "")
-            openapi_checks.append(check)
-            if check.get("ok") and not openapi_summary:
-                try:
-                    spec = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(spec, dict) and "openapi" in spec:
-                    exposure["kind"] = (
-                        "caddy-api" if exposure.get("kind") == "caddy-web" else exposure.get("kind")
-                    )
-                    openapi_summary = _summarize_openapi(spec, check["url"])
-                    break
-        for url in docs_candidates:
-            check = await _probe_text(client, url)
-            check.pop("text", None)
-            docs_checks.append(check)
+    if probe_http:
+        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True, verify=False) as client:
+            if base_url:
+                home_check = await _probe_text(client, base_url)
+                home_check.pop("text", None)
+            for url in openapi_candidates:
+                check = await _probe_text(client, url, accept="application/json")
+                text = check.pop("text", "")
+                openapi_checks.append(check)
+                if check.get("ok") and not openapi_summary:
+                    try:
+                        spec = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(spec, dict) and "openapi" in spec:
+                        exposure["kind"] = (
+                            "caddy-api"
+                            if exposure.get("kind") == "caddy-web"
+                            else exposure.get("kind")
+                        )
+                        openapi_summary = _summarize_openapi(spec, check["url"])
+                        break
+            for url in docs_candidates:
+                check = await _probe_text(client, url)
+                check.pop("text", None)
+                docs_checks.append(check)
 
     return {
         "ok": True,
@@ -1760,8 +1798,10 @@ async def local_dockge_service_info(stack_name: str, service_name: str) -> dict:
         "openapi_checks": openapi_checks,
         "docs_checks": docs_checks,
         "tests": {
-            "status": "todo",
-            "detail": "Per-stack smoke tests can be recorded in xarta-service-exposure.yaml and surfaced here later.",
+            "status": "todo" if probe_http else "skipped",
+            "detail": "Per-stack smoke tests can be recorded in xarta-service-exposure.yaml and surfaced here later."
+            if probe_http
+            else "HTTP, OpenAPI, and docs probes skipped because this service is declared non-HTTP.",
         },
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
