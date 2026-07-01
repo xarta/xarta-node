@@ -4939,14 +4939,159 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
     assert postgres_candidate.read_store == "candidate-postgres"
     assert postgres_candidate.candidate_database_url_configured is True
 
-    with pytest.raises(KanbanDatastoreConfigError, match="not enabled"):
+    active_postgres = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    assert active_postgres.active_store == "postgres"
+    assert active_postgres.read_store == "postgres"
+    assert active_postgres.candidate_database_url_configured is True
+
+    with pytest.raises(KanbanDatastoreConfigError, match="required"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres"})
 
     with pytest.raises(KanbanDatastoreConfigError, match="read stores"):
-        load_kanban_datastore_config({"BLUEPRINTS_KANBAN_READ_STORE": "postgres"})
+        load_kanban_datastore_config({"BLUEPRINTS_KANBAN_READ_STORE": "mongo"})
 
     with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})
+
+
+def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypatch, tmp_path):
+    conn = _make_conn()
+    postgres_conn = _make_conn()
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
+
+    class FakePostgres:
+        def __init__(self, sqlite_conn):
+            self.conn = sqlite_conn
+            self.begun = False
+            self.committed = False
+
+        def begin(self):
+            self.begun = True
+
+        def execute(self, sql, params=None):
+            if params is None:
+                return self.conn.execute(sql)
+            return self.conn.execute(sql, params)
+
+        def executemany(self, sql, seq_of_params):
+            return self.conn.executemany(sql, list(seq_of_params))
+
+        def commit(self):
+            self.committed = True
+            self.conn.commit()
+
+        def rollback(self):
+            self.conn.rollback()
+
+        def close(self):
+            return None
+
+    fake_connections: list[FakePostgres] = []
+
+    def fake_postgres_connection(_database_url):
+        fake = FakePostgres(postgres_conn)
+        fake_connections.append(fake)
+        return fake
+
+    monkeypatch.setattr(routes_personal, "postgres_candidate_connection", fake_postgres_connection)
+
+    status = asyncio.run(routes_personal.get_work_kanban_datastore_status())
+    assert status["active_store"] == "postgres"
+    assert status["reads"]["store"] == "postgres"
+    assert status["writes"]["store"] == "postgres"
+    assert status["safety"]["sqlite_writes_retained"] is False
+    assert status["safety"]["sqlite_archive_mirror_retained"] is True
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="active-postgres-write",
+                title="Active Postgres Write",
+                body="This write must land in Postgres.",
+                state_id="todo",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="active-postgres-write",
+            )
+        )
+    )
+    assert fake_connections and fake_connections[-1].committed is True
+    assert (
+        postgres_conn.execute(
+            "SELECT COUNT(*) FROM kanban_items WHERE item_id='active-postgres-write'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_items WHERE item_id='active-postgres-write'"
+        ).fetchone()[0]
+        == 1
+    )
+
+    conn.execute(
+        "UPDATE kanban_items SET title='SQLite rollback mirror title' WHERE item_id='active-postgres-write'"
+    )
+    postgres_conn.execute(
+        "UPDATE kanban_items SET title='Postgres authoritative title' WHERE item_id='active-postgres-write'"
+    )
+    board = asyncio.run(routes_personal.get_work_root_board())
+    root_items = [
+        item
+        for column in board["board"]["columns"]
+        for item in column["items"]
+        if item["item_id"] == "active-postgres-write"
+    ]
+    assert root_items[0]["title"] == "Postgres authoritative title"
+
+
+def test_work_kanban_datastore_parity_uses_postgres_report_for_active_postgres(monkeypatch):
+    conn = _make_conn()
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
+    called: dict[str, bool] = {}
+
+    def fake_postgres_report(conn_arg, **_kwargs):
+        called["postgres_report"] = True
+        return {
+            "ok": True,
+            "candidate": {
+                "live_reads_enabled": True,
+                "live_writes_enabled": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "kanban_postgres_parity_report",
+        fake_postgres_report,
+    )
+
+    report = asyncio.run(routes_personal.get_work_kanban_datastore_parity(sample_limit=1))
+
+    assert called["postgres_report"] is True
+    assert report["candidate"]["live_reads_enabled"] is True
+    assert report["candidate"]["live_writes_enabled"] is True
 
 
 def _seed_kanban_shadow_parity_dataset(monkeypatch, tmp_path) -> tuple[sqlite3.Connection, Path]:
@@ -5136,6 +5281,38 @@ def test_work_kanban_datastore_shadow_parity_reports_api_shapes(monkeypatch, tmp
     )
     assert all(comparison["ok"] for comparison in report["api_comparisons"])
     assert kanban_root.exists()
+
+
+def test_work_kanban_postgres_parity_reports_active_writes(monkeypatch, tmp_path):
+    conn, kanban_root = _seed_kanban_shadow_parity_dataset(monkeypatch, tmp_path)
+    candidate = kanban_parity.kanban_shadow_candidate_connection(
+        conn,
+        support_setting_keys=(routes_personal.KANBAN_SHOW_TEST_ENTRIES_SETTING,),
+    )
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    monkeypatch.setattr(kanban_parity, "postgres_candidate_connection", lambda _url: candidate)
+
+    report = kanban_parity.kanban_postgres_parity_report(
+        conn,
+        depth_limit=routes_personal.KANBAN_DEPTH_LIMIT,
+        show_test_entries_setting=routes_personal.KANBAN_SHOW_TEST_ENTRIES_SETTING,
+        agent_working_out_tag=routes_personal.KANBAN_AGENT_WORKING_OUT_TAG,
+        kanban_root=kanban_root,
+        backup_dir=Path(routes_kanban_backups.cfg.KANBAN_BACKUP_DIR),
+        datastore_config=active_config,
+        sample_limit=5,
+    )
+
+    assert report["ok"] is True
+    assert report["candidate"]["live_reads_enabled"] is True
+    assert report["candidate"]["live_writes_enabled"] is True
+    assert report["safety"]["live_reads_enabled"] is True
+    assert report["safety"]["live_writes_enabled"] is True
 
 
 def test_work_kanban_datastore_shadow_parity_detects_candidate_drift(monkeypatch, tmp_path):

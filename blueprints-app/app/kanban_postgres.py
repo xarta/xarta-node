@@ -12,7 +12,8 @@ import asyncio
 import re
 import sqlite3
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,9 @@ class PostgresRow(dict[str, Any]):
 class PostgresCursor:
     def __init__(self, rows: Iterable[PostgresRow] = ()) -> None:
         self._rows = list(rows)
+
+    def __iter__(self):
+        return iter(self._rows)
 
     def fetchall(self) -> list[PostgresRow]:
         return list(self._rows)
@@ -195,9 +199,74 @@ def _translate_placeholders(sql: str) -> str:
     return "".join(result)
 
 
+def _translate_named_placeholders(
+    sql: str, params: Mapping[str, Any]
+) -> tuple[str, tuple[Any, ...]]:
+    result: list[str] = []
+    ordered_names: list[str] = []
+    name_to_index: dict[str, int] = {}
+    in_single_quote = False
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if char == "'":
+            result.append(char)
+            if in_single_quote and i + 1 < len(sql) and sql[i + 1] == "'":
+                result.append(sql[i + 1])
+                i += 2
+                continue
+            in_single_quote = not in_single_quote
+            i += 1
+            continue
+        if (
+            char == ":"
+            and not in_single_quote
+            and (i == 0 or sql[i - 1] != ":")
+            and i + 1 < len(sql)
+            and (sql[i + 1].isalpha() or sql[i + 1] == "_")
+        ):
+            j = i + 2
+            while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            name = sql[i + 1 : j]
+            if name not in params:
+                raise KanbanPostgresError(f"missing named Postgres parameter: {name}")
+            if name not in name_to_index:
+                ordered_names.append(name)
+                name_to_index[name] = len(ordered_names)
+            result.append(f"${name_to_index[name]}")
+            i = j
+            continue
+        result.append(char)
+        i += 1
+    return "".join(result), tuple(params[name] for name in ordered_names)
+
+
 def translate_sqlite_query_to_postgres(sql: str) -> str:
     statement = _translate_json_extract(sql)
+    statement = re.sub(
+        r"datetime\('now'\)",
+        "CURRENT_TIMESTAMP::text",
+        statement,
+        flags=re.IGNORECASE,
+    )
     return _translate_placeholders(statement)
+
+
+def prepare_sqlite_query_for_postgres(
+    sql: str,
+    params: Sequence[Any] | Mapping[str, Any] | None = None,
+) -> tuple[str, tuple[Any, ...]]:
+    statement = _translate_json_extract(sql)
+    statement = re.sub(
+        r"datetime\('now'\)",
+        "CURRENT_TIMESTAMP::text",
+        statement,
+        flags=re.IGNORECASE,
+    )
+    if isinstance(params, Mapping):
+        return _translate_named_placeholders(statement, params)
+    return _translate_placeholders(statement), tuple(params or ())
 
 
 def _record_to_row(record: asyncpg.Record) -> PostgresRow:
@@ -223,25 +292,51 @@ class PostgresSyncConnection:
         self._conn = self._runner.run(
             asyncpg.connect(database_url, timeout=10, statement_cache_size=0)
         )
+        self._transaction: asyncpg.transaction.Transaction | None = None
 
     def close(self) -> None:
         if self._conn is not None:
+            if self._transaction is not None:
+                with suppress(Exception):
+                    self.rollback()
             self._runner.run(self._conn.close())
             self._conn = None
 
+    def begin(self) -> None:
+        if self._transaction is not None:
+            return
+
+        async def start_transaction() -> asyncpg.transaction.Transaction:
+            transaction = self._conn.transaction()
+            await transaction.start()
+            return transaction
+
+        self._transaction = self._runner.run(start_transaction())
+
     def commit(self) -> None:
+        if self._transaction is None:
+            return None
+        self._runner.run(self._transaction.commit())
+        self._transaction = None
         return None
 
     def rollback(self) -> None:
+        if self._transaction is None:
+            return None
+        self._runner.run(self._transaction.rollback())
+        self._transaction = None
         return None
 
-    def execute(self, sql: str, params: Sequence[Any] | None = None) -> PostgresCursor:
+    def execute(
+        self,
+        sql: str,
+        params: Sequence[Any] | Mapping[str, Any] | None = None,
+    ) -> PostgresCursor:
         pragma = _PRAGMA_TABLE_INFO_RE.match(sql.strip())
         if pragma:
             table = pragma.group("table").strip('"')
             return PostgresCursor(self._pragma_table_info(table))
-        statement = translate_sqlite_query_to_postgres(sql)
-        args = tuple(params or ())
+        statement, args = prepare_sqlite_query_for_postgres(sql, params)
         first = statement.lstrip().split(None, 1)[0].lower() if statement.strip() else ""
         if first in {"select", "with", "show"}:
             records = self._runner.run(self._conn.fetch(statement, *args))
@@ -249,9 +344,21 @@ class PostgresSyncConnection:
         self._runner.run(self._conn.execute(statement, *args))
         return PostgresCursor()
 
-    def executemany(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> None:
-        statement = translate_sqlite_query_to_postgres(sql)
-        self._runner.run(self._conn.executemany(statement, list(seq_of_params)))
+    def executemany(
+        self,
+        sql: str,
+        seq_of_params: Iterable[Sequence[Any] | Mapping[str, Any]],
+    ) -> None:
+        prepared_rows = [prepare_sqlite_query_for_postgres(sql, params) for params in seq_of_params]
+        if not prepared_rows:
+            return None
+        statements = {statement for statement, _args in prepared_rows}
+        if len(statements) != 1:
+            raise KanbanPostgresError("executemany produced inconsistent Postgres statements")
+        statement = prepared_rows[0][0]
+        self._runner.run(
+            self._conn.executemany(statement, [args for _statement, args in prepared_rows])
+        )
 
     def _pragma_table_info(self, table: str) -> list[PostgresRow]:
         info = _postgres_table_info(self._conn, table, runner=self._runner)
