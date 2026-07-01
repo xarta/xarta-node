@@ -4042,6 +4042,128 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
     }
 
 
+def test_work_kanban_read_selector_shadow_candidate_parity_and_rollback(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="selector-root",
+                title="Selector Root",
+                body="Read selector root proof",
+                state_id="doing",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="selector-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="selector-child",
+                parent_item_id="selector-root",
+                title="Selector Child",
+                body="Read selector child proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="selector-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[
+                    routes_personal.WorkPriorityRecommendationInput(
+                        item_id="selector-root",
+                        title="Selector priority",
+                        summary="Read selector should preserve priority payloads.",
+                        reason="Candidate-shadow reads should match SQLite reads.",
+                        score=87.0,
+                    )
+                ],
+                strategy_version="read-selector-test-v1",
+                generated_at="2026-07-01T10:30:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="selector-priorities-replace",
+            )
+        )
+    )
+
+    sqlite_config = load_kanban_datastore_config({})
+    shadow_config = load_kanban_datastore_config(
+        {"BLUEPRINTS_KANBAN_READ_STORE": "candidate-shadow"}
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", sqlite_config)
+    sqlite_payloads = {
+        "config": asyncio.run(routes_personal.get_work_config()),
+        "root_board": asyncio.run(routes_personal.get_work_root_board()),
+        "child_board": asyncio.run(routes_personal.get_work_child_board("selector-root")),
+        "detail": asyncio.run(routes_personal.get_work_item_detail("selector-root")),
+        "priorities": asyncio.run(routes_personal.get_work_priorities()),
+    }
+
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", shadow_config)
+    status = asyncio.run(routes_personal.get_work_kanban_datastore_status())
+    assert status["reads"]["store"] == "candidate-shadow"
+    assert status["reads"]["candidate_enabled"] is True
+    assert status["reads"]["candidate_mode"] == "sqlite-shadow"
+    assert status["writes"]["store"] == "sqlite"
+    assert status["writes"]["candidate_enabled"] is False
+    shadow_payloads = {
+        "config": asyncio.run(routes_personal.get_work_config()),
+        "root_board": asyncio.run(routes_personal.get_work_root_board()),
+        "child_board": asyncio.run(routes_personal.get_work_child_board("selector-root")),
+        "detail": asyncio.run(routes_personal.get_work_item_detail("selector-root")),
+        "priorities": asyncio.run(routes_personal.get_work_priorities()),
+    }
+    assert shadow_payloads == sqlite_payloads
+
+    before_sync_rows = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="selector-post-shadow-write",
+                parent_item_id="selector-root",
+                title="Selector Post Shadow Write",
+                body="Writes still go to SQLite while candidate-shadow reads are enabled.",
+                state_id="todo",
+                priority_id="low",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="selector-post-shadow-write",
+            )
+        )
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_items WHERE item_id='selector-post-shadow-write'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] > before_sync_rows
+    shadow_after_write = asyncio.run(routes_personal.get_work_child_board("selector-root"))
+
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", sqlite_config)
+    sqlite_after_rollback = asyncio.run(routes_personal.get_work_child_board("selector-root"))
+    assert shadow_after_write == sqlite_after_rollback
+    child_ids = [
+        item["item_id"]
+        for column in sqlite_after_rollback["board"]["columns"]
+        for item in column["items"]
+    ]
+    assert "selector-post-shadow-write" in child_ids
+
+
 def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -4052,12 +4174,19 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     status = asyncio.run(routes_personal.get_work_kanban_datastore_status())
     assert status["ok"] is True
     assert status["active_store"] == "sqlite"
-    assert status["reads"] == {"store": "sqlite", "candidate_enabled": False}
+    assert status["reads"] == {
+        "store": "sqlite",
+        "candidate_enabled": False,
+        "candidate_mode": "disabled",
+        "read_store_env": "BLUEPRINTS_KANBAN_READ_STORE",
+    }
     assert status["writes"]["store"] == "sqlite"
     assert status["writes"]["candidate_enabled"] is False
     assert status["candidate"]["backend"] == "postgres"
     assert status["candidate"]["bootstrap_dry_run_supported"] is True
     assert status["candidate"]["bootstrap_apply_supported"] is False
+    assert status["candidate"]["read_shadow_supported"] is True
+    assert status["candidate"]["read_shadow_persistent"] is False
     assert status["safety"]["sqlite_rows_retained"] is True
     assert {
         "kanban_items",
@@ -4120,9 +4249,19 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
 
 def test_work_kanban_datastore_config_rejects_unsafe_modes():
     assert load_kanban_datastore_config({}).active_store == "sqlite"
+    assert load_kanban_datastore_config({}).read_store == "sqlite"
+    assert (
+        load_kanban_datastore_config(
+            {"BLUEPRINTS_KANBAN_READ_STORE": "candidate-shadow"}
+        ).read_store
+        == "candidate-shadow"
+    )
 
     with pytest.raises(KanbanDatastoreConfigError, match="not enabled"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres"})
+
+    with pytest.raises(KanbanDatastoreConfigError, match="read stores"):
+        load_kanban_datastore_config({"BLUEPRINTS_KANBAN_READ_STORE": "postgres"})
 
     with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})

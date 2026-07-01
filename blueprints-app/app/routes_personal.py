@@ -16,7 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -32,11 +32,12 @@ from . import config as cfg
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
 from .kanban_datastore import (
+    CANDIDATE_READ_STORE_SHADOW,
     KanbanDatastoreConfigError,
     kanban_datastore_bootstrap_plan,
     kanban_datastore_status,
 )
-from .kanban_parity import kanban_shadow_parity_report
+from .kanban_parity import kanban_shadow_candidate_connection, kanban_shadow_parity_report
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
@@ -261,6 +262,22 @@ def _kanban_store(conn: Any) -> SQLiteKanbanStore:
         show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
         agent_working_out_tag=KANBAN_AGENT_WORKING_OUT_TAG,
     )
+
+
+@contextmanager
+def _kanban_read_store(conn: Any) -> Any:
+    candidate_conn = None
+    if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_SHADOW:
+        candidate_conn = kanban_shadow_candidate_connection(
+            conn,
+            support_setting_keys=(KANBAN_SHOW_TEST_ENTRIES_SETTING,),
+        )
+        try:
+            yield _kanban_store(candidate_conn)
+        finally:
+            candidate_conn.close()
+        return
+    yield _kanban_store(conn)
 
 
 def _raise_kanban_store_error(exc: Exception) -> None:
@@ -4549,10 +4566,11 @@ def _work_priority_recommendations_payload(
 ) -> dict[str, Any]:
     clean_scope_id = _clean_short_text(scope_id, KANBAN_PRIORITY_SCOPE_ID, limit=120)
     clean_limit = max(1, min(int(limit or 10), 50))
-    reads = _kanban_store(conn).priority_recommendations(
-        scope_id=clean_scope_id,
-        limit=clean_limit,
-    )
+    with _kanban_read_store(conn) as store:
+        reads = store.priority_recommendations(
+            scope_id=clean_scope_id,
+            limit=clean_limit,
+        )
     recommendations = [_row_to_work_priority_recommendation(read) for read in reads]
     source = "managed" if recommendations else "empty"
     return {
@@ -11149,10 +11167,11 @@ def _work_board_payload(
     show_test_entries: bool | None = None,
 ) -> dict[str, Any]:
     try:
-        read = _kanban_store(conn).board(
-            parent_item_id,
-            show_test_entries=show_test_entries,
-        )
+        with _kanban_read_store(conn) as store:
+            read = store.board(
+                parent_item_id,
+                show_test_entries=show_test_entries,
+            )
     except (KanbanItemNotFound, KanbanItemCycleError) as exc:
         _raise_kanban_store_error(exc)
     return {
@@ -11702,7 +11721,8 @@ async def get_work_kanban_datastore_parity(
 @router.get("/kanban/config")
 async def get_work_config() -> dict[str, Any]:
     with get_conn() as conn:
-        read = _kanban_store(conn).config()
+        with _kanban_read_store(conn) as store:
+            read = store.config()
     return {
         "ok": True,
         "depth_limit": read.depth_limit,
@@ -11769,7 +11789,8 @@ async def get_work_child_board(item_id: str) -> dict[str, Any]:
 async def get_work_item_detail(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         try:
-            read = _kanban_store(conn).item_detail(item_id)
+            with _kanban_read_store(conn) as store:
+                read = store.item_detail(item_id)
         except (KanbanItemNotFound, KanbanItemCycleError) as exc:
             _raise_kanban_store_error(exc)
         detail_document = _work_item_detail_document(conn, item_id)
