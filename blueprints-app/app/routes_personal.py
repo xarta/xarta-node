@@ -32,12 +32,19 @@ from . import config as cfg
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
 from .kanban_datastore import (
+    CANDIDATE_READ_STORE_POSTGRES,
     CANDIDATE_READ_STORE_SHADOW,
     KanbanDatastoreConfigError,
     kanban_datastore_bootstrap_plan,
     kanban_datastore_status,
 )
-from .kanban_parity import kanban_shadow_candidate_connection, kanban_shadow_parity_report
+from .kanban_parity import (
+    KanbanShadowParityError,
+    kanban_postgres_parity_report,
+    kanban_shadow_candidate_connection,
+    kanban_shadow_parity_report,
+)
+from .kanban_postgres import KanbanPostgresError, postgres_candidate_connection
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
@@ -273,7 +280,7 @@ def _kanban_write_store(conn: Any) -> SQLiteKanbanStore:
 
 
 @contextmanager
-def _kanban_read_store(conn: Any) -> Any:
+def _kanban_read_connection(conn: Any) -> Any:
     candidate_conn = None
     if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_SHADOW:
         candidate_conn = kanban_shadow_candidate_connection(
@@ -281,11 +288,29 @@ def _kanban_read_store(conn: Any) -> Any:
             support_setting_keys=(KANBAN_SHOW_TEST_ENTRIES_SETTING,),
         )
         try:
-            yield _kanban_store(candidate_conn)
+            yield candidate_conn
         finally:
             candidate_conn.close()
         return
-    yield _kanban_store(conn)
+    if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_POSTGRES:
+        try:
+            candidate_conn = postgres_candidate_connection(
+                cfg.KANBAN_DATASTORE_CONFIG.candidate_database_url
+            )
+        except KanbanPostgresError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        try:
+            yield candidate_conn
+        finally:
+            candidate_conn.close()
+        return
+    yield conn
+
+
+@contextmanager
+def _kanban_read_store(conn: Any) -> Any:
+    with _kanban_read_connection(conn) as read_conn:
+        yield _kanban_store(read_conn)
 
 
 def _raise_kanban_store_error(exc: Exception) -> None:
@@ -11624,6 +11649,7 @@ async def bootstrap_work_kanban_datastore(
                 conn,
                 cfg.KANBAN_DATASTORE_CONFIG,
                 apply=body.apply,
+                support_setting_keys=(KANBAN_SHOW_TEST_ENTRIES_SETTING,),
             )
     except KanbanDatastoreConfigError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -11644,6 +11670,21 @@ async def get_work_kanban_datastore_parity(
     include_backups: bool = True,
 ) -> dict[str, Any]:
     with get_conn() as conn:
+        if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_POSTGRES:
+            try:
+                return kanban_postgres_parity_report(
+                    conn,
+                    depth_limit=KANBAN_DEPTH_LIMIT,
+                    show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
+                    agent_working_out_tag=KANBAN_AGENT_WORKING_OUT_TAG,
+                    kanban_root=Path(cfg.KANBAN_DIR),
+                    backup_dir=Path(cfg.KANBAN_BACKUP_DIR),
+                    datastore_config=cfg.KANBAN_DATASTORE_CONFIG,
+                    sample_limit=sample_limit,
+                    include_backups=include_backups,
+                )
+            except (KanbanPostgresError, KanbanShadowParityError) as exc:
+                raise HTTPException(503, str(exc)) from exc
         return kanban_shadow_parity_report(
             conn,
             depth_limit=KANBAN_DEPTH_LIMIT,
@@ -11732,6 +11773,9 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
                 read = store.item_detail(item_id)
                 detail_document = store.item_detail_document(item_id)
                 review_document = store.item_review_document(item_id)
+                discussion_payloads = [
+                    _row_to_work_discussion(row, store.conn) for row in read.discussions
+                ]
         except (KanbanItemNotFound, KanbanItemCycleError) as exc:
             _raise_kanban_store_error(exc)
         return {
@@ -11746,7 +11790,7 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
             "issues": [_row_to_work_issue(row) for row in read.issues],
             "todos": [_row_to_work_todo(row) for row in read.todos],
             "blockers": [_row_to_work_blocker(row) for row in read.blockers],
-            "discussions": [_row_to_work_discussion(row, conn) for row in read.discussions],
+            "discussions": discussion_payloads,
             "links": [
                 {
                     "link_id": row["link_id"],
@@ -14165,21 +14209,16 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
 async def list_work_item_commits(item_id: str) -> dict[str, Any]:
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     with get_conn() as conn:
-        item = _work_item_or_404(conn, clean_item_id)
-        rows = conn.execute(
-            """
-            SELECT * FROM kanban_item_commits
-            WHERE item_id=?
-            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
-                     repo_full_name, sha
-            """,
-            (clean_item_id,),
-        ).fetchall()
+        try:
+            with _kanban_read_store(conn) as store:
+                read = store.item_detail(clean_item_id)
+        except (KanbanItemNotFound, KanbanItemCycleError) as exc:
+            _raise_kanban_store_error(exc)
         return {
             "ok": True,
-            "item": _row_to_work_item(item),
-            "count": len(rows),
-            "commits": [_row_to_work_commit(row) for row in rows],
+            "item": _row_to_work_item(read.item),
+            "count": len(read.commits),
+            "commits": [_row_to_work_commit(row) for row in read.commits],
         }
 
 
@@ -14333,30 +14372,32 @@ async def list_work_item_review_decisions(
 ) -> dict[str, Any]:
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     with get_conn() as conn:
-        item = _work_item_or_404(conn, clean_item_id)
-        rows = conn.execute(
-            """
-            SELECT * FROM kanban_review_decisions
-            WHERE item_id=?
-            ORDER BY updated_at DESC, created_at DESC, decision_id
-            LIMIT ?
-            """,
-            (clean_item_id, limit),
-        ).fetchall()
-        decisions = []
-        for row in rows:
-            commit_ids = _json_value(row["commit_link_ids_json"], [])
-            commits = [
-                _row_to_work_commit(commit)
-                for commit in _work_decision_commit_rows(conn, commit_ids)
-            ]
-            decisions.append(_row_to_work_review_decision(row, commits))
+        with _kanban_read_connection(conn) as read_conn:
+            item = _work_item_or_404(read_conn, clean_item_id)
+            rows = read_conn.execute(
+                """
+                SELECT * FROM kanban_review_decisions
+                WHERE item_id=?
+                ORDER BY updated_at DESC, created_at DESC, decision_id
+                LIMIT ?
+                """,
+                (clean_item_id, limit),
+            ).fetchall()
+            decisions = []
+            for row in rows:
+                commit_ids = _json_value(row["commit_link_ids_json"], [])
+                commits = [
+                    _row_to_work_commit(commit)
+                    for commit in _work_decision_commit_rows(read_conn, commit_ids)
+                ]
+                decisions.append(_row_to_work_review_decision(row, commits))
+            commit_link_health = _work_decision_commit_health(rows, read_conn)
         return {
             "ok": True,
             "item": _row_to_work_item(item),
             "count": len(decisions),
             "decisions": decisions,
-            "commit_link_health": _work_decision_commit_health(rows, conn),
+            "commit_link_health": commit_link_health,
         }
 
 
@@ -19017,17 +19058,18 @@ async def list_work_item_agent_sessions(item_id: str, limit: int = 12) -> dict[s
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     clean_limit = max(1, min(int(limit or 12), 50))
     with get_conn() as conn:
-        item = _work_item_or_404(conn, clean_item_id)
-        rows = conn.execute(
-            """
-            SELECT * FROM kanban_agent_sessions
-            WHERE item_id=?
-            ORDER BY COALESCE(NULLIF(last_seen_at, ''), updated_at) DESC,
-                     session_id
-            LIMIT ?
-            """,
-            (clean_item_id, clean_limit),
-        ).fetchall()
+        with _kanban_read_connection(conn) as read_conn:
+            item = _work_item_or_404(read_conn, clean_item_id)
+            rows = read_conn.execute(
+                """
+                SELECT * FROM kanban_agent_sessions
+                WHERE item_id=?
+                ORDER BY COALESCE(NULLIF(last_seen_at, ''), updated_at) DESC,
+                         session_id
+                LIMIT ?
+                """,
+                (clean_item_id, clean_limit),
+            ).fetchall()
         return {
             "ok": True,
             "item": _row_to_work_item(item),

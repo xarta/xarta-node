@@ -4858,6 +4858,8 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     assert status["candidate"]["bootstrap_apply_supported"] is False
     assert status["candidate"]["read_shadow_supported"] is True
     assert status["candidate"]["read_shadow_persistent"] is False
+    assert status["candidate"]["read_postgres_supported"] is True
+    assert status["candidate"]["read_postgres_persistent"] is True
     assert status["safety"]["sqlite_rows_retained"] is True
     assert {
         "kanban_items",
@@ -4882,6 +4884,7 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     assert plan["active_store"] == "sqlite"
     assert plan["candidate_backend"] == "postgres"
     assert plan["apply_supported"] is False
+    assert plan["support_tables"] == ["settings"]
     assert plan["statement_count"] > len(plan["tables"])
     assert plan["safety"]["live_reads_changed"] is False
     assert plan["safety"]["live_writes_changed"] is False
@@ -4894,10 +4897,10 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
         "kanban_agent_sessions",
     }.issubset(set(plan["tables"]))
     statement_by_name = {statement["name"]: statement for statement in plan["statements"]}
-    assert "CREATE TABLE kanban_items" in statement_by_name["kanban_items"]["sql"]
+    assert "CREATE TABLE IF NOT EXISTS kanban_items" in statement_by_name["kanban_items"]["sql"]
     assert statement_by_name["idx_kanban_items_pytest"]["type"] == "index"
     assert (
-        "CREATE TABLE kanban_review_processor_markers"
+        "CREATE TABLE IF NOT EXISTS kanban_review_processor_markers"
         in statement_by_name["kanban_review_processor_markers"]["sql"]
     )
     assert plan["audit"]["actor"] == "codex-test"
@@ -4915,7 +4918,7 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
             )
         )
     assert apply_error.value.status_code == 400
-    assert "bootstrap apply is disabled" in str(apply_error.value.detail)
+    assert "is not configured" in str(apply_error.value.detail)
 
 
 def test_work_kanban_datastore_config_rejects_unsafe_modes():
@@ -4927,6 +4930,14 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
         ).read_store
         == "candidate-shadow"
     )
+    postgres_candidate = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_READ_STORE": "candidate-postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    assert postgres_candidate.read_store == "candidate-postgres"
+    assert postgres_candidate.candidate_database_url_configured is True
 
     with pytest.raises(KanbanDatastoreConfigError, match="not enabled"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres"})
