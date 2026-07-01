@@ -4379,6 +4379,148 @@ def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeyp
     assert {"kanban_discussions", "kanban_audit_log"}.issubset(sync_tables)
 
 
+def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    calls = {
+        "item_detail_document": 0,
+        "item_review_document": 0,
+        "write_item_detail_document": 0,
+        "write_item_review_document": 0,
+    }
+    original_detail = routes_personal.SQLiteKanbanStore.item_detail_document
+    original_review = routes_personal.SQLiteKanbanStore.item_review_document
+    original_write_detail = routes_personal.SQLiteKanbanStore.write_item_detail_document
+    original_write_review = routes_personal.SQLiteKanbanStore.write_item_review_document
+
+    def spy_detail(self, *args, **kwargs):
+        calls["item_detail_document"] += 1
+        return original_detail(self, *args, **kwargs)
+
+    def spy_review(self, *args, **kwargs):
+        calls["item_review_document"] += 1
+        return original_review(self, *args, **kwargs)
+
+    def spy_write_detail(self, *args, **kwargs):
+        calls["write_item_detail_document"] += 1
+        return original_write_detail(self, *args, **kwargs)
+
+    def spy_write_review(self, *args, **kwargs):
+        calls["write_item_review_document"] += 1
+        return original_write_review(self, *args, **kwargs)
+
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_detail_document", spy_detail)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_review_document", spy_review)
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "write_item_detail_document",
+        spy_write_detail,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "write_item_review_document",
+        spy_write_review,
+    )
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="doc-boundary-root",
+                title="Document boundary root",
+                body="Document boundary proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="doc-boundary-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "doc-boundary-root",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="kanban-agent-session-doc-boundary",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                source_surface="pytest-session",
+                summary="Document boundary feedback proof",
+                actor="codex-test",
+                request_id="doc-boundary-session-create",
+            ),
+        )
+    )
+
+    sync_before = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+    detail = asyncio.run(
+        routes_personal.update_work_item_detail_document(
+            "doc-boundary-root",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="# Detail boundary\n\nStored as file-backed markdown.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="doc-boundary-detail-update",
+            ),
+        )
+    )
+    assert detail["detail_document"]["body"].startswith("# Detail boundary")
+
+    review = asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "doc-boundary-root",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="## Review boundary\n\nInitial review text.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="doc-boundary-review-update",
+            ),
+        )
+    )
+    assert review["review_document"]["metadata"]["body_hash"].startswith("sha256:")
+
+    item_detail = asyncio.run(routes_personal.get_work_item_detail("doc-boundary-root"))
+    assert item_detail["detail_document"]["body"].startswith("# Detail boundary")
+    assert item_detail["review_document"]["body"].startswith("## Review boundary")
+
+    feedback = asyncio.run(
+        routes_personal.append_work_item_review_feedback(
+            "doc-boundary-root",
+            routes_personal.WorkReviewFeedbackCaptureRequest(
+                feedback_id="kanban-feedback-doc-boundary",
+                feedback="Document boundary feedback should keep review scheduling intact.",
+                session_id="kanban-agent-session-doc-boundary",
+                capture_source="explicit_command",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="doc-boundary-feedback-capture",
+            ),
+        )
+    )
+    assert "Document boundary feedback" in feedback["review_document"]["body"]
+    assert feedback["review_processor"]["queued"] is True
+
+    assert calls == {
+        "item_detail_document": 1,
+        "item_review_document": 2,
+        "write_item_detail_document": 1,
+        "write_item_review_document": 2,
+    }
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] > sync_before
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {"kanban_audit_log", "kanban_review_processor_markers"}.issubset(sync_tables)
+
+
 def test_work_kanban_read_selector_shadow_candidate_parity_and_rollback(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

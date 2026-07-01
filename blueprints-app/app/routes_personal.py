@@ -261,6 +261,10 @@ def _kanban_store(conn: Any) -> SQLiteKanbanStore:
         depth_limit=KANBAN_DEPTH_LIMIT,
         show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
         agent_working_out_tag=KANBAN_AGENT_WORKING_OUT_TAG,
+        item_detail_document_reader=_work_item_detail_document,
+        item_review_document_reader=_work_item_review_document,
+        item_detail_document_writer=_write_work_item_detail_document,
+        item_review_document_writer=_write_work_item_review_document,
     )
 
 
@@ -11752,10 +11756,10 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
         try:
             with _kanban_read_store(conn) as store:
                 read = store.item_detail(item_id)
+                detail_document = store.item_detail_document(item_id)
+                review_document = store.item_review_document(item_id)
         except (KanbanItemNotFound, KanbanItemCycleError) as exc:
             _raise_kanban_store_error(exc)
-        detail_document = _work_item_detail_document(conn, item_id)
-        review_document = _work_item_review_document(conn, item_id)
         return {
             "ok": True,
             "item": _row_to_work_item(read.item),
@@ -12361,9 +12365,9 @@ async def update_work_item_detail_document(
     clean_body = _normalise_markdown_document_body(body.body)
     source_hash = _hash_json_payload({"item_id": item_id, "body": clean_body})
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, item_id)
-        document = _write_work_item_detail_document(
-            conn,
+        document = store.write_item_detail_document(
             item_id,
             clean_body,
             actor=meta["actor"],
@@ -12419,9 +12423,9 @@ async def update_work_item_review_document(
     clean_body = _normalise_markdown_document_body(body.body)
     source_hash = _hash_json_payload({"item_id": item_id, "body": clean_body})
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, item_id)
-        document = _write_work_item_review_document(
-            conn,
+        document = store.write_item_review_document(
             item_id,
             clean_body,
             actor=meta["actor"],
@@ -12482,6 +12486,7 @@ async def append_work_item_review_feedback(
         raise HTTPException(400, "Review feedback session_id is required")
     clean_child_item_id = _clean_short_text(body.child_item_id or "", "", limit=180)
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
         session_row = conn.execute(
             "SELECT * FROM kanban_agent_sessions WHERE session_id=?",
@@ -12498,14 +12503,13 @@ async def append_work_item_review_feedback(
             now=now,
             agent_session=_row_to_work_agent_session(session_row),
         )
-        existing_document = _work_item_review_document(conn, clean_item_id)
+        existing_document = store.item_review_document(clean_item_id)
         clean_body = _append_work_review_feedback_body(existing_document["body"], entry)
         feedback_metadata = _work_review_feedback_metadata(
             existing_document.get("metadata") or {},
             entry,
         )
-        document = _write_work_item_review_document(
-            conn,
+        document = store.write_item_review_document(
             clean_item_id,
             clean_body,
             actor=meta["actor"],
