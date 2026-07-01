@@ -12615,6 +12615,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
     author = _clean_short_text(body.author or meta["actor"], meta["actor"], limit=120)
     status = _clean_work_leaf_status(body.status, default="open")
     with get_conn() as conn:
+        store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_discussions",
@@ -12628,7 +12629,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             "discussion": {"item_id": clean_item_id},
             **meta,
         }
-        row = {
+        hash_row = {
             "discussion_id": clean_discussion_id,
             "item_id": clean_item_id,
             "author": author,
@@ -12644,25 +12645,22 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             "created_at": now,
             "updated_at": now,
         }
-        source_hash = _hash_json_payload({**row, "body": clean_body})
-        conn.execute(
-            """
-            INSERT INTO kanban_discussions (
-                discussion_id, item_id, author, body_excerpt, status, search_text,
-                search_metadata_json, embedding_ref, embedding_model, embedding_updated_at,
-                vector_index_key, provenance_json, created_at, updated_at
-            )
-            VALUES (
-                :discussion_id, :item_id, :author, :body_excerpt, :status, :search_text,
-                :search_metadata_json, :embedding_ref, :embedding_model, :embedding_updated_at,
-                :vector_index_key, :provenance_json, :created_at, :updated_at
-            )
-            """,
-            row,
+        source_hash = _hash_json_payload({**hash_row, "body": clean_body})
+        discussion_row = store.create_discussion_row(
+            {
+                "discussion_id": clean_discussion_id,
+                "item_id": clean_item_id,
+                "author": author,
+                "body_excerpt": body_excerpt,
+                "status": status,
+                "search_text": search_text,
+                "search_metadata": search_metadata,
+                "vector_index_key": vector_key,
+                "provenance": provenance,
+                "created_at": now,
+                "updated_at": now,
+            }
         )
-        discussion_row = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
         document = _write_work_discussion_document(
             conn,
             discussion_row,
@@ -12681,13 +12679,10 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
             source_surface=meta["source_surface"],
         )
         provenance["document"] = {"file_ref": document["file_ref"]}
-        conn.execute(
-            "UPDATE kanban_discussions SET provenance_json=? WHERE discussion_id=?",
-            (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
+        discussion_row = store.update_discussion_provenance(
+            clean_discussion_id,
+            provenance=provenance,
         )
-        discussion_row = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -12731,9 +12726,8 @@ async def update_work_discussion(
     meta = _work_request_meta(body)
     clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
+        store = _kanban_write_store(conn)
+        existing = store.discussion_row(clean_discussion_id)
         if not existing:
             raise HTTPException(404, "Kanban discussion not found")
         item = _work_item_or_404(conn, existing["item_id"])
@@ -12773,28 +12767,19 @@ async def update_work_discussion(
                 "body": clean_body,
             }
         )
-        conn.execute(
-            """
-            UPDATE kanban_discussions
-            SET author=?, body_excerpt=?, status=?, search_text=?, search_metadata_json=?,
-                vector_index_key=?, provenance_json=?, updated_at=?
-            WHERE discussion_id=?
-            """,
-            (
-                author,
-                body_excerpt,
-                status,
-                search_text,
-                json.dumps(search_metadata, ensure_ascii=True, sort_keys=True),
-                vector_key,
-                json.dumps(provenance, ensure_ascii=True, sort_keys=True),
-                now,
-                clean_discussion_id,
-            ),
+        discussion_row = store.update_discussion_row(
+            clean_discussion_id,
+            {
+                "author": author,
+                "body_excerpt": body_excerpt,
+                "status": status,
+                "search_text": search_text,
+                "search_metadata": search_metadata,
+                "vector_index_key": vector_key,
+                "provenance": provenance,
+            },
+            now=now,
         )
-        discussion_row = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
         document = _write_work_discussion_document(
             conn,
             discussion_row,
@@ -12813,13 +12798,10 @@ async def update_work_discussion(
             source_surface=meta["source_surface"],
         )
         provenance["document"] = {"file_ref": document["file_ref"]}
-        conn.execute(
-            "UPDATE kanban_discussions SET provenance_json=? WHERE discussion_id=?",
-            (json.dumps(provenance, ensure_ascii=True, sort_keys=True), clean_discussion_id),
+        discussion_row = store.update_discussion_provenance(
+            clean_discussion_id,
+            provenance=provenance,
         )
-        discussion_row = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -12863,9 +12845,8 @@ async def delete_work_discussion(
     meta = _work_request_meta(body or WorkItemActionRequest())
     clean_discussion_id = _clean_short_text(discussion_id, "", limit=180)
     with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT * FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,)
-        ).fetchone()
+        store = _kanban_write_store(conn)
+        existing = store.discussion_row(clean_discussion_id)
         if not existing:
             raise HTTPException(404, "Kanban discussion not found")
         item = _work_item_or_404(conn, existing["item_id"])
@@ -12889,7 +12870,7 @@ async def delete_work_discussion(
                 "file_ref": document["file_ref"],
             },
         )
-        conn.execute("DELETE FROM kanban_discussions WHERE discussion_id=?", (clean_discussion_id,))
+        store.delete_discussion_row(clean_discussion_id)
         with suppress(OSError):
             _kanban_discussion_path(conn, existing["item_id"], clean_discussion_id).unlink()
         gen = increment_gen(conn, "kanban-discussion")
