@@ -48,6 +48,10 @@ os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import db as app_db  # noqa: E402
 from app import routes_personal, routes_sync  # noqa: E402
+from app.kanban_datastore import (  # noqa: E402
+    KanbanDatastoreConfigError,
+    load_kanban_datastore_config,
+)
 
 
 def _minutes_turn_event(
@@ -4023,6 +4027,92 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         "item_detail": 1,
         "priority_recommendations": 1,
     }
+
+
+def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("CREATE INDEX idx_kanban_items_pytest ON kanban_items(state_id)")
+
+    before_sync_rows = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+
+    status = asyncio.run(routes_personal.get_work_kanban_datastore_status())
+    assert status["ok"] is True
+    assert status["active_store"] == "sqlite"
+    assert status["reads"] == {"store": "sqlite", "candidate_enabled": False}
+    assert status["writes"]["store"] == "sqlite"
+    assert status["writes"]["candidate_enabled"] is False
+    assert status["candidate"]["backend"] == "postgres"
+    assert status["candidate"]["bootstrap_dry_run_supported"] is True
+    assert status["candidate"]["bootstrap_apply_supported"] is False
+    assert status["safety"]["sqlite_rows_retained"] is True
+    assert {
+        "kanban_items",
+        "kanban_priority_recommendations",
+        "kanban_review_processor_markers",
+        "kanban_review_processor_failure_events",
+        "kanban_agent_sessions",
+    }.issubset(set(status["tables"]))
+
+    plan = asyncio.run(
+        routes_personal.bootstrap_work_kanban_datastore(
+            routes_personal.WorkDatastoreBootstrapRequest(
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="kanban-datastore-bootstrap-dry-run",
+            )
+        )
+    )
+    assert plan["ok"] is True
+    assert plan["dry_run"] is True
+    assert plan["applied"] is False
+    assert plan["active_store"] == "sqlite"
+    assert plan["candidate_backend"] == "postgres"
+    assert plan["apply_supported"] is False
+    assert plan["statement_count"] > len(plan["tables"])
+    assert plan["safety"]["live_reads_changed"] is False
+    assert plan["safety"]["live_writes_changed"] is False
+    assert plan["safety"]["sync_queue_rows_created"] is False
+    assert {
+        "kanban_items",
+        "kanban_priority_recommendations",
+        "kanban_review_processor_markers",
+        "kanban_review_processor_failure_events",
+        "kanban_agent_sessions",
+    }.issubset(set(plan["tables"]))
+    statement_by_name = {statement["name"]: statement for statement in plan["statements"]}
+    assert "CREATE TABLE kanban_items" in statement_by_name["kanban_items"]["sql"]
+    assert statement_by_name["idx_kanban_items_pytest"]["type"] == "index"
+    assert (
+        "CREATE TABLE kanban_review_processor_markers"
+        in statement_by_name["kanban_review_processor_markers"]["sql"]
+    )
+    assert plan["audit"]["actor"] == "codex-test"
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] == before_sync_rows
+
+    with pytest.raises(routes_personal.HTTPException) as apply_error:
+        asyncio.run(
+            routes_personal.bootstrap_work_kanban_datastore(
+                routes_personal.WorkDatastoreBootstrapRequest(
+                    apply=True,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="kanban-datastore-bootstrap-apply-rejected",
+                )
+            )
+        )
+    assert apply_error.value.status_code == 400
+    assert "bootstrap apply is disabled" in str(apply_error.value.detail)
+
+
+def test_work_kanban_datastore_config_rejects_unsafe_modes():
+    assert load_kanban_datastore_config({}).active_store == "sqlite"
+
+    with pytest.raises(KanbanDatastoreConfigError, match="not enabled"):
+        load_kanban_datastore_config({"BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres"})
+
+    with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
+        load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})
 
 
 def test_work_preprocessing_scoped_decomposition_reparent_guard(monkeypatch, tmp_path):

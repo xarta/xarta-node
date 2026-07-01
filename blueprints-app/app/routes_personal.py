@@ -31,6 +31,11 @@ from starlette.responses import FileResponse
 from . import config as cfg
 from . import hermes_minutes
 from .db import get_conn, get_setting, increment_gen, set_setting
+from .kanban_datastore import (
+    KanbanDatastoreConfigError,
+    kanban_datastore_bootstrap_plan,
+    kanban_datastore_status,
+)
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
@@ -546,6 +551,14 @@ class RichDocImageAssociateRequest(BaseModel):
 
 class WorkPreferencesUpdateRequest(BaseModel):
     show_test_entries: bool | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkDatastoreBootstrapRequest(BaseModel):
+    apply: bool = False
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
     request_id: str | None = None
@@ -11635,6 +11648,35 @@ def _upsert_typed_work_leaf_item(
         meta=meta,
     )
     return item_row, order_sync_changes
+
+
+@router.get("/kanban/datastore/status")
+async def get_work_kanban_datastore_status() -> dict[str, Any]:
+    return kanban_datastore_status(cfg.KANBAN_DATASTORE_CONFIG)
+
+
+@router.post("/kanban/datastore/bootstrap")
+async def bootstrap_work_kanban_datastore(
+    body: WorkDatastoreBootstrapRequest,
+) -> dict[str, Any]:
+    try:
+        with get_conn() as conn:
+            plan = kanban_datastore_bootstrap_plan(
+                conn,
+                cfg.KANBAN_DATASTORE_CONFIG,
+                apply=body.apply,
+            )
+    except KanbanDatastoreConfigError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        **plan,
+        "audit": {
+            "actor": body.actor,
+            "source_surface": body.source_surface,
+            "request_id": body.request_id or "",
+            "run_id": body.run_id or "",
+        },
+    }
 
 
 @router.get("/kanban/config")
