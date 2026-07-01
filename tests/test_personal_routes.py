@@ -48,7 +48,13 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import db as app_db  # noqa: E402
-from app import kanban_parity, routes_kanban_backups, routes_personal, routes_sync  # noqa: E402
+from app import (  # noqa: E402
+    kanban_parity,
+    routes_kanban_backups,
+    routes_kanban_postgres,
+    routes_personal,
+    routes_sync,
+)
 from app.kanban_datastore import (  # noqa: E402
     KanbanDatastoreConfigError,
     load_kanban_datastore_config,
@@ -5581,6 +5587,148 @@ def test_work_kanban_backup_import_dry_run_reports_conflicts_and_restore(monkeyp
         == 1
     )
     assert detail_path.read_text(encoding="utf-8") == "original detail\n"
+
+
+def test_work_kanban_backup_package_routes_retire_when_postgres_active(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_kanban_backup_env(monkeypatch, tmp_path, conn)
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+            "BLUEPRINTS_NODE_ID": "test-node",
+            "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID": "test-node",
+        }
+    )
+    monkeypatch.setattr(routes_kanban_backups.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
+
+    with pytest.raises(Exception) as exc:
+        routes_kanban_backups.list_kanban_backups()
+
+    assert getattr(exc.value, "status_code", None) == 410
+    assert exc.value.detail["replacement_api"] == "/api/v1/personal/kanban/postgres"
+    assert exc.value.detail["sqlite_kanban_storage_reintroduced"] is False
+
+
+def test_work_kanban_postgres_export_validate_import_and_distribute(monkeypatch, tmp_path):
+    export_dir = tmp_path / "postgres-exports"
+    helper = tmp_path / "xarta-kanban-postgres-distribute"
+    helper.write_text("#!/bin/sh\n", encoding="utf-8")
+    counts = {table: 0 for table in routes_kanban_postgres.KANBAN_DATASTORE_TABLES}
+    counts["kanban_items"] = 2
+    counts["kanban_priority_recommendations"] = 1
+    calls: list[dict[str, object]] = []
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+            "BLUEPRINTS_NODE_ID": "test-node",
+            "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID": "test-node",
+        }
+    )
+
+    def fake_counts(database_url: str | None = None) -> dict[str, int]:
+        assert database_url is None
+        return dict(counts)
+
+    def fake_run_command(
+        command: list[str],
+        *,
+        timeout: int = 120,
+        stdin_path: Path | None = None,
+        stdout_path: Path | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(
+            {
+                "command": command,
+                "stdin_path": str(stdin_path or ""),
+                "stdout_path": str(stdout_path or ""),
+                "timeout": timeout,
+            }
+        )
+        if "pg_dump" in command and stdout_path is not None:
+            stdout_path.write_text("-- kanban postgres dump\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        if "pg_isready" in command:
+            return subprocess.CompletedProcess(command, 0, b"accepting connections\n", b"")
+        if "createdb" in command or "dropdb" in command:
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        if "psql" in command and "-c" in command:
+            stdout = "\n".join(f"{table}\t{count}" for table, count in counts.items()) + "\n"
+            return subprocess.CompletedProcess(command, 0, stdout.encode("utf-8"), b"")
+        if "psql" in command and stdin_path is not None:
+            assert stdin_path.exists()
+            return subprocess.CompletedProcess(command, 0, b"restored\n", b"")
+        if command and command[0] == str(helper):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                b'{"schema":"xarta.kanban.postgres_fleet_distribution.v1","ok":true}\n',
+                b"",
+            )
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(routes_kanban_postgres.cfg, "KANBAN_POSTGRES_EXPORT_DIR", str(export_dir))
+    monkeypatch.setattr(routes_kanban_postgres.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
+    monkeypatch.setattr(routes_kanban_postgres.cfg, "NODE_ID", "test-node")
+    monkeypatch.setattr(routes_kanban_postgres.cfg, "NODE_NAME", "Test Node")
+    monkeypatch.setattr(
+        routes_kanban_postgres.cfg,
+        "NODES_DATA",
+        [
+            {"node_id": "test-node", "display_name": "Test Node", "active": True},
+            {"node_id": "peer-node", "display_name": "Peer Node", "active": True},
+        ],
+    )
+    monkeypatch.setattr(routes_kanban_postgres, "_postgres_table_counts", fake_counts)
+    monkeypatch.setattr(routes_kanban_postgres, "_run_command", fake_run_command)
+    monkeypatch.setattr(routes_kanban_postgres, "_distribution_helper", lambda: helper)
+
+    created = routes_kanban_postgres.create_kanban_postgres_export(kind="manual")
+    filename = created["export"]["filename"]
+
+    assert created["manifest"]["storage"] == "postgres"
+    assert created["manifest"]["sqlite_backup_package"] is False
+    assert created["manifest"]["sqlite_kanban_rows_included"] is False
+    assert (export_dir / filename).exists()
+    assert (export_dir / f"{filename}.json").exists()
+
+    status = routes_kanban_postgres.get_kanban_postgres_status()
+    assert status["ok"] is True
+    assert status["role"] == "postgres-owner"
+    assert status["latest_export"]["filename"] == filename
+    assert status["table_counts"]["kanban_priority_recommendations"] == 1
+
+    validation = routes_kanban_postgres.validate_kanban_postgres_export(filename)
+    assert validation["ok"] is True
+    assert validation["restored_table_counts"]["kanban_items"] == 2
+
+    dry_run = routes_kanban_postgres.import_kanban_postgres_export(
+        filename,
+        apply=False,
+        backup_before_import=False,
+    )
+    assert dry_run["applied"] is False
+    assert dry_run["table_counts_before"] == dry_run["table_counts_after"]
+
+    applied = routes_kanban_postgres.import_kanban_postgres_export(
+        filename,
+        apply=True,
+        backup_before_import=False,
+    )
+    assert applied["applied"] is True
+    assert applied["table_counts_after"]["kanban_items"] == 2
+
+    distribution = routes_kanban_postgres.distribute_kanban_postgres(
+        routes_kanban_postgres.KanbanPostgresDistributionRequest(
+            target_node_id="peer-node",
+            dry_run=True,
+        )
+    )
+    assert distribution["ok"] is True
+    assert distribution["target"] == "peer-node"
+    assert distribution["result"]["ok"] is True
+    assert all("kanban-backup" not in str(call["command"]) for call in calls)
 
 
 def test_work_preprocessing_scoped_decomposition_reparent_guard(monkeypatch, tmp_path):

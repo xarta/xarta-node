@@ -190,6 +190,10 @@ KANBAN_BACKUP_DIR: str = os.environ.get(
     "BLUEPRINTS_KANBAN_BACKUP_DIR",
     os.path.join(KANBAN_DIR, "backups"),
 )
+KANBAN_POSTGRES_EXPORT_DIR: str = os.environ.get(
+    "BLUEPRINTS_KANBAN_POSTGRES_EXPORT_DIR",
+    os.path.join(KANBAN_DIR, "postgres-exports"),
+)
 KANBAN_DATASTORE_CONFIG = load_kanban_datastore_config(os.environ)
 KANBAN_DATASTORE_MODE: str = KANBAN_DATASTORE_CONFIG.active_store
 KANBAN_CANDIDATE_STORE_BACKEND: str = KANBAN_DATASTORE_CONFIG.candidate_backend

@@ -11568,15 +11568,20 @@ async def update_kanban_preferences(body: WorkPreferencesUpdateRequest) -> dict[
 
 
 @router.get("/kanban/board")
-async def get_work_root_board() -> dict[str, Any]:
+async def get_work_root_board(
+    show_test_entries: Annotated[bool | None, Query()] = None,
+) -> dict[str, Any]:
     with get_conn() as conn:
-        return _work_board_payload(conn)
+        return _work_board_payload(conn, show_test_entries=show_test_entries)
 
 
 @router.get("/kanban/items/{item_id}/board")
-async def get_work_child_board(item_id: str) -> dict[str, Any]:
+async def get_work_child_board(
+    item_id: str,
+    show_test_entries: Annotated[bool | None, Query()] = None,
+) -> dict[str, Any]:
     with get_conn() as conn:
-        return _work_board_payload(conn, item_id)
+        return _work_board_payload(conn, item_id, show_test_entries=show_test_entries)
 
 
 @router.get("/kanban/items/{item_id}")
@@ -19242,6 +19247,7 @@ def _upsert_work_blocker(
     with get_conn() as conn:
         store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, body.item_id)
+        requested_blocker_id = _clean_short_text(blocker_id or body.blocker_id or "", "", limit=180)
         title = _clean_short_text(body.title, "", limit=180)
         if not title:
             raise HTTPException(400, "Kanban blocker title is required")
@@ -19250,7 +19256,11 @@ def _upsert_work_blocker(
             body.blocked_by_ref, "", limit=220
         )
         blocker_status = _clean_work_leaf_status(body.status)
-        previous = store.blocker_row(clean_blocker_id)
+        previous = store.blocker_row(requested_blocker_id) if blocker_id else None
+        if previous is not None:
+            clean_blocker_id = requested_blocker_id
+        else:
+            previous = store.blocker_row(clean_blocker_id)
         if (
             previous is not None
             and _work_request_requires_blocked_leaf_guard(meta)

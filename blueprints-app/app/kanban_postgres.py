@@ -1,9 +1,9 @@
-"""Persistent Postgres candidate store helpers for Kanban.
+"""Legacy SQLite-to-Postgres bootstrap helpers for Kanban.
 
-The live store remains SQLite in this slice.  These helpers let Blueprints
-bootstrap a node-local Postgres candidate, load current Kanban rows into it,
-and run read-only API paths through that candidate without changing write
-semantics.
+Kanban is Postgres-authoritative in current fleet operation.  These helpers are
+kept for historical migration/bootstrap tests that load a legacy SQLite schema
+snapshot into a Postgres candidate; they are not a live Kanban mirror,
+distribution path, or backup model.
 """
 
 from __future__ import annotations
@@ -447,7 +447,7 @@ def bootstrap_postgres_candidate(
     statements: Sequence[dict[str, Any]],
     support_setting_keys: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Apply schema and replace candidate data with current SQLite Kanban rows."""
+    """Apply schema and replace candidate data from a legacy SQLite snapshot."""
 
     if not database_url.strip():
         raise KanbanPostgresError("Postgres candidate database URL is not configured")

@@ -64,6 +64,10 @@ SKIP_KEYS=(
     "BLUEPRINTS_BACKUP_DIR"     # derived from REPO_INNER_PATH — documented public structure
     "CERTS_DIR"                 # derived from REPO_INNER_PATH — documented public structure
     "BLUEPRINTS_DASHBOARD_AUTH_SESSION_SECONDS" # numeric session TTL — too generic to scan for
+    "BLUEPRINTS_KANBAN_DATASTORE_MODE" # non-secret storage enum such as "postgres"
+    "BLUEPRINTS_KANBAN_READ_STORE"     # non-secret storage enum such as "postgres"
+    "BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND" # non-secret storage enum such as "postgres"
+    "BLUEPRINTS_KANBAN_POSTGRES_REPLICA_WRITE_POLICY" # non-secret policy enum such as "reject"
     "DOCS_ROOT"                 # lone-wolf docs root is intentionally referenced in skills/docs
     "THIS_NODE_DOCS_BACKUP"     # value is typically true/false — too generic to scan for
     "SEEKDB_DB"                 # value is "blueprints" — the project name, present everywhere

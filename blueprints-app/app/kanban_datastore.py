@@ -243,10 +243,17 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
             ),
         },
         "backup_restore": {
-            "kanban_backup_api": "/api/v1/personal/kanban/backups",
+            "kanban_postgres_api": "/api/v1/personal/kanban/postgres",
+            "kanban_sqlite_backup_package_api": (
+                "retired-410-while-active-store-postgres"
+                if active_postgres
+                else "/api/v1/personal/kanban/backups"
+            ),
             "full_blueprints_backup_api": "/api/v1/backup",
             "restore_requires_backup_before_import": True,
-            "restore_files_supported": True,
+            "restore_files_supported": not active_postgres,
+            "postgres_export_import_supported": active_postgres,
+            "postgres_distribution_supported": active_postgres,
             "sqlite_mirror_recovery": (
                 "Legacy Kanban SQLite rows are not a live mirror while Postgres is active; "
                 "use Postgres-native backup/restore or distribution proof for recovery."
@@ -280,6 +287,13 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
             "old_sqlite_rows_deletion_allowed": False,
             "sqlite_distribution_allowed": False,
             "requires_green_checks": [
+                "postgres_export",
+                "postgres_validate_import",
+                "postgres_distribution",
+                "operator_safety",
+            ]
+            if active_postgres
+            else [
                 "backup",
                 "restore",
                 "parity",
@@ -290,12 +304,20 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
         },
         "proof_commands": [
             "curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/datastore/status | jq .",
-            "curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/datastore/parity | jq .",
+            ("curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/postgres/status | jq .")
+            if active_postgres
+            else "curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/datastore/parity | jq .",
             "curl -fsS http://127.0.0.1:8080/api/v1/sync/status | jq .",
             (
                 "docker exec blueprints-kanban-postgres psql -U blueprints_kanban "
                 "-d blueprints_kanban -c 'select count(*) from kanban_items;'"
             ),
+            (
+                "/root/xarta-node/.xarta/.agents/bin/xarta-kanban-postgres-distribute "
+                '--owner "$BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID" --targets all'
+            )
+            if active_postgres
+            else "legacy SQLite-era Kanban distribution is not valid in Postgres mode",
         ],
     }
 

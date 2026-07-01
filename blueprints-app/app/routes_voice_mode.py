@@ -2172,15 +2172,21 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "rollup_total": _clean_browser_page_int(kanban.get("rollup_total"), maximum=5000),
         "issue_count": _clean_browser_page_int(kanban.get("issue_count"), maximum=5000),
         "todo_count": _clean_browser_page_int(kanban.get("todo_count"), maximum=5000),
-        "backups_loaded": bool(kanban.get("backups_loaded")),
-        "backup_count": _clean_browser_page_int(kanban.get("backup_count"), maximum=1000),
-        "backups_loading": bool(kanban.get("backups_loading")),
-        "backups_error": _clean_string(kanban.get("backups_error"), "", 180),
-        "backup_busy_action": _clean_string(kanban.get("backup_busy_action"), "", 40),
-        "backup_importing_filename": _clean_string(
-            kanban.get("backup_importing_filename"), "", 240
+        "postgres_loaded": bool(kanban.get("postgres_loaded")),
+        "postgres_export_count": _clean_browser_page_int(
+            kanban.get("postgres_export_count"), maximum=1000
         ),
-        "backup_last_result": _clean_string(kanban.get("backup_last_result"), "", 240),
+        "postgres_loading": bool(kanban.get("postgres_loading")),
+        "postgres_error": _clean_string(kanban.get("postgres_error"), "", 180),
+        "postgres_busy_action": _clean_string(kanban.get("postgres_busy_action"), "", 40),
+        "postgres_importing_filename": _clean_string(
+            kanban.get("postgres_importing_filename"), "", 240
+        ),
+        "postgres_last_result": _clean_string(kanban.get("postgres_last_result"), "", 240),
+        "postgres_role": _clean_string(kanban.get("postgres_role"), "", 80),
+        "postgres_row_count": _clean_browser_page_int(
+            kanban.get("postgres_row_count"), maximum=1000000
+        ),
         "automation_status_loaded": bool(kanban.get("automation_status_loaded")),
         "automation_status_loading": bool(kanban.get("automation_status_loading")),
         "automation_status_error": _clean_string(kanban.get("automation_status_error"), "", 180),

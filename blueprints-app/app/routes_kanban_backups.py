@@ -27,7 +27,7 @@ from starlette.responses import FileResponse
 
 from . import config as cfg
 from .db import get_conn, get_gen, increment_gen
-from .kanban_datastore import KANBAN_DATASTORE_TABLES
+from .kanban_datastore import ACTIVE_STORE_POSTGRES, KANBAN_DATASTORE_TABLES
 from .sync.queue import enqueue_for_all_peers
 
 log = logging.getLogger(__name__)
@@ -95,6 +95,25 @@ class KanbanBackupImportResponse(BaseModel):
     dry_run: dict[str, Any] = Field(default_factory=dict)
     pre_import_backup: str | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+def _raise_if_postgres_active() -> None:
+    if cfg.KANBAN_DATASTORE_CONFIG.active_store != ACTIVE_STORE_POSTGRES:
+        return
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "schema": "xarta.kanban.sqlite_backup_package.retired.v1",
+            "message": (
+                "SQLite-era Kanban backup packages are retired while Kanban "
+                "active_store=postgres. Use /api/v1/personal/kanban/postgres for "
+                "Postgres-native exports, validation, imports, and distribution."
+            ),
+            "replacement_api": "/api/v1/personal/kanban/postgres",
+            "active_store": ACTIVE_STORE_POSTGRES,
+            "sqlite_kanban_storage_reintroduced": False,
+        },
+    )
 
 
 def _utc_now() -> str:
@@ -650,6 +669,7 @@ def _import_table_rows(
 def list_kanban_backups(
     include_hashes: bool = False,
 ) -> KanbanBackupListResponse:
+    _raise_if_postgres_active()
     backup_dir = _backup_dir()
     backups = [
         _backup_entry(path, include_sha256=include_hashes)
@@ -668,6 +688,7 @@ def list_kanban_backups(
 def create_kanban_backup(
     kind: str = Query(default="manual", pattern="^(manual|pre-import)$"),
 ) -> KanbanBackupCreatedResponse:
+    _raise_if_postgres_active()
     backup = _create_backup_file(kind=kind)
     manifest, _table_data, _file_count = _load_backup_package(_safe_backup_path(backup.filename))
     return {"ok": True, "backup": backup, "manifest": manifest}
@@ -675,12 +696,14 @@ def create_kanban_backup(
 
 @router.get("/{filename}", include_in_schema=False)
 def download_kanban_backup(filename: str) -> FileResponse:
+    _raise_if_postgres_active()
     path = _safe_backup_path(filename)
     return FileResponse(path, filename=path.name, media_type="application/gzip")
 
 
 @router.get("/{filename}/validate", response_model=KanbanBackupValidationResponse)
 def validate_kanban_backup(filename: str) -> KanbanBackupValidationResponse:
+    _raise_if_postgres_active()
     path = _safe_backup_path(filename)
     manifest, table_data, file_count = _load_backup_package(path)
     warnings = list(manifest.get("warnings") or [])
@@ -716,6 +739,7 @@ def import_kanban_backup(
         default=True, description="Create a pre-import Kanban backup package first."
     ),
 ) -> KanbanBackupImportResponse:
+    _raise_if_postgres_active()
     path = _safe_backup_path(filename)
     manifest, table_data, file_count = _load_backup_package(path)
     table_counts = _table_counts(table_data)
