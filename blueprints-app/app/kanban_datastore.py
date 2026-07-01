@@ -1,8 +1,8 @@
-"""Kanban datastore configuration and guarded candidate bootstrap.
+"""Kanban datastore configuration, status, and guarded candidate bootstrap.
 
-Live Kanban writes remain on the current Blueprints SQLite tables.  A
-persistent Postgres candidate can be bootstrapped and selected for reads only
-after backup/parity/rollback proof.
+Kanban can run in the original SQLite mode or in active Postgres mode. SQLite
+rows are still retained as a rollback/archive mirror when Postgres is active,
+but those mirror rows are not a fleet row-sync source.
 """
 
 from __future__ import annotations
@@ -15,11 +15,14 @@ from typing import Any, Mapping
 KANBAN_DATASTORE_CONFIG_SCHEMA = "xarta.kanban.datastore.config.v1"
 KANBAN_DATASTORE_STATUS_SCHEMA = "xarta.kanban.datastore.status.v1"
 KANBAN_DATASTORE_BOOTSTRAP_SCHEMA = "xarta.kanban.datastore.bootstrap.v1"
+KANBAN_POSTGRES_DISTRIBUTION_SCHEMA = "xarta.kanban.postgres_distribution.v1"
 
 KANBAN_DATASTORE_MODE_ENV = "BLUEPRINTS_KANBAN_DATASTORE_MODE"
 KANBAN_READ_STORE_ENV = "BLUEPRINTS_KANBAN_READ_STORE"
 KANBAN_CANDIDATE_BACKEND_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND"
 KANBAN_CANDIDATE_DATABASE_URL_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL"
+KANBAN_POSTGRES_OWNER_NODE_ID_ENV = "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID"
+KANBAN_NODE_ID_ENV = "BLUEPRINTS_NODE_ID"
 
 ACTIVE_STORE_SQLITE = "sqlite"
 ACTIVE_STORE_POSTGRES = "postgres"
@@ -65,10 +68,16 @@ class KanbanDatastoreConfig:
     candidate_backend: str
     candidate_database_url_configured: bool
     candidate_database_url: str = ""
+    current_node_id: str = ""
+    postgres_owner_node_id: str = ""
 
 
 def _clean_env_value(value: str | None, default: str) -> str:
     return str(value if value is not None else default).strip().lower()
+
+
+def _clean_node_id(value: str | None, default: str = "") -> str:
+    return str(value if value is not None else default).strip()
 
 
 def load_kanban_datastore_config(
@@ -113,6 +122,16 @@ def load_kanban_datastore_config(
             f"{KANBAN_CANDIDATE_DATABASE_URL_ENV} is required when "
             f"{KANBAN_DATASTORE_MODE_ENV}=postgres."
         )
+    current_node_id = _clean_node_id(
+        source.get(KANBAN_NODE_ID_ENV) or os.environ.get(KANBAN_NODE_ID_ENV, "")
+    )
+    explicit_postgres_owner_node_id = _clean_node_id(
+        source.get(KANBAN_POSTGRES_OWNER_NODE_ID_ENV)
+        or os.environ.get(KANBAN_POSTGRES_OWNER_NODE_ID_ENV, ""),
+    )
+    postgres_owner_node_id = explicit_postgres_owner_node_id
+    if active_store == ACTIVE_STORE_POSTGRES and not postgres_owner_node_id:
+        postgres_owner_node_id = current_node_id
 
     return KanbanDatastoreConfig(
         active_store=active_store,
@@ -120,7 +139,128 @@ def load_kanban_datastore_config(
         candidate_backend=candidate_backend,
         candidate_database_url_configured=bool(candidate_database_url),
         candidate_database_url=candidate_database_url,
+        current_node_id=current_node_id,
+        postgres_owner_node_id=postgres_owner_node_id,
     )
+
+
+def _postgres_distribution_role(config: KanbanDatastoreConfig) -> str:
+    is_owner = (
+        bool(config.current_node_id)
+        and bool(config.postgres_owner_node_id)
+        and config.current_node_id == config.postgres_owner_node_id
+    )
+    if config.active_store == ACTIVE_STORE_POSTGRES:
+        return "postgres-owner" if is_owner else "postgres-non-owner-warning"
+    if is_owner:
+        return "owner-sqlite-rollback-or-precutover"
+    return "sqlite-peer"
+
+
+def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
+    active_postgres = config.active_store == ACTIVE_STORE_POSTGRES
+    is_owner = (
+        bool(config.current_node_id)
+        and bool(config.postgres_owner_node_id)
+        and config.current_node_id == config.postgres_owner_node_id
+    )
+    owner_writes = active_postgres and is_owner
+
+    return {
+        "schema": KANBAN_POSTGRES_DISTRIBUTION_SCHEMA,
+        "current_node_id": config.current_node_id,
+        "owner_node_id": config.postgres_owner_node_id,
+        "owner_node_env": KANBAN_POSTGRES_OWNER_NODE_ID_ENV,
+        "current_node_env": KANBAN_NODE_ID_ENV,
+        "this_node_role": _postgres_distribution_role(config),
+        "authority": {
+            "canonical_owner_node_id": config.postgres_owner_node_id,
+            "this_node_is_owner": is_owner,
+            "reads_authoritative_postgres": active_postgres,
+            "writes_authoritative_postgres": owner_writes,
+            "write_authority": (
+                "owner-local-postgres"
+                if owner_writes
+                else "sqlite-mode-or-non-owner-no-postgres-writes"
+            ),
+            "multi_writer_supported": False,
+        },
+        "service": {
+            "stack_name": "blueprints-kanban-postgres",
+            "stack_path": "/xarta-node/.lone-wolf/stacks/blueprints-kanban-postgres",
+            "network_exposure": "loopback-only",
+            "default_port": 15433,
+            "credential_boundary": (
+                "Postgres password and DATABASE_URL stay in node-local ignored config; "
+                "status payloads never expose connection secrets."
+            ),
+        },
+        "fleet": {
+            "expected_owner_active_store": ACTIVE_STORE_POSTGRES,
+            "expected_peer_active_store": ACTIVE_STORE_SQLITE,
+            "kanban_sqlite_row_sync": (
+                "disabled-for-kanban-tables-while-owner-postgres-active"
+                if active_postgres
+                else "normal-sqlite-sync-queue-while-sqlite-active"
+            ),
+            "peer_postgres_required_now": False,
+            "code_distribution": "git/fleet-pull",
+            "document_distribution": "xarta-kanban Syncthing folder for file-backed docs/images",
+            "data_distribution": (
+                "owner-local Postgres is canonical; use Kanban backup export/import "
+                "for explicit peer restore/distribution until replication is separately "
+                "implemented and proven."
+            ),
+        },
+        "backup_restore": {
+            "kanban_backup_api": "/api/v1/personal/kanban/backups",
+            "full_blueprints_backup_api": "/api/v1/backup",
+            "restore_requires_backup_before_import": True,
+            "restore_files_supported": True,
+            "sqlite_mirror_recovery": (
+                "Use full Blueprints backup/restore or explicit Kanban import; do not "
+                "drain Kanban SQLite mirror rows through fleet sync while Postgres is active."
+            ),
+        },
+        "offline_and_conflicts": {
+            "owner_offline": (
+                "Peers keep their local SQLite snapshots but must not become autonomous "
+                "Postgres writers without an operator-selected owner/failover action."
+            ),
+            "peer_offline": "No Kanban Postgres replication backlog is expected on peers yet.",
+            "conflict_strategy": (
+                "Single canonical writer. Multi-writer conflict resolution is not "
+                "implemented; use backup/parity/rollback proof before imports or failover."
+            ),
+        },
+        "rollback": {
+            "sqlite_archive_mirror_retained": active_postgres,
+            "read_rollback_env": KANBAN_READ_STORE_ENV,
+            "read_rollback_value": ACTIVE_STORE_SQLITE,
+            "destructive_delete_allowed": False,
+        },
+        "operator_safety": {
+            "sqlite_rows_retained": True,
+            "old_sqlite_rows_deletion_allowed": False,
+            "requires_green_checks": [
+                "backup",
+                "restore",
+                "parity",
+                "rollback",
+                "fleet_distribution",
+                "operator_safety",
+            ],
+        },
+        "proof_commands": [
+            "curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/datastore/status | jq .",
+            "curl -fsS http://127.0.0.1:8080/api/v1/personal/kanban/datastore/parity | jq .",
+            "curl -fsS http://127.0.0.1:8080/api/v1/sync/status | jq .",
+            (
+                "docker exec blueprints-kanban-postgres psql -U blueprints_kanban "
+                "-d blueprints_kanban -c 'select count(*) from kanban_items;'"
+            ),
+        ],
+    }
 
 
 def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
@@ -180,6 +320,7 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
             "sqlite_archive_mirror_retained": active_postgres,
             "cutover_requires_separate_backup_parity_and_rollback_proof": not active_postgres,
         },
+        "distribution": _kanban_postgres_distribution_status(config),
         "tables": list(KANBAN_DATASTORE_TABLES),
     }
 
