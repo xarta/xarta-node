@@ -152,7 +152,8 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
             "candidate_enabled": active_postgres,
             "audit_sync_semantics": (
                 "Postgres is authoritative for Kanban table writes; SQLite receives a "
-                "rollback/archive mirror plus existing sync_queue bookkeeping"
+                "rollback/archive mirror, but Kanban SQLite mirror rows are not enqueued "
+                "for fleet sync"
                 if active_postgres
                 else "existing SQLite audit and sync_queue writes remain authoritative"
             ),
