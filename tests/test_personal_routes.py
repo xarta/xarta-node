@@ -4521,6 +4521,198 @@ def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
     assert {"kanban_audit_log", "kanban_review_processor_markers"}.issubset(sync_tables)
 
 
+def test_work_kanban_relationship_writes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    calls = {
+        "create_item_link_row": 0,
+        "blocker_row": 0,
+        "upsert_blocker_row": 0,
+        "upsert_item_commit_row": 0,
+    }
+    original_create_link = routes_personal.SQLiteKanbanStore.create_item_link_row
+    original_blocker_row = routes_personal.SQLiteKanbanStore.blocker_row
+    original_upsert_blocker = routes_personal.SQLiteKanbanStore.upsert_blocker_row
+    original_upsert_commit = routes_personal.SQLiteKanbanStore.upsert_item_commit_row
+
+    def spy_create_link(self, *args, **kwargs):
+        calls["create_item_link_row"] += 1
+        return original_create_link(self, *args, **kwargs)
+
+    def spy_blocker_row(self, *args, **kwargs):
+        calls["blocker_row"] += 1
+        return original_blocker_row(self, *args, **kwargs)
+
+    def spy_upsert_blocker(self, *args, **kwargs):
+        calls["upsert_blocker_row"] += 1
+        return original_upsert_blocker(self, *args, **kwargs)
+
+    def spy_upsert_commit(self, *args, **kwargs):
+        calls["upsert_item_commit_row"] += 1
+        return original_upsert_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "create_item_link_row",
+        spy_create_link,
+    )
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "blocker_row", spy_blocker_row)
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "upsert_blocker_row",
+        spy_upsert_blocker,
+    )
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "upsert_item_commit_row",
+        spy_upsert_commit,
+    )
+
+    for item_id, title in (
+        ("relationship-boundary-source", "Relationship boundary source"),
+        ("relationship-boundary-target", "Relationship boundary target"),
+    ):
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    title=title,
+                    body="Relationship write boundary proof.",
+                    state_id="todo",
+                    priority_id="medium",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{item_id}-create",
+                )
+            )
+        )
+
+    sync_before = conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+    link = asyncio.run(
+        routes_personal.create_work_item_link(
+            "relationship-boundary-source",
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id="relationship-boundary-target",
+                link_type="depends_on",
+                metadata={"link_id": "kanban-link-relationship-boundary"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-link-create",
+            ),
+        )
+    )["link"]
+    assert link["link_id"] == "kanban-link-relationship-boundary"
+
+    blocker = asyncio.run(
+        routes_personal.create_work_blocker(
+            routes_personal.WorkBlockerUpsertRequest(
+                blocker_id="blocker-relationship-boundary",
+                item_id="relationship-boundary-source",
+                title="Relationship boundary blocker",
+                body="Explicit blocker row should pass through the store.",
+                blocked_by_ref="kanban_items:relationship-boundary-target",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-blocker-create",
+            )
+        )
+    )["blocker"]
+    assert blocker["status"] == "open"
+
+    resolved = asyncio.run(
+        routes_personal.update_work_blocker(
+            "blocker-relationship-boundary",
+            routes_personal.WorkBlockerUpsertRequest(
+                item_id="relationship-boundary-source",
+                title="Relationship boundary blocker resolved",
+                body="Resolved through the same store row method.",
+                status="resolved",
+                blocked_by_ref="kanban_items:relationship-boundary-target",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-blocker-update",
+            ),
+        )
+    )["blocker"]
+    assert resolved["status"] == "resolved"
+
+    blocked_leaf = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="relationship-boundary-blocked-leaf",
+                title="Relationship boundary blocked leaf",
+                body="Automation blocked leaf with explicit blocker payload.",
+                state_id="blocked",
+                blocker_title="Blocked relationship proof",
+                blocker_body="Guard-created blocker row stays visible.",
+                blocked_by_ref="kanban_items:relationship-boundary-source",
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id="relationship-boundary-blocked-leaf-create",
+                run_id="relationship-boundary-blocked-leaf-run",
+            )
+        )
+    )
+    assert blocked_leaf["created_blocker"]["status"] == "open"
+
+    sha = "c" * 40
+    commit = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "relationship-boundary-source",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha,
+                message_subject="Relationship boundary commit",
+                branch="main",
+                metadata={"relationship_boundary": "insert"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-commit-create",
+            ),
+        )
+    )["commit"]
+    assert commit["sha"] == sha
+
+    updated_commit = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "relationship-boundary-source",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha,
+                message_subject="Relationship boundary commit updated",
+                branch="main",
+                metadata={"relationship_boundary": "updated"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-commit-update",
+            ),
+        )
+    )["commit"]
+    assert updated_commit["message_subject"] == "Relationship boundary commit updated"
+    assert updated_commit["metadata"]["relationship_boundary"] == "updated"
+
+    assert calls == {
+        "create_item_link_row": 1,
+        "blocker_row": 6,
+        "upsert_blocker_row": 3,
+        "upsert_item_commit_row": 2,
+    }
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] > sync_before
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {
+        "kanban_item_links",
+        "kanban_blockers",
+        "kanban_item_commits",
+        "kanban_audit_log",
+    }.issubset(sync_tables)
+
+
 def test_work_kanban_read_selector_shadow_candidate_parity_and_rollback(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
