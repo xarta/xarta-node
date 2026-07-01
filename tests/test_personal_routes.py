@@ -3902,6 +3902,129 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     }.issubset(sync_tables)
 
 
+def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="store-root",
+                title="Store root",
+                body="Store boundary route proof",
+                state_id="todo",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="store-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="store-child",
+                parent_item_id="store-root",
+                title="Store child",
+                body="Child board proof",
+                state_id="todo",
+                priority_id="medium",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="store-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.replace_work_priorities(
+            routes_personal.WorkPriorityRecommendationsReplaceRequest(
+                recommendations=[
+                    routes_personal.WorkPriorityRecommendationInput(
+                        item_id="store-root",
+                        title="Store priority",
+                        summary="Managed recommendation survives the store boundary.",
+                        reason="The route should hydrate recommendations through the store.",
+                        score=88.0,
+                    )
+                ],
+                strategy_version="store-boundary-test-v1",
+                generated_at="2026-07-01T08:30:00Z",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="store-priorities-replace",
+            )
+        )
+    )
+
+    calls = {
+        "config": 0,
+        "board": 0,
+        "item_detail": 0,
+        "priority_recommendations": 0,
+    }
+    original_config = routes_personal.SQLiteKanbanStore.config
+    original_board = routes_personal.SQLiteKanbanStore.board
+    original_item_detail = routes_personal.SQLiteKanbanStore.item_detail
+    original_priority_recommendations = routes_personal.SQLiteKanbanStore.priority_recommendations
+
+    def spy_config(self):
+        calls["config"] += 1
+        return original_config(self)
+
+    def spy_board(self, *args, **kwargs):
+        calls["board"] += 1
+        return original_board(self, *args, **kwargs)
+
+    def spy_item_detail(self, *args, **kwargs):
+        calls["item_detail"] += 1
+        return original_item_detail(self, *args, **kwargs)
+
+    def spy_priority_recommendations(self, *args, **kwargs):
+        calls["priority_recommendations"] += 1
+        return original_priority_recommendations(self, *args, **kwargs)
+
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "config", spy_config)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "board", spy_board)
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_detail", spy_item_detail)
+    monkeypatch.setattr(
+        routes_personal.SQLiteKanbanStore,
+        "priority_recommendations",
+        spy_priority_recommendations,
+    )
+
+    config = asyncio.run(routes_personal.get_work_config())
+    board = asyncio.run(routes_personal.get_work_root_board())
+    child_board = asyncio.run(routes_personal.get_work_child_board("store-root"))
+    detail = asyncio.run(routes_personal.get_work_item_detail("store-root"))
+    priorities = asyncio.run(routes_personal.get_work_priorities())
+
+    assert [state["state_id"] for state in config["states"]] == [
+        "backlog",
+        "todo",
+        "doing",
+        "blocked",
+        "done",
+    ]
+    root_todo_items = next(
+        column for column in board["board"]["columns"] if column["state"]["state_id"] == "todo"
+    )["items"]
+    assert [item["item_id"] for item in root_todo_items] == ["store-root"]
+    assert child_board["board"]["parent"]["item_id"] == "store-root"
+    assert child_board["board"]["breadcrumbs"][0]["item_id"] == "store-root"
+    assert detail["counts"]["children"] == 1
+    assert detail["counts"]["todos"] == 1
+    assert priorities["recommendations"][0]["canonical_code"] == "xarta-kanban:item:store-root"
+    assert calls == {
+        "config": 1,
+        "board": 2,
+        "item_detail": 1,
+        "priority_recommendations": 1,
+    }
+
+
 def test_work_preprocessing_scoped_decomposition_reparent_guard(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -4789,8 +4912,11 @@ def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch
         status["proposal_surfaces"]["outbox"]["item_id"]
         == routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID
     )
-    assert status["processing_policy"]["active_mode"] == "local"
-    assert status["processing_policy"]["local_processing"]["state"] == "active"
+    assert (
+        status["processing_policy"]["active_mode"]
+        == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+    )
+    assert status["processing_policy"]["local_processing"]["state"] == "fallback-model-only"
     assert status["review_processor"]["status"] == "decision-ledger-ready"
     assert (
         status["review_processor"]["lease"]["schema"] == routes_personal.KANBAN_REVIEW_LEASE_SCHEMA
