@@ -311,11 +311,21 @@ def _kanban_active_postgres_uses_statement(sql: str, params: Any = None) -> bool
 
 
 class _KanbanActivePostgresConnection:
-    """Route Kanban table traffic to active Postgres while mirroring SQLite for rollback."""
+    """Route active Kanban table traffic to Postgres only."""
 
     def __init__(self, sqlite_conn: Any) -> None:
         self._sqlite_conn = sqlite_conn
         self._postgres_conn: Any | None = None
+        config = cfg.KANBAN_DATASTORE_CONFIG
+        self._current_node_id = config.current_node_id
+        self._owner_node_id = config.postgres_owner_node_id
+        self._reject_replica_writes = (
+            config.active_store == ACTIVE_STORE_POSTGRES
+            and bool(config.current_node_id)
+            and bool(config.postgres_owner_node_id)
+            and config.current_node_id != config.postgres_owner_node_id
+            and config.postgres_replica_write_policy == "reject"
+        )
 
     @property
     def row_factory(self) -> Any:
@@ -346,19 +356,36 @@ class _KanbanActivePostgresConnection:
                 return self._sqlite_conn.execute(sql)
             return self._sqlite_conn.execute(sql, params)
 
-        postgres = self._postgres()
         if _KANBAN_ACTIVE_POSTGRES_READ_RE.match(str(sql or "")):
+            postgres = self._postgres()
             return postgres.execute(sql, params)
+        if self._reject_replica_writes:
+            raise HTTPException(
+                409,
+                (
+                    "This node is a Postgres Kanban read replica. "
+                    f"Canonical Kanban writes must go through {self._owner_node_id}; "
+                    "local replica writes are rejected to avoid multi-writer drift."
+                ),
+            )
 
+        postgres = self._postgres()
         postgres.execute(sql, params)
-        if params is None:
-            return self._sqlite_conn.execute(sql)
-        return self._sqlite_conn.execute(sql, params)
+        return postgres
 
     def executemany(self, sql: str, seq_of_params: Any) -> Any:
         params_list = list(seq_of_params)
         if _kanban_active_postgres_uses_statement(sql, params_list):
-            self._postgres().executemany(sql, params_list)
+            if self._reject_replica_writes:
+                raise HTTPException(
+                    409,
+                    (
+                        "This node is a Postgres Kanban read replica. "
+                        f"Canonical Kanban writes must go through {self._owner_node_id}; "
+                        "local replica writes are rejected to avoid multi-writer drift."
+                    ),
+                )
+            return self._postgres().executemany(sql, params_list)
         return self._sqlite_conn.executemany(sql, params_list)
 
     def commit(self) -> None:

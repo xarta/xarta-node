@@ -1,8 +1,8 @@
 """Kanban datastore configuration, status, and guarded candidate bootstrap.
 
-Kanban can run in the original SQLite mode or in active Postgres mode. SQLite
-rows are still retained as a rollback/archive mirror when Postgres is active,
-but those mirror rows are not a fleet row-sync source.
+Kanban can run in the original SQLite mode or in active Postgres mode. When
+Postgres is active, Kanban rows are read and written through Postgres only;
+SQLite Kanban rows are legacy data and are not mirrored or distributed.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ KANBAN_READ_STORE_ENV = "BLUEPRINTS_KANBAN_READ_STORE"
 KANBAN_CANDIDATE_BACKEND_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND"
 KANBAN_CANDIDATE_DATABASE_URL_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL"
 KANBAN_POSTGRES_OWNER_NODE_ID_ENV = "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID"
+KANBAN_POSTGRES_REPLICA_WRITE_POLICY_ENV = "BLUEPRINTS_KANBAN_POSTGRES_REPLICA_WRITE_POLICY"
 KANBAN_NODE_ID_ENV = "BLUEPRINTS_NODE_ID"
 
 ACTIVE_STORE_SQLITE = "sqlite"
@@ -36,6 +37,7 @@ SUPPORTED_READ_STORES = {
     CANDIDATE_READ_STORE_POSTGRES,
 }
 SUPPORTED_CANDIDATE_BACKENDS = {"postgres"}
+SUPPORTED_POSTGRES_REPLICA_WRITE_POLICIES = {"reject", "allow-local-writes"}
 
 KANBAN_DATASTORE_TABLES: tuple[str, ...] = (
     "kanban_item_states",
@@ -70,6 +72,7 @@ class KanbanDatastoreConfig:
     candidate_database_url: str = ""
     current_node_id: str = ""
     postgres_owner_node_id: str = ""
+    postgres_replica_write_policy: str = "reject"
 
 
 def _clean_env_value(value: str | None, default: str) -> str:
@@ -132,6 +135,16 @@ def load_kanban_datastore_config(
     postgres_owner_node_id = explicit_postgres_owner_node_id
     if active_store == ACTIVE_STORE_POSTGRES and not postgres_owner_node_id:
         postgres_owner_node_id = current_node_id
+    postgres_replica_write_policy = _clean_env_value(
+        source.get(KANBAN_POSTGRES_REPLICA_WRITE_POLICY_ENV),
+        "reject",
+    )
+    if postgres_replica_write_policy not in SUPPORTED_POSTGRES_REPLICA_WRITE_POLICIES:
+        supported = ", ".join(sorted(SUPPORTED_POSTGRES_REPLICA_WRITE_POLICIES))
+        raise KanbanDatastoreConfigError(
+            f"{KANBAN_POSTGRES_REPLICA_WRITE_POLICY_ENV}={postgres_replica_write_policy!r} "
+            f"is invalid. Supported Postgres replica write policies: {supported}."
+        )
 
     return KanbanDatastoreConfig(
         active_store=active_store,
@@ -141,6 +154,7 @@ def load_kanban_datastore_config(
         candidate_database_url=candidate_database_url,
         current_node_id=current_node_id,
         postgres_owner_node_id=postgres_owner_node_id,
+        postgres_replica_write_policy=postgres_replica_write_policy,
     )
 
 
@@ -151,7 +165,11 @@ def _postgres_distribution_role(config: KanbanDatastoreConfig) -> str:
         and config.current_node_id == config.postgres_owner_node_id
     )
     if config.active_store == ACTIVE_STORE_POSTGRES:
-        return "postgres-owner" if is_owner else "postgres-non-owner-warning"
+        if is_owner:
+            return "postgres-owner"
+        if config.postgres_replica_write_policy == "reject":
+            return "postgres-read-replica"
+        return "postgres-non-owner-local-writes-warning"
     if is_owner:
         return "owner-sqlite-rollback-or-precutover"
     return "sqlite-peer"
@@ -165,6 +183,9 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
         and config.current_node_id == config.postgres_owner_node_id
     )
     owner_writes = active_postgres and is_owner
+    replica_writes_rejected = (
+        active_postgres and not is_owner and config.postgres_replica_write_policy == "reject"
+    )
 
     return {
         "schema": KANBAN_POSTGRES_DISTRIBUTION_SCHEMA,
@@ -181,9 +202,15 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
             "write_authority": (
                 "owner-local-postgres"
                 if owner_writes
-                else "sqlite-mode-or-non-owner-no-postgres-writes"
+                else (
+                    "postgres-read-replica-local-writes-rejected"
+                    if replica_writes_rejected
+                    else "sqlite-mode-or-non-owner-local-write-warning"
+                )
             ),
             "multi_writer_supported": False,
+            "replica_write_policy": config.postgres_replica_write_policy,
+            "replica_local_writes_rejected": replica_writes_rejected,
         },
         "service": {
             "stack_name": "blueprints-kanban-postgres",
@@ -197,19 +224,22 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
         },
         "fleet": {
             "expected_owner_active_store": ACTIVE_STORE_POSTGRES,
-            "expected_peer_active_store": ACTIVE_STORE_SQLITE,
+            "expected_peer_active_store": (
+                ACTIVE_STORE_POSTGRES if active_postgres else ACTIVE_STORE_SQLITE
+            ),
             "kanban_sqlite_row_sync": (
                 "disabled-for-kanban-tables-while-owner-postgres-active"
                 if active_postgres
                 else "normal-sqlite-sync-queue-while-sqlite-active"
             ),
-            "peer_postgres_required_now": False,
+            "peer_postgres_required_now": active_postgres,
             "code_distribution": "git/fleet-pull",
             "document_distribution": "xarta-kanban Syncthing folder for file-backed docs/images",
             "data_distribution": (
-                "owner-local Postgres is canonical; use Kanban backup export/import "
-                "for explicit peer restore/distribution until replication is separately "
-                "implemented and proven."
+                "owner-local Postgres is canonical; distribute Kanban database rows "
+                "from the owner Postgres store to peer Postgres stores through a "
+                "Postgres-native mechanism such as pg_dump/psql snapshot restore or "
+                "logical replication. SQLite is not a distribution mechanism."
             ),
         },
         "backup_restore": {
@@ -218,30 +248,37 @@ def _kanban_postgres_distribution_status(config: KanbanDatastoreConfig) -> dict[
             "restore_requires_backup_before_import": True,
             "restore_files_supported": True,
             "sqlite_mirror_recovery": (
-                "Use full Blueprints backup/restore or explicit Kanban import; do not "
-                "drain Kanban SQLite mirror rows through fleet sync while Postgres is active."
+                "Legacy Kanban SQLite rows are not a live mirror while Postgres is active; "
+                "use Postgres-native backup/restore or distribution proof for recovery."
             ),
         },
         "offline_and_conflicts": {
             "owner_offline": (
-                "Peers keep their local SQLite snapshots but must not become autonomous "
-                "Postgres writers without an operator-selected owner/failover action."
+                "Peers keep their last distributed local Postgres snapshot/read replica "
+                "but must not become autonomous Postgres writers without an "
+                "operator-selected owner/failover action."
             ),
-            "peer_offline": "No Kanban Postgres replication backlog is expected on peers yet.",
+            "peer_offline": (
+                "A peer receives the next Postgres-native distribution/replication "
+                "update when it returns; SQLite sync queue backlog is not the Kanban "
+                "data-distribution mechanism."
+            ),
             "conflict_strategy": (
                 "Single canonical writer. Multi-writer conflict resolution is not "
-                "implemented; use backup/parity/rollback proof before imports or failover."
+                "implemented; non-owner Postgres nodes reject local Kanban writes unless "
+                "the operator explicitly enables a different policy and proves it."
             ),
         },
         "rollback": {
-            "sqlite_archive_mirror_retained": active_postgres,
+            "sqlite_archive_mirror_retained": False,
             "read_rollback_env": KANBAN_READ_STORE_ENV,
-            "read_rollback_value": ACTIVE_STORE_SQLITE,
+            "read_rollback_value": "disabled-for-kanban-after-postgres-retirement",
             "destructive_delete_allowed": False,
         },
         "operator_safety": {
-            "sqlite_rows_retained": True,
+            "sqlite_rows_retained": not active_postgres,
             "old_sqlite_rows_deletion_allowed": False,
+            "sqlite_distribution_allowed": False,
             "requires_green_checks": [
                 "backup",
                 "restore",
@@ -267,6 +304,16 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
     """Return operator/agent-visible status without exposing connection secrets."""
 
     active_postgres = config.active_store == ACTIVE_STORE_POSTGRES
+    is_postgres_owner = (
+        bool(config.current_node_id)
+        and bool(config.postgres_owner_node_id)
+        and config.current_node_id == config.postgres_owner_node_id
+    )
+    replica_writes_rejected = (
+        active_postgres
+        and not is_postgres_owner
+        and config.postgres_replica_write_policy == "reject"
+    )
     if active_postgres:
         candidate_mode = "active-postgres"
     elif config.read_store == CANDIDATE_READ_STORE_SHADOW:
@@ -290,10 +337,20 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         "writes": {
             "store": ACTIVE_STORE_POSTGRES if active_postgres else ACTIVE_STORE_SQLITE,
             "candidate_enabled": active_postgres,
+            "local_writes_allowed": not replica_writes_rejected,
+            "replica_write_policy": config.postgres_replica_write_policy,
+            "write_authority": (
+                "owner-local-postgres"
+                if active_postgres and is_postgres_owner
+                else (
+                    "postgres-read-replica-local-writes-rejected"
+                    if replica_writes_rejected
+                    else "sqlite-mode-or-non-owner-local-write-warning"
+                )
+            ),
             "audit_sync_semantics": (
-                "Postgres is authoritative for Kanban table writes; SQLite receives a "
-                "rollback/archive mirror, but Kanban SQLite mirror rows are not enqueued "
-                "for fleet sync"
+                "Postgres is authoritative for Kanban table writes; SQLite Kanban rows "
+                "are not mirrored and are not enqueued for fleet sync"
                 if active_postgres
                 else "existing SQLite audit and sync_queue writes remain authoritative"
             ),
@@ -312,12 +369,12 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         },
         "safety": {
             "destructive": False,
-            "sqlite_rows_retained": True,
+            "sqlite_rows_retained": not active_postgres,
             "sqlite_reads_retained": (
                 not active_postgres and config.read_store == ACTIVE_STORE_SQLITE
             ),
             "sqlite_writes_retained": not active_postgres,
-            "sqlite_archive_mirror_retained": active_postgres,
+            "sqlite_archive_mirror_retained": False,
             "cutover_requires_separate_backup_parity_and_rollback_proof": not active_postgres,
         },
         "distribution": _kanban_postgres_distribution_status(config),
