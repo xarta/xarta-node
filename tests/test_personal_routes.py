@@ -676,44 +676,10 @@ def _make_conn() -> sqlite3.Connection:
     return conn
 
 
-def test_init_db_migrates_legacy_review_processor_marker_retry_columns(monkeypatch, tmp_path):
+def test_init_db_does_not_create_kanban_sqlite_tables(monkeypatch, tmp_path):
     db_dir = tmp_path / "db"
     db_dir.mkdir()
     db_path = db_dir / "blueprints.db"
-    with sqlite3.connect(db_path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE kanban_review_processor_markers (
-                marker_id TEXT PRIMARY KEY,
-                item_id TEXT NOT NULL,
-                processor_kind TEXT NOT NULL DEFAULT 'review',
-                document_type TEXT NOT NULL DEFAULT 'review',
-                document_ref TEXT NOT NULL DEFAULT '',
-                document_updated_at TEXT NOT NULL DEFAULT '',
-                document_source_hash TEXT NOT NULL DEFAULT '',
-                processed_document_updated_at TEXT NOT NULL DEFAULT '',
-                processed_source_hash TEXT NOT NULL DEFAULT '',
-                processed_at TEXT NOT NULL DEFAULT '',
-                queued_at TEXT NOT NULL DEFAULT '',
-                last_seen_at TEXT NOT NULL DEFAULT '',
-                processing_started_at TEXT NOT NULL DEFAULT '',
-                processing_expires_at TEXT NOT NULL DEFAULT '',
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT NOT NULL DEFAULT '',
-                superseded_at TEXT NOT NULL DEFAULT '',
-                superseded_by_source_hash TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'queued',
-                provider_mode TEXT NOT NULL DEFAULT 'local',
-                decision_id TEXT NOT NULL DEFAULT '',
-                source_hash TEXT NOT NULL DEFAULT '',
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                provenance_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(item_id, processor_kind, document_type)
-            );
-            """
-        )
 
     monkeypatch.setattr(app_db.cfg, "DB_DIR", str(db_dir))
     monkeypatch.setattr(app_db.cfg, "DB_PATH", str(db_path))
@@ -721,22 +687,16 @@ def test_init_db_migrates_legacy_review_processor_marker_retry_columns(monkeypat
     app_db.init_db()
 
     with sqlite3.connect(db_path) as conn:
-        marker_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(kanban_review_processor_markers)")
-        }
-        marker_indexes = {
-            row[1] for row in conn.execute("PRAGMA index_list(kanban_review_processor_markers)")
-        }
-        failure_event_columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(kanban_review_processor_failure_events)")
-        }
+        kanban_table_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE type='table'
+              AND name LIKE 'kanban\\_%' ESCAPE '\\'
+            """
+        ).fetchone()[0]
 
-    assert "next_retry_at" in marker_columns
-    assert "retry_attempt_count" in marker_columns
-    assert "last_successful_source_hash" in marker_columns
-    assert "idx_kanban_review_processor_markers_retry" in marker_indexes
-    assert "next_retry_at" in failure_event_columns
+    assert kanban_table_count == 0
 
 
 def test_kanban_ref_rewrite_records_completion_marker():
@@ -4853,6 +4813,8 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     }
     assert status["writes"]["store"] == "sqlite"
     assert status["writes"]["candidate_enabled"] is False
+    assert status["writes"]["local_writes_allowed"] is True
+    assert status["writes"]["replica_write_policy"] == "reject"
     assert status["candidate"]["backend"] == "postgres"
     assert status["candidate"]["bootstrap_dry_run_supported"] is True
     assert status["candidate"]["bootstrap_apply_supported"] is False
@@ -4873,6 +4835,7 @@ def test_work_kanban_datastore_status_and_bootstrap_are_disabled_by_default(monk
     )
     assert status["distribution"]["fleet"]["expected_peer_active_store"] == "sqlite"
     assert status["distribution"]["operator_safety"]["old_sqlite_rows_deletion_allowed"] is False
+    assert status["distribution"]["operator_safety"]["sqlite_distribution_allowed"] is False
     assert {
         "kanban_items",
         "kanban_priority_recommendations",
@@ -4960,6 +4923,7 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
     assert active_postgres.active_store == "postgres"
     assert active_postgres.read_store == "postgres"
     assert active_postgres.candidate_database_url_configured is True
+    assert active_postgres.postgres_replica_write_policy == "reject"
 
     with pytest.raises(KanbanDatastoreConfigError, match="required"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres"})
@@ -4970,10 +4934,60 @@ def test_work_kanban_datastore_config_rejects_unsafe_modes():
     with pytest.raises(KanbanDatastoreConfigError, match="invalid"):
         load_kanban_datastore_config({"BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND": "mongo"})
 
+    with pytest.raises(KanbanDatastoreConfigError, match="replica write policies"):
+        load_kanban_datastore_config(
+            {"BLUEPRINTS_KANBAN_POSTGRES_REPLICA_WRITE_POLICY": "multi-writer"}
+        )
+
+
+def test_work_kanban_datastore_status_reports_postgres_read_replica(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    replica_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_NODE_ID": "peer-node",
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+            "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID": "owner-node",
+        }
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", replica_config)
+
+    status = asyncio.run(routes_personal.get_work_kanban_datastore_status())
+
+    assert status["active_store"] == "postgres"
+    assert status["reads"]["store"] == "postgres"
+    assert status["writes"]["store"] == "postgres"
+    assert status["writes"]["local_writes_allowed"] is False
+    assert status["writes"]["replica_write_policy"] == "reject"
+    assert status["writes"]["write_authority"] == "postgres-read-replica-local-writes-rejected"
+    assert status["distribution"]["current_node_id"] == "peer-node"
+    assert status["distribution"]["owner_node_id"] == "owner-node"
+    assert status["distribution"]["this_node_role"] == "postgres-read-replica"
+    assert status["distribution"]["authority"]["this_node_is_owner"] is False
+    assert status["distribution"]["authority"]["reads_authoritative_postgres"] is True
+    assert status["distribution"]["authority"]["writes_authoritative_postgres"] is False
+    assert (
+        status["distribution"]["authority"]["write_authority"]
+        == "postgres-read-replica-local-writes-rejected"
+    )
+    assert status["distribution"]["authority"]["replica_local_writes_rejected"] is True
+    assert status["distribution"]["fleet"]["expected_peer_active_store"] == "postgres"
+    assert status["distribution"]["fleet"]["peer_postgres_required_now"] is True
+    assert (
+        "SQLite is not a distribution mechanism"
+        in status["distribution"]["fleet"]["data_distribution"]
+    )
+    assert status["distribution"]["operator_safety"]["sqlite_distribution_allowed"] is False
+
 
 def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypatch, tmp_path):
     conn = _make_conn()
     postgres_conn = _make_conn()
+    conn.executemany(
+        "INSERT INTO nodes (node_id) VALUES (?)",
+        [("peer-a",), ("peer-b",)],
+    )
     monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
     active_config = load_kanban_datastore_config(
@@ -5025,8 +5039,10 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
     assert status["active_store"] == "postgres"
     assert status["reads"]["store"] == "postgres"
     assert status["writes"]["store"] == "postgres"
+    assert status["writes"]["local_writes_allowed"] is True
+    assert status["writes"]["write_authority"] == "owner-local-postgres"
     assert status["safety"]["sqlite_writes_retained"] is False
-    assert status["safety"]["sqlite_archive_mirror_retained"] is True
+    assert status["safety"]["sqlite_archive_mirror_retained"] is False
     assert status["distribution"]["owner_node_id"] == "test-node"
     assert status["distribution"]["this_node_role"] == "postgres-owner"
     assert status["distribution"]["authority"]["this_node_is_owner"] is True
@@ -5036,8 +5052,9 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
         status["distribution"]["fleet"]["kanban_sqlite_row_sync"]
         == "disabled-for-kanban-tables-while-owner-postgres-active"
     )
-    assert status["distribution"]["fleet"]["peer_postgres_required_now"] is False
-    assert status["distribution"]["rollback"]["sqlite_archive_mirror_retained"] is True
+    assert status["distribution"]["fleet"]["expected_peer_active_store"] == "postgres"
+    assert status["distribution"]["fleet"]["peer_postgres_required_now"] is True
+    assert status["distribution"]["rollback"]["sqlite_archive_mirror_retained"] is False
     assert status["distribution"]["operator_safety"]["old_sqlite_rows_deletion_allowed"] is False
 
     asyncio.run(
@@ -5065,12 +5082,10 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
         conn.execute(
             "SELECT COUNT(*) FROM kanban_items WHERE item_id='active-postgres-write'"
         ).fetchone()[0]
-        == 1
+        == 0
     )
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] == 0
 
-    conn.execute(
-        "UPDATE kanban_items SET title='SQLite rollback mirror title' WHERE item_id='active-postgres-write'"
-    )
     postgres_conn.execute(
         "UPDATE kanban_items SET title='Postgres authoritative title' WHERE item_id='active-postgres-write'"
     )
@@ -5082,6 +5097,81 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
         if item["item_id"] == "active-postgres-write"
     ]
     assert root_items[0]["title"] == "Postgres authoritative title"
+
+
+def test_work_kanban_postgres_read_replica_rejects_local_writes(monkeypatch, tmp_path):
+    conn = _make_conn()
+    postgres_conn = _make_conn()
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    replica_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_NODE_ID": "peer-node",
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+            "BLUEPRINTS_KANBAN_POSTGRES_OWNER_NODE_ID": "owner-node",
+        }
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", replica_config)
+    postgres_opened = False
+
+    class FakePostgres:
+        def __init__(self, sqlite_conn):
+            self.conn = sqlite_conn
+
+        def begin(self):
+            return None
+
+        def execute(self, sql, params=None):
+            if params is None:
+                return self.conn.execute(sql)
+            return self.conn.execute(sql, params)
+
+        def executemany(self, sql, seq_of_params):
+            return self.conn.executemany(sql, list(seq_of_params))
+
+        def commit(self):
+            self.conn.commit()
+
+        def rollback(self):
+            self.conn.rollback()
+
+        def close(self):
+            return None
+
+    def fake_postgres_connection(_database_url):
+        nonlocal postgres_opened
+        postgres_opened = True
+        return FakePostgres(postgres_conn)
+
+    monkeypatch.setattr(routes_personal, "postgres_candidate_connection", fake_postgres_connection)
+
+    with pytest.raises(routes_personal.HTTPException) as exc:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id="replica-write-rejected",
+                    title="Replica Write Rejected",
+                    body="This write must not land on a non-owner Postgres node.",
+                    state_id="todo",
+                    priority_id="high",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="replica-write-rejected",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "Postgres Kanban read replica" in str(exc.value.detail)
+    assert "owner-node" in str(exc.value.detail)
+    assert postgres_opened is True
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM kanban_items WHERE item_id='replica-write-rejected'"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_work_kanban_datastore_parity_uses_postgres_report_for_active_postgres(monkeypatch):
