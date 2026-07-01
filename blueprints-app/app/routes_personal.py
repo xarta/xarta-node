@@ -30,10 +30,13 @@ from starlette.responses import FileResponse
 
 from . import config as cfg
 from . import hermes_minutes
-from .db import get_conn, get_setting, increment_gen, set_setting
+from .db import get_conn as _sqlite_get_conn
+from .db import get_setting, increment_gen, set_setting
 from .kanban_datastore import (
+    ACTIVE_STORE_POSTGRES,
     CANDIDATE_READ_STORE_POSTGRES,
     CANDIDATE_READ_STORE_SHADOW,
+    KANBAN_DATASTORE_TABLES,
     KanbanDatastoreConfigError,
     kanban_datastore_bootstrap_plan,
     kanban_datastore_status,
@@ -261,6 +264,140 @@ PERSONAL_FILTER_COLORS = {
     "gold",
 }
 
+_KANBAN_ACTIVE_POSTGRES_TABLES = set(KANBAN_DATASTORE_TABLES)
+_KANBAN_ACTIVE_POSTGRES_TABLE_RE = re.compile(
+    r"\b("
+    + "|".join(re.escape(table) for table in sorted(_KANBAN_ACTIVE_POSTGRES_TABLES))
+    + r")\b",
+    flags=re.IGNORECASE,
+)
+_KANBAN_ACTIVE_POSTGRES_SQLITE_ONLY_RE = re.compile(
+    r"\b(sync_queue|sync_meta|nodes|personal_|settings_audit)\b",
+    flags=re.IGNORECASE,
+)
+_KANBAN_ACTIVE_POSTGRES_TRANSACTION_RE = re.compile(
+    r"^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b",
+    flags=re.IGNORECASE,
+)
+_KANBAN_ACTIVE_POSTGRES_READ_RE = re.compile(
+    r"^\s*(SELECT|WITH|PRAGMA)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _kanban_active_store_is_postgres() -> bool:
+    return cfg.KANBAN_DATASTORE_CONFIG.active_store == ACTIVE_STORE_POSTGRES
+
+
+def _params_contain_value(params: Any, value: str) -> bool:
+    if isinstance(params, dict):
+        return any(_params_contain_value(item, value) for item in params.values())
+    if isinstance(params, (list, tuple, set)):
+        return any(_params_contain_value(item, value) for item in params)
+    return str(params or "") == value
+
+
+def _kanban_active_postgres_uses_statement(sql: str, params: Any = None) -> bool:
+    statement = str(sql or "")
+    if _KANBAN_ACTIVE_POSTGRES_TRANSACTION_RE.match(statement):
+        return False
+    if _KANBAN_ACTIVE_POSTGRES_SQLITE_ONLY_RE.search(statement):
+        return False
+    if _KANBAN_ACTIVE_POSTGRES_TABLE_RE.search(statement):
+        return True
+    if re.search(r"\bsettings\b", statement, flags=re.IGNORECASE):
+        return _params_contain_value(params, KANBAN_SHOW_TEST_ENTRIES_SETTING)
+    return False
+
+
+class _KanbanActivePostgresConnection:
+    """Route Kanban table traffic to active Postgres while mirroring SQLite for rollback."""
+
+    def __init__(self, sqlite_conn: Any) -> None:
+        self._sqlite_conn = sqlite_conn
+        self._postgres_conn: Any | None = None
+
+    @property
+    def row_factory(self) -> Any:
+        return self._sqlite_conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._sqlite_conn.row_factory = value
+
+    def _postgres(self) -> Any:
+        if self._postgres_conn is None:
+            try:
+                self._postgres_conn = postgres_candidate_connection(
+                    cfg.KANBAN_DATASTORE_CONFIG.candidate_database_url
+                )
+                self._postgres_conn.begin()
+            except KanbanPostgresError:
+                raise
+            except Exception as exc:
+                raise KanbanPostgresError(
+                    f"active Kanban Postgres connection failed: {exc}"
+                ) from exc
+        return self._postgres_conn
+
+    def execute(self, sql: str, params: Any = None) -> Any:
+        if not _kanban_active_postgres_uses_statement(sql, params):
+            if params is None:
+                return self._sqlite_conn.execute(sql)
+            return self._sqlite_conn.execute(sql, params)
+
+        postgres = self._postgres()
+        if _KANBAN_ACTIVE_POSTGRES_READ_RE.match(str(sql or "")):
+            return postgres.execute(sql, params)
+
+        postgres.execute(sql, params)
+        if params is None:
+            return self._sqlite_conn.execute(sql)
+        return self._sqlite_conn.execute(sql, params)
+
+    def executemany(self, sql: str, seq_of_params: Any) -> Any:
+        params_list = list(seq_of_params)
+        if _kanban_active_postgres_uses_statement(sql, params_list):
+            self._postgres().executemany(sql, params_list)
+        return self._sqlite_conn.executemany(sql, params_list)
+
+    def commit(self) -> None:
+        if self._postgres_conn is not None:
+            self._postgres_conn.commit()
+
+    def rollback(self) -> None:
+        if self._postgres_conn is not None:
+            self._postgres_conn.rollback()
+
+    def close(self) -> None:
+        if self._postgres_conn is not None:
+            self._postgres_conn.close()
+            self._postgres_conn = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sqlite_conn, name)
+
+
+def _is_kanban_active_postgres_connection(conn: Any) -> bool:
+    return isinstance(conn, _KanbanActivePostgresConnection)
+
+
+@contextmanager
+def get_conn() -> Any:
+    with _sqlite_get_conn() as sqlite_conn:
+        if not _kanban_active_store_is_postgres():
+            yield sqlite_conn
+            return
+        conn = _KanbanActivePostgresConnection(sqlite_conn)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
 
 def _kanban_store(conn: Any) -> SQLiteKanbanStore:
     return SQLiteKanbanStore(
@@ -282,6 +419,21 @@ def _kanban_write_store(conn: Any) -> SQLiteKanbanStore:
 @contextmanager
 def _kanban_read_connection(conn: Any) -> Any:
     candidate_conn = None
+    if _kanban_active_store_is_postgres():
+        if _is_kanban_active_postgres_connection(conn):
+            yield conn
+            return
+        try:
+            candidate_conn = postgres_candidate_connection(
+                cfg.KANBAN_DATASTORE_CONFIG.candidate_database_url
+            )
+        except KanbanPostgresError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        try:
+            yield candidate_conn
+        finally:
+            candidate_conn.close()
+        return
     if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_SHADOW:
         candidate_conn = kanban_shadow_candidate_connection(
             conn,
@@ -11670,7 +11822,10 @@ async def get_work_kanban_datastore_parity(
     include_backups: bool = True,
 ) -> dict[str, Any]:
     with get_conn() as conn:
-        if cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_POSTGRES:
+        if (
+            cfg.KANBAN_DATASTORE_CONFIG.active_store == ACTIVE_STORE_POSTGRES
+            or cfg.KANBAN_DATASTORE_CONFIG.read_store == CANDIDATE_READ_STORE_POSTGRES
+        ):
             try:
                 return kanban_postgres_parity_report(
                     conn,

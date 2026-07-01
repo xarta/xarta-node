@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .kanban_datastore import (
+    ACTIVE_STORE_POSTGRES,
     CANDIDATE_READ_STORE_POSTGRES,
     KANBAN_DATASTORE_TABLES,
     KanbanDatastoreConfig,
@@ -977,11 +978,16 @@ def kanban_postgres_parity_report(
         "agent_session_count": int(live_payloads.get("agent_sessions", {}).get("count") or 0),
         "review_decision_count": int(live_payloads.get("review_decisions", {}).get("count") or 0),
     }
+    live_reads_enabled = (
+        datastore_config.active_store == ACTIVE_STORE_POSTGRES
+        or datastore_config.read_store == CANDIDATE_READ_STORE_POSTGRES
+    )
+    live_writes_enabled = datastore_config.active_store == ACTIVE_STORE_POSTGRES
     safety = {
         "destructive": False,
         "candidate_storage": "postgres",
-        "live_reads_enabled": datastore_config.read_store == CANDIDATE_READ_STORE_POSTGRES,
-        "live_writes_enabled": False,
+        "live_reads_enabled": live_reads_enabled,
+        "live_writes_enabled": live_writes_enabled,
         "sqlite_rows_retained": True,
         "sync_queue_rows_created": False,
         "sync_queue_count_before": int(sync_before or 0),
@@ -999,8 +1005,8 @@ def kanban_postgres_parity_report(
         "candidate": {
             "backend": datastore_config.candidate_backend,
             "storage": "postgres",
-            "live_reads_enabled": datastore_config.read_store == CANDIDATE_READ_STORE_POSTGRES,
-            "live_writes_enabled": False,
+            "live_reads_enabled": live_reads_enabled,
+            "live_writes_enabled": live_writes_enabled,
             "database_url_configured": datastore_config.candidate_database_url_configured,
         },
         "tables": {

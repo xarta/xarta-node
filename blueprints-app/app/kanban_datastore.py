@@ -22,11 +22,13 @@ KANBAN_CANDIDATE_BACKEND_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_STORE_BACKEND"
 KANBAN_CANDIDATE_DATABASE_URL_ENV = "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL"
 
 ACTIVE_STORE_SQLITE = "sqlite"
+ACTIVE_STORE_POSTGRES = "postgres"
 CANDIDATE_READ_STORE_SHADOW = "candidate-shadow"
 CANDIDATE_READ_STORE_POSTGRES = "candidate-postgres"
-SUPPORTED_ACTIVE_STORES = {ACTIVE_STORE_SQLITE}
+SUPPORTED_ACTIVE_STORES = {ACTIVE_STORE_SQLITE, ACTIVE_STORE_POSTGRES}
 SUPPORTED_READ_STORES = {
     ACTIVE_STORE_SQLITE,
+    ACTIVE_STORE_POSTGRES,
     CANDIDATE_READ_STORE_SHADOW,
     CANDIDATE_READ_STORE_POSTGRES,
 }
@@ -83,7 +85,10 @@ def load_kanban_datastore_config(
             f"Supported live Kanban datastore modes in this slice: {supported}."
         )
 
-    read_store = _clean_env_value(source.get(KANBAN_READ_STORE_ENV), ACTIVE_STORE_SQLITE)
+    default_read_store = (
+        ACTIVE_STORE_POSTGRES if active_store == ACTIVE_STORE_POSTGRES else ACTIVE_STORE_SQLITE
+    )
+    read_store = _clean_env_value(source.get(KANBAN_READ_STORE_ENV), default_read_store)
     if read_store not in SUPPORTED_READ_STORES:
         supported = ", ".join(sorted(SUPPORTED_READ_STORES))
         raise KanbanDatastoreConfigError(
@@ -102,23 +107,31 @@ def load_kanban_datastore_config(
             f"Supported candidate Kanban datastore backends: {supported}."
         )
 
+    candidate_database_url = str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip()
+    if active_store == ACTIVE_STORE_POSTGRES and not candidate_database_url:
+        raise KanbanDatastoreConfigError(
+            f"{KANBAN_CANDIDATE_DATABASE_URL_ENV} is required when "
+            f"{KANBAN_DATASTORE_MODE_ENV}=postgres."
+        )
+
     return KanbanDatastoreConfig(
         active_store=active_store,
         read_store=read_store,
         candidate_backend=candidate_backend,
-        candidate_database_url_configured=bool(
-            str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip()
-        ),
-        candidate_database_url=str(source.get(KANBAN_CANDIDATE_DATABASE_URL_ENV, "")).strip(),
+        candidate_database_url_configured=bool(candidate_database_url),
+        candidate_database_url=candidate_database_url,
     )
 
 
 def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
     """Return operator/agent-visible status without exposing connection secrets."""
 
-    if config.read_store == CANDIDATE_READ_STORE_SHADOW:
+    active_postgres = config.active_store == ACTIVE_STORE_POSTGRES
+    if active_postgres:
+        candidate_mode = "active-postgres"
+    elif config.read_store == CANDIDATE_READ_STORE_SHADOW:
         candidate_mode = "sqlite-shadow"
-    elif config.read_store == CANDIDATE_READ_STORE_POSTGRES:
+    elif config.read_store in {CANDIDATE_READ_STORE_POSTGRES, ACTIVE_STORE_POSTGRES}:
         candidate_mode = "postgres"
     else:
         candidate_mode = "disabled"
@@ -129,15 +142,20 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         "config_schema": KANBAN_DATASTORE_CONFIG_SCHEMA,
         "active_store": config.active_store,
         "reads": {
-            "store": config.read_store,
-            "candidate_enabled": config.read_store != ACTIVE_STORE_SQLITE,
+            "store": ACTIVE_STORE_POSTGRES if active_postgres else config.read_store,
+            "candidate_enabled": active_postgres or config.read_store != ACTIVE_STORE_SQLITE,
             "candidate_mode": candidate_mode,
             "read_store_env": KANBAN_READ_STORE_ENV,
         },
         "writes": {
-            "store": ACTIVE_STORE_SQLITE,
-            "candidate_enabled": False,
-            "audit_sync_semantics": "existing SQLite audit and sync_queue writes remain authoritative",
+            "store": ACTIVE_STORE_POSTGRES if active_postgres else ACTIVE_STORE_SQLITE,
+            "candidate_enabled": active_postgres,
+            "audit_sync_semantics": (
+                "Postgres is authoritative for Kanban table writes; SQLite receives a "
+                "rollback/archive mirror plus existing sync_queue bookkeeping"
+                if active_postgres
+                else "existing SQLite audit and sync_queue writes remain authoritative"
+            ),
         },
         "candidate": {
             "backend": config.candidate_backend,
@@ -154,9 +172,12 @@ def kanban_datastore_status(config: KanbanDatastoreConfig) -> dict[str, Any]:
         "safety": {
             "destructive": False,
             "sqlite_rows_retained": True,
-            "sqlite_reads_retained": config.read_store == ACTIVE_STORE_SQLITE,
-            "sqlite_writes_retained": True,
-            "cutover_requires_separate_backup_parity_and_rollback_proof": True,
+            "sqlite_reads_retained": (
+                not active_postgres and config.read_store == ACTIVE_STORE_SQLITE
+            ),
+            "sqlite_writes_retained": not active_postgres,
+            "sqlite_archive_mirror_retained": active_postgres,
+            "cutover_requires_separate_backup_parity_and_rollback_proof": not active_postgres,
         },
         "tables": list(KANBAN_DATASTORE_TABLES),
     }
