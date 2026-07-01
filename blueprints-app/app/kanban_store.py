@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .db import get_setting
+
+KanbanSyncChange = tuple[str, str, dict[str, Any]]
 
 
 class KanbanStoreError(Exception):
@@ -78,6 +81,13 @@ def _json_value(value: Any, default: Any) -> Any:
         except json.JSONDecodeError:
             return default
     return value
+
+
+def _hash_json_payload(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _bool_setting_value(value: str | None, default: bool = True) -> bool:
@@ -494,6 +504,71 @@ class SQLiteKanbanStore:
             ),
         )
         return self.item_or_raise(item_id)
+
+    def update_item_parent_depth(
+        self,
+        item_id: str,
+        *,
+        parent_item_id: str | None,
+        depth: int,
+        now: str,
+    ) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_items
+            SET parent_item_id=?, depth=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (parent_item_id, depth, now, item_id),
+        )
+        return self.item_or_raise(item_id)
+
+    def update_item_state(
+        self,
+        item_id: str,
+        *,
+        state_id: str,
+        status: str,
+        now: str,
+    ) -> Any:
+        self.conn.execute(
+            """
+            UPDATE kanban_items
+            SET state_id=?, status=?, updated_at=?
+            WHERE item_id=?
+            """,
+            (state_id, status, now, item_id),
+        )
+        return self.item_or_raise(item_id)
+
+    def recompute_child_depths(self, item_id: str, depth: int, *, now: str) -> None:
+        rows = self.conn.execute(
+            "SELECT item_id FROM kanban_items WHERE parent_item_id=?",
+            (item_id,),
+        ).fetchall()
+        for row in rows:
+            child_depth = depth + 1
+            self.conn.execute(
+                "UPDATE kanban_items SET depth=?, updated_at=? WHERE item_id=?",
+                (child_depth, now, row["item_id"]),
+            )
+            self.recompute_child_depths(row["item_id"], child_depth, now=now)
+
+    def subtree_rows(self, item_id: str) -> list[Any]:
+        clean_item_id = self._clean_id(item_id)
+        return self.conn.execute(
+            """
+            WITH RECURSIVE descendants(item_id) AS (
+                SELECT item_id FROM kanban_items WHERE item_id=?
+                UNION ALL
+                SELECT w.item_id
+                FROM kanban_items w
+                JOIN descendants ON w.parent_item_id = descendants.item_id
+            )
+            SELECT w.* FROM kanban_items w JOIN descendants ON descendants.item_id = w.item_id
+            """,
+            (clean_item_id,),
+        ).fetchall()
 
     def archive_item_row(self, item_id: str, *, archived_at: str) -> Any:
         self.conn.execute(
@@ -1145,6 +1220,183 @@ class SQLiteKanbanStore:
             raise KanbanItemNotFound("Kanban item not found")
         return row
 
+    def lane_order_snapshot(
+        self,
+        parent_item_id: str | None,
+        state_id: str,
+        priority_id: str,
+    ) -> list[str]:
+        rows = self.order_group_rows(parent_item_id, state_id, priority_id)
+        return [row["item_id"] for row in self._order_priority_group(rows)]
+
+    def order_group_rows(
+        self,
+        parent_item_id: str | None,
+        state_id: str,
+        priority_id: str,
+    ) -> list[Any]:
+        parent_key = self._lane_parent_key(parent_item_id)
+        if parent_key:
+            return self.conn.execute(
+                """
+                SELECT * FROM kanban_items
+                WHERE parent_item_id=? AND state_id=? AND priority_id=? AND status != 'archived'
+                """,
+                (parent_key, state_id, priority_id),
+            ).fetchall()
+        return self.conn.execute(
+            """
+            SELECT * FROM kanban_items
+            WHERE parent_item_id IS NULL AND state_id=? AND priority_id=? AND status != 'archived'
+            """,
+            (state_id, priority_id),
+        ).fetchall()
+
+    def item_has_order_relation(
+        self,
+        parent_item_id: str | None,
+        state_id: str,
+        priority_id: str,
+        item_id: str,
+    ) -> bool:
+        clean_item_id = self._clean_id(item_id)
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM kanban_item_order_edges
+            WHERE parent_item_id=? AND state_id=? AND priority_id=?
+              AND (before_item_id=? OR after_item_id=?)
+            LIMIT 1
+            """,
+            (
+                self._lane_parent_key(parent_item_id),
+                state_id,
+                priority_id,
+                clean_item_id,
+                clean_item_id,
+            ),
+        ).fetchone()
+        return bool(row)
+
+    def replace_item_order_edges(
+        self,
+        *,
+        parent_item_id: str | None,
+        state_id: str,
+        priority_id: str,
+        ordered_ids: list[str],
+        now: str,
+        meta: dict[str, str],
+    ) -> list[KanbanSyncChange]:
+        parent_key = self._lane_parent_key(parent_item_id)
+        clean_ids = [item_id for item_id in ordered_ids if item_id]
+        wanted_pairs = list(zip(clean_ids, clean_ids[1:]))
+        wanted_edge_ids = {
+            self._order_edge_id(parent_key, state_id, priority_id, before, after)
+            for before, after in wanted_pairs
+        }
+        sync_changes: list[KanbanSyncChange] = []
+        existing = self.conn.execute(
+            """
+            SELECT * FROM kanban_item_order_edges
+            WHERE parent_item_id=? AND state_id=? AND priority_id=?
+            """,
+            (parent_key, state_id, priority_id),
+        ).fetchall()
+        for row in existing:
+            if row["edge_id"] in wanted_edge_ids:
+                continue
+            self.conn.execute(
+                "DELETE FROM kanban_item_order_edges WHERE edge_id=?", (row["edge_id"],)
+            )
+            sync_changes.append(("DELETE", row["edge_id"], {}))
+        for before, after in wanted_pairs:
+            edge_id = self._order_edge_id(parent_key, state_id, priority_id, before, after)
+            provenance = {
+                "actor": meta["actor"],
+                "source_surface": meta["source_surface"],
+                "request_id": meta["request_id"],
+                "before_item_id": before,
+                "after_item_id": after,
+            }
+            payload = {
+                "edge_id": edge_id,
+                "parent_item_id": parent_key,
+                "state_id": state_id,
+                "priority_id": priority_id,
+                "before_item_id": before,
+                "after_item_id": after,
+                "provenance": provenance,
+            }
+            source_hash = _hash_json_payload(payload)
+            self.conn.execute(
+                """
+                INSERT INTO kanban_item_order_edges (
+                    edge_id, parent_item_id, state_id, priority_id, before_item_id,
+                    after_item_id, source_hash, provenance_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(edge_id) DO UPDATE SET
+                    before_item_id=excluded.before_item_id,
+                    after_item_id=excluded.after_item_id,
+                    source_hash=excluded.source_hash,
+                    provenance_json=excluded.provenance_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    edge_id,
+                    parent_key,
+                    state_id,
+                    priority_id,
+                    before,
+                    after,
+                    source_hash,
+                    json.dumps(provenance, ensure_ascii=True, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM kanban_item_order_edges WHERE edge_id=?",
+                (edge_id,),
+            ).fetchone()
+            sync_changes.append(("UPDATE", edge_id, dict(row)))
+        return sync_changes
+
+    def ensure_item_lane_order(
+        self,
+        item_id: str,
+        *,
+        prefer_top_if_new: bool,
+        now: str,
+        meta: dict[str, str],
+    ) -> tuple[list[str], list[KanbanSyncChange]]:
+        item = self.item_or_raise(item_id)
+        rows = self.order_group_rows(item["parent_item_id"], item["state_id"], item["priority_id"])
+        ordered_ids = [row["item_id"] for row in self._order_priority_group(rows)]
+        if (
+            item_id in ordered_ids
+            and prefer_top_if_new
+            and not self.item_has_order_relation(
+                item["parent_item_id"],
+                item["state_id"],
+                item["priority_id"],
+                item_id,
+            )
+        ):
+            ordered_ids = [item_id, *[value for value in ordered_ids if value != item_id]]
+        sync_changes = self.replace_item_order_edges(
+            parent_item_id=item["parent_item_id"],
+            state_id=item["state_id"],
+            priority_id=item["priority_id"],
+            ordered_ids=ordered_ids,
+            now=now,
+            meta=meta,
+        )
+        return ordered_ids, sync_changes
+
+    def order_priority_group(self, rows: list[Any]) -> list[Any]:
+        return self._order_priority_group(rows)
+
     def breadcrumbs(self, item_id: str | None) -> list[Any]:
         current = self._clean_id(item_id)
         if not current:
@@ -1454,6 +1706,25 @@ class SQLiteKanbanStore:
             and row["after_item_id"] in item_ids
             and row["before_item_id"] != row["after_item_id"]
         ]
+
+    def _order_edge_id(
+        self,
+        parent_item_id: str | None,
+        state_id: str,
+        priority_id: str,
+        before_item_id: str,
+        after_item_id: str,
+    ) -> str:
+        digest = _hash_json_payload(
+            {
+                "parent_item_id": self._lane_parent_key(parent_item_id),
+                "state_id": state_id,
+                "priority_id": priority_id,
+                "before_item_id": before_item_id,
+                "after_item_id": after_item_id,
+            }
+        )[:24]
+        return f"kanban-order-{digest}"
 
     def _filter_test_rows(self, rows: list[Any], show_test_entries: bool) -> tuple[list[Any], int]:
         if show_test_entries:
