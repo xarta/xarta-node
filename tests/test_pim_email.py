@@ -11,7 +11,7 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from app import pim_email, pim_email_security, routes_pim_email  # noqa: E402
+from app import pim_email, pim_email_security, pim_email_uid, routes_pim_email  # noqa: E402
 
 
 def _mailbox(password: str = "test-password-123") -> pim_email.EmailMailbox:
@@ -146,6 +146,146 @@ def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     assert "<p>HTML body</p>" in parsed["views"]["html"]
     assert parsed["html_security"]["sandbox"] == "srcdoc-no-scripts-no-same-origin"
     assert parsed["html_security"]["image_proxy"] == "same-site-jpeg-transform"
+    assert parsed["email_uid"].startswith("00000000-")
+    assert parsed["email_uid_info"]["schema"] == pim_email_uid.SCHEMA
+    assert parsed["email_uid_info"]["confidence"] == "medium"
+
+
+def test_email_uid_same_headers_ignore_folder_and_imap_uid():
+    raw = (
+        b"Subject: Stable identity\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <stable@example.test>\r\n\r\n"
+        b"Body text\r\n"
+    )
+
+    inbox = pim_email.parse_message(raw, folder="INBOX", uid="42")
+    archive = pim_email.parse_message(raw, folder="Archive", uid="777")
+
+    assert inbox["folder"] == "INBOX"
+    assert archive["folder"] == "Archive"
+    assert inbox["uid"] == "42"
+    assert archive["uid"] == "777"
+    assert inbox["email_uid"] == archive["email_uid"]
+    assert inbox["email_uid_info"] == archive["email_uid_info"]
+
+
+def test_email_uid_header_only_and_full_raw_generation_match():
+    headers = (
+        b"Subject: Header-only proof\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <header-only@example.test>\r\n\r\n"
+    )
+    full_raw = headers + b"Content-Type: text/plain; charset=utf-8\r\n\r\nBody text\r\n"
+
+    header_info = pim_email_uid.generate_email_uid_info(headers)
+    full_info = pim_email_uid.generate_email_uid_info(full_raw)
+
+    assert header_info["email_uid"] == full_info["email_uid"]
+    assert header_info["hash_hex"] == full_info["hash_hex"]
+    assert header_info["storage_relpath"] == full_info["storage_relpath"]
+
+
+def test_email_uid_date_timezone_normalizes_to_utc_prefix():
+    raw = (
+        b"Subject: Timezone proof\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 00:30:00 +0200\r\n"
+        b"Message-ID: <timezone@example.test>\r\n\r\n"
+    )
+
+    info = pim_email_uid.generate_email_uid_info(raw)
+
+    assert info["date_yyyymmdd"] == "20260630"
+    assert info["date_source"] == "date"
+    assert info["email_uid"].startswith("20260630-")
+
+
+def test_email_uid_uses_received_only_as_date_prefix_fallback():
+    raw = (
+        b"Received: from mx.example.test by mailbox.example.test; "
+        b"Wed, 01 Jul 2026 10:30:00 +0000\r\n"
+        b"Subject: Received fallback\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Message-ID: <received-fallback@example.test>\r\n\r\n"
+    )
+
+    info = pim_email_uid.generate_email_uid_info(raw)
+    field_names = {field["name"] for field in info["source_fields"]}
+
+    assert info["date_yyyymmdd"] == "20260701"
+    assert info["date_source"] == "received"
+    assert info["email_uid"].startswith("20260701-")
+    assert "Received" not in field_names
+
+
+def test_email_uid_excludes_folder_and_delivery_noise_headers_from_identity_hash():
+    base = (
+        b"Subject: Noise proof\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <noise@example.test>\r\n\r\n"
+    )
+    noisy = (
+        b"Return-Path: <bounce@example.test>\r\n"
+        b"Delivered-To: user@example.test\r\n"
+        b"Authentication-Results: mx.example.test; dkim=pass\r\n"
+        b"Received-SPF: pass\r\n"
+        b"Received: from mx.example.test; Wed, 01 Jul 2026 09:15:02 +0000\r\n"
+        b"X-Folder: Archive\r\n"
+    ) + base
+
+    assert (
+        pim_email_uid.generate_email_uid_info(base)["email_uid"]
+        == (pim_email_uid.generate_email_uid_info(noisy)["email_uid"])
+    )
+
+
+def test_email_uid_missing_message_id_is_deterministic_lower_confidence():
+    raw = (
+        b"Subject: Missing message id\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+    )
+
+    first = pim_email_uid.generate_email_uid_info(raw)
+    second = pim_email_uid.generate_email_uid_info(raw)
+
+    assert first["email_uid"] == second["email_uid"]
+    assert first["confidence"] == "low"
+    assert "message_id_missing" in first["warnings"]
+    assert "header_fallback_used" in first["warnings"]
+    assert any(field["name"] == "header-fallback" for field in first["source_fields"])
+
+
+def test_email_uid_storage_relpath_derives_from_date_prefix_and_undated_bucket():
+    dated = (
+        b"Subject: Storage path\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <storage@example.test>\r\n\r\n"
+    )
+    undated = (
+        b"Subject: Storage path\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"Message-ID: <storage-undated@example.test>\r\n\r\n"
+    )
+
+    dated_info = pim_email_uid.generate_email_uid_info(dated)
+    undated_info = pim_email_uid.generate_email_uid_info(undated)
+
+    assert dated_info["storage_relpath"] == f"2026/07/01/{dated_info['email_uid']}.eml.enc"
+    assert undated_info["date_yyyymmdd"] == "00000000"
+    assert undated_info["storage_relpath"] == f"undated/{undated_info['email_uid']}.eml.enc"
 
 
 def test_parse_message_marks_real_markdown_view_available():
@@ -260,10 +400,29 @@ def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch)
     assert [folder["name"] for folder in folders] == ["INBOX", "Archive"]
     assert [row["uid"] for row in inbox] == ["42", "41"]
     assert inbox[0]["subject"] == "Message 42"
+    assert inbox[0]["email_uid"].startswith("20260630-")
+    assert inbox[0]["email_uid_info"]["confidence"] == "high"
+    assert inbox[0]["email_uid_info"]["date_source"] == "date"
     assert [row["folder"] for row in archive] == ["Archive"]
     assert [row["uid"] for row in archive] == ["42"]
+    assert archive[0]["email_uid"] == inbox[0]["email_uid"]
     assert message["views"]["plain"] == "Opened body"
+    assert message["email_uid_info"]["schema"] == pim_email_uid.SCHEMA
     assert message["security"]["aggregate"]["status"] == "green"
+
+
+def test_fast_folder_listing_uid_generation_does_not_call_security(monkeypatch):
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", FakeIMAP)
+
+    def fail_security(*args, **kwargs):
+        raise AssertionError("UID generation must not call email security checks")
+
+    monkeypatch.setattr(pim_email, "check_email_security_sync", fail_security)
+
+    rows = pim_email.list_folder_messages_sync(_mailbox(), folder="INBOX", limit=2)
+
+    assert [row["uid"] for row in rows] == ["42", "41"]
+    assert all(row["email_uid_info"]["schema"] == pim_email_uid.SCHEMA for row in rows)
 
 
 def test_message_open_blocks_when_security_service_is_unavailable(monkeypatch):

@@ -35,6 +35,7 @@ from .pim_email_security import (
     EmailSecurityUnavailableError,
     check_email_security_sync,
 )
+from .pim_email_uid import generate_email_uid_info
 
 DEFAULT_MAILBOX_ID = "default"
 DEFAULT_IMAP_PORT = 993
@@ -517,10 +518,13 @@ def list_folder_messages_sync(
                 continue
             header_bytes = _first_fetch_bytes(fetch_data)
             msg = BytesParser(policy=policy.default).parsebytes(header_bytes or b"")
+            email_uid_info = generate_email_uid_info(header_bytes)
             messages.append(
                 {
                     "uid": uid.decode("ascii", "replace"),
                     "folder": clean_folder,
+                    "email_uid": email_uid_info["email_uid"],
+                    "email_uid_info": email_uid_info,
                     "subject": _decode_header_value(msg.get("subject", "")),
                     "from": _decode_header_value(msg.get("from", "")),
                     "date": _decode_header_value(msg.get("date", "")),
@@ -647,6 +651,7 @@ def _first_fetch_bytes(fetch_data: Any) -> bytes:
 
 def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[str, Any]:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
+    email_uid_info = generate_email_uid_info(raw)
     plain = _first_text_part(msg, "plain")
     raw_markdown = _first_text_part(msg, "markdown")
     raw_html = _first_text_part(msg, "html")
@@ -663,6 +668,8 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
     return {
         "uid": uid,
         "folder": folder,
+        "email_uid": email_uid_info["email_uid"],
+        "email_uid_info": email_uid_info,
         "headers": {
             "subject": _decode_header_value(msg.get("subject", "")),
             "from": _decode_header_value(msg.get("from", "")),
