@@ -17,6 +17,8 @@ import logging
 import os
 import subprocess as _sp
 
+from .kanban_datastore import load_kanban_datastore_config
+
 log = logging.getLogger(__name__)
 
 
@@ -188,6 +190,9 @@ KANBAN_BACKUP_DIR: str = os.environ.get(
     "BLUEPRINTS_KANBAN_BACKUP_DIR",
     os.path.join(KANBAN_DIR, "backups"),
 )
+KANBAN_DATASTORE_CONFIG = load_kanban_datastore_config(os.environ)
+KANBAN_DATASTORE_MODE: str = KANBAN_DATASTORE_CONFIG.active_store
+KANBAN_CANDIDATE_STORE_BACKEND: str = KANBAN_DATASTORE_CONFIG.candidate_backend
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 GUI_DIR: str = os.environ.get("BLUEPRINTS_GUI_DIR", "/data/gui")
