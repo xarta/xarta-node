@@ -58,6 +58,7 @@ def _make_queue_db() -> sqlite3.Connection:
             gen            INTEGER NOT NULL,
             created_at     TEXT DEFAULT (datetime('now')),
             sent           INTEGER DEFAULT 0,
+            sent_at        TEXT DEFAULT '',
             guid           TEXT DEFAULT ''
         )
         """
@@ -145,3 +146,53 @@ def test_purge_unsent_db_actions_preserves_all_git_system_actions(monkeypatch):
     assert rows[outer_id] == 0
     assert rows[non_root_id] == 0
     assert rows[inner_id] == 0
+
+
+def test_mark_sent_stamps_sent_at(monkeypatch):
+    conn = _make_queue_db()
+    _patch_queue_db(monkeypatch, conn)
+    action_id = _insert_action(conn, "UPDATE")
+
+    queue.mark_sent([action_id])
+
+    row = conn.execute(
+        "SELECT sent, sent_at FROM sync_queue WHERE queue_id=?",
+        (action_id,),
+    ).fetchone()
+    assert row["sent"] == 1
+    assert row["sent_at"]
+
+
+def test_sent_queue_retention_preview_and_apply_preserves_unsent(monkeypatch):
+    conn = _make_queue_db()
+    _patch_queue_db(monkeypatch, conn)
+    old_sent_id = _insert_action(conn, "UPDATE")
+    recent_sent_id = _insert_action(conn, "UPDATE")
+    unsent_id = _insert_action(conn, "UPDATE")
+    conn.execute(
+        "UPDATE sync_queue SET sent=1, sent_at='2000-01-01 00:00:00' WHERE queue_id=?",
+        (old_sent_id,),
+    )
+    conn.execute(
+        "UPDATE sync_queue SET sent=1, sent_at='2099-01-01 00:00:00' WHERE queue_id=?",
+        (recent_sent_id,),
+    )
+
+    preview = queue.get_sent_queue_retention_summary(older_than_hours=24)
+
+    assert preview["eligible_sent_rows"] == 1
+    assert preview["would_delete"] == 1
+    assert preview["queue"]["unsent"] == 1
+    assert preview["queue"]["sent"] == 2
+
+    result = queue.prune_sent_actions(older_than_hours=0, limit=1, apply=True)
+
+    remaining = {
+        row["queue_id"]: row["sent"]
+        for row in conn.execute("SELECT queue_id, sent FROM sync_queue ORDER BY queue_id")
+    }
+    assert result["deleted_rows"] == 1
+    assert old_sent_id not in remaining
+    assert remaining[recent_sent_id] == 1
+    assert remaining[unsent_id] == 0
+    assert result["after"]["queue"]["unsent"] == 1

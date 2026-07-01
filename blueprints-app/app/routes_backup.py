@@ -33,6 +33,7 @@ from .auth import compute_token
 from .db import get_conn, get_gen
 from .sync.drain import _make_sync_client
 from .sync.restore import make_full_backup, post_restore_housekeeping, validate_sqlite_file
+from .sync.sqlite_maintenance import clone_without_sync_queue
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ _RESTORE_OP_HEADER = "x-blueprints-restore-op"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _backup_dir() -> Path:
     """Return the resolved backup directory, or raise 503 if not configured."""
@@ -65,27 +67,11 @@ def _create_backup_file(dest_path: Path) -> None:
     DB is written to a temp file and deleted afterwards.
     """
     db_dir = dest_path.parent
-    with tempfile.NamedTemporaryFile(
-        dir=db_dir, suffix=".db.tmp", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(dir=db_dir, suffix=".db.tmp", delete=False) as tmp:
         tmp_db = Path(tmp.name)
 
     try:
-        src = sqlite3.connect(cfg.DB_PATH)
-        dst = sqlite3.connect(str(tmp_db))
-        try:
-            src.backup(dst)
-        finally:
-            src.close()
-            dst.close()
-
-        # Strip sync_queue from the backup copy
-        conn = sqlite3.connect(str(tmp_db))
-        try:
-            conn.execute("DELETE FROM sync_queue")
-            conn.commit()
-        finally:
-            conn.close()
+        clone_without_sync_queue(cfg.DB_PATH, tmp_db, vacuum=True)
 
         # Compress to dest_path
         with tarfile.open(str(dest_path), "w:gz") as tar:
@@ -143,11 +129,13 @@ async def _broadcast_live_db_to_peers(operation_id: str) -> list[PeerRestoreResu
     async with _make_sync_client(60.0) as client:
         for node_id, peer_urls in cfg.PEER_SYNC_URLS.items():
             if not peer_urls:
-                results.append(PeerRestoreResult(
-                    node_id=node_id,
-                    ok=False,
-                    detail="no sync addresses configured",
-                ))
+                results.append(
+                    PeerRestoreResult(
+                        node_id=node_id,
+                        ok=False,
+                        detail="no sync addresses configured",
+                    )
+                )
                 continue
 
             last_detail = "all configured addresses failed"
@@ -163,12 +151,14 @@ async def _broadcast_live_db_to_peers(operation_id: str) -> list[PeerRestoreResu
                         headers=headers,
                     )
                     if resp.status_code == 204:
-                        results.append(PeerRestoreResult(
-                            node_id=node_id,
-                            ok=True,
-                            address=url,
-                            detail="restore applied",
-                        ))
+                        results.append(
+                            PeerRestoreResult(
+                                node_id=node_id,
+                                ok=True,
+                                address=url,
+                                detail="restore applied",
+                            )
+                        )
                         success = True
                         break
                     body = resp.text.strip()
@@ -181,17 +171,20 @@ async def _broadcast_live_db_to_peers(operation_id: str) -> list[PeerRestoreResu
                     last_detail = f"{type(exc).__name__}: {exc}"
 
             if not success:
-                results.append(PeerRestoreResult(
-                    node_id=node_id,
-                    ok=False,
-                    address=last_address,
-                    detail=last_detail,
-                ))
+                results.append(
+                    PeerRestoreResult(
+                        node_id=node_id,
+                        ok=False,
+                        address=last_address,
+                        detail=last_detail,
+                    )
+                )
 
     return results
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
+
 
 class BackupEntry(BaseModel):
     filename: str
@@ -222,6 +215,7 @@ class RestoreResponse(BaseModel):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+
 @router.get("", response_model=BackupListResponse)
 def list_backups() -> BackupListResponse:
     """List all available local backups, newest first."""
@@ -231,13 +225,13 @@ def list_backups() -> BackupListResponse:
         if not _SAFE_NAME.match(p.name):
             continue
         stat = p.stat()
-        entries.append(BackupEntry(
-            filename=p.name,
-            size_bytes=stat.st_size,
-            created_at=datetime.fromtimestamp(
-                stat.st_mtime, tz=timezone.utc
-            ).isoformat(),
-        ))
+        entries.append(
+            BackupEntry(
+                filename=p.name,
+                size_bytes=stat.st_size,
+                created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            )
+        )
     return BackupListResponse(backups=entries, backup_dir=str(bdir))
 
 
@@ -256,16 +250,16 @@ def create_backup() -> BackupCreatedResponse:
     return BackupCreatedResponse(
         filename=filename,
         size_bytes=stat.st_size,
-        created_at=datetime.fromtimestamp(
-            stat.st_mtime, tz=timezone.utc
-        ).isoformat(),
+        created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
     )
 
 
 @router.post("/restore/{filename}", response_model=RestoreResponse)
 async def restore_backup(
     filename: str,
-    force: bool = Query(default=False, description="Restore locally, then broadcast the restored DB to peers"),
+    force: bool = Query(
+        default=False, description="Restore locally, then broadcast the restored DB to peers"
+    ),
 ) -> RestoreResponse:
     """
     Restore a local backup to the live DB.
@@ -295,9 +289,7 @@ async def restore_backup(
     # Extract the .tar.gz to a temp .db file alongside the live DB, then
     # atomically replace without touching the backup original.
     db_dir = Path(cfg.DB_PATH).parent
-    with tempfile.NamedTemporaryFile(
-        dir=db_dir, suffix=".db.tmp", delete=False
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(dir=db_dir, suffix=".db.tmp", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
     try:
@@ -317,7 +309,10 @@ async def restore_backup(
             )
         log.info(
             "restore applied: %s — gen %d → %d (force=%s)",
-            filename, gen_before, gen_after, force,
+            filename,
+            gen_before,
+            gen_after,
+            force,
         )
 
     except HTTPException:
@@ -333,9 +328,7 @@ async def restore_backup(
             os.unlink(str(tmp_path))
         except OSError:
             pass
-        raise HTTPException(
-            status_code=500, detail="Restore failed — live DB was not modified."
-        )
+        raise HTTPException(status_code=500, detail="Restore failed — live DB was not modified.")
 
     if force:
         operation_id = uuid.uuid4().hex

@@ -31,14 +31,16 @@ A distributed, peer-to-peer service index. Every node holds an identical SQLite 
 ## Sync protocol
 
 ### Layer 1 — full backup (bootstrap)
-- `GET  /api/v1/sync/export` — exports current DB as a zip
+- `GET  /api/v1/sync/export` — exports a compact queue-free DB clone as a zip
 - `POST /api/v1/sync/restore` — receives and atomically applies a zip backup
-- Used for: new node onboarding (boot-catchup), crash recovery, queue overflow
+- Used for: new node onboarding (boot-catchup), crash recovery, explicit force restore
+- `sync_queue` is node-local drain state and is stripped from full backup/export payloads before packaging.
 
 ### Layer 2 — incremental actions
 - `POST /api/v1/sync/actions` — receives a batch of INSERT/UPDATE/DELETE row actions
 - Per-peer FIFO queue in SQLite, drained every 1–20s (random jitter)
-- Batch size: 50 actions. Overflow threshold: 1000 pending → tries full backup first, then falls back to batched actions if restore is rejected (for example HTTP 409 generation guard)
+- Batch size: 50 actions. Overflow threshold: 1000 pending → logs the condition and continues batched row-action drain. Full DB restore is recovery-only, not queue pressure relief.
+- Sent queue rows are local audit/drain history. `sent=0` rows are never pruned by retention helpers; `sent=1` rows can be pruned through `/api/v1/sync/queue-maintenance/prune-sent` after a confirmed backup, and live file shrink then requires SQLite compaction.
 
 ### Generation counter
 Every write increments a `gen` counter in the DB metadata. Used to:

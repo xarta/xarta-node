@@ -2,8 +2,8 @@
 # bp-backup.sh — create a local DB backup (works even when blueprints-app is down)
 #
 # Creates a timestamped copy of blueprints.db in BLUEPRINTS_BACKUP_DIR with
-# the sync_queue table cleared.  Uses Python's sqlite3 backup API for a
-# WAL-safe consistent copy.
+# the sync_queue table cleared and then VACUUMed.  Uses Python's sqlite3
+# backup API for a WAL-safe consistent copy.
 #
 # Usage:
 #   ./bp-backup.sh           — create backup, print filename
@@ -75,6 +75,7 @@ try:
     c = sqlite3.connect(str(tmp_db))
     c.execute('DELETE FROM sync_queue')
     c.commit()
+    c.execute('VACUUM')
     c.close()
     # Compress to destination
     with tarfile.open(dst_path, 'w:gz') as tar:

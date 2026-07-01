@@ -117,22 +117,15 @@ The sync system uses a persistent queue in `sync_queue` (SQLite). Each data writ
 
 **Startup guarantee:** `_git_pull_and_restart` restarts the process after every git pull, so `COMMIT_TS` always reflects the running code. No cron needed.
 
-### Queue overflow behavior (updated 2026-04-07)
+### Queue overflow behavior (updated 2026-07-01)
 
-When a peer queue depth reaches `SYNC_QUEUE_MAX_DEPTH`, `drain.py` first tries
-Layer 1 full-backup restore (`POST /api/v1/sync/restore`).
+When a peer queue depth reaches `SYNC_QUEUE_MAX_DEPTH`, `drain.py` logs the
+overflow and keeps sending ordinary row-action batches. Full DB restore is
+recovery-only or explicit force-restore; it is not a queue pressure relief path.
 
-- Healthy peers can reject restore with HTTP 409 when `sender_gen <= my_gen`.
-- Drain must not deadlock in this state.
-- Current behavior: on restore failure/rejection, drain logs the condition and
-    falls back to normal batched actions (`POST /api/v1/sync/actions`) in the
-    same cycle.
-
-This keeps queues draining even when restore guardrails are working as designed.
-
-Operator symptom for this failure mode: pending count appears frozen at a high
-value (for example 1362 per peer) and logs repeatedly show `queue overflow`
-plus restore `HTTP 409` with no successful action posts.
+This keeps queue overflow behavior aligned with per-row conflict guards. A high
+pending count is a drain/backpressure condition to investigate, not permission
+to replace a healthy peer database.
 
 Quick validation before fleet rollout:
 
@@ -141,9 +134,9 @@ Quick validation before fleet rollout:
 sqlite3 /opt/blueprints/data/db/blueprints.db \
     "select target_node_id, count(*) from sync_queue where sent=0 group by target_node_id order by target_node_id;"
 
-# 2) Confirm fallback is active and actions are accepted
+# 2) Confirm row-action drain is active and actions are accepted
 journalctl -u blueprints-app -n 200 --no-pager | \
-    rg -i "full backup path not accepted|/api/v1/sync/actions|HTTP/1.1 204"
+    rg -i "queue overflow|/api/v1/sync/actions|HTTP/1.1 204"
 ```
 
 Hold fleet update/pull actions until pending counts are trending down or fully
@@ -197,6 +190,27 @@ Prevents duplicate action application when the same write is relayed via multipl
 |---|---|
 | `sync_seen_guids` | New table: `guid TEXT PRIMARY KEY`, `received_at INTEGER` |
 | `sync_queue.guid` | New column: `TEXT DEFAULT ''` (migration in `_run_migrations`) |
+| `sync_queue.sent_at` | Sent completion timestamp used by explicit sent-row retention (migration in `_run_migrations`) |
+
+### Sent sync_queue retention and compaction (2026-07-01)
+
+`sync_queue` rows with `sent=0` are the reliable incremental drain backlog and
+must not be pruned by retention helpers. Rows with `sent=1` are local drain
+history only. `mark_sent()` stamps `sent_at` for new completions; old rows fall
+back to `created_at` for retention-window checks.
+
+Maintenance API:
+
+```text
+GET  /api/v1/sync/queue-maintenance/status
+POST /api/v1/sync/queue-maintenance/prune-sent
+```
+
+`prune-sent` previews by default. Applying it requires a confirmed existing
+`/api/v1/backup` filename unless the caller deliberately disables that guard
+for an isolated test DB. It deletes only `sent=1` rows; live file-size shrink
+still requires SQLite compaction after pruning. Use `older_than_hours=0` only
+when the operator intentionally wants all sent rows eligible.
 
 ### New config exports
 
@@ -234,7 +248,7 @@ Visible in the self-diagnostics GUI under **Sync — GUID Dedup & Forwarding (Ph
 
 ## Backup and restore
 
-Local (per-node) DB backups are stored as `.db.tar.gz` files in `BLUEPRINTS_BACKUP_DIR` (typically `.xarta/db-backups/`, committed to the private repo). The `sync_queue` table is always stripped from backups.
+Local (per-node) DB backups are stored as `.db.tar.gz` files in `BLUEPRINTS_BACKUP_DIR` (typically `.xarta/db-backups/`, committed to the private repo). The `sync_queue` table is always stripped from backups, and the temporary backup copy is VACUUMed before compression so deleted queue rows do not remain as free pages. Layer 1 sync exports also package a compact queue-free clone; a restored node should not inherit another node's outbound queue.
 
 ```bash
 bash bp-backup.sh              # create backup directly (works when app is down)

@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS sync_queue (
     row_data       TEXT,
     gen            INTEGER NOT NULL,
     created_at     TEXT    DEFAULT (datetime('now')),
-    sent           INTEGER DEFAULT 0
+    sent           INTEGER DEFAULT 0,
+    sent_at        TEXT    DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_queue_target
@@ -2377,6 +2378,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("docs", "group_id", "TEXT"),
         # sync_queue: GUID for dedup + forwarding (Phase 2, 2026-03-19)
         ("sync_queue", "guid", "TEXT DEFAULT ''"),
+        # sync_queue: completion time for sent-row retention (2026-07-01)
+        ("sync_queue", "sent_at", "TEXT DEFAULT ''"),
         # visits: count of times a URL has been visited (2026-03-21)
         ("visits", "visit_count", "INTEGER NOT NULL DEFAULT 1"),
         # form_controls: separate off-state sound for toggles/checkboxes (2026-03-24)
