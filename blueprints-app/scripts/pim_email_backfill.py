@@ -14,6 +14,25 @@ from typing import Any
 SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
 APP_ROOT = REPO_ROOT / "blueprints-app"
+
+
+def _reexec_repo_venv() -> None:
+    venv_root = REPO_ROOT / ".venv"
+    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+    try:
+        current_prefix = Path(sys.prefix).resolve()
+        target_prefix = venv_root.resolve()
+    except OSError:
+        current_prefix = Path(sys.prefix)
+        target_prefix = venv_root
+    if current_prefix != target_prefix:
+        os.execv(str(venv_python), [str(venv_python), str(SCRIPT), *sys.argv[1:]])
+
+
+_reexec_repo_venv()
+
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
