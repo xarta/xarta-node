@@ -224,9 +224,31 @@ def _json_dumps(
     )
 
 
+def _json_loads_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
 def _external_image_canonical_digest(canonical_url: str) -> str:
     # Index key for long URLs; security decisions use the raw/transformed hashes.
     return hashlib.md5(str(canonical_url or "").encode("utf-8")).hexdigest()
+
+
+def _external_image_canonical_lock_key(mailbox_id: str, canonical_url: str) -> int:
+    digest = hashlib.sha256(
+        f"xarta-pim-email-external-image\0{mailbox_id}\0{canonical_url}".encode("utf-8")
+    ).digest()
+    value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    if value >= 2**63:
+        value -= 2**64
+    return value
 
 
 def encrypt_password(password: str, *, key: str | None = None) -> str:
@@ -849,6 +871,14 @@ class PgEmailStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_pim_email_external_images_status
                 ON pim_email_external_image_derivatives(mailbox_id, status, updated_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_images_digest_status
+                ON pim_email_external_image_derivatives(
+                    mailbox_id, canonical_url_digest, status, updated_at DESC
+                );
                 """
             )
             await conn.execute(
@@ -2525,6 +2555,7 @@ class PgEmailStore:
         email_uid: str,
         asset: dict[str, Any],
         ensure_schema: bool = True,
+        update_shared_reference_count: bool = True,
     ) -> dict[str, Any]:
         if ensure_schema:
             await self.ensure_schema()
@@ -2582,7 +2613,7 @@ class PgEmailStore:
                 ),
             )
             shared_asset_uid = str(asset.get("shared_asset_uid") or "")
-            if shared_asset_uid:
+            if shared_asset_uid and update_shared_reference_count:
                 await conn.execute(
                     """
                     UPDATE pim_email_shared_assets
@@ -2713,6 +2744,249 @@ class PgEmailStore:
             except Exception:
                 continue
         return None
+
+    async def find_external_image_canonical_terminal_state(
+        self,
+        *,
+        mailbox_id: str,
+        source_url: str,
+        ensure_schema: bool = True,
+    ) -> dict[str, Any] | None:
+        if ensure_schema:
+            await self.ensure_schema()
+        canonical = _canonical_remote_image_url(source_url) or str(source_url or "")
+        if not canonical:
+            return None
+        canonical_digest = _external_image_canonical_digest(canonical)
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT derivative_id, canonical_url, canonical_url_digest, status, reason,
+                       safety_decision, transform_version, raw_image_sha256,
+                       transformed_sha256, storage_relpath, shared_asset_uid,
+                       encrypted_size, content_type, width, height, updated_at
+                FROM pim_email_external_image_derivatives
+                WHERE mailbox_id = $1
+                  AND canonical_url_digest = $2
+                  AND status IN ('blocked','unavailable')
+                ORDER BY
+                  CASE WHEN status = 'blocked' THEN 0 ELSE 1 END,
+                  updated_at DESC
+                LIMIT 20
+                """,
+                mailbox_id,
+                canonical_digest,
+            )
+        finally:
+            await conn.close()
+        for row in rows:
+            status = str(_row_get(row, "status", "") or "")
+            reason = str(_row_get(row, "reason", "") or "")
+            if not _external_image_existing_state_is_terminal(status, reason):
+                continue
+            return {
+                "derivative_id": str(_row_get(row, "derivative_id", "")),
+                "canonical_url": str(_row_get(row, "canonical_url", canonical) or canonical),
+                "canonical_url_digest": str(
+                    _row_get(row, "canonical_url_digest", canonical_digest) or canonical_digest
+                ),
+                "status": status,
+                "reason": reason,
+                "safety_decision": str(_row_get(row, "safety_decision", "") or ""),
+                "transform_version": str(_row_get(row, "transform_version", "") or ""),
+                "raw_image_sha256": str(_row_get(row, "raw_image_sha256", "") or ""),
+                "transformed_sha256": str(_row_get(row, "transformed_sha256", "") or ""),
+                "storage_relpath": str(_row_get(row, "storage_relpath", "") or ""),
+                "shared_asset_uid": str(_row_get(row, "shared_asset_uid", "") or ""),
+                "encrypted_size": int(_row_get(row, "encrypted_size", 0) or 0),
+                "content_type": str(_row_get(row, "content_type", "") or ""),
+                "width": int(_row_get(row, "width", 0) or 0),
+                "height": int(_row_get(row, "height", 0) or 0),
+                "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+            }
+        return None
+
+    async def _acquire_external_image_canonical_lock(
+        self,
+        *,
+        mailbox_id: str,
+        canonical_url: str,
+    ) -> tuple[Any, int]:
+        lock_key = _external_image_canonical_lock_key(mailbox_id, canonical_url)
+        conn = await self._connect()
+        try:
+            await conn.execute("SELECT pg_advisory_lock($1::bigint)", lock_key)
+        except Exception:
+            await conn.close()
+            raise
+        return conn, lock_key
+
+    async def _release_external_image_canonical_lock(self, conn: Any, lock_key: int) -> None:
+        try:
+            await conn.execute("SELECT pg_advisory_unlock($1::bigint)", lock_key)
+        finally:
+            await conn.close()
+
+    async def link_external_image_references_from_shared_assets(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        safe_limit = max(1, min(int(limit or 1), 5000))
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT d.derivative_id, d.email_uid, d.mailbox_id, d.input_raw_sha256,
+                       d.source_url, d.canonical_url, d.canonical_url_digest,
+                       s.shared_asset_uid, s.content_type, s.raw_image_sha256,
+                       s.transformed_sha256, s.storage_relpath, s.encrypted_size,
+                       s.width, s.height, s.transform_version, s.encryption_json,
+                       s.metadata_json
+                FROM pim_email_external_image_derivatives d
+                JOIN LATERAL (
+                    SELECT shared_asset_uid, content_type, raw_image_sha256,
+                           transformed_sha256, storage_relpath, encrypted_size,
+                           width, height, transform_version, encryption_json,
+                           metadata_json
+                    FROM pim_email_shared_assets s
+                    WHERE s.mailbox_id = d.mailbox_id
+                      AND s.canonical_url_digest = d.canonical_url_digest
+                      AND s.transform_version = 'jpeg-v1'
+                    ORDER BY s.reference_count DESC, s.updated_at DESC
+                    LIMIT 1
+                ) s ON true
+                WHERE d.mailbox_id = $1
+                  AND d.canonical_url_digest <> ''
+                  AND d.status IN ('pending','fetched','transformed')
+                ORDER BY d.updated_at DESC
+                LIMIT $2
+                """,
+                configured_mailbox_id,
+                safe_limit,
+            )
+        finally:
+            await conn.close()
+
+        summary = {
+            "schema": "xarta.pim_email.external_image_shared_asset_link.summary.v1",
+            "mailbox_id": configured_mailbox_id,
+            "planned": len(rows),
+            "linked": 0,
+            "failed": 0,
+            "failures": [],
+        }
+        touched_shared_uids: set[str] = set()
+        for row in rows:
+            source_url = str(_row_get(row, "source_url", "") or "")
+            canonical = str(_row_get(row, "canonical_url", "") or source_url)
+            shared = {
+                "shared_asset_uid": str(_row_get(row, "shared_asset_uid", "") or ""),
+                "mailbox_id": configured_mailbox_id,
+                "source_url": canonical,
+                "canonical_url": canonical,
+                "canonical_url_digest": str(_row_get(row, "canonical_url_digest", "") or ""),
+                "content_type": str(_row_get(row, "content_type", "image/jpeg") or "image/jpeg"),
+                "raw_image_sha256": str(_row_get(row, "raw_image_sha256", "") or ""),
+                "transformed_sha256": str(_row_get(row, "transformed_sha256", "") or ""),
+                "storage_relpath": str(_row_get(row, "storage_relpath", "") or ""),
+                "encrypted_size": int(_row_get(row, "encrypted_size", 0) or 0),
+                "width": int(_row_get(row, "width", 0) or 0),
+                "height": int(_row_get(row, "height", 0) or 0),
+                "transform_version": str(
+                    _row_get(row, "transform_version", "jpeg-v1") or "jpeg-v1"
+                ),
+                "encryption": _json_loads_obj(_row_get(row, "encryption_json", {})),
+                "metadata": _json_loads_obj(_row_get(row, "metadata_json", {})),
+            }
+            try:
+                stored = read_encrypted_bytes(shared["storage_relpath"], purpose=ASSET_PURPOSE)
+                if hashlib.sha256(stored).hexdigest() != shared["transformed_sha256"]:
+                    raise EmailOperationError("Shared external image asset hash mismatch")
+                reference = _asset_reference_for_email(
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=str(_row_get(row, "email_uid", "")),
+                    input_raw_sha256=str(_row_get(row, "input_raw_sha256", "")),
+                    canonical_url=canonical,
+                    shared_asset=shared,
+                    metadata={
+                        "schema": "xarta.pim_email.external_image_shared_asset_link.v1",
+                        "source_url": source_url,
+                        "canonical_url": canonical,
+                        "bulk_linked_from_shared_asset": True,
+                    },
+                )
+                await self.store_transformed_asset(
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=str(_row_get(row, "email_uid", "")),
+                    asset=reference,
+                    ensure_schema=False,
+                    update_shared_reference_count=False,
+                )
+                await self.record_external_image_derivative_state(
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=str(_row_get(row, "email_uid", "")),
+                    input_raw_sha256=str(_row_get(row, "input_raw_sha256", "")),
+                    source_url=source_url,
+                    status="stored",
+                    reason="",
+                    safety_decision="reused_verified_shared_encrypted_asset_bulk_link",
+                    transform_version=shared["transform_version"],
+                    raw_image_sha256=shared["raw_image_sha256"],
+                    transformed_sha256=shared["transformed_sha256"],
+                    storage_relpath=shared["storage_relpath"],
+                    shared_asset_uid=shared["shared_asset_uid"],
+                    encrypted_size=shared["encrypted_size"],
+                    content_type=shared["content_type"],
+                    width=shared["width"],
+                    height=shared["height"],
+                    metadata={
+                        "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                        "completion_kind": "verified-shared-asset-bulk-linked",
+                        "source_url": source_url,
+                        "canonical_url": canonical,
+                        "shared_asset_uid": shared["shared_asset_uid"],
+                    },
+                    ensure_schema=False,
+                )
+                summary["linked"] += 1
+                touched_shared_uids.add(shared["shared_asset_uid"])
+            except Exception as exc:
+                summary["failed"] += 1
+                if len(summary["failures"]) < 20:
+                    summary["failures"].append(
+                        {
+                            "derivative_id": str(_row_get(row, "derivative_id", "")),
+                            "source_url": source_url,
+                            "error_class": exc.__class__.__name__,
+                            "error_message": str(exc)[:300],
+                        }
+                    )
+        if touched_shared_uids:
+            conn = await self._connect()
+            try:
+                await conn.execute(
+                    """
+                    UPDATE pim_email_shared_assets s
+                    SET reference_count = counts.reference_count,
+                        updated_at = now()
+                    FROM (
+                        SELECT shared_asset_uid, count(*)::integer AS reference_count
+                        FROM pim_email_transformed_assets
+                        WHERE shared_asset_uid = ANY($1::text[])
+                        GROUP BY shared_asset_uid
+                    ) counts
+                    WHERE s.shared_asset_uid = counts.shared_asset_uid
+                    """,
+                    sorted(touched_shared_uids),
+                )
+            finally:
+                await conn.close()
+        return summary
 
     async def migrate_existing_transformed_assets_to_shared_store(
         self,
@@ -3309,6 +3583,126 @@ class PgEmailStore:
         finally:
             await conn.close()
 
+        async def store_shared_reference(
+            *,
+            source: str,
+            canonical: str,
+            shared: dict[str, Any],
+            completion_kind: str,
+            safety_decision: str,
+            reference_metadata: dict[str, Any] | None = None,
+        ) -> None:
+            reference = _asset_reference_for_email(
+                mailbox_id=mailbox_id,
+                email_uid=clean_uid,
+                input_raw_sha256=input_raw_sha256,
+                canonical_url=canonical,
+                shared_asset=shared,
+                metadata={
+                    **(metadata or {}),
+                    **(reference_metadata or {}),
+                    "source_url": source,
+                    "canonical_url": canonical,
+                },
+            )
+            await self.store_transformed_asset(
+                mailbox_id=mailbox_id,
+                email_uid=clean_uid,
+                asset=reference,
+                ensure_schema=False,
+            )
+            await self.record_external_image_derivative_state(
+                mailbox_id=mailbox_id,
+                email_uid=clean_uid,
+                input_raw_sha256=input_raw_sha256,
+                source_url=source,
+                status="stored",
+                reason="",
+                safety_decision=safety_decision,
+                transform_version=str(shared.get("transform_version") or ""),
+                raw_image_sha256=str(shared.get("raw_image_sha256") or ""),
+                transformed_sha256=str(shared.get("transformed_sha256") or ""),
+                storage_relpath=str(shared.get("storage_relpath") or ""),
+                shared_asset_uid=str(shared.get("shared_asset_uid") or ""),
+                encrypted_size=int(shared.get("encrypted_size") or 0),
+                content_type=str(shared.get("content_type") or ""),
+                width=int(shared.get("width") or 0),
+                height=int(shared.get("height") or 0),
+                metadata={
+                    **(metadata or {}),
+                    "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                    "completion_kind": completion_kind,
+                    "source_url": source,
+                    "canonical_url": canonical,
+                    "shared_asset_uid": str(shared.get("shared_asset_uid") or ""),
+                },
+                ensure_schema=False,
+            )
+
+        async def reuse_canonical_terminal_state(
+            *,
+            source: str,
+            canonical: str,
+            outcome: dict[str, Any],
+        ) -> str:
+            status = str(outcome.get("status") or "")
+            await self.record_external_image_derivative_state(
+                mailbox_id=mailbox_id,
+                email_uid=clean_uid,
+                input_raw_sha256=input_raw_sha256,
+                source_url=source,
+                status=status,
+                reason=str(outcome.get("reason") or ""),
+                safety_decision=f"reused_canonical_{status}_external_image_outcome",
+                transform_version=str(outcome.get("transform_version") or ""),
+                raw_image_sha256=str(outcome.get("raw_image_sha256") or ""),
+                transformed_sha256=str(outcome.get("transformed_sha256") or ""),
+                storage_relpath=str(outcome.get("storage_relpath") or ""),
+                shared_asset_uid=str(outcome.get("shared_asset_uid") or ""),
+                encrypted_size=int(outcome.get("encrypted_size") or 0),
+                content_type=str(outcome.get("content_type") or ""),
+                width=int(outcome.get("width") or 0),
+                height=int(outcome.get("height") or 0),
+                metadata={
+                    **(metadata or {}),
+                    "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                    "completion_kind": f"reused-canonical-{status}-outcome",
+                    "source_url": source,
+                    "canonical_url": canonical,
+                    "outcome_derivative_id": str(outcome.get("derivative_id") or ""),
+                },
+                ensure_schema=False,
+            )
+            return status
+
+        async def reuse_existing_canonical_work(source: str, canonical: str) -> str:
+            shared = await self.find_shared_asset_for_url(
+                mailbox_id=mailbox_id,
+                source_url=canonical,
+                ensure_schema=False,
+            )
+            if shared:
+                await store_shared_reference(
+                    source=source,
+                    canonical=canonical,
+                    shared=shared,
+                    completion_kind="verified-shared-asset-reused",
+                    safety_decision="reused_verified_shared_encrypted_asset",
+                )
+                return "stored"
+            outcome = await self.find_external_image_canonical_terminal_state(
+                mailbox_id=mailbox_id,
+                source_url=canonical,
+                ensure_schema=False,
+            )
+            if outcome:
+                return await reuse_canonical_terminal_state(
+                    source=source,
+                    canonical=canonical,
+                    outcome=outcome,
+                )
+            return ""
+
         for source, canonical in unique_sources:
             existing_state = existing.get(canonical, {})
             status = str(existing_state.get("status") or "")
@@ -3321,61 +3715,20 @@ class PgEmailStore:
                 elif status == "unavailable":
                     counts["already_unavailable"] += 1
                 continue
-            shared = await self.find_shared_asset_for_url(
-                mailbox_id=mailbox_id,
-                source_url=canonical,
-                ensure_schema=False,
-            )
-            if shared:
-                reference = _asset_reference_for_email(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    input_raw_sha256=input_raw_sha256,
-                    canonical_url=canonical,
-                    shared_asset=shared,
-                    metadata={
-                        **(metadata or {}),
-                        "source_url": source,
-                        "canonical_url": canonical,
-                    },
-                )
-                await self.store_transformed_asset(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    asset=reference,
-                    ensure_schema=False,
-                )
-                await self.record_external_image_derivative_state(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    input_raw_sha256=input_raw_sha256,
-                    source_url=source,
-                    status="stored",
-                    reason="",
-                    safety_decision="reused_verified_shared_encrypted_asset",
-                    transform_version=str(shared.get("transform_version") or ""),
-                    raw_image_sha256=str(shared.get("raw_image_sha256") or ""),
-                    transformed_sha256=str(shared.get("transformed_sha256") or ""),
-                    storage_relpath=str(shared.get("storage_relpath") or ""),
-                    shared_asset_uid=str(shared.get("shared_asset_uid") or ""),
-                    encrypted_size=int(shared.get("encrypted_size") or 0),
-                    content_type=str(shared.get("content_type") or ""),
-                    width=int(shared.get("width") or 0),
-                    height=int(shared.get("height") or 0),
-                    metadata={
-                        **(metadata or {}),
-                        "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
-                        "completion_kind": "verified-shared-asset-reused",
-                        "source_url": source,
-                        "canonical_url": canonical,
-                        "shared_asset_uid": str(shared.get("shared_asset_uid") or ""),
-                    },
-                    ensure_schema=False,
-                )
-                counts["stored"] += 1
+            reused_state = await reuse_existing_canonical_work(source, canonical)
+            if reused_state:
+                counts[reused_state] += 1
                 continue
-            counts["attempted"] += 1
+            lock_conn, lock_key = await self._acquire_external_image_canonical_lock(
+                mailbox_id=mailbox_id,
+                canonical_url=canonical,
+            )
             try:
+                reused_state = await reuse_existing_canonical_work(source, canonical)
+                if reused_state:
+                    counts[reused_state] += 1
+                    continue
+                counts["attempted"] += 1
                 fetched = await fetch_remote_image_bytes(source)
                 raw_content = bytes(fetched.get("content") or b"")
                 asset = build_transformed_external_image_asset(
@@ -3393,46 +3746,13 @@ class PgEmailStore:
                     },
                 )
                 shared = await self.store_shared_asset(asset=asset, ensure_schema=False)
-                asset = _asset_reference_for_email(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    input_raw_sha256=input_raw_sha256,
-                    canonical_url=canonical,
-                    shared_asset=shared,
-                    metadata=asset.get("metadata") or {},
-                )
-                await self.store_transformed_asset(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    asset=asset,
-                    ensure_schema=False,
-                )
-                await self.record_external_image_derivative_state(
-                    mailbox_id=mailbox_id,
-                    email_uid=clean_uid,
-                    input_raw_sha256=input_raw_sha256,
-                    source_url=source,
-                    status="stored",
-                    reason="",
+                await store_shared_reference(
+                    source=source,
+                    canonical=canonical,
+                    shared=shared,
+                    completion_kind="downloaded-transformed-encrypted-stored",
                     safety_decision="fetched_transformed_encrypted_stored",
-                    transform_version=str(asset.get("transform_version") or ""),
-                    raw_image_sha256=str(asset.get("raw_sha256") or ""),
-                    transformed_sha256=str(asset.get("transformed_sha256") or ""),
-                    storage_relpath=str(asset.get("storage_relpath") or ""),
-                    shared_asset_uid=str(asset.get("shared_asset_uid") or ""),
-                    encrypted_size=int(asset.get("encrypted_size") or 0),
-                    content_type=str(asset.get("content_type") or ""),
-                    width=int(asset.get("width") or 0),
-                    height=int(asset.get("height") or 0),
-                    metadata={
-                        **(metadata or {}),
-                        "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
-                        "completion_kind": "downloaded-transformed-encrypted-stored",
-                        "source_url": source,
-                        "canonical_url": canonical,
-                        "shared_asset_uid": str(asset.get("shared_asset_uid") or ""),
-                    },
-                    ensure_schema=False,
+                    reference_metadata=asset.get("metadata") or {},
                 )
                 counts["stored"] += 1
             except Exception as exc:
@@ -3457,6 +3777,8 @@ class PgEmailStore:
                     ensure_schema=False,
                 )
                 counts[state] += 1
+            finally:
+                await self._release_external_image_canonical_lock(lock_conn, lock_key)
         return counts
 
     async def reset_legacy_non_downloaded_external_image_derivatives(

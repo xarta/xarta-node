@@ -110,6 +110,7 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "external_images_already_unavailable",
         "external_images_already_blocked",
         "external_images_materialized_rows",
+        "external_images_shared_asset_links",
     )
     return {key: summary[key] for key in keys if key in summary}
 
@@ -152,6 +153,7 @@ def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -
         "external_images_already_unavailable": 0,
         "external_images_already_blocked": 0,
         "external_images_materialized_rows": 0,
+        "external_images_shared_asset_links": 0,
     }
 
 
@@ -180,7 +182,9 @@ def _generated_work_rows(result: dict[str, Any]) -> int:
     summary = result.get("summary") if isinstance(result, dict) else None
     if not isinstance(summary, dict):
         return 0
-    return int(summary.get("external_images_materialized_rows") or 0)
+    return int(summary.get("external_images_materialized_rows") or 0) + int(
+        summary.get("external_images_shared_asset_links") or 0
+    )
 
 
 async def _fetch_backfill_progress(store: Any, run_id: str) -> dict[str, Any]:
@@ -258,6 +262,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         max_batches=args.max_batches,
         artifact=args.artifact,
         materialize_external_image_rows=bool(args.materialize_external_image_rows),
+        link_shared_external_image_assets=bool(args.link_shared_external_image_assets),
     )
     active_backfill_run_ids = _active_backfill_run_ids()
     if args.run_id:
@@ -285,6 +290,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             _log_event("backfill_materialize_complete", result=result)
             if not args.artifact:
                 return {"ok": True, "materialize_external_image_rows": result}
+        if args.link_shared_external_image_assets and not args.repeat_until_idle:
+            result = await store.link_external_image_references_from_shared_assets(
+                mailbox_id=args.mailbox_id,
+                limit=args.limit or 5000,
+            )
+            _log_event("backfill_shared_asset_link_complete", result=result)
+            if not args.artifact:
+                return {"ok": True, "link_shared_external_image_assets": result}
         if not args.repeat_until_idle:
             result = await store.run_backfill(
                 mailbox_id=args.mailbox_id,
@@ -302,13 +315,41 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 aggregate["stopped_reason"] = "max_batches"
                 break
             batch_index += 1
-            result = await store.run_backfill(
-                mailbox_id=args.mailbox_id,
-                email_uid=args.email_uid,
-                limit=batch_limit,
-                artifact_types=args.artifact,
-                run_id=args.run_id,
-            )
+            shared_link_result = None
+            if args.link_shared_external_image_assets:
+                shared_link_result = await store.link_external_image_references_from_shared_assets(
+                    mailbox_id=args.mailbox_id,
+                    limit=batch_limit,
+                )
+                _log_event(
+                    "backfill_shared_asset_link_batch_complete",
+                    batch_index=batch_index,
+                    result=shared_link_result,
+                )
+            if args.artifact:
+                result = await store.run_backfill(
+                    mailbox_id=args.mailbox_id,
+                    email_uid=args.email_uid,
+                    limit=batch_limit,
+                    artifact_types=args.artifact,
+                    run_id=args.run_id,
+                )
+            else:
+                result = {
+                    "ok": True,
+                    "run_id": args.run_id,
+                    "summary": {
+                        "planned_messages": 0,
+                        "processed_messages": 0,
+                        "failed_messages": 0,
+                    },
+                }
+            if shared_link_result is not None:
+                summary = result.setdefault("summary", {})
+                summary["external_images_shared_asset_links"] = int(
+                    shared_link_result.get("linked") or 0
+                )
+                result["link_shared_external_image_assets"] = shared_link_result
             aggregate["batches_completed"] += 1
             _add_backfill_batch_to_aggregate(aggregate, result)
             planned = _planned_messages(result)
@@ -409,6 +450,14 @@ def main() -> int:
         "--materialize-external-image-rows",
         action="store_true",
         help="Create missing durable pending derivative rows for captured external image URLs.",
+    )
+    parser.add_argument(
+        "--link-shared-external-image-assets",
+        action="store_true",
+        help=(
+            "Mark pending external image reference rows stored when their canonical URL already "
+            "has a verified encrypted shared asset. This performs no network fetches."
+        ),
     )
     args = parser.parse_args()
     _load_env_file(Path(args.env_file))

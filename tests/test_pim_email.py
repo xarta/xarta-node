@@ -1182,6 +1182,10 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
                 ]
             raise AssertionError(query)
 
+        async def execute(self, query, *args):
+            assert "pg_advisory_" in query
+            return "SELECT 1"
+
         async def close(self):
             return None
 
@@ -1211,6 +1215,9 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
             return kwargs
 
         async def find_shared_asset_for_url(self, **kwargs):
+            return None
+
+        async def find_external_image_canonical_terminal_state(self, **kwargs):
             return None
 
     async def fake_fetch(source):
@@ -1332,6 +1339,236 @@ def test_external_image_derivative_reuses_verified_shared_asset_without_refetch(
     assert stored[0]["storage_relpath"].startswith("assets/")
     assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset"
     assert recorded[0]["shared_asset_uid"] == "email-shared-asset-existing"
+
+
+def test_external_image_derivative_rechecks_shared_asset_under_url_lock(monkeypatch):
+    stored = []
+    recorded = []
+    executed = []
+    find_calls = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "FROM pim_email_external_image_derivatives" in query:
+                return []
+            raise AssertionError(query)
+
+        async def execute(self, query, *args):
+            executed.append(query)
+            return "SELECT 1"
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def find_shared_asset_for_url(self, **kwargs):
+            find_calls.append(kwargs["source_url"])
+            if len(find_calls) == 1:
+                return None
+            return {
+                "shared_asset_uid": "email-shared-asset-locked",
+                "source_url": kwargs["source_url"],
+                "canonical_url": kwargs["source_url"],
+                "canonical_url_digest": pim_email._external_image_canonical_digest(
+                    kwargs["source_url"]
+                ),
+                "content_type": "image/jpeg",
+                "raw_image_sha256": "raw-image-hash",
+                "transformed_sha256": "transformed-image-hash",
+                "storage_relpath": "assets/aa/existing/image.jpg.enc",
+                "encrypted_size": 456,
+                "width": 12,
+                "height": 9,
+                "transform_version": "jpeg-v1",
+                "encryption": {"alg": "test"},
+            }
+
+        async def find_external_image_canonical_terminal_state(self, **kwargs):
+            return None
+
+        async def store_transformed_asset(self, **kwargs):
+            stored.append(kwargs["asset"])
+            return kwargs["asset"]
+
+        async def record_external_image_derivative_state(self, **kwargs):
+            recorded.append(kwargs)
+            return kwargs
+
+    async def fail_fetch(source):
+        raise AssertionError("URL lock recheck should find shared asset before fetching")
+
+    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fail_fetch)
+
+    counts = asyncio.run(
+        FakeStore().process_external_image_derivatives(
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "f" * 40,
+            input_raw_sha256="raw",
+            source_urls=["https://cdn.example.test/race.png"],
+            metadata={"proof": "lock-recheck"},
+        )
+    )
+
+    assert counts["stored"] == 1
+    assert counts["attempted"] == 0
+    assert len(find_calls) == 2
+    assert any("pg_advisory_lock" in query for query in executed)
+    assert any("pg_advisory_unlock" in query for query in executed)
+    assert stored[0]["shared_asset_uid"] == "email-shared-asset-locked"
+    assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset"
+
+
+def test_external_image_derivative_reuses_canonical_unavailable_outcome(monkeypatch):
+    recorded = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "FROM pim_email_external_image_derivatives" in query:
+                return []
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def find_shared_asset_for_url(self, **kwargs):
+            return None
+
+        async def find_external_image_canonical_terminal_state(self, **kwargs):
+            return {
+                "derivative_id": "prior-outcome",
+                "status": "unavailable",
+                "reason": "image unavailable: HTTP 404",
+            }
+
+        async def record_external_image_derivative_state(self, **kwargs):
+            recorded.append(kwargs)
+            return kwargs
+
+    async def fail_fetch(source):
+        raise AssertionError("canonical unavailable outcome should prevent refetch")
+
+    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fail_fetch)
+
+    counts = asyncio.run(
+        FakeStore().process_external_image_derivatives(
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "a" * 40,
+            input_raw_sha256="raw",
+            source_urls=["https://cdn.example.test/gone.png"],
+            metadata={"proof": "canonical-unavailable"},
+        )
+    )
+
+    assert counts["unavailable"] == 1
+    assert counts["attempted"] == 0
+    assert recorded[0]["status"] == "unavailable"
+    assert recorded[0]["reason"] == "image unavailable: HTTP 404"
+    assert recorded[0]["safety_decision"] == "reused_canonical_unavailable_external_image_outcome"
+
+
+def test_link_external_image_references_from_shared_assets_without_network(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    transformed = b"jpeg-ish-shared-bytes"
+    transformed_hash = pim_email.hashlib.sha256(transformed).hexdigest()
+    storage = pim_email.write_encrypted_bytes_atomic(
+        relpath="assets/aa/shared/image.jpg.enc",
+        content=transformed,
+        purpose=pim_email.ASSET_PURPOSE,
+    )
+    stored = []
+    recorded = []
+    executed = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "FROM pim_email_external_image_derivatives d" in query:
+                return [
+                    {
+                        "derivative_id": "derivative-1",
+                        "email_uid": "20260702-" + "b" * 40,
+                        "mailbox_id": "test-mailbox",
+                        "input_raw_sha256": "raw",
+                        "source_url": "https://cdn.example.test/shared.png",
+                        "canonical_url": "https://cdn.example.test/shared.png",
+                        "canonical_url_digest": pim_email._external_image_canonical_digest(
+                            "https://cdn.example.test/shared.png"
+                        ),
+                        "shared_asset_uid": "email-shared-asset-test",
+                        "content_type": "image/jpeg",
+                        "raw_image_sha256": "raw-image-hash",
+                        "transformed_sha256": transformed_hash,
+                        "storage_relpath": storage["storage_relpath"],
+                        "encrypted_size": storage["encrypted_size"],
+                        "width": 2,
+                        "height": 1,
+                        "transform_version": "jpeg-v1",
+                        "encryption_json": storage["encryption"],
+                        "metadata_json": {"proof": "shared"},
+                    }
+                ]
+            raise AssertionError(query)
+
+        async def execute(self, query, *args):
+            executed.append((query, args))
+            return "UPDATE 1"
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def store_transformed_asset(self, **kwargs):
+            stored.append(kwargs["asset"])
+            return kwargs["asset"]
+
+        async def record_external_image_derivative_state(self, **kwargs):
+            recorded.append(kwargs)
+            return kwargs
+
+    summary = asyncio.run(
+        FakeStore().link_external_image_references_from_shared_assets(
+            mailbox_id="test-mailbox",
+            limit=10,
+        )
+    )
+
+    assert summary["planned"] == 1
+    assert summary["linked"] == 1
+    assert summary["failed"] == 0
+    assert stored[0]["storage_relpath"] == storage["storage_relpath"]
+    assert stored[0]["metadata"]["storage_kind"] == "shared-encrypted-asset"
+    assert recorded[0]["status"] == "stored"
+    assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset_bulk_link"
+    assert stored[0]["shared_asset_uid"] == "email-shared-asset-test"
+    assert any("UPDATE pim_email_shared_assets" in query for query, _ in executed)
 
 
 def test_external_image_error_classification_never_uses_skipped():
