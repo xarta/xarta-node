@@ -791,6 +791,74 @@ def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
     assert len(calls) == 2
 
 
+def test_auxiliary_backfill_batch_ledger_records_running_and_final():
+    executed = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            executed.append((query, args))
+            return "UPDATE 1"
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    store = FakeStore()
+    batch = asyncio.run(
+        store.start_backfill_auxiliary_batch(
+            run_id="shared-link-run",
+            mailbox_id="test-mailbox",
+            artifact_types=["external_image_shared_asset_links"],
+            requested_limit=1000,
+            batch_index=7,
+            metadata={"source": "test"},
+        )
+    )
+
+    assert batch["run_id"] == "shared-link-run"
+    assert batch["mailbox_id"] == "test-mailbox"
+    assert batch["artifact_types"] == ["external_image_shared_asset_links"]
+    assert batch["batch_id"].startswith("email-backfill-auxiliary-batch-")
+    assert "INSERT INTO pim_email_backfill_runs" in executed[0][0]
+    assert executed[0][1][0] == "shared-link-run"
+    assert json.loads(executed[0][1][3]) == ["external_image_shared_asset_links"]
+    assert json.loads(executed[0][1][4])["auxiliary_backfill"] is True
+    assert "INSERT INTO pim_email_backfill_batches" in executed[1][0]
+
+    asyncio.run(
+        store.update_backfill_auxiliary_batch(
+            run_id="shared-link-run",
+            batch_id=batch["batch_id"],
+            processed_count=23,
+            failed_count=0,
+            summary={"planned": 23, "linked": 23, "failed": 0},
+            aggregate={"external_images_shared_asset_links": 23},
+            final=True,
+        )
+    )
+
+    run_update = executed[2]
+    assert "UPDATE pim_email_backfill_runs" in run_update[0]
+    assert run_update[1][1] == "completed"
+    assert run_update[1][2] == 23
+    assert run_update[1][3] == 0
+    assert run_update[1][5] is True
+    batch_update = executed[3]
+    assert "UPDATE pim_email_backfill_batches" in batch_update[0]
+    assert batch_update[1][1] == 23
+    assert batch_update[1][2] == 23
+    assert batch_update[1][3] == 0
+
+
 def test_download_orphan_reconcile_marks_only_non_active_running_runs():
     calls = []
 
@@ -1557,6 +1625,7 @@ def test_link_external_image_references_from_shared_assets_without_network(tmp_p
         FakeStore().link_external_image_references_from_shared_assets(
             mailbox_id="test-mailbox",
             limit=10,
+            metadata={"run_id": "shared-link-run", "batch_id": "shared-link-batch"},
         )
     )
 
@@ -1568,6 +1637,10 @@ def test_link_external_image_references_from_shared_assets_without_network(tmp_p
     assert recorded[0]["status"] == "stored"
     assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset_bulk_link"
     assert stored[0]["shared_asset_uid"] == "email-shared-asset-test"
+    assert stored[0]["metadata"]["run_id"] == "shared-link-run"
+    assert stored[0]["metadata"]["batch_id"] == "shared-link-batch"
+    assert recorded[0]["metadata"]["run_id"] == "shared-link-run"
+    assert recorded[0]["metadata"]["batch_id"] == "shared-link-batch"
     assert any("UPDATE pim_email_shared_assets" in query for query, _ in executed)
 
 
