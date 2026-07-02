@@ -2999,6 +2999,25 @@ class PgEmailStore:
                 clean_active,
                 _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
             )
+            item_rows = await conn.fetch(
+                """
+                UPDATE pim_email_backfill_items i
+                SET status = 'interrupted-orphaned',
+                    finished_at = COALESCE(i.finished_at, now()),
+                    updated_at = now(),
+                    metadata_json = i.metadata_json || jsonb_build_object(
+                        'orphan_reconcile', $2::jsonb
+                    )
+                FROM pim_email_backfill_runs r
+                WHERE i.run_id = r.run_id
+                  AND i.mailbox_id = $1
+                  AND i.status = 'running'
+                  AND r.status <> 'running'
+                RETURNING i.run_id
+                """,
+                configured_mailbox_id,
+                _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
         finally:
             await conn.close()
         return {
@@ -3007,6 +3026,7 @@ class PgEmailStore:
             "active_run_ids": clean_active,
             "marked_orphaned": [str(row["run_id"]) for row in rows],
             "marked_count": len(rows),
+            "marked_item_count": len(item_rows),
         }
 
     async def run_backfill(
@@ -3098,12 +3118,50 @@ class PgEmailStore:
                               AND d.email_uid = m.email_uid
                               AND d.input_raw_sha256 = m.raw_sha256
                               AND d.status IN ('pending','fetched','transformed')
-                        ) AS external_pending
+                        ) AS external_pending,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_backfill_items i
+                            JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                            WHERE i.mailbox_id = m.mailbox_id
+                              AND i.email_uid = m.email_uid
+                              AND i.raw_sha256 = m.raw_sha256
+                              AND i.artifact_type = 'security'
+                              AND i.status = 'running'
+                              AND r.status = 'running'
+                        ) AS security_running,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_backfill_items i
+                            JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                            WHERE i.mailbox_id = m.mailbox_id
+                              AND i.email_uid = m.email_uid
+                              AND i.raw_sha256 = m.raw_sha256
+                              AND i.artifact_type = 'sanitized_view'
+                              AND i.status = 'running'
+                              AND r.status = 'running'
+                        ) AS sanitized_running,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_backfill_items i
+                            JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                            WHERE i.mailbox_id = m.mailbox_id
+                              AND i.email_uid = m.email_uid
+                              AND i.raw_sha256 = m.raw_sha256
+                              AND i.artifact_type = 'external_images'
+                              AND i.status = 'running'
+                              AND r.status = 'running'
+                        ) AS external_running
                     FROM pim_email_messages m
                     {where}
                 )
                 SELECT email_uid, mailbox_id, raw_sha256, storage_relpath, updated_at
                 FROM candidates
+                WHERE NOT (
+                    ({security_requested} AND security_running)
+                    OR ({sanitized_requested} AND sanitized_running)
+                    OR ({external_requested} AND external_running)
+                )
                 ORDER BY
                   CASE
                     WHEN {security_requested} AND security_result_present AND NOT security_complete THEN 0
