@@ -2877,12 +2877,63 @@ class PgEmailStore:
             if safe_limit is not None:
                 params.append(safe_limit)
                 limit_clause = f"LIMIT ${len(params)}"
+            security_requested = "TRUE" if "security" in clean_artifacts else "FALSE"
+            sanitized_requested = "TRUE" if "sanitized_view" in clean_artifacts else "FALSE"
+            external_requested = "TRUE" if "external_images" in clean_artifacts else "FALSE"
             rows = await conn.fetch(
                 f"""
+                WITH candidates AS (
+                    SELECT
+                        m.email_uid,
+                        m.mailbox_id,
+                        m.raw_sha256,
+                        m.storage_relpath,
+                        m.updated_at,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_checks s
+                            WHERE s.email_uid = m.email_uid
+                              AND s.raw_sha256 = m.raw_sha256
+                              AND s.security_status = 'stored'
+                              AND s.result_json->>'available' = 'true'
+                              AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
+                              AND COALESCE(s.result_json->>'placeholder', 'false') <> 'true'
+                              AND s.result_json->>'email_uid' = m.email_uid
+                              AND s.result_json->>'raw_sha256' = m.raw_sha256
+                              AND COALESCE(s.result_json->>'checked_at', '') <> ''
+                              AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
+                        ) AS security_complete,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_sanitized_view_artifacts a
+                            WHERE a.mailbox_id = m.mailbox_id
+                              AND a.email_uid = m.email_uid
+                              AND a.input_raw_sha256 = m.raw_sha256
+                              AND a.sanitizer_policy_version = '{SANITIZED_VIEW_POLICY_VERSION}'
+                              AND a.transform_version = '{SANITIZED_VIEW_TRANSFORM_VERSION}'
+                        ) AS sanitized_complete,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_external_image_derivatives d
+                            WHERE d.mailbox_id = m.mailbox_id
+                              AND d.email_uid = m.email_uid
+                              AND d.input_raw_sha256 = m.raw_sha256
+                              AND d.status IN ('pending','fetched','transformed')
+                        ) AS external_pending
+                    FROM pim_email_messages m
+                    {where}
+                )
                 SELECT email_uid, mailbox_id, raw_sha256, storage_relpath, updated_at
-                FROM pim_email_messages
-                {where}
-                ORDER BY updated_at ASC, email_uid ASC
+                FROM candidates
+                ORDER BY
+                  CASE
+                    WHEN {security_requested} AND NOT security_complete THEN 0
+                    WHEN {sanitized_requested} AND NOT sanitized_complete THEN 0
+                    WHEN {external_requested} AND external_pending THEN 0
+                    ELSE 1
+                  END,
+                  updated_at ASC,
+                  email_uid ASC
                 {limit_clause}
                 """,
                 *params,
