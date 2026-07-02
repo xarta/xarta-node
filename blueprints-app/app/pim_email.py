@@ -219,6 +219,11 @@ def _json_dumps(
     )
 
 
+def _external_image_canonical_digest(canonical_url: str) -> str:
+    # Index key for long URLs; security decisions use the raw/transformed hashes.
+    return hashlib.md5(str(canonical_url or "").encode("utf-8")).hexdigest()
+
+
 def encrypt_password(password: str, *, key: str | None = None) -> str:
     key_bytes = _credential_key_bytes(key)
     nonce = secrets.token_bytes(16)
@@ -699,6 +704,7 @@ class PgEmailStore:
                     input_raw_sha256 TEXT NOT NULL DEFAULT '',
                     source_url TEXT NOT NULL,
                     canonical_url TEXT NOT NULL DEFAULT '',
+                    canonical_url_digest TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     reason TEXT NOT NULL DEFAULT '',
                     safety_decision TEXT NOT NULL DEFAULT '',
@@ -719,7 +725,35 @@ class PgEmailStore:
                     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (mailbox_id, email_uid, input_raw_sha256, canonical_url)
+                    UNIQUE (mailbox_id, email_uid, input_raw_sha256, canonical_url_digest)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE pim_email_external_image_derivatives
+                ADD COLUMN IF NOT EXISTS canonical_url_digest TEXT NOT NULL DEFAULT '';
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE pim_email_external_image_derivatives
+                SET canonical_url_digest = md5(canonical_url)
+                WHERE canonical_url_digest = '' AND canonical_url <> '';
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE pim_email_external_image_derivatives
+                DROP CONSTRAINT IF EXISTS
+                  pim_email_external_image_deri_mailbox_id_email_uid_input_ra_key;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pim_email_external_images_identity_digest
+                ON pim_email_external_image_derivatives(
+                    mailbox_id, email_uid, input_raw_sha256, canonical_url_digest
                 );
                 """
             )
@@ -2150,6 +2184,7 @@ class PgEmailStore:
             await self.ensure_schema()
         clean_uid = clean_email_uid(email_uid)
         canonical = _canonical_remote_image_url(source_url) or str(source_url or "")
+        canonical_digest = _external_image_canonical_digest(canonical)
         clean_status = str(status or "").strip().lower()
         if clean_status not in {
             "pending",
@@ -2174,19 +2209,19 @@ class PgEmailStore:
                 """
                 INSERT INTO pim_email_external_image_derivatives (
                     derivative_id, email_uid, mailbox_id, input_raw_sha256,
-                    source_url, canonical_url, status, reason, safety_decision,
+                    source_url, canonical_url, canonical_url_digest, status, reason, safety_decision,
                     transform_version, raw_image_sha256, transformed_sha256,
                     storage_relpath, encrypted_size, content_type, width, height,
                     metadata_json, fetched_at, transformed_at, stored_at, updated_at
                 )
                 VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,
-                    CASE WHEN $7 IN ('fetched','transformed','stored') THEN now() ELSE NULL END,
-                    CASE WHEN $7 IN ('transformed','stored') THEN now() ELSE NULL END,
-                    CASE WHEN $7 = 'stored' THEN now() ELSE NULL END,
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,
+                    CASE WHEN $8 IN ('fetched','transformed','stored') THEN now() ELSE NULL END,
+                    CASE WHEN $8 IN ('transformed','stored') THEN now() ELSE NULL END,
+                    CASE WHEN $8 = 'stored' THEN now() ELSE NULL END,
                     now()
                 )
-                ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url) DO UPDATE SET
+                ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url_digest) DO UPDATE SET
                     status = EXCLUDED.status,
                     reason = EXCLUDED.reason,
                     safety_decision = EXCLUDED.safety_decision,
@@ -2215,6 +2250,7 @@ class PgEmailStore:
                 str(input_raw_sha256 or ""),
                 str(source_url or ""),
                 canonical,
+                canonical_digest,
                 clean_status,
                 str(reason or "")[:1000],
                 str(safety_decision or ""),
@@ -2320,6 +2356,7 @@ class PgEmailStore:
                     raw_sha256,
                     source_url,
                     canonical,
+                    _external_image_canonical_digest(canonical),
                     "pending",
                     "captured_waiting_for_real_download",
                     "pending_real_download",
@@ -2353,20 +2390,20 @@ class PgEmailStore:
                     """
                     INSERT INTO pim_email_external_image_derivatives (
                         derivative_id, email_uid, mailbox_id, input_raw_sha256,
-                        source_url, canonical_url, status, reason, safety_decision,
+                        source_url, canonical_url, canonical_url_digest, status, reason, safety_decision,
                         transform_version, metadata_json
                     )
                     SELECT *
                     FROM unnest(
                         $1::text[], $2::text[], $3::text[], $4::text[],
                         $5::text[], $6::text[], $7::text[], $8::text[],
-                        $9::text[], $10::text[], $11::jsonb[]
+                        $9::text[], $10::text[], $11::text[], $12::jsonb[]
                     ) AS input(
                         derivative_id, email_uid, mailbox_id, input_raw_sha256,
-                        source_url, canonical_url, status, reason, safety_decision,
+                        source_url, canonical_url, canonical_url_digest, status, reason, safety_decision,
                         transform_version, metadata_json
                     )
-                    ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url)
+                    ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url_digest)
                     DO NOTHING
                     RETURNING derivative_id
                     """,
@@ -2381,6 +2418,7 @@ class PgEmailStore:
                     [item[8] for item in chunk],
                     [item[9] for item in chunk],
                     [item[10] for item in chunk],
+                    [item[11] for item in chunk],
                 )
                 inserted += len(result)
         finally:
