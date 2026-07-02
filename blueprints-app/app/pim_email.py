@@ -2422,12 +2422,8 @@ class PgEmailStore:
                             email_uid, security_status, checker_versions_json, metadata_json
                         )
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
-                        ON CONFLICT (security_check_id) DO UPDATE SET
-                            mailbox_id = EXCLUDED.mailbox_id,
-                            folder = EXCLUDED.folder,
-                            uid = EXCLUDED.uid,
+                        ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
                             message_id = EXCLUDED.message_id,
-                            raw_sha256 = EXCLUDED.raw_sha256,
                             aggregate_status = EXCLUDED.aggregate_status,
                             aggregate_score = EXCLUDED.aggregate_score,
                             llm_called = EXCLUDED.llm_called,

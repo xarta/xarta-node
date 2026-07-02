@@ -1130,17 +1130,35 @@ def _llm_findings(
 
 def _llm_config() -> tuple[str, str, str]:
     base_url = (
-        os.getenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL") or os.getenv("LITELLM_BASE_URL") or ""
+        os.getenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("LITELLM_BASE_URL")
+        or ""
     ).strip()
     api_key = (
-        os.getenv("BLUEPRINTS_EMAIL_SECURITY_LLM_API_KEY") or os.getenv("LITELLM_API_KEY") or ""
+        os.getenv("BLUEPRINTS_EMAIL_SECURITY_LLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("LITELLM_API_KEY")
+        or ""
     ).strip()
     model = (
         os.getenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL")
+        or os.getenv("OPENAI_MODEL")
         or os.getenv("BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL")
         or ""
     ).strip()
     return base_url, api_key, model
+
+
+def _openai_chat_completions_url(base_url: str) -> str:
+    clean = str(base_url or "").strip().rstrip("/")
+    if not clean:
+        raise EmailSecurityUnavailableError("local AI endpoint/model is not configured")
+    if clean.endswith("/chat/completions"):
+        return clean
+    if clean.endswith("/v1"):
+        return f"{clean}/chat/completions"
+    return f"{clean}/v1/chat/completions"
 
 
 def _llm_payload(msg: Any, sanitized_body: str) -> dict[str, Any]:
@@ -1193,7 +1211,7 @@ def _call_litellm(payload: dict[str, Any]) -> str:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     with httpx.Client(timeout=httpx.Timeout(LLM_TIMEOUT_SECONDS)) as client:
         response = client.post(
-            f"{base_url.rstrip('/')}/v1/chat/completions", headers=headers, json=payload
+            _openai_chat_completions_url(base_url), headers=headers, json=payload
         )
     if response.status_code >= 400:
         raise EmailSecurityUnavailableError(f"local AI HTTP {response.status_code}")
