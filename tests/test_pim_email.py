@@ -498,7 +498,7 @@ def test_email_store_schema_is_process_cached_per_dsn(monkeypatch):
         pim_email.PgEmailStore._schema_ready_dsns.discard(dsn)
 
 
-def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
+def test_sanitized_view_artifact_persists_encrypted_sanitized_raw_view(
     tmp_path,
     monkeypatch,
 ):
@@ -511,8 +511,15 @@ def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
         b"To: User <user@example.test>\r\n"
         b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
         b"Message-ID: <sanitized-artifact@example.test>\r\n"
+        b"Content-Type: multipart/mixed; boundary=artifact-boundary\r\n\r\n"
+        b"--artifact-boundary\r\n"
         b"Content-Type: text/html; charset=utf-8\r\n\r\n"
         b"<p>Visible safe body</p><script>bad()</script>\r\n"
+        b"--artifact-boundary\r\n"
+        b"Content-Type: application/octet-stream; name=secret.bin\r\n"
+        b"Content-Disposition: attachment; filename=secret.bin\r\n\r\n"
+        b"secret-bytes-must-not-render\r\n"
+        b"--artifact-boundary--\r\n"
     )
     raw_sha256 = pim_email.hashlib.sha256(raw).hexdigest()
 
@@ -526,8 +533,29 @@ def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
 
     assert b"Visible safe body" not in encrypted
     assert b"<script>" not in encrypted
+    assert b"secret-bytes-must-not-render" not in encrypted
     assert artifact["input_raw_sha256"] == raw_sha256
-    assert artifact["views_available"]["raw"] is False
+    assert artifact["transform_version"] == "email-sanitized-raw-v1"
+    assert artifact["views_available"]["raw"] is True
+    assert artifact["derivation"]["durable_body"] == "sanitized-raw-message"
+    assert artifact["derivation"]["view_bodies_persisted"] is False
+
+    stored_payload = json.loads(
+        pim_email.read_encrypted_bytes(
+            artifact["storage_relpath"],
+            purpose=pim_email.SANITIZED_VIEW_PURPOSE,
+        )
+    )
+    assert stored_payload["schema"] == "xarta.pim_email.sanitized_raw_artifact.v1"
+    assert "views" not in stored_payload
+    assert "plain" not in stored_payload
+    assert "markdown" not in stored_payload
+    assert "html" not in stored_payload
+    assert "Subject: Sanitized artifact" in stored_payload["sanitized_raw"]
+    assert "Visible safe body" in stored_payload["sanitized_raw"]
+    assert "<script>" not in stored_payload["sanitized_raw"]
+    assert "[xarta raw view omitted MIME part body:" in stored_payload["sanitized_raw"]
+    assert "secret-bytes-must-not-render" not in stored_payload["sanitized_raw"]
 
     row = {
         "artifact_uid": artifact["artifact_uid"],
@@ -546,9 +574,15 @@ def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
     }
     payload = pim_email.read_sanitized_view_artifact(row)
 
+    assert payload["sanitized_raw"] == stored_payload["sanitized_raw"]
     assert payload["views"]["plain"] == "Visible safe body"
     assert "<script>" not in payload["views"]["html"]
-    assert payload["views_available"]["raw"] is False
+    assert payload["views_available"]["raw"] is True
+    assert "Subject: Sanitized artifact" in payload["views"]["raw"]
+    assert "Visible safe body" in payload["views"]["raw"]
+    assert "<script>" not in payload["views"]["raw"]
+    assert "[xarta raw view omitted MIME part body:" in payload["views"]["raw"]
+    assert "secret-bytes-must-not-render" not in payload["views"]["raw"]
 
 
 def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, monkeypatch):
@@ -653,6 +687,149 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
     }
     assert message["security"]["security_status"] == "missing"
     assert message["security"]["blocked_reason"] == "completed_security_result_missing"
+
+
+def test_read_local_message_uses_persisted_sanitized_raw_view(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    stored_uid = "20260702-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    raw = (
+        b"Subject: Safe raw proof\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Thu, 02 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <safe-raw@example.test>\r\n"
+        b"Content-Type: multipart/mixed; boundary=proof-boundary\r\n\r\n"
+        b"--proof-boundary\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Hello safe raw body.\r\n"
+        b"--proof-boundary\r\n"
+        b"Content-Type: application/octet-stream; name=secret.bin\r\n"
+        b"Content-Disposition: attachment; filename=secret.bin\r\n\r\n"
+        b"secret-bytes-must-not-render\r\n"
+        b"--proof-boundary--\r\n"
+    )
+    storage = pim_email.write_encrypted_bytes_atomic(
+        relpath=f"2026/07/02/{stored_uid}.eml.enc",
+        content=raw,
+    )
+    artifact = pim_email.build_sanitized_view_artifact(
+        mailbox_id="test-mailbox",
+        email_uid=stored_uid,
+        raw=raw,
+        raw_sha256=storage["raw_sha256"],
+    )
+    message_row = {
+        "email_uid": stored_uid,
+        "mailbox_id": "test-mailbox",
+        "raw_sha256": storage["raw_sha256"],
+        "message_id": "<safe-raw@example.test>",
+        "subject": "Safe raw proof",
+        "from_addr": "Sender <sender@example.test>",
+        "to_addr": "User <user@example.test>",
+        "date_header": "Thu, 02 Jul 2026 09:15:00 +0000",
+        "uid_info_json": json.dumps(
+            {
+                "email_uid": stored_uid,
+                "storage_relpath": "2026/07/02/original.eml.enc",
+                "path": "/unsafe/original.eml.enc",
+            }
+        ),
+        "headers_json": "{}",
+        "metadata_json": "{}",
+        "storage_relpath": storage["storage_relpath"],
+        "encrypted_size": storage["encrypted_size"],
+        "encryption_json": "{}",
+    }
+    membership_rows = [
+        {
+            "folder_name": "INBOX",
+            "folder_uid": "folder-inbox",
+            "imap_uid": "42",
+            "uidvalidity": "777",
+            "flags_json": "[]",
+            "last_seen_at": "",
+            "remote_moved_at": "",
+            "remote_move_target": "",
+        }
+    ]
+    security_result = {
+        **_security_result("green"),
+        "email_uid": stored_uid,
+        "raw_sha256": storage["raw_sha256"],
+        "checked_at": "2026-07-02T09:30:00Z",
+        "checker_versions": {"schema": "test"},
+    }
+    security_row = {
+        "result_json": json.dumps(security_result),
+        "security_status": "stored",
+        "error_message": "",
+        "checked_at": "2026-07-02T09:30:00Z",
+        "raw_sha256": storage["raw_sha256"],
+    }
+    sanitized_row = {
+        "artifact_uid": artifact["artifact_uid"],
+        "email_uid": stored_uid,
+        "input_raw_sha256": artifact["input_raw_sha256"],
+        "sanitizer_policy_version": artifact["sanitizer_policy_version"],
+        "transform_version": artifact["transform_version"],
+        "output_sha256": artifact["output_sha256"],
+        "storage_relpath": artifact["storage_relpath"],
+        "encrypted_size": artifact["encrypted_size"],
+        "views_available_json": json.dumps(artifact["views_available"]),
+        "safety_counts_json": json.dumps(artifact["safety_counts"]),
+        "derivation_json": json.dumps(artifact["derivation"]),
+        "generated_at": "",
+        "updated_at": "",
+    }
+
+    class FakeConnection:
+        async def fetchrow(self, query, *args):
+            if "FROM pim_email_messages" in query:
+                assert args == ("test-mailbox", stored_uid)
+                return message_row
+            if "FROM pim_email_security_checks" in query:
+                assert args == (stored_uid, storage["raw_sha256"])
+                return security_row
+            if "FROM pim_email_sanitized_view_artifacts" in query:
+                assert args[:3] == ("test-mailbox", stored_uid, storage["raw_sha256"])
+                return sanitized_row
+            raise AssertionError(query)
+
+        async def fetch(self, query, *args):
+            assert args == ("test-mailbox", stored_uid)
+            if "FROM pim_email_folder_memberships" in query:
+                return membership_rows
+            if "FROM pim_email_transformed_assets" in query:
+                return []
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    message = asyncio.run(FakeStore().read_local_message(stored_uid, mailbox_id="test-mailbox"))
+
+    assert message["body_blocked"] is False
+    safe_raw = message["views"]["raw"]
+    assert message["views_available"]["raw"] is True
+    assert message["stored"]["raw_original_access"] == "blocked"
+    assert message["stored"]["sanitized_view"]["transform_version"] == "email-sanitized-raw-v1"
+    assert "storage_relpath" not in message["email_uid_info"]
+    assert "path" not in message["email_uid_info"]
+    assert "Subject: Safe raw proof" in safe_raw
+    assert "Hello safe raw body." in safe_raw
+    assert "[xarta raw view omitted MIME part body:" in safe_raw
+    assert "secret-bytes-must-not-render" not in safe_raw
 
 
 def test_local_corpus_status_reports_missing_security_without_placeholder_results():
@@ -2803,7 +2980,7 @@ class CaptureDownloadStore:
     async def save_downloaded_email(self, **kwargs):
         self.saved.append(kwargs)
 
-    async def read_local_message(self, email_uid, *, mailbox_id=None):
+    async def read_local_message(self, email_uid, *, mailbox_id=None, ensure_schema=True):
         match = next(
             item for item in reversed(self.saved) if item["parsed"]["email_uid"] == email_uid
         )
@@ -3353,6 +3530,7 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
             return _mailbox()
 
         async def local_folder_messages(self, **kwargs):
+            assert kwargs.get("ensure_schema") is False
             return [
                 {
                     "uid": "41",
@@ -3363,8 +3541,9 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
                 }
             ]
 
-        async def read_local_message(self, requested_uid, *, mailbox_id=None):
+        async def read_local_message(self, requested_uid, *, mailbox_id=None, ensure_schema=True):
             assert requested_uid == email_uid
+            assert ensure_schema is False
             return {
                 "email_uid": requested_uid,
                 "source": "local-corpus",
