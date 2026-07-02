@@ -60,6 +60,7 @@ SECURITY_POLICY_VERSION = "pim-email-security-v1"
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
+DEFAULT_REMOTE_IMAGE_MAX_REDIRECTS = 20
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_IMAGE_DIMENSIONS = (1800, 2400)
 MAX_RAW_VIEW_TEXT_CHARS = 200_000
@@ -2482,7 +2483,7 @@ class PgEmailStore:
 
         for source, canonical in unique_sources:
             status = existing.get(canonical, "")
-            if status in {"stored", "blocked", "failed", "unavailable"}:
+            if status in {"stored", "blocked", "unavailable"}:
                 counts[status] += 1
                 continue
             counts["attempted"] += 1
@@ -5243,6 +5244,15 @@ def fetch_remote_image_as_jpeg_sync(source: str) -> bytes:
 
 def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
     current = _assert_public_remote_image_url(source)
+    max_redirects = max(
+        1,
+        int(
+            os.environ.get(
+                "BLUEPRINTS_EMAIL_REMOTE_IMAGE_MAX_REDIRECTS",
+                str(DEFAULT_REMOTE_IMAGE_MAX_REDIRECTS),
+            )
+        ),
+    )
     headers = {
         "Accept": "image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8",
         "User-Agent": "BlueprintsEmailImageProxy/1.0",
@@ -5251,7 +5261,7 @@ def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
         with httpx.Client(
             follow_redirects=False, timeout=httpx.Timeout(8.0, connect=4.0)
         ) as client:
-            for _ in range(4):
+            for _ in range(max_redirects):
                 current = _assert_public_remote_image_url(current)
                 with client.stream("GET", current, headers=headers) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
@@ -5279,7 +5289,9 @@ def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
                         "content_type": content_type or "image/*",
                         "final_url": current,
                     }
-            raise EmailOperationError("image redirect chain is too long")
+            raise EmailOperationError(
+                f"image unavailable: redirect chain exceeded {max_redirects} redirects"
+            )
     except httpx.RequestError as exc:
         raise EmailOperationError(f"image unavailable: {exc.__class__.__name__}") from exc
 
@@ -5289,12 +5301,19 @@ def _external_image_error_status(exc: BaseException) -> str:
     if "private or unsafe" in text or "not an allowed http" in text:
         return "blocked"
     if (
+        "timeout" in text
+        or "connect" in text
+        or "http 429" in text
+        or re.search(r"http 5\d\d", text)
+    ):
+        return "pending"
+    if (
         "unavailable" in text
         or "could not be resolved" in text
         or "http 404" in text
         or "http 410" in text
-        or "timeout" in text
-        or "connect" in text
+        or "redirect chain" in text
+        or "did not return an image" in text
     ):
         return "unavailable"
     return "failed"

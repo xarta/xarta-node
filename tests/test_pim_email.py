@@ -564,6 +564,113 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
     assert {item["reason"] for item in inserted} == {"captured_waiting_for_real_download"}
 
 
+def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    failed_url = "https://cdn.example.test/retry.png"
+    stored_url = "https://cdn.example.test/already.jpg"
+    attempted = []
+    recorded = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "FROM pim_email_external_image_derivatives" in query:
+                return [
+                    {"canonical_url": failed_url, "status": "failed"},
+                    {"canonical_url": stored_url, "status": "stored"},
+                ]
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def store_transformed_asset(self, **kwargs):
+            return {"ok": True, "asset": kwargs["asset"]}
+
+        async def record_external_image_derivative_state(self, **kwargs):
+            recorded.append(kwargs)
+            return kwargs
+
+    async def fake_fetch(source):
+        attempted.append(source)
+        return {"content": b"image-bytes", "content_type": "image/png", "final_url": source}
+
+    def fake_asset(**kwargs):
+        return {
+            "transform_version": "jpeg-v1",
+            "raw_sha256": "raw-image-hash",
+            "transformed_sha256": "transformed-image-hash",
+            "storage_relpath": "assets/retry.jpg.enc",
+            "encrypted_size": 123,
+            "content_type": "image/jpeg",
+            "width": 2,
+            "height": 1,
+        }
+
+    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fake_fetch)
+    monkeypatch.setattr(pim_email, "build_transformed_external_image_asset", fake_asset)
+
+    counts = asyncio.run(
+        FakeStore().process_external_image_derivatives(
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "d" * 40,
+            input_raw_sha256="raw",
+            source_urls=[failed_url, stored_url],
+            metadata={"proof": "retry"},
+        )
+    )
+
+    assert attempted == [failed_url]
+    assert counts["attempted"] == 1
+    assert counts["stored"] == 2
+    assert counts["failed"] == 0
+    assert recorded[0]["status"] == "stored"
+    assert recorded[0]["safety_decision"] == "fetched_transformed_encrypted_stored"
+
+
+def test_external_image_error_classification_never_uses_skipped():
+    assert (
+        pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image unavailable: HTTP 404")
+        )
+        == "unavailable"
+    )
+    assert (
+        pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image unavailable: redirect chain exceeded 20 redirects")
+        )
+        == "unavailable"
+    )
+    assert (
+        pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image unavailable: ReadTimeout")
+        )
+        == "pending"
+    )
+
+
+def test_oversize_security_llm_state_is_scored_not_marked_skipped(monkeypatch):
+    body = "ab" * ((pim_email_security.MAX_LLM_CHARS // 2) + 1)
+    findings = []
+
+    state = pim_email_security._llm_findings(None, body, findings)
+
+    assert state["called"] is False
+    assert state["not_called_reason"] == "oversize_deterministic_risk_result"
+    assert "skipped_reason" not in state
+    assert any(item["code"] == "LLM_BODY_OVERSIZE" for item in findings)
+
+
 def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     raw = (
         b"Subject: =?utf-8?q?Hello_=E2=9C=93?=\r\n"

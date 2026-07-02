@@ -949,7 +949,7 @@ def _llm_findings(
                 details={"approx_tokens": approx_tokens, "threshold": MAX_LLM_APPROX_TOKENS},
             )
         )
-        state["skipped_reason"] = "oversize"
+        state["not_called_reason"] = "oversize_deterministic_risk_result"
         return state
 
     payload = _llm_payload(msg, sanitized)
