@@ -18,6 +18,8 @@ from typing import Any, Callable
 import httpx
 
 SCHEMA = "xarta.pim_email.security_check.v1"
+DETERMINISTIC_SCHEMA = "xarta.pim_email.security_deterministic.v1"
+LLM_PHASE_SCHEMA = "xarta.pim_email.security_llm_phase.v1"
 LLM_SCHEMA = "xarta.pim_email.llm_spam_scam_judgement.v1"
 SECURITY_PROGRESS_SCHEMA = "xarta.pim_email.security_progress.v1"
 MAX_LLM_APPROX_TOKENS = 50_000
@@ -84,6 +86,27 @@ def check_email_security_sync(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run DNS/crypto/provider/LLM checks against raw RFC822 bytes."""
+    deterministic = check_email_security_deterministic_sync(
+        raw,
+        dns_txt_lookup=dns_txt_lookup,
+        progress_callback=progress_callback,
+    )
+    return complete_email_security_with_llm_sync(
+        raw,
+        deterministic=deterministic,
+        body_text=body_text,
+        llm_client=llm_client,
+        progress_callback=progress_callback,
+    )
+
+
+def check_email_security_deterministic_sync(
+    raw: bytes,
+    *,
+    dns_txt_lookup: Callable[[str], list[str]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run deterministic provider/DNS/crypto checks without local-AI judgement."""
     _progress(progress_callback, "service", "running", "running")
     runtime = _load_runtime()
     _progress(progress_callback, "service", "complete", "green")
@@ -145,10 +168,71 @@ def check_email_security_sync(
         _stage_tone("dmarc_policy", findings[dmarc_start:]),
         findings=findings,
     )
+    progress = {
+        "schema": SECURITY_PROGRESS_SCHEMA,
+        "segments": _progress_segments(
+            findings,
+            active_stage_id="llm_input",
+            active_status="pending",
+            active_tone="pending",
+        ),
+    }
+    return {
+        "schema": DETERMINISTIC_SCHEMA,
+        "available": False,
+        "complete_security_result": False,
+        "deterministic_complete": True,
+        "checked_at": _utc_now(),
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "progress": progress,
+        "context": context,
+        "findings": findings,
+        "authentication_results": authres_report,
+        "dkim": dkim_state,
+        "spf": spf_state,
+        "dmarc": dmarc_state,
+        "llm": {
+            "schema": LLM_PHASE_SCHEMA,
+            "called": False,
+            "status": "pending",
+            "reason": "local_ai_judgement_not_run_in_deterministic_phase",
+            "model": _llm_config()[2],
+        },
+    }
+
+
+def complete_email_security_with_llm_sync(
+    raw: bytes,
+    *,
+    deterministic: dict[str, Any] | None = None,
+    body_text: str = "",
+    llm_client: Callable[[dict[str, Any]], str] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Complete security by adding the required local-AI judgement."""
+    raw = bytes(raw or b"")
+    if not raw:
+        raise EmailSecurityUnavailableError("raw email bytes are required for security checks")
+    started = time.monotonic()
+    if deterministic is None:
+        deterministic = check_email_security_deterministic_sync(raw)
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+    findings = [dict(item) for item in deterministic.get("findings", []) if isinstance(item, dict)]
+    dkim_state = dict(deterministic.get("dkim") or {})
+    spf_state = dict(deterministic.get("spf") or {})
+    dmarc_state = dict(deterministic.get("dmarc") or {})
+    authres_report = dict(deterministic.get("authentication_results") or {})
+    context = dict(deterministic.get("context") or _message_context(_load_runtime(), msg, raw))
+    if str(deterministic.get("raw_sha256") or "") != hashlib.sha256(raw).hexdigest():
+        raise EmailSecurityUnavailableError("deterministic security phase raw hash is stale")
+
     _progress(progress_callback, "llm_input", "running", "running", findings=findings)
     _progress(progress_callback, "llm_json", "pending", "pending", findings=findings)
     _progress(progress_callback, "llm_judgement", "pending", "pending", findings=findings)
     llm_state = _llm_findings(msg, body_text, findings, llm_client=llm_client)
+    llm_state["schema"] = LLM_PHASE_SCHEMA
+    llm_state["status"] = "complete"
     _progress(
         progress_callback,
         "llm_input",
@@ -201,6 +285,20 @@ def check_email_security_sync(
         "spf": spf_state,
         "dmarc": dmarc_state,
         "llm": llm_state,
+        "phases": {
+            "deterministic": {
+                "schema": DETERMINISTIC_SCHEMA,
+                "checked_at": deterministic.get("checked_at", ""),
+                "duration_ms": int(deterministic.get("duration_ms") or 0),
+                "status": "complete",
+            },
+            "llm": {
+                "schema": LLM_PHASE_SCHEMA,
+                "status": "complete",
+                "called": bool(llm_state.get("called")),
+                "valid_json": bool(llm_state.get("valid_json")),
+            },
+        },
     }
 
 
