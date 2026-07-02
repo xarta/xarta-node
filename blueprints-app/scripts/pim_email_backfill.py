@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +49,125 @@ def _load_env_file(path: Path) -> None:
         os.environ[key] = value.strip().strip("\"'")
 
 
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _log_event(event: str, **payload: Any) -> None:
+    body = {"ts": _utc_now(), "event": event, **payload}
+    print(json.dumps(_json_ready(body), sort_keys=True, separators=(",", ":")), flush=True)
+
+
+def _parse_summary(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw_summary": value}
+        return loaded if isinstance(loaded, dict) else {"summary": loaded}
+    return {}
+
+
+def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "artifact_types",
+        "planned_messages",
+        "processed_messages",
+        "failed_messages",
+        "raw_originals_verified",
+        "raw_originals_failed",
+        "security_completed",
+        "security_already_completed",
+        "security_failed",
+        "sanitized_views_stored",
+        "sanitized_views_already_current",
+        "sanitized_views_failed",
+        "external_images_captured",
+        "external_images_stored",
+        "external_images_pending",
+        "external_images_unavailable",
+        "external_images_failed",
+        "external_images_blocked",
+        "external_images_materialized_rows",
+    )
+    return {key: summary[key] for key in keys if key in summary}
+
+
+async def _fetch_backfill_progress(store: Any, run_id: str) -> dict[str, Any]:
+    conn = await store._connect()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT status, processed_count, failed_count, started_at, finished_at, summary_json
+            FROM pim_email_backfill_runs
+            WHERE run_id = $1
+            """,
+            run_id,
+        )
+    finally:
+        await conn.close()
+    if not row:
+        return {"run_id": run_id, "status": "not-created"}
+    summary = _parse_summary(row["summary_json"])
+    return {
+        "run_id": run_id,
+        "status": str(row["status"] or ""),
+        "processed_count": int(row["processed_count"] or 0),
+        "failed_count": int(row["failed_count"] or 0),
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "summary": _compact_backfill_summary(summary),
+    }
+
+
+async def _monitor_backfill_progress(
+    store: Any,
+    run_id: str,
+    stop: asyncio.Event,
+    *,
+    interval_seconds: float = 30.0,
+) -> None:
+    while not stop.is_set():
+        try:
+            _log_event("backfill_progress", **(await _fetch_backfill_progress(store, run_id)))
+        except Exception as exc:  # pragma: no cover - defensive log path
+            _log_event(
+                "backfill_progress_monitor_error",
+                run_id=run_id,
+                error_class=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            continue
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore
 
     store = PgEmailStore()
+    _log_event(
+        "backfill_cli_start",
+        run_id=args.run_id,
+        mailbox_id=args.mailbox_id,
+        email_uid=args.email_uid,
+        limit=args.limit,
+        artifact=args.artifact,
+        materialize_external_image_rows=bool(args.materialize_external_image_rows),
+    )
     active_backfill_run_ids = _active_backfill_run_ids()
     if args.run_id:
         active_backfill_run_ids.add(str(args.run_id))
@@ -61,22 +177,36 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         mailbox_id=args.mailbox_id,
     )
     await store.reconcile_superseded_backfill_failures(mailbox_id=args.mailbox_id)
-    if args.materialize_external_image_rows:
-        result = await store.materialize_external_image_derivative_rows(
+    stop = asyncio.Event()
+    monitor_task: asyncio.Task[None] | None = None
+    if args.run_id:
+        monitor_task = asyncio.create_task(
+            _monitor_backfill_progress(store, str(args.run_id), stop)
+        )
+    try:
+        if args.materialize_external_image_rows:
+            result = await store.materialize_external_image_derivative_rows(
+                mailbox_id=args.mailbox_id,
+                email_uid=args.email_uid,
+                limit=args.limit,
+                metadata={"source": "pim-email-backfill-cli-materialize"},
+            )
+            _log_event("backfill_materialize_complete", result=result)
+            if not args.artifact:
+                return {"ok": True, "materialize_external_image_rows": result}
+        result = await store.run_backfill(
             mailbox_id=args.mailbox_id,
             email_uid=args.email_uid,
             limit=args.limit,
-            metadata={"source": "pim-email-backfill-cli-materialize"},
+            artifact_types=args.artifact,
+            run_id=args.run_id,
         )
-        if not args.artifact:
-            return {"ok": True, "materialize_external_image_rows": result}
-    return await store.run_backfill(
-        mailbox_id=args.mailbox_id,
-        email_uid=args.email_uid,
-        limit=args.limit,
-        artifact_types=args.artifact,
-        run_id=args.run_id,
-    )
+        _log_event("backfill_cli_complete", result=result)
+        return result
+    finally:
+        stop.set()
+        if monitor_task is not None:
+            await monitor_task
 
 
 def _active_backfill_run_ids() -> set[str]:
@@ -119,7 +249,7 @@ def main() -> int:
     args = parser.parse_args()
     _load_env_file(Path(args.env_file))
     result = asyncio.run(_run(args))
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     return 0
 
 
