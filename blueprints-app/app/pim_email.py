@@ -60,7 +60,8 @@ SECURITY_POLICY_VERSION = "pim-email-security-v1"
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
 PIM_EMAIL_SCHEMA_LOCK_ID = 917_202_607_020_001
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
-MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
+DEFAULT_REMOTE_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+MAX_REMOTE_IMAGE_BYTES = DEFAULT_REMOTE_IMAGE_MAX_BYTES
 DEFAULT_REMOTE_IMAGE_MAX_REDIRECTS = 20
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_IMAGE_DIMENSIONS = (1800, 2400)
@@ -5507,8 +5508,19 @@ def _assert_public_remote_image_url(source: str) -> str:
     return canonical
 
 
+def _remote_image_max_bytes() -> int:
+    raw_value = os.environ.get("BLUEPRINTS_EMAIL_REMOTE_IMAGE_MAX_BYTES", "").strip()
+    if not raw_value:
+        return DEFAULT_REMOTE_IMAGE_MAX_BYTES
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return DEFAULT_REMOTE_IMAGE_MAX_BYTES
+    return max(1 * 1024 * 1024, parsed)
+
+
 def transform_image_to_jpeg(content: bytes) -> bytes:
-    if not content or len(content) > MAX_REMOTE_IMAGE_BYTES:
+    if not content or len(content) > _remote_image_max_bytes():
         raise EmailOperationError("image payload is empty or too large")
     try:
         with Image.open(BytesIO(content)) as opened:
@@ -5536,6 +5548,7 @@ def fetch_remote_image_as_jpeg_sync(source: str) -> bytes:
 
 def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
     current = _assert_public_remote_image_url(source)
+    max_image_bytes = _remote_image_max_bytes()
     max_redirects = max(
         1,
         int(
@@ -5573,7 +5586,7 @@ def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
                     total = 0
                     for chunk in response.iter_bytes():
                         total += len(chunk)
-                        if total > MAX_REMOTE_IMAGE_BYTES:
+                        if total > max_image_bytes:
                             raise EmailOperationError("image payload is too large")
                         chunks.append(chunk)
                     return {
