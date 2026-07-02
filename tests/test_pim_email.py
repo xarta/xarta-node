@@ -586,11 +586,24 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
             if "WITH captured" in query:
                 return {
                     "captured": 9,
+                    "recorded_reference_rows": 7,
                     "stored": 0,
                     "blocked": 0,
                     "failed": 0,
                     "unavailable": 3,
                     "pending": 6,
+                    "recorded_unique_canonical_urls": 4,
+                    "stored_unique_canonical_urls": 0,
+                    "pending_recorded_unique_canonical_urls": 3,
+                    "pending_reference_rows_with_shared_asset": 2,
+                    "pending_unique_canonical_urls_with_shared_asset": 1,
+                    "pending_reference_rows_needing_fetch": 4,
+                    "pending_unique_canonical_urls_needing_fetch": 2,
+                    "recorded_duplicate_reference_rows": 3,
+                    "stored_shared_asset_links": 0,
+                    "unlinked_stored_reference_rows": 0,
+                    "shared_assets_stored": 0,
+                    "shared_asset_encrypted_bytes": 0,
                 }
             if "special_use_downloaded" in query:
                 return {
@@ -635,11 +648,39 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
         "stale_hash": 0,
     }
     assert status["render_gate"]["blocked_security_incomplete"] == 31
+    assert status["external_image_derivatives"] == {
+        "captured": 9,
+        "recorded_reference_rows": 7,
+        "stored": 0,
+        "stored_reference_rows": 0,
+        "blocked": 0,
+        "failed": 0,
+        "unavailable": 3,
+        "pending": 6,
+        "pending_reference_rows": 6,
+        "recorded_unique_canonical_urls": 4,
+        "stored_unique_canonical_urls": 0,
+        "pending_recorded_unique_canonical_urls": 3,
+        "pending_reference_rows_with_shared_asset": 2,
+        "pending_unique_canonical_urls_with_shared_asset": 1,
+        "pending_reference_rows_needing_fetch": 4,
+        "pending_unique_canonical_urls_needing_fetch": 2,
+        "recorded_duplicate_reference_rows": 3,
+        "stored_shared_asset_links": 0,
+        "unlinked_stored_reference_rows": 0,
+        "shared_assets_stored": 0,
+        "shared_asset_encrypted_bytes": 0,
+    }
     assert status["special_use_folders"] == {
         "downloaded_memberships": 7,
         "unmoved_memberships": 5,
         "moved_memberships": 2,
     }
+    external_query = next(query for query in queries if "recorded_reference_rows" in query)
+    assert "recorded_unique_canonical_urls" in external_query
+    assert "pending_unique_canonical_urls_needing_fetch" in external_query
+    assert "stored_shared_asset_links" in external_query
+    assert "unlinked_stored_reference_rows" in external_query
     folder_query = next(query for query in queries if "folder_effective" in query)
     assert "effective_special_use_role" in folder_query
     assert "'rubbish'" in folder_query

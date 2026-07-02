@@ -1433,22 +1433,106 @@ class PgEmailStore:
                     ), 0) AS captured_count
                     FROM pim_email_messages
                     WHERE mailbox_id = $1
+                ), shared_digest AS (
+                    SELECT DISTINCT mailbox_id, canonical_url_digest
+                    FROM pim_email_shared_assets
+                    WHERE mailbox_id = $1 AND canonical_url_digest <> ''
+                ), derivatives AS (
+                    SELECT
+                        d.mailbox_id,
+                        d.status,
+                        d.canonical_url_digest,
+                        d.shared_asset_uid,
+                        sd.canonical_url_digest IS NOT NULL AS has_shared_asset
+                    FROM pim_email_external_image_derivatives
+                    d
+                    LEFT JOIN shared_digest sd
+                      ON sd.mailbox_id = d.mailbox_id
+                     AND sd.canonical_url_digest = d.canonical_url_digest
+                    WHERE d.mailbox_id = $1
                 ), rows AS (
                     SELECT status, count(*) AS row_count
-                    FROM pim_email_external_image_derivatives
-                    WHERE mailbox_id = $1
+                    FROM derivatives
                     GROUP BY status
                 ), totals AS (
-                    SELECT COALESCE(sum(row_count), 0) AS recorded_count FROM rows
+                    SELECT
+                        count(*) AS recorded_count,
+                        count(DISTINCT canonical_url_digest) FILTER (
+                            WHERE canonical_url_digest <> ''
+                        ) AS recorded_unique_canonical_urls,
+                        count(DISTINCT canonical_url_digest) FILTER (
+                            WHERE canonical_url_digest <> '' AND status = 'stored'
+                        ) AS stored_unique_canonical_urls,
+                        count(DISTINCT canonical_url_digest) FILTER (
+                            WHERE canonical_url_digest <> ''
+                              AND status IN ('pending','fetched','transformed')
+                        ) AS pending_recorded_unique_canonical_urls,
+                        count(*) FILTER (
+                            WHERE status IN ('pending','fetched','transformed')
+                              AND canonical_url_digest <> ''
+                              AND has_shared_asset
+                        ) AS pending_reference_rows_with_shared_asset,
+                        count(DISTINCT canonical_url_digest) FILTER (
+                            WHERE canonical_url_digest <> ''
+                              AND status IN ('pending','fetched','transformed')
+                              AND has_shared_asset
+                        ) AS pending_unique_canonical_urls_with_shared_asset,
+                        count(*) FILTER (
+                            WHERE status IN ('pending','fetched','transformed')
+                              AND canonical_url_digest <> ''
+                              AND NOT has_shared_asset
+                        ) AS pending_reference_rows_needing_fetch,
+                        count(DISTINCT canonical_url_digest) FILTER (
+                            WHERE canonical_url_digest <> ''
+                              AND status IN ('pending','fetched','transformed')
+                              AND NOT has_shared_asset
+                        ) AS pending_unique_canonical_urls_needing_fetch,
+                        count(*) FILTER (
+                            WHERE status = 'stored' AND shared_asset_uid <> ''
+                        ) AS stored_shared_asset_links,
+                        count(*) FILTER (
+                            WHERE status = 'stored' AND shared_asset_uid = ''
+                        ) AS unlinked_stored_reference_rows
+                    FROM derivatives
+                ), shared AS (
+                    SELECT
+                        count(*) AS shared_assets_stored,
+                        COALESCE(sum(encrypted_size), 0) AS shared_asset_encrypted_bytes
+                    FROM pim_email_shared_assets
+                    WHERE mailbox_id = $1
                 )
                 SELECT
                     (SELECT captured_count FROM captured) AS captured,
+                    (SELECT recorded_count FROM totals) AS recorded_reference_rows,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'stored'), 0) AS stored,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'blocked'), 0) AS blocked,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'failed'), 0) AS failed,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'unavailable'), 0) AS unavailable,
                     COALESCE((SELECT sum(row_count) FROM rows WHERE status IN ('pending','fetched','transformed')), 0)
-                      + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending
+                      + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending,
+                    (SELECT recorded_unique_canonical_urls FROM totals) AS recorded_unique_canonical_urls,
+                    (SELECT stored_unique_canonical_urls FROM totals) AS stored_unique_canonical_urls,
+                    (SELECT pending_recorded_unique_canonical_urls FROM totals)
+                        AS pending_recorded_unique_canonical_urls,
+                    (SELECT pending_reference_rows_with_shared_asset FROM totals)
+                        AS pending_reference_rows_with_shared_asset,
+                    (SELECT pending_unique_canonical_urls_with_shared_asset FROM totals)
+                        AS pending_unique_canonical_urls_with_shared_asset,
+                    (SELECT pending_reference_rows_needing_fetch FROM totals)
+                        AS pending_reference_rows_needing_fetch,
+                    (SELECT pending_unique_canonical_urls_needing_fetch FROM totals)
+                        AS pending_unique_canonical_urls_needing_fetch,
+                    GREATEST(
+                        (SELECT recorded_count FROM totals)
+                        - (SELECT recorded_unique_canonical_urls FROM totals),
+                        0
+                    ) AS recorded_duplicate_reference_rows,
+                    (SELECT stored_shared_asset_links FROM totals) AS stored_shared_asset_links,
+                    (SELECT unlinked_stored_reference_rows FROM totals)
+                        AS unlinked_stored_reference_rows,
+                    (SELECT shared_assets_stored FROM shared) AS shared_assets_stored,
+                    (SELECT shared_asset_encrypted_bytes FROM shared)
+                        AS shared_asset_encrypted_bytes
                 """,
                 configured_mailbox_id,
             )
@@ -1566,11 +1650,53 @@ class PgEmailStore:
             },
             "external_image_derivatives": {
                 "captured": int(_row_get(external_counts, "captured", 0) or 0),
+                "recorded_reference_rows": int(
+                    _row_get(external_counts, "recorded_reference_rows", 0) or 0
+                ),
                 "stored": int(_row_get(external_counts, "stored", 0) or 0),
+                "stored_reference_rows": int(_row_get(external_counts, "stored", 0) or 0),
                 "blocked": int(_row_get(external_counts, "blocked", 0) or 0),
                 "failed": int(_row_get(external_counts, "failed", 0) or 0),
                 "unavailable": int(_row_get(external_counts, "unavailable", 0) or 0),
                 "pending": int(_row_get(external_counts, "pending", 0) or 0),
+                "pending_reference_rows": int(_row_get(external_counts, "pending", 0) or 0),
+                "recorded_unique_canonical_urls": int(
+                    _row_get(external_counts, "recorded_unique_canonical_urls", 0) or 0
+                ),
+                "stored_unique_canonical_urls": int(
+                    _row_get(external_counts, "stored_unique_canonical_urls", 0) or 0
+                ),
+                "pending_recorded_unique_canonical_urls": int(
+                    _row_get(external_counts, "pending_recorded_unique_canonical_urls", 0) or 0
+                ),
+                "pending_reference_rows_with_shared_asset": int(
+                    _row_get(external_counts, "pending_reference_rows_with_shared_asset", 0) or 0
+                ),
+                "pending_unique_canonical_urls_with_shared_asset": int(
+                    _row_get(external_counts, "pending_unique_canonical_urls_with_shared_asset", 0)
+                    or 0
+                ),
+                "pending_reference_rows_needing_fetch": int(
+                    _row_get(external_counts, "pending_reference_rows_needing_fetch", 0) or 0
+                ),
+                "pending_unique_canonical_urls_needing_fetch": int(
+                    _row_get(external_counts, "pending_unique_canonical_urls_needing_fetch", 0) or 0
+                ),
+                "recorded_duplicate_reference_rows": int(
+                    _row_get(external_counts, "recorded_duplicate_reference_rows", 0) or 0
+                ),
+                "stored_shared_asset_links": int(
+                    _row_get(external_counts, "stored_shared_asset_links", 0) or 0
+                ),
+                "unlinked_stored_reference_rows": int(
+                    _row_get(external_counts, "unlinked_stored_reference_rows", 0) or 0
+                ),
+                "shared_assets_stored": int(
+                    _row_get(external_counts, "shared_assets_stored", 0) or 0
+                ),
+                "shared_asset_encrypted_bytes": int(
+                    _row_get(external_counts, "shared_asset_encrypted_bytes", 0) or 0
+                ),
             },
             "special_use_folders": {
                 "downloaded_memberships": int(
