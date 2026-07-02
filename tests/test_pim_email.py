@@ -336,19 +336,6 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
             "remote_move_target": "Downloaded",
         }
     ]
-    security_row = {
-        "result_json": json.dumps(
-            {
-                "available": False,
-                "queued": True,
-                "raw_sha256": storage["raw_sha256"],
-            }
-        ),
-        "security_status": "pending_retryable",
-        "error_message": "queued",
-        "checked_at": "",
-        "raw_sha256": storage["raw_sha256"],
-    }
 
     class FakeConnection:
         async def fetchrow(self, query, *args):
@@ -358,7 +345,7 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
                 return message_row
             if "FROM pim_email_security_checks" in query:
                 assert args == (stored_uid, storage["raw_sha256"])
-                return security_row
+                return None
             if "FROM pim_email_sanitized_view_artifacts" in query:
                 assert args[:3] == ("test-mailbox", stored_uid, storage["raw_sha256"])
                 return None
@@ -401,11 +388,11 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
         "markdown": False,
         "raw": False,
     }
-    assert message["security"]["security_status"] == "pending_retryable"
+    assert message["security"]["security_status"] == "missing"
     assert message["security"]["blocked_reason"] == "completed_security_result_missing"
 
 
-def test_local_corpus_status_reports_retryable_security_separately():
+def test_local_corpus_status_reports_missing_security_without_placeholder_results():
     class FakeConnection:
         async def fetchrow(self, query, *args):
             assert args == ("test-mailbox",) or args[:1] == ("test-mailbox",)
@@ -420,10 +407,10 @@ def test_local_corpus_status_reports_retryable_security_separately():
             if "WITH latest_current" in query:
                 return {
                     "completed": 2,
-                    "pending": 30,
-                    "pending_retryable": 30,
+                    "pending": 0,
+                    "pending_retryable": 0,
                     "failed": 0,
-                    "missing": 1,
+                    "missing": 31,
                     "stale_hash": 0,
                 }
             if "WITH current_sanitized" in query:
@@ -464,13 +451,42 @@ def test_local_corpus_status_reports_retryable_security_separately():
 
     assert status["security_results"] == {
         "completed": 2,
-        "pending": 30,
-        "pending_retryable": 30,
+        "pending": 0,
+        "pending_retryable": 0,
         "failed": 0,
-        "missing": 1,
+        "missing": 31,
         "stale_hash": 0,
     }
     assert status["render_gate"]["blocked_security_incomplete"] == 31
+
+
+def test_ensure_schema_purges_incomplete_security_placeholders():
+    queries = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            queries.append(query)
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    asyncio.run(FakeStore().ensure_schema())
+
+    cleanup_query = next(
+        query for query in queries if "DELETE FROM pim_email_security_checks" in query
+    )
+    assert "security_status <> 'stored'" in cleanup_query
+    assert "result_json->>'queued'" in cleanup_query
+    assert "result_json->>'placeholder'" in cleanup_query
+    assert "result_json->>'incomplete'" in cleanup_query
 
 
 def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
@@ -509,6 +525,47 @@ def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
     )
 
     assert result["marked_orphaned"] == ["old-run"]
+    assert result["marked_count"] == 1
+    assert calls
+
+
+def test_download_orphan_reconcile_marks_only_non_active_running_runs():
+    calls = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            calls.append((query, args))
+            assert "status = 'interrupted-orphaned'" in query
+            assert "pim_email_download_runs" in query
+            assert args[0] == "test-mailbox"
+            assert args[1] == ["active-download"]
+            metadata = json.loads(args[2])
+            assert metadata["reason"] == "process-gone"
+            assert metadata["active_run_ids"] == ["active-download"]
+            return [{"run_id": "old-download"}]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(
+        FakeStore().reconcile_orphaned_download_runs(
+            active_run_ids={"active-download"},
+            reason="process-gone",
+            mailbox_id="test-mailbox",
+        )
+    )
+
+    assert result["marked_orphaned"] == ["old-download"]
     assert result["marked_count"] == 1
     assert calls
 
@@ -1226,6 +1283,7 @@ def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_pr
     result = pim_email.download_mailbox_sync(
         _mailbox(),
         store=store,
+        run_id="test-download-run",
         apply_remote_moves=True,
         convergence_passes=2,
         security_mode="run",
@@ -1233,6 +1291,8 @@ def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_pr
 
     instance = DownloadFakeIMAP.instances[0]
     assert result["ok"] is True
+    assert result["run_id"] == "test-download-run"
+    assert store.run_start["run_id"] == "test-download-run"
     assert result["summary"]["stored_messages"] == 6
     assert result["summary"]["moved_messages"] == 2
     assert result["summary"]["sanitized_views_stored"] >= 4
@@ -1581,7 +1641,7 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
                 },
                 "security": {
                     "available": False,
-                    "security_status": "pending_retryable",
+                    "security_status": "missing",
                     "blocked_reason": "completed_security_result_missing",
                 },
             }
@@ -1596,7 +1656,7 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
     assert message["message"]["source"] == "local-corpus"
     assert message["message"]["body_blocked"] is True
     assert message["message"]["views"] == {}
-    assert message["message"]["security"]["security_status"] == "pending_retryable"
+    assert message["message"]["security"]["security_status"] == "missing"
 
 
 def test_security_service_calls_local_llm_with_json_contract(monkeypatch):
