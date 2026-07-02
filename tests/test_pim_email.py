@@ -380,7 +380,30 @@ def test_security_result_upserts_are_keyed_by_email_uid_raw_hash_contract():
     source = (APP_ROOT / "app" / "pim_email.py").read_text(encoding="utf-8")
 
     assert source.count("ON CONFLICT (security_check_id)") >= 3
-    assert "ON CONFLICT (mailbox_id, folder, uid, raw_sha256)" not in source
+    assert "ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET" in source
+    assert "security_check_id = EXCLUDED.security_check_id" not in source
+
+
+def test_security_llm_openai_env_accepts_v1_base_url(monkeypatch):
+    monkeypatch.delenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("BLUEPRINTS_EMAIL_SECURITY_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8651/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_MODEL", "hermes-sparky-toothless")
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm-fallback.example.invalid")
+    monkeypatch.setenv("LITELLM_API_KEY", "test-litellm-key")
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL", "local-default")
+
+    assert pim_email_security._llm_config() == (
+        "http://127.0.0.1:8651/v1",
+        "test-openai-key",
+        "hermes-sparky-toothless",
+    )
+    assert (
+        pim_email_security._openai_chat_completions_url("http://127.0.0.1:8651/v1")
+        == "http://127.0.0.1:8651/v1/chat/completions"
+    )
 
 
 def test_email_store_schema_is_process_cached_per_dsn(monkeypatch):
