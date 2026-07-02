@@ -60,6 +60,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         reason="stack_backfill_start_process_set_reconciliation",
         mailbox_id=args.mailbox_id,
     )
+    await store.reconcile_superseded_backfill_failures(mailbox_id=args.mailbox_id)
     if args.materialize_external_image_rows:
         result = await store.materialize_external_image_derivative_rows(
             mailbox_id=args.mailbox_id,
