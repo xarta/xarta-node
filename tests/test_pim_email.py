@@ -489,6 +489,33 @@ def test_ensure_schema_purges_incomplete_security_placeholders():
     assert "result_json->>'incomplete'" in cleanup_query
 
 
+def test_ensure_schema_serializes_schema_ddl_with_advisory_lock():
+    queries = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            queries.append((query, args))
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    asyncio.run(FakeStore().ensure_schema())
+
+    assert queries[0] == ("SELECT pg_advisory_lock($1)", (pim_email.PIM_EMAIL_SCHEMA_LOCK_ID,))
+    assert queries[-1] == (
+        "SELECT pg_advisory_unlock($1)",
+        (pim_email.PIM_EMAIL_SCHEMA_LOCK_ID,),
+    )
+
+
 def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
     calls = []
 
@@ -605,6 +632,49 @@ def test_backfill_superseded_reconcile_marks_converged_failed_items():
     assert result["marked_count"] == 73
     assert result["by_artifact"] == {"external_images": 71, "security": 2}
     assert calls
+
+
+def test_backfill_prioritizes_contract_incomplete_security_before_missing_security():
+    queries = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            queries.append(query)
+            if "WITH candidates AS" in query:
+                return []
+            return []
+
+        async def execute(self, query, *args):
+            queries.append(query)
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(
+        FakeStore().run_backfill(
+            mailbox_id="test-mailbox",
+            artifact_types=["security"],
+            limit=25,
+            run_id="priority-test",
+        )
+    )
+
+    candidate_query = next(query for query in queries if "WITH candidates AS" in query)
+    assert result["ok"] is True
+    assert "AS security_result_present" in candidate_query
+    assert "security_result_present AND NOT security_complete THEN 0" in candidate_query
+    assert "NOT security_complete THEN 1" in candidate_query
 
 
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
