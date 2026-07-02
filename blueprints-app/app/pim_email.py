@@ -58,6 +58,7 @@ SANITIZED_VIEW_POLICY_VERSION = "sanitized-view-v1"
 SANITIZED_VIEW_TRANSFORM_VERSION = "email-view-json-v1"
 SECURITY_POLICY_VERSION = "pim-email-security-v1"
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
+PIM_EMAIL_SCHEMA_LOCK_ID = 917_202_607_020_001
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 DEFAULT_REMOTE_IMAGE_MAX_REDIRECTS = 20
@@ -401,7 +402,10 @@ class PgEmailStore:
 
     async def ensure_schema(self) -> None:
         conn = await self._connect()
+        schema_lock_acquired = False
         try:
+            await conn.execute("SELECT pg_advisory_lock($1)", PIM_EMAIL_SCHEMA_LOCK_ID)
+            schema_lock_acquired = True
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pim_email_mailboxes (
@@ -839,6 +843,14 @@ class PgEmailStore:
                 """
             )
         finally:
+            if schema_lock_acquired:
+                try:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock($1)",
+                        PIM_EMAIL_SCHEMA_LOCK_ID,
+                    )
+                except Exception:
+                    pass
             await conn.close()
 
     async def upsert_mailbox(self, mailbox: EmailMailbox) -> dict[str, Any]:
@@ -3045,6 +3057,12 @@ class PgEmailStore:
                             FROM pim_email_security_checks s
                             WHERE s.email_uid = m.email_uid
                               AND s.raw_sha256 = m.raw_sha256
+                        ) AS security_result_present,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_checks s
+                            WHERE s.email_uid = m.email_uid
+                              AND s.raw_sha256 = m.raw_sha256
                               AND s.security_status = 'stored'
                               AND s.result_json->>'available' = 'true'
                               AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
@@ -3078,10 +3096,11 @@ class PgEmailStore:
                 FROM candidates
                 ORDER BY
                   CASE
-                    WHEN {security_requested} AND NOT security_complete THEN 0
-                    WHEN {sanitized_requested} AND NOT sanitized_complete THEN 0
-                    WHEN {external_requested} AND external_pending THEN 0
-                    ELSE 1
+                    WHEN {security_requested} AND security_result_present AND NOT security_complete THEN 0
+                    WHEN {security_requested} AND NOT security_complete THEN 1
+                    WHEN {sanitized_requested} AND NOT sanitized_complete THEN 1
+                    WHEN {external_requested} AND external_pending THEN 1
+                    ELSE 2
                   END,
                   updated_at ASC,
                   email_uid ASC
