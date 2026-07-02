@@ -3366,14 +3366,12 @@ class PgEmailStore:
             await conn.close()
         return _sanitized_artifact_row_public(row) if row else None
 
-    async def run_local_security_check(
+    async def _load_local_security_source(
         self,
         email_uid: str,
         *,
-        mailbox_id: str | None = None,
-        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        mailbox_id: str,
     ) -> dict[str, Any]:
-        await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
         clean_uid = clean_email_uid(email_uid)
         conn = await self._connect()
@@ -3413,19 +3411,114 @@ class PgEmailStore:
         )
         parsed["email_uid"] = clean_uid
         parsed["raw_sha256"] = raw_sha256
+        return {
+            "mailbox_id": configured_mailbox_id,
+            "email_uid": clean_uid,
+            "row": row,
+            "membership": membership,
+            "raw": raw,
+            "raw_sha256": raw_sha256,
+            "parsed": parsed,
+        }
+
+    async def completed_security_phase_result(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        raw_sha256: str,
+        phase: str,
+    ) -> dict[str, Any] | None:
+        await self.ensure_schema()
+        clean_phase = str(phase or "").strip().lower()
+        if clean_phase not in {"deterministic", "llm"}:
+            raise EmailOperationError("Invalid security phase")
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT phase_status, phase_json
+                FROM pim_email_security_phases
+                WHERE mailbox_id = $1
+                  AND email_uid = $2
+                  AND raw_sha256 = $3
+                  AND phase = $4
+                  AND policy_version = $5
+                """,
+                _configured_mailbox_id(mailbox_id),
+                clean_email_uid(email_uid),
+                str(raw_sha256 or ""),
+                clean_phase,
+                SECURITY_POLICY_VERSION,
+            )
+        finally:
+            await conn.close()
+        if not row or str(_row_get(row, "phase_status", "")) != "complete":
+            return None
+        result = _json_value(_row_get(row, "phase_json"), {})
+        return result if isinstance(result, dict) else None
+
+    async def run_local_security_deterministic_phase(
+        self,
+        email_uid: str,
+        *,
+        mailbox_id: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        source = await self._load_local_security_source(
+            email_uid,
+            mailbox_id=configured_mailbox_id,
+        )
+        raw = bytes(source["raw"])
+        raw_sha256 = str(source["raw_sha256"])
         deterministic = check_email_security_deterministic_sync(
             raw,
             progress_callback=progress_callback,
         )
         await self.record_security_phase_result(
             mailbox_id=configured_mailbox_id,
-            email_uid=clean_uid,
+            email_uid=str(source["email_uid"]),
             raw_sha256=raw_sha256,
             phase="deterministic",
             phase_status="complete",
             phase_result=deterministic,
             ensure_schema=False,
         )
+        return {
+            "schema": "xarta.pim_email.local_security_deterministic_phase.v1",
+            "email_uid": str(source["email_uid"]),
+            "raw_sha256": raw_sha256,
+            "deterministic": deterministic,
+        }
+
+    async def run_local_security_llm_phase(
+        self,
+        email_uid: str,
+        *,
+        mailbox_id: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        source = await self._load_local_security_source(
+            email_uid,
+            mailbox_id=configured_mailbox_id,
+        )
+        clean_uid = str(source["email_uid"])
+        raw = bytes(source["raw"])
+        raw_sha256 = str(source["raw_sha256"])
+        parsed = source["parsed"]
+        membership = source["membership"]
+        deterministic = await self.completed_security_phase_result(
+            mailbox_id=configured_mailbox_id,
+            email_uid=clean_uid,
+            raw_sha256=raw_sha256,
+            phase="deterministic",
+        )
+        if deterministic is None:
+            raise EmailOperationError("Deterministic security phase is not complete")
         try:
             security = complete_email_security_with_llm_sync(
                 raw,
@@ -3564,6 +3657,25 @@ class PgEmailStore:
             "security": storage_security,
             "sanitized_view": artifact_public,
         }
+
+    async def run_local_security_check(
+        self,
+        email_uid: str,
+        *,
+        mailbox_id: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        await self.run_local_security_deterministic_phase(
+            email_uid,
+            mailbox_id=configured_mailbox_id,
+            progress_callback=progress_callback,
+        )
+        return await self.run_local_security_llm_phase(
+            email_uid,
+            mailbox_id=configured_mailbox_id,
+            progress_callback=progress_callback,
+        )
 
     async def _record_backfill_item(
         self,
@@ -3721,6 +3833,34 @@ class PgEmailStore:
                               AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
                         )
                     ) OR (
+                        f.artifact_type = 'security_deterministic'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_phases p
+                            WHERE p.mailbox_id = f.mailbox_id
+                              AND p.email_uid = f.email_uid
+                              AND p.raw_sha256 = f.raw_sha256
+                              AND p.phase = 'deterministic'
+                              AND p.phase_status = 'complete'
+                              AND p.policy_version = '{SECURITY_POLICY_VERSION}'
+                        )
+                    ) OR (
+                        f.artifact_type = 'security_llm'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_checks s
+                            WHERE s.email_uid = f.email_uid
+                              AND s.raw_sha256 = f.raw_sha256
+                              AND s.security_status = 'stored'
+                              AND s.result_json->>'available' = 'true'
+                              AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
+                              AND COALESCE(s.result_json->>'placeholder', 'false') <> 'true'
+                              AND s.result_json->>'email_uid' = f.email_uid
+                              AND s.result_json->>'raw_sha256' = f.raw_sha256
+                              AND COALESCE(s.result_json->>'checked_at', '') <> ''
+                              AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
+                        )
+                    ) OR (
                         f.artifact_type = 'sanitized_view'
                         AND EXISTS (
                             SELECT 1
@@ -3863,7 +4003,13 @@ class PgEmailStore:
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
-        allowed_artifacts = {"security", "sanitized_view", "external_images"}
+        allowed_artifacts = {
+            "security",
+            "security_deterministic",
+            "security_llm",
+            "sanitized_view",
+            "external_images",
+        }
         requested_artifacts = [
             str(item or "").strip().lower().replace("-", "_")
             for item in (artifact_types or ["security", "sanitized_view", "external_images"])
@@ -3894,6 +4040,10 @@ class PgEmailStore:
                 params.append(safe_limit)
                 limit_clause = f"LIMIT ${len(params)}"
             security_requested = "TRUE" if "security" in clean_artifacts else "FALSE"
+            security_deterministic_requested = (
+                "TRUE" if "security_deterministic" in clean_artifacts else "FALSE"
+            )
+            security_llm_requested = "TRUE" if "security_llm" in clean_artifacts else "FALSE"
             sanitized_requested = "TRUE" if "sanitized_view" in clean_artifacts else "FALSE"
             external_requested = "TRUE" if "external_images" in clean_artifacts else "FALSE"
             rows = await conn.fetch(
@@ -3925,6 +4075,26 @@ class PgEmailStore:
                               AND COALESCE(s.result_json->>'checked_at', '') <> ''
                               AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
                         ) AS security_complete,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_phases p
+                            WHERE p.mailbox_id = m.mailbox_id
+                              AND p.email_uid = m.email_uid
+                              AND p.raw_sha256 = m.raw_sha256
+                              AND p.phase = 'deterministic'
+                              AND p.phase_status = 'complete'
+                              AND p.policy_version = '{SECURITY_POLICY_VERSION}'
+                        ) AS deterministic_complete,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_phases p
+                            WHERE p.mailbox_id = m.mailbox_id
+                              AND p.email_uid = m.email_uid
+                              AND p.raw_sha256 = m.raw_sha256
+                              AND p.phase = 'llm'
+                              AND p.phase_status = 'complete'
+                              AND p.policy_version = '{SECURITY_POLICY_VERSION}'
+                        ) AS llm_complete,
                         EXISTS (
                             SELECT 1
                             FROM pim_email_sanitized_view_artifacts a
@@ -3960,6 +4130,28 @@ class PgEmailStore:
                             WHERE i.mailbox_id = m.mailbox_id
                               AND i.email_uid = m.email_uid
                               AND i.raw_sha256 = m.raw_sha256
+                              AND i.artifact_type = 'security_deterministic'
+                              AND i.status = 'running'
+                              AND r.status = 'running'
+                        ) AS security_deterministic_running,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_backfill_items i
+                            JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                            WHERE i.mailbox_id = m.mailbox_id
+                              AND i.email_uid = m.email_uid
+                              AND i.raw_sha256 = m.raw_sha256
+                              AND i.artifact_type = 'security_llm'
+                              AND i.status = 'running'
+                              AND r.status = 'running'
+                        ) AS security_llm_running,
+                        EXISTS (
+                            SELECT 1
+                            FROM pim_email_backfill_items i
+                            JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                            WHERE i.mailbox_id = m.mailbox_id
+                              AND i.email_uid = m.email_uid
+                              AND i.raw_sha256 = m.raw_sha256
                               AND i.artifact_type = 'sanitized_view'
                               AND i.status = 'running'
                               AND r.status = 'running'
@@ -3982,21 +4174,37 @@ class PgEmailStore:
                 FROM candidates
                 WHERE NOT (
                     ({security_requested} AND security_running)
+                    OR ({security_deterministic_requested} AND (
+                        security_deterministic_running OR security_running
+                    ))
+                    OR ({security_llm_requested} AND (security_llm_running OR security_running))
                     OR ({sanitized_requested} AND sanitized_running)
                     OR ({external_requested} AND external_running)
                 )
                 AND (
                     ({security_requested} AND NOT security_complete)
+                    OR (
+                        {security_deterministic_requested}
+                        AND NOT security_complete
+                        AND NOT deterministic_complete
+                    )
+                    OR (
+                        {security_llm_requested}
+                        AND deterministic_complete
+                        AND NOT security_complete
+                    )
                     OR ({sanitized_requested} AND NOT sanitized_complete)
                     OR ({external_requested} AND external_pending)
                 )
                 ORDER BY
                   email_uid DESC,
                   CASE
-                    WHEN {security_requested} AND security_result_present AND NOT security_complete THEN 0
-                    WHEN {security_requested} AND NOT security_complete THEN 1
-                    WHEN {sanitized_requested} AND NOT sanitized_complete THEN 1
-                    WHEN {external_requested} AND external_pending THEN 1
+                    WHEN {security_llm_requested} AND deterministic_complete AND NOT security_complete THEN 0
+                    WHEN {security_requested} AND security_result_present AND NOT security_complete THEN 1
+                    WHEN {security_deterministic_requested} AND NOT deterministic_complete THEN 1
+                    WHEN {security_requested} AND NOT security_complete THEN 2
+                    WHEN {sanitized_requested} AND NOT sanitized_complete THEN 2
+                    WHEN {external_requested} AND external_pending THEN 2
                     ELSE 2
                   END,
                   updated_at DESC
@@ -4081,6 +4289,12 @@ class PgEmailStore:
             "processed_messages": 0,
             "raw_originals_verified": 0,
             "raw_originals_failed": 0,
+            "security_deterministic_completed": 0,
+            "security_deterministic_already_completed": 0,
+            "security_deterministic_failed": 0,
+            "security_llm_completed": 0,
+            "security_llm_already_completed": 0,
+            "security_llm_failed": 0,
             "security_completed": 0,
             "security_already_completed": 0,
             "security_failed": 0,
@@ -4171,6 +4385,114 @@ class PgEmailStore:
                     )
                 continue
 
+            if "security_deterministic" in clean_artifacts:
+                deterministic_claimed = await self._record_backfill_item(
+                    run_id=actual_run_id,
+                    batch_id=batch_id,
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=email_uid,
+                    raw_sha256=expected_hash,
+                    artifact_type="security_deterministic",
+                    status="running",
+                    metadata={"phase": "security-deterministic"},
+                )
+                if deterministic_claimed:
+                    try:
+                        completed = await self.completed_security_result(
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                        )
+                        deterministic = await self.completed_security_phase_result(
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            phase="deterministic",
+                        )
+                        if completed is None and deterministic is None:
+                            await self.run_local_security_deterministic_phase(
+                                email_uid,
+                                mailbox_id=configured_mailbox_id,
+                            )
+                            summary["security_deterministic_completed"] += 1
+                        else:
+                            summary["security_deterministic_already_completed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security_deterministic",
+                            status="completed",
+                            metadata={"phase": "security-deterministic"},
+                        )
+                    except Exception as exc:
+                        run_status = "completed-with-errors"
+                        summary["security_deterministic_failed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security_deterministic",
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "security-deterministic"},
+                        )
+
+            if "security_llm" in clean_artifacts:
+                llm_claimed = await self._record_backfill_item(
+                    run_id=actual_run_id,
+                    batch_id=batch_id,
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=email_uid,
+                    raw_sha256=expected_hash,
+                    artifact_type="security_llm",
+                    status="running",
+                    metadata={"phase": "security-llm-final"},
+                )
+                if llm_claimed:
+                    try:
+                        completed = await self.completed_security_result(
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                        )
+                        if completed is None:
+                            await self.run_local_security_llm_phase(
+                                email_uid,
+                                mailbox_id=configured_mailbox_id,
+                            )
+                            summary["security_llm_completed"] += 1
+                        else:
+                            summary["security_llm_already_completed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security_llm",
+                            status="completed",
+                            metadata={"phase": "security-llm-final"},
+                        )
+                    except Exception as exc:
+                        run_status = "completed-with-errors"
+                        summary["security_llm_failed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security_llm",
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "security-llm-final"},
+                        )
+
             if "security" in clean_artifacts:
                 security_claimed = await self._record_backfill_item(
                     run_id=actual_run_id,
@@ -4189,10 +4511,22 @@ class PgEmailStore:
                             raw_sha256=expected_hash,
                         )
                         if completed is None:
-                            await self.run_local_security_check(
-                                email_uid,
+                            deterministic = await self.completed_security_phase_result(
                                 mailbox_id=configured_mailbox_id,
+                                email_uid=email_uid,
+                                raw_sha256=expected_hash,
+                                phase="deterministic",
                             )
+                            if deterministic is None:
+                                await self.run_local_security_check(
+                                    email_uid,
+                                    mailbox_id=configured_mailbox_id,
+                                )
+                            else:
+                                await self.run_local_security_llm_phase(
+                                    email_uid,
+                                    mailbox_id=configured_mailbox_id,
+                                )
                             summary["security_completed"] += 1
                         else:
                             summary["security_already_completed"] += 1
