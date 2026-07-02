@@ -531,11 +531,17 @@ def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
             calls.append((query, args))
             assert "status = 'interrupted-orphaned'" in query
             assert args[0] == "test-mailbox"
-            assert args[1] == ["active-run"]
-            metadata = json.loads(args[2])
+            if "UPDATE pim_email_backfill_runs" in query:
+                assert args[1] == ["active-run"]
+                metadata = json.loads(args[2])
+                result = [{"run_id": "old-run"}]
+            else:
+                assert "UPDATE pim_email_backfill_items" in query
+                metadata = json.loads(args[1])
+                result = [{"run_id": "old-run"}]
             assert metadata["reason"] == "process-gone"
             assert metadata["active_run_ids"] == ["active-run"]
-            return [{"run_id": "old-run"}]
+            return result
 
         async def close(self):
             return None
@@ -560,7 +566,8 @@ def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
 
     assert result["marked_orphaned"] == ["old-run"]
     assert result["marked_count"] == 1
-    assert calls
+    assert result["marked_item_count"] == 1
+    assert len(calls) == 2
 
 
 def test_download_orphan_reconcile_marks_only_non_active_running_runs():
@@ -682,6 +689,10 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "AS security_result_present" in candidate_query
     assert "security_result_present AND NOT security_complete THEN 0" in candidate_query
     assert "NOT security_complete THEN 1" in candidate_query
+    assert "AS security_running" in candidate_query
+    assert "AS sanitized_running" in candidate_query
+    assert "AS external_running" in candidate_query
+    assert "AND security_running" in candidate_query
 
 
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
