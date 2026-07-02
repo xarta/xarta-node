@@ -242,6 +242,46 @@ def test_security_result_upserts_are_keyed_by_email_uid_raw_hash_contract():
     assert "ON CONFLICT (mailbox_id, folder, uid, raw_sha256)" not in source
 
 
+def test_email_store_schema_is_process_cached_per_dsn(monkeypatch):
+    dsn = "postgresql://pim-email-cache-test"
+    pim_email.PgEmailStore._schema_ready_dsns.discard(dsn)
+    connections = []
+
+    class FakeConnection:
+        def __init__(self):
+            self.statements = []
+            self.closed = False
+
+        async def execute(self, statement, *args):
+            self.statements.append(str(statement))
+            return "OK"
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_connect(connect_dsn):
+        assert connect_dsn == dsn
+        conn = FakeConnection()
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(pim_email.asyncpg, "connect", fake_connect)
+    try:
+        store = pim_email.PgEmailStore(dsn=dsn)
+
+        asyncio.run(store.ensure_schema())
+        asyncio.run(store.ensure_schema())
+
+        assert len(connections) == 1
+        assert connections[0].closed
+        assert any(
+            "CREATE TABLE IF NOT EXISTS pim_email_mailboxes" in statement
+            for statement in connections[0].statements
+        )
+    finally:
+        pim_email.PgEmailStore._schema_ready_dsns.discard(dsn)
+
+
 def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
     tmp_path,
     monkeypatch,
