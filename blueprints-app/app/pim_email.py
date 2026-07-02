@@ -2829,11 +2829,13 @@ class PgEmailStore:
         *,
         mailbox_id: str | None = None,
         limit: int = 500,
+        canonical_url_digest: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
         safe_limit = max(1, min(int(limit or 1), 5000))
+        clean_digest = str(canonical_url_digest or "").strip()
         link_metadata = dict(metadata or {})
         conn = await self._connect()
         try:
@@ -2860,12 +2862,14 @@ class PgEmailStore:
                 ) s ON true
                 WHERE d.mailbox_id = $1
                   AND d.canonical_url_digest <> ''
-                  AND d.status IN ('pending','fetched','transformed')
+                  AND ($3::text = '' OR d.canonical_url_digest = $3)
+                  AND d.status IN ('pending','fetched','transformed','failed')
                 ORDER BY d.updated_at DESC
                 LIMIT $2
                 """,
                 configured_mailbox_id,
                 safe_limit,
+                clean_digest,
             )
         finally:
             await conn.close()
@@ -2873,6 +2877,7 @@ class PgEmailStore:
         summary = {
             "schema": "xarta.pim_email.external_image_shared_asset_link.summary.v1",
             "mailbox_id": configured_mailbox_id,
+            "canonical_url_digest": clean_digest,
             "planned": len(rows),
             "linked": 0,
             "failed": 0,
@@ -2986,6 +2991,305 @@ class PgEmailStore:
                 )
             finally:
                 await conn.close()
+        return summary
+
+    async def record_external_image_canonical_terminal_state(
+        self,
+        *,
+        mailbox_id: str,
+        canonical_url_digest: str,
+        status: str,
+        reason: str,
+        safety_decision: str,
+        transform_version: str = "",
+        metadata: dict[str, Any] | None = None,
+        ensure_schema: bool = True,
+    ) -> int:
+        if ensure_schema:
+            await self.ensure_schema()
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"blocked", "unavailable"}:
+            raise EmailOperationError("Canonical external image outcome must be terminal")
+        clean_digest = str(canonical_url_digest or "").strip()
+        if not clean_digest:
+            return 0
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_external_image_derivatives
+                SET status = $3,
+                    reason = $4,
+                    safety_decision = $5,
+                    transform_version = $6,
+                    metadata_json = metadata_json || jsonb_build_object(
+                        'canonical_terminal_outcome', $7::jsonb
+                    ),
+                    updated_at = now()
+                WHERE mailbox_id = $1
+                  AND canonical_url_digest = $2
+                  AND status IN ('pending','fetched','transformed','failed')
+                RETURNING derivative_id
+                """,
+                mailbox_id,
+                clean_digest,
+                clean_status,
+                str(reason or "")[:1000],
+                str(safety_decision or ""),
+                str(transform_version or ""),
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return len(rows)
+
+    async def process_external_image_unique_canonical_assets(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        limit: int = 50,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        safe_limit = max(1, min(int(limit or 1), 500))
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                WITH shared_digest AS (
+                    SELECT DISTINCT mailbox_id, canonical_url_digest
+                    FROM pim_email_shared_assets
+                    WHERE mailbox_id = $1 AND canonical_url_digest <> ''
+                )
+                SELECT DISTINCT ON (d.canonical_url_digest)
+                       d.canonical_url_digest,
+                       d.canonical_url,
+                       d.source_url,
+                       d.email_uid,
+                       d.input_raw_sha256,
+                       d.updated_at
+                FROM pim_email_external_image_derivatives d
+                LEFT JOIN shared_digest sd
+                  ON sd.mailbox_id = d.mailbox_id
+                 AND sd.canonical_url_digest = d.canonical_url_digest
+                WHERE d.mailbox_id = $1
+                  AND d.canonical_url_digest <> ''
+                  AND d.status IN ('pending','fetched','transformed','failed')
+                  AND sd.canonical_url_digest IS NULL
+                ORDER BY d.canonical_url_digest, d.email_uid DESC, d.updated_at DESC
+                LIMIT $2
+                """,
+                configured_mailbox_id,
+                safe_limit,
+            )
+        finally:
+            await conn.close()
+
+        summary: dict[str, Any] = {
+            "schema": "xarta.pim_email.external_image_unique_asset.summary.v1",
+            "mailbox_id": configured_mailbox_id,
+            "planned_unique_urls": len(rows),
+            "attempted_unique_urls": 0,
+            "stored_unique_urls": 0,
+            "already_stored_unique_urls": 0,
+            "unavailable_unique_urls": 0,
+            "blocked_unique_urls": 0,
+            "pending_retryable_unique_urls": 0,
+            "failed_unique_urls": 0,
+            "references_linked": 0,
+            "references_link_failed": 0,
+            "references_terminal": 0,
+            "retryable": [],
+            "failures": [],
+        }
+
+        async def reuse_existing_canonical_work(canonical: str) -> dict[str, Any] | None:
+            shared = await self.find_shared_asset_for_url(
+                mailbox_id=configured_mailbox_id,
+                source_url=canonical,
+                ensure_schema=False,
+            )
+            if shared:
+                return {"status": "stored", "shared": shared}
+            outcome = await self.find_external_image_canonical_terminal_state(
+                mailbox_id=configured_mailbox_id,
+                source_url=canonical,
+                ensure_schema=False,
+            )
+            if outcome:
+                return {"status": str(outcome.get("status") or ""), "outcome": outcome}
+            return None
+
+        for row in rows:
+            canonical = str(_row_get(row, "canonical_url", "") or _row_get(row, "source_url", ""))
+            canonical = _canonical_remote_image_url(canonical) or canonical
+            source = str(_row_get(row, "source_url", "") or canonical)
+            canonical_digest = str(_row_get(row, "canonical_url_digest", "") or "")
+            clean_uid = clean_email_uid(str(_row_get(row, "email_uid", "")))
+            raw_sha256 = str(_row_get(row, "input_raw_sha256", "") or "")
+            if not canonical or not canonical_digest:
+                continue
+
+            lock_conn, lock_key = await self._acquire_external_image_canonical_lock(
+                mailbox_id=configured_mailbox_id,
+                canonical_url=canonical,
+            )
+            try:
+                reused = await reuse_existing_canonical_work(canonical)
+                if reused:
+                    status = str(reused.get("status") or "")
+                    if status == "stored":
+                        summary["already_stored_unique_urls"] += 1
+                        link_result = await self.link_external_image_references_from_shared_assets(
+                            mailbox_id=configured_mailbox_id,
+                            canonical_url_digest=canonical_digest,
+                            limit=5000,
+                            metadata={
+                                **(metadata or {}),
+                                "phase": "external-image-unique-asset-reuse-link",
+                                "canonical_url": canonical,
+                            },
+                        )
+                        summary["references_linked"] += int(link_result.get("linked") or 0)
+                        summary["references_link_failed"] += int(link_result.get("failed") or 0)
+                    elif status in {"blocked", "unavailable"}:
+                        terminal = int(
+                            await self.record_external_image_canonical_terminal_state(
+                                mailbox_id=configured_mailbox_id,
+                                canonical_url_digest=canonical_digest,
+                                status=status,
+                                reason=str((reused.get("outcome") or {}).get("reason") or ""),
+                                safety_decision=f"reused_canonical_{status}_external_image_outcome",
+                                transform_version=str(
+                                    (reused.get("outcome") or {}).get("transform_version") or ""
+                                ),
+                                metadata={
+                                    **(metadata or {}),
+                                    "schema": "xarta.pim_email.external_image_unique_asset.reuse.v1",
+                                    "canonical_url": canonical,
+                                },
+                                ensure_schema=False,
+                            )
+                        )
+                        summary[f"{status}_unique_urls"] += 1
+                        summary["references_terminal"] += terminal
+                    continue
+
+                summary["attempted_unique_urls"] += 1
+                fetched = await fetch_remote_image_bytes(source)
+                raw_content = bytes(fetched.get("content") or b"")
+                asset = build_transformed_external_image_asset(
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=clean_uid,
+                    source_url=canonical,
+                    content=raw_content,
+                    metadata={
+                        **(metadata or {}),
+                        "input_raw_sha256": raw_sha256,
+                        "source_url": source,
+                        "canonical_url": canonical,
+                        "fetched_content_type": str(fetched.get("content_type") or ""),
+                        "fetched_final_url": str(fetched.get("final_url") or ""),
+                        "unique_canonical_asset_fetch": True,
+                    },
+                )
+                await self.store_shared_asset(asset=asset, ensure_schema=False)
+                summary["stored_unique_urls"] += 1
+                link_result = await self.link_external_image_references_from_shared_assets(
+                    mailbox_id=configured_mailbox_id,
+                    canonical_url_digest=canonical_digest,
+                    limit=5000,
+                    metadata={
+                        **(metadata or {}),
+                        "phase": "external-image-unique-asset-store-link",
+                        "canonical_url": canonical,
+                        "shared_asset_uid": str(asset.get("shared_asset_uid") or ""),
+                    },
+                )
+                summary["references_linked"] += int(link_result.get("linked") or 0)
+                summary["references_link_failed"] += int(link_result.get("failed") or 0)
+            except Exception as exc:
+                state = _external_image_error_status(exc)
+                if state in {"blocked", "unavailable"}:
+                    terminal_count = await self.record_external_image_canonical_terminal_state(
+                        mailbox_id=configured_mailbox_id,
+                        canonical_url_digest=canonical_digest,
+                        status=state,
+                        reason=str(exc),
+                        safety_decision=f"{state}_during_unique_external_image_download_or_transform",
+                        transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                        metadata={
+                            **(metadata or {}),
+                            "schema": "xarta.pim_email.external_image_unique_asset.terminal.v1",
+                            "canonical_url": canonical,
+                            "source_url": source,
+                            "error_class": exc.__class__.__name__,
+                        },
+                        ensure_schema=False,
+                    )
+                    summary[f"{state}_unique_urls"] += 1
+                    summary["references_terminal"] += terminal_count
+                elif state == "pending":
+                    await self.record_external_image_derivative_state(
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=clean_uid,
+                        input_raw_sha256=raw_sha256,
+                        source_url=source,
+                        status=state,
+                        reason=str(exc),
+                        safety_decision=f"{state}_during_unique_external_image_download_or_transform",
+                        transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                        metadata={
+                            **(metadata or {}),
+                            "schema": "xarta.pim_email.external_image_unique_asset.failure.v1",
+                            "canonical_url": canonical,
+                            "source_url": source,
+                            "error_class": exc.__class__.__name__,
+                        },
+                        ensure_schema=False,
+                    )
+                    summary["pending_retryable_unique_urls"] += 1
+                    if len(summary["retryable"]) < 20:
+                        summary["retryable"].append(
+                            {
+                                "canonical_url_digest": canonical_digest,
+                                "canonical_url": canonical,
+                                "error_class": exc.__class__.__name__,
+                                "error_message": str(exc)[:300],
+                            }
+                        )
+                else:
+                    await self.record_external_image_derivative_state(
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=clean_uid,
+                        input_raw_sha256=raw_sha256,
+                        source_url=source,
+                        status=state,
+                        reason=str(exc),
+                        safety_decision=f"{state}_during_unique_external_image_download_or_transform",
+                        transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                        metadata={
+                            **(metadata or {}),
+                            "schema": "xarta.pim_email.external_image_unique_asset.failure.v1",
+                            "canonical_url": canonical,
+                            "source_url": source,
+                            "error_class": exc.__class__.__name__,
+                        },
+                        ensure_schema=False,
+                    )
+                    summary["failed_unique_urls"] += 1
+                    if len(summary["failures"]) < 20:
+                        summary["failures"].append(
+                            {
+                                "canonical_url_digest": canonical_digest,
+                                "canonical_url": canonical,
+                                "error_class": exc.__class__.__name__,
+                                "error_message": str(exc)[:300],
+                            }
+                        )
+            finally:
+                await self._release_external_image_canonical_lock(lock_conn, lock_key)
         return summary
 
     async def migrate_existing_transformed_assets_to_shared_store(

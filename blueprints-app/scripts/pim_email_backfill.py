@@ -112,6 +112,17 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "external_images_materialized_rows",
         "external_images_shared_asset_links",
         "external_images_shared_asset_link_failed",
+        "external_image_unique_urls_planned",
+        "external_image_unique_urls_attempted",
+        "external_image_unique_urls_stored",
+        "external_image_unique_urls_already_stored",
+        "external_image_unique_urls_unavailable",
+        "external_image_unique_urls_blocked",
+        "external_image_unique_urls_pending_retryable",
+        "external_image_unique_urls_failed",
+        "external_image_unique_references_linked",
+        "external_image_unique_references_link_failed",
+        "external_image_unique_references_terminal",
     )
     return {key: summary[key] for key in keys if key in summary}
 
@@ -156,6 +167,17 @@ def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -
         "external_images_materialized_rows": 0,
         "external_images_shared_asset_links": 0,
         "external_images_shared_asset_link_failed": 0,
+        "external_image_unique_urls_planned": 0,
+        "external_image_unique_urls_attempted": 0,
+        "external_image_unique_urls_stored": 0,
+        "external_image_unique_urls_already_stored": 0,
+        "external_image_unique_urls_unavailable": 0,
+        "external_image_unique_urls_blocked": 0,
+        "external_image_unique_urls_pending_retryable": 0,
+        "external_image_unique_urls_failed": 0,
+        "external_image_unique_references_linked": 0,
+        "external_image_unique_references_link_failed": 0,
+        "external_image_unique_references_terminal": 0,
     }
 
 
@@ -188,6 +210,12 @@ def _generated_work_rows(result: dict[str, Any]) -> int:
         int(summary.get("external_images_materialized_rows") or 0)
         + int(summary.get("external_images_shared_asset_links") or 0)
         + int(summary.get("external_images_shared_asset_link_failed") or 0)
+        + int(summary.get("external_image_unique_urls_stored") or 0)
+        + int(summary.get("external_image_unique_urls_already_stored") or 0)
+        + int(summary.get("external_image_unique_urls_unavailable") or 0)
+        + int(summary.get("external_image_unique_urls_blocked") or 0)
+        + int(summary.get("external_image_unique_references_linked") or 0)
+        + int(summary.get("external_image_unique_references_terminal") or 0)
     )
 
 
@@ -202,6 +230,8 @@ def _aggregate_failed_count(aggregate: dict[str, Any]) -> int:
             "sanitized_views_failed",
             "external_images_failed",
             "external_images_shared_asset_link_failed",
+            "external_image_unique_urls_failed",
+            "external_image_unique_references_link_failed",
         )
     )
 
@@ -213,6 +243,31 @@ def _shared_asset_link_summary(result: dict[str, Any]) -> dict[str, Any]:
         "failed_messages": 0,
         "external_images_shared_asset_links": int(result.get("linked") or 0),
         "external_images_shared_asset_link_failed": int(result.get("failed") or 0),
+    }
+
+
+def _unique_asset_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "planned_messages": 0,
+        "processed_messages": 0,
+        "failed_messages": 0,
+        "external_image_unique_urls_planned": int(result.get("planned_unique_urls") or 0),
+        "external_image_unique_urls_attempted": int(result.get("attempted_unique_urls") or 0),
+        "external_image_unique_urls_stored": int(result.get("stored_unique_urls") or 0),
+        "external_image_unique_urls_already_stored": int(
+            result.get("already_stored_unique_urls") or 0
+        ),
+        "external_image_unique_urls_unavailable": int(result.get("unavailable_unique_urls") or 0),
+        "external_image_unique_urls_blocked": int(result.get("blocked_unique_urls") or 0),
+        "external_image_unique_urls_pending_retryable": int(
+            result.get("pending_retryable_unique_urls") or 0
+        ),
+        "external_image_unique_urls_failed": int(result.get("failed_unique_urls") or 0),
+        "external_image_unique_references_linked": int(result.get("references_linked") or 0),
+        "external_image_unique_references_link_failed": int(
+            result.get("references_link_failed") or 0
+        ),
+        "external_image_unique_references_terminal": int(result.get("references_terminal") or 0),
     }
 
 
@@ -242,6 +297,39 @@ async def _run_shared_asset_link_batch(
         metadata["run_id"] = ledger["run_id"]
         metadata["batch_id"] = ledger["batch_id"]
     result = await store.link_external_image_references_from_shared_assets(
+        mailbox_id=args.mailbox_id,
+        limit=batch_limit,
+        metadata=metadata,
+    )
+    return result, ledger
+
+
+async def _run_unique_external_image_asset_batch(
+    store: Any,
+    args: argparse.Namespace,
+    *,
+    batch_limit: int,
+    batch_index: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ledger: dict[str, Any] | None = None
+    metadata = {
+        "source": "pim-email-backfill-cli-unique-external-image-assets",
+        "run_id": args.run_id or "",
+        "batch_index": batch_index,
+    }
+    if not args.artifact:
+        ledger = await store.start_backfill_auxiliary_batch(
+            run_id=args.run_id,
+            mailbox_id=args.mailbox_id,
+            artifact_types=["external_image_unique_assets"],
+            requested_limit=batch_limit,
+            batch_index=batch_index,
+            metadata=metadata,
+        )
+        args.run_id = ledger["run_id"]
+        metadata["run_id"] = ledger["run_id"]
+        metadata["batch_id"] = ledger["batch_id"]
+    result = await store.process_external_image_unique_canonical_assets(
         mailbox_id=args.mailbox_id,
         limit=batch_limit,
         metadata=metadata,
@@ -303,6 +391,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore
 
     store = PgEmailStore()
+    process_unique_assets = bool(getattr(args, "process_external_image_unique_assets", False))
     batch_limit = (
         max(1, int(args.batch_size))
         if args.batch_size is not None
@@ -325,6 +414,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         artifact=args.artifact,
         materialize_external_image_rows=bool(args.materialize_external_image_rows),
         link_shared_external_image_assets=bool(args.link_shared_external_image_assets),
+        process_external_image_unique_assets=process_unique_assets,
     )
     active_backfill_run_ids = _active_backfill_run_ids()
     if args.run_id:
@@ -352,6 +442,40 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             _log_event("backfill_materialize_complete", result=result)
             if not args.artifact:
                 return {"ok": True, "materialize_external_image_rows": result}
+        if process_unique_assets and not args.repeat_until_idle:
+            result, ledger = await _run_unique_external_image_asset_batch(
+                store,
+                args,
+                batch_limit=args.limit or batch_limit or 50,
+                batch_index=1,
+            )
+            unique_summary = _unique_asset_summary(result)
+            if ledger is not None:
+                await store.update_backfill_auxiliary_batch(
+                    run_id=ledger["run_id"],
+                    batch_id=ledger["batch_id"],
+                    processed_count=(
+                        unique_summary["external_image_unique_references_linked"]
+                        + unique_summary["external_image_unique_references_terminal"]
+                        + unique_summary["external_image_unique_urls_stored"]
+                    ),
+                    failed_count=(
+                        unique_summary["external_image_unique_urls_failed"]
+                        + unique_summary["external_image_unique_references_link_failed"]
+                    ),
+                    summary={**result, **unique_summary},
+                    aggregate={**result, **unique_summary},
+                    final=not args.artifact,
+                )
+            _log_event("backfill_unique_external_image_asset_complete", result=result)
+            if not args.artifact:
+                return {
+                    "ok": int(result.get("failed_unique_urls") or 0) == 0
+                    and int(result.get("references_link_failed") or 0) == 0,
+                    "run_id": args.run_id,
+                    "process_external_image_unique_assets": result,
+                    "summary": unique_summary,
+                }
         if args.link_shared_external_image_assets and not args.repeat_until_idle:
             result, ledger = await _run_shared_asset_link_batch(
                 store,
@@ -398,6 +522,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             batch_index += 1
             shared_link_result = None
             shared_link_ledger = None
+            unique_asset_result = None
+            unique_asset_ledger = None
             if args.link_shared_external_image_assets:
                 shared_link_result, shared_link_ledger = await _run_shared_asset_link_batch(
                     store,
@@ -409,6 +535,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "backfill_shared_asset_link_batch_complete",
                     batch_index=batch_index,
                     result=shared_link_result,
+                )
+            if process_unique_assets:
+                (
+                    unique_asset_result,
+                    unique_asset_ledger,
+                ) = await _run_unique_external_image_asset_batch(
+                    store,
+                    args,
+                    batch_limit=batch_limit,
+                    batch_index=batch_index,
+                )
+                _log_event(
+                    "backfill_unique_external_image_asset_batch_complete",
+                    batch_index=batch_index,
+                    result=unique_asset_result,
                 )
             if args.artifact:
                 result = await store.run_backfill(
@@ -437,6 +578,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     shared_link_result.get("failed") or 0
                 )
                 result["link_shared_external_image_assets"] = shared_link_result
+            if unique_asset_result is not None:
+                summary = result.setdefault("summary", {})
+                summary.update(_unique_asset_summary(unique_asset_result))
+                result["process_external_image_unique_assets"] = unique_asset_result
             aggregate["batches_completed"] += 1
             _add_backfill_batch_to_aggregate(aggregate, result)
             planned = _planned_messages(result)
@@ -458,6 +603,26 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         **shared_link_result,
                         **_shared_asset_link_summary(shared_link_result),
                     },
+                    aggregate=aggregate,
+                    final=False,
+                )
+            if unique_asset_ledger is not None:
+                unique_summary = _unique_asset_summary(unique_asset_result)
+                await store.update_backfill_auxiliary_batch(
+                    run_id=unique_asset_ledger["run_id"],
+                    batch_id=unique_asset_ledger["batch_id"],
+                    processed_count=(
+                        aggregate["external_images_shared_asset_links"]
+                        + aggregate["external_image_unique_references_linked"]
+                        + aggregate["external_image_unique_references_terminal"]
+                        + aggregate["external_image_unique_urls_stored"]
+                    ),
+                    failed_count=(
+                        aggregate["external_images_shared_asset_link_failed"]
+                        + aggregate["external_image_unique_urls_failed"]
+                        + aggregate["external_image_unique_references_link_failed"]
+                    ),
+                    summary={**unique_asset_result, **unique_summary},
                     aggregate=aggregate,
                     final=False,
                 )
@@ -486,6 +651,26 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                             aggregate=aggregate,
                             final=True,
                         )
+                    if unique_asset_ledger is not None:
+                        unique_summary = _unique_asset_summary(unique_asset_result)
+                        await store.update_backfill_auxiliary_batch(
+                            run_id=unique_asset_ledger["run_id"],
+                            batch_id=unique_asset_ledger["batch_id"],
+                            processed_count=(
+                                aggregate["external_images_shared_asset_links"]
+                                + aggregate["external_image_unique_references_linked"]
+                                + aggregate["external_image_unique_references_terminal"]
+                                + aggregate["external_image_unique_urls_stored"]
+                            ),
+                            failed_count=(
+                                aggregate["external_images_shared_asset_link_failed"]
+                                + aggregate["external_image_unique_urls_failed"]
+                                + aggregate["external_image_unique_references_link_failed"]
+                            ),
+                            summary={**unique_asset_result, **unique_summary},
+                            aggregate=aggregate,
+                            final=True,
+                        )
                     break
             if args.idle_sleep_seconds and float(args.idle_sleep_seconds) > 0:
                 await asyncio.sleep(float(args.idle_sleep_seconds))
@@ -499,6 +684,25 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 batch_id="",
                 processed_count=aggregate["external_images_shared_asset_links"],
                 failed_count=aggregate["external_images_shared_asset_link_failed"],
+                summary=aggregate,
+                aggregate=aggregate,
+                final=True,
+            )
+        if process_unique_assets and not args.artifact and aggregate["stopped_reason"] != "idle":
+            await store.update_backfill_auxiliary_batch(
+                run_id=str(args.run_id or ""),
+                batch_id="",
+                processed_count=(
+                    aggregate["external_images_shared_asset_links"]
+                    + aggregate["external_image_unique_references_linked"]
+                    + aggregate["external_image_unique_references_terminal"]
+                    + aggregate["external_image_unique_urls_stored"]
+                ),
+                failed_count=(
+                    aggregate["external_images_shared_asset_link_failed"]
+                    + aggregate["external_image_unique_urls_failed"]
+                    + aggregate["external_image_unique_references_link_failed"]
+                ),
                 summary=aggregate,
                 aggregate=aggregate,
                 final=True,
@@ -600,6 +804,14 @@ def main() -> int:
         help=(
             "Mark pending external image reference rows stored when their canonical URL already "
             "has a verified encrypted shared asset. This performs no network fetches."
+        ),
+    )
+    parser.add_argument(
+        "--process-external-image-unique-assets",
+        action="store_true",
+        help=(
+            "Fetch/transform/store one encrypted shared image asset per unique canonical URL, "
+            "then bulk-link all pending email reference rows for that URL."
         ),
     )
     args = parser.parse_args()
