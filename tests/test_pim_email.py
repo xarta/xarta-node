@@ -2052,16 +2052,20 @@ def test_unique_external_image_asset_fetches_once_and_links_all_references(tmp_p
     assert {item["status"] for item in recorded_refs} == {"stored"}
     assert selected_queries
     assert "LEFT JOIN shared_digest" in selected_queries[0]
+    assert "waiting.next_retry_at > now()" in selected_queries[0]
+    assert "captured_waiting_for_real_download" in selected_queries[0]
 
 
 def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
     canonical = "https://cdn.example.test/timeout.png"
     digest = pim_email._external_image_canonical_digest(canonical)
     recorded = []
+    selected_queries = []
 
     class FakeConnection:
         async def fetch(self, query, *args):
             if "SELECT DISTINCT ON (d.canonical_url_digest)" in query:
+                selected_queries.append(query)
                 return [
                     {
                         "canonical_url_digest": digest,
@@ -2122,6 +2126,75 @@ def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
         recorded[0]["safety_decision"]
         == "pending_during_unique_external_image_download_or_transform"
     )
+    assert selected_queries
+    assert "waiting.next_retry_at > now()" in selected_queries[0]
+    assert "captured_waiting_for_real_download" in selected_queries[0]
+
+
+def test_record_external_image_pending_retryable_sets_retry_metadata():
+    canonical = "https://cdn.example.test/retry.png"
+    captured = {}
+
+    class FakeConnection:
+        async def fetchrow(self, query, *args):
+            captured["query"] = query
+            captured["args"] = args
+            assert "retry_count" in query
+            assert "next_retry_at" in query
+            assert args[20] is True
+            assert args[21] == pim_email.EXTERNAL_IMAGE_RETRY_DELAY_SECONDS
+            return {
+                "derivative_id": "email-image-derivative-test",
+                "email_uid": "20260702-" + "f" * 40,
+                "input_raw_sha256": "raw-retry",
+                "source_url": canonical,
+                "canonical_url": canonical,
+                "status": "pending",
+                "reason": "image unavailable: ReadTimeout",
+                "safety_decision": "pending_during_unique_external_image_download_or_transform",
+                "transform_version": pim_email.EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                "raw_image_sha256": "",
+                "transformed_sha256": "",
+                "storage_relpath": "",
+                "shared_asset_uid": "",
+                "encrypted_size": 0,
+                "content_type": "",
+                "width": 0,
+                "height": 0,
+                "retry_count": 3,
+                "last_error": "image unavailable: ReadTimeout",
+                "next_retry_at": "2026-07-02T19:30:00+00:00",
+                "updated_at": "2026-07-02T19:15:00+00:00",
+            }
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    row = asyncio.run(
+        FakeStore().record_external_image_derivative_state(
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "f" * 40,
+            input_raw_sha256="raw-retry",
+            source_url=canonical,
+            status="pending",
+            reason="image unavailable: ReadTimeout",
+            safety_decision="pending_during_unique_external_image_download_or_transform",
+            transform_version=pim_email.EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+            ensure_schema=False,
+        )
+    )
+
+    assert "pim_email_external_image_derivatives.retry_count + 1" in captured["query"]
+    assert row["retry_count"] == 3
+    assert row["last_error"] == "image unavailable: ReadTimeout"
+    assert row["next_retry_at"] == "2026-07-02T19:30:00+00:00"
 
 
 def test_external_image_error_classification_never_uses_skipped():
