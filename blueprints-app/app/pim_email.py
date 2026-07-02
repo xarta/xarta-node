@@ -4713,6 +4713,40 @@ class PgEmailStore:
             "by_artifact": by_artifact,
         }
 
+    async def backfill_item_status_counts(self, *, run_id: str) -> dict[str, Any]:
+        clean_run_id = str(run_id or "").strip()
+        if not clean_run_id:
+            return {
+                "schema": "xarta.pim_email.backfill_item_status_counts.v1",
+                "run_id": "",
+                "by_artifact": {},
+            }
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT artifact_type, status, count(*) AS item_count
+                FROM pim_email_backfill_items
+                WHERE run_id = $1
+                GROUP BY artifact_type, status
+                ORDER BY artifact_type, status
+                """,
+                clean_run_id,
+            )
+        finally:
+            await conn.close()
+        by_artifact: dict[str, dict[str, int]] = {}
+        for row in rows:
+            artifact = str(row["artifact_type"] or "")
+            status = str(row["status"] or "")
+            by_artifact.setdefault(artifact, {})[status] = int(row["item_count"] or 0)
+        return {
+            "schema": "xarta.pim_email.backfill_item_status_counts.v1",
+            "run_id": clean_run_id,
+            "by_artifact": by_artifact,
+        }
+
     async def reconcile_orphaned_backfill_runs(
         self,
         *,
