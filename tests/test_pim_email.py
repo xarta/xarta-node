@@ -327,6 +327,58 @@ def test_deterministic_security_handles_malformed_message_id_header(monkeypatch)
     assert deterministic["context"]["message_id"] == "<[bad-local-part@example.test]>"
 
 
+def test_security_handles_surrogate_escaped_headers_as_evidence(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", "http://local-email-test.invalid")
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", "LOCAL-EMAIL-TEST")
+    raw = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Subject: bad \xff\xfe here\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Bad header bytes are durable evidence, not a checker failure.\r\n"
+    )
+
+    deterministic = pim_email_security.check_email_security_deterministic_sync(
+        raw,
+        dns_txt_lookup=lambda name: [],
+    )
+
+    safe_subject = "bad \\udcff\\udcfe here"
+    assert deterministic["deterministic_complete"] is True
+    assert deterministic["raw_sha256"] == pim_email.hashlib.sha256(raw).hexdigest()
+    assert (
+        deterministic["context"]["subject_sha256"]
+        == pim_email.hashlib.sha256(safe_subject.encode("utf-8")).hexdigest()
+    )
+
+    payloads: list[dict] = []
+
+    def fake_llm(payload):
+        payload["messages"][1]["content"].encode("utf-8")
+        payloads.append(payload)
+        return json.dumps(
+            {
+                "verdict": "safe",
+                "confidence": 0.9,
+                "risk_score": 1,
+                "scam_traits": [],
+                "rationale": "Malformed header evidence was normalized.",
+                "needs_human_review": False,
+            }
+        )
+
+    full = pim_email_security.complete_email_security_with_llm_sync(
+        raw,
+        deterministic=deterministic,
+        body_text="Bad header bytes are durable evidence, not a checker failure.",
+        llm_client=fake_llm,
+    )
+
+    assert full["available"] is True
+    user_payload = json.loads(payloads[0]["messages"][1]["content"].split("\n", 1)[1])
+    assert user_payload["headers"]["subject"] == safe_subject
+
+
 def test_security_llm_phase_requires_prior_deterministic_phase():
     email_uid = "20260701-" + "d" * 40
     raw = b"Subject: Split stage\r\n\r\nLLM must not run before deterministic.\r\n"

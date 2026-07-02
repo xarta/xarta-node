@@ -57,6 +57,28 @@ class _SecurityRuntime:
     publicsuffix2: Any
 
 
+def _utf8_safe_text(value: Any) -> str:
+    """Return deterministic text that can always be encoded as UTF-8."""
+    text = str(value or "")
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _utf8_safe_bytes(value: Any) -> bytes:
+    return _utf8_safe_text(value).encode("utf-8")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, str):
+        return _utf8_safe_text(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "backslashreplace")
+    if isinstance(value, dict):
+        return {_utf8_safe_text(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def security_status() -> dict[str, Any]:
     deps = _dependency_status()
     base_url, api_key, model = _llm_config()
@@ -523,7 +545,9 @@ def _message_context(runtime: _SecurityRuntime, msg: Any, raw: bytes) -> dict[st
     source = _extract_source_ip(received_headers)
     return {
         "message_id": _header_value(msg, "message-id"),
-        "subject_sha256": hashlib.sha256(_header_value(msg, "subject").encode()).hexdigest(),
+        "subject_sha256": hashlib.sha256(
+            _utf8_safe_bytes(_header_value(msg, "subject"))
+        ).hexdigest(),
         "from_domain": from_domain,
         "from_org_domain": _org_domain(runtime, from_domain),
         "return_path_domain": return_path_domain,
@@ -1058,8 +1082,9 @@ def _llm_findings(
     except Exception as exc:
         raise EmailSecurityUnavailableError(f"local AI security judgement failed: {exc}") from exc
     state["called"] = True
-    state["response_sha256"] = hashlib.sha256(str(raw_response or "").encode()).hexdigest()
-    judgement, gate_error = _gate_llm_json(str(raw_response or ""))
+    safe_response = _utf8_safe_text(raw_response)
+    state["response_sha256"] = hashlib.sha256(_utf8_safe_bytes(safe_response)).hexdigest()
+    judgement, gate_error = _gate_llm_json(safe_response)
     if gate_error:
         findings.append(
             _finding(
@@ -1196,7 +1221,10 @@ def _llm_payload(msg: Any, sanitized_body: str) -> dict[str, Any]:
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": "/no-think\n" + json.dumps(user, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": "/no-think\n" + json.dumps(_json_safe(user), ensure_ascii=False),
+            },
         ],
         "temperature": 0,
         "max_tokens": 700,
@@ -1550,7 +1578,7 @@ def _header_values(msg: Any, name: str) -> list[str]:
 
 
 def _stringify_header(value: Any) -> str:
-    return str(value or "").replace("\r\n", "\n").replace("\n", " ").strip()
+    return _utf8_safe_text(value).replace("\r\n", "\n").replace("\n", " ").strip()
 
 
 def _utc_now() -> str:
