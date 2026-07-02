@@ -482,7 +482,7 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
             "test-mailbox",
             uid_existing,
             "raw-existing",
-            "https://cdn.example.test/stored.png",
+            pim_email._external_image_canonical_digest("https://cdn.example.test/stored.png"),
         )
     }
     inserted = []
@@ -519,18 +519,18 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
                 ]
             if "INSERT INTO pim_email_external_image_derivatives" in query:
                 rows = []
-                for index, canonical in enumerate(args[5]):
-                    key = (args[2][index], args[1][index], args[3][index], canonical)
+                for index, digest in enumerate(args[6]):
+                    key = (args[2][index], args[1][index], args[3][index], digest)
                     if key in existing:
                         continue
                     existing.add(key)
                     inserted.append(
                         {
-                            "status": args[6][index],
-                            "reason": args[7][index],
-                            "safety_decision": args[8][index],
-                            "transform_version": args[9][index],
-                            "metadata_json": args[10][index],
+                            "status": args[7][index],
+                            "reason": args[8][index],
+                            "safety_decision": args[9][index],
+                            "transform_version": args[10][index],
+                            "metadata_json": args[11][index],
                         }
                     )
                     rows.append({"derivative_id": args[0][index]})
