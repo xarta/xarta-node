@@ -5323,9 +5323,11 @@ class PgEmailStore:
                 await conn.execute(
                     """
                     UPDATE pim_email_backfill_runs
-                    SET processed_count = $2,
+                    SET status = 'running',
+                        processed_count = $2,
                         failed_count = $3,
                         summary_json = $4::jsonb,
+                        finished_at = NULL,
                         updated_at = now()
                     WHERE run_id = $1
                     """,

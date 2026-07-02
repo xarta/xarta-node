@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import inspect
 import json
 import sys
 from io import BytesIO
@@ -1066,6 +1067,14 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "d.status IN ('pending','fetched','transformed','failed')" in candidate_query
     assert "email_uid DESC" in candidate_query
     assert "updated_at ASC" not in candidate_query
+
+
+def test_backfill_progress_updates_clear_terminal_run_fields():
+    source = inspect.getsource(pim_email.PgEmailStore.run_backfill)
+
+    assert "UPDATE pim_email_backfill_runs" in source
+    assert "SET status = 'running'," in source
+    assert "finished_at = NULL" in source
 
 
 def test_backfill_cli_generated_external_rows_are_not_idle(monkeypatch):
