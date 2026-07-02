@@ -551,6 +551,8 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
             raise AssertionError(query)
 
         async def fetch(self, query, *args):
+            if "UPDATE pim_email_download_runs" in query:
+                return []
             if "FROM pim_email_security_phases" in query:
                 return []
             raise AssertionError(query)
@@ -570,6 +572,7 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
 
     status = asyncio.run(FakeStore().local_corpus_status(mailbox_id="test-mailbox"))
 
+    assert status["download_orphan_reconcile"]["marked_count"] == 0
     assert status["security_results"] == {
         "completed": 2,
         "pending": 0,
@@ -722,6 +725,58 @@ def test_download_orphan_reconcile_marks_only_non_active_running_runs():
 
     assert result["marked_orphaned"] == ["old-download"]
     assert result["marked_count"] == 1
+    assert calls
+
+
+def test_active_download_run_ids_from_proc_parses_only_download_script_run_ids(tmp_path):
+    active_dir = tmp_path / "123"
+    active_dir.mkdir()
+    (active_dir / "cmdline").write_bytes(
+        b"python\0blueprints-app/scripts/pim_email_download_mailbox.py\0--run-id\0active-run\0"
+    )
+    ignored_dir = tmp_path / "456"
+    ignored_dir.mkdir()
+    (ignored_dir / "cmdline").write_bytes(
+        b"python\0blueprints-app/scripts/pim_email_backfill.py\0--run-id\0wrong-run\0"
+    )
+
+    assert pim_email._active_download_run_ids_from_proc(tmp_path) == {"active-run"}
+
+
+def test_record_download_run_start_resets_reused_run_terminal_fields():
+    calls = []
+
+    class FakeConnection:
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            assert "finished_at = NULL" in query
+            assert "started_at = now()" in query
+            assert "summary_json = '{}'::jsonb" in query
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    asyncio.run(
+        FakeStore().record_download_run_start(
+            run_id="download-run",
+            mailbox_id="test-mailbox",
+            apply_remote_moves=True,
+            downloaded_folder="Downloaded",
+            metadata={"schema": "test"},
+        )
+    )
+
     assert calls
 
 
