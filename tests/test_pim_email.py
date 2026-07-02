@@ -1585,6 +1585,57 @@ def test_downloader_does_not_move_before_persisted_completed_security(
     assert blocked[0]["metadata"]["move_gate"]["security_completed"] is False
 
 
+def test_downloader_does_not_move_when_external_image_processing_failed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    DownloadFakeIMAP.instances = []
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
+    monkeypatch.setattr(
+        pim_email,
+        "check_email_security_sync",
+        lambda raw, **kwargs: {
+            **_security_result(),
+            "raw_sha256": pim_email.hashlib.sha256(raw).hexdigest(),
+        },
+    )
+
+    class FailedExternalImageStore(CaptureDownloadStore):
+        async def process_external_image_derivatives(self, **kwargs):
+            return {
+                "stored": 0,
+                "blocked": 0,
+                "failed": 1,
+                "unavailable": 0,
+                "pending": 0,
+                "attempted": 1,
+            }
+
+    store = FailedExternalImageStore()
+
+    result = pim_email.download_mailbox_sync(
+        _mailbox(),
+        store=store,
+        apply_remote_moves=True,
+        convergence_passes=1,
+        folder_allowlist=["INBOX"],
+        limit_per_folder=1,
+        max_messages=1,
+        security_mode="run",
+    )
+
+    assert result["summary"]["stored_messages"] == 1
+    assert result["summary"]["external_image_derivatives_failed"] == 1
+    assert result["summary"]["moved_messages"] == 0
+    assert result["summary"]["move_blocked"] == 1
+    assert DownloadFakeIMAP.instances[0].moves == []
+    blocked = [item for item in store.events if item["event_type"] == "remote-move-gate-blocked"]
+    assert blocked
+    assert blocked[0]["metadata"]["move_gate"]["external_image_derivatives_handled"] is False
+
+
 def test_special_use_descendants_do_not_move_but_inbox_subfolders_can_move():
     target = "Downloaded"
 
