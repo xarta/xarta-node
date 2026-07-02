@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .events import AppEvent
 from .pim_email import (
@@ -37,6 +37,8 @@ class SmtpSelfTestRequest(BaseModel):
 
 
 class DownloadMailboxRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mailbox_id: str | None = Field(None, min_length=1, max_length=120)
     apply_remote_moves: bool = False
     downloaded_folder: str = Field(DEFAULT_DOWNLOADED_FOLDER, min_length=1, max_length=180)
@@ -44,8 +46,6 @@ class DownloadMailboxRequest(BaseModel):
     limit_per_folder: int | None = Field(None, ge=1, le=5000)
     max_messages: int | None = Field(None, ge=1, le=1000000)
     convergence_passes: int = Field(2, ge=1, le=5)
-    include_special_use: bool = True
-    security_mode: str = Field("run", min_length=3, max_length=20)
 
 
 def _store() -> PgEmailStore:
@@ -307,8 +307,8 @@ async def email_download_run(body: DownloadMailboxRequest) -> dict[str, Any]:
             limit_per_folder=body.limit_per_folder,
             max_messages=body.max_messages,
             convergence_passes=body.convergence_passes,
-            include_special_use=body.include_special_use,
-            security_mode=body.security_mode,
+            include_special_use=True,
+            security_mode="run",
         )
         return {"ok": True, "result": result}
     except Exception as exc:
