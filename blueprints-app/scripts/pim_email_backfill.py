@@ -105,6 +105,59 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return {key: summary[key] for key in keys if key in summary}
 
 
+def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -> dict[str, Any]:
+    return {
+        "schema": "xarta.pim_email.backfill_cli.aggregate.v1",
+        "run_id": args.run_id,
+        "mailbox_id": args.mailbox_id,
+        "email_uid": args.email_uid,
+        "artifact": args.artifact,
+        "repeat_until_idle": bool(args.repeat_until_idle),
+        "batch_limit": batch_limit,
+        "batches_completed": 0,
+        "idle_batches": 0,
+        "stopped_reason": "",
+        "processed_messages": 0,
+        "failed_messages": 0,
+        "raw_originals_verified": 0,
+        "raw_originals_failed": 0,
+        "security_completed": 0,
+        "security_already_completed": 0,
+        "security_failed": 0,
+        "sanitized_views_stored": 0,
+        "sanitized_views_already_current": 0,
+        "sanitized_views_failed": 0,
+        "external_images_captured": 0,
+        "external_images_stored": 0,
+        "external_images_pending": 0,
+        "external_images_unavailable": 0,
+        "external_images_failed": 0,
+        "external_images_blocked": 0,
+        "external_images_materialized_rows": 0,
+    }
+
+
+def _add_backfill_batch_to_aggregate(
+    aggregate: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    summary = result.get("summary") if isinstance(result, dict) else None
+    if not isinstance(summary, dict):
+        return
+    for key, value in summary.items():
+        if key in {"schema", "mailbox_id", "artifact_types", "planned_messages"}:
+            continue
+        if isinstance(value, int) and isinstance(aggregate.get(key), int):
+            aggregate[key] += value
+
+
+def _planned_messages(result: dict[str, Any]) -> int:
+    summary = result.get("summary") if isinstance(result, dict) else None
+    if not isinstance(summary, dict):
+        return 0
+    return int(summary.get("planned_messages") or 0)
+
+
 async def _fetch_backfill_progress(store: Any, run_id: str) -> dict[str, Any]:
     conn = await store._connect()
     try:
@@ -159,12 +212,25 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore
 
     store = PgEmailStore()
+    batch_limit = (
+        max(1, int(args.batch_size))
+        if args.batch_size is not None
+        else (
+            max(1, int(args.limit))
+            if args.repeat_until_idle and args.limit
+            else (250 if args.repeat_until_idle else args.limit)
+        )
+    )
     _log_event(
         "backfill_cli_start",
         run_id=args.run_id,
         mailbox_id=args.mailbox_id,
         email_uid=args.email_uid,
         limit=args.limit,
+        batch_size=args.batch_size,
+        repeat_until_idle=bool(args.repeat_until_idle),
+        idle_sleep_seconds=args.idle_sleep_seconds,
+        max_batches=args.max_batches,
         artifact=args.artifact,
         materialize_external_image_rows=bool(args.materialize_external_image_rows),
     )
@@ -194,13 +260,52 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             _log_event("backfill_materialize_complete", result=result)
             if not args.artifact:
                 return {"ok": True, "materialize_external_image_rows": result}
-        result = await store.run_backfill(
-            mailbox_id=args.mailbox_id,
-            email_uid=args.email_uid,
-            limit=args.limit,
-            artifact_types=args.artifact,
-            run_id=args.run_id,
-        )
+        if not args.repeat_until_idle:
+            result = await store.run_backfill(
+                mailbox_id=args.mailbox_id,
+                email_uid=args.email_uid,
+                limit=args.limit,
+                artifact_types=args.artifact,
+                run_id=args.run_id,
+            )
+            _log_event("backfill_cli_complete", result=result)
+            return result
+        aggregate = _new_backfill_aggregate(args, batch_limit)
+        batch_index = 0
+        while True:
+            if args.max_batches is not None and batch_index >= max(1, int(args.max_batches)):
+                aggregate["stopped_reason"] = "max_batches"
+                break
+            batch_index += 1
+            result = await store.run_backfill(
+                mailbox_id=args.mailbox_id,
+                email_uid=args.email_uid,
+                limit=batch_limit,
+                artifact_types=args.artifact,
+                run_id=args.run_id,
+            )
+            aggregate["batches_completed"] += 1
+            _add_backfill_batch_to_aggregate(aggregate, result)
+            planned = _planned_messages(result)
+            _log_event(
+                "backfill_cli_batch_complete",
+                batch_index=batch_index,
+                planned_messages=planned,
+                result=result,
+                aggregate=aggregate,
+            )
+            if planned <= 0:
+                aggregate["idle_batches"] += 1
+                aggregate["stopped_reason"] = "idle"
+                break
+            if args.idle_sleep_seconds and float(args.idle_sleep_seconds) > 0:
+                await asyncio.sleep(float(args.idle_sleep_seconds))
+        result = {
+            "ok": True,
+            "run_id": args.run_id,
+            "status": "completed",
+            "aggregate": aggregate,
+        }
         _log_event("backfill_cli_complete", result=result)
         return result
     finally:
@@ -234,6 +339,32 @@ def main() -> int:
     parser.add_argument("--mailbox-id", default=None)
     parser.add_argument("--email-uid", default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Per-run candidate limit for --repeat-until-idle. Keeps long stack workers "
+            "memory-bounded instead of loading the full corpus in every process."
+        ),
+    )
+    parser.add_argument(
+        "--repeat-until-idle",
+        action="store_true",
+        help="Run bounded backfill batches until no candidate rows remain.",
+    )
+    parser.add_argument(
+        "--idle-sleep-seconds",
+        type=float,
+        default=0.0,
+        help="Delay between repeated real backfill batches.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Optional safety cap for repeated batches.",
+    )
     parser.add_argument("--run-id", default=None)
     parser.add_argument(
         "--artifact",
