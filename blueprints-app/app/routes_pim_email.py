@@ -40,11 +40,12 @@ class DownloadMailboxRequest(BaseModel):
     mailbox_id: str | None = Field(None, min_length=1, max_length=120)
     apply_remote_moves: bool = False
     downloaded_folder: str = Field(DEFAULT_DOWNLOADED_FOLDER, min_length=1, max_length=180)
+    folder_allowlist: list[str] | None = None
     limit_per_folder: int | None = Field(None, ge=1, le=5000)
     max_messages: int | None = Field(None, ge=1, le=1000000)
     convergence_passes: int = Field(2, ge=1, le=5)
-    include_special_use: bool = False
-    security_mode: str = Field("run-or-queue", min_length=3, max_length=20)
+    include_special_use: bool = True
+    security_mode: str = Field("run", min_length=3, max_length=20)
 
 
 def _store() -> PgEmailStore:
@@ -213,6 +214,33 @@ async def email_local_message(
         raise _http_error(exc) from exc
 
 
+@router.post("/local/messages/{email_uid}/security")
+async def email_local_message_security(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    security_run_id: str | None = Query(None, min_length=8, max_length=120),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(mailbox_id)
+        run_id = _clean_security_run_id(security_run_id)
+        result = await store.run_local_security_check(
+            email_uid,
+            mailbox_id=mailbox.mailbox_id,
+            progress_callback=_security_progress_emitter(
+                loop=asyncio.get_running_loop(),
+                run_id=run_id,
+                mailbox_id=mailbox.mailbox_id,
+                folder="local-corpus",
+                uid=email_uid,
+            ),
+        )
+        _attach_security_run_id(result["security"], run_id)
+        return {"ok": True, "mailbox": mailbox.public_dict(), **result}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.get("/folders")
 async def email_folders(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
@@ -275,6 +303,7 @@ async def email_download_run(body: DownloadMailboxRequest) -> dict[str, Any]:
             store=store,
             apply_remote_moves=body.apply_remote_moves,
             downloaded_folder=body.downloaded_folder,
+            folder_allowlist=body.folder_allowlist,
             limit_per_folder=body.limit_per_folder,
             max_messages=body.max_messages,
             convergence_passes=body.convergence_passes,
