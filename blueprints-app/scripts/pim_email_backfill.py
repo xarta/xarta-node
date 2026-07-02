@@ -111,6 +111,7 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "external_images_already_blocked",
         "external_images_materialized_rows",
         "external_images_shared_asset_links",
+        "external_images_shared_asset_link_failed",
     )
     return {key: summary[key] for key in keys if key in summary}
 
@@ -154,6 +155,7 @@ def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -
         "external_images_already_blocked": 0,
         "external_images_materialized_rows": 0,
         "external_images_shared_asset_links": 0,
+        "external_images_shared_asset_link_failed": 0,
     }
 
 
@@ -182,9 +184,54 @@ def _generated_work_rows(result: dict[str, Any]) -> int:
     summary = result.get("summary") if isinstance(result, dict) else None
     if not isinstance(summary, dict):
         return 0
-    return int(summary.get("external_images_materialized_rows") or 0) + int(
-        summary.get("external_images_shared_asset_links") or 0
+    return (
+        int(summary.get("external_images_materialized_rows") or 0)
+        + int(summary.get("external_images_shared_asset_links") or 0)
+        + int(summary.get("external_images_shared_asset_link_failed") or 0)
     )
+
+
+def _shared_asset_link_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "planned_messages": 0,
+        "processed_messages": 0,
+        "failed_messages": 0,
+        "external_images_shared_asset_links": int(result.get("linked") or 0),
+        "external_images_shared_asset_link_failed": int(result.get("failed") or 0),
+    }
+
+
+async def _run_shared_asset_link_batch(
+    store: Any,
+    args: argparse.Namespace,
+    *,
+    batch_limit: int,
+    batch_index: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ledger: dict[str, Any] | None = None
+    metadata = {
+        "source": "pim-email-backfill-cli-shared-asset-link",
+        "run_id": args.run_id or "",
+        "batch_index": batch_index,
+    }
+    if not args.artifact:
+        ledger = await store.start_backfill_auxiliary_batch(
+            run_id=args.run_id,
+            mailbox_id=args.mailbox_id,
+            artifact_types=["external_image_shared_asset_links"],
+            requested_limit=batch_limit,
+            batch_index=batch_index,
+            metadata=metadata,
+        )
+        args.run_id = ledger["run_id"]
+        metadata["run_id"] = ledger["run_id"]
+        metadata["batch_id"] = ledger["batch_id"]
+    result = await store.link_external_image_references_from_shared_assets(
+        mailbox_id=args.mailbox_id,
+        limit=batch_limit,
+        metadata=metadata,
+    )
+    return result, ledger
 
 
 async def _fetch_backfill_progress(store: Any, run_id: str) -> dict[str, Any]:
@@ -291,13 +338,32 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             if not args.artifact:
                 return {"ok": True, "materialize_external_image_rows": result}
         if args.link_shared_external_image_assets and not args.repeat_until_idle:
-            result = await store.link_external_image_references_from_shared_assets(
-                mailbox_id=args.mailbox_id,
-                limit=args.limit or 5000,
+            result, ledger = await _run_shared_asset_link_batch(
+                store,
+                args,
+                batch_limit=args.limit or 5000,
+                batch_index=1,
             )
+            link_summary = _shared_asset_link_summary(result)
+            if ledger is not None:
+                await store.update_backfill_auxiliary_batch(
+                    run_id=ledger["run_id"],
+                    batch_id=ledger["batch_id"],
+                    processed_count=link_summary["external_images_shared_asset_links"],
+                    failed_count=link_summary["external_images_shared_asset_link_failed"],
+                    summary={**result, **link_summary},
+                    aggregate={**result, **link_summary},
+                    final=not args.artifact,
+                )
             _log_event("backfill_shared_asset_link_complete", result=result)
             if not args.artifact:
-                return {"ok": True, "link_shared_external_image_assets": result}
+                return {
+                    "ok": int(result.get("failed") or 0) == 0,
+                    "run_id": args.run_id,
+                    "batch_id": ledger["batch_id"] if ledger else "",
+                    "link_shared_external_image_assets": result,
+                    "summary": link_summary,
+                }
         if not args.repeat_until_idle:
             result = await store.run_backfill(
                 mailbox_id=args.mailbox_id,
@@ -316,10 +382,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 break
             batch_index += 1
             shared_link_result = None
+            shared_link_ledger = None
             if args.link_shared_external_image_assets:
-                shared_link_result = await store.link_external_image_references_from_shared_assets(
-                    mailbox_id=args.mailbox_id,
-                    limit=batch_limit,
+                shared_link_result, shared_link_ledger = await _run_shared_asset_link_batch(
+                    store,
+                    args,
+                    batch_limit=batch_limit,
+                    batch_index=batch_index,
                 )
                 _log_event(
                     "backfill_shared_asset_link_batch_complete",
@@ -349,10 +418,26 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 summary["external_images_shared_asset_links"] = int(
                     shared_link_result.get("linked") or 0
                 )
+                summary["external_images_shared_asset_link_failed"] = int(
+                    shared_link_result.get("failed") or 0
+                )
                 result["link_shared_external_image_assets"] = shared_link_result
             aggregate["batches_completed"] += 1
             _add_backfill_batch_to_aggregate(aggregate, result)
             planned = _planned_messages(result)
+            if shared_link_ledger is not None:
+                await store.update_backfill_auxiliary_batch(
+                    run_id=shared_link_ledger["run_id"],
+                    batch_id=shared_link_ledger["batch_id"],
+                    processed_count=aggregate["external_images_shared_asset_links"],
+                    failed_count=aggregate["external_images_shared_asset_link_failed"],
+                    summary={
+                        **shared_link_result,
+                        **_shared_asset_link_summary(shared_link_result),
+                    },
+                    aggregate=aggregate,
+                    final=False,
+                )
             _log_event(
                 "backfill_cli_batch_complete",
                 batch_index=batch_index,
@@ -365,9 +450,36 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 if generated <= 0:
                     aggregate["idle_batches"] += 1
                     aggregate["stopped_reason"] = "idle"
+                    if shared_link_ledger is not None:
+                        await store.update_backfill_auxiliary_batch(
+                            run_id=shared_link_ledger["run_id"],
+                            batch_id=shared_link_ledger["batch_id"],
+                            processed_count=aggregate["external_images_shared_asset_links"],
+                            failed_count=aggregate["external_images_shared_asset_link_failed"],
+                            summary={
+                                **shared_link_result,
+                                **_shared_asset_link_summary(shared_link_result),
+                            },
+                            aggregate=aggregate,
+                            final=True,
+                        )
                     break
             if args.idle_sleep_seconds and float(args.idle_sleep_seconds) > 0:
                 await asyncio.sleep(float(args.idle_sleep_seconds))
+        if (
+            args.link_shared_external_image_assets
+            and not args.artifact
+            and aggregate["stopped_reason"] != "idle"
+        ):
+            await store.update_backfill_auxiliary_batch(
+                run_id=str(args.run_id or ""),
+                batch_id="",
+                processed_count=aggregate["external_images_shared_asset_links"],
+                failed_count=aggregate["external_images_shared_asset_link_failed"],
+                summary=aggregate,
+                aggregate=aggregate,
+                final=True,
+            )
         result = {
             "ok": True,
             "run_id": args.run_id,

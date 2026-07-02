@@ -2833,10 +2833,12 @@ class PgEmailStore:
         *,
         mailbox_id: str | None = None,
         limit: int = 500,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
         safe_limit = max(1, min(int(limit or 1), 5000))
+        link_metadata = dict(metadata or {})
         conn = await self._connect()
         try:
             rows = await conn.fetch(
@@ -2918,6 +2920,7 @@ class PgEmailStore:
                         "source_url": source_url,
                         "canonical_url": canonical,
                         "bulk_linked_from_shared_asset": True,
+                        **link_metadata,
                     },
                 )
                 await self.store_transformed_asset(
@@ -2950,6 +2953,7 @@ class PgEmailStore:
                         "source_url": source_url,
                         "canonical_url": canonical,
                         "shared_asset_uid": shared["shared_asset_uid"],
+                        **link_metadata,
                     },
                     ensure_schema=False,
                 )
@@ -4473,6 +4477,168 @@ class PgEmailStore:
             "marked_count": len(rows),
             "marked_item_count": len(item_rows),
         }
+
+    async def start_backfill_auxiliary_batch(
+        self,
+        *,
+        run_id: str | None = None,
+        mailbox_id: str | None = None,
+        artifact_types: list[str],
+        requested_limit: int | None = None,
+        batch_index: int = 1,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_artifacts = [
+            str(item or "").strip().lower().replace("-", "_")
+            for item in artifact_types
+            if str(item or "").strip()
+        ]
+        if not clean_artifacts:
+            raise EmailOperationError("No valid auxiliary backfill artifact types requested")
+        safe_limit = None if requested_limit is None else max(1, int(requested_limit))
+        actual_run_id = str(
+            run_id
+            or _stable_id(
+                "email-backfill-run",
+                configured_mailbox_id,
+                ",".join(clean_artifacts),
+                str(time.time_ns()),
+            )
+        )
+        batch_id = _stable_id(
+            "email-backfill-auxiliary-batch",
+            actual_run_id,
+            configured_mailbox_id,
+            ",".join(clean_artifacts),
+            str(max(1, int(batch_index or 1))),
+            str(time.time_ns()),
+        )
+        run_metadata = {
+            "schema": "xarta.pim_email.backfill_run.metadata.v1",
+            "auxiliary_backfill": True,
+            "candidate_order": "email_uid_desc_then_artifact_gap_priority",
+            **(metadata or {}),
+        }
+        batch_metadata = {
+            "schema": "xarta.pim_email.backfill_batch.metadata.v1",
+            "auxiliary_backfill": True,
+            "batch_index": max(1, int(batch_index or 1)),
+            **(metadata or {}),
+        }
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_backfill_runs (
+                    run_id, mailbox_id, status, requested_limit, artifact_types_json,
+                    metadata_json, finished_at, updated_at
+                )
+                VALUES ($1,$2,'running',$3,$4::jsonb,$5::jsonb,NULL,now())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status = 'running',
+                    requested_limit = EXCLUDED.requested_limit,
+                    artifact_types_json = EXCLUDED.artifact_types_json,
+                    metadata_json = pim_email_backfill_runs.metadata_json
+                      || EXCLUDED.metadata_json,
+                    finished_at = NULL,
+                    updated_at = now()
+                """,
+                actual_run_id,
+                configured_mailbox_id,
+                safe_limit,
+                _json_dumps(clean_artifacts, sort_keys=True, separators=(",", ":")),
+                _json_dumps(run_metadata, sort_keys=True, separators=(",", ":")),
+            )
+            await conn.execute(
+                """
+                INSERT INTO pim_email_backfill_batches (
+                    batch_id, run_id, mailbox_id, artifact_types_json,
+                    planned_count, metadata_json, updated_at
+                )
+                VALUES ($1,$2,$3,$4::jsonb,0,$5::jsonb,now())
+                ON CONFLICT (batch_id) DO UPDATE SET
+                    artifact_types_json = EXCLUDED.artifact_types_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now()
+                """,
+                batch_id,
+                actual_run_id,
+                configured_mailbox_id,
+                _json_dumps(clean_artifacts, sort_keys=True, separators=(",", ":")),
+                _json_dumps(batch_metadata, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.backfill_auxiliary_batch.v1",
+            "run_id": actual_run_id,
+            "batch_id": batch_id,
+            "mailbox_id": configured_mailbox_id,
+            "artifact_types": clean_artifacts,
+        }
+
+    async def update_backfill_auxiliary_batch(
+        self,
+        *,
+        run_id: str,
+        batch_id: str,
+        processed_count: int,
+        failed_count: int,
+        summary: dict[str, Any],
+        aggregate: dict[str, Any] | None = None,
+        final: bool = False,
+    ) -> None:
+        clean_status = (
+            "completed-with-errors"
+            if final and int(failed_count or 0) > 0
+            else ("completed" if final else "running")
+        )
+        metadata = {
+            "schema": "xarta.pim_email.backfill_batch.update.v1",
+            "summary": summary,
+            "aggregate": aggregate or {},
+        }
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_backfill_runs
+                SET status = $2,
+                    processed_count = $3,
+                    failed_count = $4,
+                    summary_json = $5::jsonb,
+                    finished_at = CASE WHEN $6 THEN now() ELSE NULL END,
+                    updated_at = now()
+                WHERE run_id = $1
+                """,
+                run_id,
+                clean_status,
+                int(processed_count or 0),
+                int(failed_count or 0),
+                _json_dumps(aggregate or summary, sort_keys=True, separators=(",", ":")),
+                bool(final),
+            )
+            if batch_id:
+                await conn.execute(
+                    """
+                    UPDATE pim_email_backfill_batches
+                    SET planned_count = $2,
+                        processed_count = $3,
+                        failed_count = $4,
+                        metadata_json = $5::jsonb,
+                        updated_at = now()
+                    WHERE batch_id = $1
+                    """,
+                    batch_id,
+                    int(summary.get("planned") or 0),
+                    int(summary.get("linked") or summary.get("processed_messages") or 0),
+                    int(summary.get("failed") or summary.get("failed_messages") or 0),
+                    _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
+                )
+        finally:
+            await conn.close()
 
     async def run_backfill(
         self,
