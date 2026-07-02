@@ -3923,7 +3923,7 @@ class PgEmailStore:
                             WHERE d.mailbox_id = m.mailbox_id
                               AND d.email_uid = m.email_uid
                               AND d.input_raw_sha256 = m.raw_sha256
-                              AND d.status IN ('pending','fetched','transformed')
+                              AND d.status IN ('pending','fetched','transformed','failed')
                         ) AS external_pending,
                         EXISTS (
                             SELECT 1
@@ -3967,6 +3967,11 @@ class PgEmailStore:
                     ({security_requested} AND security_running)
                     OR ({sanitized_requested} AND sanitized_running)
                     OR ({external_requested} AND external_running)
+                )
+                AND (
+                    ({security_requested} AND NOT security_complete)
+                    OR ({sanitized_requested} AND NOT sanitized_complete)
+                    OR ({external_requested} AND external_pending)
                 )
                 ORDER BY
                   email_uid DESC,
