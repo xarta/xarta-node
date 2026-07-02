@@ -967,9 +967,7 @@ class PgEmailStore:
             raw_sha256=raw_sha256,
             parsed=message,
         )
-        check_id = hashlib.sha256(
-            f"{mailbox_id}\n{folder}\n{uid}\n{email_uid}\n{raw_sha256}".encode("utf-8")
-        ).hexdigest()
+        check_id = _stable_id("email-security", email_uid, raw_sha256)
         conn = await self._connect()
         try:
             await conn.execute(
@@ -980,8 +978,12 @@ class PgEmailStore:
                     email_uid, security_status, checker_versions_json, metadata_json
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now(),$11,$12,$13::jsonb,$14::jsonb)
-                ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                ON CONFLICT (security_check_id) DO UPDATE SET
+                    mailbox_id = EXCLUDED.mailbox_id,
+                    folder = EXCLUDED.folder,
+                    uid = EXCLUDED.uid,
                     message_id = EXCLUDED.message_id,
+                    raw_sha256 = EXCLUDED.raw_sha256,
                     aggregate_status = EXCLUDED.aggregate_status,
                     aggregate_score = EXCLUDED.aggregate_score,
                     llm_called = EXCLUDED.llm_called,
@@ -1933,8 +1935,12 @@ class PgEmailStore:
                             email_uid, security_status, checker_versions_json, metadata_json
                         )
                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
-                        ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                        ON CONFLICT (security_check_id) DO UPDATE SET
+                            mailbox_id = EXCLUDED.mailbox_id,
+                            folder = EXCLUDED.folder,
+                            uid = EXCLUDED.uid,
                             message_id = EXCLUDED.message_id,
+                            raw_sha256 = EXCLUDED.raw_sha256,
                             aggregate_status = EXCLUDED.aggregate_status,
                             aggregate_score = EXCLUDED.aggregate_score,
                             llm_called = EXCLUDED.llm_called,
@@ -2710,8 +2716,12 @@ class PgEmailStore:
                     email_uid, security_status, checker_versions_json, metadata_json
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
-                ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                ON CONFLICT (security_check_id) DO UPDATE SET
+                    mailbox_id = EXCLUDED.mailbox_id,
+                    folder = EXCLUDED.folder,
+                    uid = EXCLUDED.uid,
                     message_id = EXCLUDED.message_id,
+                    raw_sha256 = EXCLUDED.raw_sha256,
                     aggregate_status = EXCLUDED.aggregate_status,
                     aggregate_score = EXCLUDED.aggregate_score,
                     llm_called = EXCLUDED.llm_called,

@@ -235,6 +235,13 @@ def test_completed_security_contract_rejects_placeholders_and_requires_exact_has
     )
 
 
+def test_security_result_upserts_are_keyed_by_email_uid_raw_hash_contract():
+    source = (APP_ROOT / "app" / "pim_email.py").read_text(encoding="utf-8")
+
+    assert source.count("ON CONFLICT (security_check_id)") >= 3
+    assert "ON CONFLICT (mailbox_id, folder, uid, raw_sha256)" not in source
+
+
 def test_sanitized_view_artifact_is_persisted_encrypted_and_blocks_raw_view(
     tmp_path,
     monkeypatch,
