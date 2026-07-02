@@ -36,6 +36,9 @@ import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .pim_email_security import (
+    SCHEMA as SECURITY_CHECK_SCHEMA,
+)
+from .pim_email_security import (
     EmailSecurityUnavailableError,
     check_email_security_sync,
 )
@@ -50,6 +53,11 @@ DEFAULT_IMAP_FETCH_CHUNK_BYTES = 1024 * 1024
 ENVELOPE_PURPOSE = b"xarta-pim-email-password-v1"
 CONTENT_PURPOSE = b"xarta-pim-email-content-v1"
 ASSET_PURPOSE = b"xarta-pim-email-asset-v1"
+SANITIZED_VIEW_PURPOSE = b"xarta-pim-email-sanitized-view-v1"
+SANITIZED_VIEW_POLICY_VERSION = "sanitized-view-v1"
+SANITIZED_VIEW_TRANSFORM_VERSION = "email-view-json-v1"
+SECURITY_POLICY_VERSION = "pim-email-security-v1"
+EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 12_000_000
@@ -639,6 +647,141 @@ class PgEmailStore:
                 ON pim_email_transformed_assets(email_uid, updated_at DESC);
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_sanitized_view_artifacts (
+                    artifact_uid TEXT PRIMARY KEY,
+                    email_uid TEXT NOT NULL REFERENCES pim_email_messages(email_uid) ON DELETE CASCADE,
+                    mailbox_id TEXT NOT NULL,
+                    input_raw_sha256 TEXT NOT NULL,
+                    sanitizer_policy_version TEXT NOT NULL,
+                    transform_version TEXT NOT NULL,
+                    output_sha256 TEXT NOT NULL,
+                    storage_relpath TEXT NOT NULL,
+                    encrypted_size BIGINT NOT NULL DEFAULT 0,
+                    views_available_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    safety_counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    derivation_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    encryption_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (
+                        mailbox_id, email_uid, input_raw_sha256,
+                        sanitizer_policy_version, transform_version
+                    )
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_sanitized_views_current
+                ON pim_email_sanitized_view_artifacts(
+                    mailbox_id, email_uid, input_raw_sha256,
+                    sanitizer_policy_version, transform_version, updated_at DESC
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_external_image_derivatives (
+                    derivative_id TEXT PRIMARY KEY,
+                    email_uid TEXT NOT NULL REFERENCES pim_email_messages(email_uid) ON DELETE CASCADE,
+                    mailbox_id TEXT NOT NULL,
+                    input_raw_sha256 TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL,
+                    canonical_url TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    safety_decision TEXT NOT NULL DEFAULT '',
+                    transform_version TEXT NOT NULL DEFAULT '',
+                    raw_image_sha256 TEXT NOT NULL DEFAULT '',
+                    transformed_sha256 TEXT NOT NULL DEFAULT '',
+                    storage_relpath TEXT NOT NULL DEFAULT '',
+                    encrypted_size BIGINT NOT NULL DEFAULT 0,
+                    content_type TEXT NOT NULL DEFAULT '',
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    fetched_at TIMESTAMPTZ,
+                    transformed_at TIMESTAMPTZ,
+                    stored_at TIMESTAMPTZ,
+                    next_retry_at TIMESTAMPTZ,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (mailbox_id, email_uid, input_raw_sha256, canonical_url)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_images_status
+                ON pim_email_external_image_derivatives(mailbox_id, status, updated_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_backfill_runs (
+                    run_id TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    requested_limit INTEGER,
+                    artifact_types_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    processed_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    finished_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_backfill_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES pim_email_backfill_runs(run_id) ON DELETE CASCADE,
+                    mailbox_id TEXT NOT NULL,
+                    artifact_types_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    planned_count INTEGER NOT NULL DEFAULT 0,
+                    processed_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_backfill_items (
+                    item_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES pim_email_backfill_runs(run_id) ON DELETE CASCADE,
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    mailbox_id TEXT NOT NULL,
+                    email_uid TEXT NOT NULL,
+                    raw_sha256 TEXT NOT NULL DEFAULT '',
+                    artifact_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error_class TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    started_at TIMESTAMPTZ,
+                    finished_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (run_id, email_uid, raw_sha256, artifact_type)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_backfill_items_status
+                ON pim_email_backfill_items(mailbox_id, artifact_type, status, updated_at DESC);
+                """
+            )
         finally:
             await conn.close()
 
@@ -750,6 +893,12 @@ class PgEmailStore:
         uid = clean_uid_value(str(message.get("uid") or ""))
         email_uid = str(message.get("email_uid") or "")
         message_id = str((message.get("headers") or {}).get("message_id") or "")
+        storage_security = _security_result_for_storage(
+            security,
+            email_uid=email_uid,
+            raw_sha256=raw_sha256,
+            parsed=message,
+        )
         check_id = hashlib.sha256(
             f"{mailbox_id}\n{folder}\n{uid}\n{email_uid}\n{raw_sha256}".encode("utf-8")
         ).hexdigest()
@@ -784,17 +933,20 @@ class PgEmailStore:
                 str(aggregate.get("status") or "amber"),
                 int(aggregate.get("score") or aggregate.get("risk_score") or 0),
                 bool(aggregate.get("llm_called") or (security.get("llm") or {}).get("called")),
-                _json_dumps(security, sort_keys=True, separators=(",", ":")),
+                _json_dumps(storage_security, sort_keys=True, separators=(",", ":")),
                 email_uid,
                 "stored",
                 _json_dumps(
-                    _security_checker_versions(security), sort_keys=True, separators=(",", ":")
+                    _security_checker_versions(storage_security),
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
                 _json_dumps(
                     {
                         "schema": "xarta.pim_email.security_result.metadata.v1",
                         "email_uid": email_uid,
                         "raw_sha256": raw_sha256,
+                        "policy_version": SECURITY_POLICY_VERSION,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -814,7 +966,156 @@ class PgEmailStore:
                   (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1) AS messages,
                   (SELECT count(*) FROM pim_email_local_folders WHERE mailbox_id = $1 AND tombstoned_at IS NULL) AS folders,
                   (SELECT count(*) FROM pim_email_folder_memberships WHERE mailbox_id = $1) AS memberships,
-                  (SELECT count(*) FROM pim_email_transformed_assets WHERE mailbox_id = $1) AS transformed_assets
+                  (SELECT count(*) FROM pim_email_transformed_assets WHERE mailbox_id = $1) AS transformed_assets,
+                  (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1 AND storage_relpath <> '') AS raw_originals_stored
+                """,
+                configured_mailbox_id,
+            )
+            security_counts = await conn.fetchrow(
+                """
+                WITH latest_current AS (
+                    SELECT DISTINCT ON (m.email_uid)
+                           m.email_uid,
+                           m.raw_sha256 AS message_raw_sha256,
+                           s.raw_sha256 AS security_raw_sha256,
+                           s.security_status,
+                           s.error_message,
+                           s.result_json,
+                           s.checked_at
+                    FROM pim_email_messages m
+                    LEFT JOIN pim_email_security_checks s
+                      ON s.email_uid = m.email_uid AND s.raw_sha256 = m.raw_sha256
+                    WHERE m.mailbox_id = $1
+                    ORDER BY m.email_uid, s.checked_at DESC NULLS LAST
+                ), classified AS (
+                    SELECT
+                        email_uid,
+                        CASE
+                            WHEN security_raw_sha256 IS NULL THEN 'missing'
+                            WHEN security_status = 'stored'
+                              AND result_json->>'available' = 'true'
+                              AND COALESCE(result_json->>'queued', 'false') <> 'true'
+                              AND COALESCE(result_json->>'placeholder', 'false') <> 'true'
+                              AND result_json->>'email_uid' = email_uid
+                              AND result_json->>'raw_sha256' = message_raw_sha256
+                              AND COALESCE(result_json->>'checked_at', '') <> ''
+                              AND jsonb_typeof(result_json->'checker_versions') = 'object'
+                            THEN 'completed'
+                            WHEN security_status LIKE 'failed%' OR COALESCE(error_message, '') <> ''
+                            THEN 'failed'
+                            ELSE 'pending'
+                        END AS state
+                    FROM latest_current
+                ), stale AS (
+                    SELECT count(DISTINCT m.email_uid) AS stale_hash
+                    FROM pim_email_messages m
+                    JOIN pim_email_security_checks s
+                      ON s.email_uid = m.email_uid AND s.raw_sha256 <> m.raw_sha256
+                    WHERE m.mailbox_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_security_checks current_s
+                          WHERE current_s.email_uid = m.email_uid
+                            AND current_s.raw_sha256 = m.raw_sha256
+                      )
+                )
+                SELECT
+                    count(*) FILTER (WHERE state = 'completed') AS completed,
+                    count(*) FILTER (WHERE state = 'pending') AS pending,
+                    count(*) FILTER (WHERE state = 'failed') AS failed,
+                    count(*) FILTER (WHERE state = 'missing') AS missing,
+                    (SELECT stale_hash FROM stale) AS stale_hash
+                FROM classified
+                """,
+                configured_mailbox_id,
+            )
+            sanitized_counts = await conn.fetchrow(
+                """
+                WITH current_sanitized AS (
+                    SELECT DISTINCT m.email_uid
+                    FROM pim_email_messages m
+                    JOIN pim_email_sanitized_view_artifacts a
+                      ON a.mailbox_id = m.mailbox_id
+                     AND a.email_uid = m.email_uid
+                     AND a.input_raw_sha256 = m.raw_sha256
+                     AND a.sanitizer_policy_version = $2
+                     AND a.transform_version = $3
+                    WHERE m.mailbox_id = $1
+                ), latest_failures AS (
+                    SELECT DISTINCT ON (email_uid, raw_sha256)
+                           email_uid, raw_sha256, status
+                    FROM pim_email_backfill_items
+                    WHERE mailbox_id = $1 AND artifact_type = 'sanitized_view'
+                    ORDER BY email_uid, raw_sha256, updated_at DESC
+                )
+                SELECT
+                    (SELECT count(*) FROM current_sanitized) AS completed,
+                    count(*) FILTER (
+                        WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
+                          AND f.status = 'failed'
+                    ) AS failed,
+                    count(*) FILTER (
+                        WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
+                          AND COALESCE(f.status, '') <> 'failed'
+                    ) AS pending
+                FROM pim_email_messages m
+                LEFT JOIN latest_failures f
+                  ON f.email_uid = m.email_uid AND f.raw_sha256 = m.raw_sha256
+                WHERE m.mailbox_id = $1
+                """,
+                configured_mailbox_id,
+                SANITIZED_VIEW_POLICY_VERSION,
+                SANITIZED_VIEW_TRANSFORM_VERSION,
+            )
+            external_counts = await conn.fetchrow(
+                """
+                WITH captured AS (
+                    SELECT COALESCE(sum(
+                        CASE
+                          WHEN jsonb_typeof(metadata_json->'remote_image_sources') = 'array'
+                          THEN jsonb_array_length(metadata_json->'remote_image_sources')
+                          ELSE 0
+                        END
+                    ), 0) AS captured_count
+                    FROM pim_email_messages
+                    WHERE mailbox_id = $1
+                ), rows AS (
+                    SELECT status, count(*) AS row_count
+                    FROM pim_email_external_image_derivatives
+                    WHERE mailbox_id = $1
+                    GROUP BY status
+                ), totals AS (
+                    SELECT COALESCE(sum(row_count), 0) AS recorded_count FROM rows
+                )
+                SELECT
+                    (SELECT captured_count FROM captured) AS captured,
+                    COALESCE((SELECT row_count FROM rows WHERE status = 'stored'), 0) AS stored,
+                    COALESCE((SELECT row_count FROM rows WHERE status = 'blocked'), 0) AS blocked,
+                    COALESCE((SELECT row_count FROM rows WHERE status = 'failed'), 0) AS failed,
+                    COALESCE((SELECT row_count FROM rows WHERE status = 'skipped'), 0) AS skipped,
+                    COALESCE((SELECT sum(row_count) FROM rows WHERE status IN ('pending','fetched','transformed')), 0)
+                      + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending
+                """,
+                configured_mailbox_id,
+            )
+            folder_counts = await conn.fetchrow(
+                """
+                SELECT
+                    count(*) FILTER (
+                        WHERE f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                    ) AS special_use_downloaded,
+                    count(*) FILTER (
+                        WHERE f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                          AND fm.remote_moved_at IS NULL
+                    ) AS special_use_unmoved,
+                    count(*) FILTER (
+                        WHERE (fm.folder_name = 'INBOX' OR fm.folder_name LIKE 'INBOX/%')
+                          AND fm.remote_moved_at IS NOT NULL
+                    ) AS inbox_subfolders_moved
+                FROM pim_email_folder_memberships fm
+                JOIN pim_email_local_folders f
+                  ON f.mailbox_id = fm.mailbox_id AND f.folder_uid = fm.folder_uid
+                WHERE fm.mailbox_id = $1
                 """,
                 configured_mailbox_id,
             )
@@ -830,16 +1131,87 @@ class PgEmailStore:
             )
         finally:
             await conn.close()
+        message_count = int(row["messages"] or 0) if row else 0
+        security_completed = int(_row_get(security_counts, "completed", 0) or 0)
+        sanitized_completed = int(_row_get(sanitized_counts, "completed", 0) or 0)
         return {
             "schema": "xarta.pim_email.local_corpus.status.v1",
             "mailbox_id": configured_mailbox_id,
-            "message_count": int(row["messages"] or 0) if row else 0,
+            "message_count": message_count,
             "folder_count": int(row["folders"] or 0) if row else 0,
             "membership_count": int(row["memberships"] or 0) if row else 0,
             "transformed_asset_count": int(row["transformed_assets"] or 0) if row else 0,
-            "available": bool(row and int(row["messages"] or 0) > 0),
+            "raw_originals": {
+                "stored": int(row["raw_originals_stored"] or 0) if row else 0,
+                "messages": message_count,
+            },
+            "security_results": {
+                "completed": security_completed,
+                "pending": int(_row_get(security_counts, "pending", 0) or 0),
+                "failed": int(_row_get(security_counts, "failed", 0) or 0),
+                "missing": int(_row_get(security_counts, "missing", 0) or 0),
+                "stale_hash": int(_row_get(security_counts, "stale_hash", 0) or 0),
+            },
+            "sanitized_derivatives": {
+                "completed": sanitized_completed,
+                "pending": int(_row_get(sanitized_counts, "pending", 0) or 0),
+                "failed": int(_row_get(sanitized_counts, "failed", 0) or 0),
+                "policy_version": SANITIZED_VIEW_POLICY_VERSION,
+                "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
+            },
+            "external_image_derivatives": {
+                "captured": int(_row_get(external_counts, "captured", 0) or 0),
+                "stored": int(_row_get(external_counts, "stored", 0) or 0),
+                "blocked": int(_row_get(external_counts, "blocked", 0) or 0),
+                "failed": int(_row_get(external_counts, "failed", 0) or 0),
+                "skipped": int(_row_get(external_counts, "skipped", 0) or 0),
+                "pending": int(_row_get(external_counts, "pending", 0) or 0),
+            },
+            "special_use_folders": {
+                "downloaded_memberships": int(
+                    _row_get(folder_counts, "special_use_downloaded", 0) or 0
+                ),
+                "unmoved_memberships": int(_row_get(folder_counts, "special_use_unmoved", 0) or 0),
+            },
+            "inbox_subfolders": {
+                "moved_memberships": int(_row_get(folder_counts, "inbox_subfolders_moved", 0) or 0),
+            },
+            "render_gate": {
+                "blocked_security_incomplete": max(message_count - security_completed, 0),
+                "blocked_sanitized_missing": max(security_completed - sanitized_completed, 0),
+            },
+            "available": bool(row and message_count > 0),
             "last_run": _download_run_public(last_run) if last_run else None,
         }
+
+    async def completed_security_result(
+        self,
+        *,
+        email_uid: str,
+        raw_sha256: str,
+    ) -> dict[str, Any] | None:
+        await self.ensure_schema()
+        clean_uid = clean_email_uid(email_uid)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT result_json, security_status, error_message, checked_at, raw_sha256
+                FROM pim_email_security_checks
+                WHERE email_uid = $1 AND raw_sha256 = $2
+                ORDER BY checked_at DESC
+                LIMIT 1
+                """,
+                clean_uid,
+                str(raw_sha256 or ""),
+            )
+        finally:
+            await conn.close()
+        return _completed_security_result_from_row(
+            row,
+            email_uid=clean_uid,
+            raw_sha256=str(raw_sha256 or ""),
+        )
 
     async def local_folders(self, *, mailbox_id: str | None = None) -> list[dict[str, Any]]:
         await self.ensure_schema()
@@ -929,16 +1301,6 @@ class PgEmailStore:
                 configured_mailbox_id,
                 clean_uid,
             )
-            security = await conn.fetchrow(
-                """
-                SELECT result_json, security_status, error_message, checked_at, raw_sha256
-                FROM pim_email_security_checks
-                WHERE email_uid = $1
-                ORDER BY checked_at DESC
-                LIMIT 1
-                """,
-                clean_uid,
-            )
             assets = await conn.fetch(
                 """
                 SELECT asset_uid, source_url, content_type, transformed_sha256, storage_relpath,
@@ -950,6 +1312,39 @@ class PgEmailStore:
                 configured_mailbox_id,
                 clean_uid,
             )
+            stored_hash = str(_row_get(row, "raw_sha256", "")) if row is not None else ""
+            security = await conn.fetchrow(
+                """
+                SELECT result_json, security_status, error_message, checked_at, raw_sha256
+                FROM pim_email_security_checks
+                WHERE email_uid = $1 AND raw_sha256 = $2
+                ORDER BY checked_at DESC
+                LIMIT 1
+                """,
+                clean_uid,
+                stored_hash,
+            )
+            sanitized = await conn.fetchrow(
+                """
+                SELECT artifact_uid, email_uid, input_raw_sha256, sanitizer_policy_version,
+                       transform_version, output_sha256, storage_relpath, encrypted_size,
+                       views_available_json, safety_counts_json, derivation_json,
+                       generated_at, updated_at
+                FROM pim_email_sanitized_view_artifacts
+                WHERE mailbox_id = $1
+                  AND email_uid = $2
+                  AND input_raw_sha256 = $3
+                  AND sanitizer_policy_version = $4
+                  AND transform_version = $5
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                configured_mailbox_id,
+                clean_uid,
+                stored_hash,
+                SANITIZED_VIEW_POLICY_VERSION,
+                SANITIZED_VIEW_TRANSFORM_VERSION,
+            )
         finally:
             await conn.close()
         if row is None:
@@ -958,55 +1353,61 @@ class PgEmailStore:
         raw_sha256 = hashlib.sha256(raw).hexdigest()
         if raw_sha256 != str(row["raw_sha256"]):
             raise EmailOperationError("Local email content hash verification failed")
-        parsed = parse_message(
-            raw,
-            folder=str(memberships[0]["folder_name"]) if memberships else "",
-            uid=str(memberships[0]["imap_uid"]) if memberships else "",
+        completed_security = _completed_security_result_from_row(
+            security,
+            email_uid=clean_uid,
+            raw_sha256=raw_sha256,
         )
-        reparsed_email_uid = str(parsed.get("email_uid") or "")
-        stored_uid_info = _json_value(_row_get(row, "uid_info_json"), {})
-        stored_headers = _json_value(_row_get(row, "headers_json"), {})
-        headers = parsed.get("headers") if isinstance(parsed.get("headers"), dict) else {}
-        if isinstance(stored_headers, dict):
-            headers = {**headers, **stored_headers}
-        for key, column in {
-            "subject": "subject",
-            "from": "from_addr",
-            "to": "to_addr",
-            "date": "date_header",
-            "message_id": "message_id",
-        }.items():
-            value = str(_row_get(row, column, "") or "")
-            if value:
-                headers[key] = value
-        if isinstance(stored_uid_info, dict) and stored_uid_info:
-            parsed["email_uid_info"] = {**stored_uid_info, "email_uid": clean_uid}
-        parsed["email_uid"] = clean_uid
-        parsed["raw_sha256"] = raw_sha256
-        parsed["headers"] = headers
-        parsed["source"] = "local-corpus"
-        parsed["stored"] = {
-            "email_uid": clean_uid,
-            "raw_sha256": raw_sha256,
-            "storage_relpath": str(row["storage_relpath"]),
-            "encrypted_size": int(row["encrypted_size"] or 0),
-            "verified": True,
-            "memberships": [_membership_row_public(item) for item in memberships],
-            "transformed_assets": [_asset_row_public(item) for item in assets],
-        }
-        if reparsed_email_uid and reparsed_email_uid != clean_uid:
-            parsed["stored"]["reparsed_email_uid"] = reparsed_email_uid
-        if security is not None and _row_get(security, "result_json"):
-            parsed["security"] = dict(_json_value(_row_get(security, "result_json"), {}))
-        else:
-            parsed["security"] = {
-                "available": False,
-                "security_status": _row_get(security, "security_status", "missing")
-                if security
-                else "missing",
-                "raw_sha256": raw_sha256,
-            }
-        return parsed
+        if completed_security is None:
+            message = _local_message_envelope(
+                row,
+                memberships=list(memberships),
+                raw_sha256=raw_sha256,
+                security=_security_block_payload(
+                    email_uid=clean_uid,
+                    raw_sha256=raw_sha256,
+                    reason="completed_security_result_missing",
+                    row=security,
+                ),
+                body_blocked=True,
+            )
+            message["stored"]["transformed_assets"] = [_asset_row_public(item) for item in assets]
+            return message
+        if sanitized is None:
+            message = _local_message_envelope(
+                row,
+                memberships=list(memberships),
+                raw_sha256=raw_sha256,
+                security=completed_security,
+                body_blocked=True,
+            )
+            message["blocked_reason"] = "sanitized_derivative_missing"
+            message["stored"]["transformed_assets"] = [_asset_row_public(item) for item in assets]
+            return message
+        try:
+            sanitized_payload = read_sanitized_view_artifact(sanitized)
+        except Exception as exc:
+            message = _local_message_envelope(
+                row,
+                memberships=list(memberships),
+                raw_sha256=raw_sha256,
+                security=completed_security,
+                body_blocked=True,
+            )
+            message["blocked_reason"] = "sanitized_derivative_unreadable"
+            message["blocked_error"] = exc.__class__.__name__
+            message["stored"]["transformed_assets"] = [_asset_row_public(item) for item in assets]
+            return message
+        message = _local_message_envelope(
+            row,
+            memberships=list(memberships),
+            raw_sha256=raw_sha256,
+            security=completed_security,
+            body_blocked=False,
+            sanitized_artifact=sanitized_payload,
+        )
+        message["stored"]["transformed_assets"] = [_asset_row_public(item) for item in assets]
+        return message
 
     async def record_download_run_start(
         self,
@@ -1395,6 +1796,12 @@ class PgEmailStore:
                         if isinstance(security.get("aggregate"), dict)
                         else {}
                     )
+                    storage_security = _security_result_for_storage(
+                        security,
+                        email_uid=email_uid,
+                        raw_sha256=raw_sha256,
+                        parsed=parsed,
+                    )
                     security_check_id = _stable_id("email-security", email_uid, raw_sha256)
                     await conn.execute(
                         """
@@ -1427,15 +1834,19 @@ class PgEmailStore:
                         bool(
                             aggregate.get("llm_called") or (security.get("llm") or {}).get("called")
                         ),
-                        _json_dumps(security, sort_keys=True, separators=(",", ":")),
+                        _json_dumps(storage_security, sort_keys=True, separators=(",", ":")),
                         email_uid,
                         _json_dumps(
-                            _security_checker_versions(security),
+                            _security_checker_versions(storage_security),
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
                         _json_dumps(
-                            {"email_uid": email_uid, "raw_sha256": raw_sha256},
+                            {
+                                "email_uid": email_uid,
+                                "raw_sha256": raw_sha256,
+                                "policy_version": SECURITY_POLICY_VERSION,
+                            },
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
@@ -1621,6 +2032,954 @@ class PgEmailStore:
             await conn.close()
         return _asset_row_public(row)
 
+    async def store_sanitized_view_artifact(
+        self,
+        *,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO pim_email_sanitized_view_artifacts (
+                    artifact_uid, email_uid, mailbox_id, input_raw_sha256,
+                    sanitizer_policy_version, transform_version, output_sha256,
+                    storage_relpath, encrypted_size, views_available_json,
+                    safety_counts_json, derivation_json, encryption_json, updated_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,now())
+                ON CONFLICT (
+                    mailbox_id, email_uid, input_raw_sha256,
+                    sanitizer_policy_version, transform_version
+                ) DO UPDATE SET
+                    output_sha256 = EXCLUDED.output_sha256,
+                    storage_relpath = EXCLUDED.storage_relpath,
+                    encrypted_size = EXCLUDED.encrypted_size,
+                    views_available_json = EXCLUDED.views_available_json,
+                    safety_counts_json = EXCLUDED.safety_counts_json,
+                    derivation_json = EXCLUDED.derivation_json,
+                    encryption_json = EXCLUDED.encryption_json,
+                    updated_at = now()
+                RETURNING artifact_uid, email_uid, input_raw_sha256, sanitizer_policy_version,
+                          transform_version, output_sha256, storage_relpath, encrypted_size,
+                          views_available_json, safety_counts_json, derivation_json,
+                          generated_at, updated_at;
+                """,
+                str(artifact["artifact_uid"]),
+                clean_email_uid(str(artifact["email_uid"])),
+                str(artifact["mailbox_id"]),
+                str(artifact["input_raw_sha256"]),
+                str(artifact["sanitizer_policy_version"]),
+                str(artifact["transform_version"]),
+                str(artifact["output_sha256"]),
+                str(artifact["storage_relpath"]),
+                int(artifact.get("encrypted_size") or 0),
+                _json_dumps(
+                    artifact.get("views_available") or {}, sort_keys=True, separators=(",", ":")
+                ),
+                _json_dumps(
+                    artifact.get("safety_counts") or {}, sort_keys=True, separators=(",", ":")
+                ),
+                _json_dumps(
+                    artifact.get("derivation") or {}, sort_keys=True, separators=(",", ":")
+                ),
+                _json_dumps(
+                    artifact.get("encryption") or {}, sort_keys=True, separators=(",", ":")
+                ),
+            )
+        finally:
+            await conn.close()
+        return _sanitized_artifact_row_public(row)
+
+    async def record_external_image_derivative_state(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        input_raw_sha256: str,
+        source_url: str,
+        status: str,
+        reason: str = "",
+        safety_decision: str = "",
+        transform_version: str = "",
+        raw_image_sha256: str = "",
+        transformed_sha256: str = "",
+        storage_relpath: str = "",
+        encrypted_size: int = 0,
+        content_type: str = "",
+        width: int = 0,
+        height: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        clean_uid = clean_email_uid(email_uid)
+        canonical = _canonical_remote_image_url(source_url) or str(source_url or "")
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {
+            "pending",
+            "fetched",
+            "transformed",
+            "stored",
+            "blocked",
+            "failed",
+            "skipped",
+        }:
+            raise EmailOperationError("Invalid external image derivative status")
+        derivative_id = _stable_id(
+            "email-image-derivative",
+            mailbox_id,
+            clean_uid,
+            input_raw_sha256,
+            canonical,
+        )
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO pim_email_external_image_derivatives (
+                    derivative_id, email_uid, mailbox_id, input_raw_sha256,
+                    source_url, canonical_url, status, reason, safety_decision,
+                    transform_version, raw_image_sha256, transformed_sha256,
+                    storage_relpath, encrypted_size, content_type, width, height,
+                    metadata_json, fetched_at, transformed_at, stored_at, updated_at
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,
+                    CASE WHEN $7 IN ('fetched','transformed','stored') THEN now() ELSE NULL END,
+                    CASE WHEN $7 IN ('transformed','stored') THEN now() ELSE NULL END,
+                    CASE WHEN $7 = 'stored' THEN now() ELSE NULL END,
+                    now()
+                )
+                ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    reason = EXCLUDED.reason,
+                    safety_decision = EXCLUDED.safety_decision,
+                    transform_version = EXCLUDED.transform_version,
+                    raw_image_sha256 = EXCLUDED.raw_image_sha256,
+                    transformed_sha256 = EXCLUDED.transformed_sha256,
+                    storage_relpath = EXCLUDED.storage_relpath,
+                    encrypted_size = EXCLUDED.encrypted_size,
+                    content_type = EXCLUDED.content_type,
+                    width = EXCLUDED.width,
+                    height = EXCLUDED.height,
+                    metadata_json = EXCLUDED.metadata_json,
+                    fetched_at = COALESCE(EXCLUDED.fetched_at, pim_email_external_image_derivatives.fetched_at),
+                    transformed_at = COALESCE(EXCLUDED.transformed_at, pim_email_external_image_derivatives.transformed_at),
+                    stored_at = COALESCE(EXCLUDED.stored_at, pim_email_external_image_derivatives.stored_at),
+                    updated_at = now()
+                RETURNING derivative_id, email_uid, input_raw_sha256, source_url,
+                          canonical_url, status, reason, safety_decision,
+                          transform_version, raw_image_sha256, transformed_sha256,
+                          storage_relpath, encrypted_size, content_type, width,
+                          height, retry_count, last_error, created_at, updated_at;
+                """,
+                derivative_id,
+                clean_uid,
+                mailbox_id,
+                str(input_raw_sha256 or ""),
+                str(source_url or ""),
+                canonical,
+                clean_status,
+                str(reason or "")[:1000],
+                str(safety_decision or ""),
+                str(transform_version or ""),
+                str(raw_image_sha256 or ""),
+                str(transformed_sha256 or ""),
+                str(storage_relpath or ""),
+                int(encrypted_size or 0),
+                str(content_type or ""),
+                int(width or 0),
+                int(height or 0),
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "derivative_id": str(_row_get(row, "derivative_id", "")),
+            "email_uid": str(_row_get(row, "email_uid", "")),
+            "input_raw_sha256": str(_row_get(row, "input_raw_sha256", "")),
+            "source_url": str(_row_get(row, "source_url", "")),
+            "canonical_url": str(_row_get(row, "canonical_url", "")),
+            "status": str(_row_get(row, "status", "")),
+            "reason": str(_row_get(row, "reason", "")),
+            "safety_decision": str(_row_get(row, "safety_decision", "")),
+            "transform_version": str(_row_get(row, "transform_version", "")),
+            "raw_image_sha256": str(_row_get(row, "raw_image_sha256", "")),
+            "transformed_sha256": str(_row_get(row, "transformed_sha256", "")),
+            "storage_relpath": str(_row_get(row, "storage_relpath", "")),
+            "encrypted_size": int(_row_get(row, "encrypted_size", 0) or 0),
+            "content_type": str(_row_get(row, "content_type", "")),
+            "width": int(_row_get(row, "width", 0) or 0),
+            "height": int(_row_get(row, "height", 0) or 0),
+            "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+        }
+
+    async def record_external_image_derivatives_skipped(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        input_raw_sha256: str,
+        source_urls: list[str],
+        reason: str,
+        safety_decision: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        await self.ensure_schema()
+        clean_uid = clean_email_uid(email_uid)
+        unique_sources: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for source in source_urls or []:
+            canonical = _canonical_remote_image_url(source) or str(source or "")
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            unique_sources.append((str(source or ""), canonical))
+        counts = {
+            "stored": 0,
+            "blocked": 0,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "created_skipped": 0,
+        }
+        if not unique_sources:
+            return counts
+        conn = await self._connect()
+        try:
+            existing_rows = await conn.fetch(
+                """
+                SELECT canonical_url, status
+                FROM pim_email_external_image_derivatives
+                WHERE mailbox_id = $1
+                  AND email_uid = $2
+                  AND input_raw_sha256 = $3
+                  AND canonical_url = ANY($4::text[])
+                """,
+                mailbox_id,
+                clean_uid,
+                str(input_raw_sha256 or ""),
+                [canonical for _, canonical in unique_sources],
+            )
+            existing = {
+                str(row["canonical_url"]): str(row["status"] or "") for row in existing_rows
+            }
+            inserts: list[tuple[Any, ...]] = []
+            for source, canonical in unique_sources:
+                status = existing.get(canonical, "")
+                if status in {"stored", "blocked", "failed", "skipped"}:
+                    counts[status] += 1
+                    continue
+                derivative_id = _stable_id(
+                    "email-image-derivative",
+                    mailbox_id,
+                    clean_uid,
+                    input_raw_sha256,
+                    canonical,
+                )
+                inserts.append(
+                    (
+                        derivative_id,
+                        clean_uid,
+                        mailbox_id,
+                        str(input_raw_sha256 or ""),
+                        source,
+                        canonical,
+                        "skipped",
+                        str(reason or "")[:1000],
+                        str(safety_decision or ""),
+                        EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                        _json_dumps(
+                            {
+                                **(metadata or {}),
+                                "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                                "completion_kind": "durable-skipped-state",
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+            if inserts:
+                await conn.executemany(
+                    """
+                    INSERT INTO pim_email_external_image_derivatives (
+                        derivative_id, email_uid, mailbox_id, input_raw_sha256,
+                        source_url, canonical_url, status, reason, safety_decision,
+                        transform_version, metadata_json, updated_at
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,now())
+                    ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url)
+                    DO UPDATE SET
+                        status = EXCLUDED.status,
+                        reason = EXCLUDED.reason,
+                        safety_decision = EXCLUDED.safety_decision,
+                        transform_version = EXCLUDED.transform_version,
+                        metadata_json = EXCLUDED.metadata_json,
+                        updated_at = now()
+                    WHERE pim_email_external_image_derivatives.status
+                      NOT IN ('stored','blocked','failed','skipped')
+                    """,
+                    inserts,
+                )
+                counts["skipped"] += len(inserts)
+                counts["created_skipped"] += len(inserts)
+        finally:
+            await conn.close()
+        return counts
+
+    async def current_sanitized_view_artifact(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        raw_sha256: str,
+    ) -> dict[str, Any] | None:
+        await self.ensure_schema()
+        clean_uid = clean_email_uid(email_uid)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT artifact_uid, email_uid, input_raw_sha256, sanitizer_policy_version,
+                       transform_version, output_sha256, storage_relpath, encrypted_size,
+                       views_available_json, safety_counts_json, derivation_json,
+                       generated_at, updated_at
+                FROM pim_email_sanitized_view_artifacts
+                WHERE mailbox_id = $1
+                  AND email_uid = $2
+                  AND input_raw_sha256 = $3
+                  AND sanitizer_policy_version = $4
+                  AND transform_version = $5
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                mailbox_id,
+                clean_uid,
+                str(raw_sha256 or ""),
+                SANITIZED_VIEW_POLICY_VERSION,
+                SANITIZED_VIEW_TRANSFORM_VERSION,
+            )
+        finally:
+            await conn.close()
+        return _sanitized_artifact_row_public(row) if row else None
+
+    async def run_local_security_check(
+        self,
+        email_uid: str,
+        *,
+        mailbox_id: str | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_uid = clean_email_uid(email_uid)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM pim_email_messages
+                WHERE mailbox_id = $1 AND email_uid = $2
+                """,
+                configured_mailbox_id,
+                clean_uid,
+            )
+            membership = await conn.fetchrow(
+                """
+                SELECT folder_name, imap_uid
+                FROM pim_email_folder_memberships
+                WHERE mailbox_id = $1 AND email_uid = $2
+                ORDER BY last_seen_at DESC
+                LIMIT 1
+                """,
+                configured_mailbox_id,
+                clean_uid,
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("Local email message is not stored")
+        raw = read_encrypted_bytes(str(row["storage_relpath"]))
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        if raw_sha256 != str(row["raw_sha256"]):
+            raise EmailOperationError("Local email content hash verification failed")
+        parsed = parse_message(
+            raw,
+            folder=str(_row_get(membership, "folder_name", "")) if membership else "",
+            uid=str(_row_get(membership, "imap_uid", "")) if membership else "",
+        )
+        parsed["email_uid"] = clean_uid
+        parsed["raw_sha256"] = raw_sha256
+        security = check_email_security_sync(
+            raw,
+            body_text=str((parsed.get("views") or {}).get("plain") or ""),
+            progress_callback=progress_callback,
+        )
+        storage_security = _security_result_for_storage(
+            security,
+            email_uid=clean_uid,
+            raw_sha256=raw_sha256,
+            parsed=parsed,
+        )
+        aggregate = (
+            storage_security.get("aggregate")
+            if isinstance(storage_security.get("aggregate"), dict)
+            else {}
+        )
+        folder = clean_folder_name(str(_row_get(membership, "folder_name", "local") or "local"))
+        uid = str(_row_get(membership, "imap_uid", clean_uid) if membership else clean_uid)
+        message_id = str((parsed.get("headers") or {}).get("message_id") or "")
+        security_check_id = _stable_id("email-security", clean_uid, raw_sha256)
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_security_checks (
+                    security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
+                    aggregate_status, aggregate_score, llm_called, result_json, checked_at,
+                    email_uid, security_status, checker_versions_json, metadata_json
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
+                ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                    message_id = EXCLUDED.message_id,
+                    aggregate_status = EXCLUDED.aggregate_status,
+                    aggregate_score = EXCLUDED.aggregate_score,
+                    llm_called = EXCLUDED.llm_called,
+                    result_json = EXCLUDED.result_json,
+                    email_uid = EXCLUDED.email_uid,
+                    security_status = EXCLUDED.security_status,
+                    checker_versions_json = EXCLUDED.checker_versions_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    error_message = '',
+                    checked_at = now();
+                """,
+                security_check_id,
+                configured_mailbox_id,
+                folder,
+                uid,
+                message_id,
+                raw_sha256,
+                str(aggregate.get("status") or "amber"),
+                int(aggregate.get("score") or aggregate.get("risk_score") or 0),
+                bool(
+                    aggregate.get("llm_called") or (storage_security.get("llm") or {}).get("called")
+                ),
+                _json_dumps(storage_security, sort_keys=True, separators=(",", ":")),
+                clean_uid,
+                _json_dumps(
+                    _security_checker_versions(storage_security),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                _json_dumps(
+                    {
+                        "schema": "xarta.pim_email.security_result.metadata.v1",
+                        "email_uid": clean_uid,
+                        "raw_sha256": raw_sha256,
+                        "policy_version": SECURITY_POLICY_VERSION,
+                        "source": "local-email-uid-security-action",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        finally:
+            await conn.close()
+        sanitized_artifact = build_sanitized_view_artifact(
+            mailbox_id=configured_mailbox_id,
+            email_uid=clean_uid,
+            raw=raw,
+            raw_sha256=raw_sha256,
+        )
+        artifact_public = await self.store_sanitized_view_artifact(artifact=sanitized_artifact)
+        return {
+            "schema": "xarta.pim_email.local_security_result.v1",
+            "email_uid": clean_uid,
+            "raw_sha256": raw_sha256,
+            "security": storage_security,
+            "sanitized_view": artifact_public,
+        }
+
+    async def _record_backfill_item(
+        self,
+        *,
+        run_id: str,
+        batch_id: str,
+        mailbox_id: str,
+        email_uid: str,
+        raw_sha256: str,
+        artifact_type: str,
+        status: str,
+        error_class: str = "",
+        error_message: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"running", "completed", "skipped", "failed"}:
+            raise EmailOperationError("Invalid backfill item status")
+        clean_artifact = str(artifact_type or "").strip().lower()
+        if not clean_artifact:
+            raise EmailOperationError("Invalid backfill artifact type")
+        item_id = _stable_id(
+            "email-backfill-item",
+            run_id,
+            email_uid,
+            raw_sha256,
+            clean_artifact,
+        )
+        finished = clean_status in {"completed", "skipped", "failed"}
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_backfill_items (
+                    item_id, run_id, batch_id, mailbox_id, email_uid, raw_sha256,
+                    artifact_type, status, attempts, error_class, error_message,
+                    metadata_json, started_at, finished_at, updated_at
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,
+                    CASE WHEN $8 = 'running' THEN 1 ELSE 0 END,
+                    $9,$10,$11::jsonb,
+                    CASE WHEN $8 = 'running' THEN now() ELSE NULL END,
+                    CASE WHEN $12 THEN now() ELSE NULL END,
+                    now()
+                )
+                ON CONFLICT (run_id, email_uid, raw_sha256, artifact_type)
+                DO UPDATE SET
+                    batch_id = EXCLUDED.batch_id,
+                    status = EXCLUDED.status,
+                    attempts = pim_email_backfill_items.attempts
+                      + CASE WHEN EXCLUDED.status = 'running' THEN 1 ELSE 0 END,
+                    error_class = EXCLUDED.error_class,
+                    error_message = EXCLUDED.error_message,
+                    metadata_json = EXCLUDED.metadata_json,
+                    started_at = COALESCE(pim_email_backfill_items.started_at, EXCLUDED.started_at),
+                    finished_at = CASE WHEN $12 THEN now() ELSE pim_email_backfill_items.finished_at END,
+                    updated_at = now()
+                """,
+                item_id,
+                run_id,
+                batch_id,
+                mailbox_id,
+                clean_email_uid(email_uid),
+                str(raw_sha256 or ""),
+                clean_artifact,
+                clean_status,
+                str(error_class or "")[:200],
+                str(error_message or "")[:1000],
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                finished,
+            )
+        finally:
+            await conn.close()
+
+    async def run_backfill(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        email_uid: str | None = None,
+        limit: int | None = None,
+        artifact_types: list[str] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        allowed_artifacts = {"security", "sanitized_view", "external_images"}
+        requested_artifacts = [
+            str(item or "").strip().lower().replace("-", "_")
+            for item in (artifact_types or ["security", "sanitized_view", "external_images"])
+        ]
+        clean_artifacts = [item for item in requested_artifacts if item in allowed_artifacts]
+        if not clean_artifacts:
+            raise EmailOperationError("No valid PIM email backfill artifact types requested")
+        clean_email_filter = clean_email_uid(email_uid) if email_uid else ""
+        safe_limit = None if limit is None else max(1, int(limit))
+        actual_run_id = str(
+            run_id
+            or _stable_id(
+                "email-backfill-run",
+                configured_mailbox_id,
+                ",".join(clean_artifacts),
+                str(time.time_ns()),
+            )
+        )
+        conn = await self._connect()
+        try:
+            params: list[Any] = [configured_mailbox_id]
+            where = "WHERE mailbox_id = $1"
+            if clean_email_filter:
+                params.append(clean_email_filter)
+                where += f" AND email_uid = ${len(params)}"
+            limit_clause = ""
+            if safe_limit is not None:
+                params.append(safe_limit)
+                limit_clause = f"LIMIT ${len(params)}"
+            rows = await conn.fetch(
+                f"""
+                SELECT email_uid, mailbox_id, raw_sha256, storage_relpath, updated_at
+                FROM pim_email_messages
+                {where}
+                ORDER BY updated_at ASC, email_uid ASC
+                {limit_clause}
+                """,
+                *params,
+            )
+            await conn.execute(
+                """
+                INSERT INTO pim_email_backfill_runs (
+                    run_id, mailbox_id, status, requested_limit, artifact_types_json,
+                    metadata_json, updated_at
+                )
+                VALUES ($1,$2,'running',$3,$4::jsonb,$5::jsonb,now())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status = 'running',
+                    requested_limit = EXCLUDED.requested_limit,
+                    artifact_types_json = EXCLUDED.artifact_types_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now()
+                """,
+                actual_run_id,
+                configured_mailbox_id,
+                safe_limit,
+                _json_dumps(clean_artifacts, sort_keys=True, separators=(",", ":")),
+                _json_dumps(
+                    {
+                        "schema": "xarta.pim_email.backfill_run.metadata.v1",
+                        "email_uid": clean_email_filter,
+                        "security_policy_version": SECURITY_POLICY_VERSION,
+                        "sanitizer_policy_version": SANITIZED_VIEW_POLICY_VERSION,
+                        "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
+                        "external_image_derivative_version": EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        finally:
+            await conn.close()
+        batch_id = _stable_id(
+            "email-backfill-batch",
+            actual_run_id,
+            configured_mailbox_id,
+            str(len(rows)),
+            str(time.time_ns()),
+        )
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_backfill_batches (
+                    batch_id, run_id, mailbox_id, artifact_types_json,
+                    planned_count, metadata_json, updated_at
+                )
+                VALUES ($1,$2,$3,$4::jsonb,$5,$6::jsonb,now())
+                ON CONFLICT (batch_id) DO UPDATE SET
+                    planned_count = EXCLUDED.planned_count,
+                    artifact_types_json = EXCLUDED.artifact_types_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now()
+                """,
+                batch_id,
+                actual_run_id,
+                configured_mailbox_id,
+                _json_dumps(clean_artifacts, sort_keys=True, separators=(",", ":")),
+                len(rows),
+                _json_dumps(
+                    {"schema": "xarta.pim_email.backfill_batch.metadata.v1"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        finally:
+            await conn.close()
+        summary: dict[str, Any] = {
+            "schema": "xarta.pim_email.backfill_run.summary.v1",
+            "mailbox_id": configured_mailbox_id,
+            "artifact_types": clean_artifacts,
+            "planned_messages": len(rows),
+            "processed_messages": 0,
+            "raw_originals_verified": 0,
+            "raw_originals_failed": 0,
+            "security_completed": 0,
+            "security_already_completed": 0,
+            "security_failed": 0,
+            "sanitized_views_stored": 0,
+            "sanitized_views_already_current": 0,
+            "sanitized_views_failed": 0,
+            "external_images_stored": 0,
+            "external_images_blocked": 0,
+            "external_images_failed": 0,
+            "external_images_skipped": 0,
+            "external_images_pending": 0,
+            "external_images_captured": 0,
+            "failed_messages": 0,
+        }
+        run_status = "completed"
+        for row in rows:
+            email_uid = clean_email_uid(str(row["email_uid"]))
+            expected_hash = str(row["raw_sha256"] or "")
+            raw = b""
+            try:
+                raw = read_encrypted_bytes(str(row["storage_relpath"]))
+                actual_hash = hashlib.sha256(raw).hexdigest()
+                if actual_hash != expected_hash:
+                    raise EmailOperationError("Backfill raw hash verification failed")
+                summary["raw_originals_verified"] += 1
+            except Exception as exc:
+                run_status = "completed-with-errors"
+                summary["raw_originals_failed"] += 1
+                summary["failed_messages"] += 1
+                for artifact in clean_artifacts:
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type=artifact,
+                        status="failed",
+                        error_class=exc.__class__.__name__,
+                        error_message=str(exc),
+                        metadata={"phase": "raw-verification"},
+                    )
+                continue
+
+            if "security" in clean_artifacts:
+                await self._record_backfill_item(
+                    run_id=actual_run_id,
+                    batch_id=batch_id,
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=email_uid,
+                    raw_sha256=expected_hash,
+                    artifact_type="security",
+                    status="running",
+                    metadata={"phase": "security"},
+                )
+                try:
+                    completed = await self.completed_security_result(
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                    )
+                    if completed is None:
+                        await self.run_local_security_check(
+                            email_uid,
+                            mailbox_id=configured_mailbox_id,
+                        )
+                        summary["security_completed"] += 1
+                    else:
+                        summary["security_already_completed"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="security",
+                        status="completed",
+                        metadata={"phase": "security"},
+                    )
+                except Exception as exc:
+                    run_status = "completed-with-errors"
+                    summary["security_failed"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="security",
+                        status="failed",
+                        error_class=exc.__class__.__name__,
+                        error_message=str(exc),
+                        metadata={"phase": "security"},
+                    )
+
+            if "sanitized_view" in clean_artifacts:
+                await self._record_backfill_item(
+                    run_id=actual_run_id,
+                    batch_id=batch_id,
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=email_uid,
+                    raw_sha256=expected_hash,
+                    artifact_type="sanitized_view",
+                    status="running",
+                    metadata={"phase": "sanitized-view"},
+                )
+                try:
+                    current = await self.current_sanitized_view_artifact(
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                    )
+                    if current is None:
+                        artifact = build_sanitized_view_artifact(
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw=raw,
+                            raw_sha256=expected_hash,
+                        )
+                        await self.store_sanitized_view_artifact(artifact=artifact)
+                        summary["sanitized_views_stored"] += 1
+                    else:
+                        summary["sanitized_views_already_current"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="sanitized_view",
+                        status="completed",
+                        metadata={"phase": "sanitized-view"},
+                    )
+                except Exception as exc:
+                    run_status = "completed-with-errors"
+                    summary["sanitized_views_failed"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="sanitized_view",
+                        status="failed",
+                        error_class=exc.__class__.__name__,
+                        error_message=str(exc),
+                        metadata={"phase": "sanitized-view"},
+                    )
+
+            if "external_images" in clean_artifacts:
+                await self._record_backfill_item(
+                    run_id=actual_run_id,
+                    batch_id=batch_id,
+                    mailbox_id=configured_mailbox_id,
+                    email_uid=email_uid,
+                    raw_sha256=expected_hash,
+                    artifact_type="external_images",
+                    status="running",
+                    metadata={"phase": "external-images"},
+                )
+                try:
+                    sources = remote_image_sources_from_raw(raw)
+                    summary["external_images_captured"] += len(sources)
+                    counts = await self.record_external_image_derivatives_skipped(
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        input_raw_sha256=expected_hash,
+                        source_urls=sources,
+                        reason="external_image_fetch_disabled_by_local_backfill_policy",
+                        safety_decision="skipped_not_fetched",
+                        metadata={"run_id": actual_run_id, "batch_id": batch_id},
+                    )
+                    summary["external_images_stored"] += counts["stored"]
+                    summary["external_images_blocked"] += counts["blocked"]
+                    summary["external_images_failed"] += counts["failed"]
+                    summary["external_images_skipped"] += counts["skipped"]
+                    summary["external_images_pending"] += counts["pending"]
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="external_images",
+                        status="completed" if sources else "skipped",
+                        metadata={"phase": "external-images", "captured": len(sources)},
+                    )
+                except Exception as exc:
+                    run_status = "completed-with-errors"
+                    summary["external_images_failed"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type="external_images",
+                        status="failed",
+                        error_class=exc.__class__.__name__,
+                        error_message=str(exc),
+                        metadata={"phase": "external-images"},
+                    )
+            summary["processed_messages"] += 1
+            conn = await self._connect()
+            try:
+                await conn.execute(
+                    """
+                    UPDATE pim_email_backfill_runs
+                    SET processed_count = $2,
+                        failed_count = $3,
+                        summary_json = $4::jsonb,
+                        updated_at = now()
+                    WHERE run_id = $1
+                    """,
+                    actual_run_id,
+                    int(summary["processed_messages"]),
+                    int(summary["failed_messages"]),
+                    _json_dumps(summary, sort_keys=True, separators=(",", ":")),
+                )
+                await conn.execute(
+                    """
+                    UPDATE pim_email_backfill_batches
+                    SET processed_count = $2,
+                        failed_count = $3,
+                        metadata_json = $4::jsonb,
+                        updated_at = now()
+                    WHERE batch_id = $1
+                    """,
+                    batch_id,
+                    int(summary["processed_messages"]),
+                    int(summary["failed_messages"]),
+                    _json_dumps({"summary": summary}, sort_keys=True, separators=(",", ":")),
+                )
+            finally:
+                await conn.close()
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_backfill_runs
+                SET status = $2,
+                    processed_count = $3,
+                    failed_count = $4,
+                    summary_json = $5::jsonb,
+                    finished_at = now(),
+                    updated_at = now()
+                WHERE run_id = $1
+                """,
+                actual_run_id,
+                run_status,
+                int(summary["processed_messages"]),
+                int(summary["failed_messages"]),
+                _json_dumps(summary, sort_keys=True, separators=(",", ":")),
+            )
+            await conn.execute(
+                """
+                UPDATE pim_email_backfill_batches
+                SET processed_count = $2,
+                    failed_count = $3,
+                    metadata_json = $4::jsonb,
+                    updated_at = now()
+                WHERE batch_id = $1
+                """,
+                batch_id,
+                int(summary["processed_messages"]),
+                int(summary["failed_messages"]),
+                _json_dumps({"summary": summary}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "ok": run_status != "failed",
+            "run_id": actual_run_id,
+            "batch_id": batch_id,
+            "status": run_status,
+            "summary": summary,
+        }
+
 
 def _mailbox_row_public(row: Any) -> dict[str, Any]:
     updated = _row_get(row, "updated_at")
@@ -1656,6 +3015,11 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 def _json_value(value: Any, default: Any) -> Any:
     if value is None:
         return default
+    if isinstance(value, bytes):
+        try:
+            return json.loads(value.decode("utf-8"))
+        except Exception:
+            return default
     if isinstance(value, str):
         try:
             return json.loads(value)
@@ -1748,6 +3112,27 @@ def _asset_row_public(row: Any) -> dict[str, Any]:
     }
 
 
+def _sanitized_artifact_row_public(row: Any) -> dict[str, Any]:
+    safety_counts = _json_value(_row_get(row, "safety_counts_json"), {})
+    derivation = _json_value(_row_get(row, "derivation_json"), {})
+    views_available = _json_value(_row_get(row, "views_available_json"), {})
+    return {
+        "artifact_uid": str(_row_get(row, "artifact_uid", "")),
+        "email_uid": str(_row_get(row, "email_uid", "")),
+        "input_raw_sha256": str(_row_get(row, "input_raw_sha256", "")),
+        "sanitizer_policy_version": str(_row_get(row, "sanitizer_policy_version", "")),
+        "transform_version": str(_row_get(row, "transform_version", "")),
+        "output_sha256": str(_row_get(row, "output_sha256", "")),
+        "storage_relpath": str(_row_get(row, "storage_relpath", "")),
+        "encrypted_size": int(_row_get(row, "encrypted_size", 0) or 0),
+        "views_available": views_available if isinstance(views_available, dict) else {},
+        "safety_counts": safety_counts if isinstance(safety_counts, dict) else {},
+        "derivation": derivation if isinstance(derivation, dict) else {},
+        "generated_at": _iso_datetime(_row_get(row, "generated_at")),
+        "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+    }
+
+
 def clean_email_uid(value: str) -> str:
     clean = str(value or "").strip().lower()
     if not re.fullmatch(r"[0-9]{8}-[0-9a-f]{40}", clean):
@@ -1770,6 +3155,265 @@ def _security_checker_versions(security: dict[str, Any]) -> dict[str, Any]:
         "llm_model": str(llm.get("model") or ""),
         "llm_tools": "disabled",
     }
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _sanitized_view_relpath(email_uid: str, artifact_uid: str) -> str:
+    clean_uid = clean_email_uid(email_uid)
+    prefix = clean_uid.split("-", 1)[0]
+    if prefix == "00000000":
+        return f"undated/views/{clean_uid}/{artifact_uid}.json.enc"
+    return f"{prefix[0:4]}/{prefix[4:6]}/{prefix[6:8]}/views/{clean_uid}/{artifact_uid}.json.enc"
+
+
+def _sanitizer_safety_counts(parsed: dict[str, Any]) -> dict[str, Any]:
+    html_security = (
+        parsed.get("html_security") if isinstance(parsed.get("html_security"), dict) else {}
+    )
+    return {
+        "schema": "xarta.pim_email.sanitizer_safety_counts.v1",
+        "remote_images_blocked": int(html_security.get("remote_images_blocked") or 0),
+        "remote_images_proxied": int(html_security.get("remote_images_proxied") or 0),
+        "tracking_images_blocked": int(html_security.get("tracking_images_blocked") or 0),
+        "inline_images_rendered": int(html_security.get("inline_images_rendered") or 0),
+        "inline_images_blocked": int(html_security.get("inline_images_blocked") or 0),
+        "active_content_blocked": int(html_security.get("active_content_blocked") or 0),
+        "unsafe_links_blocked": int(html_security.get("unsafe_links_blocked") or 0),
+        "allowed_links": int(html_security.get("allowed_links") or 0),
+    }
+
+
+def _security_counts(parsed: dict[str, Any]) -> dict[str, Any]:
+    counts = _sanitizer_safety_counts(parsed)
+    return {
+        "schema": "xarta.pim_email.security_counts.v1",
+        "url_link_count": counts["allowed_links"] + counts["unsafe_links_blocked"],
+        "image_count": (
+            counts["remote_images_blocked"]
+            + counts["remote_images_proxied"]
+            + counts["tracking_images_blocked"]
+            + counts["inline_images_rendered"]
+            + counts["inline_images_blocked"]
+        ),
+        "tracking_image_count": counts["tracking_images_blocked"],
+        "active_content_count": counts["active_content_blocked"],
+        "sanitizer_safety_counts": counts,
+    }
+
+
+def _security_result_for_storage(
+    security: dict[str, Any],
+    *,
+    email_uid: str,
+    raw_sha256: str,
+    parsed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(_json_safe(security))
+    result["schema"] = str(result.get("schema") or SECURITY_CHECK_SCHEMA)
+    result["available"] = bool(result.get("available"))
+    result["email_uid"] = clean_email_uid(email_uid)
+    result["raw_sha256"] = str(raw_sha256)
+    result["policy_version"] = SECURITY_POLICY_VERSION
+    result["sanitizer_policy_version"] = SANITIZED_VIEW_POLICY_VERSION
+    result["checker_versions"] = _security_checker_versions(result)
+    if parsed is not None:
+        result["message_counts"] = _security_counts(parsed)
+    result.setdefault("checked_at", _now_iso())
+    return result
+
+
+def _completed_security_result_from_row(
+    row: Any,
+    *,
+    email_uid: str,
+    raw_sha256: str,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    result = _json_value(_row_get(row, "result_json"), {})
+    if not isinstance(result, dict):
+        return None
+    if str(_row_get(row, "security_status", "")) != "stored":
+        return None
+    if str(_row_get(row, "raw_sha256", "")) != str(raw_sha256):
+        return None
+    if result.get("available") is not True:
+        return None
+    if result.get("queued") or result.get("placeholder"):
+        return None
+    if str(result.get("email_uid") or "") != clean_email_uid(email_uid):
+        return None
+    if str(result.get("raw_sha256") or "") != str(raw_sha256):
+        return None
+    if not str(result.get("checked_at") or ""):
+        return None
+    if not isinstance(result.get("checker_versions"), dict):
+        return None
+    return result
+
+
+def _security_block_payload(
+    *,
+    email_uid: str,
+    raw_sha256: str,
+    reason: str,
+    row: Any | None = None,
+) -> dict[str, Any]:
+    status = str(_row_get(row, "security_status", "missing") if row is not None else "missing")
+    return {
+        "schema": "xarta.pim_email.security_gate.v1",
+        "available": False,
+        "completed": False,
+        "email_uid": clean_email_uid(email_uid),
+        "raw_sha256": str(raw_sha256),
+        "security_status": status or "missing",
+        "blocked_reason": reason,
+        "checked_at": _iso_datetime(_row_get(row, "checked_at")) if row is not None else "",
+        "error_message": str(_row_get(row, "error_message", "") if row is not None else ""),
+    }
+
+
+def _local_message_envelope(
+    row: Any,
+    *,
+    memberships: list[Any],
+    raw_sha256: str,
+    security: dict[str, Any],
+    body_blocked: bool,
+    sanitized_artifact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clean_uid = clean_email_uid(str(_row_get(row, "email_uid", "")))
+    headers = {
+        "subject": str(_row_get(row, "subject", "")),
+        "from": str(_row_get(row, "from_addr", "")),
+        "to": str(_row_get(row, "to_addr", "")),
+        "date": str(_row_get(row, "date_header", "")),
+        "message_id": str(_row_get(row, "message_id", "")),
+    }
+    first_membership = memberships[0] if memberships else None
+    message: dict[str, Any] = {
+        "uid": str(_row_get(first_membership, "imap_uid", "")) if first_membership else "",
+        "folder": str(_row_get(first_membership, "folder_name", "")) if first_membership else "",
+        "email_uid": clean_uid,
+        "email_uid_info": _json_value(_row_get(row, "uid_info_json"), {}),
+        "raw_sha256": str(raw_sha256),
+        "headers": headers,
+        "source": "local-corpus",
+        "security": security,
+        "body_blocked": bool(body_blocked),
+        "views": {},
+        "views_available": {"plain": False, "html": False, "markdown": False, "raw": False},
+        "stored": {
+            "email_uid": clean_uid,
+            "raw_sha256": str(raw_sha256),
+            "encrypted_size": int(_row_get(row, "encrypted_size", 0) or 0),
+            "verified": True,
+            "memberships": [_membership_row_public(item) for item in memberships],
+            "raw_original_access": "blocked",
+        },
+    }
+    if sanitized_artifact:
+        message.update(
+            {
+                "views": sanitized_artifact.get("views") or {},
+                "views_available": {
+                    **(sanitized_artifact.get("views_available") or {}),
+                    "raw": False,
+                },
+                "html_security": sanitized_artifact.get("html_security") or {},
+                "attachments": sanitized_artifact.get("attachments") or [],
+            }
+        )
+        message["stored"]["sanitized_view"] = sanitized_artifact.get("artifact") or {}
+    return message
+
+
+def build_sanitized_view_artifact(
+    *,
+    mailbox_id: str,
+    email_uid: str,
+    raw: bytes,
+    raw_sha256: str | None = None,
+) -> dict[str, Any]:
+    clean_uid = clean_email_uid(email_uid)
+    input_hash = str(raw_sha256 or hashlib.sha256(bytes(raw or b"")).hexdigest())
+    parsed = parse_message(bytes(raw or b""), folder="", uid="")
+    payload = {
+        "schema": "xarta.pim_email.sanitized_view_artifact.v1",
+        "email_uid": clean_uid,
+        "input_raw_sha256": input_hash,
+        "sanitizer_policy_version": SANITIZED_VIEW_POLICY_VERSION,
+        "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
+        "headers": parsed.get("headers") or {},
+        "views": {
+            "plain": str((parsed.get("views") or {}).get("plain") or ""),
+            "html": str((parsed.get("views") or {}).get("html") or ""),
+            "markdown": str((parsed.get("views") or {}).get("markdown") or ""),
+        },
+        "views_available": {
+            "plain": bool((parsed.get("views") or {}).get("plain")),
+            "html": bool((parsed.get("views") or {}).get("html")),
+            "markdown": bool((parsed.get("views") or {}).get("markdown")),
+            "raw": False,
+        },
+        "html_security": parsed.get("html_security") or {},
+        "attachments": parsed.get("attachments") or [],
+        "safety_counts": _sanitizer_safety_counts(parsed),
+        "derivation": {
+            "schema": "xarta.pim_email.sanitized_view.derivation.v1",
+            "input": "encrypted-raw-eml",
+            "input_raw_sha256": input_hash,
+            "raw_original_exposed": False,
+        },
+    }
+    encoded = _json_dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    output_sha256 = hashlib.sha256(encoded).hexdigest()
+    artifact_uid = _stable_id(
+        "email-sanitized-view",
+        mailbox_id,
+        clean_uid,
+        input_hash,
+        SANITIZED_VIEW_POLICY_VERSION,
+        SANITIZED_VIEW_TRANSFORM_VERSION,
+    )
+    storage = write_encrypted_bytes_atomic(
+        relpath=_sanitized_view_relpath(clean_uid, artifact_uid),
+        content=encoded,
+        purpose=SANITIZED_VIEW_PURPOSE,
+    )
+    return {
+        "artifact_uid": artifact_uid,
+        "email_uid": clean_uid,
+        "mailbox_id": mailbox_id,
+        "input_raw_sha256": input_hash,
+        "sanitizer_policy_version": SANITIZED_VIEW_POLICY_VERSION,
+        "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
+        "output_sha256": output_sha256,
+        "storage_relpath": storage["storage_relpath"],
+        "encrypted_size": storage["encrypted_size"],
+        "views_available": payload["views_available"],
+        "safety_counts": payload["safety_counts"],
+        "derivation": payload["derivation"],
+        "encryption": storage["encryption"],
+        "payload": payload,
+    }
+
+
+def read_sanitized_view_artifact(row: Any) -> dict[str, Any]:
+    output_sha256 = str(_row_get(row, "output_sha256", ""))
+    relpath = str(_row_get(row, "storage_relpath", ""))
+    encoded = read_encrypted_bytes(relpath, purpose=SANITIZED_VIEW_PURPOSE)
+    actual = hashlib.sha256(encoded).hexdigest()
+    if output_sha256 and actual != output_sha256:
+        raise EmailOperationError("Sanitized email view artifact hash verification failed")
+    payload = _json_value(encoded, {})
+    if not isinstance(payload, dict):
+        raise EmailOperationError("Sanitized email view artifact payload is invalid")
+    payload["artifact"] = _sanitized_artifact_row_public(row)
+    return payload
 
 
 def special_use_role(folder_name: str, flags: list[str] | None = None) -> str:
@@ -2185,10 +3829,28 @@ def _folder_is_download_target(folder_name: str, downloaded_folder: str) -> bool
     return clean_folder_name(folder_name).lower() == clean_folder_name(downloaded_folder).lower()
 
 
+def _folder_name_move_skip_role(folder_name: str) -> str:
+    clean = clean_folder_name(folder_name)
+    first_part = re.sub(r"[^a-z0-9]+", "", clean.split("/", 1)[0].lower())
+    if first_part in {"draft", "drafts"}:
+        return "drafts"
+    if first_part in {"sent", "sentmail", "sentmessages", "sentitems"}:
+        return "sent"
+    if first_part in {"trash", "rubbish", "bin", "deleted", "deleteditems"}:
+        return "trash"
+    if first_part in {"junk", "spam"}:
+        return "junk" if first_part == "junk" else "spam"
+    if first_part in {"archive", "archives", "archived"}:
+        return "archive"
+    return ""
+
+
 def _folder_move_allowed(folder_snapshot: dict[str, Any], downloaded_folder: str) -> bool:
     role = str(folder_snapshot.get("special_use_role") or "").lower()
     folder_name = str(folder_snapshot.get("folder_name") or "")
     if _folder_is_download_target(folder_name, downloaded_folder):
+        return False
+    if _folder_name_move_skip_role(folder_name) in SPECIAL_USE_MOVE_SKIP_ROLES:
         return False
     return role not in SPECIAL_USE_MOVE_SKIP_ROLES
 
@@ -2312,17 +3974,23 @@ def download_mailbox_sync(
     store: PgEmailStore | None = None,
     apply_remote_moves: bool = False,
     downloaded_folder: str | None = None,
+    folder_allowlist: list[str] | None = None,
     limit_per_folder: int | None = None,
     max_messages: int | None = None,
     convergence_passes: int = 2,
-    include_special_use: bool = False,
-    security_mode: str = "run-or-queue",
+    include_special_use: bool = True,
+    security_mode: str = "run",
 ) -> dict[str, Any]:
     store = store or PgEmailStore()
     target_folder = clean_folder_name(
         downloaded_folder
         or os.environ.get("BLUEPRINTS_EMAIL_DOWNLOADED_FOLDER", DEFAULT_DOWNLOADED_FOLDER)
     )
+    allowed_folders = {
+        clean_folder_name(folder).lower()
+        for folder in (folder_allowlist or [])
+        if str(folder or "").strip()
+    }
     run_id = _stable_id("email-download-run", mailbox.mailbox_id, str(time.time_ns()))
     summary: dict[str, Any] = {
         "schema": "xarta.pim_email.download_run.summary.v1",
@@ -2339,6 +4007,8 @@ def download_mailbox_sync(
         "stored_messages": 0,
         "security_stored": 0,
         "security_queued": 0,
+        "sanitized_views_stored": 0,
+        "external_image_derivatives_skipped": 0,
         "moved_messages": 0,
         "move_skipped": 0,
         "failed_messages": 0,
@@ -2354,6 +4024,7 @@ def download_mailbox_sync(
                 "schema": "xarta.pim_email.download_run.metadata.v1",
                 "security_mode": security_mode,
                 "include_special_use": include_special_use,
+                "folder_allowlist": sorted(allowed_folders),
                 "limit_per_folder": limit_per_folder,
                 "max_messages": max_messages,
             },
@@ -2383,6 +4054,8 @@ def download_mailbox_sync(
                 break
             for folder in folders:
                 folder_name = clean_folder_name(str(folder.get("name") or "INBOX"))
+                if allowed_folders and folder_name.lower() not in allowed_folders:
+                    continue
                 folder_status = _imap_folder_status(client, folder_name)
                 folder_snapshot = _run_store(
                     store.save_folder_snapshot(
@@ -2516,6 +4189,8 @@ def download_mailbox_sync(
                                 metadata=metadata,
                             )
                         )
+                        email_uid = clean_email_uid(str(parsed.get("email_uid") or ""))
+                        raw_sha256 = str(storage.get("raw_sha256") or "")
                         if isinstance(store, PgEmailStore):
                             verified_raw = read_encrypted_bytes(
                                 str(storage.get("storage_relpath") or "")
@@ -2534,12 +4209,87 @@ def download_mailbox_sync(
                         if verified_hash != str(storage.get("raw_sha256") or ""):
                             raise EmailOperationError("Post-commit local verification failed")
                         summary["stored_messages"] += 1
+                        security_complete = False
                         if security and security.get("available"):
                             summary["security_stored"] += 1
+                            if hasattr(store, "completed_security_result"):
+                                security_complete = bool(
+                                    _run_store(
+                                        store.completed_security_result(
+                                            email_uid=email_uid,
+                                            raw_sha256=raw_sha256,
+                                        )
+                                    )
+                                )
+                            else:
+                                security_complete = True
                         else:
                             summary["security_queued"] += 1
+                        sanitized_complete = False
+                        if hasattr(store, "current_sanitized_view_artifact") and hasattr(
+                            store, "store_sanitized_view_artifact"
+                        ):
+                            current_sanitized = _run_store(
+                                store.current_sanitized_view_artifact(
+                                    mailbox_id=mailbox.mailbox_id,
+                                    email_uid=email_uid,
+                                    raw_sha256=raw_sha256,
+                                )
+                            )
+                            if current_sanitized:
+                                sanitized_complete = True
+                            else:
+                                sanitized_artifact = build_sanitized_view_artifact(
+                                    mailbox_id=mailbox.mailbox_id,
+                                    email_uid=email_uid,
+                                    raw=raw,
+                                    raw_sha256=raw_sha256,
+                                )
+                                _run_store(
+                                    store.store_sanitized_view_artifact(artifact=sanitized_artifact)
+                                )
+                                summary["sanitized_views_stored"] += 1
+                                sanitized_complete = True
+                        external_derivatives_complete = len(remote_sources) == 0
+                        if hasattr(store, "record_external_image_derivatives_skipped"):
+                            external_counts = _run_store(
+                                store.record_external_image_derivatives_skipped(
+                                    mailbox_id=mailbox.mailbox_id,
+                                    email_uid=email_uid,
+                                    input_raw_sha256=raw_sha256,
+                                    source_urls=remote_sources,
+                                    reason=("external_image_fetch_disabled_by_download_policy"),
+                                    safety_decision="skipped_not_fetched",
+                                    metadata={"run_id": run_id, "batch_id": batch_id},
+                                )
+                            )
+                            summary["external_image_derivatives_skipped"] += int(
+                                (external_counts or {}).get("skipped") or 0
+                            )
+                            handled_external = sum(
+                                int((external_counts or {}).get(key) or 0)
+                                for key in ("stored", "blocked", "failed", "skipped")
+                            )
+                            unique_remote_sources = len(
+                                {
+                                    _canonical_remote_image_url(source) or str(source or "")
+                                    for source in remote_sources
+                                }
+                                - {""}
+                            )
+                            external_derivatives_complete = (
+                                handled_external >= unique_remote_sources
+                            )
+                        move_gate = {
+                            "raw_encrypted_verified": True,
+                            "db_committed": True,
+                            "security_completed": security_complete,
+                            "sanitized_view_persisted": sanitized_complete,
+                            "external_image_derivatives_handled": external_derivatives_complete,
+                        }
+                        move_ready = move_allowed and all(move_gate.values())
                         moved = False
-                        if move_allowed:
+                        if move_ready:
                             moved = _imap_move_uid(client, uid, target_folder)
                             if moved:
                                 _run_store(
@@ -2571,6 +4321,30 @@ def download_mailbox_sync(
                                         metadata={"target_folder": target_folder},
                                     )
                                 )
+                        elif move_allowed:
+                            summary["move_skipped"] += 1
+                            _run_store(
+                                store.record_download_event(
+                                    run_id=run_id,
+                                    batch_id=batch_id,
+                                    mailbox_id=mailbox.mailbox_id,
+                                    folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                    folder_name=folder_name,
+                                    email_uid=email_uid,
+                                    imap_uid=uid,
+                                    uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                    event_type="remote-move-gate-blocked",
+                                    status="blocked",
+                                    message=(
+                                        "Remote move blocked until raw, security, sanitized, "
+                                        "and external image derivative gates are complete."
+                                    ),
+                                    metadata={
+                                        "target_folder": target_folder,
+                                        "move_gate": move_gate,
+                                    },
+                                )
+                            )
                         else:
                             summary["move_skipped"] += 1
                         summary["processed_messages"] += 1
@@ -2591,8 +4365,10 @@ def download_mailbox_sync(
                                 metadata={
                                     "raw_sha256": storage.get("raw_sha256"),
                                     "encrypted_size": storage.get("encrypted_size"),
-                                    "security_status": "stored" if security else "queued",
+                                    "security_status": "stored" if security_complete else "queued",
                                     "move_allowed": move_allowed,
+                                    "move_ready": move_ready,
+                                    "move_gate": move_gate,
                                 },
                             )
                         )
@@ -3464,11 +5240,12 @@ async def download_mailbox(
     store: PgEmailStore | None = None,
     apply_remote_moves: bool = False,
     downloaded_folder: str | None = None,
+    folder_allowlist: list[str] | None = None,
     limit_per_folder: int | None = None,
     max_messages: int | None = None,
     convergence_passes: int = 2,
-    include_special_use: bool = False,
-    security_mode: str = "run-or-queue",
+    include_special_use: bool = True,
+    security_mode: str = "run",
 ) -> dict[str, Any]:
     return await asyncio.to_thread(
         download_mailbox_sync,
@@ -3476,6 +5253,7 @@ async def download_mailbox(
         store=store,
         apply_remote_moves=apply_remote_moves,
         downloaded_folder=downloaded_folder,
+        folder_allowlist=folder_allowlist,
         limit_per_folder=limit_per_folder,
         max_messages=max_messages,
         convergence_passes=convergence_passes,
