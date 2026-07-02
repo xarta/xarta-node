@@ -1088,8 +1088,10 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
 
     assert attempted == [failed_url, transient_url]
     assert counts["attempted"] == 2
-    assert counts["stored"] == 3
-    assert counts["unavailable"] == 1
+    assert counts["stored"] == 2
+    assert counts["unavailable"] == 0
+    assert counts["already_stored"] == 1
+    assert counts["already_unavailable"] == 1
     assert counts["failed"] == 0
     assert {item["source_url"] for item in recorded} == {failed_url, transient_url}
     assert {item["status"] for item in recorded} == {"stored"}
@@ -1165,6 +1167,7 @@ def test_external_image_derivative_reuses_verified_shared_asset_without_refetch(
     )
 
     assert counts["stored"] == 1
+    assert counts["already_stored"] == 0
     assert counts["attempted"] == 0
     assert stored[0]["shared_asset_uid"] == "email-shared-asset-existing"
     assert stored[0]["storage_relpath"].startswith("assets/")
@@ -1702,6 +1705,9 @@ class CaptureDownloadStore:
             "unavailable": 0,
             "pending": 0,
             "attempted": len(unique),
+            "already_stored": 0,
+            "already_blocked": 0,
+            "already_unavailable": 0,
         }
 
     async def mark_remote_moved(self, **kwargs):
@@ -1837,6 +1843,9 @@ def test_downloader_does_not_move_when_external_image_processing_failed(
                 "unavailable": 0,
                 "pending": 0,
                 "attempted": 1,
+                "already_stored": 0,
+                "already_blocked": 0,
+                "already_unavailable": 0,
             }
 
     store = FailedExternalImageStore()
@@ -1888,6 +1897,9 @@ def test_downloader_moves_when_external_image_is_proven_unavailable(
                 "unavailable": 1,
                 "pending": 0,
                 "attempted": 1,
+                "already_stored": 0,
+                "already_blocked": 0,
+                "already_unavailable": 0,
             }
 
     store = UnavailableExternalImageStore()

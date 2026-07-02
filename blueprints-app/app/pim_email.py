@@ -3108,6 +3108,9 @@ class PgEmailStore:
             "unavailable": 0,
             "pending": 0,
             "attempted": 0,
+            "already_stored": 0,
+            "already_blocked": 0,
+            "already_unavailable": 0,
         }
         if not unique_sources:
             return counts
@@ -3142,7 +3145,12 @@ class PgEmailStore:
             status = str(existing_state.get("status") or "")
             reason = str(existing_state.get("reason") or "")
             if _external_image_existing_state_is_terminal(status, reason):
-                counts[status] += 1
+                if status == "stored":
+                    counts["already_stored"] += 1
+                elif status == "blocked":
+                    counts["already_blocked"] += 1
+                elif status == "unavailable":
+                    counts["already_unavailable"] += 1
                 continue
             shared = await self.find_shared_asset_for_url(
                 mailbox_id=mailbox_id,
@@ -4075,6 +4083,9 @@ class PgEmailStore:
             "external_images_failed": 0,
             "external_images_unavailable": 0,
             "external_images_pending": 0,
+            "external_images_already_stored": 0,
+            "external_images_already_blocked": 0,
+            "external_images_already_unavailable": 0,
             "external_images_captured": 0,
             "external_images_materialize_candidates": 0,
             "external_images_materialized_rows": 0,
@@ -4284,6 +4295,11 @@ class PgEmailStore:
                         summary["external_images_failed"] += counts["failed"]
                         summary["external_images_unavailable"] += counts["unavailable"]
                         summary["external_images_pending"] += counts["pending"]
+                        summary["external_images_already_stored"] += counts["already_stored"]
+                        summary["external_images_already_blocked"] += counts["already_blocked"]
+                        summary["external_images_already_unavailable"] += counts[
+                            "already_unavailable"
+                        ]
                         await self._record_backfill_item(
                             run_id=actual_run_id,
                             batch_id=batch_id,
@@ -5530,6 +5546,9 @@ def download_mailbox_sync(
         "external_image_derivatives_unavailable": 0,
         "external_image_derivatives_failed": 0,
         "external_image_derivatives_pending": 0,
+        "external_image_derivatives_already_stored": 0,
+        "external_image_derivatives_already_blocked": 0,
+        "external_image_derivatives_already_unavailable": 0,
         "moved_messages": 0,
         "move_not_allowed": 0,
         "move_blocked": 0,
@@ -5794,9 +5813,25 @@ def download_mailbox_sync(
                             summary["external_image_derivatives_pending"] += int(
                                 (external_counts or {}).get("pending") or 0
                             )
+                            summary["external_image_derivatives_already_stored"] += int(
+                                (external_counts or {}).get("already_stored") or 0
+                            )
+                            summary["external_image_derivatives_already_blocked"] += int(
+                                (external_counts or {}).get("already_blocked") or 0
+                            )
+                            summary["external_image_derivatives_already_unavailable"] += int(
+                                (external_counts or {}).get("already_unavailable") or 0
+                            )
                             handled_external = sum(
                                 int((external_counts or {}).get(key) or 0)
-                                for key in ("stored", "blocked", "unavailable")
+                                for key in (
+                                    "stored",
+                                    "blocked",
+                                    "unavailable",
+                                    "already_stored",
+                                    "already_blocked",
+                                    "already_unavailable",
+                                )
                             )
                             unique_remote_sources = len(
                                 {
