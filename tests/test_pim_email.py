@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
@@ -1246,6 +1247,18 @@ def test_router_exposes_no_delete_or_general_send_capability():
     assert ("GET", "/personal/email/image-proxy") in routes
     assert ("GET", "/personal/email/messages/{uid}/security") in routes
     assert ("POST", "/personal/email/smtp-self-test") in routes
+
+
+def test_download_run_request_has_no_security_or_special_use_shortcuts():
+    request = routes_pim_email.DownloadMailboxRequest(max_messages=1)
+
+    assert request.max_messages == 1
+    assert not hasattr(request, "security_mode")
+    assert not hasattr(request, "include_special_use")
+    with pytest.raises(ValidationError):
+        routes_pim_email.DownloadMailboxRequest(security_mode="queue")
+    with pytest.raises(ValidationError):
+        routes_pim_email.DownloadMailboxRequest(include_special_use=False)
 
 
 def test_email_image_proxy_signature_is_required(monkeypatch):
