@@ -28,7 +28,7 @@ from email.parser import BytesParser
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import asyncpg
@@ -390,6 +390,9 @@ def read_encrypted_bytes(
 
 
 class PgEmailStore:
+    _schema_ready_dsns: ClassVar[set[str]] = set()
+    _schema_ready_lock: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(self, dsn: str | None = None) -> None:
         self.dsn = (
             dsn if dsn is not None else os.environ.get("BLUEPRINTS_EMAIL_POSTGRES_DSN", "")
@@ -401,6 +404,11 @@ class PgEmailStore:
         return await asyncpg.connect(self.dsn)
 
     async def ensure_schema(self) -> None:
+        schema_cache_key = str(getattr(self, "dsn", "") or "")
+        if schema_cache_key:
+            with self._schema_ready_lock:
+                if schema_cache_key in self._schema_ready_dsns:
+                    return
         conn = await self._connect()
         schema_lock_acquired = False
         try:
@@ -842,6 +850,9 @@ class PgEmailStore:
                 ON pim_email_backfill_items(mailbox_id, artifact_type, status, updated_at DESC);
                 """
             )
+            if schema_cache_key:
+                with self._schema_ready_lock:
+                    self._schema_ready_dsns.add(schema_cache_key)
         finally:
             if schema_lock_acquired:
                 try:
