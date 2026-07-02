@@ -981,6 +981,24 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
 def test_external_image_error_classification_never_uses_skipped():
     assert (
         pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image host resolved to a private or unsafe address")
+        )
+        == "blocked"
+    )
+    assert (
+        pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image could not be decoded safely")
+        )
+        == "blocked"
+    )
+    assert (
+        pim_email._external_image_error_status(
+            pim_email.EmailOperationError("image payload is too large")
+        )
+        == "blocked"
+    )
+    assert (
+        pim_email._external_image_error_status(
             pim_email.EmailOperationError("image unavailable: HTTP 404")
         )
         == "unavailable"
