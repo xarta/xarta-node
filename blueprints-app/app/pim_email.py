@@ -2463,7 +2463,7 @@ class PgEmailStore:
         try:
             existing_rows = await conn.fetch(
                 """
-                SELECT canonical_url, status
+                SELECT canonical_url, status, reason
                 FROM pim_email_external_image_derivatives
                 WHERE mailbox_id = $1
                   AND email_uid = $2
@@ -2476,14 +2476,20 @@ class PgEmailStore:
                 [canonical for _, canonical in unique_sources],
             )
             existing = {
-                str(row["canonical_url"]): str(row["status"] or "") for row in existing_rows
+                str(_row_get(row, "canonical_url", "")): {
+                    "status": str(_row_get(row, "status", "") or ""),
+                    "reason": str(_row_get(row, "reason", "") or ""),
+                }
+                for row in existing_rows
             }
         finally:
             await conn.close()
 
         for source, canonical in unique_sources:
-            status = existing.get(canonical, "")
-            if status in {"stored", "blocked", "unavailable"}:
+            existing_state = existing.get(canonical, {})
+            status = str(existing_state.get("status") or "")
+            reason = str(existing_state.get("reason") or "")
+            if _external_image_existing_state_is_terminal(status, reason):
                 counts[status] += 1
                 continue
             counts["attempted"] += 1
@@ -5317,6 +5323,15 @@ def _external_image_error_status(exc: BaseException) -> str:
     ):
         return "unavailable"
     return "failed"
+
+
+def _external_image_existing_state_is_terminal(status: str, reason: str = "") -> bool:
+    clean_status = str(status or "").strip().lower()
+    if clean_status in {"stored", "blocked"}:
+        return True
+    if clean_status == "unavailable":
+        return _external_image_error_status(EmailOperationError(reason)) != "pending"
+    return False
 
 
 async def fetch_remote_image_as_jpeg(source: str) -> bytes:

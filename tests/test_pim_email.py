@@ -568,6 +568,8 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
     failed_url = "https://cdn.example.test/retry.png"
+    transient_url = "https://cdn.example.test/transient.png"
+    gone_url = "https://cdn.example.test/gone.png"
     stored_url = "https://cdn.example.test/already.jpg"
     attempted = []
     recorded = []
@@ -577,6 +579,16 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
             if "FROM pim_email_external_image_derivatives" in query:
                 return [
                     {"canonical_url": failed_url, "status": "failed"},
+                    {
+                        "canonical_url": transient_url,
+                        "status": "unavailable",
+                        "reason": "image unavailable: ConnectError",
+                    },
+                    {
+                        "canonical_url": gone_url,
+                        "status": "unavailable",
+                        "reason": "image unavailable: HTTP 404",
+                    },
                     {"canonical_url": stored_url, "status": "stored"},
                 ]
             raise AssertionError(query)
@@ -625,17 +637,21 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
             mailbox_id="test-mailbox",
             email_uid="20260702-" + "d" * 40,
             input_raw_sha256="raw",
-            source_urls=[failed_url, stored_url],
+            source_urls=[failed_url, transient_url, gone_url, stored_url],
             metadata={"proof": "retry"},
         )
     )
 
-    assert attempted == [failed_url]
-    assert counts["attempted"] == 1
-    assert counts["stored"] == 2
+    assert attempted == [failed_url, transient_url]
+    assert counts["attempted"] == 2
+    assert counts["stored"] == 3
+    assert counts["unavailable"] == 1
     assert counts["failed"] == 0
-    assert recorded[0]["status"] == "stored"
-    assert recorded[0]["safety_decision"] == "fetched_transformed_encrypted_stored"
+    assert {item["source_url"] for item in recorded} == {failed_url, transient_url}
+    assert {item["status"] for item in recorded} == {"stored"}
+    assert {item["safety_decision"] for item in recorded} == {
+        "fetched_transformed_encrypted_stored"
+    }
 
 
 def test_external_image_error_classification_never_uses_skipped():
