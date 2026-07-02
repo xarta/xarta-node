@@ -152,6 +152,8 @@ def test_encrypted_content_and_transformed_external_asset_round_trip(tmp_path, m
     assert asset["content_type"] == "image/jpeg"
     assert asset["width"] == 3
     assert asset["height"] == 2
+    assert asset["shared_asset_uid"].startswith("email-shared-asset-")
+    assert asset["storage_relpath"].startswith("assets/")
     asset_plain = pim_email.read_encrypted_bytes(
         asset["storage_relpath"],
         purpose=pim_email.ASSET_PURPOSE,
@@ -233,6 +235,71 @@ def test_completed_security_contract_rejects_placeholders_and_requires_exact_has
         )
         is None
     )
+
+
+def test_split_security_phase_only_result_does_not_unlock_render(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", "http://local-email-test.invalid")
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", "LOCAL-EMAIL-TEST")
+    raw = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Subject: Split security\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Deterministic evidence should persist before local AI.\r\n"
+    )
+    deterministic = pim_email_security.check_email_security_deterministic_sync(
+        raw,
+        dns_txt_lookup=lambda name: [],
+    )
+
+    assert deterministic["schema"] == pim_email_security.DETERMINISTIC_SCHEMA
+    assert deterministic["deterministic_complete"] is True
+    assert deterministic["available"] is False
+    assert deterministic["llm"]["status"] == "pending"
+
+    row = {
+        "result_json": json.dumps(
+            {
+                **deterministic,
+                "email_uid": "20260701-" + "c" * 40,
+                "checker_versions": {"schema": "test"},
+            }
+        ),
+        "security_status": "failed_retryable",
+        "raw_sha256": deterministic["raw_sha256"],
+    }
+    assert (
+        pim_email._completed_security_result_from_row(
+            row,
+            email_uid="20260701-" + "c" * 40,
+            raw_sha256=deterministic["raw_sha256"],
+        )
+        is None
+    )
+
+    def fake_llm(payload):
+        return json.dumps(
+            {
+                "verdict": "safe",
+                "confidence": 0.9,
+                "risk_score": 1,
+                "scam_traits": [],
+                "rationale": "Routine message.",
+                "needs_human_review": False,
+            }
+        )
+
+    full = pim_email_security.complete_email_security_with_llm_sync(
+        raw,
+        deterministic=deterministic,
+        body_text="Deterministic evidence should persist before local AI.",
+        llm_client=fake_llm,
+    )
+
+    assert full["available"] is True
+    assert full["phases"]["deterministic"]["status"] == "complete"
+    assert full["phases"]["llm"]["status"] == "complete"
+    assert full["llm"]["valid_json"] is True
 
 
 def test_security_result_upserts_are_keyed_by_email_uid_raw_hash_contract():
@@ -449,6 +516,7 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
                     "folders": 4,
                     "memberships": 35,
                     "transformed_assets": 0,
+                    "shared_assets": 0,
                     "raw_originals_stored": 33,
                 }
             if "WITH latest_current" in query:
@@ -479,6 +547,11 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
                 }
             if "FROM pim_email_download_runs" in query:
                 return None
+            raise AssertionError(query)
+
+        async def fetch(self, query, *args):
+            if "FROM pim_email_security_phases" in query:
+                return []
             raise AssertionError(query)
 
         async def close(self):
@@ -941,9 +1014,20 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
         async def store_transformed_asset(self, **kwargs):
             return {"ok": True, "asset": kwargs["asset"]}
 
+        async def store_shared_asset(self, **kwargs):
+            asset = dict(kwargs["asset"])
+            asset.setdefault("shared_asset_uid", "email-shared-asset-test")
+            asset.setdefault("source_url", "https://cdn.example.test/image.png")
+            asset.setdefault("canonical_url_digest", "digest-test")
+            asset.setdefault("raw_image_sha256", asset.get("raw_sha256", "raw-image-hash"))
+            return asset
+
         async def record_external_image_derivative_state(self, **kwargs):
             recorded.append(kwargs)
             return kwargs
+
+        async def find_shared_asset_for_url(self, **kwargs):
+            return None
 
     async def fake_fetch(source):
         attempted.append(source)
@@ -953,8 +1037,11 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
         return {
             "transform_version": "jpeg-v1",
             "raw_sha256": "raw-image-hash",
+            "raw_image_sha256": "raw-image-hash",
             "transformed_sha256": "transformed-image-hash",
             "storage_relpath": "assets/retry.jpg.enc",
+            "shared_asset_uid": "email-shared-asset-test",
+            "canonical_url_digest": "digest-test",
             "encrypted_size": 123,
             "content_type": "image/jpeg",
             "width": 2,
@@ -984,6 +1071,80 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
     assert {item["safety_decision"] for item in recorded} == {
         "fetched_transformed_encrypted_stored"
     }
+    assert {item["shared_asset_uid"] for item in recorded} == {"email-shared-asset-test"}
+
+
+def test_external_image_derivative_reuses_verified_shared_asset_without_refetch(monkeypatch):
+    stored = []
+    recorded = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "FROM pim_email_external_image_derivatives" in query:
+                return []
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def find_shared_asset_for_url(self, **kwargs):
+            return {
+                "shared_asset_uid": "email-shared-asset-existing",
+                "source_url": kwargs["source_url"],
+                "canonical_url": kwargs["source_url"],
+                "canonical_url_digest": pim_email._external_image_canonical_digest(
+                    kwargs["source_url"]
+                ),
+                "content_type": "image/jpeg",
+                "raw_image_sha256": "raw-image-hash",
+                "transformed_sha256": "transformed-image-hash",
+                "storage_relpath": "assets/aa/existing/image.jpg.enc",
+                "encrypted_size": 456,
+                "width": 12,
+                "height": 9,
+                "transform_version": "jpeg-v1",
+                "encryption": {"alg": "test"},
+            }
+
+        async def store_transformed_asset(self, **kwargs):
+            stored.append(kwargs["asset"])
+            return kwargs["asset"]
+
+        async def record_external_image_derivative_state(self, **kwargs):
+            recorded.append(kwargs)
+            return kwargs
+
+    async def fail_fetch(source):
+        raise AssertionError("duplicate URL should reuse verified shared asset")
+
+    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fail_fetch)
+
+    counts = asyncio.run(
+        FakeStore().process_external_image_derivatives(
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "e" * 40,
+            input_raw_sha256="raw",
+            source_urls=["https://cdn.example.test/dup.png"],
+            metadata={"proof": "reuse"},
+        )
+    )
+
+    assert counts["stored"] == 1
+    assert counts["attempted"] == 0
+    assert stored[0]["shared_asset_uid"] == "email-shared-asset-existing"
+    assert stored[0]["storage_relpath"].startswith("assets/")
+    assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset"
+    assert recorded[0]["shared_asset_uid"] == "email-shared-asset-existing"
 
 
 def test_external_image_error_classification_never_uses_skipped():
