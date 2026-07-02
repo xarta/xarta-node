@@ -1373,6 +1373,148 @@ def test_backfill_running_item_claim_is_atomic_and_refuses_live_duplicate():
     assert queries[-1] == ("close", ())
 
 
+def test_backfill_running_item_claim_refuses_already_converged_artifact():
+    queries = []
+    fetchval_calls = 0
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            queries.append(("transaction-enter", ()))
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            queries.append(("transaction-exit", (exc_type,)))
+            return False
+
+    class FakeConnection:
+        def transaction(self):
+            return FakeTransaction()
+
+        async def execute(self, query, *args):
+            queries.append((query, args))
+            return None
+
+        async def fetchval(self, query, *args):
+            nonlocal fetchval_calls
+            fetchval_calls += 1
+            queries.append((query, args))
+            if fetchval_calls == 1:
+                assert "pim_email_backfill_items" in query
+                return None
+            assert "already" not in query.lower()
+            assert "pim_email_security_checks" in query
+            assert args == (
+                "test-mailbox",
+                "20260702-" + "f" * 40,
+                "raw-hash",
+                "security_llm",
+            )
+            return True
+
+        async def close(self):
+            queries.append(("close", ()))
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    claimed = asyncio.run(
+        FakeStore()._record_backfill_item(
+            run_id="run-a",
+            batch_id="batch-a",
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "f" * 40,
+            raw_sha256="raw-hash",
+            artifact_type="security_llm",
+            status="running",
+            metadata={"phase": "security-llm-final"},
+        )
+    )
+
+    assert claimed is False
+    assert fetchval_calls == 2
+    assert any("pg_advisory_xact_lock" in item[0] for item in queries)
+    assert not any("INSERT INTO pim_email_backfill_items" in item[0] for item in queries)
+    assert queries[-1] == ("close", ())
+
+
+def test_backfill_skips_raw_decrypt_when_stale_row_cannot_be_claimed(monkeypatch):
+    queries = []
+    record_calls = []
+    uid = "20260702-" + "a" * 40
+
+    def fail_read_encrypted_bytes(path):
+        raise AssertionError(f"raw decrypt should not run for unclaimed stale row: {path}")
+
+    monkeypatch.setattr(pim_email, "read_encrypted_bytes", fail_read_encrypted_bytes)
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            queries.append((query, args))
+            if "WITH candidates AS" in query:
+                return [
+                    {
+                        "email_uid": uid,
+                        "mailbox_id": "test-mailbox",
+                        "raw_sha256": "raw-hash",
+                        "storage_relpath": "stale/message.eml.enc",
+                        "updated_at": None,
+                    }
+                ]
+            return []
+
+        async def execute(self, query, *args):
+            queries.append((query, args))
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+        async def _record_backfill_item(self, **kwargs):
+            record_calls.append(kwargs)
+            return False
+
+    result = asyncio.run(
+        FakeStore().run_backfill(
+            mailbox_id="test-mailbox",
+            artifact_types=["security_llm"],
+            limit=1,
+            run_id="stale-row-skip",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["summary"]["planned_messages"] == 1
+    assert result["summary"]["processed_messages"] == 0
+    assert result["summary"]["raw_originals_verified"] == 0
+    assert record_calls == [
+        {
+            "run_id": "stale-row-skip",
+            "batch_id": result["batch_id"],
+            "mailbox_id": "test-mailbox",
+            "email_uid": uid,
+            "raw_sha256": "raw-hash",
+            "artifact_type": "security_llm",
+            "status": "running",
+            "metadata": {"phase": "security-llm-final"},
+        }
+    ]
+
+
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
     uid_a = "20260702-" + "a" * 40
     uid_b = "20260702-" + "b" * 40
