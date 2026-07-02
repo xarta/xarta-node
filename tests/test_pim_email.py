@@ -303,6 +303,55 @@ def test_split_security_phase_only_result_does_not_unlock_render(monkeypatch):
     assert full["llm"]["valid_json"] is True
 
 
+def test_security_llm_phase_requires_prior_deterministic_phase():
+    email_uid = "20260701-" + "d" * 40
+    raw = b"Subject: Split stage\r\n\r\nLLM must not run before deterministic.\r\n"
+    raw_sha256 = pim_email.hashlib.sha256(raw).hexdigest()
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            pass
+
+        async def ensure_schema(self):
+            return None
+
+        async def _load_local_security_source(self, email_uid_arg, *, mailbox_id):
+            assert email_uid_arg == email_uid
+            assert mailbox_id == "test-mailbox"
+            return {
+                "mailbox_id": mailbox_id,
+                "email_uid": email_uid,
+                "membership": None,
+                "raw": raw,
+                "raw_sha256": raw_sha256,
+                "parsed": {"views": {"plain": "LLM must not run before deterministic."}},
+            }
+
+        async def completed_security_phase_result(self, **kwargs):
+            assert kwargs["phase"] == "deterministic"
+            return None
+
+    with pytest.raises(pim_email.EmailOperationError, match="Deterministic security phase"):
+        asyncio.run(
+            FakeStore().run_local_security_llm_phase(
+                email_uid,
+                mailbox_id="test-mailbox",
+            )
+        )
+
+
+def test_backfill_cli_exposes_independent_security_phase_artifacts():
+    source = (APP_ROOT / "app" / "pim_email.py").read_text(encoding="utf-8")
+    cli = (APP_ROOT / "scripts" / "pim_email_backfill.py").read_text(encoding="utf-8")
+
+    assert '"security_deterministic"' in source
+    assert '"security_llm"' in source
+    assert '"security_deterministic"' in cli
+    assert '"security_llm"' in cli
+    assert "run_local_security_deterministic_phase" in source
+    assert "run_local_security_llm_phase" in source
+
+
 def test_security_result_upserts_are_keyed_by_email_uid_raw_hash_contract():
     source = (APP_ROOT / "app" / "pim_email.py").read_text(encoding="utf-8")
 
@@ -856,8 +905,8 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     candidate_query = next(query for query in queries if "WITH candidates AS" in query)
     assert result["ok"] is True
     assert "AS security_result_present" in candidate_query
-    assert "security_result_present AND NOT security_complete THEN 0" in candidate_query
-    assert "NOT security_complete THEN 1" in candidate_query
+    assert "security_result_present AND NOT security_complete THEN 1" in candidate_query
+    assert "NOT security_complete THEN 2" in candidate_query
     assert "AS security_running" in candidate_query
     assert "AS sanitized_running" in candidate_query
     assert "AS external_running" in candidate_query
