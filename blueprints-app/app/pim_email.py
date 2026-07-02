@@ -4872,6 +4872,7 @@ class PgEmailStore:
                     requested_limit = EXCLUDED.requested_limit,
                     artifact_types_json = EXCLUDED.artifact_types_json,
                     metadata_json = EXCLUDED.metadata_json,
+                    finished_at = NULL,
                     updated_at = now()
                 """,
                 actual_run_id,

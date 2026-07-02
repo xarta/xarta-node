@@ -519,7 +519,7 @@ def _message_context(runtime: _SecurityRuntime, msg: Any, raw: bytes) -> dict[st
     return_addr = _first_address(return_path)
     from_domain = _domain_from_address(from_addr)
     return_path_domain = _domain_from_address(return_addr)
-    received_headers = [_stringify_header(item) for item in msg.get_all("received", [])]
+    received_headers = _header_values(msg, "received")
     source = _extract_source_ip(received_headers)
     return {
         "message_id": _header_value(msg, "message-id"),
@@ -540,7 +540,7 @@ def _authentication_results_findings(
     msg: Any,
     findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    headers = [_stringify_header(item) for item in msg.get_all("authentication-results", [])]
+    headers = _header_values(msg, "authentication-results")
     parsed_headers: list[dict[str, Any]] = []
     if not headers:
         findings.append(
@@ -658,7 +658,7 @@ def _dkim_findings(
     context: dict[str, Any],
     findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    signatures = [_stringify_header(item) for item in msg.get_all("dkim-signature", [])]
+    signatures = _header_values(msg, "dkim-signature")
     state = {"signature_count": len(signatures), "passed": [], "failed": [], "aligned_pass": False}
     if not signatures:
         findings.append(
@@ -1506,7 +1506,29 @@ def _public_ip(ip: ipaddress._BaseAddress) -> bool:
 
 
 def _header_value(msg: Any, name: str) -> str:
-    return _stringify_header(msg.get(name, ""))
+    values = _header_values(msg, name)
+    return values[0] if values else ""
+
+
+def _header_values(msg: Any, name: str) -> list[str]:
+    clean_name = str(name or "").lower()
+    if not clean_name:
+        return []
+    try:
+        raw_items = getattr(msg, "raw_items", None)
+        if callable(raw_items):
+            values = [
+                _stringify_header(value)
+                for key, value in raw_items()
+                if str(key or "").lower() == clean_name
+            ]
+            return [value for value in values if value]
+    except Exception:
+        pass
+    try:
+        return [_stringify_header(item) for item in (msg.get_all(name, []) or []) if item]
+    except Exception:
+        return []
 
 
 def _stringify_header(value: Any) -> str:
