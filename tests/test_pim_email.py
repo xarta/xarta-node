@@ -5,6 +5,7 @@ import json
 import sys
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -1095,6 +1096,74 @@ def test_backfill_cli_generated_external_rows_are_not_idle(monkeypatch):
 
     assert module._planned_messages(result) == 0
     assert module._generated_work_rows(result) == 7
+
+
+def test_backfill_cli_repeat_artifact_keeps_run_active_until_loop_exit(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_STACK_RUNNER", "1")
+    script_path = APP_ROOT / "scripts" / "pim_email_backfill.py"
+    spec = importlib.util.spec_from_file_location("pim_email_backfill_test_module", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class FakeStore:
+        def __init__(self):
+            self.updates = []
+
+        async def reconcile_orphaned_backfill_runs(self, **kwargs):
+            return {}
+
+        async def reconcile_superseded_backfill_failures(self, **kwargs):
+            return {}
+
+        async def run_backfill(self, **kwargs):
+            return {
+                "ok": True,
+                "run_id": kwargs["run_id"],
+                "status": "completed",
+                "summary": {
+                    "planned_messages": 1,
+                    "processed_messages": 1,
+                    "failed_messages": 0,
+                    "raw_originals_verified": 1,
+                    "security_completed": 1,
+                },
+            }
+
+        async def update_backfill_run_summary(self, **kwargs):
+            self.updates.append(kwargs)
+
+    async def quiet_monitor(store, run_id, stop, *, interval_seconds=30.0):
+        await stop.wait()
+
+    store = FakeStore()
+    monkeypatch.setattr(pim_email, "PgEmailStore", lambda: store)
+    monkeypatch.setattr(module, "_monitor_backfill_progress", quiet_monitor)
+
+    result = asyncio.run(
+        module._run(
+            SimpleNamespace(
+                run_id="repeat-run",
+                mailbox_id=None,
+                email_uid=None,
+                limit=None,
+                batch_size=1,
+                repeat_until_idle=True,
+                idle_sleep_seconds=0,
+                max_batches=1,
+                artifact=["security"],
+                materialize_external_image_rows=False,
+                link_shared_external_image_assets=False,
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert [update["final"] for update in store.updates] == [False, True]
+    assert store.updates[0]["processed_count"] == 1
+    assert store.updates[0]["summary"]["security_completed"] == 1
+    assert store.updates[1]["summary"]["stopped_reason"] == "max_batches"
 
 
 def test_backfill_running_item_claim_is_atomic_and_refuses_live_duplicate():

@@ -4640,6 +4640,43 @@ class PgEmailStore:
         finally:
             await conn.close()
 
+    async def update_backfill_run_summary(
+        self,
+        *,
+        run_id: str,
+        processed_count: int,
+        failed_count: int,
+        summary: dict[str, Any],
+        final: bool = False,
+    ) -> None:
+        clean_status = (
+            "completed-with-errors"
+            if final and int(failed_count or 0) > 0
+            else ("completed" if final else "running")
+        )
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_backfill_runs
+                SET status = $2,
+                    processed_count = $3,
+                    failed_count = $4,
+                    summary_json = $5::jsonb,
+                    finished_at = CASE WHEN $6 THEN now() ELSE NULL END,
+                    updated_at = now()
+                WHERE run_id = $1
+                """,
+                run_id,
+                clean_status,
+                int(processed_count or 0),
+                int(failed_count or 0),
+                _json_dumps(summary, sort_keys=True, separators=(",", ":")),
+                bool(final),
+            )
+        finally:
+            await conn.close()
+
     async def run_backfill(
         self,
         *,
