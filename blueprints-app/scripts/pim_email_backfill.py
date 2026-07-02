@@ -100,6 +100,9 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "external_images_unavailable",
         "external_images_failed",
         "external_images_blocked",
+        "external_images_already_stored",
+        "external_images_already_unavailable",
+        "external_images_already_blocked",
         "external_images_materialized_rows",
     )
     return {key: summary[key] for key in keys if key in summary}
@@ -133,6 +136,9 @@ def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -
         "external_images_unavailable": 0,
         "external_images_failed": 0,
         "external_images_blocked": 0,
+        "external_images_already_stored": 0,
+        "external_images_already_unavailable": 0,
+        "external_images_already_blocked": 0,
         "external_images_materialized_rows": 0,
     }
 
