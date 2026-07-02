@@ -91,20 +91,25 @@ def _compact_backfill_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "security_deterministic_completed",
         "security_deterministic_already_completed",
         "security_deterministic_failed",
+        "security_deterministic_superseded",
         "security_llm_completed",
         "security_llm_already_completed",
         "security_llm_failed",
+        "security_llm_superseded",
         "security_completed",
         "security_already_completed",
         "security_failed",
+        "security_superseded",
         "sanitized_views_stored",
         "sanitized_views_already_current",
         "sanitized_views_failed",
+        "sanitized_views_superseded",
         "external_images_captured",
         "external_images_stored",
         "external_images_pending",
         "external_images_unavailable",
         "external_images_failed",
+        "external_images_superseded",
         "external_images_blocked",
         "external_images_already_stored",
         "external_images_already_unavailable",
@@ -146,20 +151,25 @@ def _new_backfill_aggregate(args: argparse.Namespace, batch_limit: int | None) -
         "security_deterministic_completed": 0,
         "security_deterministic_already_completed": 0,
         "security_deterministic_failed": 0,
+        "security_deterministic_superseded": 0,
         "security_llm_completed": 0,
         "security_llm_already_completed": 0,
         "security_llm_failed": 0,
+        "security_llm_superseded": 0,
         "security_completed": 0,
         "security_already_completed": 0,
         "security_failed": 0,
+        "security_superseded": 0,
         "sanitized_views_stored": 0,
         "sanitized_views_already_current": 0,
         "sanitized_views_failed": 0,
+        "sanitized_views_superseded": 0,
         "external_images_captured": 0,
         "external_images_stored": 0,
         "external_images_pending": 0,
         "external_images_unavailable": 0,
         "external_images_failed": 0,
+        "external_images_superseded": 0,
         "external_images_blocked": 0,
         "external_images_already_stored": 0,
         "external_images_already_unavailable": 0,
@@ -234,6 +244,33 @@ def _aggregate_failed_count(aggregate: dict[str, Any]) -> int:
             "external_image_unique_references_link_failed",
         )
     )
+
+
+def _sync_aggregate_item_status_counts(
+    aggregate: dict[str, Any],
+    status_counts: dict[str, Any],
+) -> None:
+    if not isinstance(aggregate, dict) or not isinstance(status_counts, dict):
+        return
+    by_artifact = status_counts.get("by_artifact")
+    if not isinstance(by_artifact, dict):
+        return
+    mapping = {
+        "security_deterministic": (
+            "security_deterministic_failed",
+            "security_deterministic_superseded",
+        ),
+        "security_llm": ("security_llm_failed", "security_llm_superseded"),
+        "security": ("security_failed", "security_superseded"),
+        "sanitized_view": ("sanitized_views_failed", "sanitized_views_superseded"),
+        "external_images": ("external_images_failed", "external_images_superseded"),
+    }
+    for artifact, (failed_key, superseded_key) in mapping.items():
+        counts = by_artifact.get(artifact)
+        if not isinstance(counts, dict):
+            continue
+        aggregate[failed_key] = int(counts.get("failed") or 0)
+        aggregate[superseded_key] = int(counts.get("superseded") or 0)
 
 
 def _shared_asset_link_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -584,6 +621,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 result["process_external_image_unique_assets"] = unique_asset_result
             aggregate["batches_completed"] += 1
             _add_backfill_batch_to_aggregate(aggregate, result)
+            superseded = await store.reconcile_superseded_backfill_failures(
+                mailbox_id=args.mailbox_id
+            )
+            if int(superseded.get("marked_count") or 0) > 0:
+                _log_event(
+                    "backfill_superseded_failures_reconciled",
+                    run_id=args.run_id,
+                    batch_index=batch_index,
+                    result=superseded,
+                )
+            if args.run_id and hasattr(store, "backfill_item_status_counts"):
+                status_counts = await store.backfill_item_status_counts(run_id=str(args.run_id))
+                _sync_aggregate_item_status_counts(aggregate, status_counts)
             planned = _planned_messages(result)
             if args.artifact and args.run_id:
                 await store.update_backfill_run_summary(

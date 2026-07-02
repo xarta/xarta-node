@@ -1036,6 +1036,40 @@ def test_backfill_superseded_reconcile_marks_converged_failed_items():
     assert calls
 
 
+def test_backfill_item_status_counts_groups_by_artifact_and_status():
+    calls = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            calls.append((query, args))
+            assert "GROUP BY artifact_type, status" in query
+            assert args == ("run-1",)
+            return [
+                {"artifact_type": "security", "status": "superseded", "item_count": 1},
+                {"artifact_type": "security", "status": "completed", "item_count": 7},
+                {"artifact_type": "security_llm", "status": "failed", "item_count": 2},
+            ]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(FakeStore().backfill_item_status_counts(run_id="run-1"))
+
+    assert result["by_artifact"]["security"] == {"superseded": 1, "completed": 7}
+    assert result["by_artifact"]["security_llm"] == {"failed": 2}
+    assert calls
+
+
 def test_backfill_prioritizes_contract_incomplete_security_before_missing_security():
     queries = []
 
@@ -1119,6 +1153,42 @@ def test_backfill_cli_generated_external_rows_are_not_idle(monkeypatch):
 
     assert module._planned_messages(result) == 0
     assert module._generated_work_rows(result) == 7
+
+
+def test_backfill_cli_superseded_items_do_not_count_as_failed(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_STACK_RUNNER", "1")
+    script_path = APP_ROOT / "scripts" / "pim_email_backfill.py"
+    spec = importlib.util.spec_from_file_location("pim_email_backfill_test_module", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    aggregate = {
+        "failed_messages": 0,
+        "security_failed": 9,
+        "security_llm_failed": 0,
+        "security_deterministic_failed": 0,
+        "sanitized_views_failed": 0,
+        "external_images_failed": 0,
+        "external_images_shared_asset_link_failed": 0,
+        "external_image_unique_urls_failed": 0,
+        "external_image_unique_references_link_failed": 0,
+    }
+    module._sync_aggregate_item_status_counts(
+        aggregate,
+        {
+            "by_artifact": {
+                "security": {"completed": 12, "superseded": 1},
+                "security_llm": {"failed": 2},
+            }
+        },
+    )
+
+    assert aggregate["security_failed"] == 0
+    assert aggregate["security_superseded"] == 1
+    assert aggregate["security_llm_failed"] == 2
+    assert module._aggregate_failed_count(aggregate) == 2
 
 
 def test_backfill_cli_repeat_artifact_keeps_run_active_until_loop_exit(monkeypatch):
