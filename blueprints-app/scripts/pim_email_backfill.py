@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore
 
     store = PgEmailStore()
+    active_backfill_run_ids = _active_backfill_run_ids()
+    if args.run_id:
+        active_backfill_run_ids.add(str(args.run_id))
+    await store.reconcile_orphaned_backfill_runs(
+        active_run_ids=active_backfill_run_ids,
+        reason="stack_backfill_start_process_set_reconciliation",
+        mailbox_id=args.mailbox_id,
+    )
     if args.materialize_external_image_rows:
         result = await store.materialize_external_image_derivative_rows(
             mailbox_id=args.mailbox_id,
@@ -67,6 +76,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         artifact_types=args.artifact,
         run_id=args.run_id,
     )
+
+
+def _active_backfill_run_ids() -> set[str]:
+    active: set[str] = set()
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            raw = cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except Exception:
+            continue
+        if "pim_email_backfill.py" not in raw:
+            continue
+        match = re.search(r"(?:^|\s)--run-id\s+(\S+)", raw)
+        if match:
+            active.add(match.group(1))
+    return active
 
 
 def main() -> int:

@@ -2843,6 +2843,51 @@ class PgEmailStore:
         finally:
             await conn.close()
 
+    async def reconcile_orphaned_backfill_runs(
+        self,
+        *,
+        active_run_ids: set[str] | list[str] | tuple[str, ...],
+        reason: str,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_active = sorted({str(run_id or "").strip() for run_id in active_run_ids if run_id})
+        metadata = {
+            "schema": "xarta.pim_email.backfill_orphan_reconcile.v1",
+            "reason": str(reason or "stack_process_not_active"),
+            "active_run_ids": clean_active,
+        }
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_backfill_runs
+                SET status = 'interrupted-orphaned',
+                    finished_at = COALESCE(finished_at, now()),
+                    updated_at = now(),
+                    metadata_json = metadata_json || jsonb_build_object(
+                        'orphan_reconcile', $3::jsonb
+                    )
+                WHERE mailbox_id = $1
+                  AND status = 'running'
+                  AND NOT (run_id = ANY($2::text[]))
+                RETURNING run_id
+                """,
+                configured_mailbox_id,
+                clean_active,
+                _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.backfill_orphan_reconcile.result.v1",
+            "mailbox_id": configured_mailbox_id,
+            "active_run_ids": clean_active,
+            "marked_orphaned": [str(row["run_id"]) for row in rows],
+            "marked_count": len(rows),
+        }
+
     async def run_backfill(
         self,
         *,
