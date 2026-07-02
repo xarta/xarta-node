@@ -303,6 +303,28 @@ def test_split_security_phase_only_result_does_not_unlock_render(monkeypatch):
     assert full["llm"]["valid_json"] is True
 
 
+def test_deterministic_security_handles_malformed_message_id_header(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_BASE_URL", "http://local-email-test.invalid")
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_SECURITY_LLM_MODEL", "LOCAL-EMAIL-TEST")
+    raw = (
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Subject: Malformed message id\r\n"
+        b"Message-ID: <[bad-local-part@example.test]>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Malformed headers are evidence; they must not make the checker fail.\r\n"
+    )
+
+    deterministic = pim_email_security.check_email_security_deterministic_sync(
+        raw,
+        dns_txt_lookup=lambda name: [],
+    )
+
+    assert deterministic["deterministic_complete"] is True
+    assert deterministic["raw_sha256"] == pim_email.hashlib.sha256(raw).hexdigest()
+    assert deterministic["context"]["message_id"] == "<[bad-local-part@example.test]>"
+
+
 def test_security_llm_phase_requires_prior_deterministic_phase():
     email_uid = "20260701-" + "d" * 40
     raw = b"Subject: Split stage\r\n\r\nLLM must not run before deterministic.\r\n"
@@ -1026,7 +1048,11 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     )
 
     candidate_query = next(query for query in queries if "WITH candidates AS" in query)
+    run_upsert_query = next(
+        query for query in queries if "INSERT INTO pim_email_backfill_runs" in query
+    )
     assert result["ok"] is True
+    assert "finished_at = NULL" in run_upsert_query
     assert "AS security_result_present" in candidate_query
     assert "security_result_present AND NOT security_complete THEN 1" in candidate_query
     assert "NOT security_complete THEN 2" in candidate_query
