@@ -557,8 +557,11 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
 
 
 def test_local_corpus_status_reports_missing_security_without_placeholder_results():
+    queries = []
+
     class FakeConnection:
         async def fetchrow(self, query, *args):
+            queries.append(query)
             assert args == ("test-mailbox",) or args[:1] == ("test-mailbox",)
             if "raw_originals_stored" in query:
                 return {
@@ -592,7 +595,8 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
             if "special_use_downloaded" in query:
                 return {
                     "special_use_downloaded": 7,
-                    "special_use_unmoved": 7,
+                    "special_use_unmoved": 5,
+                    "special_use_moved": 2,
                     "inbox_subfolders_moved": 5,
                 }
             if "FROM pim_email_download_runs" in query:
@@ -631,6 +635,16 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
         "stale_hash": 0,
     }
     assert status["render_gate"]["blocked_security_incomplete"] == 31
+    assert status["special_use_folders"] == {
+        "downloaded_memberships": 7,
+        "unmoved_memberships": 5,
+        "moved_memberships": 2,
+    }
+    folder_query = next(query for query in queries if "folder_effective" in query)
+    assert "effective_special_use_role" in folder_query
+    assert "'rubbish'" in folder_query
+    assert "'sentitems'" in folder_query
+    assert "'archived'" in folder_query
 
 
 def test_ensure_schema_purges_incomplete_security_placeholders():
