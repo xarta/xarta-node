@@ -135,7 +135,7 @@ def _identity_source_fields(message: Message) -> list[dict[str, Any]]:
     for name in IDENTITY_HEADER_ORDER:
         values = [
             normalized
-            for value in message.get_all(name, [])
+            for value in _raw_header_values(message, name)
             if (normalized := _normalize_header_value(name, value))
         ]
         if values:
@@ -145,7 +145,7 @@ def _identity_source_fields(message: Message) -> list[dict[str, Any]]:
 
 def _date_prefix(message: Message) -> tuple[str, str, list[str]]:
     warnings: list[str] = []
-    raw_dates = message.get_all("Date", [])
+    raw_dates = _raw_header_values(message, "Date")
     for raw_date in raw_dates:
         parsed = _parse_header_datetime(raw_date)
         if parsed is not None:
@@ -153,7 +153,7 @@ def _date_prefix(message: Message) -> tuple[str, str, list[str]]:
     if raw_dates:
         warnings.append("date_unparseable")
 
-    for received in message.get_all("Received", []):
+    for received in _raw_header_values(message, "Received"):
         parsed = _parse_received_datetime(received)
         if parsed is not None:
             _append_warning(warnings, "date_from_received_fallback")
@@ -161,6 +161,15 @@ def _date_prefix(message: Message) -> tuple[str, str, list[str]]:
 
     _append_warning(warnings, "date_missing")
     return "00000000", "missing", warnings
+
+
+def _raw_header_values(message: Message, name: str) -> list[Any]:
+    clean_name = str(name or "").lower()
+    return [
+        value
+        for header_name, value in message.raw_items()
+        if str(header_name or "").lower() == clean_name
+    ]
 
 
 def _parse_header_datetime(value: Any) -> datetime | None:
@@ -193,9 +202,10 @@ def _normalize_header_value(name: str, value: Any) -> str:
 
 def _decode_header_value(value: Any) -> str:
     try:
-        return str(make_header(decode_header(str(value or ""))))
+        decoded = str(make_header(decode_header(str(value or ""))))
     except Exception:
-        return str(value or "")
+        decoded = str(value or "")
+    return decoded.encode("utf-8", "replace").decode("utf-8")
 
 
 def _collapse_whitespace(value: str) -> str:

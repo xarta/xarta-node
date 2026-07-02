@@ -12,10 +12,12 @@ from pydantic import BaseModel, Field
 
 from .events import AppEvent
 from .pim_email import (
+    DEFAULT_DOWNLOADED_FOLDER,
     EmailConfigError,
     EmailCredentialError,
     EmailOperationError,
     PgEmailStore,
+    download_mailbox,
     fetch_message,
     fetch_message_security,
     fetch_remote_image_as_jpeg,
@@ -32,6 +34,17 @@ router = APIRouter(prefix="/personal/email", tags=["personal-email"])
 
 class SmtpSelfTestRequest(BaseModel):
     recipient: str = Field(..., min_length=3, max_length=254)
+
+
+class DownloadMailboxRequest(BaseModel):
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    apply_remote_moves: bool = False
+    downloaded_folder: str = Field(DEFAULT_DOWNLOADED_FOLDER, min_length=1, max_length=180)
+    limit_per_folder: int | None = Field(None, ge=1, le=5000)
+    max_messages: int | None = Field(None, ge=1, le=1000000)
+    convergence_passes: int = Field(2, ge=1, le=5)
+    include_special_use: bool = False
+    security_mode: str = Field("run-or-queue", min_length=3, max_length=20)
 
 
 def _store() -> PgEmailStore:
@@ -111,12 +124,20 @@ async def email_status() -> dict[str, Any]:
         store = _store()
         await store.ensure_schema()
         mailboxes = await store.public_mailboxes()
+        if hasattr(store, "local_corpus_status"):
+            local = await store.local_corpus_status()
+        else:
+            local = {"available": False, "message_count": 0}
         return {
             "ok": True,
             "storage": "postgres",
             "mailboxes": mailboxes,
+            "local_corpus": local,
             "capabilities": {
                 "imap_read": True,
+                "local_corpus_read": True,
+                "safe_local_download": True,
+                "imap_uid_move_after_local_commit": True,
                 "smtp_self_test": True,
                 "smtp_general_send": False,
                 "delete": False,
@@ -124,6 +145,70 @@ async def email_status() -> dict[str, Any]:
                 "security_checks": security_status(),
             },
         }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/local/status")
+async def email_local_status(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        status = await store.local_corpus_status(mailbox_id=mailbox_id)
+        return {"ok": True, "status": status}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/local/folders")
+async def email_local_folders(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(mailbox_id)
+        folders = await store.local_folders(mailbox_id=mailbox.mailbox_id)
+        return {"ok": True, "mailbox": mailbox.public_dict(), "folders": folders}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/local/folder-messages")
+async def email_local_folder_messages(
+    folder: str = Query("INBOX", min_length=1, max_length=180),
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(25, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(mailbox_id)
+        messages = await store.local_folder_messages(
+            mailbox_id=mailbox.mailbox_id,
+            folder=folder,
+            limit=limit,
+        )
+        return {
+            "ok": True,
+            "mailbox": mailbox.public_dict(),
+            "folder": folder,
+            "messages": messages,
+            "source": "local-corpus",
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/local/messages/{email_uid}")
+async def email_local_message(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(mailbox_id)
+        message = await store.read_local_message(email_uid, mailbox_id=mailbox.mailbox_id)
+        return {"ok": True, "mailbox": mailbox.public_dict(), "message": message}
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -176,6 +261,27 @@ async def email_folder_messages(
             "folder": folder,
             "messages": messages,
         }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/download/run")
+async def email_download_run(body: DownloadMailboxRequest) -> dict[str, Any]:
+    try:
+        store = _store()
+        mailbox = await store.get_mailbox(body.mailbox_id)
+        result = await download_mailbox(
+            mailbox,
+            store=store,
+            apply_remote_moves=body.apply_remote_moves,
+            downloaded_folder=body.downloaded_folder,
+            limit_per_folder=body.limit_per_folder,
+            max_messages=body.max_messages,
+            convergence_passes=body.convergence_passes,
+            include_special_use=body.include_special_use,
+            security_mode=body.security_mode,
+        )
+        return {"ok": True, "result": result}
     except Exception as exc:
         raise _http_error(exc) from exc
 

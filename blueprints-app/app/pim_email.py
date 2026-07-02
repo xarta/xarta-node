@@ -11,11 +11,14 @@ import imaplib
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import smtplib
 import socket
 import ssl
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import policy
@@ -24,6 +27,7 @@ from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
@@ -40,13 +44,21 @@ from .pim_email_uid import generate_email_uid_info
 DEFAULT_MAILBOX_ID = "default"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_SMTP_PORT = 465
+DEFAULT_IMAP_TIMEOUT_SECONDS = 60.0
+DEFAULT_IMAP_CALL_TIMEOUT_SECONDS = 60.0
+DEFAULT_IMAP_FETCH_CHUNK_BYTES = 1024 * 1024
 ENVELOPE_PURPOSE = b"xarta-pim-email-password-v1"
+CONTENT_PURPOSE = b"xarta-pim-email-content-v1"
+ASSET_PURPOSE = b"xarta-pim-email-asset-v1"
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_IMAGE_DIMENSIONS = (1800, 2400)
 MAX_RAW_VIEW_TEXT_CHARS = 200_000
 EMAIL_IMAGE_PROXY_PATH = "/api/v1/personal/email/image-proxy"
+DEFAULT_EMAIL_CONTENT_ROOT = "/xarta-node/.lone-wolf/email"
+DEFAULT_DOWNLOADED_FOLDER = "Downloaded"
+SPECIAL_USE_MOVE_SKIP_ROLES = {"drafts", "sent", "trash", "junk", "spam", "archive"}
 SAFE_INLINE_IMAGE_TYPES = {
     "image/gif",
     "image/jpeg",
@@ -66,6 +78,10 @@ class EmailCredentialError(RuntimeError):
 
 
 class EmailOperationError(RuntimeError):
+    pass
+
+
+class EmailImapTimeoutError(EmailOperationError):
     pass
 
 
@@ -158,11 +174,41 @@ def _credential_key_bytes(raw_key: str | None = None) -> bytes:
 def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     chunks: list[bytes] = []
     counter = 0
-    while sum(len(chunk) for chunk in chunks) < length:
+    produced = 0
+    while produced < length:
         counter_bytes = counter.to_bytes(4, "big")
-        chunks.append(hashlib.sha256(key + nonce + counter_bytes).digest())
+        chunk = hashlib.sha256(key + nonce + counter_bytes).digest()
+        chunks.append(chunk)
+        produced += len(chunk)
         counter += 1
     return b"".join(chunks)[:length]
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, dict):
+        return {_json_safe(str(key)): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _json_dumps(
+    value: Any,
+    *,
+    sort_keys: bool = True,
+    separators: tuple[str, str] | None = (",", ":"),
+    **kwargs: Any,
+) -> str:
+    return json.dumps(
+        _json_safe(value),
+        sort_keys=sort_keys,
+        separators=separators,
+        **kwargs,
+    )
 
 
 def encrypt_password(password: str, *, key: str | None = None) -> str:
@@ -172,7 +218,7 @@ def encrypt_password(password: str, *, key: str | None = None) -> str:
     stream = _keystream(key_bytes, nonce, len(plaintext))
     ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
     mac = hmac.new(key_bytes, ENVELOPE_PURPOSE + nonce + ciphertext, hashlib.sha256).digest()
-    return json.dumps(
+    return _json_dumps(
         {
             "v": 1,
             "alg": "xarta-secretbox-sha256-stream-hmac",
@@ -200,6 +246,132 @@ def decrypt_password(envelope: str, *, key: str | None = None) -> str:
     stream = _keystream(key_bytes, nonce, len(ciphertext))
     plaintext = bytes(a ^ b for a, b in zip(ciphertext, stream))
     return plaintext.decode("utf-8")
+
+
+def _content_key_bytes(raw_key: str | None = None) -> bytes:
+    raw = raw_key if raw_key is not None else os.environ.get("BLUEPRINTS_EMAIL_CONTENT_KEY", "")
+    raw = str(raw or "").strip()
+    if raw:
+        try:
+            decoded = _b64_decode(raw)
+        except Exception:
+            decoded = b""
+        if len(decoded) >= 32:
+            return decoded[:32]
+        return hashlib.sha256(raw.encode("utf-8")).digest()
+    credential_key = _credential_key_bytes()
+    return hmac.new(credential_key, CONTENT_PURPOSE, hashlib.sha256).digest()
+
+
+def _email_content_root(root: str | None = None) -> Path:
+    configured = (
+        root
+        if root is not None
+        else os.environ.get("BLUEPRINTS_EMAIL_CONTENT_ROOT", DEFAULT_EMAIL_CONTENT_ROOT)
+    )
+    return Path(str(configured or DEFAULT_EMAIL_CONTENT_ROOT)).expanduser()
+
+
+def _assert_safe_relpath(relpath: str) -> Path:
+    path = Path(str(relpath or ""))
+    if path.is_absolute() or ".." in path.parts or not path.name:
+        raise EmailOperationError("Unsafe email content storage path")
+    return path
+
+
+def encrypt_bytes_envelope(
+    content: bytes,
+    *,
+    purpose: bytes = CONTENT_PURPOSE,
+    key: str | None = None,
+) -> dict[str, Any]:
+    key_bytes = _content_key_bytes(key)
+    nonce = secrets.token_bytes(16)
+    plaintext = bytes(content or b"")
+    stream = _keystream(key_bytes, nonce, len(plaintext))
+    ciphertext = bytes(a ^ b for a, b in zip(plaintext, stream))
+    mac = hmac.new(key_bytes, purpose + nonce + ciphertext, hashlib.sha256).digest()
+    return {
+        "v": 1,
+        "alg": "xarta-secretbox-sha256-stream-hmac",
+        "purpose": purpose.decode("ascii", "replace"),
+        "nonce": _b64_encode(nonce),
+        "ciphertext": _b64_encode(ciphertext),
+        "mac": _b64_encode(mac),
+    }
+
+
+def decrypt_bytes_envelope(
+    envelope: dict[str, Any] | str | bytes,
+    *,
+    purpose: bytes = CONTENT_PURPOSE,
+    key: str | None = None,
+) -> bytes:
+    key_bytes = _content_key_bytes(key)
+    try:
+        payload = json.loads(envelope) if isinstance(envelope, (str, bytes)) else dict(envelope)
+        nonce = _b64_decode(str(payload["nonce"]))
+        ciphertext = _b64_decode(str(payload["ciphertext"]))
+        expected_mac = _b64_decode(str(payload["mac"]))
+    except Exception as exc:
+        raise EmailCredentialError("Invalid encrypted email content envelope") from exc
+    actual_mac = hmac.new(key_bytes, purpose + nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(actual_mac, expected_mac):
+        raise EmailCredentialError("Encrypted email content authentication failed")
+    stream = _keystream(key_bytes, nonce, len(ciphertext))
+    return bytes(a ^ b for a, b in zip(ciphertext, stream))
+
+
+def write_encrypted_bytes_atomic(
+    *,
+    relpath: str,
+    content: bytes,
+    purpose: bytes = CONTENT_PURPOSE,
+    root: str | None = None,
+) -> dict[str, Any]:
+    safe_relpath = _assert_safe_relpath(relpath)
+    root_path = _email_content_root(root)
+    target = root_path / safe_relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    envelope = encrypt_bytes_envelope(content, purpose=purpose)
+    encoded = _json_dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_bytes(encoded)
+    os.replace(tmp, target)
+    decrypted = decrypt_bytes_envelope(encoded, purpose=purpose)
+    raw_sha256 = hashlib.sha256(bytes(content or b"")).hexdigest()
+    verified_sha256 = hashlib.sha256(decrypted).hexdigest()
+    if verified_sha256 != raw_sha256:
+        raise EmailOperationError("Encrypted email content verification failed")
+    return {
+        "storage_relpath": str(safe_relpath),
+        "storage_abspath": str(target),
+        "encrypted_size": len(encoded),
+        "raw_sha256": raw_sha256,
+        "verified": True,
+        "encryption": {
+            "schema": "xarta.pim_email.encrypted_file.v1",
+            "alg": envelope["alg"],
+            "purpose": envelope["purpose"],
+            "nonce": envelope["nonce"],
+            "mac": envelope["mac"],
+        },
+    }
+
+
+def read_encrypted_bytes(
+    relpath: str,
+    *,
+    purpose: bytes = CONTENT_PURPOSE,
+    root: str | None = None,
+) -> bytes:
+    safe_relpath = _assert_safe_relpath(relpath)
+    path = _email_content_root(root) / safe_relpath
+    try:
+        encoded = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise EmailOperationError("Encrypted email content file is missing") from exc
+    return decrypt_bytes_envelope(encoded, purpose=purpose)
 
 
 class PgEmailStore:
@@ -256,6 +428,215 @@ class PgEmailStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_pim_email_security_checks_message
                 ON pim_email_security_checks(mailbox_id, folder, uid, checked_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE pim_email_security_checks
+                ADD COLUMN IF NOT EXISTS email_uid TEXT NOT NULL DEFAULT '',
+                ADD COLUMN IF NOT EXISTS security_status TEXT NOT NULL DEFAULT 'stored',
+                ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '',
+                ADD COLUMN IF NOT EXISTS checker_versions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                ADD COLUMN IF NOT EXISTS metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+                """
+            )
+            await conn.execute(
+                """
+                DROP INDEX IF EXISTS idx_pim_email_security_email_uid_raw;
+                CREATE INDEX IF NOT EXISTS idx_pim_email_security_email_uid_raw
+                ON pim_email_security_checks(email_uid, raw_sha256)
+                WHERE email_uid <> '' AND raw_sha256 <> '';
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_local_folders (
+                    folder_uid TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    parent_folder_uid TEXT NOT NULL DEFAULT '',
+                    folder_name TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    delimiter TEXT NOT NULL DEFAULT '/',
+                    special_use_role TEXT NOT NULL DEFAULT '',
+                    flags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    tombstoned_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (mailbox_id, folder_name)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_folder_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    folder_uid TEXT NOT NULL,
+                    folder_name TEXT NOT NULL,
+                    delimiter TEXT NOT NULL DEFAULT '/',
+                    special_use_role TEXT NOT NULL DEFAULT '',
+                    flags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    uidvalidity TEXT NOT NULL DEFAULT '',
+                    uidnext TEXT NOT NULL DEFAULT '',
+                    messages_count INTEGER NOT NULL DEFAULT 0,
+                    unseen_count INTEGER NOT NULL DEFAULT 0,
+                    status_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_folder_snapshots_folder
+                ON pim_email_folder_snapshots(mailbox_id, folder_uid, captured_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_messages (
+                    email_uid TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    raw_sha256 TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    subject TEXT NOT NULL DEFAULT '',
+                    from_addr TEXT NOT NULL DEFAULT '',
+                    to_addr TEXT NOT NULL DEFAULT '',
+                    date_header TEXT NOT NULL DEFAULT '',
+                    uid_info_json JSONB NOT NULL,
+                    headers_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    storage_relpath TEXT NOT NULL,
+                    encrypted_size BIGINT NOT NULL DEFAULT 0,
+                    encryption_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    first_downloaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_messages_mailbox_updated
+                ON pim_email_messages(mailbox_id, updated_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_folder_memberships (
+                    membership_id TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    folder_uid TEXT NOT NULL,
+                    folder_name TEXT NOT NULL,
+                    email_uid TEXT NOT NULL REFERENCES pim_email_messages(email_uid) ON DELETE CASCADE,
+                    imap_uid TEXT NOT NULL,
+                    uidvalidity TEXT NOT NULL DEFAULT '',
+                    flags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    source_snapshot_id TEXT NOT NULL DEFAULT '',
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    remote_moved_at TIMESTAMPTZ,
+                    remote_move_target TEXT NOT NULL DEFAULT '',
+                    UNIQUE (mailbox_id, folder_uid, uidvalidity, imap_uid)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_memberships_email_uid
+                ON pim_email_folder_memberships(email_uid, last_seen_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_download_runs (
+                    run_id TEXT PRIMARY KEY,
+                    mailbox_id TEXT NOT NULL,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    finished_at TIMESTAMPTZ,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    apply_remote_moves BOOLEAN NOT NULL DEFAULT false,
+                    downloaded_folder TEXT NOT NULL DEFAULT '',
+                    summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_download_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES pim_email_download_runs(run_id) ON DELETE CASCADE,
+                    mailbox_id TEXT NOT NULL,
+                    folder_uid TEXT NOT NULL,
+                    folder_name TEXT NOT NULL,
+                    uidvalidity TEXT NOT NULL DEFAULT '',
+                    uid_min TEXT NOT NULL DEFAULT '',
+                    uid_max TEXT NOT NULL DEFAULT '',
+                    planned_count INTEGER NOT NULL DEFAULT 0,
+                    processed_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    moved_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_download_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    mailbox_id TEXT NOT NULL DEFAULT '',
+                    folder_uid TEXT NOT NULL DEFAULT '',
+                    folder_name TEXT NOT NULL DEFAULT '',
+                    email_uid TEXT NOT NULL DEFAULT '',
+                    imap_uid TEXT NOT NULL DEFAULT '',
+                    uidvalidity TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    error_class TEXT NOT NULL DEFAULT '',
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_download_events_run
+                ON pim_email_download_events(run_id, created_at);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_transformed_assets (
+                    asset_uid TEXT PRIMARY KEY,
+                    email_uid TEXT NOT NULL REFERENCES pim_email_messages(email_uid) ON DELETE CASCADE,
+                    mailbox_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL DEFAULT '',
+                    content_type TEXT NOT NULL DEFAULT 'image/jpeg',
+                    raw_sha256 TEXT NOT NULL DEFAULT '',
+                    transformed_sha256 TEXT NOT NULL,
+                    storage_relpath TEXT NOT NULL,
+                    encrypted_size BIGINT NOT NULL DEFAULT 0,
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    transform_version TEXT NOT NULL DEFAULT 'jpeg-v1',
+                    encryption_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_assets_email_uid
+                ON pim_email_transformed_assets(email_uid, updated_at DESC);
                 """
             )
         finally:
@@ -367,9 +748,10 @@ class PgEmailStore:
         raw_sha256 = str(security.get("raw_sha256") or "")
         folder = clean_folder_name(str(message.get("folder") or "INBOX"))
         uid = clean_uid_value(str(message.get("uid") or ""))
+        email_uid = str(message.get("email_uid") or "")
         message_id = str((message.get("headers") or {}).get("message_id") or "")
         check_id = hashlib.sha256(
-            f"{mailbox_id}\n{folder}\n{uid}\n{raw_sha256}".encode("utf-8")
+            f"{mailbox_id}\n{folder}\n{uid}\n{email_uid}\n{raw_sha256}".encode("utf-8")
         ).hexdigest()
         conn = await self._connect()
         try:
@@ -377,14 +759,19 @@ class PgEmailStore:
                 """
                 INSERT INTO pim_email_security_checks (
                     security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
-                    aggregate_status, aggregate_score, llm_called, result_json, checked_at
+                    aggregate_status, aggregate_score, llm_called, result_json, checked_at,
+                    email_uid, security_status, checker_versions_json, metadata_json
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now())
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb, now(),$11,$12,$13::jsonb,$14::jsonb)
                 ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
                     message_id = EXCLUDED.message_id,
                     aggregate_status = EXCLUDED.aggregate_status,
                     aggregate_score = EXCLUDED.aggregate_score,
                     llm_called = EXCLUDED.llm_called,
+                    email_uid = EXCLUDED.email_uid,
+                    security_status = EXCLUDED.security_status,
+                    checker_versions_json = EXCLUDED.checker_versions_json,
+                    metadata_json = EXCLUDED.metadata_json,
                     result_json = EXCLUDED.result_json,
                     checked_at = now();
                 """,
@@ -397,14 +784,846 @@ class PgEmailStore:
                 str(aggregate.get("status") or "amber"),
                 int(aggregate.get("score") or aggregate.get("risk_score") or 0),
                 bool(aggregate.get("llm_called") or (security.get("llm") or {}).get("called")),
-                json.dumps(security, sort_keys=True, separators=(",", ":")),
+                _json_dumps(security, sort_keys=True, separators=(",", ":")),
+                email_uid,
+                "stored",
+                _json_dumps(
+                    _security_checker_versions(security), sort_keys=True, separators=(",", ":")
+                ),
+                _json_dumps(
+                    {
+                        "schema": "xarta.pim_email.security_result.metadata.v1",
+                        "email_uid": email_uid,
+                        "raw_sha256": raw_sha256,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             )
         finally:
             await conn.close()
 
+    async def local_corpus_status(self, *, mailbox_id: str | None = None) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                  (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1) AS messages,
+                  (SELECT count(*) FROM pim_email_local_folders WHERE mailbox_id = $1 AND tombstoned_at IS NULL) AS folders,
+                  (SELECT count(*) FROM pim_email_folder_memberships WHERE mailbox_id = $1) AS memberships,
+                  (SELECT count(*) FROM pim_email_transformed_assets WHERE mailbox_id = $1) AS transformed_assets
+                """,
+                configured_mailbox_id,
+            )
+            last_run = await conn.fetchrow(
+                """
+                SELECT run_id, status, started_at, finished_at, summary_json
+                FROM pim_email_download_runs
+                WHERE mailbox_id = $1
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                configured_mailbox_id,
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.local_corpus.status.v1",
+            "mailbox_id": configured_mailbox_id,
+            "message_count": int(row["messages"] or 0) if row else 0,
+            "folder_count": int(row["folders"] or 0) if row else 0,
+            "membership_count": int(row["memberships"] or 0) if row else 0,
+            "transformed_asset_count": int(row["transformed_assets"] or 0) if row else 0,
+            "available": bool(row and int(row["messages"] or 0) > 0),
+            "last_run": _download_run_public(last_run) if last_run else None,
+        }
+
+    async def local_folders(self, *, mailbox_id: str | None = None) -> list[dict[str, Any]]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT f.folder_uid, f.parent_folder_uid, f.folder_name, f.display_name,
+                       f.delimiter, f.special_use_role, f.flags_json, f.metadata_json,
+                       count(m.email_uid) AS message_count
+                FROM pim_email_local_folders f
+                LEFT JOIN pim_email_folder_memberships m
+                  ON m.mailbox_id = f.mailbox_id AND m.folder_uid = f.folder_uid
+                WHERE f.mailbox_id = $1 AND f.tombstoned_at IS NULL
+                GROUP BY f.folder_uid, f.parent_folder_uid, f.folder_name, f.display_name,
+                         f.delimiter, f.special_use_role, f.flags_json, f.metadata_json
+                ORDER BY CASE WHEN upper(f.folder_name) = 'INBOX' THEN 0 ELSE 1 END, lower(f.folder_name)
+                """,
+                configured_mailbox_id,
+            )
+        finally:
+            await conn.close()
+        return [_folder_row_public(row) for row in rows]
+
+    async def local_folder_messages(
+        self,
+        *,
+        folder: str = "INBOX",
+        mailbox_id: str | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_folder = clean_folder_name(folder)
+        safe_limit = max(1, min(int(limit), 200))
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT m.email_uid, m.raw_sha256, m.message_id, m.subject, m.from_addr,
+                       m.to_addr, m.date_header, m.uid_info_json, m.metadata_json,
+                       fm.folder_name, fm.imap_uid, fm.uidvalidity, fm.flags_json,
+                       fm.last_seen_at, m.updated_at
+                FROM pim_email_folder_memberships fm
+                JOIN pim_email_messages m ON m.email_uid = fm.email_uid
+                WHERE fm.mailbox_id = $1 AND fm.folder_name = $2
+                ORDER BY fm.last_seen_at DESC, m.updated_at DESC
+                LIMIT $3
+                """,
+                configured_mailbox_id,
+                clean_folder,
+                safe_limit,
+            )
+        finally:
+            await conn.close()
+        return [_local_message_row_public(row) for row in rows]
+
+    async def read_local_message(
+        self,
+        email_uid: str,
+        *,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_uid = clean_email_uid(email_uid)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM pim_email_messages
+                WHERE mailbox_id = $1 AND email_uid = $2
+                """,
+                configured_mailbox_id,
+                clean_uid,
+            )
+            memberships = await conn.fetch(
+                """
+                SELECT folder_name, folder_uid, imap_uid, uidvalidity, flags_json, last_seen_at,
+                       remote_moved_at, remote_move_target
+                FROM pim_email_folder_memberships
+                WHERE mailbox_id = $1 AND email_uid = $2
+                ORDER BY last_seen_at DESC
+                """,
+                configured_mailbox_id,
+                clean_uid,
+            )
+            security = await conn.fetchrow(
+                """
+                SELECT result_json, security_status, error_message, checked_at, raw_sha256
+                FROM pim_email_security_checks
+                WHERE email_uid = $1
+                ORDER BY checked_at DESC
+                LIMIT 1
+                """,
+                clean_uid,
+            )
+            assets = await conn.fetch(
+                """
+                SELECT asset_uid, source_url, content_type, transformed_sha256, storage_relpath,
+                       width, height, transform_version, metadata_json, updated_at
+                FROM pim_email_transformed_assets
+                WHERE mailbox_id = $1 AND email_uid = $2
+                ORDER BY updated_at DESC
+                """,
+                configured_mailbox_id,
+                clean_uid,
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("Local email message is not stored")
+        raw = read_encrypted_bytes(str(row["storage_relpath"]))
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        if raw_sha256 != str(row["raw_sha256"]):
+            raise EmailOperationError("Local email content hash verification failed")
+        parsed = parse_message(
+            raw,
+            folder=str(memberships[0]["folder_name"]) if memberships else "",
+            uid=str(memberships[0]["imap_uid"]) if memberships else "",
+        )
+        reparsed_email_uid = str(parsed.get("email_uid") or "")
+        stored_uid_info = _json_value(_row_get(row, "uid_info_json"), {})
+        stored_headers = _json_value(_row_get(row, "headers_json"), {})
+        headers = parsed.get("headers") if isinstance(parsed.get("headers"), dict) else {}
+        if isinstance(stored_headers, dict):
+            headers = {**headers, **stored_headers}
+        for key, column in {
+            "subject": "subject",
+            "from": "from_addr",
+            "to": "to_addr",
+            "date": "date_header",
+            "message_id": "message_id",
+        }.items():
+            value = str(_row_get(row, column, "") or "")
+            if value:
+                headers[key] = value
+        if isinstance(stored_uid_info, dict) and stored_uid_info:
+            parsed["email_uid_info"] = {**stored_uid_info, "email_uid": clean_uid}
+        parsed["email_uid"] = clean_uid
+        parsed["raw_sha256"] = raw_sha256
+        parsed["headers"] = headers
+        parsed["source"] = "local-corpus"
+        parsed["stored"] = {
+            "email_uid": clean_uid,
+            "raw_sha256": raw_sha256,
+            "storage_relpath": str(row["storage_relpath"]),
+            "encrypted_size": int(row["encrypted_size"] or 0),
+            "verified": True,
+            "memberships": [_membership_row_public(item) for item in memberships],
+            "transformed_assets": [_asset_row_public(item) for item in assets],
+        }
+        if reparsed_email_uid and reparsed_email_uid != clean_uid:
+            parsed["stored"]["reparsed_email_uid"] = reparsed_email_uid
+        if security is not None and _row_get(security, "result_json"):
+            parsed["security"] = dict(_json_value(_row_get(security, "result_json"), {}))
+        else:
+            parsed["security"] = {
+                "available": False,
+                "security_status": _row_get(security, "security_status", "missing")
+                if security
+                else "missing",
+                "raw_sha256": raw_sha256,
+            }
+        return parsed
+
+    async def record_download_run_start(
+        self,
+        *,
+        run_id: str,
+        mailbox_id: str,
+        apply_remote_moves: bool,
+        downloaded_folder: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_download_runs (
+                    run_id, mailbox_id, status, apply_remote_moves, downloaded_folder, metadata_json
+                )
+                VALUES ($1,$2,'running',$3,$4,$5::jsonb)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    status = 'running',
+                    apply_remote_moves = EXCLUDED.apply_remote_moves,
+                    downloaded_folder = EXCLUDED.downloaded_folder,
+                    metadata_json = EXCLUDED.metadata_json;
+                """,
+                run_id,
+                mailbox_id,
+                apply_remote_moves,
+                downloaded_folder,
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+
+    async def record_download_run_finish(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        summary: dict[str, Any],
+    ) -> None:
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_download_runs
+                SET status = $2, finished_at = now(), summary_json = $3::jsonb
+                WHERE run_id = $1
+                """,
+                run_id,
+                status,
+                _json_dumps(summary, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+
+    async def record_download_event(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        status: str = "",
+        message: str = "",
+        mailbox_id: str = "",
+        batch_id: str = "",
+        folder_uid: str = "",
+        folder_name: str = "",
+        email_uid: str = "",
+        imap_uid: str = "",
+        uidvalidity: str = "",
+        error_class: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_download_events (
+                    event_id, run_id, batch_id, mailbox_id, folder_uid, folder_name,
+                    email_uid, imap_uid, uidvalidity, event_type, status, message,
+                    error_class, metadata_json
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+                """,
+                _stable_id(
+                    "email-event", run_id, event_type, folder_name, imap_uid, str(time.time_ns())
+                ),
+                run_id,
+                batch_id,
+                mailbox_id,
+                folder_uid,
+                folder_name,
+                email_uid,
+                imap_uid,
+                uidvalidity,
+                event_type,
+                status,
+                message[:1000],
+                error_class[:200],
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+
+    async def record_download_batch_start(
+        self,
+        *,
+        batch_id: str,
+        run_id: str,
+        mailbox_id: str,
+        folder_snapshot: dict[str, Any],
+        uids: list[str],
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        safe_uids = [clean_uid_value(uid) for uid in uids]
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_download_batches (
+                    batch_id, run_id, mailbox_id, folder_uid, folder_name, uidvalidity,
+                    uid_min, uid_max, planned_count, metadata_json, updated_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now())
+                ON CONFLICT (batch_id) DO UPDATE SET
+                    uid_min = EXCLUDED.uid_min,
+                    uid_max = EXCLUDED.uid_max,
+                    planned_count = EXCLUDED.planned_count,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now();
+                """,
+                batch_id,
+                run_id,
+                mailbox_id,
+                str(folder_snapshot.get("folder_uid") or ""),
+                str(folder_snapshot.get("folder_name") or ""),
+                str(folder_snapshot.get("uidvalidity") or ""),
+                min(safe_uids, key=int) if safe_uids else "",
+                max(safe_uids, key=int) if safe_uids else "",
+                len(safe_uids),
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+
+    async def record_download_batch_finish(
+        self,
+        *,
+        batch_id: str,
+        processed_count: int = 0,
+        skipped_count: int = 0,
+        moved_count: int = 0,
+        failed_count: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_download_batches
+                SET processed_count = $2,
+                    skipped_count = $3,
+                    moved_count = $4,
+                    failed_count = $5,
+                    metadata_json = COALESCE($6::jsonb, metadata_json),
+                    updated_at = now()
+                WHERE batch_id = $1
+                """,
+                batch_id,
+                int(processed_count),
+                int(skipped_count),
+                int(moved_count),
+                int(failed_count),
+                _json_dumps(metadata, sort_keys=True, separators=(",", ":"))
+                if metadata is not None
+                else None,
+            )
+        finally:
+            await conn.close()
+
+    async def save_folder_snapshot(
+        self,
+        *,
+        mailbox_id: str,
+        folder: dict[str, Any],
+        status: dict[str, Any],
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        folder_name = clean_folder_name(str(folder.get("name") or "INBOX"))
+        delimiter = str(folder.get("delimiter") or "/") or "/"
+        flags = [str(item).lower() for item in folder.get("flags") or []]
+        role = special_use_role(folder_name, flags)
+        folder_uid = folder_uid_for(mailbox_id, folder_name)
+        parent_uid = parent_folder_uid_for(mailbox_id, folder_name, delimiter)
+        snapshot_id = _stable_id(
+            "email-folder-snapshot",
+            mailbox_id,
+            folder_uid,
+            str(time.time_ns()),
+        )
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_local_folders (
+                    folder_uid, mailbox_id, parent_folder_uid, folder_name, display_name,
+                    delimiter, special_use_role, flags_json, metadata_json, tombstoned_at, updated_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,NULL,now())
+                ON CONFLICT (mailbox_id, folder_name) DO UPDATE SET
+                    parent_folder_uid = EXCLUDED.parent_folder_uid,
+                    display_name = EXCLUDED.display_name,
+                    delimiter = EXCLUDED.delimiter,
+                    special_use_role = EXCLUDED.special_use_role,
+                    flags_json = EXCLUDED.flags_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    tombstoned_at = NULL,
+                    updated_at = now();
+                """,
+                folder_uid,
+                mailbox_id,
+                parent_uid,
+                folder_name,
+                folder_name.rsplit(delimiter, 1)[-1] if delimiter in folder_name else folder_name,
+                delimiter,
+                role,
+                _json_dumps(flags, sort_keys=True, separators=(",", ":")),
+                _json_dumps(
+                    {
+                        "schema": "xarta.pim_email.local_folder.metadata.v1",
+                        "raw_folder": folder,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            await conn.execute(
+                """
+                INSERT INTO pim_email_folder_snapshots (
+                    snapshot_id, mailbox_id, folder_uid, folder_name, delimiter,
+                    special_use_role, flags_json, uidvalidity, uidnext, messages_count,
+                    unseen_count, status_json
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12::jsonb)
+                """,
+                snapshot_id,
+                mailbox_id,
+                folder_uid,
+                folder_name,
+                delimiter,
+                role,
+                _json_dumps(flags, sort_keys=True, separators=(",", ":")),
+                str(status.get("UIDVALIDITY") or status.get("uidvalidity") or ""),
+                str(status.get("UIDNEXT") or status.get("uidnext") or ""),
+                int(status.get("MESSAGES") or status.get("messages") or 0),
+                int(status.get("UNSEEN") or status.get("unseen") or 0),
+                _json_dumps(status, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "snapshot_id": snapshot_id,
+            "folder_uid": folder_uid,
+            "folder_name": folder_name,
+            "delimiter": delimiter,
+            "flags": flags,
+            "special_use_role": role,
+            "uidvalidity": str(status.get("UIDVALIDITY") or status.get("uidvalidity") or ""),
+            "uidnext": str(status.get("UIDNEXT") or status.get("uidnext") or ""),
+            "messages_count": int(status.get("MESSAGES") or status.get("messages") or 0),
+        }
+
+    async def save_downloaded_email(
+        self,
+        *,
+        mailbox_id: str,
+        folder_snapshot: dict[str, Any],
+        imap_uid: str,
+        flags: list[str],
+        raw: bytes,
+        parsed: dict[str, Any],
+        storage: dict[str, Any],
+        security: dict[str, Any] | None,
+        security_error: str = "",
+        transformed_assets: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.ensure_schema()
+        email_uid = clean_email_uid(str(parsed.get("email_uid") or ""))
+        headers = parsed.get("headers") if isinstance(parsed.get("headers"), dict) else {}
+        email_uid_info = (
+            parsed.get("email_uid_info") if isinstance(parsed.get("email_uid_info"), dict) else {}
+        )
+        uidvalidity = str(folder_snapshot.get("uidvalidity") or "")
+        folder_uid = str(folder_snapshot.get("folder_uid") or "")
+        folder_name = str(folder_snapshot.get("folder_name") or "")
+        membership_id = _stable_id(
+            "email-membership",
+            mailbox_id,
+            folder_uid,
+            uidvalidity,
+            imap_uid,
+        )
+        raw_sha256 = str(storage.get("raw_sha256") or hashlib.sha256(raw).hexdigest())
+        conn = await self._connect()
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO pim_email_messages (
+                        email_uid, mailbox_id, raw_sha256, message_id, subject, from_addr,
+                        to_addr, date_header, uid_info_json, headers_json, metadata_json,
+                        storage_relpath, encrypted_size, encryption_json, updated_at
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12,$13,$14::jsonb,now())
+                    ON CONFLICT (email_uid) DO UPDATE SET
+                        mailbox_id = EXCLUDED.mailbox_id,
+                        raw_sha256 = EXCLUDED.raw_sha256,
+                        message_id = EXCLUDED.message_id,
+                        subject = EXCLUDED.subject,
+                        from_addr = EXCLUDED.from_addr,
+                        to_addr = EXCLUDED.to_addr,
+                        date_header = EXCLUDED.date_header,
+                        uid_info_json = EXCLUDED.uid_info_json,
+                        headers_json = EXCLUDED.headers_json,
+                        metadata_json = EXCLUDED.metadata_json,
+                        storage_relpath = EXCLUDED.storage_relpath,
+                        encrypted_size = EXCLUDED.encrypted_size,
+                        encryption_json = EXCLUDED.encryption_json,
+                        updated_at = now();
+                    """,
+                    email_uid,
+                    mailbox_id,
+                    raw_sha256,
+                    str(headers.get("message_id") or ""),
+                    str(headers.get("subject") or ""),
+                    str(headers.get("from") or ""),
+                    str(headers.get("to") or ""),
+                    str(headers.get("date") or ""),
+                    _json_dumps(email_uid_info, sort_keys=True, separators=(",", ":")),
+                    _json_dumps(headers, sort_keys=True, separators=(",", ":")),
+                    _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                    str(storage.get("storage_relpath") or ""),
+                    int(storage.get("encrypted_size") or 0),
+                    _json_dumps(
+                        storage.get("encryption") or {}, sort_keys=True, separators=(",", ":")
+                    ),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO pim_email_folder_memberships (
+                        membership_id, mailbox_id, folder_uid, folder_name, email_uid,
+                        imap_uid, uidvalidity, flags_json, source_snapshot_id,
+                        metadata_json, last_seen_at
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,now())
+                    ON CONFLICT (mailbox_id, folder_uid, uidvalidity, imap_uid) DO UPDATE SET
+                        email_uid = EXCLUDED.email_uid,
+                        folder_name = EXCLUDED.folder_name,
+                        flags_json = EXCLUDED.flags_json,
+                        source_snapshot_id = EXCLUDED.source_snapshot_id,
+                        metadata_json = EXCLUDED.metadata_json,
+                        last_seen_at = now();
+                    """,
+                    membership_id,
+                    mailbox_id,
+                    folder_uid,
+                    folder_name,
+                    email_uid,
+                    imap_uid,
+                    uidvalidity,
+                    _json_dumps(flags, sort_keys=True, separators=(",", ":")),
+                    str(folder_snapshot.get("snapshot_id") or ""),
+                    _json_dumps(
+                        {
+                            "schema": "xarta.pim_email.folder_membership.metadata.v1",
+                            "source": "imap-download",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                if security and security.get("available"):
+                    aggregate = (
+                        security.get("aggregate")
+                        if isinstance(security.get("aggregate"), dict)
+                        else {}
+                    )
+                    security_check_id = _stable_id("email-security", email_uid, raw_sha256)
+                    await conn.execute(
+                        """
+                        INSERT INTO pim_email_security_checks (
+                            security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
+                            aggregate_status, aggregate_score, llm_called, result_json, checked_at,
+                            email_uid, security_status, checker_versions_json, metadata_json
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
+                        ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                            message_id = EXCLUDED.message_id,
+                            aggregate_status = EXCLUDED.aggregate_status,
+                            aggregate_score = EXCLUDED.aggregate_score,
+                            llm_called = EXCLUDED.llm_called,
+                            result_json = EXCLUDED.result_json,
+                            email_uid = EXCLUDED.email_uid,
+                            security_status = EXCLUDED.security_status,
+                            checker_versions_json = EXCLUDED.checker_versions_json,
+                            metadata_json = EXCLUDED.metadata_json,
+                            checked_at = now();
+                        """,
+                        security_check_id,
+                        mailbox_id,
+                        folder_name,
+                        imap_uid,
+                        str(headers.get("message_id") or ""),
+                        raw_sha256,
+                        str(aggregate.get("status") or "amber"),
+                        int(aggregate.get("score") or aggregate.get("risk_score") or 0),
+                        bool(
+                            aggregate.get("llm_called") or (security.get("llm") or {}).get("called")
+                        ),
+                        _json_dumps(security, sort_keys=True, separators=(",", ":")),
+                        email_uid,
+                        _json_dumps(
+                            _security_checker_versions(security),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        _json_dumps(
+                            {"email_uid": email_uid, "raw_sha256": raw_sha256},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                else:
+                    security_check_id = _stable_id("email-security-queued", email_uid, raw_sha256)
+                    await conn.execute(
+                        """
+                        INSERT INTO pim_email_security_checks (
+                            security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
+                            aggregate_status, aggregate_score, llm_called, result_json, checked_at,
+                            email_uid, security_status, error_message, metadata_json
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,'queued',0,false,$7::jsonb,now(),$8,$9,$10,$11::jsonb)
+                        ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
+                            email_uid = EXCLUDED.email_uid,
+                            security_status = CASE
+                                WHEN pim_email_security_checks.security_status = 'stored'
+                                THEN pim_email_security_checks.security_status
+                                ELSE EXCLUDED.security_status
+                            END,
+                            error_message = CASE
+                                WHEN pim_email_security_checks.security_status = 'stored'
+                                THEN pim_email_security_checks.error_message
+                                ELSE EXCLUDED.error_message
+                            END,
+                            result_json = CASE
+                                WHEN pim_email_security_checks.security_status = 'stored'
+                                THEN pim_email_security_checks.result_json
+                                ELSE EXCLUDED.result_json
+                            END,
+                            metadata_json = EXCLUDED.metadata_json,
+                            checked_at = now();
+                        """,
+                        security_check_id,
+                        mailbox_id,
+                        folder_name,
+                        imap_uid,
+                        str(headers.get("message_id") or ""),
+                        raw_sha256,
+                        _json_dumps(
+                            {
+                                "available": False,
+                                "queued": True,
+                                "raw_sha256": raw_sha256,
+                                "error": security_error,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        email_uid,
+                        "queued" if not security_error else "failed_retryable",
+                        security_error[:1000],
+                        _json_dumps(
+                            {"email_uid": email_uid, "raw_sha256": raw_sha256},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                for asset in transformed_assets or []:
+                    await conn.execute(
+                        """
+                        INSERT INTO pim_email_transformed_assets (
+                            asset_uid, email_uid, mailbox_id, source_url, content_type,
+                            raw_sha256, transformed_sha256, storage_relpath, encrypted_size,
+                            width, height, transform_version, encryption_json, metadata_json, updated_at
+                        )
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,now())
+                        ON CONFLICT (asset_uid) DO UPDATE SET
+                            source_url = EXCLUDED.source_url,
+                            content_type = EXCLUDED.content_type,
+                            raw_sha256 = EXCLUDED.raw_sha256,
+                            transformed_sha256 = EXCLUDED.transformed_sha256,
+                            storage_relpath = EXCLUDED.storage_relpath,
+                            encrypted_size = EXCLUDED.encrypted_size,
+                            width = EXCLUDED.width,
+                            height = EXCLUDED.height,
+                            transform_version = EXCLUDED.transform_version,
+                            encryption_json = EXCLUDED.encryption_json,
+                            metadata_json = EXCLUDED.metadata_json,
+                            updated_at = now();
+                        """,
+                        str(asset["asset_uid"]),
+                        email_uid,
+                        mailbox_id,
+                        str(asset.get("source_url") or ""),
+                        str(asset.get("content_type") or "image/jpeg"),
+                        str(asset.get("raw_sha256") or ""),
+                        str(asset.get("transformed_sha256") or ""),
+                        str(asset.get("storage_relpath") or ""),
+                        int(asset.get("encrypted_size") or 0),
+                        int(asset.get("width") or 0),
+                        int(asset.get("height") or 0),
+                        str(asset.get("transform_version") or "jpeg-v1"),
+                        _json_dumps(
+                            asset.get("encryption") or {}, sort_keys=True, separators=(",", ":")
+                        ),
+                        _json_dumps(
+                            asset.get("metadata") or {}, sort_keys=True, separators=(",", ":")
+                        ),
+                    )
+        finally:
+            await conn.close()
+
+    async def mark_remote_moved(
+        self,
+        *,
+        mailbox_id: str,
+        folder_uid: str,
+        uidvalidity: str,
+        imap_uid: str,
+        target_folder: str,
+    ) -> None:
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                UPDATE pim_email_folder_memberships
+                SET remote_moved_at = now(), remote_move_target = $5
+                WHERE mailbox_id = $1 AND folder_uid = $2 AND uidvalidity = $3 AND imap_uid = $4
+                """,
+                mailbox_id,
+                folder_uid,
+                uidvalidity,
+                imap_uid,
+                target_folder,
+            )
+        finally:
+            await conn.close()
+
+    async def store_transformed_asset(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        asset: dict[str, Any],
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        clean_uid = clean_email_uid(email_uid)
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO pim_email_transformed_assets (
+                    asset_uid, email_uid, mailbox_id, source_url, content_type,
+                    raw_sha256, transformed_sha256, storage_relpath, encrypted_size,
+                    width, height, transform_version, encryption_json, metadata_json, updated_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,now())
+                ON CONFLICT (asset_uid) DO UPDATE SET
+                    source_url = EXCLUDED.source_url,
+                    content_type = EXCLUDED.content_type,
+                    raw_sha256 = EXCLUDED.raw_sha256,
+                    transformed_sha256 = EXCLUDED.transformed_sha256,
+                    storage_relpath = EXCLUDED.storage_relpath,
+                    encrypted_size = EXCLUDED.encrypted_size,
+                    width = EXCLUDED.width,
+                    height = EXCLUDED.height,
+                    transform_version = EXCLUDED.transform_version,
+                    encryption_json = EXCLUDED.encryption_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = now()
+                RETURNING asset_uid, source_url, content_type, transformed_sha256,
+                          storage_relpath, width, height, transform_version,
+                          metadata_json, updated_at;
+                """,
+                str(asset["asset_uid"]),
+                clean_uid,
+                mailbox_id,
+                str(asset.get("source_url") or ""),
+                str(asset.get("content_type") or "image/jpeg"),
+                str(asset.get("raw_sha256") or ""),
+                str(asset.get("transformed_sha256") or ""),
+                str(asset.get("storage_relpath") or ""),
+                int(asset.get("encrypted_size") or 0),
+                int(asset.get("width") or 0),
+                int(asset.get("height") or 0),
+                str(asset.get("transform_version") or "jpeg-v1"),
+                _json_dumps(asset.get("encryption") or {}, sort_keys=True, separators=(",", ":")),
+                _json_dumps(asset.get("metadata") or {}, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return _asset_row_public(row)
+
 
 def _mailbox_row_public(row: Any) -> dict[str, Any]:
-    updated = row.get("updated_at") if hasattr(row, "get") else row["updated_at"]
+    updated = _row_get(row, "updated_at")
     return {
         "mailbox_id": str(row["mailbox_id"]),
         "email_address": str(row["email_address"]),
@@ -420,6 +1639,223 @@ def _mailbox_row_public(row: Any) -> dict[str, Any]:
             "starttls": bool(row["smtp_starttls"]),
         },
         "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else str(updated or ""),
+    }
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if hasattr(row, "get"):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def _json_value(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+    return value
+
+
+def _iso_datetime(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+
+
+def _download_run_public(row: Any) -> dict[str, Any]:
+    return {
+        "run_id": str(_row_get(row, "run_id", "")),
+        "status": str(_row_get(row, "status", "")),
+        "started_at": _iso_datetime(_row_get(row, "started_at")),
+        "finished_at": _iso_datetime(_row_get(row, "finished_at")),
+        "summary": _json_value(_row_get(row, "summary_json"), {}),
+    }
+
+
+def _folder_row_public(row: Any) -> dict[str, Any]:
+    flags = _json_value(_row_get(row, "flags_json"), [])
+    metadata = _json_value(_row_get(row, "metadata_json"), {})
+    folder_name = str(_row_get(row, "folder_name", ""))
+    return {
+        "folder_uid": str(_row_get(row, "folder_uid", "")),
+        "parent_folder_uid": str(_row_get(row, "parent_folder_uid", "")),
+        "name": folder_name,
+        "path": folder_name,
+        "display_name": str(_row_get(row, "display_name", folder_name)),
+        "delimiter": str(_row_get(row, "delimiter", "/") or "/"),
+        "flags": flags if isinstance(flags, list) else [],
+        "special_use_role": str(_row_get(row, "special_use_role", "")),
+        "message_count": int(_row_get(row, "message_count", 0) or 0),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def _local_message_row_public(row: Any) -> dict[str, Any]:
+    metadata = _json_value(_row_get(row, "metadata_json"), {})
+    flags = _json_value(_row_get(row, "flags_json"), [])
+    return {
+        "uid": str(_row_get(row, "imap_uid", "")),
+        "folder": str(_row_get(row, "folder_name", "")),
+        "email_uid": str(_row_get(row, "email_uid", "")),
+        "raw_sha256": str(_row_get(row, "raw_sha256", "")),
+        "subject": str(_row_get(row, "subject", "")),
+        "from": str(_row_get(row, "from_addr", "")),
+        "to": str(_row_get(row, "to_addr", "")),
+        "date": str(_row_get(row, "date_header", "")),
+        "message_id": str(_row_get(row, "message_id", "")),
+        "uidvalidity": str(_row_get(row, "uidvalidity", "")),
+        "flags": flags if isinstance(flags, list) else [],
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "source": "local-corpus",
+        "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+        "last_seen_at": _iso_datetime(_row_get(row, "last_seen_at")),
+    }
+
+
+def _membership_row_public(row: Any) -> dict[str, Any]:
+    flags = _json_value(_row_get(row, "flags_json"), [])
+    return {
+        "folder_name": str(_row_get(row, "folder_name", "")),
+        "folder_uid": str(_row_get(row, "folder_uid", "")),
+        "imap_uid": str(_row_get(row, "imap_uid", "")),
+        "uidvalidity": str(_row_get(row, "uidvalidity", "")),
+        "flags": flags if isinstance(flags, list) else [],
+        "last_seen_at": _iso_datetime(_row_get(row, "last_seen_at")),
+        "remote_moved_at": _iso_datetime(_row_get(row, "remote_moved_at")),
+        "remote_move_target": str(_row_get(row, "remote_move_target", "")),
+    }
+
+
+def _asset_row_public(row: Any) -> dict[str, Any]:
+    metadata = _json_value(_row_get(row, "metadata_json"), {})
+    return {
+        "asset_uid": str(_row_get(row, "asset_uid", "")),
+        "source_url": str(_row_get(row, "source_url", "")),
+        "content_type": str(_row_get(row, "content_type", "image/jpeg")),
+        "transformed_sha256": str(_row_get(row, "transformed_sha256", "")),
+        "storage_relpath": str(_row_get(row, "storage_relpath", "")),
+        "width": int(_row_get(row, "width", 0) or 0),
+        "height": int(_row_get(row, "height", 0) or 0),
+        "transform_version": str(_row_get(row, "transform_version", "jpeg-v1")),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+    }
+
+
+def clean_email_uid(value: str) -> str:
+    clean = str(value or "").strip().lower()
+    if not re.fullmatch(r"[0-9]{8}-[0-9a-f]{40}", clean):
+        raise EmailOperationError("Invalid local email UID")
+    return clean
+
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    digest = hashlib.sha256("\n".join(str(part) for part in parts).encode("utf-8")).hexdigest()
+    return f"{prefix}-{digest[:32]}"
+
+
+def _security_checker_versions(security: dict[str, Any]) -> dict[str, Any]:
+    progress = security.get("progress") if isinstance(security.get("progress"), dict) else {}
+    llm = security.get("llm") if isinstance(security.get("llm"), dict) else {}
+    return {
+        "schema": "xarta.pim_email.security_checker_versions.v1",
+        "security_schema": str(security.get("schema") or ""),
+        "progress_schema": str(progress.get("schema") or ""),
+        "llm_model": str(llm.get("model") or ""),
+        "llm_tools": "disabled",
+    }
+
+
+def special_use_role(folder_name: str, flags: list[str] | None = None) -> str:
+    clean_flags = {str(flag or "").lower().lstrip("\\") for flag in (flags or [])}
+    for role in ("drafts", "sent", "trash", "junk", "archive"):
+        if role in clean_flags:
+            return role
+    if "spam" in clean_flags:
+        return "spam"
+    leaf = re.sub(r"[^a-z0-9]+", "", str(folder_name or "").rsplit("/", 1)[-1].lower())
+    if leaf in {"draft", "drafts"}:
+        return "drafts"
+    if leaf in {"sent", "sentmail", "sentmessages", "sentitems"}:
+        return "sent"
+    if leaf in {"trash", "rubbish", "bin", "deleted", "deleteditems"}:
+        return "trash"
+    if leaf in {"junk", "spam"}:
+        return "junk" if leaf == "junk" else "spam"
+    if leaf in {"archive", "archives", "archived"}:
+        return "archive"
+    if leaf == "inbox":
+        return "inbox"
+    return ""
+
+
+def folder_uid_for(mailbox_id: str, folder_name: str) -> str:
+    return _stable_id("email-folder", mailbox_id, clean_folder_name(folder_name))
+
+
+def parent_folder_uid_for(mailbox_id: str, folder_name: str, delimiter: str = "/") -> str:
+    clean = clean_folder_name(folder_name)
+    delim = delimiter or "/"
+    if delim not in clean:
+        return ""
+    parent = clean.rsplit(delim, 1)[0]
+    return folder_uid_for(mailbox_id, parent) if parent else ""
+
+
+def _email_asset_relpath(email_uid: str, asset_uid: str) -> str:
+    clean_uid = clean_email_uid(email_uid)
+    prefix = clean_uid.split("-", 1)[0]
+    if prefix == "00000000":
+        return f"undated/assets/{clean_uid}/{asset_uid}.jpg.enc"
+    return f"{prefix[0:4]}/{prefix[4:6]}/{prefix[6:8]}/assets/{clean_uid}/{asset_uid}.jpg.enc"
+
+
+def build_transformed_external_image_asset(
+    *,
+    mailbox_id: str,
+    email_uid: str,
+    source_url: str,
+    content: bytes,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clean_uid = clean_email_uid(email_uid)
+    canonical = _canonical_remote_image_url(source_url) or str(source_url or "")
+    raw_sha256 = hashlib.sha256(bytes(content or b"")).hexdigest()
+    jpeg = transform_image_to_jpeg(content)
+    transformed_sha256 = hashlib.sha256(jpeg).hexdigest()
+    asset_uid = _stable_id("email-asset", mailbox_id, clean_uid, canonical, raw_sha256)
+    with Image.open(BytesIO(jpeg)) as image:
+        width, height = image.size
+    storage = write_encrypted_bytes_atomic(
+        relpath=_email_asset_relpath(clean_uid, asset_uid),
+        content=jpeg,
+        purpose=ASSET_PURPOSE,
+    )
+    return {
+        "asset_uid": asset_uid,
+        "email_uid": clean_uid,
+        "mailbox_id": mailbox_id,
+        "source_url": canonical,
+        "content_type": "image/jpeg",
+        "raw_sha256": raw_sha256,
+        "transformed_sha256": transformed_sha256,
+        "storage_relpath": storage["storage_relpath"],
+        "encrypted_size": storage["encrypted_size"],
+        "width": int(width),
+        "height": int(height),
+        "transform_version": "jpeg-v1",
+        "encryption": storage["encryption"],
+        "metadata": {
+            "schema": "xarta.pim_email.transformed_external_image.metadata.v1",
+            "verified": storage["verified"],
+            **(metadata or {}),
+        },
     }
 
 
@@ -476,7 +1912,13 @@ def parse_imap_list_line(line: bytes | str) -> dict[str, Any]:
 def _connect_imap(mailbox: EmailMailbox) -> imaplib.IMAP4:
     if not mailbox.imap_ssl:
         raise EmailConfigError("Only SSL/TLS IMAP is enabled for this MVP")
-    client = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port)
+    timeout = float(
+        os.environ.get("BLUEPRINTS_EMAIL_IMAP_TIMEOUT_SECONDS", DEFAULT_IMAP_TIMEOUT_SECONDS)
+    )
+    client = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port, timeout=timeout)
+    sock = getattr(client, "sock", None)
+    if sock is not None and hasattr(sock, "settimeout"):
+        sock.settimeout(timeout)
     client.login(mailbox.email_address, mailbox.password)
     return client
 
@@ -525,10 +1967,10 @@ def list_folder_messages_sync(
                     "folder": clean_folder,
                     "email_uid": email_uid_info["email_uid"],
                     "email_uid_info": email_uid_info,
-                    "subject": _decode_header_value(msg.get("subject", "")),
-                    "from": _decode_header_value(msg.get("from", "")),
-                    "date": _decode_header_value(msg.get("date", "")),
-                    "message_id": _decode_header_value(msg.get("message-id", "")),
+                    "subject": _message_header_value(msg, "subject"),
+                    "from": _message_header_value(msg, "from"),
+                    "date": _message_header_value(msg, "date"),
+                    "message_id": _message_header_value(msg, "message-id"),
                 }
             )
         return messages
@@ -538,6 +1980,662 @@ def list_folder_messages_sync(
 
 def list_inbox_sync(mailbox: EmailMailbox, *, limit: int = 25) -> list[dict[str, Any]]:
     return list_folder_messages_sync(mailbox, folder="INBOX", limit=limit)
+
+
+def _run_store(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def _imap_list_folders(client: imaplib.IMAP4) -> list[dict[str, Any]]:
+    status, rows = client.list()
+    if status != "OK":
+        raise EmailOperationError("IMAP folder listing failed")
+    return [parse_imap_list_line(row) for row in rows or []]
+
+
+def _parse_imap_status_rows(rows: Any) -> dict[str, Any]:
+    text = " ".join(
+        row.decode("utf-8", "replace") if isinstance(row, bytes) else str(row)
+        for row in (rows or [])
+    )
+    status: dict[str, Any] = {}
+    for key, value in re.findall(r"\b([A-Z][A-Z0-9-]*)\s+([0-9]+)", text):
+        status[key] = value
+    return status
+
+
+def _imap_folder_status(client: imaplib.IMAP4, folder: str) -> dict[str, Any]:
+    try:
+        status, rows = client.status(
+            _imap_mailbox_select_arg(folder), "(UIDVALIDITY UIDNEXT MESSAGES UNSEEN)"
+        )
+    except Exception:
+        return {}
+    if status != "OK":
+        return {}
+    return _parse_imap_status_rows(rows)
+
+
+def _imap_uid_search_all(client: imaplib.IMAP4) -> list[str]:
+    status, search_data = client.uid("search", None, "ALL")
+    if status != "OK" or not search_data:
+        raise EmailOperationError("IMAP folder search failed")
+    return [
+        clean_uid_value(uid.decode("ascii", "replace") if isinstance(uid, bytes) else str(uid))
+        for uid in search_data[0].split()
+    ]
+
+
+def _imap_fetch_flags(fetch_data: Any) -> list[str]:
+    text = " ".join(
+        part.decode("utf-8", "replace") if isinstance(part, bytes) else str(part)
+        for item in (fetch_data or [])
+        for part in (item if isinstance(item, tuple) else (item,))
+    )
+    match = re.search(r"FLAGS\s+\(([^)]*)\)", text, re.I)
+    if not match:
+        return []
+    return [flag.strip().lstrip("\\").lower() for flag in match.group(1).split() if flag.strip()]
+
+
+def _imap_call_timeout_seconds() -> float:
+    return max(
+        1.0,
+        float(
+            os.environ.get(
+                "BLUEPRINTS_EMAIL_IMAP_CALL_TIMEOUT_SECONDS",
+                DEFAULT_IMAP_CALL_TIMEOUT_SECONDS,
+            )
+        ),
+    )
+
+
+def _imap_fetch_chunk_bytes() -> int:
+    return max(
+        64 * 1024,
+        int(
+            os.environ.get(
+                "BLUEPRINTS_EMAIL_IMAP_FETCH_CHUNK_BYTES",
+                DEFAULT_IMAP_FETCH_CHUNK_BYTES,
+            )
+        ),
+    )
+
+
+def _close_imap_socket(client: imaplib.IMAP4) -> None:
+    for attr in ("sock", "sslobj"):
+        sock = getattr(client, attr, None)
+        if sock is None:
+            continue
+        try:
+            if hasattr(sock, "settimeout"):
+                sock.settimeout(0)
+            sock.close()
+        except Exception:
+            pass
+
+
+def _imap_uid_fetch_with_timeout(
+    client: imaplib.IMAP4,
+    uid: str,
+    query: str,
+    *,
+    timeout: float | None = None,
+) -> Any:
+    clean_uid = clean_uid_value(uid)
+    timeout_seconds = timeout if timeout is not None else _imap_call_timeout_seconds()
+    results: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def run_fetch() -> None:
+        try:
+            results.put(("ok", client.uid("fetch", clean_uid, query)))
+        except BaseException as exc:
+            results.put(("error", exc))
+
+    thread = threading.Thread(
+        target=run_fetch,
+        name=f"pim-email-imap-fetch-{clean_uid}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        _close_imap_socket(client)
+        raise EmailImapTimeoutError(
+            f"IMAP UID FETCH timed out after {timeout_seconds:.0f}s for UID {clean_uid}"
+        )
+    try:
+        kind, payload = results.get_nowait()
+    except queue.Empty as exc:
+        raise EmailOperationError("IMAP fetch worker returned no result") from exc
+    if kind == "error":
+        raise payload
+    return payload
+
+
+def _imap_fetch_size(fetch_data: Any) -> int | None:
+    text = " ".join(
+        part.decode("utf-8", "replace") if isinstance(part, bytes) else str(part)
+        for item in (fetch_data or [])
+        for part in (item if isinstance(item, tuple) else (item,))
+    )
+    match = re.search(r"RFC822\.SIZE\s+([0-9]+)", text, re.I)
+    if not match:
+        return None
+    return max(0, int(match.group(1)))
+
+
+def _is_imap_connection_error(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            EmailImapTimeoutError,
+            imaplib.IMAP4.abort,
+            ssl.SSLError,
+            ConnectionError,
+            TimeoutError,
+        ),
+    )
+
+
+def _imap_fetch_raw_for_uid(client: imaplib.IMAP4, uid: str) -> tuple[bytes, list[str]]:
+    clean_uid = clean_uid_value(uid)
+    fetch_status, fetch_data = _imap_uid_fetch_with_timeout(
+        client,
+        clean_uid,
+        "(RFC822.SIZE FLAGS)",
+    )
+    flags = _imap_fetch_flags(fetch_data)
+    raw_size = _imap_fetch_size(fetch_data)
+    if fetch_status == "OK" and raw_size is not None:
+        chunks: list[bytes] = []
+        offset = 0
+        chunk_size = _imap_fetch_chunk_bytes()
+        while offset < raw_size:
+            requested = min(chunk_size, raw_size - offset)
+            chunk_status, chunk_data = _imap_uid_fetch_with_timeout(
+                client,
+                clean_uid,
+                f"(BODY.PEEK[]<{offset}.{requested}>)",
+            )
+            if chunk_status != "OK":
+                raise EmailOperationError("IMAP message chunk fetch failed")
+            chunk = _first_fetch_bytes(chunk_data)
+            if not chunk:
+                raise EmailOperationError("IMAP message chunk was empty")
+            chunks.append(chunk)
+            offset += len(chunk)
+        raw = b"".join(chunks)
+    else:
+        fetch_status, fetch_data = _imap_uid_fetch_with_timeout(
+            client,
+            clean_uid,
+            "(RFC822 FLAGS)",
+        )
+        if fetch_status != "OK":
+            raise EmailOperationError("IMAP message fetch failed")
+        raw = _first_fetch_bytes(fetch_data)
+        flags = _imap_fetch_flags(fetch_data)
+    if not raw:
+        raise EmailOperationError("IMAP message body was empty")
+    return raw, flags
+
+
+def _folder_is_download_target(folder_name: str, downloaded_folder: str) -> bool:
+    return clean_folder_name(folder_name).lower() == clean_folder_name(downloaded_folder).lower()
+
+
+def _folder_move_allowed(folder_snapshot: dict[str, Any], downloaded_folder: str) -> bool:
+    role = str(folder_snapshot.get("special_use_role") or "").lower()
+    folder_name = str(folder_snapshot.get("folder_name") or "")
+    if _folder_is_download_target(folder_name, downloaded_folder):
+        return False
+    return role not in SPECIAL_USE_MOVE_SKIP_ROLES
+
+
+def _ensure_downloaded_folder(
+    client: imaplib.IMAP4,
+    folders: list[dict[str, Any]],
+    downloaded_folder: str,
+) -> bool:
+    target = clean_folder_name(downloaded_folder)
+    if any(_folder_is_download_target(str(folder.get("name") or ""), target) for folder in folders):
+        return True
+    try:
+        status, _ = client.create(_imap_mailbox_select_arg(target))
+    except Exception:
+        return False
+    return status == "OK"
+
+
+def _imap_move_uid(client: imaplib.IMAP4, uid: str, target_folder: str) -> bool:
+    status, _ = client.uid("MOVE", clean_uid_value(uid), _imap_mailbox_select_arg(target_folder))
+    return status == "OK"
+
+
+def _all_headers_json(raw: bytes) -> dict[str, Any]:
+    msg = BytesParser(policy=policy.default).parsebytes(bytes(raw or b""))
+    values: dict[str, list[str]] = {}
+    for name, value in msg.raw_items():
+        values.setdefault(str(name), []).append(_decode_header_value(str(value or "")))
+    return {
+        "schema": "xarta.pim_email.headers.full_capture.v1",
+        "headers": values,
+        "header_count": sum(len(items) for items in values.values()),
+    }
+
+
+class _RemoteImageSourceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        attrs_by_name = {str(name or "").lower(): str(value or "") for name, value in attrs}
+        source = _canonical_remote_image_url(attrs_by_name.get("src", ""))
+        if source and source not in self.sources:
+            self.sources.append(source)
+
+
+def remote_image_sources_from_raw(raw: bytes) -> list[str]:
+    msg = BytesParser(policy=policy.default).parsebytes(bytes(raw or b""))
+    html_parts: list[str] = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.is_multipart() or part.get_content_maintype() != "text":
+                continue
+            if part.get_content_subtype() != "html":
+                continue
+            try:
+                html_part = str(part.get_content())
+            except Exception:
+                payload = part.get_payload(decode=True) or b""
+                html_part = payload.decode(part.get_content_charset() or "utf-8", "replace")
+            html_parts.append(html_part)
+    elif msg.get_content_maintype() == "text" and msg.get_content_subtype() == "html":
+        try:
+            html_parts.append(str(msg.get_content()))
+        except Exception:
+            payload = msg.get_payload(decode=True) or b""
+            html_parts.append(payload.decode(msg.get_content_charset() or "utf-8", "replace"))
+    parser = _RemoteImageSourceParser()
+    for html_part in html_parts:
+        parser.feed(html_part)
+    parser.close()
+    return parser.sources
+
+
+def _download_relpath_for_message(parsed: dict[str, Any]) -> str:
+    info = parsed.get("email_uid_info") if isinstance(parsed.get("email_uid_info"), dict) else {}
+    relpath = str(info.get("storage_relpath") or "")
+    if not relpath:
+        email_uid = clean_email_uid(str(parsed.get("email_uid") or ""))
+        prefix = email_uid.split("-", 1)[0]
+        relpath = (
+            f"undated/{email_uid}.eml.enc"
+            if prefix == "00000000"
+            else f"{prefix[0:4]}/{prefix[4:6]}/{prefix[6:8]}/{email_uid}.eml.enc"
+        )
+    return relpath
+
+
+def _download_security_for_message(
+    raw: bytes,
+    parsed: dict[str, Any],
+    *,
+    security_mode: str,
+) -> tuple[dict[str, Any] | None, str]:
+    clean_mode = str(security_mode or "run-or-queue").strip().lower()
+    if clean_mode in {"queue", "queued", "defer"}:
+        return None, "queued by download policy"
+    try:
+        security = check_email_security_sync(
+            raw,
+            body_text=str((parsed.get("views") or {}).get("plain") or ""),
+        )
+        return security, ""
+    except EmailSecurityUnavailableError as exc:
+        if clean_mode == "run":
+            raise EmailConfigError("Email security checks are unavailable") from exc
+        return None, str(exc)
+    except Exception as exc:
+        if clean_mode == "run":
+            raise
+        return None, str(exc)
+
+
+def download_mailbox_sync(
+    mailbox: EmailMailbox,
+    *,
+    store: PgEmailStore | None = None,
+    apply_remote_moves: bool = False,
+    downloaded_folder: str | None = None,
+    limit_per_folder: int | None = None,
+    max_messages: int | None = None,
+    convergence_passes: int = 2,
+    include_special_use: bool = False,
+    security_mode: str = "run-or-queue",
+) -> dict[str, Any]:
+    store = store or PgEmailStore()
+    target_folder = clean_folder_name(
+        downloaded_folder
+        or os.environ.get("BLUEPRINTS_EMAIL_DOWNLOADED_FOLDER", DEFAULT_DOWNLOADED_FOLDER)
+    )
+    run_id = _stable_id("email-download-run", mailbox.mailbox_id, str(time.time_ns()))
+    summary: dict[str, Any] = {
+        "schema": "xarta.pim_email.download_run.summary.v1",
+        "mailbox_id": mailbox.mailbox_id,
+        "apply_remote_moves": bool(apply_remote_moves),
+        "downloaded_folder": target_folder,
+        "convergence_passes": max(1, int(convergence_passes or 1)),
+        "folders_seen": 0,
+        "folders_downloaded": 0,
+        "target_folder_skipped": 0,
+        "special_use_skipped": 0,
+        "planned_messages": 0,
+        "processed_messages": 0,
+        "stored_messages": 0,
+        "security_stored": 0,
+        "security_queued": 0,
+        "moved_messages": 0,
+        "move_skipped": 0,
+        "failed_messages": 0,
+        "remote_image_sources_seen": 0,
+    }
+    _run_store(
+        store.record_download_run_start(
+            run_id=run_id,
+            mailbox_id=mailbox.mailbox_id,
+            apply_remote_moves=bool(apply_remote_moves),
+            downloaded_folder=target_folder,
+            metadata={
+                "schema": "xarta.pim_email.download_run.metadata.v1",
+                "security_mode": security_mode,
+                "include_special_use": include_special_use,
+                "limit_per_folder": limit_per_folder,
+                "max_messages": max_messages,
+            },
+        )
+    )
+    client = _connect_imap(mailbox)
+    status = "completed"
+    try:
+        folders = _imap_list_folders(client)
+        summary["folders_seen"] = len(folders)
+        target_ready = True
+        if apply_remote_moves:
+            target_ready = _ensure_downloaded_folder(client, folders, target_folder)
+            if not target_ready:
+                _run_store(
+                    store.record_download_event(
+                        run_id=run_id,
+                        event_type="move-target-unavailable",
+                        status="warn",
+                        mailbox_id=mailbox.mailbox_id,
+                        message="Downloaded folder could not be created or verified; moves disabled for this run.",
+                        metadata={"target_folder": target_folder},
+                    )
+                )
+        for pass_no in range(1, max(1, int(convergence_passes or 1)) + 1):
+            if max_messages is not None and summary["processed_messages"] >= max_messages:
+                break
+            for folder in folders:
+                folder_name = clean_folder_name(str(folder.get("name") or "INBOX"))
+                folder_status = _imap_folder_status(client, folder_name)
+                folder_snapshot = _run_store(
+                    store.save_folder_snapshot(
+                        mailbox_id=mailbox.mailbox_id,
+                        folder=folder,
+                        status=folder_status,
+                    )
+                )
+                if _folder_is_download_target(folder_name, target_folder):
+                    summary["target_folder_skipped"] += 1
+                    _run_store(
+                        store.record_download_event(
+                            run_id=run_id,
+                            event_type="folder-skip-target",
+                            status="skipped",
+                            mailbox_id=mailbox.mailbox_id,
+                            folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                            folder_name=folder_name,
+                            metadata={"pass": pass_no, "target_folder": target_folder},
+                        )
+                    )
+                    continue
+                special_role = str(folder_snapshot.get("special_use_role") or "")
+                if special_role in SPECIAL_USE_MOVE_SKIP_ROLES and not include_special_use:
+                    summary["special_use_skipped"] += 1
+                    _run_store(
+                        store.record_download_event(
+                            run_id=run_id,
+                            event_type="folder-skip-special-use",
+                            status="skipped",
+                            mailbox_id=mailbox.mailbox_id,
+                            folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                            folder_name=folder_name,
+                            metadata={"pass": pass_no, "special_use_role": special_role},
+                        )
+                    )
+                    continue
+                summary["folders_downloaded"] += 1
+                move_allowed = bool(
+                    apply_remote_moves
+                    and target_ready
+                    and _folder_move_allowed(folder_snapshot, target_folder)
+                )
+                _select_imap_folder(client, folder_name, readonly=not move_allowed)
+                uids = _imap_uid_search_all(client)
+                if limit_per_folder is not None:
+                    uids = uids[-max(0, int(limit_per_folder)) :]
+                if max_messages is not None:
+                    remaining = max(0, int(max_messages) - int(summary["processed_messages"]))
+                    uids = uids[:remaining]
+                summary["planned_messages"] += len(uids)
+                batch_id = _stable_id(
+                    "email-download-batch",
+                    run_id,
+                    pass_no,
+                    folder_snapshot.get("folder_uid"),
+                    folder_snapshot.get("uidvalidity"),
+                    ",".join(uids),
+                )
+                _run_store(
+                    store.record_download_batch_start(
+                        batch_id=batch_id,
+                        run_id=run_id,
+                        mailbox_id=mailbox.mailbox_id,
+                        folder_snapshot=folder_snapshot,
+                        uids=uids,
+                        metadata={
+                            "schema": "xarta.pim_email.download_batch.metadata.v1",
+                            "pass": pass_no,
+                            "folder_status": folder_status,
+                            "move_allowed": move_allowed,
+                        },
+                    )
+                )
+                batch_processed = batch_skipped = batch_moved = batch_failed = 0
+                for uid in uids:
+                    try:
+                        _run_store(
+                            store.record_download_event(
+                                run_id=run_id,
+                                batch_id=batch_id,
+                                mailbox_id=mailbox.mailbox_id,
+                                folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                folder_name=folder_name,
+                                imap_uid=uid,
+                                uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                event_type="message-fetch-start",
+                                status="started",
+                                message="Starting bounded IMAP fetch for email download.",
+                                metadata={
+                                    "pass": pass_no,
+                                    "move_allowed": move_allowed,
+                                    "timeout_seconds": _imap_call_timeout_seconds(),
+                                },
+                            )
+                        )
+                        raw, flags = _imap_fetch_raw_for_uid(client, uid)
+                        parsed = parse_message(raw, folder=folder_name, uid=uid)
+                        relpath = _download_relpath_for_message(parsed)
+                        storage = write_encrypted_bytes_atomic(relpath=relpath, content=raw)
+                        security, security_error = _download_security_for_message(
+                            raw,
+                            parsed,
+                            security_mode=security_mode,
+                        )
+                        remote_sources = remote_image_sources_from_raw(raw)
+                        summary["remote_image_sources_seen"] += len(remote_sources)
+                        metadata = {
+                            "schema": "xarta.pim_email.message_download.metadata.v1",
+                            "run_id": run_id,
+                            "batch_id": batch_id,
+                            "pass": pass_no,
+                            "raw_size_bytes": len(raw),
+                            "flags": flags,
+                            "headers": _all_headers_json(raw),
+                            "remote_image_sources": remote_sources,
+                            "folder_snapshot": folder_snapshot,
+                        }
+                        _run_store(
+                            store.save_downloaded_email(
+                                mailbox_id=mailbox.mailbox_id,
+                                folder_snapshot=folder_snapshot,
+                                imap_uid=uid,
+                                flags=flags,
+                                raw=raw,
+                                parsed=parsed,
+                                storage=storage,
+                                security=security,
+                                security_error=security_error,
+                                transformed_assets=[],
+                                metadata=metadata,
+                            )
+                        )
+                        if isinstance(store, PgEmailStore):
+                            verified_raw = read_encrypted_bytes(
+                                str(storage.get("storage_relpath") or "")
+                            )
+                            verified_hash = hashlib.sha256(verified_raw).hexdigest()
+                        else:
+                            verified = _run_store(
+                                store.read_local_message(
+                                    str(parsed.get("email_uid") or ""),
+                                    mailbox_id=mailbox.mailbox_id,
+                                )
+                            )
+                            verified_hash = str(
+                                ((verified.get("stored") or {}).get("raw_sha256")) or ""
+                            )
+                        if verified_hash != str(storage.get("raw_sha256") or ""):
+                            raise EmailOperationError("Post-commit local verification failed")
+                        summary["stored_messages"] += 1
+                        if security and security.get("available"):
+                            summary["security_stored"] += 1
+                        else:
+                            summary["security_queued"] += 1
+                        moved = False
+                        if move_allowed:
+                            moved = _imap_move_uid(client, uid, target_folder)
+                            if moved:
+                                _run_store(
+                                    store.mark_remote_moved(
+                                        mailbox_id=mailbox.mailbox_id,
+                                        folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                        uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                        imap_uid=uid,
+                                        target_folder=target_folder,
+                                    )
+                                )
+                                summary["moved_messages"] += 1
+                                batch_moved += 1
+                            else:
+                                summary["move_skipped"] += 1
+                                _run_store(
+                                    store.record_download_event(
+                                        run_id=run_id,
+                                        batch_id=batch_id,
+                                        mailbox_id=mailbox.mailbox_id,
+                                        folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                        folder_name=folder_name,
+                                        email_uid=str(parsed.get("email_uid") or ""),
+                                        imap_uid=uid,
+                                        uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                        event_type="remote-move-refused",
+                                        status="warn",
+                                        message="IMAP UID MOVE did not return OK after local verification.",
+                                        metadata={"target_folder": target_folder},
+                                    )
+                                )
+                        else:
+                            summary["move_skipped"] += 1
+                        summary["processed_messages"] += 1
+                        batch_processed += 1
+                        _run_store(
+                            store.record_download_event(
+                                run_id=run_id,
+                                batch_id=batch_id,
+                                mailbox_id=mailbox.mailbox_id,
+                                folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                folder_name=folder_name,
+                                email_uid=str(parsed.get("email_uid") or ""),
+                                imap_uid=uid,
+                                uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                event_type="message-stored",
+                                status="moved" if moved else "stored",
+                                message="Email durably stored locally and verified.",
+                                metadata={
+                                    "raw_sha256": storage.get("raw_sha256"),
+                                    "encrypted_size": storage.get("encrypted_size"),
+                                    "security_status": "stored" if security else "queued",
+                                    "move_allowed": move_allowed,
+                                },
+                            )
+                        )
+                    except Exception as exc:
+                        summary["failed_messages"] += 1
+                        batch_failed += 1
+                        status = "completed-with-errors"
+                        _run_store(
+                            store.record_download_event(
+                                run_id=run_id,
+                                batch_id=batch_id,
+                                mailbox_id=mailbox.mailbox_id,
+                                folder_uid=str(folder_snapshot.get("folder_uid") or ""),
+                                folder_name=folder_name,
+                                imap_uid=str(uid),
+                                uidvalidity=str(folder_snapshot.get("uidvalidity") or ""),
+                                event_type="message-failed",
+                                status="error",
+                                message=str(exc),
+                                error_class=exc.__class__.__name__,
+                            )
+                        )
+                        if _is_imap_connection_error(exc):
+                            _logout_imap(client)
+                            client = _connect_imap(mailbox)
+                            _select_imap_folder(client, folder_name, readonly=not move_allowed)
+                _run_store(
+                    store.record_download_batch_finish(
+                        batch_id=batch_id,
+                        processed_count=batch_processed,
+                        skipped_count=batch_skipped,
+                        moved_count=batch_moved,
+                        failed_count=batch_failed,
+                        metadata={"pass": pass_no},
+                    )
+                )
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        _logout_imap(client)
+        _run_store(store.record_download_run_finish(run_id=run_id, status=status, summary=summary))
+    return {"ok": status != "failed", "run_id": run_id, "status": status, "summary": summary}
 
 
 def fetch_message_sync(
@@ -622,9 +2720,9 @@ def _imap_mailbox_select_arg(folder: str) -> str:
     return f'"{escaped}"'
 
 
-def _select_imap_folder(client: imaplib.IMAP4, folder: str) -> None:
+def _select_imap_folder(client: imaplib.IMAP4, folder: str, *, readonly: bool = True) -> None:
     try:
-        status, _ = client.select(_imap_mailbox_select_arg(folder), readonly=True)
+        status, _ = client.select(_imap_mailbox_select_arg(folder), readonly=readonly)
     except imaplib.IMAP4.error as exc:
         raise EmailOperationError("IMAP folder select failed") from exc
     if status != "OK":
@@ -671,11 +2769,11 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
         "email_uid": email_uid_info["email_uid"],
         "email_uid_info": email_uid_info,
         "headers": {
-            "subject": _decode_header_value(msg.get("subject", "")),
-            "from": _decode_header_value(msg.get("from", "")),
-            "to": _decode_header_value(msg.get("to", "")),
-            "date": _decode_header_value(msg.get("date", "")),
-            "message_id": _decode_header_value(msg.get("message-id", "")),
+            "subject": _message_header_value(msg, "subject"),
+            "from": _message_header_value(msg, "from"),
+            "to": _message_header_value(msg, "to"),
+            "date": _message_header_value(msg, "date"),
+            "message_id": _message_header_value(msg, "message-id"),
         },
         "views": {
             "plain": default_text,
@@ -695,9 +2793,28 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
 
 def _decode_header_value(value: str | None) -> str:
     try:
-        return str(make_header(decode_header(value or "")))
+        decoded = str(make_header(decode_header(value or "")))
     except Exception:
-        return str(value or "")
+        decoded = str(value or "")
+    return decoded.encode("utf-8", "replace").decode("utf-8")
+
+
+def _raw_message_header_values(message: Message, name: str) -> list[str]:
+    clean = str(name or "").lower()
+    return [
+        str(value or "")
+        for header_name, value in message.raw_items()
+        if str(header_name or "").lower() == clean
+    ]
+
+
+def _message_header_value(message: Message, name: str) -> str:
+    values = [
+        decoded
+        for value in _raw_message_header_values(message, name)
+        if (decoded := _decode_header_value(value))
+    ]
+    return ", ".join(values)
 
 
 def _first_text_part(message: Message, subtype: str) -> str:
@@ -1338,6 +3455,32 @@ async def fetch_message_security(
         folder=folder,
         uid=uid,
         security_progress_callback=security_progress_callback,
+    )
+
+
+async def download_mailbox(
+    mailbox: EmailMailbox,
+    *,
+    store: PgEmailStore | None = None,
+    apply_remote_moves: bool = False,
+    downloaded_folder: str | None = None,
+    limit_per_folder: int | None = None,
+    max_messages: int | None = None,
+    convergence_passes: int = 2,
+    include_special_use: bool = False,
+    security_mode: str = "run-or-queue",
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        download_mailbox_sync,
+        mailbox,
+        store=store,
+        apply_remote_moves=apply_remote_moves,
+        downloaded_folder=downloaded_folder,
+        limit_per_folder=limit_per_folder,
+        max_messages=max_messages,
+        convergence_passes=convergence_passes,
+        include_special_use=include_special_use,
+        security_mode=security_mode,
     )
 
 
