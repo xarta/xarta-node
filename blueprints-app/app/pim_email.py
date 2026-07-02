@@ -456,11 +456,13 @@ class PgEmailStore:
             )
             await conn.execute(
                 """
-                UPDATE pim_email_security_checks
-                SET security_status = 'pending_retryable',
-                    error_message = ''
-                WHERE security_status = 'failed_retryable'
-                  AND aggregate_status = 'queued';
+                DELETE FROM pim_email_security_checks
+                WHERE security_status <> 'stored'
+                   OR aggregate_status IN ('queued', 'pending')
+                   OR COALESCE(result_json->>'available', 'false') <> 'true'
+                   OR COALESCE(result_json->>'queued', 'false') = 'true'
+                   OR COALESCE(result_json->>'placeholder', 'false') = 'true'
+                   OR COALESCE(result_json->>'incomplete', 'false') = 'true';
                 """
             )
             await conn.execute(
@@ -1506,6 +1508,50 @@ class PgEmailStore:
         finally:
             await conn.close()
 
+    async def reconcile_orphaned_download_runs(
+        self,
+        *,
+        active_run_ids: set[str] | list[str] | tuple[str, ...],
+        reason: str,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_active = sorted({str(run_id or "").strip() for run_id in active_run_ids if run_id})
+        metadata = {
+            "schema": "xarta.pim_email.download_orphan_reconcile.v1",
+            "reason": str(reason or "stack_process_not_active"),
+            "active_run_ids": clean_active,
+        }
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_download_runs
+                SET status = 'interrupted-orphaned',
+                    finished_at = COALESCE(finished_at, now()),
+                    metadata_json = metadata_json || jsonb_build_object(
+                        'orphan_reconcile', $3::jsonb
+                    )
+                WHERE mailbox_id = $1
+                  AND status = 'running'
+                  AND NOT (run_id = ANY($2::text[]))
+                RETURNING run_id
+                """,
+                configured_mailbox_id,
+                clean_active,
+                _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.download_orphan_reconcile.result.v1",
+            "mailbox_id": configured_mailbox_id,
+            "active_run_ids": clean_active,
+            "marked_orphaned": [str(row["run_id"]) for row in rows],
+            "marked_count": len(rows),
+        }
+
     async def record_download_run_finish(
         self,
         *,
@@ -1911,63 +1957,6 @@ class PgEmailStore:
                                 "raw_sha256": raw_sha256,
                                 "policy_version": SECURITY_POLICY_VERSION,
                             },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                    )
-                else:
-                    security_check_id = _stable_id(
-                        "email-security-incomplete", email_uid, raw_sha256
-                    )
-                    await conn.execute(
-                        """
-                        INSERT INTO pim_email_security_checks (
-                            security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
-                            aggregate_status, aggregate_score, llm_called, result_json, checked_at,
-                            email_uid, security_status, error_message, metadata_json
-                        )
-                        VALUES ($1,$2,$3,$4,$5,$6,'pending',0,false,$7::jsonb,now(),$8,$9,$10,$11::jsonb)
-                        ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
-                            email_uid = EXCLUDED.email_uid,
-                            security_status = CASE
-                                WHEN pim_email_security_checks.security_status = 'stored'
-                                THEN pim_email_security_checks.security_status
-                                ELSE EXCLUDED.security_status
-                            END,
-                            error_message = CASE
-                                WHEN pim_email_security_checks.security_status = 'stored'
-                                THEN pim_email_security_checks.error_message
-                                ELSE EXCLUDED.error_message
-                            END,
-                            result_json = CASE
-                                WHEN pim_email_security_checks.security_status = 'stored'
-                                THEN pim_email_security_checks.result_json
-                                ELSE EXCLUDED.result_json
-                            END,
-                            metadata_json = EXCLUDED.metadata_json,
-                            checked_at = now();
-                        """,
-                        security_check_id,
-                        mailbox_id,
-                        folder_name,
-                        imap_uid,
-                        str(headers.get("message_id") or ""),
-                        raw_sha256,
-                        _json_dumps(
-                            {
-                                "available": False,
-                                "incomplete": True,
-                                "raw_sha256": raw_sha256,
-                                "error": security_error,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        email_uid,
-                        "pending_retryable",
-                        security_error[:1000],
-                        _json_dumps(
-                            {"email_uid": email_uid, "raw_sha256": raw_sha256},
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
@@ -4374,6 +4363,7 @@ def download_mailbox_sync(
     mailbox: EmailMailbox,
     *,
     store: PgEmailStore | None = None,
+    run_id: str | None = None,
     apply_remote_moves: bool = False,
     downloaded_folder: str | None = None,
     folder_allowlist: list[str] | None = None,
@@ -4402,7 +4392,9 @@ def download_mailbox_sync(
         for folder in (folder_allowlist or [])
         if str(folder or "").strip()
     }
-    run_id = _stable_id("email-download-run", mailbox.mailbox_id, str(time.time_ns()))
+    run_id = str(run_id or "").strip() or _stable_id(
+        "email-download-run", mailbox.mailbox_id, str(time.time_ns())
+    )
     summary: dict[str, Any] = {
         "schema": "xarta.pim_email.download_run.summary.v1",
         "mailbox_id": mailbox.mailbox_id,
@@ -5720,6 +5712,7 @@ async def download_mailbox(
     mailbox: EmailMailbox,
     *,
     store: PgEmailStore | None = None,
+    run_id: str | None = None,
     apply_remote_moves: bool = False,
     downloaded_folder: str | None = None,
     folder_allowlist: list[str] | None = None,
@@ -5733,6 +5726,7 @@ async def download_mailbox(
         download_mailbox_sync,
         mailbox,
         store=store,
+        run_id=run_id,
         apply_remote_moves=apply_remote_moves,
         downloaded_folder=downloaded_folder,
         folder_allowlist=folder_allowlist,

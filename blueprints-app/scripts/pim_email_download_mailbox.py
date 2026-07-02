@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,10 +52,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore, download_mailbox
 
     store = PgEmailStore()
+    active_download_run_ids = _active_download_run_ids()
+    if args.run_id:
+        active_download_run_ids.add(str(args.run_id))
+    await store.reconcile_orphaned_download_runs(
+        active_run_ids=active_download_run_ids,
+        reason="stack_download_start_process_set_reconciliation",
+        mailbox_id=args.mailbox_id,
+    )
     mailbox = await store.get_mailbox(args.mailbox_id)
     return await download_mailbox(
         mailbox,
         store=store,
+        run_id=args.run_id,
         apply_remote_moves=args.apply_remote_moves,
         downloaded_folder=args.downloaded_folder,
         folder_allowlist=args.folder,
@@ -66,6 +76,21 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _active_download_run_ids() -> set[str]:
+    active: set[str] = set()
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            raw = cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except Exception:
+            continue
+        if "pim_email_download_mailbox.py" not in raw:
+            continue
+        match = re.search(r"(?:^|\s)--run-id\s+(\S+)", raw)
+        if match:
+            active.add(match.group(1))
+    return active
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -73,6 +98,7 @@ def main() -> int:
         default=str(REPO_ROOT / ".env"),
         help="Blueprints .env file to load before connecting to PIM Email storage.",
     )
+    parser.add_argument("--run-id", default=None)
     parser.add_argument("--mailbox-id", default=None)
     parser.add_argument("--apply-remote-moves", action="store_true")
     parser.add_argument("--downloaded-folder", default=None)
