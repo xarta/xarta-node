@@ -123,6 +123,147 @@ def test_image_transform_reencodes_inline_images_to_jpeg():
     assert len(jpeg) > 20
 
 
+def test_encrypted_content_and_transformed_external_asset_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    raw = b"Subject: Stored\r\n\r\nBody that must not appear in ciphertext.\r\n"
+
+    storage = pim_email.write_encrypted_bytes_atomic(
+        relpath="2026/07/01/test-message.eml.enc",
+        content=raw,
+    )
+
+    encrypted = (tmp_path / storage["storage_relpath"]).read_bytes()
+    assert raw not in encrypted
+    assert pim_email.read_encrypted_bytes(storage["storage_relpath"]) == raw
+    assert storage["raw_sha256"] == pim_email.hashlib.sha256(raw).hexdigest()
+
+    image_source = BytesIO()
+    Image.new("RGBA", (3, 2), (0, 160, 240, 255)).save(image_source, format="PNG")
+    asset = pim_email.build_transformed_external_image_asset(
+        mailbox_id="test-mailbox",
+        email_uid="20260701-0123456789abcdef0123456789abcdef01234567",
+        source_url="https://images.example.test/banner.png?utm=1",
+        content=image_source.getvalue(),
+        metadata={"proof": "unit"},
+    )
+
+    assert asset["content_type"] == "image/jpeg"
+    assert asset["width"] == 3
+    assert asset["height"] == 2
+    asset_plain = pim_email.read_encrypted_bytes(
+        asset["storage_relpath"],
+        purpose=pim_email.ASSET_PURPOSE,
+    )
+    assert asset_plain.startswith(b"\xff\xd8\xff")
+    assert b"PNG" not in (tmp_path / asset["storage_relpath"]).read_bytes()
+
+
+def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    raw = (
+        b"Subject: Reparsed identity\r\n"
+        b"From: Sender <sender@example.test>\r\n"
+        b"To: User <user@example.test>\r\n"
+        b"Date: Wed, 01 Jul 2026 09:15:00 +0000\r\n"
+        b"Message-ID: <reparsed@example.test>\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Body\r\n"
+    )
+    reparsed = pim_email.parse_message(raw, folder="INBOX", uid="42")
+    stored_uid = "20260701-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert reparsed["email_uid"] != stored_uid
+    storage = pim_email.write_encrypted_bytes_atomic(
+        relpath=f"2026/07/01/{stored_uid}.eml.enc",
+        content=raw,
+    )
+
+    message_row = {
+        "email_uid": stored_uid,
+        "mailbox_id": "test-mailbox",
+        "raw_sha256": storage["raw_sha256"],
+        "message_id": "<stored@example.test>",
+        "subject": "Stored identity subject",
+        "from_addr": "Stored Sender <stored@example.test>",
+        "to_addr": "User <user@example.test>",
+        "date_header": "Wed, 01 Jul 2026 09:15:00 +0000",
+        "uid_info_json": json.dumps({**reparsed["email_uid_info"], "email_uid": stored_uid}),
+        "headers_json": json.dumps({"subject": "Stale parsed subject"}),
+        "metadata_json": "{}",
+        "storage_relpath": storage["storage_relpath"],
+        "encrypted_size": storage["encrypted_size"],
+        "encryption_json": "{}",
+    }
+    membership_rows = [
+        {
+            "folder_name": "INBOX",
+            "folder_uid": "folder-inbox",
+            "imap_uid": "42",
+            "uidvalidity": "777",
+            "flags_json": json.dumps(["seen"]),
+            "last_seen_at": "",
+            "remote_moved_at": "",
+            "remote_move_target": "Downloaded",
+        }
+    ]
+    security_row = {
+        "result_json": json.dumps(
+            {
+                "available": False,
+                "queued": True,
+                "raw_sha256": storage["raw_sha256"],
+            }
+        ),
+        "security_status": "failed_retryable",
+        "error_message": "queued",
+        "checked_at": "",
+        "raw_sha256": storage["raw_sha256"],
+    }
+
+    class FakeConnection:
+        async def fetchrow(self, query, *args):
+            assert args[0] == "test-mailbox" or args[0] == stored_uid
+            if "FROM pim_email_messages" in query:
+                assert args == ("test-mailbox", stored_uid)
+                return message_row
+            if "FROM pim_email_security_checks" in query:
+                assert args == (stored_uid,)
+                return security_row
+            raise AssertionError(query)
+
+        async def fetch(self, query, *args):
+            assert args == ("test-mailbox", stored_uid)
+            if "FROM pim_email_folder_memberships" in query:
+                return membership_rows
+            if "FROM pim_email_transformed_assets" in query:
+                return []
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    message = asyncio.run(FakeStore().read_local_message(stored_uid, mailbox_id="test-mailbox"))
+
+    assert message["email_uid"] == stored_uid
+    assert message["email_uid_info"]["email_uid"] == stored_uid
+    assert message["raw_sha256"] == storage["raw_sha256"]
+    assert message["headers"]["subject"] == "Stored identity subject"
+    assert message["stored"]["verified"] is True
+    assert message["stored"]["reparsed_email_uid"] == reparsed["email_uid"]
+    assert message["security"]["queued"] is True
+
+
 def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     raw = (
         b"Subject: =?utf-8?q?Hello_=E2=9C=93?=\r\n"
@@ -337,9 +478,10 @@ def test_parse_message_raw_view_omits_attachment_payloads_but_keeps_security_hea
 
 
 class FakeIMAP:
-    def __init__(self, host, port):
+    def __init__(self, host, port, *, timeout=None):
         self.host = host
         self.port = port
+        self.timeout = timeout
         self.logged_in = False
 
     def login(self, user, password):
@@ -383,6 +525,230 @@ class FakeIMAP:
 
     def logout(self):
         return "OK", [b"bye"]
+
+
+def _download_raw(uid: str, *, subject: str | None = None) -> bytes:
+    subject = subject or f"Download {uid}"
+    return (
+        f"Subject: {subject}\r\n"
+        "From: Sender <sender@example.test>\r\n"
+        "To: User <user@example.test>\r\n"
+        f"Date: Wed, 01 Jul 2026 09:{int(uid) % 60:02d}:00 +0000\r\n"
+        f"Message-ID: <download-{uid}@example.test>\r\n"
+        "Content-Type: multipart/alternative; boundary=x\r\n\r\n"
+        "--x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        f"Plain body {uid}\r\n"
+        "--x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        f'<p>HTML {uid}</p><img src="https://images.example.test/{uid}.png?track=1">\r\n'
+        "--x--\r\n"
+    ).encode()
+
+
+class DownloadFakeIMAP:
+    instances = []
+
+    def __init__(self, host, port, *, timeout=None):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.current_folder = ""
+        self.search_calls = {"INBOX": 0, "Archive": 0, "Drafts": 0}
+        self.messages = {
+            "INBOX": {"41": _download_raw("41"), "42": _download_raw("42")},
+            "Archive": {"9": _download_raw("9", subject="Archive message")},
+            "Drafts": {"8": _download_raw("8", subject="Draft message")},
+        }
+        self.moves = []
+        self.selected = []
+        self.created = []
+        self.__class__.instances.append(self)
+
+    def login(self, user, password):
+        return "OK", [b"logged in"]
+
+    def list(self):
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\Archive) "/" "Archive"',
+            b'(\\HasNoChildren \\Drafts) "/" "Drafts"',
+        ]
+
+    def create(self, folder):
+        self.created.append(str(folder).strip('"'))
+        return "OK", [b"created"]
+
+    def status(self, folder, query):
+        clean = str(folder).strip('"')
+        count = len(self.messages.get(clean, {}))
+        return "OK", [f"{clean} (MESSAGES {count} UIDNEXT 100 UIDVALIDITY 777 UNSEEN 0)".encode()]
+
+    def select(self, folder, readonly=False):
+        self.current_folder = str(folder).strip('"')
+        self.selected.append((self.current_folder, readonly))
+        return "OK", [str(len(self.messages.get(self.current_folder, {}))).encode()]
+
+    def uid(self, command, *args):
+        if command == "search":
+            self.search_calls[self.current_folder] += 1
+            if self.current_folder == "INBOX" and self.search_calls[self.current_folder] == 1:
+                return "OK", [b"41"]
+            uids = " ".join(sorted(self.messages.get(self.current_folder, {}), key=int)).encode()
+            return "OK", [uids]
+        if command == "fetch":
+            uid = args[0].decode() if isinstance(args[0], bytes) else str(args[0])
+            raw = self.messages.get(self.current_folder, {}).get(uid)
+            if not raw:
+                return "NO", []
+            prefix = f"1 (UID {uid} FLAGS (\\Seen) RFC822 {{{len(raw)}}}".encode()
+            return "OK", [(prefix, raw)]
+        if command == "MOVE":
+            uid = str(args[0])
+            target = str(args[1]).strip('"')
+            self.moves.append((self.current_folder, uid, target))
+            self.messages.get(self.current_folder, {}).pop(uid, None)
+            return "OK", [b"moved"]
+        return "NO", []
+
+    def logout(self):
+        return "OK", [b"bye"]
+
+
+class CaptureDownloadStore:
+    def __init__(self):
+        self.snapshots = []
+        self.saved = []
+        self.verified = set()
+        self.moved = []
+        self.events = []
+        self.batches = []
+        self.run_finish = None
+
+    async def ensure_schema(self):
+        return None
+
+    async def record_download_run_start(self, **kwargs):
+        self.run_start = kwargs
+
+    async def record_download_run_finish(self, **kwargs):
+        self.run_finish = kwargs
+
+    async def record_download_event(self, **kwargs):
+        self.events.append(kwargs)
+
+    async def record_download_batch_start(self, **kwargs):
+        self.batches.append(("start", kwargs))
+
+    async def record_download_batch_finish(self, **kwargs):
+        self.batches.append(("finish", kwargs))
+
+    async def save_folder_snapshot(self, *, mailbox_id, folder, status):
+        flags = [str(item).lower() for item in folder.get("flags") or []]
+        folder_name = pim_email.clean_folder_name(folder["name"])
+        snapshot = {
+            "snapshot_id": f"snapshot-{folder_name}",
+            "folder_uid": pim_email.folder_uid_for(mailbox_id, folder_name),
+            "folder_name": folder_name,
+            "delimiter": folder.get("delimiter", "/"),
+            "flags": flags,
+            "special_use_role": pim_email.special_use_role(folder_name, flags),
+            "uidvalidity": str(status.get("UIDVALIDITY", "")),
+            "uidnext": str(status.get("UIDNEXT", "")),
+            "messages_count": int(status.get("MESSAGES", 0)),
+        }
+        self.snapshots.append(snapshot)
+        return snapshot
+
+    async def save_downloaded_email(self, **kwargs):
+        self.saved.append(kwargs)
+
+    async def read_local_message(self, email_uid, *, mailbox_id=None):
+        match = next(
+            item for item in reversed(self.saved) if item["parsed"]["email_uid"] == email_uid
+        )
+        raw = pim_email.read_encrypted_bytes(match["storage"]["storage_relpath"])
+        raw_sha256 = pim_email.hashlib.sha256(raw).hexdigest()
+        self.verified.add(match["imap_uid"])
+        return {"stored": {"raw_sha256": raw_sha256}}
+
+    async def mark_remote_moved(self, **kwargs):
+        self.moved.append(kwargs)
+
+
+def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_proof(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    DownloadFakeIMAP.instances = []
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
+    monkeypatch.setattr(
+        pim_email,
+        "check_email_security_sync",
+        lambda raw, **kwargs: {
+            **_security_result(),
+            "raw_sha256": pim_email.hashlib.sha256(raw).hexdigest(),
+        },
+    )
+    store = CaptureDownloadStore()
+    real_move = pim_email._imap_move_uid
+
+    def guarded_move(client, uid, target):
+        assert uid in store.verified
+        return real_move(client, uid, target)
+
+    monkeypatch.setattr(pim_email, "_imap_move_uid", guarded_move)
+
+    result = pim_email.download_mailbox_sync(
+        _mailbox(),
+        store=store,
+        apply_remote_moves=True,
+        convergence_passes=2,
+        security_mode="run",
+    )
+
+    instance = DownloadFakeIMAP.instances[0]
+    assert result["ok"] is True
+    assert result["summary"]["stored_messages"] == 2
+    assert result["summary"]["moved_messages"] == 2
+    assert result["summary"]["special_use_skipped"] == 4
+    assert {item["imap_uid"] for item in store.saved} == {"41", "42"}
+    assert {item["folder_snapshot"]["folder_name"] for item in store.saved} == {"INBOX"}
+    assert ("INBOX", "41", "Downloaded") in instance.moves
+    assert ("INBOX", "42", "Downloaded") in instance.moves
+    assert not any(folder == "Archive" for folder, _, _ in instance.moves)
+    assert all(item["storage"]["verified"] for item in store.saved)
+    assert all(item["metadata"]["remote_image_sources"] for item in store.saved)
+    assert all((tmp_path / item["storage"]["storage_relpath"]).exists() for item in store.saved)
+    assert any(item["event_type"] == "folder-skip-special-use" for item in store.events)
+    assert store.run_finish["status"] == "completed"
+
+
+def test_safe_downloader_resume_idempotence_keeps_duplicate_identity_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    DownloadFakeIMAP.instances = []
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
+    monkeypatch.setattr(
+        pim_email, "check_email_security_sync", lambda raw, **kwargs: _security_result()
+    )
+    store = CaptureDownloadStore()
+
+    result = pim_email.download_mailbox_sync(
+        _mailbox(),
+        store=store,
+        apply_remote_moves=False,
+        convergence_passes=2,
+        security_mode="queue",
+    )
+
+    email_uids = [item["parsed"]["email_uid"] for item in store.saved]
+    assert result["summary"]["moved_messages"] == 0
+    assert len(store.saved) == 3
+    assert len(set(email_uids)) == 2
+    assert result["summary"]["security_queued"] == 3
 
 
 def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch):
@@ -516,6 +882,9 @@ def test_router_exposes_no_delete_or_general_send_capability():
     assert not any(method == "DELETE" for method, _ in routes)
     assert not any(path.endswith("/send") for _, path in routes)
     assert ("GET", "/personal/email/folder-messages") in routes
+    assert ("GET", "/personal/email/local/folder-messages") in routes
+    assert ("GET", "/personal/email/local/messages/{email_uid}") in routes
+    assert ("POST", "/personal/email/download/run") in routes
     assert ("GET", "/personal/email/image-proxy") in routes
     assert ("GET", "/personal/email/messages/{uid}/security") in routes
     assert ("POST", "/personal/email/smtp-self-test") in routes
@@ -545,11 +914,51 @@ def test_status_route_reports_disabled_send_delete_capabilities(monkeypatch):
 
     assert response["storage"] == "postgres"
     assert response["capabilities"]["imap_read"] is True
+    assert response["capabilities"]["local_corpus_read"] is True
+    assert response["capabilities"]["safe_local_download"] is True
     assert response["capabilities"]["smtp_self_test"] is True
     assert response["capabilities"]["smtp_general_send"] is False
     assert response["capabilities"]["delete"] is False
     assert response["capabilities"]["ai_send"] is False
     assert response["capabilities"]["security_checks"]["message_view_requires_security"] is True
+
+
+def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
+    email_uid = "20260701-0123456789abcdef0123456789abcdef01234567"
+
+    class FakeLocalStore:
+        async def get_mailbox(self, mailbox_id=None):
+            return _mailbox()
+
+        async def local_folder_messages(self, **kwargs):
+            return [
+                {
+                    "uid": "41",
+                    "email_uid": email_uid,
+                    "folder": "INBOX",
+                    "subject": "Stored",
+                    "from": "Sender <sender@example.test>",
+                }
+            ]
+
+        async def read_local_message(self, requested_uid, *, mailbox_id=None):
+            assert requested_uid == email_uid
+            return {
+                "email_uid": requested_uid,
+                "source": "local-corpus",
+                "views": {"plain": "Stored body"},
+                "security": {"available": False, "security_status": "queued"},
+            }
+
+    monkeypatch.setattr(routes_pim_email, "_store", lambda: FakeLocalStore())
+
+    listing = asyncio.run(routes_pim_email.email_local_folder_messages(folder="INBOX"))
+    message = asyncio.run(routes_pim_email.email_local_message(email_uid))
+
+    assert listing["source"] == "local-corpus"
+    assert listing["messages"][0]["email_uid"] == email_uid
+    assert message["message"]["source"] == "local-corpus"
+    assert message["message"]["security"]["security_status"] == "queued"
 
 
 def test_security_service_calls_local_llm_with_json_contract(monkeypatch):
