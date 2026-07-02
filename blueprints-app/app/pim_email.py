@@ -1454,22 +1454,55 @@ class PgEmailStore:
             )
             folder_counts = await conn.fetchrow(
                 """
+                WITH folder_effective AS (
+                    SELECT
+                        fm.folder_name,
+                        fm.remote_moved_at,
+                        CASE
+                            WHEN f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                            THEN f.special_use_role
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 IN ('archive','archives','archived')
+                            THEN 'archive'
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 IN ('draft','drafts')
+                            THEN 'drafts'
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 IN ('sent','sentmail','sentmessages','sentitems')
+                            THEN 'sent'
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 IN ('trash','rubbish','bin','deleted','deleteditems')
+                            THEN 'trash'
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 = 'junk'
+                            THEN 'junk'
+                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                 = 'spam'
+                            THEN 'spam'
+                            ELSE ''
+                        END AS effective_special_use_role
+                    FROM pim_email_folder_memberships fm
+                    JOIN pim_email_local_folders f
+                      ON f.mailbox_id = fm.mailbox_id AND f.folder_uid = fm.folder_uid
+                    WHERE fm.mailbox_id = $1
+                )
                 SELECT
                     count(*) FILTER (
-                        WHERE f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
                     ) AS special_use_downloaded,
                     count(*) FILTER (
-                        WHERE f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
-                          AND fm.remote_moved_at IS NULL
+                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                          AND remote_moved_at IS NULL
                     ) AS special_use_unmoved,
                     count(*) FILTER (
-                        WHERE (fm.folder_name = 'INBOX' OR fm.folder_name LIKE 'INBOX/%')
-                          AND fm.remote_moved_at IS NOT NULL
+                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                          AND remote_moved_at IS NOT NULL
+                    ) AS special_use_moved,
+                    count(*) FILTER (
+                        WHERE (folder_name = 'INBOX' OR folder_name LIKE 'INBOX/%')
+                          AND remote_moved_at IS NOT NULL
                     ) AS inbox_subfolders_moved
-                FROM pim_email_folder_memberships fm
-                JOIN pim_email_local_folders f
-                  ON f.mailbox_id = fm.mailbox_id AND f.folder_uid = fm.folder_uid
-                WHERE fm.mailbox_id = $1
+                FROM folder_effective
                 """,
                 configured_mailbox_id,
             )
@@ -1544,6 +1577,7 @@ class PgEmailStore:
                     _row_get(folder_counts, "special_use_downloaded", 0) or 0
                 ),
                 "unmoved_memberships": int(_row_get(folder_counts, "special_use_unmoved", 0) or 0),
+                "moved_memberships": int(_row_get(folder_counts, "special_use_moved", 0) or 0),
             },
             "inbox_subfolders": {
                 "moved_memberships": int(_row_get(folder_counts, "inbox_subfolders_moved", 0) or 0),
