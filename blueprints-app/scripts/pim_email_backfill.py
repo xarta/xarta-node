@@ -51,6 +51,15 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from app.pim_email import PgEmailStore
 
     store = PgEmailStore()
+    if args.materialize_external_image_rows:
+        result = await store.materialize_external_image_derivative_rows(
+            mailbox_id=args.mailbox_id,
+            email_uid=args.email_uid,
+            limit=args.limit,
+            metadata={"source": "pim-email-backfill-cli-materialize"},
+        )
+        if not args.artifact:
+            return {"ok": True, "materialize_external_image_rows": result}
     return await store.run_backfill(
         mailbox_id=args.mailbox_id,
         email_uid=args.email_uid,
@@ -76,6 +85,11 @@ def main() -> int:
         action="append",
         choices=["security", "sanitized_view", "external_images"],
         help="Artifact type to backfill; repeat for multiple. Defaults to all.",
+    )
+    parser.add_argument(
+        "--materialize-external-image-rows",
+        action="store_true",
+        help="Create missing durable pending derivative rows for captured external image URLs.",
     )
     args = parser.parse_args()
     _load_env_file(Path(args.env_file))
