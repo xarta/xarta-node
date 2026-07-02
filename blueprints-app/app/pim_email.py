@@ -2773,7 +2773,7 @@ class PgEmailStore:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         clean_status = str(status or "").strip().lower()
-        if clean_status not in {"running", "completed", "failed"}:
+        if clean_status not in {"running", "completed", "failed", "superseded"}:
             raise EmailOperationError("Invalid backfill item status")
         clean_artifact = str(artifact_type or "").strip().lower()
         if not clean_artifact:
@@ -2785,7 +2785,7 @@ class PgEmailStore:
             raw_sha256,
             clean_artifact,
         )
-        finished = clean_status in {"completed", "failed"}
+        finished = clean_status in {"completed", "failed", "superseded"}
         conn = await self._connect()
         try:
             await conn.execute(
@@ -2831,6 +2831,116 @@ class PgEmailStore:
             )
         finally:
             await conn.close()
+
+    async def reconcile_superseded_backfill_failures(
+        self,
+        *,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        metadata = {
+            "schema": "xarta.pim_email.backfill_item_superseded.v1",
+            "reason": "artifact_converged_after_failed_attempt",
+        }
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                f"""
+                WITH failed AS (
+                    SELECT i.*, m.metadata_json AS message_metadata
+                    FROM pim_email_backfill_items i
+                    LEFT JOIN pim_email_messages m
+                      ON m.mailbox_id = i.mailbox_id
+                     AND m.email_uid = i.email_uid
+                     AND m.raw_sha256 = i.raw_sha256
+                    WHERE i.mailbox_id = $1
+                      AND i.status = 'failed'
+                ), converged AS (
+                    SELECT f.item_id
+                    FROM failed f
+                    WHERE (
+                        f.artifact_type = 'security'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pim_email_security_checks s
+                            WHERE s.email_uid = f.email_uid
+                              AND s.raw_sha256 = f.raw_sha256
+                              AND s.security_status = 'stored'
+                              AND s.result_json->>'available' = 'true'
+                              AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
+                              AND COALESCE(s.result_json->>'placeholder', 'false') <> 'true'
+                              AND s.result_json->>'email_uid' = f.email_uid
+                              AND s.result_json->>'raw_sha256' = f.raw_sha256
+                              AND COALESCE(s.result_json->>'checked_at', '') <> ''
+                              AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
+                        )
+                    ) OR (
+                        f.artifact_type = 'sanitized_view'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pim_email_sanitized_view_artifacts a
+                            WHERE a.mailbox_id = f.mailbox_id
+                              AND a.email_uid = f.email_uid
+                              AND a.input_raw_sha256 = f.raw_sha256
+                              AND a.sanitizer_policy_version = '{SANITIZED_VIEW_POLICY_VERSION}'
+                              AND a.transform_version = '{SANITIZED_VIEW_TRANSFORM_VERSION}'
+                        )
+                    ) OR (
+                        f.artifact_type = 'external_images'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM pim_email_external_image_derivatives d
+                            WHERE d.mailbox_id = f.mailbox_id
+                              AND d.email_uid = f.email_uid
+                              AND d.input_raw_sha256 = f.raw_sha256
+                              AND d.status IN ('pending','fetched','transformed','failed')
+                        )
+                        AND (
+                            CASE
+                              WHEN jsonb_typeof(f.message_metadata->'remote_image_sources') = 'array'
+                              THEN jsonb_array_length(f.message_metadata->'remote_image_sources')
+                              ELSE 0
+                            END = 0
+                            OR EXISTS (
+                                SELECT 1
+                                FROM pim_email_external_image_derivatives terminal_d
+                                WHERE terminal_d.mailbox_id = f.mailbox_id
+                                  AND terminal_d.email_uid = f.email_uid
+                                  AND terminal_d.input_raw_sha256 = f.raw_sha256
+                                  AND terminal_d.status IN ('stored','unavailable','blocked')
+                            )
+                        )
+                    )
+                ), updated AS (
+                    UPDATE pim_email_backfill_items i
+                    SET status = 'superseded',
+                        metadata_json = i.metadata_json || jsonb_build_object(
+                            'superseded_by_convergence', $2::jsonb
+                        ),
+                        finished_at = COALESCE(i.finished_at, now()),
+                        updated_at = now()
+                    FROM converged c
+                    WHERE i.item_id = c.item_id
+                    RETURNING i.item_id, i.artifact_type
+                )
+                SELECT artifact_type, count(*) AS marked_count
+                FROM updated
+                GROUP BY artifact_type
+                ORDER BY artifact_type
+                """,
+                configured_mailbox_id,
+                _json_dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+        finally:
+            await conn.close()
+        by_artifact = {str(row["artifact_type"]): int(row["marked_count"] or 0) for row in rows}
+        return {
+            "schema": "xarta.pim_email.backfill_item_superseded.result.v1",
+            "mailbox_id": configured_mailbox_id,
+            "marked_count": sum(by_artifact.values()),
+            "by_artifact": by_artifact,
+        }
 
     async def reconcile_orphaned_backfill_runs(
         self,

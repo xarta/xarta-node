@@ -570,6 +570,43 @@ def test_download_orphan_reconcile_marks_only_non_active_running_runs():
     assert calls
 
 
+def test_backfill_superseded_reconcile_marks_converged_failed_items():
+    calls = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            calls.append((query, args))
+            assert "status = 'superseded'" in query
+            assert "artifact_converged_after_failed_attempt" in args[1]
+            assert "pim_email_external_image_derivatives" in query
+            assert "pim_email_security_checks" in query
+            return [
+                {"artifact_type": "external_images", "marked_count": 71},
+                {"artifact_type": "security", "marked_count": 2},
+            ]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(
+        FakeStore().reconcile_superseded_backfill_failures(mailbox_id="test-mailbox")
+    )
+
+    assert result["marked_count"] == 73
+    assert result["by_artifact"] == {"external_images": 71, "security": 2}
+    assert calls
+
+
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
     uid_a = "20260702-" + "a" * 40
     uid_b = "20260702-" + "b" * 40
