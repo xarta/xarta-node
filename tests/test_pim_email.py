@@ -999,6 +999,20 @@ def test_external_image_error_classification_never_uses_skipped():
     )
 
 
+def test_external_image_max_bytes_defaults_above_observed_corpus_and_is_configurable(
+    monkeypatch,
+):
+    monkeypatch.delenv("BLUEPRINTS_EMAIL_REMOTE_IMAGE_MAX_BYTES", raising=False)
+
+    assert pim_email._remote_image_max_bytes() == 25 * 1024 * 1024
+
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_REMOTE_IMAGE_MAX_BYTES", str(32 * 1024 * 1024))
+    assert pim_email._remote_image_max_bytes() == 32 * 1024 * 1024
+
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_REMOTE_IMAGE_MAX_BYTES", "invalid")
+    assert pim_email._remote_image_max_bytes() == 25 * 1024 * 1024
+
+
 def test_oversize_security_llm_state_is_scored_not_marked_skipped(monkeypatch):
     body = "ab" * ((pim_email_security.MAX_LLM_CHARS // 2) + 1)
     findings = []
