@@ -4930,7 +4930,7 @@ def download_mailbox_sync(
                             )
                             handled_external = sum(
                                 int((external_counts or {}).get(key) or 0)
-                                for key in ("stored", "blocked", "failed", "unavailable")
+                                for key in ("stored", "blocked", "unavailable")
                             )
                             unique_remote_sources = len(
                                 {
