@@ -473,6 +473,97 @@ def test_local_corpus_status_reports_retryable_security_separately():
     assert status["render_gate"]["blocked_security_incomplete"] == 31
 
 
+def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
+    uid_a = "20260702-" + "a" * 40
+    uid_b = "20260702-" + "b" * 40
+    uid_existing = "20260702-" + "c" * 40
+    existing = {
+        (
+            "test-mailbox",
+            uid_existing,
+            "raw-existing",
+            "https://cdn.example.test/stored.png",
+        )
+    }
+    inserted = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            if "selected_messages" in query:
+                assert args == ("test-mailbox",)
+                return [
+                    {
+                        "email_uid": uid_a,
+                        "mailbox_id": "test-mailbox",
+                        "raw_sha256": "raw-a",
+                        "source_url": "https://cdn.example.test/a.png",
+                    },
+                    {
+                        "email_uid": uid_a,
+                        "mailbox_id": "test-mailbox",
+                        "raw_sha256": "raw-a",
+                        "source_url": "https://cdn.example.test/a.png",
+                    },
+                    {
+                        "email_uid": uid_existing,
+                        "mailbox_id": "test-mailbox",
+                        "raw_sha256": "raw-existing",
+                        "source_url": "https://cdn.example.test/stored.png",
+                    },
+                    {
+                        "email_uid": uid_b,
+                        "mailbox_id": "test-mailbox",
+                        "raw_sha256": "raw-b",
+                        "source_url": "https://cdn.example.test/b.png",
+                    },
+                ]
+            if "INSERT INTO pim_email_external_image_derivatives" in query:
+                rows = []
+                for index, canonical in enumerate(args[5]):
+                    key = (args[2][index], args[1][index], args[3][index], canonical)
+                    if key in existing:
+                        continue
+                    existing.add(key)
+                    inserted.append(
+                        {
+                            "status": args[6][index],
+                            "reason": args[7][index],
+                            "safety_decision": args[8][index],
+                            "transform_version": args[9][index],
+                            "metadata_json": args[10][index],
+                        }
+                    )
+                    rows.append({"derivative_id": args[0][index]})
+                return rows
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(
+        FakeStore().materialize_external_image_derivative_rows(mailbox_id="test-mailbox")
+    )
+
+    assert result == {
+        "captured_sources": 4,
+        "candidate_rows": 3,
+        "materialized_rows": 2,
+    }
+    assert {item["status"] for item in inserted} == {"pending"}
+    assert {item["safety_decision"] for item in inserted} == {"pending_real_download"}
+    assert {item["reason"] for item in inserted} == {"captured_waiting_for_real_download"}
+
+
 def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     raw = (
         b"Subject: =?utf-8?q?Hello_=E2=9C=93?=\r\n"

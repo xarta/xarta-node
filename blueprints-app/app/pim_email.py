@@ -2250,6 +2250,147 @@ class PgEmailStore:
             "updated_at": _iso_datetime(_row_get(row, "updated_at")),
         }
 
+    async def materialize_external_image_derivative_rows(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        email_uid: str | None = None,
+        limit: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_email_filter = clean_email_uid(email_uid) if email_uid else ""
+        safe_limit = None if limit is None else max(1, int(limit))
+        params: list[Any] = [configured_mailbox_id]
+        where = "WHERE mailbox_id = $1"
+        if clean_email_filter:
+            params.append(clean_email_filter)
+            where += f" AND email_uid = ${len(params)}"
+        limit_clause = ""
+        if safe_limit is not None:
+            params.append(safe_limit)
+            limit_clause = f"LIMIT ${len(params)}"
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                f"""
+                WITH selected_messages AS (
+                    SELECT email_uid, mailbox_id, raw_sha256, metadata_json
+                    FROM pim_email_messages
+                    {where}
+                    ORDER BY updated_at ASC, email_uid ASC
+                    {limit_clause}
+                )
+                SELECT email_uid, mailbox_id, raw_sha256, source.value #>> '{{}}' AS source_url
+                FROM selected_messages,
+                     LATERAL jsonb_array_elements(
+                       COALESCE(metadata_json->'remote_image_sources', '[]'::jsonb)
+                     ) AS source(value)
+                """,
+                *params,
+            )
+        finally:
+            await conn.close()
+
+        records: list[tuple[Any, ...]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in rows:
+            clean_uid = clean_email_uid(str(row["email_uid"] or ""))
+            raw_sha256 = str(row["raw_sha256"] or "")
+            source_url = str(row["source_url"] or "")
+            canonical = _canonical_remote_image_url(source_url) or source_url
+            if not canonical:
+                continue
+            key = (configured_mailbox_id, clean_uid, raw_sha256, canonical)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(
+                (
+                    _stable_id(
+                        "email-image-derivative",
+                        configured_mailbox_id,
+                        clean_uid,
+                        raw_sha256,
+                        canonical,
+                    ),
+                    clean_uid,
+                    configured_mailbox_id,
+                    raw_sha256,
+                    source_url,
+                    canonical,
+                    "pending",
+                    "captured_waiting_for_real_download",
+                    "pending_real_download",
+                    EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                    _json_dumps(
+                        {
+                            **(metadata or {}),
+                            "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                            "completion_kind": "pending_real_download",
+                            "source_url": source_url,
+                            "canonical_url": canonical,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        if not records:
+            return {
+                "captured_sources": len(rows),
+                "candidate_rows": 0,
+                "materialized_rows": 0,
+            }
+
+        inserted = 0
+        conn = await self._connect()
+        try:
+            for offset in range(0, len(records), 1000):
+                chunk = records[offset : offset + 1000]
+                result = await conn.fetch(
+                    """
+                    INSERT INTO pim_email_external_image_derivatives (
+                        derivative_id, email_uid, mailbox_id, input_raw_sha256,
+                        source_url, canonical_url, status, reason, safety_decision,
+                        transform_version, metadata_json
+                    )
+                    SELECT *
+                    FROM unnest(
+                        $1::text[], $2::text[], $3::text[], $4::text[],
+                        $5::text[], $6::text[], $7::text[], $8::text[],
+                        $9::text[], $10::text[], $11::jsonb[]
+                    ) AS input(
+                        derivative_id, email_uid, mailbox_id, input_raw_sha256,
+                        source_url, canonical_url, status, reason, safety_decision,
+                        transform_version, metadata_json
+                    )
+                    ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url)
+                    DO NOTHING
+                    RETURNING derivative_id
+                    """,
+                    [item[0] for item in chunk],
+                    [item[1] for item in chunk],
+                    [item[2] for item in chunk],
+                    [item[3] for item in chunk],
+                    [item[4] for item in chunk],
+                    [item[5] for item in chunk],
+                    [item[6] for item in chunk],
+                    [item[7] for item in chunk],
+                    [item[8] for item in chunk],
+                    [item[9] for item in chunk],
+                    [item[10] for item in chunk],
+                )
+                inserted += len(result)
+        finally:
+            await conn.close()
+        return {
+            "captured_sources": len(rows),
+            "candidate_rows": len(records),
+            "materialized_rows": inserted,
+        }
+
     async def process_external_image_derivatives(
         self,
         *,
@@ -2796,9 +2937,52 @@ class PgEmailStore:
             "external_images_unavailable": 0,
             "external_images_pending": 0,
             "external_images_captured": 0,
+            "external_images_materialize_candidates": 0,
+            "external_images_materialized_rows": 0,
             "failed_messages": 0,
         }
         run_status = "completed"
+        if "external_images" in clean_artifacts:
+            materialized = await self.materialize_external_image_derivative_rows(
+                mailbox_id=configured_mailbox_id,
+                email_uid=clean_email_filter or None,
+                limit=safe_limit,
+                metadata={
+                    "run_id": actual_run_id,
+                    "batch_id": batch_id,
+                    "phase": "external-images-materialize",
+                },
+            )
+            summary["external_images_materialize_candidates"] = int(
+                materialized.get("candidate_rows") or 0
+            )
+            summary["external_images_materialized_rows"] = int(
+                materialized.get("materialized_rows") or 0
+            )
+            conn = await self._connect()
+            try:
+                await conn.execute(
+                    """
+                    UPDATE pim_email_backfill_runs
+                    SET summary_json = $2::jsonb,
+                        updated_at = now()
+                    WHERE run_id = $1
+                    """,
+                    actual_run_id,
+                    _json_dumps(summary, sort_keys=True, separators=(",", ":")),
+                )
+                await conn.execute(
+                    """
+                    UPDATE pim_email_backfill_batches
+                    SET metadata_json = $2::jsonb,
+                        updated_at = now()
+                    WHERE batch_id = $1
+                    """,
+                    batch_id,
+                    _json_dumps({"summary": summary}, sort_keys=True, separators=(",", ":")),
+                )
+            finally:
+                await conn.close()
         for row in rows:
             email_uid = clean_email_uid(str(row["email_uid"]))
             expected_hash = str(row["raw_sha256"] or "")
