@@ -60,6 +60,7 @@ SANITIZED_VIEW_POLICY_VERSION = "sanitized-view-v1"
 SANITIZED_VIEW_TRANSFORM_VERSION = "email-view-json-v1"
 SECURITY_POLICY_VERSION = "pim-email-security-v1"
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
+EXTERNAL_IMAGE_RETRY_DELAY_SECONDS = 15 * 60
 PIM_EMAIL_SCHEMA_LOCK_ID = 917_202_607_020_001
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 DEFAULT_REMOTE_IMAGE_MAX_BYTES = 25 * 1024 * 1024
@@ -3077,6 +3078,16 @@ class PgEmailStore:
                   AND d.canonical_url_digest <> ''
                   AND d.status IN ('pending','fetched','transformed','failed')
                   AND sd.canonical_url_digest IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pim_email_external_image_derivatives waiting
+                      WHERE waiting.mailbox_id = d.mailbox_id
+                        AND waiting.canonical_url_digest = d.canonical_url_digest
+                        AND waiting.status = 'pending'
+                        AND COALESCE(waiting.reason, '') <> 'captured_waiting_for_real_download'
+                        AND waiting.next_retry_at IS NOT NULL
+                        AND waiting.next_retry_at > now()
+                  )
                 ORDER BY d.canonical_url_digest, d.email_uid DESC, d.updated_at DESC
                 LIMIT $2
                 """,
@@ -3590,6 +3601,12 @@ class PgEmailStore:
             input_raw_sha256,
             canonical,
         )
+        clean_reason = str(reason or "")[:1000]
+        retryable_pending = (
+            clean_status == "pending"
+            and bool(clean_reason)
+            and clean_reason != "captured_waiting_for_real_download"
+        )
         conn = await self._connect()
         try:
             row = await conn.fetchrow(
@@ -3599,10 +3616,15 @@ class PgEmailStore:
                     source_url, canonical_url, canonical_url_digest, status, reason, safety_decision,
                     transform_version, raw_image_sha256, transformed_sha256,
                     storage_relpath, shared_asset_uid, encrypted_size, content_type, width, height,
-                    metadata_json, fetched_at, transformed_at, stored_at, updated_at
+                    retry_count, last_error, next_retry_at, metadata_json,
+                    fetched_at, transformed_at, stored_at, updated_at
                 )
                 VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                    CASE WHEN $21::boolean THEN 1 ELSE 0 END,
+                    CASE WHEN $21::boolean THEN $9 ELSE '' END,
+                    CASE WHEN $21::boolean THEN now() + ($22::integer * interval '1 second') ELSE NULL END,
+                    $20::jsonb,
                     CASE WHEN $8 IN ('fetched','transformed','stored') THEN now() ELSE NULL END,
                     CASE WHEN $8 IN ('transformed','stored') THEN now() ELSE NULL END,
                     CASE WHEN $8 = 'stored' THEN now() ELSE NULL END,
@@ -3621,6 +3643,20 @@ class PgEmailStore:
                     content_type = EXCLUDED.content_type,
                     width = EXCLUDED.width,
                     height = EXCLUDED.height,
+                    retry_count = CASE
+                        WHEN $21::boolean THEN pim_email_external_image_derivatives.retry_count + 1
+                        ELSE pim_email_external_image_derivatives.retry_count
+                    END,
+                    last_error = CASE
+                        WHEN $21::boolean THEN EXCLUDED.last_error
+                        WHEN EXCLUDED.status IN ('stored','blocked','unavailable') THEN ''
+                        ELSE pim_email_external_image_derivatives.last_error
+                    END,
+                    next_retry_at = CASE
+                        WHEN $21::boolean THEN now() + ($22::integer * interval '1 second')
+                        WHEN EXCLUDED.status IN ('stored','blocked','unavailable') THEN NULL
+                        ELSE pim_email_external_image_derivatives.next_retry_at
+                    END,
                     metadata_json = EXCLUDED.metadata_json,
                     fetched_at = COALESCE(EXCLUDED.fetched_at, pim_email_external_image_derivatives.fetched_at),
                     transformed_at = COALESCE(EXCLUDED.transformed_at, pim_email_external_image_derivatives.transformed_at),
@@ -3630,7 +3666,7 @@ class PgEmailStore:
                           canonical_url, status, reason, safety_decision,
                           transform_version, raw_image_sha256, transformed_sha256,
                           storage_relpath, shared_asset_uid, encrypted_size, content_type, width,
-                          height, retry_count, last_error, created_at, updated_at;
+                          height, retry_count, last_error, next_retry_at, created_at, updated_at;
                 """,
                 derivative_id,
                 clean_uid,
@@ -3640,7 +3676,7 @@ class PgEmailStore:
                 canonical,
                 canonical_digest,
                 clean_status,
-                str(reason or "")[:1000],
+                clean_reason,
                 str(safety_decision or ""),
                 str(transform_version or ""),
                 str(raw_image_sha256 or ""),
@@ -3652,6 +3688,8 @@ class PgEmailStore:
                 int(width or 0),
                 int(height or 0),
                 _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                retryable_pending,
+                EXTERNAL_IMAGE_RETRY_DELAY_SECONDS,
             )
         finally:
             await conn.close()
@@ -3673,6 +3711,9 @@ class PgEmailStore:
             "content_type": str(_row_get(row, "content_type", "")),
             "width": int(_row_get(row, "width", 0) or 0),
             "height": int(_row_get(row, "height", 0) or 0),
+            "retry_count": int(_row_get(row, "retry_count", 0) or 0),
+            "last_error": str(_row_get(row, "last_error", "")),
+            "next_retry_at": _iso_datetime(_row_get(row, "next_retry_at")),
             "updated_at": _iso_datetime(_row_get(row, "updated_at")),
         }
 
