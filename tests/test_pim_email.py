@@ -473,6 +473,46 @@ def test_local_corpus_status_reports_retryable_security_separately():
     assert status["render_gate"]["blocked_security_incomplete"] == 31
 
 
+def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
+    calls = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            calls.append((query, args))
+            assert "status = 'interrupted-orphaned'" in query
+            assert args[0] == "test-mailbox"
+            assert args[1] == ["active-run"]
+            metadata = json.loads(args[2])
+            assert metadata["reason"] == "process-gone"
+            assert metadata["active_run_ids"] == ["active-run"]
+            return [{"run_id": "old-run"}]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    result = asyncio.run(
+        FakeStore().reconcile_orphaned_backfill_runs(
+            active_run_ids={"active-run"},
+            reason="process-gone",
+            mailbox_id="test-mailbox",
+        )
+    )
+
+    assert result["marked_orphaned"] == ["old-run"]
+    assert result["marked_count"] == 1
+    assert calls
+
+
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
     uid_a = "20260702-" + "a" * 40
     uid_b = "20260702-" + "b" * 40
