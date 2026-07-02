@@ -1288,6 +1288,11 @@ class PgEmailStore:
     async def local_corpus_status(self, *, mailbox_id: str | None = None) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        download_orphan_reconcile = await self.reconcile_orphaned_download_runs(
+            active_run_ids=_active_download_run_ids_from_proc(),
+            reason="local_corpus_status_process_set_reconciliation",
+            mailbox_id=configured_mailbox_id,
+        )
         conn = await self._connect()
         try:
             row = await conn.fetchrow(
@@ -1549,6 +1554,7 @@ class PgEmailStore:
             },
             "available": bool(row and message_count > 0),
             "last_run": _download_run_public(last_run) if last_run else None,
+            "download_orphan_reconcile": download_orphan_reconcile,
         }
 
     async def completed_security_result(
@@ -1796,9 +1802,12 @@ class PgEmailStore:
                 )
                 VALUES ($1,$2,'running',$3,$4,$5::jsonb)
                 ON CONFLICT (run_id) DO UPDATE SET
+                    started_at = now(),
+                    finished_at = NULL,
                     status = 'running',
                     apply_remote_moves = EXCLUDED.apply_remote_moves,
                     downloaded_folder = EXCLUDED.downloaded_folder,
+                    summary_json = '{}'::jsonb,
                     metadata_json = EXCLUDED.metadata_json;
                 """,
                 run_id,
@@ -4461,6 +4470,26 @@ def _download_run_public(row: Any) -> dict[str, Any]:
         "finished_at": _iso_datetime(_row_get(row, "finished_at")),
         "summary": _json_value(_row_get(row, "summary_json"), {}),
     }
+
+
+def _active_download_run_ids_from_proc(proc_root: str | Path = "/proc") -> set[str]:
+    active: set[str] = set()
+    root = Path(proc_root)
+    try:
+        cmdlines = root.glob("[0-9]*/cmdline")
+    except Exception:
+        return active
+    for cmdline in cmdlines:
+        try:
+            raw = cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except Exception:
+            continue
+        if "pim_email_download_mailbox.py" not in raw or "--run-id" not in raw:
+            continue
+        match = re.search(r"(?:^|\s)--run-id\s+(\S+)", raw)
+        if match:
+            active.add(match.group(1))
+    return active
 
 
 def _folder_row_public(row: Any) -> dict[str, Any]:
