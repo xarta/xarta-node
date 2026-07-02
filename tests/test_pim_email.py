@@ -733,6 +733,8 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "AS sanitized_running" in candidate_query
     assert "AS external_running" in candidate_query
     assert "AND security_running" in candidate_query
+    assert "email_uid DESC" in candidate_query
+    assert "updated_at ASC" not in candidate_query
 
 
 def test_backfill_running_item_claim_is_atomic_and_refuses_live_duplicate():
@@ -801,6 +803,7 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
     uid_a = "20260702-" + "a" * 40
     uid_b = "20260702-" + "b" * 40
     uid_existing = "20260702-" + "c" * 40
+    queries = []
     existing = {
         (
             "test-mailbox",
@@ -813,6 +816,7 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
 
     class FakeConnection:
         async def fetch(self, query, *args):
+            queries.append(query)
             if "selected_messages" in query:
                 assert args == ("test-mailbox",)
                 return [
@@ -883,6 +887,10 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
         "candidate_rows": 3,
         "materialized_rows": 2,
     }
+    selected_query = next(query for query in queries if "selected_messages" in query)
+    assert "count(DISTINCT d.canonical_url_digest)" in selected_query
+    assert "pim_email_external_image_derivatives" in selected_query
+    assert "ORDER BY email_uid DESC" in selected_query
     assert {item["status"] for item in inserted} == {"pending"}
     assert {item["safety_decision"] for item in inserted} == {"pending_real_download"}
     assert {item["reason"] for item in inserted} == {"captured_waiting_for_real_download"}
@@ -1740,6 +1748,10 @@ def test_special_use_descendants_do_not_move_but_inbox_subfolders_can_move():
         {"folder_name": "INBOX/Receipts", "special_use_role": ""},
         target,
     )
+
+
+def test_imap_uids_newest_first_uses_numeric_uid_descending():
+    assert pim_email._imap_uids_newest_first(["2", "10", "1"]) == ["10", "2", "1"]
 
 
 def test_safe_downloader_resume_idempotence_keeps_duplicate_identity_singleton(

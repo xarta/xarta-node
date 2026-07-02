@@ -2335,7 +2335,17 @@ class PgEmailStore:
                     SELECT email_uid, mailbox_id, raw_sha256, metadata_json
                     FROM pim_email_messages
                     {where}
-                    ORDER BY updated_at ASC, email_uid ASC
+                      AND jsonb_typeof(metadata_json->'remote_image_sources') = 'array'
+                      AND jsonb_array_length(metadata_json->'remote_image_sources') > 0
+                      AND (
+                          SELECT count(DISTINCT d.canonical_url_digest)
+                          FROM pim_email_external_image_derivatives d
+                          WHERE d.mailbox_id = pim_email_messages.mailbox_id
+                            AND d.email_uid = pim_email_messages.email_uid
+                            AND d.input_raw_sha256 = pim_email_messages.raw_sha256
+                            AND d.canonical_url_digest <> ''
+                      ) < jsonb_array_length(metadata_json->'remote_image_sources')
+                    ORDER BY email_uid DESC, updated_at DESC
                     {limit_clause}
                 )
                 SELECT email_uid, mailbox_id, raw_sha256, source.value #>> '{{}}' AS source_url
@@ -3213,6 +3223,7 @@ class PgEmailStore:
                     OR ({external_requested} AND external_running)
                 )
                 ORDER BY
+                  email_uid DESC,
                   CASE
                     WHEN {security_requested} AND security_result_present AND NOT security_complete THEN 0
                     WHEN {security_requested} AND NOT security_complete THEN 1
@@ -3220,8 +3231,7 @@ class PgEmailStore:
                     WHEN {external_requested} AND external_pending THEN 1
                     ELSE 2
                   END,
-                  updated_at ASC,
-                  email_uid ASC
+                  updated_at DESC
                 {limit_clause}
                 """,
                 *params,
@@ -3252,6 +3262,7 @@ class PgEmailStore:
                         "sanitizer_policy_version": SANITIZED_VIEW_POLICY_VERSION,
                         "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
                         "external_image_derivative_version": EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                        "candidate_order": "email_uid_desc_then_artifact_gap_priority",
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -4743,9 +4754,9 @@ def download_mailbox_sync(
                     and _folder_move_allowed(folder_snapshot, target_folder)
                 )
                 _select_imap_folder(client, folder_name, readonly=not move_allowed)
-                uids = _imap_uid_search_all(client)
+                uids = _imap_uids_newest_first(_imap_uid_search_all(client))
                 if limit_per_folder is not None:
-                    uids = uids[-max(0, int(limit_per_folder)) :]
+                    uids = uids[: max(0, int(limit_per_folder))]
                 if max_messages is not None:
                     remaining = max(0, int(max_messages) - int(summary["processed_messages"]))
                     uids = uids[:remaining]
@@ -5175,6 +5186,10 @@ def clean_uid_value(value: str) -> str:
     if not re.fullmatch(r"[0-9]+", clean):
         raise EmailOperationError("Invalid IMAP UID")
     return clean
+
+
+def _imap_uids_newest_first(uids: list[str]) -> list[str]:
+    return sorted((clean_uid_value(uid) for uid in uids), key=int, reverse=True)
 
 
 def _first_fetch_bytes(fetch_data: Any) -> bytes:
