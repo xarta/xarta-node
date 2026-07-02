@@ -5603,7 +5603,14 @@ def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
 
 def _external_image_error_status(exc: BaseException) -> str:
     text = str(exc).lower()
-    if "private or unsafe" in text or "not an allowed http" in text:
+    if (
+        "private or unsafe" in text
+        or "not an allowed http" in text
+        or "could not be decoded safely" in text
+        or "payload is empty or too large" in text
+        or "payload is too large" in text
+        or "decompression" in text
+    ):
         return "blocked"
     if (
         "timeout" in text
