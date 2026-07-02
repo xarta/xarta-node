@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import sys
 from io import BytesIO
@@ -806,8 +807,32 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "AS sanitized_running" in candidate_query
     assert "AS external_running" in candidate_query
     assert "AND security_running" in candidate_query
+    assert "AND (\n                    (TRUE AND NOT security_complete)" in candidate_query
+    assert "OR (FALSE AND NOT sanitized_complete)" in candidate_query
+    assert "OR (FALSE AND external_pending)" in candidate_query
+    assert "d.status IN ('pending','fetched','transformed','failed')" in candidate_query
     assert "email_uid DESC" in candidate_query
     assert "updated_at ASC" not in candidate_query
+
+
+def test_backfill_cli_generated_external_rows_are_not_idle(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_STACK_RUNNER", "1")
+    script_path = APP_ROOT / "scripts" / "pim_email_backfill.py"
+    spec = importlib.util.spec_from_file_location("pim_email_backfill_test_module", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    result = {
+        "summary": {
+            "planned_messages": 0,
+            "external_images_materialized_rows": 7,
+        }
+    }
+
+    assert module._planned_messages(result) == 0
+    assert module._generated_work_rows(result) == 7
 
 
 def test_backfill_running_item_claim_is_atomic_and_refuses_live_duplicate():

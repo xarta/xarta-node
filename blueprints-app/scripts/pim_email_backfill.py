@@ -158,6 +158,13 @@ def _planned_messages(result: dict[str, Any]) -> int:
     return int(summary.get("planned_messages") or 0)
 
 
+def _generated_work_rows(result: dict[str, Any]) -> int:
+    summary = result.get("summary") if isinstance(result, dict) else None
+    if not isinstance(summary, dict):
+        return 0
+    return int(summary.get("external_images_materialized_rows") or 0)
+
+
 async def _fetch_backfill_progress(store: Any, run_id: str) -> dict[str, Any]:
     conn = await store._connect()
     try:
@@ -295,9 +302,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 aggregate=aggregate,
             )
             if planned <= 0:
-                aggregate["idle_batches"] += 1
-                aggregate["stopped_reason"] = "idle"
-                break
+                generated = _generated_work_rows(result)
+                if generated <= 0:
+                    aggregate["idle_batches"] += 1
+                    aggregate["stopped_reason"] = "idle"
+                    break
             if args.idle_sleep_seconds and float(args.idle_sleep_seconds) > 0:
                 await asyncio.sleep(float(args.idle_sleep_seconds))
         result = {
