@@ -48,8 +48,8 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         limit_per_folder=args.limit_per_folder,
         max_messages=args.max_messages,
         convergence_passes=args.convergence_passes,
-        include_special_use=not args.exclude_special_use,
-        security_mode=args.security_mode,
+        include_special_use=True,
+        security_mode="run",
     )
 
 
@@ -67,8 +67,6 @@ def main() -> int:
     parser.add_argument("--limit-per-folder", type=int, default=None)
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--convergence-passes", type=int, default=1)
-    parser.add_argument("--exclude-special-use", action="store_true")
-    parser.add_argument("--security-mode", default="run", choices=["run", "queue", "run-or-queue"])
     args = parser.parse_args()
     _load_env_file(Path(args.env_file))
     result = asyncio.run(_run(args))
