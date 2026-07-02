@@ -2793,66 +2793,104 @@ class PgEmailStore:
         error_class: str = "",
         error_message: str = "",
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         clean_status = str(status or "").strip().lower()
         if clean_status not in {"running", "completed", "failed", "superseded"}:
             raise EmailOperationError("Invalid backfill item status")
         clean_artifact = str(artifact_type or "").strip().lower()
         if not clean_artifact:
             raise EmailOperationError("Invalid backfill artifact type")
+        clean_uid = clean_email_uid(email_uid)
+        clean_hash = str(raw_sha256 or "")
         item_id = _stable_id(
             "email-backfill-item",
             run_id,
-            email_uid,
-            raw_sha256,
+            clean_uid,
+            clean_hash,
             clean_artifact,
         )
         finished = clean_status in {"completed", "failed", "superseded"}
         conn = await self._connect()
         try:
-            await conn.execute(
-                """
-                INSERT INTO pim_email_backfill_items (
-                    item_id, run_id, batch_id, mailbox_id, email_uid, raw_sha256,
-                    artifact_type, status, attempts, error_class, error_message,
-                    metadata_json, started_at, finished_at, updated_at
+            async with conn.transaction():
+                if clean_status == "running":
+                    claim_key = "\n".join((mailbox_id, clean_uid, clean_hash, clean_artifact))
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        claim_key,
+                    )
+                    claimed_by = await conn.fetchval(
+                        """
+                        SELECT i.run_id
+                        FROM pim_email_backfill_items i
+                        JOIN pim_email_backfill_runs r ON r.run_id = i.run_id
+                        WHERE i.mailbox_id = $1
+                          AND i.email_uid = $2
+                          AND i.raw_sha256 = $3
+                          AND i.artifact_type = $4
+                          AND i.status = 'running'
+                          AND r.status = 'running'
+                          AND i.run_id <> $5
+                        LIMIT 1
+                        """,
+                        mailbox_id,
+                        clean_uid,
+                        clean_hash,
+                        clean_artifact,
+                        run_id,
+                    )
+                    if claimed_by:
+                        return False
+                await conn.execute(
+                    """
+                    INSERT INTO pim_email_backfill_items (
+                        item_id, run_id, batch_id, mailbox_id, email_uid, raw_sha256,
+                        artifact_type, status, attempts, error_class, error_message,
+                        metadata_json, started_at, finished_at, updated_at
+                    )
+                    VALUES (
+                        $1,$2,$3,$4,$5,$6,$7,$8,
+                        CASE WHEN $8 = 'running' THEN 1 ELSE 0 END,
+                        $9,$10,$11::jsonb,
+                        CASE WHEN $8 = 'running' THEN now() ELSE NULL END,
+                        CASE WHEN $12 THEN now() ELSE NULL END,
+                        now()
+                    )
+                    ON CONFLICT (run_id, email_uid, raw_sha256, artifact_type)
+                    DO UPDATE SET
+                        batch_id = EXCLUDED.batch_id,
+                        status = EXCLUDED.status,
+                        attempts = pim_email_backfill_items.attempts
+                          + CASE WHEN EXCLUDED.status = 'running' THEN 1 ELSE 0 END,
+                        error_class = EXCLUDED.error_class,
+                        error_message = EXCLUDED.error_message,
+                        metadata_json = EXCLUDED.metadata_json,
+                        started_at = COALESCE(
+                            pim_email_backfill_items.started_at,
+                            EXCLUDED.started_at
+                        ),
+                        finished_at = CASE
+                            WHEN $12 THEN now()
+                            ELSE pim_email_backfill_items.finished_at
+                        END,
+                        updated_at = now()
+                    """,
+                    item_id,
+                    run_id,
+                    batch_id,
+                    mailbox_id,
+                    clean_uid,
+                    clean_hash,
+                    clean_artifact,
+                    clean_status,
+                    str(error_class or "")[:200],
+                    str(error_message or "")[:1000],
+                    _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                    finished,
                 )
-                VALUES (
-                    $1,$2,$3,$4,$5,$6,$7,$8,
-                    CASE WHEN $8 = 'running' THEN 1 ELSE 0 END,
-                    $9,$10,$11::jsonb,
-                    CASE WHEN $8 = 'running' THEN now() ELSE NULL END,
-                    CASE WHEN $12 THEN now() ELSE NULL END,
-                    now()
-                )
-                ON CONFLICT (run_id, email_uid, raw_sha256, artifact_type)
-                DO UPDATE SET
-                    batch_id = EXCLUDED.batch_id,
-                    status = EXCLUDED.status,
-                    attempts = pim_email_backfill_items.attempts
-                      + CASE WHEN EXCLUDED.status = 'running' THEN 1 ELSE 0 END,
-                    error_class = EXCLUDED.error_class,
-                    error_message = EXCLUDED.error_message,
-                    metadata_json = EXCLUDED.metadata_json,
-                    started_at = COALESCE(pim_email_backfill_items.started_at, EXCLUDED.started_at),
-                    finished_at = CASE WHEN $12 THEN now() ELSE pim_email_backfill_items.finished_at END,
-                    updated_at = now()
-                """,
-                item_id,
-                run_id,
-                batch_id,
-                mailbox_id,
-                clean_email_uid(email_uid),
-                str(raw_sha256 or ""),
-                clean_artifact,
-                clean_status,
-                str(error_class or "")[:200],
-                str(error_message or "")[:1000],
-                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
-                finished,
-            )
         finally:
             await conn.close()
+        return True
 
     async def reconcile_superseded_backfill_failures(
         self,
@@ -3340,7 +3378,7 @@ class PgEmailStore:
                 continue
 
             if "security" in clean_artifacts:
-                await self._record_backfill_item(
+                security_claimed = await self._record_backfill_item(
                     run_id=actual_run_id,
                     batch_id=batch_id,
                     mailbox_id=configured_mailbox_id,
@@ -3350,47 +3388,48 @@ class PgEmailStore:
                     status="running",
                     metadata={"phase": "security"},
                 )
-                try:
-                    completed = await self.completed_security_result(
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                    )
-                    if completed is None:
-                        await self.run_local_security_check(
-                            email_uid,
-                            mailbox_id=configured_mailbox_id,
+                if security_claimed:
+                    try:
+                        completed = await self.completed_security_result(
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
                         )
-                        summary["security_completed"] += 1
-                    else:
-                        summary["security_already_completed"] += 1
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="security",
-                        status="completed",
-                        metadata={"phase": "security"},
-                    )
-                except Exception as exc:
-                    run_status = "completed-with-errors"
-                    summary["security_failed"] += 1
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="security",
-                        status="failed",
-                        error_class=exc.__class__.__name__,
-                        error_message=str(exc),
-                        metadata={"phase": "security"},
-                    )
+                        if completed is None:
+                            await self.run_local_security_check(
+                                email_uid,
+                                mailbox_id=configured_mailbox_id,
+                            )
+                            summary["security_completed"] += 1
+                        else:
+                            summary["security_already_completed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security",
+                            status="completed",
+                            metadata={"phase": "security"},
+                        )
+                    except Exception as exc:
+                        run_status = "completed-with-errors"
+                        summary["security_failed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="security",
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "security"},
+                        )
 
             if "sanitized_view" in clean_artifacts:
-                await self._record_backfill_item(
+                sanitized_claimed = await self._record_backfill_item(
                     run_id=actual_run_id,
                     batch_id=batch_id,
                     mailbox_id=configured_mailbox_id,
@@ -3400,51 +3439,52 @@ class PgEmailStore:
                     status="running",
                     metadata={"phase": "sanitized-view"},
                 )
-                try:
-                    current = await self.current_sanitized_view_artifact(
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                    )
-                    if current is None:
-                        artifact = build_sanitized_view_artifact(
+                if sanitized_claimed:
+                    try:
+                        current = await self.current_sanitized_view_artifact(
                             mailbox_id=configured_mailbox_id,
                             email_uid=email_uid,
-                            raw=raw,
                             raw_sha256=expected_hash,
                         )
-                        await self.store_sanitized_view_artifact(artifact=artifact)
-                        summary["sanitized_views_stored"] += 1
-                    else:
-                        summary["sanitized_views_already_current"] += 1
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="sanitized_view",
-                        status="completed",
-                        metadata={"phase": "sanitized-view"},
-                    )
-                except Exception as exc:
-                    run_status = "completed-with-errors"
-                    summary["sanitized_views_failed"] += 1
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="sanitized_view",
-                        status="failed",
-                        error_class=exc.__class__.__name__,
-                        error_message=str(exc),
-                        metadata={"phase": "sanitized-view"},
-                    )
+                        if current is None:
+                            artifact = build_sanitized_view_artifact(
+                                mailbox_id=configured_mailbox_id,
+                                email_uid=email_uid,
+                                raw=raw,
+                                raw_sha256=expected_hash,
+                            )
+                            await self.store_sanitized_view_artifact(artifact=artifact)
+                            summary["sanitized_views_stored"] += 1
+                        else:
+                            summary["sanitized_views_already_current"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="sanitized_view",
+                            status="completed",
+                            metadata={"phase": "sanitized-view"},
+                        )
+                    except Exception as exc:
+                        run_status = "completed-with-errors"
+                        summary["sanitized_views_failed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="sanitized_view",
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "sanitized-view"},
+                        )
 
             if "external_images" in clean_artifacts:
-                await self._record_backfill_item(
+                external_claimed = await self._record_backfill_item(
                     run_id=actual_run_id,
                     batch_id=batch_id,
                     mailbox_id=configured_mailbox_id,
@@ -3454,46 +3494,47 @@ class PgEmailStore:
                     status="running",
                     metadata={"phase": "external-images"},
                 )
-                try:
-                    sources = remote_image_sources_from_raw(raw)
-                    summary["external_images_captured"] += len(sources)
-                    counts = await self.process_external_image_derivatives(
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        input_raw_sha256=expected_hash,
-                        source_urls=sources,
-                        metadata={"run_id": actual_run_id, "batch_id": batch_id},
-                    )
-                    summary["external_images_stored"] += counts["stored"]
-                    summary["external_images_blocked"] += counts["blocked"]
-                    summary["external_images_failed"] += counts["failed"]
-                    summary["external_images_unavailable"] += counts["unavailable"]
-                    summary["external_images_pending"] += counts["pending"]
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="external_images",
-                        status="completed",
-                        metadata={"phase": "external-images", "captured": len(sources)},
-                    )
-                except Exception as exc:
-                    run_status = "completed-with-errors"
-                    summary["external_images_failed"] += 1
-                    await self._record_backfill_item(
-                        run_id=actual_run_id,
-                        batch_id=batch_id,
-                        mailbox_id=configured_mailbox_id,
-                        email_uid=email_uid,
-                        raw_sha256=expected_hash,
-                        artifact_type="external_images",
-                        status="failed",
-                        error_class=exc.__class__.__name__,
-                        error_message=str(exc),
-                        metadata={"phase": "external-images"},
-                    )
+                if external_claimed:
+                    try:
+                        sources = remote_image_sources_from_raw(raw)
+                        summary["external_images_captured"] += len(sources)
+                        counts = await self.process_external_image_derivatives(
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            input_raw_sha256=expected_hash,
+                            source_urls=sources,
+                            metadata={"run_id": actual_run_id, "batch_id": batch_id},
+                        )
+                        summary["external_images_stored"] += counts["stored"]
+                        summary["external_images_blocked"] += counts["blocked"]
+                        summary["external_images_failed"] += counts["failed"]
+                        summary["external_images_unavailable"] += counts["unavailable"]
+                        summary["external_images_pending"] += counts["pending"]
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="external_images",
+                            status="completed",
+                            metadata={"phase": "external-images", "captured": len(sources)},
+                        )
+                    except Exception as exc:
+                        run_status = "completed-with-errors"
+                        summary["external_images_failed"] += 1
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type="external_images",
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "external-images"},
+                        )
             summary["processed_messages"] += 1
             conn = await self._connect()
             try:

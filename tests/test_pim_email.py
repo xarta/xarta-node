@@ -695,6 +695,68 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "AND security_running" in candidate_query
 
 
+def test_backfill_running_item_claim_is_atomic_and_refuses_live_duplicate():
+    queries = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            queries.append(("transaction-enter", ()))
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            queries.append(("transaction-exit", (exc_type,)))
+            return False
+
+    class FakeConnection:
+        def transaction(self):
+            return FakeTransaction()
+
+        async def execute(self, query, *args):
+            queries.append((query, args))
+            return None
+
+        async def fetchval(self, query, *args):
+            queries.append((query, args))
+            assert "pim_email_backfill_items" in query
+            assert args == (
+                "test-mailbox",
+                "20260702-" + "e" * 40,
+                "raw-hash",
+                "security",
+                "run-a",
+            )
+            return "run-b"
+
+        async def close(self):
+            queries.append(("close", ()))
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    claimed = asyncio.run(
+        FakeStore()._record_backfill_item(
+            run_id="run-a",
+            batch_id="batch-a",
+            mailbox_id="test-mailbox",
+            email_uid="20260702-" + "e" * 40,
+            raw_sha256="raw-hash",
+            artifact_type="security",
+            status="running",
+            metadata={"phase": "security"},
+        )
+    )
+
+    assert claimed is False
+    assert any("pg_advisory_xact_lock" in item[0] for item in queries)
+    assert not any("INSERT INTO pim_email_backfill_items" in item[0] for item in queries)
+    assert queries[-1] == ("close", ())
+
+
 def test_external_image_materializer_creates_missing_rows_without_overwriting_existing():
     uid_a = "20260702-" + "a" * 40
     uid_b = "20260702-" + "b" * 40
