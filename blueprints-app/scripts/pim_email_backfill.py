@@ -191,6 +191,21 @@ def _generated_work_rows(result: dict[str, Any]) -> int:
     )
 
 
+def _aggregate_failed_count(aggregate: dict[str, Any]) -> int:
+    return sum(
+        int(aggregate.get(key) or 0)
+        for key in (
+            "failed_messages",
+            "security_deterministic_failed",
+            "security_llm_failed",
+            "security_failed",
+            "sanitized_views_failed",
+            "external_images_failed",
+            "external_images_shared_asset_link_failed",
+        )
+    )
+
+
 def _shared_asset_link_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "planned_messages": 0,
@@ -425,6 +440,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             aggregate["batches_completed"] += 1
             _add_backfill_batch_to_aggregate(aggregate, result)
             planned = _planned_messages(result)
+            if args.artifact and args.run_id:
+                await store.update_backfill_run_summary(
+                    run_id=str(args.run_id),
+                    processed_count=aggregate["processed_messages"],
+                    failed_count=_aggregate_failed_count(aggregate),
+                    summary=aggregate,
+                    final=False,
+                )
             if shared_link_ledger is not None:
                 await store.update_backfill_auxiliary_batch(
                     run_id=shared_link_ledger["run_id"],
@@ -478,6 +501,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 failed_count=aggregate["external_images_shared_asset_link_failed"],
                 summary=aggregate,
                 aggregate=aggregate,
+                final=True,
+            )
+        if args.artifact and args.run_id:
+            await store.update_backfill_run_summary(
+                run_id=str(args.run_id),
+                processed_count=aggregate["processed_messages"],
+                failed_count=_aggregate_failed_count(aggregate),
+                summary=aggregate,
                 final=True,
             )
         result = {
