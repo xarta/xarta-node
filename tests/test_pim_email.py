@@ -1636,6 +1636,59 @@ def test_downloader_does_not_move_when_external_image_processing_failed(
     assert blocked[0]["metadata"]["move_gate"]["external_image_derivatives_handled"] is False
 
 
+def test_downloader_moves_when_external_image_is_proven_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    DownloadFakeIMAP.instances = []
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
+    monkeypatch.setattr(
+        pim_email,
+        "check_email_security_sync",
+        lambda raw, **kwargs: {
+            **_security_result(),
+            "raw_sha256": pim_email.hashlib.sha256(raw).hexdigest(),
+        },
+    )
+
+    class UnavailableExternalImageStore(CaptureDownloadStore):
+        async def process_external_image_derivatives(self, **kwargs):
+            return {
+                "stored": 0,
+                "blocked": 0,
+                "failed": 0,
+                "unavailable": 1,
+                "pending": 0,
+                "attempted": 1,
+            }
+
+    store = UnavailableExternalImageStore()
+
+    result = pim_email.download_mailbox_sync(
+        _mailbox(),
+        store=store,
+        apply_remote_moves=True,
+        convergence_passes=1,
+        folder_allowlist=["INBOX"],
+        limit_per_folder=1,
+        max_messages=1,
+        security_mode="run",
+    )
+
+    assert result["summary"]["stored_messages"] == 1
+    assert result["summary"]["external_image_derivatives_unavailable"] == 1
+    assert result["summary"]["external_image_derivatives_failed"] == 0
+    assert result["summary"]["moved_messages"] == 1
+    assert result["summary"]["move_blocked"] == 0
+    assert DownloadFakeIMAP.instances[0].moves == [("INBOX", "41", "Downloaded")]
+    stored = [item for item in store.events if item["event_type"] == "message-stored"]
+    assert stored
+    assert stored[0]["status"] == "moved"
+    assert stored[0]["metadata"]["move_gate"]["external_image_derivatives_handled"] is True
+
+
 def test_special_use_descendants_do_not_move_but_inbox_subfolders_can_move():
     target = "Downloaded"
 
