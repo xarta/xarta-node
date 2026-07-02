@@ -57,7 +57,7 @@ CONTENT_PURPOSE = b"xarta-pim-email-content-v1"
 ASSET_PURPOSE = b"xarta-pim-email-asset-v1"
 SANITIZED_VIEW_PURPOSE = b"xarta-pim-email-sanitized-view-v1"
 SANITIZED_VIEW_POLICY_VERSION = "sanitized-view-v1"
-SANITIZED_VIEW_TRANSFORM_VERSION = "email-view-json-v1"
+SANITIZED_VIEW_TRANSFORM_VERSION = "email-sanitized-raw-v1"
 SECURITY_POLICY_VERSION = "pim-email-security-v1"
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
 EXTERNAL_IMAGE_RETRY_DELAY_SECONDS = 15 * 60
@@ -1807,8 +1807,10 @@ class PgEmailStore:
         folder: str = "INBOX",
         mailbox_id: str | None = None,
         limit: int = 25,
+        ensure_schema: bool = True,
     ) -> list[dict[str, Any]]:
-        await self.ensure_schema()
+        if ensure_schema:
+            await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
         clean_folder = clean_folder_name(folder)
         safe_limit = max(1, min(int(limit), 200))
@@ -1839,8 +1841,10 @@ class PgEmailStore:
         email_uid: str,
         *,
         mailbox_id: str | None = None,
+        ensure_schema: bool = True,
     ) -> dict[str, Any]:
-        await self.ensure_schema()
+        if ensure_schema:
+            await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
         clean_uid = clean_email_uid(email_uid)
         conn = await self._connect()
@@ -5979,6 +5983,23 @@ def _local_message_row_public(row: Any) -> dict[str, Any]:
     }
 
 
+def _public_email_uid_info(value: Any) -> dict[str, Any]:
+    info = _json_value(value, {})
+    if not isinstance(info, dict):
+        return {}
+    public = dict(info)
+    for key in (
+        "storage_relpath",
+        "raw_storage_relpath",
+        "content_relpath",
+        "path",
+        "file_path",
+        "filesystem_path",
+    ):
+        public.pop(key, None)
+    return public
+
+
 def _membership_row_public(row: Any) -> dict[str, Any]:
     flags = _json_value(_row_get(row, "flags_json"), [])
     return {
@@ -6222,7 +6243,7 @@ def _local_message_envelope(
         "uid": str(_row_get(first_membership, "imap_uid", "")) if first_membership else "",
         "folder": str(_row_get(first_membership, "folder_name", "")) if first_membership else "",
         "email_uid": clean_uid,
-        "email_uid_info": _json_value(_row_get(row, "uid_info_json"), {}),
+        "email_uid_info": _public_email_uid_info(_row_get(row, "uid_info_json")),
         "raw_sha256": str(raw_sha256),
         "headers": headers,
         "source": "local-corpus",
@@ -6243,10 +6264,7 @@ def _local_message_envelope(
         message.update(
             {
                 "views": sanitized_artifact.get("views") or {},
-                "views_available": {
-                    **(sanitized_artifact.get("views_available") or {}),
-                    "raw": False,
-                },
+                "views_available": sanitized_artifact.get("views_available") or {},
                 "html_security": sanitized_artifact.get("html_security") or {},
                 "attachments": sanitized_artifact.get("attachments") or [],
             }
@@ -6265,23 +6283,23 @@ def build_sanitized_view_artifact(
     clean_uid = clean_email_uid(email_uid)
     input_hash = str(raw_sha256 or hashlib.sha256(bytes(raw or b"")).hexdigest())
     parsed = parse_message(bytes(raw or b""), folder="", uid="")
+    sanitized_raw = safe_raw_email_view(bytes(raw or b""))
+    sanitized_raw_bytes = sanitized_raw.encode("utf-8", "replace")
+    derived = parse_message(sanitized_raw_bytes, folder="", uid="")
     payload = {
-        "schema": "xarta.pim_email.sanitized_view_artifact.v1",
+        "schema": "xarta.pim_email.sanitized_raw_artifact.v1",
         "email_uid": clean_uid,
         "input_raw_sha256": input_hash,
+        "sanitized_raw_sha256": hashlib.sha256(sanitized_raw_bytes).hexdigest(),
         "sanitizer_policy_version": SANITIZED_VIEW_POLICY_VERSION,
         "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
         "headers": parsed.get("headers") or {},
-        "views": {
-            "plain": str((parsed.get("views") or {}).get("plain") or ""),
-            "html": str((parsed.get("views") or {}).get("html") or ""),
-            "markdown": str((parsed.get("views") or {}).get("markdown") or ""),
-        },
+        "sanitized_raw": sanitized_raw,
         "views_available": {
-            "plain": bool((parsed.get("views") or {}).get("plain")),
-            "html": bool((parsed.get("views") or {}).get("html")),
-            "markdown": bool((parsed.get("views") or {}).get("markdown")),
-            "raw": False,
+            "plain": bool((derived.get("views") or {}).get("plain")),
+            "html": bool((derived.get("views") or {}).get("html")),
+            "markdown": bool((derived.get("views") or {}).get("markdown")),
+            "raw": bool(sanitized_raw),
         },
         "html_security": parsed.get("html_security") or {},
         "attachments": parsed.get("attachments") or [],
@@ -6290,6 +6308,9 @@ def build_sanitized_view_artifact(
             "schema": "xarta.pim_email.sanitized_view.derivation.v1",
             "input": "encrypted-raw-eml",
             "input_raw_sha256": input_hash,
+            "durable_body": "sanitized-raw-message",
+            "view_bodies_persisted": False,
+            "view_source": "derived-from-sanitized-raw",
             "raw_original_exposed": False,
         },
     }
@@ -6336,6 +6357,27 @@ def read_sanitized_view_artifact(row: Any) -> dict[str, Any]:
     payload = _json_value(encoded, {})
     if not isinstance(payload, dict):
         raise EmailOperationError("Sanitized email view artifact payload is invalid")
+    sanitized_raw = str(payload.get("sanitized_raw") or "")
+    if not sanitized_raw:
+        raise EmailOperationError("Sanitized email raw artifact payload is missing")
+    sanitized_raw_sha256 = str(payload.get("sanitized_raw_sha256") or "")
+    actual_sanitized_raw_sha256 = hashlib.sha256(
+        sanitized_raw.encode("utf-8", "replace")
+    ).hexdigest()
+    if sanitized_raw_sha256 and sanitized_raw_sha256 != actual_sanitized_raw_sha256:
+        raise EmailOperationError("Sanitized email raw artifact hash verification failed")
+    derived = parse_message(sanitized_raw.encode("utf-8", "replace"), folder="", uid="")
+    views = dict(derived.get("views") or {})
+    views["raw"] = sanitized_raw
+    payload["views"] = views
+    payload["views_available"] = {
+        "plain": bool(views.get("plain")),
+        "html": bool(views.get("html")),
+        "markdown": bool(views.get("markdown")),
+        "raw": bool(sanitized_raw),
+    }
+    payload["html_security"] = derived.get("html_security") or {}
+    payload["attachments"] = derived.get("attachments") or payload.get("attachments") or []
     payload["artifact"] = _sanitized_artifact_row_public(row)
     return payload
 
@@ -7606,6 +7648,7 @@ def parse_message(raw: bytes, *, folder: str = "INBOX", uid: str = "") -> dict[s
             "plain": bool(default_text),
             "html": bool(html_result.html),
             "markdown": bool(markdown_text),
+            "raw": bool(raw),
         },
         "html_security": html_result.public_dict(),
         "attachments": _attachment_summaries(msg),
@@ -7664,7 +7707,7 @@ def _first_text_part(message: Message, subtype: str) -> str:
 
 
 def safe_raw_email_view(raw: bytes) -> str:
-    """Return a raw-message view with attachment and binary payload bodies omitted."""
+    """Return a persisted-safe source view with HTML sanitized and binary bodies omitted."""
     msg = BytesParser(policy=policy.default).parsebytes(bytes(raw or b""))
     lines: list[str] = []
     _append_raw_headers(lines, msg)
@@ -7706,11 +7749,9 @@ def _append_raw_part_payload(lines: list[str], part: Message) -> None:
     if not _raw_view_part_can_show_payload(part):
         lines.append(_raw_view_omitted_part_marker(part))
         return
-    payload = part.get_payload(decode=False)
-    if isinstance(payload, bytes):
-        text = payload.decode(part.get_content_charset() or "utf-8", "replace")
-    else:
-        text = str(payload or "")
+    text = _raw_view_text_payload(part)
+    if part.get_content_type().lower() == "text/html":
+        text = sanitize_email_html_with_report(text).html
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if len(text) > MAX_RAW_VIEW_TEXT_CHARS:
         text = (
@@ -7718,6 +7759,18 @@ def _append_raw_part_payload(lines: list[str], part: Message) -> None:
             + f"\n[xarta raw view truncated text part at {MAX_RAW_VIEW_TEXT_CHARS} characters]"
         )
     lines.extend(text.split("\n"))
+
+
+def _raw_view_text_payload(part: Message) -> str:
+    try:
+        return str(part.get_content())
+    except Exception:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = part.get_payload(decode=False)
+        if isinstance(payload, bytes):
+            return payload.decode(part.get_content_charset() or "utf-8", "replace")
+        return str(payload or "")
 
 
 def _raw_view_part_can_show_payload(part: Message) -> bool:

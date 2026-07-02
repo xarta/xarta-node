@@ -188,6 +188,7 @@ async def email_local_folder_messages(
             mailbox_id=mailbox.mailbox_id,
             folder=folder,
             limit=limit,
+            ensure_schema=False,
         )
         return {
             "ok": True,
@@ -208,7 +209,11 @@ async def email_local_message(
     try:
         store = _store()
         mailbox = await store.get_mailbox(mailbox_id)
-        message = await store.read_local_message(email_uid, mailbox_id=mailbox.mailbox_id)
+        message = await store.read_local_message(
+            email_uid,
+            mailbox_id=mailbox.mailbox_id,
+            ensure_schema=False,
+        )
         return {"ok": True, "mailbox": mailbox.public_dict(), "message": message}
     except Exception as exc:
         raise _http_error(exc) from exc
