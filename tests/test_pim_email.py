@@ -343,7 +343,7 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
                 "raw_sha256": storage["raw_sha256"],
             }
         ),
-        "security_status": "failed_retryable",
+        "security_status": "pending_retryable",
         "error_message": "queued",
         "checked_at": "",
         "raw_sha256": storage["raw_sha256"],
@@ -400,8 +400,76 @@ def test_read_local_message_uses_stored_uid_as_authoritative_identity(tmp_path, 
         "markdown": False,
         "raw": False,
     }
-    assert message["security"]["security_status"] == "failed_retryable"
+    assert message["security"]["security_status"] == "pending_retryable"
     assert message["security"]["blocked_reason"] == "completed_security_result_missing"
+
+
+def test_local_corpus_status_reports_retryable_security_separately():
+    class FakeConnection:
+        async def fetchrow(self, query, *args):
+            assert args == ("test-mailbox",) or args[:1] == ("test-mailbox",)
+            if "raw_originals_stored" in query:
+                return {
+                    "messages": 33,
+                    "folders": 4,
+                    "memberships": 35,
+                    "transformed_assets": 0,
+                    "raw_originals_stored": 33,
+                }
+            if "WITH latest_current" in query:
+                return {
+                    "completed": 2,
+                    "pending": 30,
+                    "pending_retryable": 30,
+                    "failed": 0,
+                    "missing": 1,
+                    "stale_hash": 0,
+                }
+            if "WITH current_sanitized" in query:
+                return {"completed": 2, "pending": 31, "failed": 0}
+            if "WITH captured" in query:
+                return {
+                    "captured": 9,
+                    "stored": 0,
+                    "blocked": 0,
+                    "failed": 0,
+                    "unavailable": 3,
+                    "pending": 6,
+                }
+            if "special_use_downloaded" in query:
+                return {
+                    "special_use_downloaded": 7,
+                    "special_use_unmoved": 7,
+                    "inbox_subfolders_moved": 5,
+                }
+            if "FROM pim_email_download_runs" in query:
+                return None
+            raise AssertionError(query)
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return self.connection
+
+    status = asyncio.run(FakeStore().local_corpus_status(mailbox_id="test-mailbox"))
+
+    assert status["security_results"] == {
+        "completed": 2,
+        "pending": 30,
+        "pending_retryable": 30,
+        "failed": 0,
+        "missing": 1,
+        "stale_hash": 0,
+    }
+    assert status["render_gate"]["blocked_security_incomplete"] == 31
 
 
 def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
@@ -836,15 +904,13 @@ class CaptureDownloadStore:
         self.sanitized[key] = artifact
         return artifact
 
-    async def record_external_image_derivatives_skipped(
+    async def process_external_image_derivatives(
         self,
         *,
         mailbox_id,
         email_uid,
         input_raw_sha256,
         source_urls,
-        reason,
-        safety_decision,
         metadata=None,
     ):
         unique = {
@@ -858,19 +924,19 @@ class CaptureDownloadStore:
                     "email_uid": email_uid,
                     "input_raw_sha256": input_raw_sha256,
                     "source_url": source,
-                    "status": "skipped",
-                    "reason": reason,
-                    "safety_decision": safety_decision,
+                    "status": "stored",
+                    "reason": "",
+                    "safety_decision": "fetched_transformed_encrypted_stored",
                     "metadata": metadata or {},
                 }
             )
         return {
-            "stored": 0,
+            "stored": len(unique),
             "blocked": 0,
             "failed": 0,
-            "skipped": len(unique),
+            "unavailable": 0,
             "pending": 0,
-            "created_skipped": len(unique),
+            "attempted": len(unique),
         }
 
     async def mark_remote_moved(self, **kwargs):
@@ -914,9 +980,8 @@ def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_pr
     assert result["ok"] is True
     assert result["summary"]["stored_messages"] == 6
     assert result["summary"]["moved_messages"] == 2
-    assert result["summary"]["special_use_skipped"] == 0
     assert result["summary"]["sanitized_views_stored"] >= 4
-    assert result["summary"]["external_image_derivatives_skipped"] >= 4
+    assert result["summary"]["external_image_derivatives_stored"] >= 4
     assert {item["imap_uid"] for item in store.saved} == {"8", "9", "41", "42"}
     assert {item["folder_snapshot"]["folder_name"] for item in store.saved} == {
         "INBOX",
@@ -969,9 +1034,9 @@ def test_downloader_does_not_move_before_persisted_completed_security(
     )
 
     assert result["summary"]["stored_messages"] == 1
-    assert result["summary"]["security_stored"] == 1
+    assert result["summary"]["security_incomplete"] == 1
     assert result["summary"]["moved_messages"] == 0
-    assert result["summary"]["move_skipped"] == 1
+    assert result["summary"]["move_blocked"] == 1
     assert DownloadFakeIMAP.instances[0].moves == []
     blocked = [item for item in store.events if item["event_type"] == "remote-move-gate-blocked"]
     assert blocked
@@ -1016,14 +1081,31 @@ def test_safe_downloader_resume_idempotence_keeps_duplicate_identity_singleton(
         store=store,
         apply_remote_moves=False,
         convergence_passes=2,
-        security_mode="queue",
+        security_mode="run",
     )
 
     email_uids = [item["parsed"]["email_uid"] for item in store.saved]
     assert result["summary"]["moved_messages"] == 0
     assert len(store.saved) == 7
     assert len(set(email_uids)) == 4
-    assert result["summary"]["security_queued"] == 7
+    assert result["summary"]["security_completed"] == 7
+
+
+def test_downloader_rejects_security_queue_modes(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    DownloadFakeIMAP.instances = []
+    monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
+
+    with pytest.raises(pim_email.EmailConfigError, match="must run the checker"):
+        pim_email.download_mailbox_sync(
+            _mailbox(),
+            store=CaptureDownloadStore(),
+            folder_allowlist=["INBOX"],
+            limit_per_folder=1,
+            max_messages=1,
+            security_mode="queue",
+        )
 
 
 def test_imap_folder_inbox_and_message_paths_use_configured_mailbox(monkeypatch):
@@ -1232,7 +1314,7 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
                 },
                 "security": {
                     "available": False,
-                    "security_status": "queued",
+                    "security_status": "pending_retryable",
                     "blocked_reason": "completed_security_result_missing",
                 },
             }
@@ -1247,7 +1329,7 @@ def test_local_corpus_routes_read_stored_message_without_live_imap(monkeypatch):
     assert message["message"]["source"] == "local-corpus"
     assert message["message"]["body_blocked"] is True
     assert message["message"]["views"] == {}
-    assert message["message"]["security"]["security_status"] == "queued"
+    assert message["message"]["security"]["security_status"] == "pending_retryable"
 
 
 def test_security_service_calls_local_llm_with_json_contract(monkeypatch):

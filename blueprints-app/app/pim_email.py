@@ -450,6 +450,15 @@ class PgEmailStore:
             )
             await conn.execute(
                 """
+                UPDATE pim_email_security_checks
+                SET security_status = 'pending_retryable',
+                    error_message = ''
+                WHERE security_status = 'failed_retryable'
+                  AND aggregate_status = 'queued';
+                """
+            )
+            await conn.execute(
+                """
                 DROP INDEX IF EXISTS idx_pim_email_security_email_uid_raw;
                 CREATE INDEX IF NOT EXISTS idx_pim_email_security_email_uid_raw
                 ON pim_email_security_checks(email_uid, raw_sha256)
@@ -722,6 +731,16 @@ class PgEmailStore:
             )
             await conn.execute(
                 """
+                UPDATE pim_email_external_image_derivatives
+                SET status = 'pending',
+                    reason = 'legacy_non_downloaded_state_reset_for_real_download',
+                    safety_decision = 'pending_real_download',
+                    updated_at = now()
+                WHERE status = 'skipped';
+                """
+            )
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pim_email_backfill_runs (
                     run_id TEXT PRIMARY KEY,
                     mailbox_id TEXT NOT NULL,
@@ -979,6 +998,7 @@ class PgEmailStore:
                            m.raw_sha256 AS message_raw_sha256,
                            s.raw_sha256 AS security_raw_sha256,
                            s.security_status,
+                           s.aggregate_status,
                            s.error_message,
                            s.result_json,
                            s.checked_at
@@ -1001,6 +1021,13 @@ class PgEmailStore:
                               AND COALESCE(result_json->>'checked_at', '') <> ''
                               AND jsonb_typeof(result_json->'checker_versions') = 'object'
                             THEN 'completed'
+                            WHEN security_status IN ('pending_retryable', 'failed_retryable')
+                            THEN 'pending_retryable'
+                            WHEN COALESCE(result_json->>'queued', 'false') = 'true'
+                              OR COALESCE(result_json->>'placeholder', 'false') = 'true'
+                              OR result_json->>'available' = 'false'
+                              OR aggregate_status = 'queued'
+                            THEN 'pending'
                             WHEN security_status LIKE 'failed%' OR COALESCE(error_message, '') <> ''
                             THEN 'failed'
                             ELSE 'pending'
@@ -1021,7 +1048,8 @@ class PgEmailStore:
                 )
                 SELECT
                     count(*) FILTER (WHERE state = 'completed') AS completed,
-                    count(*) FILTER (WHERE state = 'pending') AS pending,
+                    count(*) FILTER (WHERE state IN ('pending', 'pending_retryable')) AS pending,
+                    count(*) FILTER (WHERE state = 'pending_retryable') AS pending_retryable,
                     count(*) FILTER (WHERE state = 'failed') AS failed,
                     count(*) FILTER (WHERE state = 'missing') AS missing,
                     (SELECT stale_hash FROM stale) AS stale_hash
@@ -1092,7 +1120,7 @@ class PgEmailStore:
                     COALESCE((SELECT row_count FROM rows WHERE status = 'stored'), 0) AS stored,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'blocked'), 0) AS blocked,
                     COALESCE((SELECT row_count FROM rows WHERE status = 'failed'), 0) AS failed,
-                    COALESCE((SELECT row_count FROM rows WHERE status = 'skipped'), 0) AS skipped,
+                    COALESCE((SELECT row_count FROM rows WHERE status = 'unavailable'), 0) AS unavailable,
                     COALESCE((SELECT sum(row_count) FROM rows WHERE status IN ('pending','fetched','transformed')), 0)
                       + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending
                 """,
@@ -1148,6 +1176,7 @@ class PgEmailStore:
             "security_results": {
                 "completed": security_completed,
                 "pending": int(_row_get(security_counts, "pending", 0) or 0),
+                "pending_retryable": int(_row_get(security_counts, "pending_retryable", 0) or 0),
                 "failed": int(_row_get(security_counts, "failed", 0) or 0),
                 "missing": int(_row_get(security_counts, "missing", 0) or 0),
                 "stale_hash": int(_row_get(security_counts, "stale_hash", 0) or 0),
@@ -1164,7 +1193,7 @@ class PgEmailStore:
                 "stored": int(_row_get(external_counts, "stored", 0) or 0),
                 "blocked": int(_row_get(external_counts, "blocked", 0) or 0),
                 "failed": int(_row_get(external_counts, "failed", 0) or 0),
-                "skipped": int(_row_get(external_counts, "skipped", 0) or 0),
+                "unavailable": int(_row_get(external_counts, "unavailable", 0) or 0),
                 "pending": int(_row_get(external_counts, "pending", 0) or 0),
             },
             "special_use_folders": {
@@ -1852,7 +1881,9 @@ class PgEmailStore:
                         ),
                     )
                 else:
-                    security_check_id = _stable_id("email-security-queued", email_uid, raw_sha256)
+                    security_check_id = _stable_id(
+                        "email-security-incomplete", email_uid, raw_sha256
+                    )
                     await conn.execute(
                         """
                         INSERT INTO pim_email_security_checks (
@@ -1860,7 +1891,7 @@ class PgEmailStore:
                             aggregate_status, aggregate_score, llm_called, result_json, checked_at,
                             email_uid, security_status, error_message, metadata_json
                         )
-                        VALUES ($1,$2,$3,$4,$5,$6,'queued',0,false,$7::jsonb,now(),$8,$9,$10,$11::jsonb)
+                        VALUES ($1,$2,$3,$4,$5,$6,'pending',0,false,$7::jsonb,now(),$8,$9,$10,$11::jsonb)
                         ON CONFLICT (mailbox_id, folder, uid, raw_sha256) DO UPDATE SET
                             email_uid = EXCLUDED.email_uid,
                             security_status = CASE
@@ -1890,7 +1921,7 @@ class PgEmailStore:
                         _json_dumps(
                             {
                                 "available": False,
-                                "queued": True,
+                                "incomplete": True,
                                 "raw_sha256": raw_sha256,
                                 "error": security_error,
                             },
@@ -1898,7 +1929,7 @@ class PgEmailStore:
                             separators=(",", ":"),
                         ),
                         email_uid,
-                        "queued" if not security_error else "failed_retryable",
+                        "pending_retryable",
                         security_error[:1000],
                         _json_dumps(
                             {"email_uid": email_uid, "raw_sha256": raw_sha256},
@@ -1983,8 +2014,10 @@ class PgEmailStore:
         mailbox_id: str,
         email_uid: str,
         asset: dict[str, Any],
+        ensure_schema: bool = True,
     ) -> dict[str, Any]:
-        await self.ensure_schema()
+        if ensure_schema:
+            await self.ensure_schema()
         clean_uid = clean_email_uid(email_uid)
         conn = await self._connect()
         try:
@@ -2111,8 +2144,10 @@ class PgEmailStore:
         width: int = 0,
         height: int = 0,
         metadata: dict[str, Any] | None = None,
+        ensure_schema: bool = True,
     ) -> dict[str, Any]:
-        await self.ensure_schema()
+        if ensure_schema:
+            await self.ensure_schema()
         clean_uid = clean_email_uid(email_uid)
         canonical = _canonical_remote_image_url(source_url) or str(source_url or "")
         clean_status = str(status or "").strip().lower()
@@ -2123,7 +2158,7 @@ class PgEmailStore:
             "stored",
             "blocked",
             "failed",
-            "skipped",
+            "unavailable",
         }:
             raise EmailOperationError("Invalid external image derivative status")
         derivative_id = _stable_id(
@@ -2215,15 +2250,13 @@ class PgEmailStore:
             "updated_at": _iso_datetime(_row_get(row, "updated_at")),
         }
 
-    async def record_external_image_derivatives_skipped(
+    async def process_external_image_derivatives(
         self,
         *,
         mailbox_id: str,
         email_uid: str,
         input_raw_sha256: str,
         source_urls: list[str],
-        reason: str,
-        safety_decision: str,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         await self.ensure_schema()
@@ -2240,9 +2273,9 @@ class PgEmailStore:
             "stored": 0,
             "blocked": 0,
             "failed": 0,
-            "skipped": 0,
+            "unavailable": 0,
             "pending": 0,
-            "created_skipped": 0,
+            "attempted": 0,
         }
         if not unique_sources:
             return counts
@@ -2265,69 +2298,117 @@ class PgEmailStore:
             existing = {
                 str(row["canonical_url"]): str(row["status"] or "") for row in existing_rows
             }
-            inserts: list[tuple[Any, ...]] = []
-            for source, canonical in unique_sources:
-                status = existing.get(canonical, "")
-                if status in {"stored", "blocked", "failed", "skipped"}:
-                    counts[status] += 1
-                    continue
-                derivative_id = _stable_id(
-                    "email-image-derivative",
-                    mailbox_id,
-                    clean_uid,
-                    input_raw_sha256,
-                    canonical,
-                )
-                inserts.append(
-                    (
-                        derivative_id,
-                        clean_uid,
-                        mailbox_id,
-                        str(input_raw_sha256 or ""),
-                        source,
-                        canonical,
-                        "skipped",
-                        str(reason or "")[:1000],
-                        str(safety_decision or ""),
-                        EXTERNAL_IMAGE_DERIVATIVE_VERSION,
-                        _json_dumps(
-                            {
-                                **(metadata or {}),
-                                "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
-                                "completion_kind": "durable-skipped-state",
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                    )
-                )
-            if inserts:
-                await conn.executemany(
-                    """
-                    INSERT INTO pim_email_external_image_derivatives (
-                        derivative_id, email_uid, mailbox_id, input_raw_sha256,
-                        source_url, canonical_url, status, reason, safety_decision,
-                        transform_version, metadata_json, updated_at
-                    )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,now())
-                    ON CONFLICT (mailbox_id, email_uid, input_raw_sha256, canonical_url)
-                    DO UPDATE SET
-                        status = EXCLUDED.status,
-                        reason = EXCLUDED.reason,
-                        safety_decision = EXCLUDED.safety_decision,
-                        transform_version = EXCLUDED.transform_version,
-                        metadata_json = EXCLUDED.metadata_json,
-                        updated_at = now()
-                    WHERE pim_email_external_image_derivatives.status
-                      NOT IN ('stored','blocked','failed','skipped')
-                    """,
-                    inserts,
-                )
-                counts["skipped"] += len(inserts)
-                counts["created_skipped"] += len(inserts)
         finally:
             await conn.close()
+
+        for source, canonical in unique_sources:
+            status = existing.get(canonical, "")
+            if status in {"stored", "blocked", "failed", "unavailable"}:
+                counts[status] += 1
+                continue
+            counts["attempted"] += 1
+            try:
+                fetched = await fetch_remote_image_bytes(source)
+                raw_content = bytes(fetched.get("content") or b"")
+                asset = build_transformed_external_image_asset(
+                    mailbox_id=mailbox_id,
+                    email_uid=clean_uid,
+                    source_url=canonical,
+                    content=raw_content,
+                    metadata={
+                        **(metadata or {}),
+                        "source_url": source,
+                        "canonical_url": canonical,
+                        "fetched_content_type": str(fetched.get("content_type") or ""),
+                        "fetched_final_url": str(fetched.get("final_url") or ""),
+                    },
+                )
+                await self.store_transformed_asset(
+                    mailbox_id=mailbox_id,
+                    email_uid=clean_uid,
+                    asset=asset,
+                    ensure_schema=False,
+                )
+                await self.record_external_image_derivative_state(
+                    mailbox_id=mailbox_id,
+                    email_uid=clean_uid,
+                    input_raw_sha256=input_raw_sha256,
+                    source_url=source,
+                    status="stored",
+                    reason="",
+                    safety_decision="fetched_transformed_encrypted_stored",
+                    transform_version=str(asset.get("transform_version") or ""),
+                    raw_image_sha256=str(asset.get("raw_sha256") or ""),
+                    transformed_sha256=str(asset.get("transformed_sha256") or ""),
+                    storage_relpath=str(asset.get("storage_relpath") or ""),
+                    encrypted_size=int(asset.get("encrypted_size") or 0),
+                    content_type=str(asset.get("content_type") or ""),
+                    width=int(asset.get("width") or 0),
+                    height=int(asset.get("height") or 0),
+                    metadata={
+                        **(metadata or {}),
+                        "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                        "completion_kind": "downloaded-transformed-encrypted-stored",
+                        "source_url": source,
+                        "canonical_url": canonical,
+                    },
+                    ensure_schema=False,
+                )
+                counts["stored"] += 1
+            except Exception as exc:
+                state = _external_image_error_status(exc)
+                await self.record_external_image_derivative_state(
+                    mailbox_id=mailbox_id,
+                    email_uid=clean_uid,
+                    input_raw_sha256=input_raw_sha256,
+                    source_url=source,
+                    status=state,
+                    reason=str(exc),
+                    safety_decision=f"{state}_during_external_image_download_or_transform",
+                    transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                    metadata={
+                        **(metadata or {}),
+                        "schema": "xarta.pim_email.external_image_derivative.metadata.v1",
+                        "completion_kind": state,
+                        "source_url": source,
+                        "canonical_url": canonical,
+                        "error_class": exc.__class__.__name__,
+                    },
+                    ensure_schema=False,
+                )
+                counts[state] += 1
         return counts
+
+    async def reset_legacy_non_downloaded_external_image_derivatives(
+        self,
+        *,
+        mailbox_id: str | None = None,
+    ) -> int:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        conn = await self._connect()
+        try:
+            return int(
+                await conn.fetchval(
+                    """
+                    WITH updated AS (
+                        UPDATE pim_email_external_image_derivatives
+                        SET status = 'pending',
+                            reason = 'legacy_non_downloaded_state_reset_for_real_download',
+                            safety_decision = 'pending_real_download',
+                            updated_at = now()
+                        WHERE mailbox_id = $1
+                          AND status = 'skipped'
+                        RETURNING 1
+                    )
+                    SELECT count(*) FROM updated
+                    """,
+                    configured_mailbox_id,
+                )
+                or 0
+            )
+        finally:
+            await conn.close()
 
     async def current_sanitized_view_artifact(
         self,
@@ -2517,7 +2598,7 @@ class PgEmailStore:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         clean_status = str(status or "").strip().lower()
-        if clean_status not in {"running", "completed", "skipped", "failed"}:
+        if clean_status not in {"running", "completed", "failed"}:
             raise EmailOperationError("Invalid backfill item status")
         clean_artifact = str(artifact_type or "").strip().lower()
         if not clean_artifact:
@@ -2529,7 +2610,7 @@ class PgEmailStore:
             raw_sha256,
             clean_artifact,
         )
-        finished = clean_status in {"completed", "skipped", "failed"}
+        finished = clean_status in {"completed", "failed"}
         conn = await self._connect()
         try:
             await conn.execute(
@@ -2712,7 +2793,7 @@ class PgEmailStore:
             "external_images_stored": 0,
             "external_images_blocked": 0,
             "external_images_failed": 0,
-            "external_images_skipped": 0,
+            "external_images_unavailable": 0,
             "external_images_pending": 0,
             "external_images_captured": 0,
             "failed_messages": 0,
@@ -2865,19 +2946,17 @@ class PgEmailStore:
                 try:
                     sources = remote_image_sources_from_raw(raw)
                     summary["external_images_captured"] += len(sources)
-                    counts = await self.record_external_image_derivatives_skipped(
+                    counts = await self.process_external_image_derivatives(
                         mailbox_id=configured_mailbox_id,
                         email_uid=email_uid,
                         input_raw_sha256=expected_hash,
                         source_urls=sources,
-                        reason="external_image_fetch_disabled_by_local_backfill_policy",
-                        safety_decision="skipped_not_fetched",
                         metadata={"run_id": actual_run_id, "batch_id": batch_id},
                     )
                     summary["external_images_stored"] += counts["stored"]
                     summary["external_images_blocked"] += counts["blocked"]
                     summary["external_images_failed"] += counts["failed"]
-                    summary["external_images_skipped"] += counts["skipped"]
+                    summary["external_images_unavailable"] += counts["unavailable"]
                     summary["external_images_pending"] += counts["pending"]
                     await self._record_backfill_item(
                         run_id=actual_run_id,
@@ -2886,7 +2965,7 @@ class PgEmailStore:
                         email_uid=email_uid,
                         raw_sha256=expected_hash,
                         artifact_type="external_images",
-                        status="completed" if sources else "skipped",
+                        status="completed",
                         metadata={"phase": "external-images", "captured": len(sources)},
                     )
                 except Exception as exc:
@@ -3949,23 +4028,21 @@ def _download_security_for_message(
     *,
     security_mode: str,
 ) -> tuple[dict[str, Any] | None, str]:
-    clean_mode = str(security_mode or "run-or-queue").strip().lower()
-    if clean_mode in {"queue", "queued", "defer"}:
-        return None, "queued by download policy"
+    clean_mode = str(security_mode or "run").strip().lower()
+    if clean_mode not in {"run", "require", "required", "sync"}:
+        raise EmailConfigError(
+            "Email downloader security_mode must run the checker; queue/defer modes are disabled."
+        )
     try:
         security = check_email_security_sync(
             raw,
             body_text=str((parsed.get("views") or {}).get("plain") or ""),
         )
+        if not security or not security.get("available"):
+            raise EmailOperationError("Email security checker did not produce a completed result")
         return security, ""
     except EmailSecurityUnavailableError as exc:
-        if clean_mode == "run":
-            raise EmailConfigError("Email security checks are unavailable") from exc
-        return None, str(exc)
-    except Exception as exc:
-        if clean_mode == "run":
-            raise
-        return None, str(exc)
+        raise EmailConfigError("Email security checks are unavailable") from exc
 
 
 def download_mailbox_sync(
@@ -3982,6 +4059,15 @@ def download_mailbox_sync(
     security_mode: str = "run",
 ) -> dict[str, Any]:
     store = store or PgEmailStore()
+    clean_security_mode = str(security_mode or "run").strip().lower()
+    if clean_security_mode not in {"run", "require", "required", "sync"}:
+        raise EmailConfigError(
+            "Email downloader security_mode must run the checker; queue/defer modes are disabled."
+        )
+    if not include_special_use:
+        raise EmailConfigError(
+            "Special-use folders must be downloaded; include_special_use cannot be false"
+        )
     target_folder = clean_folder_name(
         downloaded_folder
         or os.environ.get("BLUEPRINTS_EMAIL_DOWNLOADED_FOLDER", DEFAULT_DOWNLOADED_FOLDER)
@@ -4000,17 +4086,22 @@ def download_mailbox_sync(
         "convergence_passes": max(1, int(convergence_passes or 1)),
         "folders_seen": 0,
         "folders_downloaded": 0,
-        "target_folder_skipped": 0,
-        "special_use_skipped": 0,
+        "target_folder_ignored": 0,
         "planned_messages": 0,
         "processed_messages": 0,
         "stored_messages": 0,
-        "security_stored": 0,
-        "security_queued": 0,
+        "security_completed": 0,
+        "security_incomplete": 0,
         "sanitized_views_stored": 0,
-        "external_image_derivatives_skipped": 0,
+        "external_image_derivatives_stored": 0,
+        "external_image_derivatives_blocked": 0,
+        "external_image_derivatives_unavailable": 0,
+        "external_image_derivatives_failed": 0,
+        "external_image_derivatives_pending": 0,
         "moved_messages": 0,
-        "move_skipped": 0,
+        "move_not_allowed": 0,
+        "move_blocked": 0,
+        "move_refused": 0,
         "failed_messages": 0,
         "remote_image_sources_seen": 0,
     }
@@ -4022,7 +4113,7 @@ def download_mailbox_sync(
             downloaded_folder=target_folder,
             metadata={
                 "schema": "xarta.pim_email.download_run.metadata.v1",
-                "security_mode": security_mode,
+                "security_mode": clean_security_mode,
                 "include_special_use": include_special_use,
                 "folder_allowlist": sorted(allowed_folders),
                 "limit_per_folder": limit_per_folder,
@@ -4065,31 +4156,16 @@ def download_mailbox_sync(
                     )
                 )
                 if _folder_is_download_target(folder_name, target_folder):
-                    summary["target_folder_skipped"] += 1
+                    summary["target_folder_ignored"] += 1
                     _run_store(
                         store.record_download_event(
                             run_id=run_id,
-                            event_type="folder-skip-target",
-                            status="skipped",
+                            event_type="folder-target-ignored",
+                            status="ignored",
                             mailbox_id=mailbox.mailbox_id,
                             folder_uid=str(folder_snapshot.get("folder_uid") or ""),
                             folder_name=folder_name,
                             metadata={"pass": pass_no, "target_folder": target_folder},
-                        )
-                    )
-                    continue
-                special_role = str(folder_snapshot.get("special_use_role") or "")
-                if special_role in SPECIAL_USE_MOVE_SKIP_ROLES and not include_special_use:
-                    summary["special_use_skipped"] += 1
-                    _run_store(
-                        store.record_download_event(
-                            run_id=run_id,
-                            event_type="folder-skip-special-use",
-                            status="skipped",
-                            mailbox_id=mailbox.mailbox_id,
-                            folder_uid=str(folder_snapshot.get("folder_uid") or ""),
-                            folder_name=folder_name,
-                            metadata={"pass": pass_no, "special_use_role": special_role},
                         )
                     )
                     continue
@@ -4130,7 +4206,7 @@ def download_mailbox_sync(
                         },
                     )
                 )
-                batch_processed = batch_skipped = batch_moved = batch_failed = 0
+                batch_processed = batch_moved = batch_failed = 0
                 for uid in uids:
                     try:
                         _run_store(
@@ -4159,7 +4235,7 @@ def download_mailbox_sync(
                         security, security_error = _download_security_for_message(
                             raw,
                             parsed,
-                            security_mode=security_mode,
+                            security_mode=clean_security_mode,
                         )
                         remote_sources = remote_image_sources_from_raw(raw)
                         summary["remote_image_sources_seen"] += len(remote_sources)
@@ -4211,20 +4287,26 @@ def download_mailbox_sync(
                         summary["stored_messages"] += 1
                         security_complete = False
                         if security and security.get("available"):
-                            summary["security_stored"] += 1
-                            if hasattr(store, "completed_security_result"):
-                                security_complete = bool(
-                                    _run_store(
-                                        store.completed_security_result(
-                                            email_uid=email_uid,
-                                            raw_sha256=raw_sha256,
-                                        )
+                            if not hasattr(store, "completed_security_result"):
+                                raise EmailOperationError(
+                                    "Store cannot verify completed security result after download"
+                                )
+                            security_complete = bool(
+                                _run_store(
+                                    store.completed_security_result(
+                                        email_uid=email_uid,
+                                        raw_sha256=raw_sha256,
                                     )
                                 )
+                            )
+                            if security_complete:
+                                summary["security_completed"] += 1
                             else:
-                                security_complete = True
+                                summary["security_incomplete"] += 1
                         else:
-                            summary["security_queued"] += 1
+                            raise EmailOperationError(
+                                "Email security checker did not produce a completed result"
+                            )
                         sanitized_complete = False
                         if hasattr(store, "current_sanitized_view_artifact") and hasattr(
                             store, "store_sanitized_view_artifact"
@@ -4251,24 +4333,38 @@ def download_mailbox_sync(
                                 summary["sanitized_views_stored"] += 1
                                 sanitized_complete = True
                         external_derivatives_complete = len(remote_sources) == 0
-                        if hasattr(store, "record_external_image_derivatives_skipped"):
+                        if remote_sources:
+                            if not hasattr(store, "process_external_image_derivatives"):
+                                raise EmailOperationError(
+                                    "Store cannot process external image derivatives"
+                                )
                             external_counts = _run_store(
-                                store.record_external_image_derivatives_skipped(
+                                store.process_external_image_derivatives(
                                     mailbox_id=mailbox.mailbox_id,
                                     email_uid=email_uid,
                                     input_raw_sha256=raw_sha256,
                                     source_urls=remote_sources,
-                                    reason=("external_image_fetch_disabled_by_download_policy"),
-                                    safety_decision="skipped_not_fetched",
                                     metadata={"run_id": run_id, "batch_id": batch_id},
                                 )
                             )
-                            summary["external_image_derivatives_skipped"] += int(
-                                (external_counts or {}).get("skipped") or 0
+                            summary["external_image_derivatives_stored"] += int(
+                                (external_counts or {}).get("stored") or 0
+                            )
+                            summary["external_image_derivatives_blocked"] += int(
+                                (external_counts or {}).get("blocked") or 0
+                            )
+                            summary["external_image_derivatives_unavailable"] += int(
+                                (external_counts or {}).get("unavailable") or 0
+                            )
+                            summary["external_image_derivatives_failed"] += int(
+                                (external_counts or {}).get("failed") or 0
+                            )
+                            summary["external_image_derivatives_pending"] += int(
+                                (external_counts or {}).get("pending") or 0
                             )
                             handled_external = sum(
                                 int((external_counts or {}).get(key) or 0)
-                                for key in ("stored", "blocked", "failed", "skipped")
+                                for key in ("stored", "blocked", "failed", "unavailable")
                             )
                             unique_remote_sources = len(
                                 {
@@ -4304,7 +4400,7 @@ def download_mailbox_sync(
                                 summary["moved_messages"] += 1
                                 batch_moved += 1
                             else:
-                                summary["move_skipped"] += 1
+                                summary["move_refused"] += 1
                                 _run_store(
                                     store.record_download_event(
                                         run_id=run_id,
@@ -4322,7 +4418,7 @@ def download_mailbox_sync(
                                     )
                                 )
                         elif move_allowed:
-                            summary["move_skipped"] += 1
+                            summary["move_blocked"] += 1
                             _run_store(
                                 store.record_download_event(
                                     run_id=run_id,
@@ -4346,7 +4442,7 @@ def download_mailbox_sync(
                                 )
                             )
                         else:
-                            summary["move_skipped"] += 1
+                            summary["move_not_allowed"] += 1
                         summary["processed_messages"] += 1
                         batch_processed += 1
                         _run_store(
@@ -4365,7 +4461,9 @@ def download_mailbox_sync(
                                 metadata={
                                     "raw_sha256": storage.get("raw_sha256"),
                                     "encrypted_size": storage.get("encrypted_size"),
-                                    "security_status": "stored" if security_complete else "queued",
+                                    "security_status": "completed"
+                                    if security_complete
+                                    else "incomplete",
                                     "move_allowed": move_allowed,
                                     "move_ready": move_ready,
                                     "move_gate": move_gate,
@@ -4399,7 +4497,7 @@ def download_mailbox_sync(
                     store.record_download_batch_finish(
                         batch_id=batch_id,
                         processed_count=batch_processed,
-                        skipped_count=batch_skipped,
+                        skipped_count=0,
                         moved_count=batch_moved,
                         failed_count=batch_failed,
                         metadata={"pass": pass_no},
@@ -4866,43 +4964,75 @@ def transform_image_to_jpeg(content: bytes) -> bytes:
 
 
 def fetch_remote_image_as_jpeg_sync(source: str) -> bytes:
+    fetched = fetch_remote_image_bytes_sync(source)
+    return transform_image_to_jpeg(bytes(fetched["content"]))
+
+
+def fetch_remote_image_bytes_sync(source: str) -> dict[str, Any]:
     current = _assert_public_remote_image_url(source)
     headers = {
         "Accept": "image/avif,image/webp,image/png,image/jpeg,image/gif,image/*;q=0.8",
         "User-Agent": "BlueprintsEmailImageProxy/1.0",
     }
-    with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(8.0, connect=4.0)) as client:
-        for _ in range(4):
-            current = _assert_public_remote_image_url(current)
-            with client.stream("GET", current, headers=headers) as response:
-                if response.status_code in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("location", "").strip()
-                    if not location:
-                        raise EmailOperationError("image redirect was missing a location")
-                    current = urljoin(current, location)
-                    continue
-                if response.status_code >= 400:
-                    raise EmailOperationError(
-                        f"image fetch failed with HTTP {response.status_code}"
+    try:
+        with httpx.Client(
+            follow_redirects=False, timeout=httpx.Timeout(8.0, connect=4.0)
+        ) as client:
+            for _ in range(4):
+                current = _assert_public_remote_image_url(current)
+                with client.stream("GET", current, headers=headers) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location", "").strip()
+                        if not location:
+                            raise EmailOperationError("image redirect was missing a location")
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code >= 400:
+                        raise EmailOperationError(f"image unavailable: HTTP {response.status_code}")
+                    content_type = (
+                        response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                     )
-                content_type = (
-                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                )
-                if content_type and not content_type.startswith("image/"):
-                    raise EmailOperationError("image fetch did not return an image")
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > MAX_REMOTE_IMAGE_BYTES:
-                        raise EmailOperationError("image payload is too large")
-                    chunks.append(chunk)
-                return transform_image_to_jpeg(b"".join(chunks))
-        raise EmailOperationError("image redirect chain is too long")
+                    if content_type and not content_type.startswith("image/"):
+                        raise EmailOperationError("image fetch did not return an image")
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > MAX_REMOTE_IMAGE_BYTES:
+                            raise EmailOperationError("image payload is too large")
+                        chunks.append(chunk)
+                    return {
+                        "content": b"".join(chunks),
+                        "content_type": content_type or "image/*",
+                        "final_url": current,
+                    }
+            raise EmailOperationError("image redirect chain is too long")
+    except httpx.RequestError as exc:
+        raise EmailOperationError(f"image unavailable: {exc.__class__.__name__}") from exc
+
+
+def _external_image_error_status(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if "private or unsafe" in text or "not an allowed http" in text:
+        return "blocked"
+    if (
+        "unavailable" in text
+        or "could not be resolved" in text
+        or "http 404" in text
+        or "http 410" in text
+        or "timeout" in text
+        or "connect" in text
+    ):
+        return "unavailable"
+    return "failed"
 
 
 async def fetch_remote_image_as_jpeg(source: str) -> bytes:
     return await asyncio.to_thread(fetch_remote_image_as_jpeg_sync, source)
+
+
+async def fetch_remote_image_bytes(source: str) -> dict[str, Any]:
+    return await asyncio.to_thread(fetch_remote_image_bytes_sync, source)
 
 
 class _SafeHtmlParser(HTMLParser):
