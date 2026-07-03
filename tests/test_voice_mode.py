@@ -496,6 +496,117 @@ def test_active_browser_automation_preserves_personal_search_graph_surfaces():
     assert report["surfaces"]["personal_graph"]["first_link"] == "git_commit:abc123"
 
 
+def test_active_browser_automation_compacts_menu_lists_and_preserves_matrix_metrics():
+    report = voice_mode._clean_active_browser_automation_report(
+        {
+            "menus": [
+                {
+                    "group": "settings",
+                    "pages": [
+                        {"id": f"page-{index}", "label": f"Page {index}"} for index in range(30)
+                    ],
+                    "function_items": [
+                        {"id": f"fn-{index}", "fn": f"settings.fn{index}"} for index in range(30)
+                    ],
+                }
+            ],
+            "current_menu": {
+                "group": "settings",
+                "active_id": "matrix-chat",
+                "pages": [{"id": "matrix-chat", "label": "Chat"}],
+                "current_functions": [{"id": "chat-fn-refresh", "fn": "chat.refresh"}],
+            },
+            "surfaces": {
+                "matrix_chat": {
+                    "server_id": "tb1",
+                    "loading": False,
+                    "active_room_id": "!room:matrix.example.test",
+                    "known_message_count": 60,
+                    "last_refresh": {
+                        "server_id": "tb1",
+                        "total_ms": 1200,
+                        "status_ms": 40,
+                        "rooms_ms": 80,
+                        "messages_ms": 900,
+                        "ok": True,
+                    },
+                    "last_message_load": {
+                        "server_id": "tb1",
+                        "room_id": "!room:matrix.example.test",
+                        "total_ms": 900,
+                        "visible_message_count": 60,
+                        "ok": True,
+                    },
+                    "inline_images": {
+                        "scheduled": 24,
+                        "requested": 3,
+                        "loaded": 3,
+                        "dom_total": 24,
+                    },
+                }
+            },
+        }
+    )
+
+    assert report["menus"][0]["page_count"] == 30
+    assert report["menus"][0]["function_count"] == 30
+    assert report["menus"][0]["pages"] == []
+    assert report["menus"][0]["function_items"] == []
+    assert report["current_menu"]["pages"][0]["id"] == "matrix-chat"
+    assert report["current_menu"]["current_functions"][0]["fn"] == "chat.refresh"
+    matrix_chat = report["surfaces"]["matrix_chat"]
+    assert matrix_chat["server_id"] == "tb1"
+    assert matrix_chat["last_refresh"]["messages_ms"] == 900
+    assert matrix_chat["last_message_load"]["visible_message_count"] == 60
+    assert matrix_chat["inline_images"]["requested"] == 3
+
+
+def test_active_browser_view_compacts_history_clients_and_reports():
+    heavy_automation = {
+        "menus": [
+            {
+                "group": "settings",
+                "pages": [{"id": f"page-{index}", "label": f"Page {index}"} for index in range(80)],
+                "function_items": [
+                    {"id": f"fn-{index}", "fn": f"settings.fn{index}"} for index in range(80)
+                ],
+            }
+        ]
+    }
+    state = {
+        "active": {"browser_id": "browser-a", "tab_id": "tab-a"},
+        "browser_views": {
+            "browser-a::tab-a": {
+                "browser_id": "browser-a",
+                "browser_label": "Active",
+                "tab_id": "tab-a",
+                "reported_at": 100,
+                "page": {"group": "settings", "tab": "matrix-chat", "ready": True},
+                "frontend": {"asset_version": "dev-test"},
+                "automation": heavy_automation,
+            },
+            "browser-b::tab-b": {
+                "browser_id": "browser-b",
+                "browser_label": "Other",
+                "tab_id": "tab-b",
+                "reported_at": 90,
+                "page": {"group": "kanban", "tab": "kanban", "ready": True},
+                "frontend": {"asset_version": "old"},
+                "automation": heavy_automation,
+            },
+        },
+    }
+
+    public = voice_mode._public_active_browser_view(state)
+
+    assert public["view"]["automation"]["menus"][0]["pages"] == []
+    assert "automation" not in public["clients"][0]
+    assert "automation" not in public["reports"][0]
+    assert public["clients"][0]["browser_id"] == "browser-a"
+    assert public["reports"][0]["page"]["tab"] == "matrix-chat"
+    assert len(json.dumps(public).encode("utf-8")) < 50000
+
+
 def test_active_browser_command_rejects_unsupported_actions():
     response = asyncio.run(
         voice_mode.active_browser_command(
@@ -863,8 +974,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
     assert view["viewport_class"] == "landscape_1080p_like"
     assert view["viewport_flags"]["standard_landscape"] is True
     assert view["automation"]["current_group"] == "settings"
-    assert view["automation"]["menus"][0]["pages"][0]["id"] == "matrix-chat"
-    assert view["automation"]["menus"][0]["function_items"][0]["fn"] == "chat.vadDev"
+    assert view["automation"]["menus"][0]["page_count"] == 1
+    assert view["automation"]["menus"][0]["function_count"] == 1
+    assert view["automation"]["menus"][0]["pages"] == []
+    assert view["automation"]["menus"][0]["function_items"] == []
     assert view["automation"]["selector_actions"][0]["action"] == "settings"
     assert view["automation"]["surfaces"]["calendar"] == {
         "loaded": True,
@@ -944,13 +1057,15 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "rollup_total": 1,
         "issue_count": 1,
         "todo_count": 1,
-        "backups_loaded": True,
-        "backup_count": 2,
-        "backups_loading": False,
-        "backups_error": "",
-        "backup_busy_action": "validate",
-        "backup_importing_filename": "",
-        "backup_last_result": "Backup package is valid.",
+        "postgres_loaded": False,
+        "postgres_export_count": 0,
+        "postgres_loading": False,
+        "postgres_error": "",
+        "postgres_busy_action": "",
+        "postgres_importing_filename": "",
+        "postgres_last_result": "",
+        "postgres_role": "",
+        "postgres_row_count": 0,
         "automation_status_loaded": False,
         "automation_status_loading": False,
         "automation_status_error": "",
@@ -1015,6 +1130,42 @@ def test_active_browser_view_exposes_automation_defaults():
     assert public["automation"]["default_step_timeout_seconds"] == 10
     assert public["automation"]["minimum_step_timeout_seconds"] == 1
     assert public["automation"]["maximum_step_timeout_seconds"] == 120
+
+
+def test_active_browser_view_offloads_payload_build_and_reports_metrics(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    state_path.write_text(
+        json.dumps(
+            {
+                "active": {"browser_id": "browser-a", "tab_id": "tab-1"},
+                "browser_views": {
+                    "browser-a::tab-1": {
+                        "browser_id": "browser-a",
+                        "tab_id": "tab-1",
+                        "reported_at": 100,
+                        "page": {"group": "settings", "tab": "matrix-chat", "ready": True},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(voice_mode.asyncio, "to_thread", fake_to_thread)
+
+    public = asyncio.run(voice_mode.active_browser_view(metrics=True))
+
+    assert calls[0][0] == "_active_browser_view_locked_sync"
+    assert public["view"]["page"]["tab"] == "matrix-chat"
+    assert public["server_metrics"]["schema"] == "xarta.active_browser_view.metrics.v1"
+    assert public["server_metrics"]["state_read_and_payload_seconds"] >= 0
 
 
 def test_browser_view_post_returns_small_ack_and_coalesces_disk_persistence(tmp_path, monkeypatch):

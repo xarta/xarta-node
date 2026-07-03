@@ -1,7 +1,9 @@
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
@@ -88,7 +90,11 @@ def test_queue_overflow_continues_batched_row_drain(monkeypatch):
             }
         ],
     )
-    monkeypatch.setattr(drain, "mark_sent", lambda queue_ids: marked_sent.append(queue_ids))
+    monkeypatch.setattr(
+        drain,
+        "try_mark_sent",
+        lambda queue_ids: not marked_sent.append(queue_ids),
+    )
     monkeypatch.setattr(drain, "_make_sync_client", lambda timeout: _FakeClient(action_posts))
 
     asyncio.run(drain._drain_peer("peer-1", ["http://peer-1"]))
@@ -123,7 +129,11 @@ def test_action_commit_guard_rejection_keeps_actions_queued(monkeypatch):
             }
         ],
     )
-    monkeypatch.setattr(drain, "mark_sent", lambda queue_ids: marked_sent.append(queue_ids))
+    monkeypatch.setattr(
+        drain,
+        "try_mark_sent",
+        lambda queue_ids: not marked_sent.append(queue_ids),
+    )
     monkeypatch.setattr(
         drain,
         "_make_sync_client",
@@ -134,3 +144,87 @@ def test_action_commit_guard_rejection_keeps_actions_queued(monkeypatch):
 
     assert len(action_posts) == 1
     assert marked_sent == []
+
+
+def test_successful_post_with_busy_sqlite_defers_mark_sent_without_retrying_urls(monkeypatch):
+    action_posts = []
+
+    monkeypatch.setattr(drain.cfg, "NODE_ID", "test-node")
+    monkeypatch.setattr(drain.cfg, "COMMIT_TS", 123)
+    monkeypatch.setattr(drain.cfg, "SYNC_SECRET", "")
+    monkeypatch.setattr(drain.cfg, "SYNC_QUEUE_MAX_DEPTH", 1000)
+    monkeypatch.setattr(drain.cfg, "SYNC_BATCH_SIZE", 1)
+    monkeypatch.setattr(drain, "get_queue_depth", lambda node_id: 1)
+    monkeypatch.setattr(
+        drain,
+        "get_pending_actions",
+        lambda node_id, limit: [
+            {
+                "queue_id": 10,
+                "action_type": "upsert",
+                "table_name": "personal_git_commits",
+                "row_id": "commit-1",
+                "row_data": "{}",
+                "gen": 1,
+                "guid": "guid-1",
+            }
+        ],
+    )
+    monkeypatch.setattr(drain, "try_mark_sent", lambda queue_ids: False)
+    monkeypatch.setattr(drain, "_make_sync_client", lambda timeout: _FakeClient(action_posts))
+
+    asyncio.run(drain._drain_peer("peer-1", ["http://peer-1", "http://peer-1-tail"]))
+
+    assert len(action_posts) == 1
+    assert action_posts[0][0] == "http://peer-1/api/v1/sync/actions"
+
+
+def test_self_target_cleanup_defers_busy_sqlite_without_raising(monkeypatch, tmp_path):
+    db_path = tmp_path / "drain-housekeeping.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE sync_queue (
+                queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_node_id TEXT NOT NULL,
+                sent INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO sync_queue (target_node_id, sent) VALUES (?, 0)",
+            ("test-node",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(drain.cfg, "DB_PATH", str(db_path))
+    monkeypatch.setattr(drain.cfg, "NODE_ID", "test-node")
+
+    locker = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+
+        drain._discard_self_target_actions()
+        assert time.monotonic() - started < 0.5
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT sent FROM sync_queue WHERE queue_id=1").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    drain._discard_self_target_actions()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT sent FROM sync_queue WHERE queue_id=1").fetchone()[0] == 1
+    finally:
+        conn.close()

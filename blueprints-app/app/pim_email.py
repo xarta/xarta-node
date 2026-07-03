@@ -422,6 +422,12 @@ def read_encrypted_bytes(
     return decrypt_bytes_envelope(encoded, purpose=purpose)
 
 
+def _verify_encrypted_asset_sha256(relpath: str, expected_sha256: str) -> None:
+    stored = read_encrypted_bytes(relpath, purpose=ASSET_PURPOSE)
+    if hashlib.sha256(stored).hexdigest() != str(expected_sha256 or ""):
+        raise EmailOperationError("Shared external image asset hash verification failed")
+
+
 class PgEmailStore:
     _schema_ready_dsns: ClassVar[set[str]] = set()
     _schema_ready_lock: ClassVar[threading.Lock] = threading.Lock()
@@ -3044,9 +3050,11 @@ class PgEmailStore:
         storage_relpath = str(asset.get("storage_relpath") or "")
         transformed_sha256 = str(asset.get("transformed_sha256") or "")
         if storage_relpath and transformed_sha256:
-            stored = read_encrypted_bytes(storage_relpath, purpose=ASSET_PURPOSE)
-            if hashlib.sha256(stored).hexdigest() != transformed_sha256:
-                raise EmailOperationError("Shared external image asset hash verification failed")
+            await asyncio.to_thread(
+                _verify_encrypted_asset_sha256,
+                storage_relpath,
+                transformed_sha256,
+            )
         canonical = _canonical_remote_image_url(str(asset.get("source_url") or "")) or str(
             asset.get("source_url") or ""
         )
@@ -3331,9 +3339,11 @@ class PgEmailStore:
                 "metadata": _json_loads_obj(_row_get(row, "metadata_json", {})),
             }
             try:
-                stored = read_encrypted_bytes(shared["storage_relpath"], purpose=ASSET_PURPOSE)
-                if hashlib.sha256(stored).hexdigest() != shared["transformed_sha256"]:
-                    raise EmailOperationError("Shared external image asset hash mismatch")
+                await asyncio.to_thread(
+                    _verify_encrypted_asset_sha256,
+                    shared["storage_relpath"],
+                    shared["transformed_sha256"],
+                )
                 reference = _asset_reference_for_email(
                     mailbox_id=configured_mailbox_id,
                     email_uid=str(_row_get(row, "email_uid", "")),
@@ -3855,7 +3865,8 @@ class PgEmailStore:
         )
         canonical = assignment["canonical_url"] or assignment["source_url"]
         source = assignment["source_url"] or canonical
-        asset = build_transformed_external_image_asset_from_worker_payload(
+        asset = await asyncio.to_thread(
+            build_transformed_external_image_asset_from_worker_payload,
             mailbox_id=configured_mailbox_id,
             email_uid=assignment["email_uid"],
             source_url=canonical,

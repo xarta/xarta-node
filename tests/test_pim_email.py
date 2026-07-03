@@ -2576,6 +2576,23 @@ def test_message_external_image_path_feeds_assignment_flow_without_direct_downlo
     assert "pending_real_download" in source
 
 
+def test_external_image_worker_asset_file_work_is_off_event_loop():
+    complete_source = inspect.getsource(
+        pim_email.PgEmailStore.complete_external_image_url_assignment_with_transformed_payload
+    )
+    store_shared_source = inspect.getsource(pim_email.PgEmailStore.store_shared_asset)
+    link_source = inspect.getsource(
+        pim_email.PgEmailStore.link_external_image_references_from_shared_assets
+    )
+
+    assert "await asyncio.to_thread(" in complete_source
+    assert "build_transformed_external_image_asset_from_worker_payload" in complete_source
+    assert "await asyncio.to_thread(" in store_shared_source
+    assert "_verify_encrypted_asset_sha256" in store_shared_source
+    assert "await asyncio.to_thread(" in link_source
+    assert "_verify_encrypted_asset_sha256" in link_source
+
+
 def test_external_image_url_assignment_block_claim_uses_unique_resumable_assignments():
     canonical = "https://cdn.example.test/assignment.png"
     digest = pim_email._external_image_canonical_digest(canonical)
@@ -3773,6 +3790,11 @@ def test_email_image_proxy_signature_is_required(monkeypatch):
 def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch):
     monkeypatch.setenv("BLUEPRINTS_PIM_EMAIL_WORKER_SECRET", "worker-secret-123456")
     digest = pim_email._external_image_canonical_digest("https://cdn.example.test/api.png")
+    to_thread_calls = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
 
     class FakeStore:
         async def claim_external_image_url_assignment_block(self, **kwargs):
@@ -3822,6 +3844,7 @@ def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch)
             }
 
     monkeypatch.setattr(routes_pim_email, "_store", lambda: FakeStore())
+    monkeypatch.setattr(routes_pim_email.asyncio, "to_thread", fake_to_thread)
 
     with pytest.raises(routes_pim_email.HTTPException) as exc_info:
         asyncio.run(
@@ -3879,6 +3902,7 @@ def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch)
     assert "assignment_token" not in complete["result"]["assignment"]
     assert "storage_relpath" not in complete["result"]["shared_asset"]
     assert "encryption" not in complete["result"]["shared_asset"]
+    assert "_decode_transformed_image_base64" in to_thread_calls
 
     with pytest.raises(routes_pim_email.HTTPException) as bad_base64:
         asyncio.run(

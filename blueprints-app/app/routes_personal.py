@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -59,6 +60,13 @@ from .sync.queue import enqueue_for_all_peers
 router = APIRouter(prefix="/personal", tags=["personal"])
 log = logging.getLogger(__name__)
 
+
+async def _run_personal_sync_work(func: Any, *args: Any, **kwargs: Any) -> Any:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return func(*args, **kwargs)
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
 KANBAN_ROOT = Path(os.environ.get("BLUEPRINTS_KANBAN_DIR", "/xarta-node/.lone-wolf/kanban"))
 KANBAN_PRIORITY_SCOPE_ID = "kanban"
@@ -82,6 +90,8 @@ IMPORT_ARTIFACT_TEXT_SUFFIXES: tuple[str, ...] = (
     ".yaml",
     ".yml",
 )
+
+_WORK_AUTOMATION_PROFILE_CONFIG_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
 IMPORT_ARTIFACT_PREVIEW_BYTES = 256 * 1024
 OPENCLAW_AUDIT_PATTERNS: tuple[tuple[str, str, str], ...] = (
     (
@@ -1389,11 +1399,26 @@ def _work_automation_processor_profile_config(
     config_path = live_path if live_path.exists() else template_path
     if not config_path.exists():
         return config_path, {}
+    cache_key = str(config_path)
+    try:
+        stat = config_path.stat()
+    except OSError:
+        return config_path, {}
+    cached = _WORK_AUTOMATION_PROFILE_CONFIG_CACHE.get(cache_key)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return config_path, cached[2]
     try:
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
+        _WORK_AUTOMATION_PROFILE_CONFIG_CACHE.pop(cache_key, None)
         return config_path, {}
-    return config_path, loaded if isinstance(loaded, dict) else {}
+    parsed = loaded if isinstance(loaded, dict) else {}
+    _WORK_AUTOMATION_PROFILE_CONFIG_CACHE[cache_key] = (
+        stat.st_mtime_ns,
+        stat.st_size,
+        parsed,
+    )
+    return config_path, parsed
 
 
 def _work_automation_processor_profile_fallback(
@@ -1466,12 +1491,13 @@ def _work_automation_processor_profile_drift(processor_kind: str) -> dict[str, A
     if not config_path.exists():
         problems.append("profile_config_missing")
     else:
-        try:
-            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            parsed = loaded if isinstance(loaded, dict) else {}
-        except Exception:
+        _config_path, parsed = _work_automation_processor_profile_config(
+            profile,
+            template_path=template_path,
+            live_path=live_path,
+        )
+        if not parsed:
             problems.append("profile_config_unreadable")
-            parsed = {}
     model = parsed.get("model") if isinstance(parsed, dict) else {}
     primary_provider = str(model.get("provider") or "") if isinstance(model, dict) else ""
     primary_model = str(model.get("default") or "") if isinstance(model, dict) else ""
@@ -1520,7 +1546,7 @@ def _work_review_processing_policy() -> dict[str, Any]:
     auth_drift = {
         kind: _work_automation_processor_profile_drift(kind) for kind in ("review", "preprocessing")
     }
-    return {
+    policy = {
         "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
         "status": "active",
         "version": "2026-06-29",
@@ -1558,6 +1584,7 @@ def _work_review_processing_policy() -> dict[str, Any]:
             "Do not silently switch provider modes when profile processing fails.",
         ],
     }
+    return policy
 
 
 def _work_automation_idle_worker_contract() -> dict[str, Any]:
@@ -1569,8 +1596,10 @@ def _work_automation_idle_worker_contract() -> dict[str, Any]:
     return contract
 
 
-def _work_review_processing_metadata_contract() -> dict[str, Any]:
-    processing_policy = _work_review_processing_policy()
+def _work_review_processing_metadata_contract(
+    processing_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    processing_policy = processing_policy or _work_review_processing_policy()
     return {
         "schema": KANBAN_REVIEW_METADATA_CONTRACT_SCHEMA,
         "status": "active",
@@ -1736,8 +1765,10 @@ def _work_review_processing_metadata_contract() -> dict[str, Any]:
     }
 
 
-def _work_preprocessing_readiness_contract() -> dict[str, Any]:
-    processing_policy = _work_review_processing_policy()
+def _work_preprocessing_readiness_contract(
+    processing_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    processing_policy = processing_policy or _work_review_processing_policy()
     return {
         "schema": KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA,
         "status": "active",
@@ -1866,9 +1897,14 @@ def _work_preprocessing_readiness_contract() -> dict[str, Any]:
     }
 
 
-def _work_review_processor_output_contract() -> dict[str, Any]:
-    processing_policy = _work_review_processing_policy()
-    metadata_contract = _work_review_processing_metadata_contract()
+def _work_review_processor_output_contract(
+    processing_policy: dict[str, Any] | None = None,
+    metadata_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    processing_policy = processing_policy or _work_review_processing_policy()
+    metadata_contract = metadata_contract or _work_review_processing_metadata_contract(
+        processing_policy
+    )
     return {
         "schema": KANBAN_REVIEW_OUTPUT_CONTRACT_SCHEMA,
         "status": "active",
@@ -4308,6 +4344,237 @@ def _row_to_work_review_decision(
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+def _compact_work_review_decision(
+    decision: dict[str, Any],
+    *,
+    include_metadata: bool = False,
+) -> dict[str, Any]:
+    keys = (
+        "schema",
+        "decision_id",
+        "item_id",
+        "processor_kind",
+        "decision_type",
+        "title",
+        "summary",
+        "rationale",
+        "confidence",
+        "uncertainty",
+        "commit_link_ids",
+        "commit_count",
+        "status",
+        "provider_mode",
+        "source_hash",
+        "created_at",
+        "updated_at",
+    )
+    compact = {key: decision.get(key) for key in keys if key in decision}
+    if include_metadata:
+        compact["affected_refs"] = decision.get("affected_refs") or []
+        compact["proof_refs"] = decision.get("proof_refs") or []
+        compact["commits"] = decision.get("commits") or []
+        compact["metadata"] = decision.get("metadata") or {}
+        compact["provenance"] = decision.get("provenance") or {}
+    return compact
+
+
+def _compact_work_output_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    output_types = (
+        contract.get("output_types") if isinstance(contract.get("output_types"), list) else []
+    )
+    provider = (
+        contract.get("provider_mode") if isinstance(contract.get("provider_mode"), dict) else {}
+    )
+    return {
+        "schema": contract.get("schema") or "",
+        "status": contract.get("status") or "",
+        "version": contract.get("version") or "",
+        "provider_mode": {
+            "active": provider.get("active") or "",
+            "local_processing_gate": provider.get("local_processing_gate") or "",
+            "automatic_switch": provider.get("automatic_switch"),
+        },
+        "output_types": [
+            {
+                "type": item.get("type") or "",
+                "label": item.get("label") or item.get("type") or "",
+                "decision_type": item.get("decision_type") or "",
+            }
+            for item in output_types
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _compact_work_processing_policy(
+    policy: dict[str, Any],
+    *,
+    include_auth_drift: bool = False,
+) -> dict[str, Any]:
+    profile = (
+        policy.get("profile_processing")
+        if isinstance(policy.get("profile_processing"), dict)
+        else {}
+    )
+    local = (
+        policy.get("local_processing") if isinstance(policy.get("local_processing"), dict) else {}
+    )
+    compact_profile = {
+        "state": profile.get("state") or "",
+        "required": bool(profile.get("required")),
+        "automatic_switch": bool(profile.get("automatic_switch")),
+        "failure_policy": profile.get("failure_policy") or "",
+    }
+    if include_auth_drift:
+        compact_profile["auth_drift"] = profile.get("auth_drift") or {}
+    return {
+        "schema": policy.get("schema") or "",
+        "status": policy.get("status") or "",
+        "version": policy.get("version") or "",
+        "active_mode": policy.get("active_mode") or "",
+        "applies_to": policy.get("applies_to")
+        if isinstance(policy.get("applies_to"), list)
+        else [],
+        "profile_processing": compact_profile,
+        "local_processing": {
+            "state": local.get("state") or "",
+            "gate": local.get("gate") or "",
+            "automatic_switch": bool(local.get("automatic_switch")),
+            "substitute_decisions_allowed": bool(local.get("substitute_decisions_allowed")),
+        },
+    }
+
+
+def _compact_work_contract_header(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": contract.get("schema") or "",
+        "status": contract.get("status") or "",
+        "version": contract.get("version") or "",
+    }
+
+
+def _compact_work_proposal_surfaces(contract: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_work_contract_header(contract)
+    for key in ("surface_root", "workstream", "inbox", "outbox"):
+        value = contract.get(key)
+        if isinstance(value, dict):
+            compact[key] = {
+                "item_id": value.get("item_id") or "",
+                "uri": value.get("uri") or "",
+                "role": value.get("role") or "",
+            }
+    return compact
+
+
+def _compact_work_review_marker(marker: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema",
+        "marker_id",
+        "item_id",
+        "processor_kind",
+        "document_type",
+        "document_ref",
+        "document_updated_at",
+        "document_source_hash",
+        "processed_document_updated_at",
+        "processed_source_hash",
+        "processed_at",
+        "queued_at",
+        "last_seen_at",
+        "processing_started_at",
+        "processing_expires_at",
+        "attempt_count",
+        "last_error",
+        "next_retry_at",
+        "retry_after_seconds",
+        "retry_attempt_count",
+        "last_error_class",
+        "retry_state",
+        "retry_waiting",
+        "superseded_at",
+        "superseded_by_source_hash",
+        "status",
+        "provider_mode",
+        "decision_id",
+        "source_hash",
+        "created_at",
+        "updated_at",
+    )
+    return {key: marker.get(key) for key in keys if key in marker}
+
+
+def _compact_work_failure_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "schema",
+        "failure_event_id",
+        "marker_id",
+        "item_id",
+        "item_title",
+        "item_ref",
+        "processor_kind",
+        "document_type",
+        "source_hash",
+        "error_class",
+        "error_message",
+        "provider_mode",
+        "model_alias",
+        "attempt_number",
+        "attempt_count",
+        "event_count",
+        "first_failed_at",
+        "last_failed_at",
+        "failed_at",
+        "next_retry_at",
+        "scheduled_retry_at",
+        "retry_after_seconds",
+        "retry_policy_version",
+        "retryable",
+        "status",
+        "marker_status",
+        "retry_state",
+        "retry_waiting",
+        "terminal",
+        "created_at",
+        "updated_at",
+    )
+    return {key: entry.get(key) for key in keys if key in entry}
+
+
+def _compact_work_marker_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(stats)
+    compact["recent_markers"] = [
+        _compact_work_review_marker(marker)
+        for marker in stats.get("recent_markers", [])
+        if isinstance(marker, dict)
+    ]
+    compact["failure_events"] = [
+        _compact_work_failure_entry(event)
+        for event in stats.get("failure_events", [])
+        if isinstance(event, dict)
+    ]
+    compact["failure_aggregates"] = [
+        _compact_work_failure_entry(entry)
+        for entry in stats.get("failure_aggregates", [])
+        if isinstance(entry, dict)
+    ]
+    return compact
+
+
+def _compact_work_failure_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(stats)
+    compact["recent_events"] = [
+        _compact_work_failure_entry(event)
+        for event in stats.get("recent_events", [])
+        if isinstance(event, dict)
+    ]
+    compact["aggregates"] = [
+        _compact_work_failure_entry(entry)
+        for entry in stats.get("aggregates", [])
+        if isinstance(entry, dict)
+    ]
+    return compact
 
 
 def _work_decision_commit_rows(conn: Any, commit_link_ids: list[str]) -> list[Any]:
@@ -11447,11 +11714,21 @@ def _upsert_typed_work_leaf_item(
 
 @router.get("/kanban/datastore/status")
 async def get_work_kanban_datastore_status() -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_kanban_datastore_status_sync)
+
+
+def _get_work_kanban_datastore_status_sync() -> dict[str, Any]:
     return kanban_datastore_status(cfg.KANBAN_DATASTORE_CONFIG)
 
 
 @router.post("/kanban/datastore/bootstrap")
 async def bootstrap_work_kanban_datastore(
+    body: WorkDatastoreBootstrapRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_bootstrap_work_kanban_datastore_sync, body)
+
+
+def _bootstrap_work_kanban_datastore_sync(
     body: WorkDatastoreBootstrapRequest,
 ) -> dict[str, Any]:
     try:
@@ -11479,6 +11756,17 @@ async def bootstrap_work_kanban_datastore(
 async def get_work_kanban_datastore_parity(
     sample_limit: Annotated[int, Query(ge=1, le=20)] = 5,
     include_backups: bool = True,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _get_work_kanban_datastore_parity_sync,
+        sample_limit,
+        include_backups,
+    )
+
+
+def _get_work_kanban_datastore_parity_sync(
+    sample_limit: int,
+    include_backups: bool,
 ) -> dict[str, Any]:
     with get_conn() as conn:
         if (
@@ -14779,6 +15067,13 @@ def _work_review_processor_local_ai_messages(
     ]
 
 
+def _work_review_idle_marker_context_sync(item_id: str) -> tuple[Any, dict[str, Any]]:
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        review_document = _work_item_review_document(conn, item_id)
+    return item, review_document
+
+
 async def _process_work_review_idle_marker(
     marker: dict[str, Any],
     *,
@@ -14787,9 +15082,10 @@ async def _process_work_review_idle_marker(
     run_id: str,
 ) -> dict[str, Any]:
     item_id = marker["item_id"]
-    with get_conn() as conn:
-        item = _work_item_or_404(conn, item_id)
-        review_document = _work_item_review_document(conn, item_id)
+    item, review_document = await _run_personal_sync_work(
+        _work_review_idle_marker_context_sync,
+        item_id,
+    )
     ai = await _work_automation_local_ai_json_completion(
         messages=_work_review_processor_local_ai_messages(
             item=item,
@@ -15359,6 +15655,74 @@ def _preprocessing_readiness_marker(
     }
 
 
+def _work_preprocessing_marker_ineligible_reason_sync(marker: dict[str, Any]) -> str:
+    with get_conn() as conn:
+        return _work_preprocessing_pending_ineligible_reason(conn, marker)
+
+
+def _work_preprocessing_idle_marker_context_sync(item_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, item_id)
+        source = _work_preprocessing_context_source(conn, item)
+        detail_document = _work_item_detail_document(conn, item_id)
+        review_document = _work_item_review_document(conn, item_id)
+        discussion_rows = conn.execute(
+            """
+            SELECT * FROM kanban_discussions
+            WHERE item_id=? AND status!='archived'
+            ORDER BY updated_at DESC, created_at DESC, discussion_id
+            LIMIT 6
+            """,
+            (item_id,),
+        ).fetchall()
+        discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows]
+        commit_rows = conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
+                     updated_at DESC, commit_link_id
+            LIMIT 8
+            """,
+            (item_id,),
+        ).fetchall()
+        recent_commits = [
+            {
+                "commit_link_id": row["commit_link_id"],
+                "repo_full_name": row["repo_full_name"],
+                "sha": row["sha"],
+                "short_sha": row["short_sha"],
+                "message_subject": row["message_subject"],
+                "committed_at": row["committed_at"],
+                "metadata": _json_value(row["metadata_json"], {}),
+            }
+            for row in commit_rows
+        ]
+        recent_decisions = _work_preprocessing_recent_decisions(
+            conn,
+            item_id=item_id,
+            current_source_hash=source["document_source_hash"],
+            limit=8,
+        )
+        hints_row = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        hints = _row_to_work_agent_hints(hints_row, item_id)
+        ancestor_context = _work_preprocessing_ancestor_context(conn, item)
+    return {
+        "item": item,
+        "source": source,
+        "detail_document": detail_document,
+        "review_document": review_document,
+        "discussions": discussions,
+        "recent_commits": recent_commits,
+        "recent_decisions": recent_decisions,
+        "hints": hints,
+        "ancestor_context": ancestor_context,
+    }
+
+
 async def _process_work_preprocessing_idle_marker(
     marker: dict[str, Any],
     *,
@@ -15368,9 +15732,11 @@ async def _process_work_preprocessing_idle_marker(
 ) -> dict[str, Any]:
     item_id = marker["item_id"]
     now = _utc_now_iso()
-    with get_conn() as conn:
-        ineligible_reason = _work_preprocessing_pending_ineligible_reason(conn, marker)
-        automation_excluded = ineligible_reason == "automation_excluded"
+    ineligible_reason = await _run_personal_sync_work(
+        _work_preprocessing_marker_ineligible_reason_sync,
+        marker,
+    )
+    automation_excluded = ineligible_reason == "automation_excluded"
     if automation_excluded:
         complete = await complete_work_review_processor_marker(
             marker["marker_id"],
@@ -15429,55 +15795,16 @@ async def _process_work_preprocessing_idle_marker(
             "reason": ineligible_reason,
             "status": complete.get("marker", {}).get("status", "cancelled"),
         }
-    with get_conn() as conn:
-        item = _work_item_or_404(conn, item_id)
-        source = _work_preprocessing_context_source(conn, item)
-        detail_document = _work_item_detail_document(conn, item_id)
-        review_document = _work_item_review_document(conn, item_id)
-        discussion_rows = conn.execute(
-            """
-            SELECT * FROM kanban_discussions
-            WHERE item_id=? AND status!='archived'
-            ORDER BY updated_at DESC, created_at DESC, discussion_id
-            LIMIT 6
-            """,
-            (item_id,),
-        ).fetchall()
-        discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows]
-        commit_rows = conn.execute(
-            """
-            SELECT * FROM kanban_item_commits
-            WHERE item_id=?
-            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
-                     updated_at DESC, commit_link_id
-            LIMIT 8
-            """,
-            (item_id,),
-        ).fetchall()
-        recent_commits = [
-            {
-                "commit_link_id": row["commit_link_id"],
-                "repo_full_name": row["repo_full_name"],
-                "sha": row["sha"],
-                "short_sha": row["short_sha"],
-                "message_subject": row["message_subject"],
-                "committed_at": row["committed_at"],
-                "metadata": _json_value(row["metadata_json"], {}),
-            }
-            for row in commit_rows
-        ]
-        recent_decisions = _work_preprocessing_recent_decisions(
-            conn,
-            item_id=item_id,
-            current_source_hash=source["document_source_hash"],
-            limit=8,
-        )
-        hints_row = conn.execute(
-            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
-            (item_id,),
-        ).fetchone()
-        hints = _row_to_work_agent_hints(hints_row, item_id)
-        ancestor_context = _work_preprocessing_ancestor_context(conn, item)
+    context = await _run_personal_sync_work(_work_preprocessing_idle_marker_context_sync, item_id)
+    item = context["item"]
+    source = context["source"]
+    detail_document = context["detail_document"]
+    review_document = context["review_document"]
+    discussions = context["discussions"]
+    recent_commits = context["recent_commits"]
+    recent_decisions = context["recent_decisions"]
+    hints = context["hints"]
+    ancestor_context = context["ancestor_context"]
     ai = await _work_automation_local_ai_json_completion(
         messages=_work_preprocessing_local_ai_messages(
             item=item,
@@ -16049,6 +16376,12 @@ async def _process_work_automation_claimed_marker(
         }
 
 
+def _work_queued_processor_marker_ids_for_item_sync(clean_item_id: str) -> list[str]:
+    with get_conn() as conn:
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        return _work_queued_processor_marker_ids(conn, scope_ids)
+
+
 async def run_work_kanban_automation_idle_tick(
     *,
     item_id: str | None = None,
@@ -16140,9 +16473,10 @@ async def run_work_kanban_automation_idle_tick(
             metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
         )
     )
-    with get_conn() as conn:
-        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
-        eligible_marker_ids = _work_queued_processor_marker_ids(conn, scope_ids)
+    eligible_marker_ids = await _run_personal_sync_work(
+        _work_queued_processor_marker_ids_for_item_sync,
+        clean_item_id,
+    )
     lease = await acquire_work_review_processor_lease(
         WorkReviewProcessorLeaseRequest(
             holder_id=clean_holder_id,
@@ -16327,6 +16661,12 @@ async def trigger_work_automation_idle_worker_tick(
 
 @router.post("/kanban/automation/review-processor/idle-scan")
 async def trigger_work_review_processor_idle_scan(
+    body: WorkReviewProcessorIdleScanRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_trigger_work_review_processor_idle_scan_sync, body)
+
+
+def _trigger_work_review_processor_idle_scan_sync(
     body: WorkReviewProcessorIdleScanRequest,
 ) -> dict[str, Any]:
     now = _utc_now_iso()
@@ -16551,6 +16891,12 @@ async def trigger_work_review_processor_idle_scan(
 
 @router.post("/kanban/automation/preprocessing/idle-scan")
 async def trigger_work_preprocessing_idle_scan(
+    body: WorkPreprocessingIdleScanRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_trigger_work_preprocessing_idle_scan_sync, body)
+
+
+def _trigger_work_preprocessing_idle_scan_sync(
     body: WorkPreprocessingIdleScanRequest,
 ) -> dict[str, Any]:
     now = _utc_now_iso()
@@ -17011,6 +17357,12 @@ async def trigger_work_preprocessing_idle_scan(
 async def claim_next_work_review_processor_marker(
     body: WorkReviewProcessorMarkerClaimRequest,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_claim_next_work_review_processor_marker_sync, body)
+
+
+def _claim_next_work_review_processor_marker_sync(
+    body: WorkReviewProcessorMarkerClaimRequest,
+) -> dict[str, Any]:
     now = _utc_now_iso()
     now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
     meta = _work_request_meta(body)
@@ -17055,7 +17407,7 @@ async def claim_next_work_review_processor_marker(
                 where += f" AND marker.marker_id IN ({placeholders})"
                 args.extend(clean_eligible_marker_ids)
             else:
-                where += " AND 0"
+                where += " AND FALSE"
         marker_row = conn.execute(
             f"""
             SELECT marker.* FROM kanban_review_processor_markers marker
@@ -17197,6 +17549,15 @@ async def claim_next_work_review_processor_marker(
 
 @router.post("/kanban/automation/review-processor/markers/{marker_id}/complete")
 async def complete_work_review_processor_marker(
+    marker_id: str,
+    body: WorkReviewProcessorMarkerCompleteRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _complete_work_review_processor_marker_sync, marker_id, body
+    )
+
+
+def _complete_work_review_processor_marker_sync(
     marker_id: str,
     body: WorkReviewProcessorMarkerCompleteRequest,
 ) -> dict[str, Any]:
@@ -17666,6 +18027,14 @@ async def complete_work_review_processor_marker(
 async def requeue_timed_out_work_review_processor_markers(
     body: WorkReviewProcessorTimeoutRequeueRequest,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _requeue_timed_out_work_review_processor_markers_sync, body
+    )
+
+
+def _requeue_timed_out_work_review_processor_markers_sync(
+    body: WorkReviewProcessorTimeoutRequeueRequest,
+) -> dict[str, Any]:
     now = _utc_now_iso()
     meta = _work_request_meta(body)
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
@@ -17950,6 +18319,12 @@ async def get_work_review_processor_lease() -> dict[str, Any]:
 async def acquire_work_review_processor_lease(
     body: WorkReviewProcessorLeaseRequest,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_acquire_work_review_processor_lease_sync, body)
+
+
+def _acquire_work_review_processor_lease_sync(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
     now = _utc_now_iso()
     now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
     meta = _work_request_meta(body)
@@ -18091,6 +18466,12 @@ async def acquire_work_review_processor_lease(
 async def heartbeat_work_review_processor_lease(
     body: WorkReviewProcessorLeaseRequest,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_heartbeat_work_review_processor_lease_sync, body)
+
+
+def _heartbeat_work_review_processor_lease_sync(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
     now = _utc_now_iso()
     now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
     meta = _work_request_meta(body)
@@ -18175,6 +18556,12 @@ async def heartbeat_work_review_processor_lease(
 async def release_work_review_processor_lease(
     body: WorkReviewProcessorLeaseRequest,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_release_work_review_processor_lease_sync, body)
+
+
+def _release_work_review_processor_lease_sync(
+    body: WorkReviewProcessorLeaseRequest,
+) -> dict[str, Any]:
     now = _utc_now_iso()
     now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
     meta = _work_request_meta(body)
@@ -18257,11 +18644,55 @@ async def release_work_review_processor_lease(
 async def get_work_automation_status(
     item_id: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    include_contracts: Annotated[bool, Query()] = True,
+    include_auth_drift: Annotated[bool, Query()] = False,
+    include_decision_metadata: Annotated[bool, Query()] = False,
+    metrics: Annotated[bool, Query()] = False,
 ) -> dict[str, Any]:
+    started = time.monotonic()
     clean_item_id = _clean_short_text(item_id, "", limit=180)
+    payload = await _run_personal_sync_work(
+        _get_work_automation_status_sync,
+        clean_item_id,
+        limit,
+        include_contracts=include_contracts,
+        include_auth_drift=include_auth_drift,
+        include_decision_metadata=include_decision_metadata,
+    )
+    finished = time.monotonic()
+    if metrics:
+        payload["server_metrics"] = {
+            "schema": "xarta.kanban.automation_status.metrics.v1",
+            "total_seconds": round(finished - started, 6),
+            "status_thread_seconds": round(finished - started, 6),
+            "limit": limit,
+            "item_id_present": bool(clean_item_id),
+            "include_contracts": bool(include_contracts),
+            "include_auth_drift": bool(include_auth_drift),
+            "include_decision_metadata": bool(include_decision_metadata),
+        }
+    return payload
+
+
+def _get_work_automation_status_sync(
+    clean_item_id: str,
+    limit: int,
+    *,
+    include_contracts: bool = False,
+    include_auth_drift: bool = False,
+    include_decision_metadata: bool = False,
+) -> dict[str, Any]:
     generated_at = _utc_now_iso()
     now_dt = _parse_utc_datetime(generated_at) or datetime.now(timezone.utc)
-    processing_policy = _work_review_processing_policy()
+    raw_processing_policy = _work_review_processing_policy()
+    processing_policy = (
+        raw_processing_policy
+        if include_contracts
+        else _compact_work_processing_policy(
+            raw_processing_policy,
+            include_auth_drift=include_auth_drift,
+        )
+    )
     idle_worker_config = _work_automation_idle_worker_config()
     with get_conn() as conn:
         scope_ids: list[str] = []
@@ -18289,9 +18720,12 @@ async def get_work_automation_status(
             commit_ids = _json_value(row["commit_link_ids_json"], [])
             commit_rows = _work_decision_commit_rows(conn, commit_ids)
             recent_decisions.append(
-                _row_to_work_review_decision(
-                    row,
-                    [_row_to_work_commit(commit) for commit in commit_rows],
+                _compact_work_review_decision(
+                    _row_to_work_review_decision(
+                        row,
+                        [_row_to_work_commit(commit) for commit in commit_rows],
+                    ),
+                    include_metadata=include_decision_metadata,
                 )
             )
         status_rows = conn.execute(
@@ -18327,14 +18761,20 @@ async def get_work_automation_status(
         ).fetchone()
         lease = _row_to_work_review_processor_lease(lease_row, now_dt=now_dt)
         lease_active = bool(lease["active"])
-        marker_stats = _work_review_processor_marker_stats(conn, scope_ids, limit=limit)
-        preprocessing_marker_stats = _work_review_processor_marker_stats(
-            conn,
-            scope_ids,
-            limit=limit,
-            processor_kind="preprocessing",
+        marker_stats = _compact_work_marker_stats(
+            _work_review_processor_marker_stats(conn, scope_ids, limit=limit)
         )
-        failure_stats = _work_review_processor_failure_stats(conn, scope_ids, limit=limit)
+        preprocessing_marker_stats = _compact_work_marker_stats(
+            _work_review_processor_marker_stats(
+                conn,
+                scope_ids,
+                limit=limit,
+                processor_kind="preprocessing",
+            )
+        )
+        failure_stats = _compact_work_failure_stats(
+            _work_review_processor_failure_stats(conn, scope_ids, limit=limit)
+        )
         exclusion_where = (
             "WHERE item.status != 'archived' AND COALESCE(item.automation_excluded, 0) != 0"
         )
@@ -18383,20 +18823,52 @@ async def get_work_automation_status(
             args,
         ).fetchone()
         all_decision_rows = conn.execute(
-            f"SELECT * FROM kanban_review_decisions {where}",
+            f"""
+            SELECT decision_id, status, commit_link_ids_json, metadata_json
+            FROM kanban_review_decisions
+            {where}
+            """,
             args,
         ).fetchall()
+        metadata_contract = _work_review_processing_metadata_contract(raw_processing_policy)
+        output_contract = _work_review_processor_output_contract(
+            raw_processing_policy,
+            metadata_contract,
+        )
+        preprocessing_contract = _work_preprocessing_readiness_contract(raw_processing_policy)
+        proposal_surfaces = _work_proposal_surfaces_contract()
+        idle_worker_contract = _work_automation_idle_worker_contract()
         return {
             "ok": True,
             "schema": "xarta.kanban.automation_status.v1",
             "item": item_payload,
             "generated_at": generated_at,
-            "output_contract": _work_review_processor_output_contract(),
-            "metadata_contract": _work_review_processing_metadata_contract(),
-            "preprocessing_contract": _work_preprocessing_readiness_contract(),
+            "output_contract": (
+                output_contract
+                if include_contracts
+                else _compact_work_output_contract(output_contract)
+            ),
+            "metadata_contract": (
+                metadata_contract
+                if include_contracts
+                else _compact_work_contract_header(metadata_contract)
+            ),
+            "preprocessing_contract": (
+                preprocessing_contract
+                if include_contracts
+                else _compact_work_contract_header(preprocessing_contract)
+            ),
             "processing_policy": processing_policy,
-            "proposal_surfaces": _work_proposal_surfaces_contract(),
-            "idle_worker_contract": _work_automation_idle_worker_contract(),
+            "proposal_surfaces": (
+                proposal_surfaces
+                if include_contracts
+                else _compact_work_proposal_surfaces(proposal_surfaces)
+            ),
+            "idle_worker_contract": (
+                idle_worker_contract
+                if include_contracts
+                else _compact_work_contract_header(idle_worker_contract)
+            ),
             "idle_worker": idle_worker_config,
             "automation_exclusions": {
                 "schema": KANBAN_AUTOMATION_EXCLUSION_SCHEMA,
@@ -18408,7 +18880,11 @@ async def get_work_automation_status(
                 "active": processing_policy["active_mode"],
                 "planned": processing_policy["profile_processing"]["state"],
                 "profile_processing": processing_policy["profile_processing"],
-                "auth_drift": processing_policy["profile_processing"]["auth_drift"],
+                "auth_drift": (
+                    processing_policy["profile_processing"].get("auth_drift", {})
+                    if include_auth_drift or include_contracts
+                    else {}
+                ),
                 "local_processing_gate": processing_policy["local_processing"]["gate"],
                 "automatic_switch": processing_policy["profile_processing"]["automatic_switch"],
                 "by_mode": {row["provider_mode"]: int(row["count"]) for row in provider_rows},
@@ -18464,7 +18940,11 @@ async def get_work_automation_status(
                     preprocessing_active_row["item_id"] if preprocessing_active_row else ""
                 ),
                 "last_completed_item_id": "",
-                "readiness_contract": _work_preprocessing_readiness_contract(),
+                "readiness_contract": (
+                    preprocessing_contract
+                    if include_contracts
+                    else _compact_work_contract_header(preprocessing_contract)
+                ),
                 "scheduler": preprocessing_marker_stats,
                 "markers": preprocessing_marker_stats["recent_markers"],
                 "failure_events": preprocessing_marker_stats["failure_events"],

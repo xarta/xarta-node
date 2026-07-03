@@ -52,6 +52,7 @@ router = APIRouter(prefix="/sync", tags=["sync"])
 _FORCE_RESTORE_HEADER = "x-blueprints-force-restore"
 _RESTORE_OP_HEADER = "x-blueprints-restore-op"
 _SAFE_BACKUP_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-blueprints\.db\.tar\.gz$")
+_receive_actions_apply_lock: asyncio.Lock | None = None
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
 # NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
@@ -586,62 +587,14 @@ def _forward_actions(
     )
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+def _get_receive_actions_apply_lock() -> asyncio.Lock:
+    global _receive_actions_apply_lock
+    if _receive_actions_apply_lock is None:
+        _receive_actions_apply_lock = asyncio.Lock()
+    return _receive_actions_apply_lock
 
 
-@router.post("/actions", status_code=204)
-async def receive_actions(payload: SyncActionsPayload) -> Response:
-    """
-    Receive a batch of CRUD actions from a peer node and apply them locally.
-
-    Commit guard: if the source node's commit timestamp is older than ours,
-    DB-write actions are rejected (409) to prevent stale data overwriting
-    newer-schema rows. System actions (git-pull) are always accepted so the
-    stale node can be told to pull newer code.
-    """
-    if not payload.actions:
-        return Response(status_code=204)
-
-    # Separate system actions (fire-and-forget) from DB-write actions
-    system_actions = [a for a in payload.actions if a.action_type in _SYSTEM_ACTION_TYPES]
-    db_actions = [a for a in payload.actions if a.action_type not in _SYSTEM_ACTION_TYPES]
-
-    # Schedule system actions as one ordered batch — always accepted regardless
-    # of commit age so a newer node can tell an older one to git-pull.
-    system_scopes = _ordered_git_scopes(
-        _scope_for_system_action(action.action_type) for action in system_actions
-    )
-    if system_scopes:
-        asyncio.create_task(
-            _git_pull_scopes_and_maybe_restart(
-                system_scopes,
-                source=f"from {payload.source_node_id}",
-            )
-        )
-        log.info(
-            "scheduled git pull scopes %s from %s", ",".join(system_scopes), payload.source_node_id
-        )
-
-    if not db_actions:
-        return Response(status_code=204)
-
-    # ── Commit guard: reject DB writes from older-commit peers ────────────
-    if cfg.COMMIT_TS and payload.source_commit_ts:
-        if payload.source_commit_ts < cfg.COMMIT_TS:
-            log.warning(
-                "commit guard: rejecting %d DB actions from %s (source_ts=%d < local_ts=%d)",
-                len(db_actions),
-                payload.source_node_id,
-                payload.source_commit_ts,
-                cfg.COMMIT_TS,
-            )
-            raise HTTPException(
-                409,
-                f"commit guard: source commit ({payload.source_commit_ts}) "
-                f"is older than local ({cfg.COMMIT_TS}) — "
-                "pull newer code before syncing data",
-            )
-
+def _receive_db_actions_sync(payload: SyncActionsPayload, db_actions: list) -> int:
     with get_conn() as conn:
         # Check own integrity — if not OK, refuse to accept (corrupt state)
         integrity_ok = get_meta(conn, "integrity_ok") == "true"
@@ -713,9 +666,71 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
         # originator cannot reach but we can (no-op for current 6-node fleet).
         _forward_actions(conn, payload.source_node_id, newly_applied)
 
+    return len(newly_applied)
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+
+@router.post("/actions", status_code=204)
+async def receive_actions(payload: SyncActionsPayload) -> Response:
+    """
+    Receive a batch of CRUD actions from a peer node and apply them locally.
+
+    Commit guard: if the source node's commit timestamp is older than ours,
+    DB-write actions are rejected (409) to prevent stale data overwriting
+    newer-schema rows. System actions (git-pull) are always accepted so the
+    stale node can be told to pull newer code.
+    """
+    if not payload.actions:
+        return Response(status_code=204)
+
+    # Separate system actions (fire-and-forget) from DB-write actions
+    system_actions = [a for a in payload.actions if a.action_type in _SYSTEM_ACTION_TYPES]
+    db_actions = [a for a in payload.actions if a.action_type not in _SYSTEM_ACTION_TYPES]
+
+    # Schedule system actions as one ordered batch — always accepted regardless
+    # of commit age so a newer node can tell an older one to git-pull.
+    system_scopes = _ordered_git_scopes(
+        _scope_for_system_action(action.action_type) for action in system_actions
+    )
+    if system_scopes:
+        asyncio.create_task(
+            _git_pull_scopes_and_maybe_restart(
+                system_scopes,
+                source=f"from {payload.source_node_id}",
+            )
+        )
+        log.info(
+            "scheduled git pull scopes %s from %s", ",".join(system_scopes), payload.source_node_id
+        )
+
+    if not db_actions:
+        return Response(status_code=204)
+
+    # ── Commit guard: reject DB writes from older-commit peers ────────────
+    if cfg.COMMIT_TS and payload.source_commit_ts:
+        if payload.source_commit_ts < cfg.COMMIT_TS:
+            log.warning(
+                "commit guard: rejecting %d DB actions from %s (source_ts=%d < local_ts=%d)",
+                len(db_actions),
+                payload.source_node_id,
+                payload.source_commit_ts,
+                cfg.COMMIT_TS,
+            )
+            raise HTTPException(
+                409,
+                f"commit guard: source commit ({payload.source_commit_ts}) "
+                f"is older than local ({cfg.COMMIT_TS}) — "
+                "pull newer code before syncing data",
+            )
+
+    async with _get_receive_actions_apply_lock():
+        applied_count = await asyncio.to_thread(_receive_db_actions_sync, payload, db_actions)
+
     log.info(
         "applied %d sync actions from %s",
-        len(newly_applied),
+        applied_count,
         payload.source_node_id,
     )
     return Response(status_code=204)
