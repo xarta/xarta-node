@@ -5390,3 +5390,63 @@ async def test_matrix_chat_e2ee_messages_treat_missing_end_as_start_of_history(m
         "end": None,
         "at_start": True,
     }
+
+
+def test_matrix_chat_e2ee_messages_timeout_returns_undecrypted_placeholder(monkeypatch):
+    class SlowCrypto:
+        async def decrypt_megolm_event(self, _event):
+            await asyncio.sleep(1)
+
+    class FakeClient:
+        crypto = SlowCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+    monkeypatch.setattr(matrix_chat, "_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS", 0.01)
+
+    messages = asyncio.run(
+        client.messages_from_raw_events(
+            "!room:test",
+            [
+                {
+                    "type": "m.room.encrypted",
+                    "event_id": "$slow",
+                    "room_id": "!room:test",
+                    "sender": "@alice:test",
+                    "origin_server_ts": 1710000000000,
+                    "content": {
+                        "algorithm": "m.megolm.v1.aes-sha2",
+                        "ciphertext": "abc",
+                        "device_id": "DEVICE",
+                        "sender_key": "key",
+                        "session_id": "session",
+                    },
+                }
+            ],
+            total_timeout_seconds=0.05,
+        )
+    )
+
+    assert messages == [
+        {
+            "event_id": "$slow",
+            "room_id": "!room:test",
+            "sender": "@alice:test",
+            "origin_server_ts": 1710000000000,
+            "msgtype": "m.encrypted",
+            "body": "[unable to decrypt encrypted event]",
+            "relates_to": None,
+            "system_message": None,
+            "media": None,
+            "encrypted": True,
+            "decrypted": False,
+        }
+    ]
