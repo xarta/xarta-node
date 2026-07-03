@@ -4,8 +4,9 @@
 Helper-node worker contract:
 - ask the coordinator API for a stable block of unique canonical URL assignments;
 - fetch image bytes from the public internet only;
-- post bytes or exact failure reason back to the coordinator API;
-- the coordinator transforms, encrypts, stores, and links all references.
+- transform public image bytes to JPEG in memory;
+- post the transformed JPEG plus hashes, dimensions, fetched metadata, or exact failure reason;
+- the coordinator validates, encrypts, stores, and links all references.
 """
 
 from __future__ import annotations
@@ -26,6 +27,13 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from pim_email_image_transform import (
+    TRANSFORM_VERSION,
+    ImageTransformError,
+    jpeg_dimensions,
+    sha256_hex,
+    transform_image_to_jpeg,
+)
 
 TOKEN_WINDOW_SECONDS = 5
 DEFAULT_API_BASE = "http://127.0.0.1:8080/api/v1"
@@ -75,7 +83,13 @@ def _json_log(event: str, **payload: Any) -> None:
     safe_payload = {
         key: value
         for key, value in payload.items()
-        if key not in {"canonical_url", "source_url", "image_base64", "assignment_token"}
+        if key
+        not in {
+            "canonical_url",
+            "source_url",
+            "transformed_image_base64",
+            "assignment_token",
+        }
     }
     print(
         json.dumps({"event": event, **safe_payload}, sort_keys=True, separators=(",", ":")),
@@ -116,7 +130,7 @@ def _assert_public_remote_url(url: str) -> str:
 
 def _status_for_http_error(status_code: int) -> str:
     if status_code == 429 or 500 <= status_code <= 599:
-        return "pending"
+        return "retryable"
     return "unavailable"
 
 
@@ -173,11 +187,11 @@ async def _fetch_image(
                 )
         raise WorkerError("image unavailable: redirect chain exceeded limit", status="unavailable")
     except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as exc:
-        raise WorkerError(f"image unavailable: {exc.__class__.__name__}", status="pending") from exc
+        raise WorkerError(f"image retryable: {exc.__class__.__name__}", status="retryable") from exc
     except httpx.ConnectError as exc:
-        raise WorkerError("image unavailable: ConnectError", status="pending") from exc
+        raise WorkerError("image retryable: ConnectError", status="retryable") from exc
     except httpx.RequestError as exc:
-        raise WorkerError(f"image unavailable: {exc.__class__.__name__}", status="pending") from exc
+        raise WorkerError(f"image retryable: {exc.__class__.__name__}", status="retryable") from exc
 
 
 async def _post_json(
@@ -239,15 +253,22 @@ async def _process_item(
             max_image_bytes=max_image_bytes,
             max_redirects=max_redirects,
         )
+        transformed = transform_image_to_jpeg(fetched.content)
+        width, height = jpeg_dimensions(transformed)
         payload = {
             "worker_id": worker_id,
             "assignment_token": assignment_token,
-            "image_base64": base64.b64encode(fetched.content).decode("ascii"),
+            "transformed_image_base64": base64.b64encode(transformed).decode("ascii"),
+            "raw_image_sha256": sha256_hex(fetched.content),
+            "transformed_sha256": sha256_hex(transformed),
+            "width": width,
+            "height": height,
+            "transform_version": TRANSFORM_VERSION,
             "fetched_content_type": fetched.content_type,
             "fetched_final_url": fetched.final_url,
             "metadata": {
                 "source": "remote-pim-email-image-download-worker",
-                "raw_image_sha256": hashlib.sha256(fetched.content).hexdigest(),
+                "worker_transformed": True,
             },
         }
         result = await _post_json(
@@ -263,9 +284,12 @@ async def _process_item(
     except WorkerError as exc:
         status = exc.status
         reason = str(exc)[:1000]
+    except ImageTransformError as exc:
+        status = "blocked"
+        reason = str(exc)[:1000]
     except Exception as exc:
-        status = "pending"
-        reason = f"image unavailable: {exc.__class__.__name__}"
+        status = "retryable"
+        reason = f"image retryable: {exc.__class__.__name__}"
     await _post_json(
         api_client,
         f"{api_base}/personal/email/workers/external-images/assignments/{digest}/fail",
@@ -332,13 +356,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             return {
                 "claimed": 0,
                 "stored": 0,
-                "pending": 0,
+                "retryable": 0,
                 "unavailable": 0,
                 "blocked": 0,
                 "failed": 0,
             }
 
-        counts = {"stored": 0, "pending": 0, "unavailable": 0, "blocked": 0, "failed": 0}
+        counts = {"stored": 0, "retryable": 0, "unavailable": 0, "blocked": 0, "failed": 0}
         semaphore = asyncio.Semaphore(args.concurrency)
         fetch_timeout = httpx.Timeout(
             args.fetch_timeout_seconds, connect=args.fetch_connect_timeout_seconds

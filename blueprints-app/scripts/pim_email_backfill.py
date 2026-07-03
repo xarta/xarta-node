@@ -374,6 +374,7 @@ async def _run_unique_external_image_asset_batch(
         or f"{getattr(os.uname(), 'nodename', 'pim-email-worker')}:{os.getpid()}:unique-images",
         run_id=args.run_id or "",
         metadata=metadata,
+        allow_coordinator_transform_fallback=bool(args.allow_coordinator_transform_fallback),
     )
     return result, ledger
 
@@ -878,6 +879,14 @@ def main() -> int:
         help=(
             "Stable worker identity for durable unique-URL assignment blocks. Reusing the same "
             "worker id and run id resumes unfinished URLs from the same block."
+        ),
+    )
+    parser.add_argument(
+        "--allow-coordinator-transform-fallback",
+        action="store_true",
+        help=(
+            "Explicit test/safety override: let the coordinator fetch and transform assigned "
+            "external images locally. Normal work must use the remote worker API."
         ),
     )
     args = parser.parse_args()
