@@ -1904,6 +1904,45 @@ def _check_e2ee_deps() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _configure_history_decrypt_fast_path(olm: Any) -> None:
+    """Avoid per-event cross-signing lookups on the Matrix Chat history path.
+
+    mautrix resolves the trust state of the sender device after decrypting every
+    Megolm event. Blueprints does not expose that trust state in the Chat UI, but
+    the lookup path repeatedly queries missing cross-signing keys and can make a
+    normal history fetch take tens of seconds. Keep the sender-device lookup and
+    Megolm session verification, but cache device-by-key lookups and return an
+    unverified trust state without cross-signing DB/network work.
+    """
+    from mautrix.types import TrustState
+
+    device_by_key_cache: dict[tuple[str, str], Any] = {}
+    original_get_or_fetch_device_by_key = olm.get_or_fetch_device_by_key
+    original_find_device_by_key = olm.crypto_store.find_device_by_key
+
+    async def cached_get_or_fetch_device_by_key(user_id: Any, identity_key: Any) -> Any:
+        key = (str(user_id), str(identity_key))
+        if key not in device_by_key_cache:
+            device_by_key_cache[key] = await original_get_or_fetch_device_by_key(
+                user_id,
+                identity_key,
+            )
+        return device_by_key_cache[key]
+
+    async def cached_find_device_by_key(user_id: Any, identity_key: Any) -> Any:
+        key = (str(user_id), str(identity_key))
+        if key not in device_by_key_cache:
+            device_by_key_cache[key] = await original_find_device_by_key(user_id, identity_key)
+        return device_by_key_cache[key]
+
+    async def unverified_trust(_device: Any, allow_fetch: bool = True) -> Any:
+        return TrustState.UNVERIFIED
+
+    olm.get_or_fetch_device_by_key = cached_get_or_fetch_device_by_key
+    olm.crypto_store.find_device_by_key = cached_find_device_by_key
+    olm.resolve_trust = unverified_trust
+
+
 def _secure_crypto_store(store_dir: Path) -> None:
     store_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -2072,6 +2111,7 @@ class _MatrixChatE2EEClient:
             crypto_store,
             _MatrixCryptoStateStore(state_store, self._joined_rooms),
         )
+        _configure_history_decrypt_fast_path(olm)
         olm.share_keys_min_trust = TrustState.UNVERIFIED
         olm.send_keys_min_trust = TrustState.UNVERIFIED
         await olm.load()
