@@ -370,6 +370,9 @@ async def _run_unique_external_image_asset_batch(
     result = await store.process_external_image_unique_canonical_assets(
         mailbox_id=args.mailbox_id,
         limit=batch_limit,
+        worker_id=args.worker_id
+        or f"{getattr(os.uname(), 'nodename', 'pim-email-worker')}:{os.getpid()}:unique-images",
+        run_id=args.run_id or "",
         metadata=metadata,
     )
     return result, ledger
@@ -867,6 +870,14 @@ def main() -> int:
         help=(
             "Fetch/transform/store one encrypted shared image asset per unique canonical URL, "
             "then bulk-link all pending email reference rows for that URL."
+        ),
+    )
+    parser.add_argument(
+        "--worker-id",
+        default="",
+        help=(
+            "Stable worker identity for durable unique-URL assignment blocks. Reusing the same "
+            "worker id and run id resumes unfinished URLs from the same block."
         ),
     )
     args = parser.parse_args()

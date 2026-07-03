@@ -1382,7 +1382,10 @@ def test_backfill_prioritizes_contract_incomplete_security_before_missing_securi
     assert "AND (\n                    (TRUE AND NOT security_complete)" in candidate_query
     assert "OR (FALSE AND NOT sanitized_complete)" in candidate_query
     assert "OR (FALSE AND external_pending)" in candidate_query
-    assert "d.status IN ('pending','fetched','transformed','failed')" in candidate_query
+    assert "d.status IN ('fetched','transformed','failed')" in candidate_query
+    assert "d.status = 'pending'" in candidate_query
+    assert "d.next_retry_at <= now()" in candidate_query
+    assert "captured_waiting_for_real_download" in candidate_query
     assert "email_uid DESC" in candidate_query
     assert "updated_at ASC" not in candidate_query
 
@@ -2280,21 +2283,10 @@ def test_unique_external_image_asset_fetches_once_and_links_all_references(tmp_p
     shared_assets = []
     stored_refs = []
     recorded_refs = []
-    selected_queries = []
+    finished_assignments = []
 
     class FakeConnection:
         async def fetch(self, query, *args):
-            if "SELECT DISTINCT ON (d.canonical_url_digest)" in query:
-                selected_queries.append(query)
-                return [
-                    {
-                        "canonical_url_digest": digest,
-                        "canonical_url": canonical,
-                        "source_url": canonical + "?utm=proof",
-                        "email_uid": "20260702-" + "c" * 40,
-                        "input_raw_sha256": "raw-latest",
-                    }
-                ]
             if "FROM pim_email_external_image_derivatives d" in query:
                 assert args[2] == digest
                 return [
@@ -2363,6 +2355,26 @@ def test_unique_external_image_asset_fetches_once_and_links_all_references(tmp_p
         async def find_external_image_canonical_terminal_state(self, **kwargs):
             return None
 
+        async def claim_external_image_url_assignment_block(self, **kwargs):
+            assert kwargs["limit"] == 10
+            return {
+                "assignment_batch_id": "assignment-batch-test",
+                "assignment_token": "assignment-token-test",
+                "items": [
+                    {
+                        "canonical_url_digest": digest,
+                        "canonical_url": canonical,
+                        "source_url": canonical + "?utm=proof",
+                        "email_uid": "20260702-" + "c" * 40,
+                        "input_raw_sha256": "raw-latest",
+                    }
+                ],
+            }
+
+        async def _finish_external_image_url_assignment(self, **kwargs):
+            finished_assignments.append(kwargs)
+            return kwargs
+
         async def store_shared_asset(self, **kwargs):
             shared_assets.append(kwargs["asset"])
             return kwargs["asset"]
@@ -2420,31 +2432,19 @@ def test_unique_external_image_asset_fetches_once_and_links_all_references(tmp_p
     assert len(stored_refs) == 2
     assert {item["shared_asset_uid"] for item in stored_refs} == {"email-shared-asset-unique"}
     assert {item["status"] for item in recorded_refs} == {"stored"}
-    assert selected_queries
-    assert "LEFT JOIN shared_digest" in selected_queries[0]
-    assert "waiting.next_retry_at > now()" in selected_queries[0]
-    assert "captured_waiting_for_real_download" in selected_queries[0]
+    assert finished_assignments
+    assert finished_assignments[0]["assignment_status"] == "completed"
+    assert finished_assignments[0]["result_status"] == "stored"
 
 
 def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
     canonical = "https://cdn.example.test/timeout.png"
     digest = pim_email._external_image_canonical_digest(canonical)
     recorded = []
-    selected_queries = []
+    finished_assignments = []
 
     class FakeConnection:
         async def fetch(self, query, *args):
-            if "SELECT DISTINCT ON (d.canonical_url_digest)" in query:
-                selected_queries.append(query)
-                return [
-                    {
-                        "canonical_url_digest": digest,
-                        "canonical_url": canonical,
-                        "source_url": canonical,
-                        "email_uid": "20260702-" + "e" * 40,
-                        "input_raw_sha256": "raw-timeout",
-                    }
-                ]
             raise AssertionError(query)
 
         async def execute(self, query, *args):
@@ -2468,6 +2468,25 @@ def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
 
         async def find_external_image_canonical_terminal_state(self, **kwargs):
             return None
+
+        async def claim_external_image_url_assignment_block(self, **kwargs):
+            return {
+                "assignment_batch_id": "assignment-batch-test",
+                "assignment_token": "assignment-token-test",
+                "items": [
+                    {
+                        "canonical_url_digest": digest,
+                        "canonical_url": canonical,
+                        "source_url": canonical,
+                        "email_uid": "20260702-" + "e" * 40,
+                        "input_raw_sha256": "raw-timeout",
+                    }
+                ],
+            }
+
+        async def _finish_external_image_url_assignment(self, **kwargs):
+            finished_assignments.append(kwargs)
+            return kwargs
 
         async def record_external_image_derivative_state(self, **kwargs):
             recorded.append(kwargs)
@@ -2496,9 +2515,148 @@ def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
         recorded[0]["safety_decision"]
         == "pending_during_unique_external_image_download_or_transform"
     )
-    assert selected_queries
-    assert "waiting.next_retry_at > now()" in selected_queries[0]
-    assert "captured_waiting_for_real_download" in selected_queries[0]
+    assert finished_assignments
+    assert finished_assignments[0]["assignment_status"] == "retryable"
+    assert finished_assignments[0]["result_status"] == "pending"
+
+
+def test_external_image_url_assignment_block_claim_uses_unique_resumable_assignments():
+    canonical = "https://cdn.example.test/assignment.png"
+    digest = pim_email._external_image_canonical_digest(canonical)
+    queries = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            queries.append(query)
+            if "worker_id = $2" in query and "run_id = $3" in query:
+                return []
+            assert "SELECT DISTINCT ON (d.canonical_url_digest)" in query
+            assert "ON CONFLICT (mailbox_id, canonical_url_digest, transform_version)" in query
+            assert "waiting.next_retry_at > now()" in query
+            assert "captured_waiting_for_real_download" in query
+            assert "l.assignment_status = 'unassigned'" in query
+            assert "l.assignment_status IN ('unassigned','retryable','failed')" not in query
+            assert "l.result_status IN ('blocked','unavailable')" not in query
+            assert "pim_email_external_image_url_assignments.expires_at <= now()" not in query
+            return [
+                {
+                    "assignment_id": "assignment-1",
+                    "assignment_batch_id": "assignment-batch-1",
+                    "mailbox_id": "test-mailbox",
+                    "canonical_url_digest": digest,
+                    "canonical_url": canonical,
+                    "source_url": canonical + "?utm=proof",
+                    "email_uid": "20260702-" + "f" * 40,
+                    "input_raw_sha256": "raw-assignment",
+                    "transform_version": "jpeg-v1",
+                    "assignment_status": "assigned",
+                    "worker_id": "tb3-worker-01",
+                    "assignment_token": "secret-token",
+                    "run_id": "stable-run-1",
+                    "attempts": 1,
+                    "result_status": "",
+                    "reason": "",
+                    "metadata_json": {},
+                    "claimed_at": None,
+                    "renewed_at": None,
+                    "expires_at": None,
+                    "next_retry_at": None,
+                    "completed_at": None,
+                    "updated_at": None,
+                }
+            ]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            return None
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return FakeConnection()
+
+    result = asyncio.run(
+        FakeStore().claim_external_image_url_assignment_block(
+            mailbox_id="test-mailbox",
+            worker_id="tb3-worker-01",
+            run_id="stable-run-1",
+            limit=1000,
+        )
+    )
+
+    assert result["claimed"] == 1
+    assert result["items"][0]["canonical_url_digest"] == digest
+    assert "assignment_token" not in result["items"][0]
+    assert len(queries) == 2
+
+
+def test_external_image_url_assignment_block_claim_resumes_same_worker_run_before_new_scan():
+    digest = pim_email._external_image_canonical_digest("https://cdn.example.test/resume.png")
+    queries = []
+
+    class FakeConnection:
+        async def fetch(self, query, *args):
+            queries.append(query)
+            assert "worker_id = $2" in query and "run_id = $3" in query
+            assert "assignment_status = 'assigned'" in query
+            assert "assignment_status = 'retryable'" not in query
+            return [
+                {
+                    "assignment_id": "assignment-resume",
+                    "assignment_batch_id": "assignment-batch-resume",
+                    "mailbox_id": "test-mailbox",
+                    "canonical_url_digest": digest,
+                    "canonical_url": "https://cdn.example.test/resume.png",
+                    "source_url": "https://cdn.example.test/resume.png",
+                    "email_uid": "20260702-" + "a" * 40,
+                    "input_raw_sha256": "raw-resume",
+                    "transform_version": "jpeg-v1",
+                    "assignment_status": "assigned",
+                    "worker_id": "tb3-worker-01",
+                    "assignment_token": "secret-token",
+                    "run_id": "stable-run-1",
+                    "attempts": 2,
+                    "result_status": "",
+                    "reason": "",
+                    "metadata_json": {},
+                    "claimed_at": None,
+                    "renewed_at": None,
+                    "expires_at": None,
+                    "next_retry_at": None,
+                    "completed_at": None,
+                    "updated_at": None,
+                }
+            ]
+
+        async def close(self):
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            return None
+
+        async def ensure_schema(self):
+            return None
+
+        async def _connect(self):
+            return FakeConnection()
+
+    result = asyncio.run(
+        FakeStore().claim_external_image_url_assignment_block(
+            mailbox_id="test-mailbox",
+            worker_id="tb3-worker-01",
+            run_id="stable-run-1",
+            limit=1000,
+        )
+    )
+
+    assert result["claimed"] == 1
+    assert result["items"][0]["canonical_url_digest"] == digest
+    assert len(queries) == 1
 
 
 def test_record_external_image_pending_retryable_sets_retry_metadata():
@@ -3548,6 +3706,107 @@ def test_email_image_proxy_signature_is_required(monkeypatch):
 
     assert pim_email.verify_email_image_signature(source, signature)
     assert not pim_email.verify_email_image_signature(source, "bad")
+
+
+def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_PIM_EMAIL_WORKER_SECRET", "worker-secret-123456")
+    digest = pim_email._external_image_canonical_digest("https://cdn.example.test/api.png")
+
+    class FakeStore:
+        async def claim_external_image_url_assignment_block(self, **kwargs):
+            return {
+                "schema": "xarta.pim_email.external_image_url_assignment.block.v1",
+                "mailbox_id": "test-mailbox",
+                "assignment_batch_id": "assignment-batch-api",
+                "assignment_token": "assignment-token-worker-needs",
+                "worker_id": kwargs["worker_id"],
+                "run_id": kwargs["run_id"],
+                "claimed": 1,
+                "items": [
+                    {
+                        "canonical_url_digest": digest,
+                        "canonical_url": "https://cdn.example.test/api.png",
+                        "source_url": "https://cdn.example.test/api.png?track=1",
+                        "email_uid": "20260702-" + "b" * 40,
+                        "input_raw_sha256": "raw-api-secret",
+                        "assignment_token": "row-token-secret",
+                    }
+                ],
+            }
+
+        async def complete_external_image_url_assignment_with_content(self, **kwargs):
+            assert kwargs["content"] == b"image-bytes"
+            return {
+                "ok": True,
+                "assignment": {
+                    "canonical_url_digest": digest,
+                    "email_uid": "20260702-" + "b" * 40,
+                    "input_raw_sha256": "raw-api-secret",
+                    "assignment_token": "row-token-secret",
+                },
+                "shared_asset": {
+                    "shared_asset_uid": "email-shared-asset-api",
+                    "canonical_url_digest": digest,
+                    "storage_relpath": "assets/plain/path/hidden.enc",
+                    "encryption": {"cipher": "secret"},
+                },
+                "references_linked": 2,
+                "references_link_failed": 0,
+            }
+
+    monkeypatch.setattr(routes_pim_email, "_store", lambda: FakeStore())
+
+    with pytest.raises(routes_pim_email.HTTPException) as exc_info:
+        asyncio.run(
+            routes_pim_email.email_external_image_worker_claim_assignments(
+                routes_pim_email.ExternalImageAssignmentClaimRequest(
+                    worker_id="tb3-worker-01",
+                    run_id="stable-run-1",
+                    limit=1000,
+                ),
+                x_pim_email_worker_token="wrong-token",
+            )
+        )
+    assert exc_info.value.status_code == 401
+
+    claim = asyncio.run(
+        routes_pim_email.email_external_image_worker_claim_assignments(
+            routes_pim_email.ExternalImageAssignmentClaimRequest(
+                worker_id="tb3-worker-01",
+                run_id="stable-run-1",
+                limit=1000,
+            ),
+            x_pim_email_worker_token="worker-secret-123456",
+        )
+    )
+
+    assert claim["assignment_token"] == "assignment-token-worker-needs"
+    assert claim["items"][0]["canonical_url_digest"] == digest
+    assert "assignment_token" not in claim["items"][0]
+    assert "assignment_token" not in claim["items"][0]
+    assert "email_uid" not in claim["items"][0]
+    assert "input_raw_sha256" not in claim["items"][0]
+    assert "raw-api-secret" not in json.dumps(claim)
+
+    complete = asyncio.run(
+        routes_pim_email.email_external_image_worker_complete_assignment(
+            digest,
+            routes_pim_email.ExternalImageAssignmentCompleteRequest(
+                worker_id="tb3-worker-01",
+                assignment_token="assignment-token-worker-needs",
+                image_base64="aW1hZ2UtYnl0ZXM=",
+            ),
+            x_pim_email_worker_token="worker-secret-123456",
+        )
+    )
+
+    assert complete["ok"] is True
+    assert "email_uid" not in complete["result"]["assignment"]
+    assert "input_raw_sha256" not in complete["result"]["assignment"]
+    assert "assignment_token" not in complete["result"]["assignment"]
+    assert "assignment_token" not in complete["result"]["assignment"]
+    assert "storage_relpath" not in complete["result"]["shared_asset"]
+    assert "encryption" not in complete["result"]["shared_asset"]
 
 
 def test_status_route_reports_disabled_send_delete_capabilities(monkeypatch):
