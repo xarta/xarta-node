@@ -79,6 +79,16 @@ class ActiveTerminalProcess:
 
 _TARGET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,80}$")
 _PRIVATE_TARGETS_FILE_ENV = "SSH_TERMINAL_TARGETS_FILE"
+_HERMES_DARK_TUI_ENV = (
+    "-e",
+    "TERM=xterm-256color",
+    "-e",
+    "COLORTERM=truecolor",
+    "-e",
+    "HERMES_TUI_THEME=dark",
+    "-e",
+    "HERMES_TUI_BACKGROUND=#05070b",
+)
 
 
 _STATIC_TARGETS: dict[str, TerminalTarget] = {
@@ -91,8 +101,7 @@ _STATIC_TARGETS: dict[str, TerminalTarget] = {
             "docker",
             "exec",
             "-it",
-            "-e",
-            "TERM=xterm-256color",
+            *_HERMES_DARK_TUI_ENV,
             "hermes-local",
             "/opt/hermes/.venv/bin/hermes",
         ),
@@ -109,8 +118,7 @@ _STATIC_TARGETS: dict[str, TerminalTarget] = {
             "docker",
             "exec",
             "-it",
-            "-e",
-            "TERM=xterm-256color",
+            *_HERMES_DARK_TUI_ENV,
             "-e",
             "PS1=hermes-local:\\w\\$ ",
             "-w",
@@ -133,8 +141,7 @@ _STATIC_TARGETS: dict[str, TerminalTarget] = {
             "docker",
             "exec",
             "-it",
-            "-e",
-            "TERM=xterm-256color",
+            *_HERMES_DARK_TUI_ENV,
             "hermes-local",
             "/opt/hermes/.venv/bin/hermes",
             "setup",
@@ -274,7 +281,7 @@ def _vps_dockge_ssh_command_from_spec(spec: dict[str, Any]) -> tuple[str, ...]:
         "set -u\n"
         f"hosts=({host_array})\n"
         "last_rc=255\n"
-        "for host in \"${hosts[@]}\"; do\n"
+        'for host in "${hosts[@]}"; do\n'
         "  ssh -tt"
         f" -i {shlex.quote(key)}"
         " -o BatchMode=yes"
@@ -284,12 +291,12 @@ def _vps_dockge_ssh_command_from_spec(spec: dict[str, Any]) -> tuple[str, ...]:
         " -o IdentitiesOnly=yes"
         f" -o ConnectTimeout={connect_timeout}"
         f"{source_bind}"
-        f" -a {shlex.quote(user)}@\"$host\" {shlex.quote(remote_command)}\n"
+        f' -a {shlex.quote(user)}@"$host" {shlex.quote(remote_command)}\n'
         "  rc=$?\n"
-        "  if [ \"$rc\" -ne 255 ]; then exit \"$rc\"; fi\n"
+        '  if [ "$rc" -ne 255 ]; then exit "$rc"; fi\n'
         "  last_rc=$rc\n"
         "done\n"
-        "exit \"$last_rc\"\n"
+        'exit "$last_rc"\n'
     )
     return ("bash", "-lc", script)
 
@@ -329,7 +336,9 @@ def _load_private_targets() -> dict[str, TerminalTarget]:
         raw = json.load(handle)
     specs = raw.get("targets") if isinstance(raw, dict) else raw
     if not isinstance(specs, list):
-        raise RuntimeError(f"{_PRIVATE_TARGETS_FILE_ENV} must contain a list or {{'targets': [...]}}")
+        raise RuntimeError(
+            f"{_PRIVATE_TARGETS_FILE_ENV} must contain a list or {{'targets': [...]}}"
+        )
 
     targets: dict[str, TerminalTarget] = {}
     for spec in specs:
@@ -456,7 +465,9 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=2)
 
 
-def _register_process(target_id: str, process: subprocess.Popen[bytes], client_ip: str) -> ActiveTerminalProcess:
+def _register_process(
+    target_id: str, process: subprocess.Popen[bytes], client_ip: str
+) -> ActiveTerminalProcess:
     now = time.monotonic()
     record = ActiveTerminalProcess(
         target_id=target_id,
@@ -495,13 +506,15 @@ def _active_process_payload(now: float | None = None) -> list[dict[str, int | st
     payload: list[dict[str, int | str | float]] = []
     for target_id, records in _ACTIVE_PROCESSES.items():
         for record in records.values():
-            payload.append({
-                "target_id": target_id,
-                "pid": record.process.pid,
-                "client_ip": record.client_ip,
-                "age_secs": round(now - record.started_at, 3),
-                "idle_secs": round(now - record.last_seen_at, 3),
-            })
+            payload.append(
+                {
+                    "target_id": target_id,
+                    "pid": record.process.pid,
+                    "client_ip": record.client_ip,
+                    "age_secs": round(now - record.started_at, 3),
+                    "idle_secs": round(now - record.last_seen_at, 3),
+                }
+            )
     return payload
 
 
@@ -553,7 +566,10 @@ async def run_terminal_process_reaper() -> None:
         for target_id in list(_ACTIVE_PROCESSES):
             stopped += _terminate_target_processes(target_id)
         if stopped:
-            log.info("ssh-terminal reaper stopped %d active terminal process(es) during shutdown", stopped)
+            log.info(
+                "ssh-terminal reaper stopped %d active terminal process(es) during shutdown",
+                stopped,
+            )
         raise
 
 
@@ -622,7 +638,9 @@ async def terminal_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1011, reason="Target config unavailable")
         return
     if not target or not target.enabled:
-        log.warning("ssh-terminal: blocked websocket from %s for unknown target %r", client_ip, target_id)
+        log.warning(
+            "ssh-terminal: blocked websocket from %s for unknown target %r", client_ip, target_id
+        )
         await websocket.close(code=1008, reason="Unknown target")
         return
 
@@ -636,7 +654,9 @@ async def terminal_websocket(websocket: WebSocket) -> None:
     env = os.environ.copy()
     env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor"})
     master_fd, slave_fd = pty.openpty()
-    _resize_pty(master_fd, websocket.query_params.get("cols", 100), websocket.query_params.get("rows", 28))
+    _resize_pty(
+        master_fd, websocket.query_params.get("cols", 100), websocket.query_params.get("rows", 28)
+    )
 
     def _prepare_child() -> None:
         os.setsid()
