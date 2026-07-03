@@ -96,6 +96,7 @@ _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
 _E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS: float | None = None
+_E2EE_SYNC_PAYLOAD_TOTAL_TIMEOUT_SECONDS = 2.0
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -109,6 +110,7 @@ _MAX_SYNC_TIMEOUT_MS = 30_000
 _WORKER_SYNC_TIMEOUT_MS = 25_000
 _WORKER_ERROR_SLEEP_SECONDS = 8.0
 _WORKER_MISSING_CREDENTIALS_SLEEP_SECONDS = 60.0
+_ROOM_SNAPSHOT_CACHE_MAX_AGE_SECONDS = 120.0
 _runtime_access_tokens: dict[tuple[str, str, str, str], str] = {}
 _runtime_access_token_lock = asyncio.Lock()
 _DEFAULT_CRYPTO_STORE_DIR = (
@@ -2396,18 +2398,18 @@ class _MatrixChatE2EEClient:
             if total_timeout_seconds and total_timeout_seconds > 0
             else None
         )
-        async with self._crypto_lock:
-            for raw in _events_without_redacted_targets(events):
-                if _event_is_redacted(raw):
-                    continue
-                try:
-                    event = Event.deserialize(raw)
-                except Exception:
-                    fallback = _message_from_event(raw, room_id)
-                    if fallback:
-                        messages.append(fallback)
-                    continue
-                try:
+        for raw in _events_without_redacted_targets(events):
+            if _event_is_redacted(raw):
+                continue
+            try:
+                event = Event.deserialize(raw)
+            except Exception:
+                fallback = _message_from_event(raw, room_id)
+                if fallback:
+                    messages.append(fallback)
+                continue
+            try:
+                async with self._crypto_lock:
                     if deadline is None:
                         message = await self.message_from_event(event, room_id)
                     else:
@@ -2418,18 +2420,18 @@ class _MatrixChatE2EEClient:
                             self.message_from_event(event, room_id),
                             timeout=remaining,
                         )
-                except TimeoutError:
-                    fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
-                    if fallback:
-                        log.warning(
-                            "Matrix chat E2EE decrypt timed out room=%s event=%s",
-                            room_id,
-                            fallback["event_id"],
-                        )
-                        messages.append(fallback)
-                    continue
-                if message:
-                    messages.append(message)
+            except TimeoutError:
+                fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
+                if fallback:
+                    log.warning(
+                        "Matrix chat E2EE decrypt timed out room=%s event=%s",
+                        room_id,
+                        fallback["event_id"],
+                    )
+                    messages.append(fallback)
+                continue
+            if message:
+                messages.append(message)
         return messages
 
 
@@ -5058,12 +5060,19 @@ async def _matrix_chat_sync_payload(
     settings: dict[str, str],
     sync: dict[str, Any],
     e2ee_client: _MatrixChatE2EEClient | None,
+    *,
+    decrypt_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     joined, invited = _rooms_from_sync(sync)
     _annotate_room_settings(settings, joined)
     rooms = sync.get("rooms") if isinstance(sync.get("rooms"), dict) else {}
     joined_raw = rooms.get("join") if isinstance(rooms.get("join"), dict) else {}
     room_updates = []
+    decrypt_deadline = (
+        time.monotonic() + decrypt_timeout_seconds
+        if decrypt_timeout_seconds and decrypt_timeout_seconds > 0
+        else None
+    )
     for room_id, room in joined_raw.items():
         if not isinstance(room, dict):
             continue
@@ -5072,7 +5081,19 @@ async def _matrix_chat_sync_payload(
         redacted_event_id_set = set(redacted_event_ids)
         unredacted_events = _events_without_redacted_targets(raw_events)
         if e2ee_client:
-            messages = await e2ee_client.messages_from_raw_events(room_id, unredacted_events)
+            remaining = (
+                max(0.0, decrypt_deadline - time.monotonic())
+                if decrypt_deadline is not None
+                else None
+            )
+            if remaining is not None and remaining <= 0:
+                messages = []
+            else:
+                messages = await e2ee_client.messages_from_raw_events(
+                    room_id,
+                    unredacted_events,
+                    total_timeout_seconds=remaining,
+                )
         else:
             messages = [_message_from_event(event, room_id) for event in unredacted_events]
         messages = [
@@ -5114,6 +5135,7 @@ def _payload_has_visible_updates(payload: dict[str, Any], *, snapshot: bool = Fa
 _sync_worker_tasks: dict[str, asyncio.Task[None]] = {}
 _sync_worker_lock = asyncio.Lock()
 _sync_worker_status: dict[str, dict[str, Any]] = {}
+_sync_worker_room_snapshots: dict[str, dict[str, Any]] = {}
 _BRIDGE_MINUTES_SEEN_EVENT_IDS: dict[str, float] = {}
 _BRIDGE_MINUTES_SEEN_EVENT_LIMIT = 2000
 
@@ -5133,6 +5155,39 @@ def _set_worker_status(server_id: str, **updates: Any) -> None:
     )
     state.update(updates)
     state["updated_at"] = time.time()
+
+
+def _remember_room_snapshot(payload: dict[str, Any]) -> None:
+    server_id = str(payload.get("server_id") or "")
+    if server_id not in _MATRIX_SERVER_LABELS:
+        return
+    joined = payload.get("joined") if isinstance(payload.get("joined"), list) else []
+    invites = payload.get("invites") if isinstance(payload.get("invites"), list) else []
+    _sync_worker_room_snapshots[server_id] = {
+        "server_id": server_id,
+        "next_batch": payload.get("next_batch")
+        if isinstance(payload.get("next_batch"), str)
+        else None,
+        "joined": [room for room in joined if isinstance(room, dict)],
+        "invites": [room for room in invites if isinstance(room, dict)],
+        "updated_at": time.time(),
+    }
+
+
+def _cached_room_snapshot(server_id: str) -> dict[str, Any] | None:
+    snapshot = _sync_worker_room_snapshots.get(server_id)
+    if not snapshot:
+        return None
+    updated_at = float(snapshot.get("updated_at") or 0.0)
+    if time.time() - updated_at > _ROOM_SNAPSHOT_CACHE_MAX_AGE_SECONDS:
+        return None
+    return {
+        "next_batch": snapshot.get("next_batch")
+        if isinstance(snapshot.get("next_batch"), str)
+        else None,
+        "joined": [dict(room) for room in snapshot.get("joined") or []],
+        "invites": [dict(room) for room in snapshot.get("invites") or []],
+    }
 
 
 async def _publish_worker_payload(payload: dict[str, Any], *, snapshot: bool) -> None:
@@ -5322,7 +5377,14 @@ async def _matrix_chat_sync_worker(server_id: str) -> None:
                     timeout_ms=0 if snapshot else _WORKER_SYNC_TIMEOUT_MS,
                     full_state=snapshot,
                 )
-                payload = await _matrix_chat_sync_payload(settings, sync, e2ee_client)
+                payload = await _matrix_chat_sync_payload(
+                    settings,
+                    sync,
+                    e2ee_client,
+                    decrypt_timeout_seconds=_E2EE_SYNC_PAYLOAD_TOTAL_TIMEOUT_SECONDS,
+                )
+                if snapshot:
+                    _remember_room_snapshot(payload)
                 next_batch = payload.get("next_batch") or next_batch
                 if _payload_has_visible_updates(payload, snapshot=snapshot):
                     minutes_record = _record_matrix_bridge_minutes_from_payload(
@@ -5563,20 +5625,23 @@ async def matrix_chat_admin_room_members(room_id: str) -> dict[str, Any]:
 @router.get("/rooms")
 async def matrix_chat_rooms() -> dict[str, Any]:
     settings = _settings()
+    cached = _cached_room_snapshot(settings["server_id"])
+    if cached is not None:
+        _annotate_room_settings(settings, cached["joined"])
+        return cached
+
     sync, _e2ee_client = await _sync_for_chat(timeout_ms=0, full_state=True)
     joined, invited = _rooms_from_sync(sync)
-    if _e2ee_client:
-        raw_sync = await _sync(timeout_ms=0, full_state=True)
-        raw_joined, raw_invited = _rooms_from_sync(raw_sync)
-        joined_ids = {room.get("room_id") for room in joined}
-        invite_ids = {room.get("room_id") for room in invited}
-        joined.extend(room for room in raw_joined if room.get("room_id") not in joined_ids)
-        invited.extend(room for room in raw_invited if room.get("room_id") not in invite_ids)
-        joined.sort(key=lambda room: room.get("last_event_ts") or 0, reverse=True)
-        invited.sort(key=lambda room: room.get("name") or room.get("room_id"))
     _annotate_room_settings(settings, joined)
-    return {
+    payload = {
+        "server_id": settings["server_id"],
         "next_batch": sync.get("next_batch") if isinstance(sync.get("next_batch"), str) else None,
+        "joined": joined,
+        "invites": invited,
+    }
+    _remember_room_snapshot(payload)
+    return {
+        "next_batch": payload["next_batch"],
         "joined": joined,
         "invites": invited,
     }
@@ -7236,7 +7301,13 @@ async def matrix_chat_sync(
 ) -> dict[str, Any]:
     settings = _settings()
     sync, e2ee_client = await _sync_for_chat(since=since, timeout_ms=timeout_ms, full_state=False)
-    return await _matrix_chat_sync_payload(settings, sync, e2ee_client)
+    payload = await _matrix_chat_sync_payload(
+        settings,
+        sync,
+        e2ee_client,
+        decrypt_timeout_seconds=_E2EE_SYNC_PAYLOAD_TOTAL_TIMEOUT_SECONDS,
+    )
+    return payload
 
 
 @router.get("/sync-worker/status")

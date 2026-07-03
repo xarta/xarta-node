@@ -2636,7 +2636,7 @@ def test_matrix_chat_sync_records_bridge_messages_to_minutes(monkeypatch, tmp_pa
     assert "prior turn order" in entries[1]["payload"]["result_summary"]
 
 
-def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch, tmp_path):
+def test_matrix_chat_rooms_uses_cached_worker_snapshot(monkeypatch, tmp_path):
     bridge_id = "!bridge:test.example"
     minutes_id = "!minutes:test.example"
 
@@ -2658,17 +2658,6 @@ def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch,
             )
         return {"state": {"events": events}, "timeline": {"events": []}}
 
-    e2ee_sync = {"rooms": {"join": {bridge_id: room_state("Bridge")}}, "next_batch": "e2ee"}
-    raw_sync = {
-        "rooms": {
-            "join": {
-                bridge_id: room_state("Bridge"),
-                minutes_id: room_state("Minutes"),
-            }
-        },
-        "next_batch": "raw",
-    }
-
     monkeypatch.setattr(
         matrix_chat,
         "_settings",
@@ -2680,14 +2669,22 @@ def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch,
         },
     )
 
-    async def fake_sync_for_chat(**_kwargs):
-        return e2ee_sync, object()
+    matrix_chat._sync_worker_room_snapshots.clear()
+    matrix_chat._sync_worker_room_snapshots["tb1"] = {
+        "server_id": "tb1",
+        "next_batch": "cached",
+        "joined": [
+            {"room_id": bridge_id, "display_name": "Bridge"},
+            {"room_id": minutes_id, "display_name": "Minutes", "encrypted": True},
+        ],
+        "invites": [],
+        "updated_at": matrix_chat.time.time(),
+    }
 
-    async def fake_sync(**_kwargs):
-        return raw_sync
+    async def fail_sync_for_chat(**_kwargs):
+        raise AssertionError("cached Matrix rooms should not issue a fresh sync")
 
-    monkeypatch.setattr(matrix_chat, "_sync_for_chat", fake_sync_for_chat)
-    monkeypatch.setattr(matrix_chat, "_sync", fake_sync)
+    monkeypatch.setattr(matrix_chat, "_sync_for_chat", fail_sync_for_chat)
 
     result = asyncio.run(matrix_chat.matrix_chat_rooms())
 
@@ -2696,6 +2693,110 @@ def test_matrix_chat_rooms_merges_raw_sync_when_e2ee_room_list_lags(monkeypatch,
     assert "Minutes" in titles
     minutes = [room for room in result["joined"] if room["room_id"] == minutes_id][0]
     assert minutes["encrypted"] is True
+    matrix_chat._sync_worker_room_snapshots.clear()
+
+
+def test_matrix_chat_rooms_does_not_run_raw_sync_fallback_for_e2ee(monkeypatch, tmp_path):
+    bridge_id = "!bridge:test.example"
+
+    def room_state(name: str) -> dict[str, object]:
+        return {
+            "state": {
+                "events": [
+                    {
+                        "type": "m.room.name",
+                        "content": {"name": name},
+                        "origin_server_ts": 1000,
+                    },
+                    {
+                        "type": "m.room.encryption",
+                        "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                        "origin_server_ts": 1001,
+                    },
+                ]
+            },
+            "timeline": {"events": []},
+        }
+
+    e2ee_sync = {"rooms": {"join": {bridge_id: room_state("Bridge")}}, "next_batch": "e2ee"}
+
+    monkeypatch.setattr(
+        matrix_chat,
+        "_settings",
+        lambda: {
+            "server_id": "tb1",
+            "server_label": "TB1",
+            "room_settings_file": str(tmp_path / "room-settings.json"),
+            "admin_access_token": "",
+        },
+    )
+    matrix_chat._sync_worker_room_snapshots.clear()
+
+    async def fake_sync_for_chat(**_kwargs):
+        return e2ee_sync, object()
+
+    async def fail_raw_sync(**_kwargs):
+        raise AssertionError("Matrix rooms should not issue duplicate raw full-state sync")
+
+    monkeypatch.setattr(matrix_chat, "_sync_for_chat", fake_sync_for_chat)
+    monkeypatch.setattr(matrix_chat, "_sync", fail_raw_sync)
+
+    result = asyncio.run(matrix_chat.matrix_chat_rooms())
+
+    assert result["next_batch"] == "e2ee"
+    assert [room["room_id"] for room in result["joined"]] == [bridge_id]
+    assert matrix_chat._sync_worker_room_snapshots["tb1"]["next_batch"] == "e2ee"
+    matrix_chat._sync_worker_room_snapshots.clear()
+
+
+def test_matrix_chat_incremental_sync_does_not_overwrite_room_snapshot(monkeypatch, tmp_path):
+    bridge_id = "!bridge:test.example"
+    minutes_id = "!minutes:test.example"
+    monkeypatch.setattr(
+        matrix_chat,
+        "_settings",
+        lambda: {
+            "server_id": "tb1",
+            "server_label": "TB1",
+            "room_settings_file": str(tmp_path / "room-settings.json"),
+            "admin_access_token": "",
+        },
+    )
+    matrix_chat._sync_worker_room_snapshots.clear()
+    matrix_chat._sync_worker_room_snapshots["tb1"] = {
+        "server_id": "tb1",
+        "next_batch": "full",
+        "joined": [
+            {"room_id": bridge_id, "display_name": "Bridge"},
+            {"room_id": minutes_id, "display_name": "Minutes"},
+        ],
+        "invites": [],
+        "updated_at": matrix_chat.time.time(),
+    }
+
+    async def fake_sync_for_chat(**_kwargs):
+        return {}, object()
+
+    async def fake_sync_payload(*_args, **_kwargs):
+        return {
+            "server_id": "tb1",
+            "server_label": "TB1",
+            "next_batch": "incremental",
+            "joined": [{"room_id": bridge_id, "display_name": "Bridge"}],
+            "invites": [],
+            "room_updates": [],
+        }
+
+    monkeypatch.setattr(matrix_chat, "_sync_for_chat", fake_sync_for_chat)
+    monkeypatch.setattr(matrix_chat, "_matrix_chat_sync_payload", fake_sync_payload)
+
+    result = asyncio.run(matrix_chat.matrix_chat_sync())
+
+    assert result["next_batch"] == "incremental"
+    snapshot = matrix_chat._sync_worker_room_snapshots["tb1"]
+    assert snapshot["next_batch"] == "full"
+    assert [room["room_id"] for room in snapshot["joined"]] == [bridge_id, minutes_id]
+    matrix_chat._sync_worker_room_snapshots.clear()
 
 
 def test_minutes_config_reads_matrix_targets(tmp_path, monkeypatch):
@@ -5540,6 +5641,61 @@ def test_matrix_chat_e2ee_messages_serializes_crypto_store_access():
     assert max_active == 1
     assert first[0]["body"] == "decrypted text"
     assert second[0]["body"] == "decrypted text"
+
+
+def test_matrix_chat_e2ee_message_batches_release_lock_between_events():
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+
+    class SlowCrypto:
+        async def decrypt_megolm_event(self, event):
+            event_id = str(event.event_id)
+            if event_id == "$batch-one":
+                first_started.set()
+                await release_first.wait()
+            elif event_id == "$batch-two":
+                second_started.set()
+                await release_second.wait()
+            return _FakeDecryptedEvent(event_id=event_id)
+
+    class FakeClient:
+        crypto = SlowCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    async def run_probe():
+        batch_task = asyncio.create_task(
+            client.messages_from_raw_events(
+                "!room:test",
+                [_encrypted_raw_event("$batch-one"), _encrypted_raw_event("$batch-two")],
+            )
+        )
+        await first_started.wait()
+        single_task = asyncio.create_task(
+            client.messages_from_raw_events("!room:test", [_encrypted_raw_event("$single")])
+        )
+        await asyncio.sleep(0)
+        release_first.set()
+        single = await asyncio.wait_for(single_task, timeout=0.2)
+        release_second.set()
+        batch = await asyncio.wait_for(batch_task, timeout=0.2)
+        return batch, single
+
+    batch, single = asyncio.run(run_probe())
+
+    assert [message["event_id"] for message in single] == ["$single"]
+    assert [message["event_id"] for message in batch] == ["$batch-one", "$batch-two"]
 
 
 def test_matrix_chat_sync_long_poll_does_not_block_message_decrypt():
