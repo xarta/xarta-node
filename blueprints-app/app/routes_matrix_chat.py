@@ -95,6 +95,8 @@ _DEFAULT_SMOKE_ROOM_ID = ""
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
+_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS = 0.75
+_E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS = 5.0
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -2377,10 +2379,13 @@ class _MatrixChatE2EEClient:
         self,
         room_id: str,
         events: list[dict[str, Any]],
+        *,
+        total_timeout_seconds: float = _E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS,
     ) -> list[dict[str, Any]]:
         from mautrix.types import Event
 
         messages: list[dict[str, Any]] = []
+        deadline = time.monotonic() + max(0.0, total_timeout_seconds)
         for raw in _events_without_redacted_targets(events):
             if _event_is_redacted(raw):
                 continue
@@ -2391,7 +2396,27 @@ class _MatrixChatE2EEClient:
                 if fallback:
                     messages.append(fallback)
                 continue
-            message = await self.message_from_event(event, room_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
+                if fallback:
+                    messages.append(fallback)
+                continue
+            try:
+                message = await asyncio.wait_for(
+                    self.message_from_event(event, room_id),
+                    timeout=min(_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS, remaining),
+                )
+            except TimeoutError:
+                fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
+                if fallback:
+                    log.warning(
+                        "Matrix chat E2EE decrypt timed out room=%s event=%s",
+                        room_id,
+                        fallback["event_id"],
+                    )
+                    messages.append(fallback)
+                continue
             if message:
                 messages.append(message)
         return messages
@@ -4630,6 +4655,24 @@ def _message_from_event(event: dict[str, Any], room_id: str) -> dict[str, Any] |
         system_message=system_message if isinstance(system_message, dict) else None,
         media=media,
         encrypted=event_type == "m.room.encrypted",
+        decrypted=False,
+    )
+
+
+def _unable_to_decrypt_message_from_raw_event(
+    event: dict[str, Any],
+    room_id: str,
+) -> dict[str, Any] | None:
+    if _event_is_redacted(event) or event.get("type") != "m.room.encrypted":
+        return None
+    return _message_from_parts(
+        event_id=event.get("event_id") or "",
+        room_id=room_id,
+        sender=event.get("sender") or "",
+        origin_server_ts=_event_ts(event),
+        msgtype="m.encrypted",
+        body="[unable to decrypt encrypted event]",
+        encrypted=True,
         decrypted=False,
     )
 
