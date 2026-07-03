@@ -5392,7 +5392,43 @@ async def test_matrix_chat_e2ee_messages_treat_missing_end_as_start_of_history(m
     }
 
 
-def test_matrix_chat_e2ee_messages_timeout_returns_undecrypted_placeholder(monkeypatch):
+class _FakeDecryptedContent:
+    body = "decrypted text"
+    msgtype = "m.text"
+
+    def serialize(self):
+        return {"msgtype": self.msgtype, "body": self.body}
+
+
+class _FakeDecryptedEvent:
+    def __init__(self, event_id="$decrypted", sender="@alice:test", timestamp=1710000000000):
+        from mautrix.types import EventType
+
+        self.type = EventType.ROOM_MESSAGE
+        self.event_id = event_id
+        self.sender = sender
+        self.timestamp = timestamp
+        self.content = _FakeDecryptedContent()
+
+
+def _encrypted_raw_event(event_id: str) -> dict[str, object]:
+    return {
+        "type": "m.room.encrypted",
+        "event_id": event_id,
+        "room_id": "!room:test",
+        "sender": "@alice:test",
+        "origin_server_ts": 1710000000000,
+        "content": {
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "ciphertext": "abc",
+            "device_id": "DEVICE",
+            "sender_key": "key",
+            "session_id": "session",
+        },
+    }
+
+
+def test_matrix_chat_e2ee_messages_explicit_timeout_returns_undecrypted_placeholder():
     class SlowCrypto:
         async def decrypt_megolm_event(self, _event):
             await asyncio.sleep(1)
@@ -5410,27 +5446,11 @@ def test_matrix_chat_e2ee_messages_timeout_returns_undecrypted_placeholder(monke
     )
     client._started = True
     client._client = FakeClient()
-    monkeypatch.setattr(matrix_chat, "_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS", 0.01)
 
     messages = asyncio.run(
         client.messages_from_raw_events(
             "!room:test",
-            [
-                {
-                    "type": "m.room.encrypted",
-                    "event_id": "$slow",
-                    "room_id": "!room:test",
-                    "sender": "@alice:test",
-                    "origin_server_ts": 1710000000000,
-                    "content": {
-                        "algorithm": "m.megolm.v1.aes-sha2",
-                        "ciphertext": "abc",
-                        "device_id": "DEVICE",
-                        "sender_key": "key",
-                        "session_id": "session",
-                    },
-                }
-            ],
+            [_encrypted_raw_event("$slow")],
             total_timeout_seconds=0.05,
         )
     )
@@ -5450,3 +5470,73 @@ def test_matrix_chat_e2ee_messages_timeout_returns_undecrypted_placeholder(monke
             "decrypted": False,
         }
     ]
+
+
+def test_matrix_chat_e2ee_messages_waits_for_decryptable_events_by_default():
+    class SlowCrypto:
+        async def decrypt_megolm_event(self, event):
+            await asyncio.sleep(0.02)
+            return _FakeDecryptedEvent(event_id=str(event.event_id))
+
+    class FakeClient:
+        crypto = SlowCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    messages = asyncio.run(
+        client.messages_from_raw_events("!room:test", [_encrypted_raw_event("$ok")])
+    )
+
+    assert messages[0]["event_id"] == "$ok"
+    assert messages[0]["body"] == "decrypted text"
+    assert messages[0]["encrypted"] is True
+    assert messages[0]["decrypted"] is True
+
+
+def test_matrix_chat_e2ee_messages_serializes_crypto_store_access():
+    active = 0
+    max_active = 0
+
+    class SlowCrypto:
+        async def decrypt_megolm_event(self, event):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return _FakeDecryptedEvent(event_id=str(event.event_id))
+
+    class FakeClient:
+        crypto = SlowCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    async def run_concurrently():
+        return await asyncio.gather(
+            client.messages_from_raw_events("!room:test", [_encrypted_raw_event("$one")]),
+            client.messages_from_raw_events("!room:test", [_encrypted_raw_event("$two")]),
+        )
+
+    first, second = asyncio.run(run_concurrently())
+
+    assert max_active == 1
+    assert first[0]["body"] == "decrypted text"
+    assert second[0]["body"] == "decrypted text"
