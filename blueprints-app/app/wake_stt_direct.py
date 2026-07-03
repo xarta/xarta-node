@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import ipaddress
 import json
 import os
@@ -6290,7 +6291,7 @@ async def _call_nullclaw_web_research(
     followup: WakeSttResearchFollowupResult | None = None,
     environ: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    from . import routes_web_research
+    routes_web_research = importlib.import_module("app.routes_web_research")
 
     context = _read_wake_stt_research_context(environ)
     if followup is None and context and not _wake_stt_research_request_resets_context(request_text):

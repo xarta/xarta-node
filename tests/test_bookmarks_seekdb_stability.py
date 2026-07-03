@@ -110,17 +110,14 @@ def test_bookmarks_health_degrades_when_seekdb_counts_fail(monkeypatch):
 
 
 def test_normal_health_does_not_call_seekdb(monkeypatch):
-    async def run():
-        monkeypatch.setattr(routes_health, "get_conn", _bookmark_counts_conn)
+    monkeypatch.setattr(routes_health, "get_conn", _bookmark_counts_conn)
 
-        payload = await routes_health.health()
+    payload = routes_health.health()
 
-        assert payload.status == "ok"
-        assert payload.node_id == "test-node"
-        assert payload.gen == 7
-        assert payload.integrity_ok is True
-
-    asyncio.run(run())
+    assert payload.status == "ok"
+    assert payload.node_id == "test-node"
+    assert payload.gen == 7
+    assert payload.integrity_ok is True
 
 
 def test_sync_single_flight_coalesces_followup(monkeypatch):

@@ -258,7 +258,7 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
     if node_id == cfg.NODE_ID:
         from .routes_health import repo_versions
 
-        return await repo_versions()
+        return await asyncio.to_thread(repo_versions)
 
     with get_conn() as conn:
         row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
