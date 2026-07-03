@@ -95,8 +95,7 @@ _DEFAULT_SMOKE_ROOM_ID = ""
 _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
-_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS = 0.75
-_E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS = 5.0
+_E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS: float | None = None
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -1960,6 +1959,7 @@ class _MatrixChatE2EEClient:
         self._joined_rooms: set[str] = set()
         self._started = False
         self._lock = asyncio.Lock()
+        self._crypto_lock = asyncio.Lock()
 
     @property
     def key(self) -> tuple[str, str, str, str]:
@@ -1987,16 +1987,17 @@ class _MatrixChatE2EEClient:
             self._client = None
             self._crypto_db = None
 
-            if crypto_db is not None:
-                with suppress(Exception):
-                    await crypto_db.stop()
-            session = getattr(api, "session", None)
-            close = getattr(session, "close", None)
-            if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
+            async with self._crypto_lock:
+                if crypto_db is not None:
                     with suppress(Exception):
-                        await result
+                        await crypto_db.stop()
+                session = getattr(api, "session", None)
+                close = getattr(session, "close", None)
+                if close is not None:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        with suppress(Exception):
+                            await result
 
     async def _start(self) -> None:
         ok, detail = _check_e2ee_deps()
@@ -2162,14 +2163,15 @@ class _MatrixChatE2EEClient:
         filter_id = None
         if full_state and not since:
             filter_id = json.dumps({"room": {"timeline": {"limit": 0}}}, separators=(",", ":"))
-        data = await self._client.sync(
-            since=since,
-            timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
-            full_state=full_state,
-            filter_id=filter_id,
-        )
-        if isinstance(data, dict):
-            await self._handle_sync_data(data)
+        async with self._crypto_lock:
+            data = await self._client.sync(
+                since=since,
+                timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
+                full_state=full_state,
+                filter_id=filter_id,
+            )
+            if isinstance(data, dict):
+                await self._handle_sync_data(data)
         return data if isinstance(data, dict) else {}
 
     async def messages(
@@ -2221,24 +2223,26 @@ class _MatrixChatE2EEClient:
         from mautrix.types import EventType, RoomID
 
         await self.ensure_started()
-        event_id = await self._client.send_message_event(
-            RoomID(room_id),
-            EventType.ROOM_MESSAGE,
-            _matrix_message_content(body),
-        )
-        _secure_crypto_store(self._store_dir)
+        async with self._crypto_lock:
+            event_id = await self._client.send_message_event(
+                RoomID(room_id),
+                EventType.ROOM_MESSAGE,
+                _matrix_message_content(body),
+            )
+            _secure_crypto_store(self._store_dir)
         return {"room_id": room_id, "event_id": str(event_id)}
 
     async def send_message_content(self, room_id: str, content: dict[str, Any]) -> dict[str, Any]:
         from mautrix.types import EventType, RoomID
 
         await self.ensure_started()
-        event_id = await self._client.send_message_event(
-            RoomID(room_id),
-            EventType.ROOM_MESSAGE,
-            content,
-        )
-        _secure_crypto_store(self._store_dir)
+        async with self._crypto_lock:
+            event_id = await self._client.send_message_event(
+                RoomID(room_id),
+                EventType.ROOM_MESSAGE,
+                content,
+            )
+            _secure_crypto_store(self._store_dir)
         return {"room_id": room_id, "event_id": str(event_id)}
 
     async def download_attachment_event(self, room_id: str, event_id: str) -> dict[str, Any]:
@@ -2246,16 +2250,17 @@ class _MatrixChatE2EEClient:
         from mautrix.types import EventID, EventType, RoomID
 
         await self.ensure_started()
-        event = await self._client.get_event(RoomID(room_id), EventID(event_id))
-        encrypted_event = str(getattr(event, "type", "")) == str(EventType.ROOM_ENCRYPTED)
-        if encrypted_event:
-            try:
-                event = await self._client.crypto.decrypt_megolm_event(event)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Matrix event could not be decrypted by the Blueprints service device",
-                ) from exc
+        async with self._crypto_lock:
+            event = await self._client.get_event(RoomID(room_id), EventID(event_id))
+            encrypted_event = str(getattr(event, "type", "")) == str(EventType.ROOM_ENCRYPTED)
+            if encrypted_event:
+                try:
+                    event = await self._client.crypto.decrypt_megolm_event(event)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Matrix event could not be decrypted by the Blueprints service device",
+                    ) from exc
 
         if str(getattr(event, "type", "")) != str(EventType.ROOM_MESSAGE):
             raise HTTPException(status_code=400, detail="Matrix event is not a room message")
@@ -2384,41 +2389,47 @@ class _MatrixChatE2EEClient:
     ) -> list[dict[str, Any]]:
         from mautrix.types import Event
 
+        await self.ensure_started() if not self._started else None
         messages: list[dict[str, Any]] = []
-        deadline = time.monotonic() + max(0.0, total_timeout_seconds)
-        for raw in _events_without_redacted_targets(events):
-            if _event_is_redacted(raw):
-                continue
-            try:
-                event = Event.deserialize(raw)
-            except Exception:
-                fallback = _message_from_event(raw, room_id)
-                if fallback:
-                    messages.append(fallback)
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
-                if fallback:
-                    messages.append(fallback)
-                continue
-            try:
-                message = await asyncio.wait_for(
-                    self.message_from_event(event, room_id),
-                    timeout=min(_E2EE_MESSAGE_DECRYPT_TIMEOUT_SECONDS, remaining),
-                )
-            except TimeoutError:
-                fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
-                if fallback:
-                    log.warning(
-                        "Matrix chat E2EE decrypt timed out room=%s event=%s",
-                        room_id,
-                        fallback["event_id"],
-                    )
-                    messages.append(fallback)
-                continue
-            if message:
-                messages.append(message)
+        deadline = (
+            time.monotonic() + total_timeout_seconds
+            if total_timeout_seconds and total_timeout_seconds > 0
+            else None
+        )
+        async with self._crypto_lock:
+            for raw in _events_without_redacted_targets(events):
+                if _event_is_redacted(raw):
+                    continue
+                try:
+                    event = Event.deserialize(raw)
+                except Exception:
+                    fallback = _message_from_event(raw, room_id)
+                    if fallback:
+                        messages.append(fallback)
+                    continue
+                try:
+                    if deadline is None:
+                        message = await self.message_from_event(event, room_id)
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        message = await asyncio.wait_for(
+                            self.message_from_event(event, room_id),
+                            timeout=remaining,
+                        )
+                except TimeoutError:
+                    fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
+                    if fallback:
+                        log.warning(
+                            "Matrix chat E2EE decrypt timed out room=%s event=%s",
+                            room_id,
+                            fallback["event_id"],
+                        )
+                        messages.append(fallback)
+                    continue
+                if message:
+                    messages.append(message)
         return messages
 
 
