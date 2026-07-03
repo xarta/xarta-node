@@ -224,6 +224,7 @@ def _generated_work_rows(result: dict[str, Any]) -> int:
         + int(summary.get("external_image_unique_urls_already_stored") or 0)
         + int(summary.get("external_image_unique_urls_unavailable") or 0)
         + int(summary.get("external_image_unique_urls_blocked") or 0)
+        + int(summary.get("external_image_unique_urls_pending_retryable") or 0)
         + int(summary.get("external_image_unique_references_linked") or 0)
         + int(summary.get("external_image_unique_references_terminal") or 0)
     )
@@ -495,6 +496,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         unique_summary["external_image_unique_references_linked"]
                         + unique_summary["external_image_unique_references_terminal"]
                         + unique_summary["external_image_unique_urls_stored"]
+                        + unique_summary["external_image_unique_urls_pending_retryable"]
                     ),
                     failed_count=(
                         unique_summary["external_image_unique_urls_failed"]
@@ -666,6 +668,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         + aggregate["external_image_unique_references_linked"]
                         + aggregate["external_image_unique_references_terminal"]
                         + aggregate["external_image_unique_urls_stored"]
+                        + aggregate["external_image_unique_urls_pending_retryable"]
                     ),
                     failed_count=(
                         aggregate["external_images_shared_asset_link_failed"]
@@ -711,6 +714,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                                 + aggregate["external_image_unique_references_linked"]
                                 + aggregate["external_image_unique_references_terminal"]
                                 + aggregate["external_image_unique_urls_stored"]
+                                + aggregate["external_image_unique_urls_pending_retryable"]
                             ),
                             failed_count=(
                                 aggregate["external_images_shared_asset_link_failed"]
@@ -747,6 +751,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                     + aggregate["external_image_unique_references_linked"]
                     + aggregate["external_image_unique_references_terminal"]
                     + aggregate["external_image_unique_urls_stored"]
+                    + aggregate["external_image_unique_urls_pending_retryable"]
                 ),
                 failed_count=(
                     aggregate["external_images_shared_asset_link_failed"]
