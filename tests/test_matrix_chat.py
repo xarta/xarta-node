@@ -5540,3 +5540,51 @@ def test_matrix_chat_e2ee_messages_serializes_crypto_store_access():
     assert max_active == 1
     assert first[0]["body"] == "decrypted text"
     assert second[0]["body"] == "decrypted text"
+
+
+def test_matrix_chat_sync_long_poll_does_not_block_message_decrypt():
+    sync_started = asyncio.Event()
+    release_sync = asyncio.Event()
+
+    class SlowSyncClient:
+        crypto = None
+
+        async def sync(self, **_kwargs):
+            sync_started.set()
+            await release_sync.wait()
+            return {}
+
+        def handle_sync(self, _data):
+            return []
+
+    class FakeCrypto:
+        async def decrypt_megolm_event(self, event):
+            return _FakeDecryptedEvent(event_id=str(event.event_id))
+
+    SlowSyncClient.crypto = FakeCrypto()
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = SlowSyncClient()
+
+    async def run_probe():
+        sync_task = asyncio.create_task(client.sync(since="s1", timeout_ms=25_000))
+        await sync_started.wait()
+        messages = await asyncio.wait_for(
+            client.messages_from_raw_events("!room:test", [_encrypted_raw_event("$ok")]),
+            timeout=0.2,
+        )
+        release_sync.set()
+        await sync_task
+        return messages
+
+    messages = asyncio.run(run_probe())
+
+    assert messages[0]["event_id"] == "$ok"
+    assert messages[0]["body"] == "decrypted text"

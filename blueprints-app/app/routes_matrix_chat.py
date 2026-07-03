@@ -2163,14 +2163,14 @@ class _MatrixChatE2EEClient:
         filter_id = None
         if full_state and not since:
             filter_id = json.dumps({"room": {"timeline": {"limit": 0}}}, separators=(",", ":"))
-        async with self._crypto_lock:
-            data = await self._client.sync(
-                since=since,
-                timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
-                full_state=full_state,
-                filter_id=filter_id,
-            )
-            if isinstance(data, dict):
+        data = await self._client.sync(
+            since=since,
+            timeout=max(0, min(timeout_ms, _MAX_SYNC_TIMEOUT_MS)),
+            full_state=full_state,
+            filter_id=filter_id,
+        )
+        if isinstance(data, dict):
+            async with self._crypto_lock:
                 await self._handle_sync_data(data)
         return data if isinstance(data, dict) else {}
 
