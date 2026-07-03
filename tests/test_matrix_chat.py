@@ -5475,7 +5475,7 @@ async def test_matrix_chat_e2ee_messages_treat_missing_end_as_start_of_history(m
     client._started = True
     client._client = FakeClient()
 
-    async def fake_messages_from_raw_events(room_id, events):
+    async def fake_messages_from_raw_events(room_id, events, **_kwargs):
         return []
 
     monkeypatch.setattr(client, "messages_from_raw_events", fake_messages_from_raw_events)
@@ -5491,6 +5491,82 @@ async def test_matrix_chat_e2ee_messages_treat_missing_end_as_start_of_history(m
         "end": None,
         "at_start": True,
     }
+
+
+def test_matrix_chat_e2ee_messages_exposes_history_metrics_and_recent_order():
+    class FakeAPI:
+        async def request(self, method, path, *, query_params=None, metrics_method=None):
+            return {
+                "chunk": [
+                    _plain_raw_event("$newest", timestamp=1710000002000, body="newest"),
+                    _plain_raw_event("$older", timestamp=1710000001000, body="older"),
+                ],
+                "start": "s-start",
+                "end": "s-end",
+            }
+
+    class FakeClient:
+        api = FakeAPI()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    result = asyncio.run(
+        client.messages(
+            "!room:test",
+            limit=2,
+            include_metrics=True,
+            response_order="recent",
+        )
+    )
+
+    assert [message["event_id"] for message in result["messages"]] == ["$newest", "$older"]
+    assert result["metrics"]["source_order"] == "recent"
+    assert result["metrics"]["response_order"] == "recent"
+    assert result["metrics"]["history_read_only_crypto"] is True
+    assert result["metrics"]["raw_event_count"] == 2
+    assert result["metrics"]["decoded_message_count"] == 2
+    assert "upstream_fetch" in result["metrics"]["stage_seconds"]
+    assert "deserialize_event" in result["metrics"]["stage_seconds"]
+
+
+def test_matrix_chat_e2ee_messages_keep_default_chronological_response():
+    class FakeAPI:
+        async def request(self, method, path, *, query_params=None, metrics_method=None):
+            return {
+                "chunk": [
+                    _plain_raw_event("$newest", timestamp=1710000002000, body="newest"),
+                    _plain_raw_event("$older", timestamp=1710000001000, body="older"),
+                ],
+                "start": "s-start",
+                "end": "s-end",
+            }
+
+    class FakeClient:
+        api = FakeAPI()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    result = asyncio.run(client.messages("!room:test", limit=2))
+
+    assert [message["event_id"] for message in result["messages"]] == ["$older", "$newest"]
 
 
 class _FakeDecryptedContent:
@@ -5526,6 +5602,17 @@ def _encrypted_raw_event(event_id: str) -> dict[str, object]:
             "sender_key": "key",
             "session_id": "session",
         },
+    }
+
+
+def _plain_raw_event(event_id: str, *, timestamp: int, body: str) -> dict[str, object]:
+    return {
+        "type": "m.room.message",
+        "event_id": event_id,
+        "room_id": "!room:test",
+        "sender": "@alice:test",
+        "origin_server_ts": timestamp,
+        "content": {"msgtype": "m.text", "body": body},
     }
 
 
@@ -5648,6 +5735,182 @@ def test_matrix_chat_history_decrypt_fast_path_caches_device_and_skips_trust_res
         assert await olm.resolve_trust(first_device) == TrustState.UNVERIFIED
 
     asyncio.run(run())
+
+
+def test_matrix_chat_history_read_only_crypto_context_skips_mutating_megolm_store_calls():
+    group_session = object()
+    calls = {"get_group": 0, "validate": 0, "put": 0, "ratchet": 0}
+
+    class FakeCryptoStore:
+        async def find_device_by_key(self, _user_id, _identity_key):
+            return None
+
+        async def get_group_session(self, _room_id, _session_id):
+            calls["get_group"] += 1
+            return group_session
+
+        async def validate_message_index(self, *_args, **_kwargs):
+            calls["validate"] += 1
+            return False
+
+        async def put_group_session(self, *_args, **_kwargs):
+            calls["put"] += 1
+
+    class FakeOlm:
+        def __init__(self):
+            self.crypto_store = FakeCryptoStore()
+
+        async def get_or_fetch_device_by_key(self, _user_id, _identity_key):
+            return None
+
+        async def resolve_trust(self, _device, allow_fetch=True):
+            return None
+
+        async def _ratchet_session(self, *_args, **_kwargs):
+            calls["ratchet"] += 1
+
+    olm = FakeOlm()
+    matrix_chat._configure_history_decrypt_fast_path(olm)
+    metrics = matrix_chat._MatrixHistoryMetrics(room_id="!room:test", limit=2)
+    context = matrix_chat._MatrixHistoryCryptoContext(metrics=metrics, read_only=True)
+
+    async def run():
+        token = matrix_chat._MATRIX_HISTORY_CRYPTO_CONTEXT.set(context)
+        try:
+            first = await olm.crypto_store.get_group_session("!room:test", "session")
+            second = await olm.crypto_store.get_group_session("!room:test", "session")
+            assert first is group_session
+            assert second is group_session
+            assert await olm.crypto_store.validate_message_index("key", "session", "$event", 7, 1)
+            await olm._ratchet_session(group_session, 7)
+        finally:
+            matrix_chat._MATRIX_HISTORY_CRYPTO_CONTEXT.reset(token)
+
+    asyncio.run(run())
+
+    assert calls == {"get_group": 1, "validate": 0, "put": 0, "ratchet": 0}
+    assert metrics.stage_counts["crypto_store.get_group_session"] == 1
+    assert metrics.stage_counts["crypto_store.get_group_session_cache"] == 1
+    assert metrics.stage_counts["crypto_store.validate_message_index_skipped"] == 1
+    assert metrics.stage_counts["crypto.ratchet_session_skipped"] == 1
+
+
+def test_matrix_chat_history_fast_path_keeps_live_megolm_store_calls_mutating():
+    group_session = object()
+    calls = {"get_group": 0, "validate": 0, "put": 0, "ratchet": 0}
+
+    class FakeCryptoStore:
+        async def find_device_by_key(self, _user_id, _identity_key):
+            return None
+
+        async def get_group_session(self, _room_id, _session_id):
+            calls["get_group"] += 1
+            return group_session
+
+        async def validate_message_index(self, *_args, **_kwargs):
+            calls["validate"] += 1
+            return True
+
+        async def put_group_session(self, *_args, **_kwargs):
+            calls["put"] += 1
+
+    class FakeOlm:
+        def __init__(self):
+            self.crypto_store = FakeCryptoStore()
+
+        async def get_or_fetch_device_by_key(self, _user_id, _identity_key):
+            return None
+
+        async def resolve_trust(self, _device, allow_fetch=True):
+            return None
+
+        async def _ratchet_session(self, *_args, **_kwargs):
+            calls["ratchet"] += 1
+
+    olm = FakeOlm()
+    matrix_chat._configure_history_decrypt_fast_path(olm)
+
+    async def run():
+        assert await olm.crypto_store.get_group_session("!room:test", "session") is group_session
+        assert await olm.crypto_store.validate_message_index("key", "session", "$event", 7, 1)
+        await olm.crypto_store.put_group_session("!room:test", "key", "session", group_session)
+        await olm._ratchet_session(group_session, 7)
+
+    asyncio.run(run())
+
+    assert calls == {"get_group": 1, "validate": 1, "put": 1, "ratchet": 1}
+
+
+def test_matrix_chat_history_read_only_context_is_active_during_message_decrypt():
+    seen_context = []
+
+    class ContextCheckingCrypto:
+        async def decrypt_megolm_event(self, event):
+            context = matrix_chat._MATRIX_HISTORY_CRYPTO_CONTEXT.get()
+            seen_context.append(context.read_only if context else None)
+            return _FakeDecryptedEvent(event_id=str(event.event_id))
+
+    class FakeClient:
+        crypto = ContextCheckingCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+    metrics = matrix_chat._MatrixHistoryMetrics(room_id="!room:test", limit=1)
+
+    messages = asyncio.run(
+        client.messages_from_raw_events(
+            "!room:test",
+            [_encrypted_raw_event("$ok")],
+            history_read_only_crypto=True,
+            metrics=metrics,
+        )
+    )
+
+    assert seen_context == [True]
+    assert messages[0]["event_id"] == "$ok"
+    assert metrics.stage_counts["decrypt_megolm_event"] == 1
+
+
+def test_matrix_chat_history_decrypt_attempts_events_in_source_recent_order():
+    attempted = []
+
+    class OrderCrypto:
+        async def decrypt_megolm_event(self, event):
+            attempted.append(str(event.event_id))
+            return _FakeDecryptedEvent(event_id=str(event.event_id))
+
+    class FakeClient:
+        crypto = OrderCrypto()
+
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": "/tmp/unused",
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+    client._started = True
+    client._client = FakeClient()
+
+    messages = asyncio.run(
+        client.messages_from_raw_events(
+            "!room:test",
+            [_encrypted_raw_event("$newest"), _encrypted_raw_event("$older")],
+            history_read_only_crypto=True,
+        )
+    )
+
+    assert attempted == ["$newest", "$older"]
+    assert [message["event_id"] for message in messages] == ["$newest", "$older"]
 
 
 def test_matrix_chat_e2ee_messages_serializes_crypto_store_access():

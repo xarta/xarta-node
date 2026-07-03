@@ -26,7 +26,7 @@ import uuid
 import zipfile
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable
 from urllib.parse import quote
@@ -97,6 +97,8 @@ _READ_TIMEOUT = 20.0
 _MAX_MESSAGE_LIMIT = 100
 _E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS: float | None = None
 _E2EE_SYNC_PAYLOAD_TOTAL_TIMEOUT_SECONDS = 2.0
+_MATRIX_HISTORY_SLOW_LOG_SECONDS = 3.0
+_MATRIX_HISTORY_EVENT_METRIC_LIMIT = 80
 _MAX_AUDIO_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_MEDIA_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -1904,6 +1906,116 @@ def _check_e2ee_deps() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _rounded_seconds(value: float) -> float:
+    return round(max(0.0, value), 6)
+
+
+@dataclass
+class _MatrixHistoryMetrics:
+    room_id: str
+    limit: int
+    from_token_present: bool = False
+    raw_event_count: int = 0
+    filtered_event_count: int = 0
+    encrypted_event_count: int = 0
+    redacted_event_count: int = 0
+    attempted_event_count: int = 0
+    decoded_message_count: int = 0
+    undecryptable_event_count: int = 0
+    skipped_event_count: int = 0
+    stage_seconds: dict[str, float] = field(default_factory=dict)
+    stage_counts: dict[str, int] = field(default_factory=dict)
+    event_timings: list[dict[str, Any]] = field(default_factory=list)
+    _active_event: dict[str, Any] | None = field(default=None, init=False, repr=False)
+
+    def record_stage(self, name: str, elapsed: float) -> None:
+        self.stage_seconds[name] = self.stage_seconds.get(name, 0.0) + max(0.0, elapsed)
+        self.stage_counts[name] = self.stage_counts.get(name, 0) + 1
+        if self._active_event is not None:
+            event_stages = self._active_event.setdefault("stage_seconds", {})
+            event_stages[name] = event_stages.get(name, 0.0) + max(0.0, elapsed)
+
+    def begin_event(self, raw: dict[str, Any], *, encrypted: bool) -> None:
+        self.attempted_event_count += 1
+        event_id = str(raw.get("event_id") or "")
+        timing = {
+            "event_id": event_id,
+            "encrypted": encrypted,
+            "origin_server_ts": raw.get("origin_server_ts"),
+            "status": "started",
+            "stage_seconds": {},
+        }
+        if len(self.event_timings) < _MATRIX_HISTORY_EVENT_METRIC_LIMIT:
+            self.event_timings.append(timing)
+            self._active_event = timing
+        else:
+            self._active_event = None
+
+    def finish_event(self, status: str) -> None:
+        if status == "decoded":
+            self.decoded_message_count += 1
+        elif status == "undecryptable":
+            self.undecryptable_event_count += 1
+        elif status == "skipped":
+            self.skipped_event_count += 1
+        if self._active_event is not None:
+            self._active_event["status"] = status
+            self._active_event["stage_seconds"] = {
+                key: _rounded_seconds(value)
+                for key, value in self._active_event.get("stage_seconds", {}).items()
+            }
+        self._active_event = None
+
+    def as_dict(
+        self,
+        *,
+        total_seconds: float,
+        source_order: str,
+        response_order: str,
+        history_read_only_crypto: bool,
+    ) -> dict[str, Any]:
+        return {
+            "room_id": self.room_id,
+            "limit": self.limit,
+            "from_token_present": self.from_token_present,
+            "source_order": source_order,
+            "response_order": response_order,
+            "history_read_only_crypto": history_read_only_crypto,
+            "total_seconds": _rounded_seconds(total_seconds),
+            "raw_event_count": self.raw_event_count,
+            "filtered_event_count": self.filtered_event_count,
+            "encrypted_event_count": self.encrypted_event_count,
+            "redacted_event_count": self.redacted_event_count,
+            "attempted_event_count": self.attempted_event_count,
+            "decoded_message_count": self.decoded_message_count,
+            "undecryptable_event_count": self.undecryptable_event_count,
+            "skipped_event_count": self.skipped_event_count,
+            "stage_seconds": {
+                key: _rounded_seconds(value) for key, value in self.stage_seconds.items()
+            },
+            "stage_counts": dict(self.stage_counts),
+            "event_timings": self.event_timings,
+        }
+
+
+@dataclass
+class _MatrixHistoryCryptoContext:
+    metrics: _MatrixHistoryMetrics | None = None
+    read_only: bool = False
+    group_session_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
+
+
+_MATRIX_HISTORY_CRYPTO_CONTEXT: contextvars.ContextVar[_MatrixHistoryCryptoContext | None] = (
+    contextvars.ContextVar("matrix_history_crypto_context", default=None)
+)
+
+
+def _record_history_crypto_stage(name: str, elapsed: float) -> None:
+    context = _MATRIX_HISTORY_CRYPTO_CONTEXT.get()
+    if context and context.metrics:
+        context.metrics.record_stage(name, elapsed)
+
+
 def _configure_history_decrypt_fast_path(olm: Any) -> None:
     """Avoid per-event cross-signing lookups on the Matrix Chat history path.
 
@@ -1914,6 +2026,9 @@ def _configure_history_decrypt_fast_path(olm: Any) -> None:
     Megolm session verification, but cache device-by-key lookups and return an
     unverified trust state without cross-signing DB/network work.
     """
+    if getattr(olm, "_xarta_history_fast_path_configured", False):
+        return
+
     from mautrix.types import TrustState
 
     device_by_key_cache: dict[tuple[str, str], Any] = {}
@@ -1941,6 +2056,81 @@ def _configure_history_decrypt_fast_path(olm: Any) -> None:
     olm.get_or_fetch_device_by_key = cached_get_or_fetch_device_by_key
     olm.crypto_store.find_device_by_key = cached_find_device_by_key
     olm.resolve_trust = unverified_trust
+
+    if hasattr(olm.crypto_store, "get_group_session"):
+        original_get_group_session = olm.crypto_store.get_group_session
+
+        async def history_get_group_session(room_id: Any, session_id: Any) -> Any:
+            context = _MATRIX_HISTORY_CRYPTO_CONTEXT.get()
+            key = (str(room_id), str(session_id))
+            if context and context.read_only and key in context.group_session_cache:
+                if context.metrics:
+                    context.metrics.record_stage("crypto_store.get_group_session_cache", 0.0)
+                return context.group_session_cache[key]
+            started = time.monotonic()
+            result = await original_get_group_session(room_id, session_id)
+            elapsed = time.monotonic() - started
+            if context and context.metrics:
+                context.metrics.record_stage("crypto_store.get_group_session", elapsed)
+            if context and context.read_only and result is not None:
+                context.group_session_cache[key] = result
+            return result
+
+        olm.crypto_store.get_group_session = history_get_group_session
+
+    if hasattr(olm.crypto_store, "validate_message_index"):
+        original_validate_message_index = olm.crypto_store.validate_message_index
+
+        async def history_validate_message_index(*args: Any, **kwargs: Any) -> Any:
+            context = _MATRIX_HISTORY_CRYPTO_CONTEXT.get()
+            if context and context.read_only:
+                if context.metrics:
+                    context.metrics.record_stage("crypto_store.validate_message_index_skipped", 0.0)
+                return True
+            started = time.monotonic()
+            try:
+                return await original_validate_message_index(*args, **kwargs)
+            finally:
+                _record_history_crypto_stage(
+                    "crypto_store.validate_message_index",
+                    time.monotonic() - started,
+                )
+
+        olm.crypto_store.validate_message_index = history_validate_message_index
+
+    if hasattr(olm.crypto_store, "put_group_session"):
+        original_put_group_session = olm.crypto_store.put_group_session
+
+        async def history_put_group_session(*args: Any, **kwargs: Any) -> Any:
+            started = time.monotonic()
+            try:
+                return await original_put_group_session(*args, **kwargs)
+            finally:
+                _record_history_crypto_stage(
+                    "crypto_store.put_group_session",
+                    time.monotonic() - started,
+                )
+
+        olm.crypto_store.put_group_session = history_put_group_session
+
+    if hasattr(olm, "_ratchet_session"):
+        original_ratchet_session = olm._ratchet_session
+
+        async def history_ratchet_session(*args: Any, **kwargs: Any) -> Any:
+            context = _MATRIX_HISTORY_CRYPTO_CONTEXT.get()
+            if context and context.read_only:
+                if context.metrics:
+                    context.metrics.record_stage("crypto.ratchet_session_skipped", 0.0)
+                return None
+            started = time.monotonic()
+            try:
+                return await original_ratchet_session(*args, **kwargs)
+            finally:
+                _record_history_crypto_stage("crypto.ratchet_session", time.monotonic() - started)
+
+        olm._ratchet_session = history_ratchet_session
+
+    olm._xarta_history_fast_path_configured = True
 
 
 def _secure_crypto_store(store_dir: Path) -> None:
@@ -2222,29 +2412,51 @@ class _MatrixChatE2EEClient:
         *,
         limit: int,
         from_token: str | None = None,
+        include_metrics: bool = False,
+        response_order: str = "chronological",
     ) -> dict[str, Any]:
         from mautrix.api import Method, Path
 
         await self.ensure_started()
+        started = time.monotonic()
+        metrics = (
+            _MatrixHistoryMetrics(
+                room_id=room_id,
+                limit=limit,
+                from_token_present=bool(from_token),
+            )
+            if include_metrics
+            else None
+        )
         query_params = {
             "dir": "b",
             "limit": str(limit),
         }
         if from_token:
             query_params["from"] = from_token
+        upstream_started = time.monotonic()
         data = await self._client.api.request(
             Method.GET,
             Path.v3.rooms[room_id].messages,
             query_params=query_params,
             metrics_method="getMessages",
         )
+        if metrics:
+            metrics.record_stage("upstream_fetch", time.monotonic() - upstream_started)
         events = (
             data.get("chunk")
             if isinstance(data, dict) and isinstance(data.get("chunk"), list)
             else []
         )
-        messages = await self.messages_from_raw_events(room_id, events)
-        messages.reverse()
+        messages = await self.messages_from_raw_events(
+            room_id,
+            events,
+            history_read_only_crypto=True,
+            metrics=metrics,
+        )
+        clean_response_order = response_order if response_order == "recent" else "chronological"
+        if clean_response_order == "chronological":
+            messages.reverse()
         end = (
             data.get("end") if isinstance(data, dict) and isinstance(data.get("end"), str) else None
         )
@@ -2253,13 +2465,30 @@ class _MatrixChatE2EEClient:
             if isinstance(data, dict) and isinstance(data.get("start"), str)
             else from_token
         )
-        return {
+        result = {
             "room_id": room_id,
             "messages": messages,
             "start": start,
             "end": end,
             "at_start": not bool(end),
         }
+        if metrics:
+            elapsed = time.monotonic() - started
+            result["metrics"] = metrics.as_dict(
+                total_seconds=elapsed,
+                source_order="recent",
+                response_order=clean_response_order,
+                history_read_only_crypto=True,
+            )
+            if elapsed >= _MATRIX_HISTORY_SLOW_LOG_SECONDS:
+                log.warning(
+                    "Matrix chat history fetch slow room=%s limit=%s elapsed=%.3fs stages=%s",
+                    room_id,
+                    limit,
+                    elapsed,
+                    result["metrics"]["stage_seconds"],
+                )
+        return result
 
     async def send_message(self, room_id: str, body: str) -> dict[str, Any]:
         from mautrix.types import EventType, RoomID
@@ -2376,8 +2605,17 @@ class _MatrixChatE2EEClient:
         encrypted = str(getattr(event, "type", "")) == str(EventType.ROOM_ENCRYPTED)
         if encrypted:
             try:
+                started = time.monotonic()
                 event = await self._client.crypto.decrypt_megolm_event(event)
+                _record_history_crypto_stage(
+                    "decrypt_megolm_event",
+                    time.monotonic() - started,
+                )
             except Exception:
+                _record_history_crypto_stage(
+                    "decrypt_megolm_event_failed",
+                    time.monotonic() - started,
+                )
                 return _message_from_parts(
                     event_id=str(getattr(event, "event_id", "") or ""),
                     room_id=room_id,
@@ -2389,38 +2627,44 @@ class _MatrixChatE2EEClient:
                     decrypted=False,
                 )
 
-        if str(getattr(event, "type", "")) != str(EventType.ROOM_MESSAGE):
-            return None
-        content = getattr(event, "content", None)
-        body = getattr(content, "body", None)
-        msgtype = getattr(content, "msgtype", None) or "m.text"
-        if not isinstance(body, str):
-            return None
-        source_content = content.serialize() if hasattr(content, "serialize") else {}
-        relates_to = (
-            source_content.get("m.relates_to") if isinstance(source_content, dict) else None
-        )
-        system_message = (
-            source_content.get("org.xarta.system_message")
-            if isinstance(source_content, dict)
-            else None
-        )
-        media = (
-            _media_fields_from_content(source_content) if isinstance(source_content, dict) else None
-        )
-        return _message_from_parts(
-            event_id=str(getattr(event, "event_id", "") or ""),
-            room_id=room_id,
-            sender=str(getattr(event, "sender", "") or ""),
-            origin_server_ts=getattr(event, "timestamp", None),
-            msgtype=str(msgtype),
-            body=body,
-            relates_to=relates_to if isinstance(relates_to, dict) else None,
-            system_message=system_message if isinstance(system_message, dict) else None,
-            media=media,
-            encrypted=encrypted,
-            decrypted=encrypted,
-        )
+        convert_started = time.monotonic()
+        try:
+            if str(getattr(event, "type", "")) != str(EventType.ROOM_MESSAGE):
+                return None
+            content = getattr(event, "content", None)
+            body = getattr(content, "body", None)
+            msgtype = getattr(content, "msgtype", None) or "m.text"
+            if not isinstance(body, str):
+                return None
+            source_content = content.serialize() if hasattr(content, "serialize") else {}
+            relates_to = (
+                source_content.get("m.relates_to") if isinstance(source_content, dict) else None
+            )
+            system_message = (
+                source_content.get("org.xarta.system_message")
+                if isinstance(source_content, dict)
+                else None
+            )
+            media = (
+                _media_fields_from_content(source_content)
+                if isinstance(source_content, dict)
+                else None
+            )
+            return _message_from_parts(
+                event_id=str(getattr(event, "event_id", "") or ""),
+                room_id=room_id,
+                sender=str(getattr(event, "sender", "") or ""),
+                origin_server_ts=getattr(event, "timestamp", None),
+                msgtype=str(msgtype),
+                body=body,
+                relates_to=relates_to if isinstance(relates_to, dict) else None,
+                system_message=system_message if isinstance(system_message, dict) else None,
+                media=media,
+                encrypted=encrypted,
+                decrypted=encrypted,
+            )
+        finally:
+            _record_history_crypto_stage("message_convert", time.monotonic() - convert_started)
 
     async def messages_from_raw_events(
         self,
@@ -2428,38 +2672,81 @@ class _MatrixChatE2EEClient:
         events: list[dict[str, Any]],
         *,
         total_timeout_seconds: float = _E2EE_MESSAGES_TOTAL_TIMEOUT_SECONDS,
+        history_read_only_crypto: bool = False,
+        metrics: _MatrixHistoryMetrics | None = None,
     ) -> list[dict[str, Any]]:
         from mautrix.types import Event
 
         await self.ensure_started() if not self._started else None
         messages: list[dict[str, Any]] = []
+        filtered_events = _events_without_redacted_targets(events)
+        if metrics:
+            metrics.raw_event_count = len(events)
+            metrics.filtered_event_count = len(filtered_events)
+            metrics.redacted_event_count = max(0, len(events) - len(filtered_events))
+            metrics.encrypted_event_count = sum(
+                1
+                for raw in filtered_events
+                if isinstance(raw, dict) and raw.get("type") == "m.room.encrypted"
+            )
         deadline = (
             time.monotonic() + total_timeout_seconds
             if total_timeout_seconds and total_timeout_seconds > 0
             else None
         )
-        for raw in _events_without_redacted_targets(events):
+        context = _MatrixHistoryCryptoContext(metrics=metrics, read_only=history_read_only_crypto)
+        for raw in filtered_events:
             if _event_is_redacted(raw):
+                if metrics:
+                    metrics.redacted_event_count += 1
                 continue
+            encrypted = raw.get("type") == "m.room.encrypted"
+            if metrics:
+                metrics.begin_event(raw, encrypted=encrypted)
+            event_started = time.monotonic()
             try:
+                deserialize_started = time.monotonic()
                 event = Event.deserialize(raw)
+                if metrics:
+                    metrics.record_stage(
+                        "deserialize_event", time.monotonic() - deserialize_started
+                    )
             except Exception:
+                if metrics:
+                    metrics.record_stage(
+                        "deserialize_event_failed", time.monotonic() - event_started
+                    )
                 fallback = _message_from_event(raw, room_id)
                 if fallback:
                     messages.append(fallback)
+                    if metrics:
+                        metrics.finish_event("decoded")
+                elif metrics:
+                    metrics.finish_event("skipped")
                 continue
             try:
+                lock_started = time.monotonic()
                 async with self._crypto_lock:
-                    if deadline is None:
-                        message = await self.message_from_event(event, room_id)
-                    else:
+                    if metrics:
+                        metrics.record_stage("crypto_lock_wait", time.monotonic() - lock_started)
+                    if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError
-                        message = await asyncio.wait_for(
-                            self.message_from_event(event, room_id),
-                            timeout=remaining,
-                        )
+                    token = _MATRIX_HISTORY_CRYPTO_CONTEXT.set(context)
+                    if deadline is None:
+                        try:
+                            message = await self.message_from_event(event, room_id)
+                        finally:
+                            _MATRIX_HISTORY_CRYPTO_CONTEXT.reset(token)
+                    else:
+                        try:
+                            message = await asyncio.wait_for(
+                                self.message_from_event(event, room_id),
+                                timeout=remaining,
+                            )
+                        finally:
+                            _MATRIX_HISTORY_CRYPTO_CONTEXT.reset(token)
             except TimeoutError:
                 fallback = _unable_to_decrypt_message_from_raw_event(raw, room_id)
                 if fallback:
@@ -2469,9 +2756,22 @@ class _MatrixChatE2EEClient:
                         fallback["event_id"],
                     )
                     messages.append(fallback)
+                    if metrics:
+                        metrics.finish_event("undecryptable")
+                elif metrics:
+                    metrics.finish_event("skipped")
                 continue
             if message:
                 messages.append(message)
+                if metrics:
+                    status = (
+                        "undecryptable"
+                        if message.get("encrypted") and not message.get("decrypted")
+                        else "decoded"
+                    )
+                    metrics.finish_event(status)
+            elif metrics:
+                metrics.finish_event("skipped")
         return messages
 
 
@@ -2764,7 +3064,11 @@ async def fetch_bounded_minutes_source_events(
             raw = await _matrix_request("GET", f"/rooms/{encoded_room}/event/{encoded_event}")
             e2ee_client = await _get_e2ee_client()
             if e2ee_client:
-                decoded = await e2ee_client.messages_from_raw_events(clean_room_id, [raw])
+                decoded = await e2ee_client.messages_from_raw_events(
+                    clean_room_id,
+                    [raw],
+                    history_read_only_crypto=True,
+                )
             else:
                 message = _message_from_event(raw, clean_room_id)
                 decoded = [message] if message else []
@@ -5828,27 +6132,64 @@ async def matrix_chat_messages(
     room_id: str,
     limit: int = Query(default=50, ge=1, le=_MAX_MESSAGE_LIMIT),
     from_token: str | None = Query(default=None, alias="from"),
+    metrics: bool = Query(default=False),
+    order: str = Query(default="chronological"),
 ) -> dict[str, Any]:
+    clean_order = (
+        "recent" if str(order).strip().lower() in {"recent", "newest"} else "chronological"
+    )
     e2ee_client = await _get_e2ee_client()
     if e2ee_client:
-        return await e2ee_client.messages(room_id, limit=limit, from_token=from_token)
+        return await e2ee_client.messages(
+            room_id,
+            limit=limit,
+            from_token=from_token,
+            include_metrics=metrics,
+            response_order=clean_order,
+        )
 
+    started = time.monotonic()
+    history_metrics = (
+        _MatrixHistoryMetrics(
+            room_id=room_id,
+            limit=limit,
+            from_token_present=bool(from_token),
+        )
+        if metrics
+        else None
+    )
     encoded_room = quote(room_id, safe="")
     params: dict[str, Any] = {"dir": "b", "limit": limit}
     if from_token:
         params["from"] = from_token
+    upstream_started = time.monotonic()
     data = await _matrix_request("GET", f"/rooms/{encoded_room}/messages", params=params)
+    if history_metrics:
+        history_metrics.record_stage("upstream_fetch", time.monotonic() - upstream_started)
     chunk = data.get("chunk") if isinstance(data.get("chunk"), list) else []
+    if history_metrics:
+        history_metrics.raw_event_count = len(chunk)
+        history_metrics.filtered_event_count = len(chunk)
     messages = [_message_from_event(event, room_id) for event in chunk if isinstance(event, dict)]
     messages = [message for message in messages if message]
-    messages.reverse()
-    return {
+    if clean_order == "chronological":
+        messages.reverse()
+    result = {
         "room_id": room_id,
         "messages": messages,
         "start": data.get("start") if isinstance(data.get("start"), str) else None,
         "end": data.get("end") if isinstance(data.get("end"), str) else None,
         "at_start": not isinstance(data.get("end"), str),
     }
+    if history_metrics:
+        history_metrics.decoded_message_count = len(messages)
+        result["metrics"] = history_metrics.as_dict(
+            total_seconds=time.monotonic() - started,
+            source_order="recent",
+            response_order=clean_order,
+            history_read_only_crypto=False,
+        )
+    return result
 
 
 @router.post("/rooms/{room_id}/redactions")
