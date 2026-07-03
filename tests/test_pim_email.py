@@ -1020,6 +1020,37 @@ def test_ensure_schema_serializes_schema_ddl_with_advisory_lock():
     )
 
 
+def test_ensure_schema_current_sentinel_skips_advisory_lock_and_ddl():
+    calls = []
+
+    class FakeConnection:
+        async def fetchval(self, query, *args):
+            calls.append(("fetchval", query, args))
+            assert "information_schema.columns" in query
+            return True
+
+        async def execute(self, query, *args):
+            calls.append(("execute", query, args))
+            return None
+
+        async def close(self):
+            calls.append(("close", "", ()))
+            return None
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        async def _connect(self):
+            return self.connection
+
+    asyncio.run(FakeStore().ensure_schema())
+
+    assert calls[0][0] == "fetchval"
+    assert not any(call[0] == "execute" and "pg_advisory_lock" in call[1] for call in calls)
+    assert not any(call[0] == "execute" and "ALTER TABLE" in call[1] for call in calls)
+
+
 def test_backfill_orphan_reconcile_marks_only_non_active_running_runs():
     calls = []
 
@@ -1382,6 +1413,26 @@ def test_backfill_cli_generated_external_rows_are_not_idle(monkeypatch):
 
     assert module._planned_messages(result) == 0
     assert module._generated_work_rows(result) == 7
+
+
+def test_backfill_cli_retryable_external_image_urls_are_not_idle(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_STACK_RUNNER", "1")
+    script_path = APP_ROOT / "scripts" / "pim_email_backfill.py"
+    spec = importlib.util.spec_from_file_location("pim_email_backfill_test_module", script_path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    result = {
+        "summary": {
+            "planned_messages": 0,
+            "external_image_unique_urls_pending_retryable": 20,
+        }
+    }
+
+    assert module._planned_messages(result) == 0
+    assert module._generated_work_rows(result) == 20
 
 
 def test_backfill_cli_superseded_items_do_not_count_as_failed(monkeypatch):

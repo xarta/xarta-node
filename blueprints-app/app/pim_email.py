@@ -429,6 +429,47 @@ class PgEmailStore:
     async def _connect(self) -> asyncpg.Connection:
         return await asyncpg.connect(self.dsn)
 
+    async def _schema_sentinel_ready(self, conn: asyncpg.Connection) -> bool:
+        fetchval = getattr(conn, "fetchval", None)
+        if fetchval is None:
+            return False
+        return bool(
+            await fetchval(
+                """
+                WITH required(table_name, column_name) AS (
+                    VALUES
+                      ('pim_email_mailboxes', 'mailbox_id'),
+                      ('pim_email_messages', 'email_uid'),
+                      ('pim_email_messages', 'raw_sha256'),
+                      ('pim_email_messages', 'storage_relpath'),
+                      ('pim_email_security_checks', 'email_uid'),
+                      ('pim_email_security_checks', 'raw_sha256'),
+                      ('pim_email_security_checks', 'security_status'),
+                      ('pim_email_security_checks', 'result_json'),
+                      ('pim_email_security_phases', 'phase_status'),
+                      ('pim_email_sanitized_view_artifacts', 'input_raw_sha256'),
+                      ('pim_email_sanitized_view_artifacts', 'storage_relpath'),
+                      ('pim_email_external_image_derivatives', 'canonical_url_digest'),
+                      ('pim_email_external_image_derivatives', 'shared_asset_uid'),
+                      ('pim_email_external_image_derivatives', 'next_retry_at'),
+                      ('pim_email_shared_assets', 'canonical_url_digest'),
+                      ('pim_email_shared_assets', 'storage_relpath'),
+                      ('pim_email_shared_assets', 'encrypted_size'),
+                      ('pim_email_shared_assets', 'reference_count'),
+                      ('pim_email_backfill_runs', 'summary_json'),
+                      ('pim_email_backfill_batches', 'batch_id'),
+                      ('pim_email_backfill_items', 'item_id')
+                )
+                SELECT COALESCE(bool_and(c.column_name IS NOT NULL), false)
+                FROM required r
+                LEFT JOIN information_schema.columns c
+                  ON c.table_schema = 'public'
+                 AND c.table_name = r.table_name
+                 AND c.column_name = r.column_name
+                """
+            )
+        )
+
     async def ensure_schema(self) -> None:
         schema_cache_key = str(getattr(self, "dsn", "") or "")
         if schema_cache_key:
@@ -438,8 +479,18 @@ class PgEmailStore:
         conn = await self._connect()
         schema_lock_acquired = False
         try:
+            if await self._schema_sentinel_ready(conn):
+                if schema_cache_key:
+                    with self._schema_ready_lock:
+                        self._schema_ready_dsns.add(schema_cache_key)
+                return
             await conn.execute("SELECT pg_advisory_lock($1)", PIM_EMAIL_SCHEMA_LOCK_ID)
             schema_lock_acquired = True
+            if await self._schema_sentinel_ready(conn):
+                if schema_cache_key:
+                    with self._schema_ready_lock:
+                        self._schema_ready_dsns.add(schema_cache_key)
+                return
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pim_email_mailboxes (
