@@ -5603,6 +5603,53 @@ def test_matrix_chat_e2ee_messages_waits_for_decryptable_events_by_default():
     assert messages[0]["decrypted"] is True
 
 
+def test_matrix_chat_history_decrypt_fast_path_caches_device_and_skips_trust_resolution():
+    from mautrix.types import TrustState
+
+    first_device = object()
+    second_device = object()
+    calls = {"get_or_fetch": 0, "find": 0}
+
+    class FakeCryptoStore:
+        async def find_device_by_key(self, user_id, identity_key):
+            calls["find"] += 1
+            return second_device
+
+    class FakeOlm:
+        def __init__(self):
+            self.crypto_store = FakeCryptoStore()
+
+        async def get_or_fetch_device_by_key(self, user_id, identity_key):
+            calls["get_or_fetch"] += 1
+            return first_device
+
+        async def resolve_trust(self, _device, allow_fetch=True):
+            raise AssertionError("slow cross-signing trust resolution should be bypassed")
+
+    olm = FakeOlm()
+    matrix_chat._configure_history_decrypt_fast_path(olm)
+
+    async def run():
+        assert await olm.get_or_fetch_device_by_key("@alice:test", "curve-key") is first_device
+        assert await olm.get_or_fetch_device_by_key("@alice:test", "curve-key") is first_device
+        assert calls["get_or_fetch"] == 1
+
+        assert await olm.crypto_store.find_device_by_key("@alice:test", "curve-key") is first_device
+        assert calls["find"] == 0
+
+        assert (
+            await olm.crypto_store.find_device_by_key("@alice:test", "other-key") is second_device
+        )
+        assert (
+            await olm.crypto_store.find_device_by_key("@alice:test", "other-key") is second_device
+        )
+        assert calls["find"] == 1
+
+        assert await olm.resolve_trust(first_device) == TrustState.UNVERIFIED
+
+    asyncio.run(run())
+
+
 def test_matrix_chat_e2ee_messages_serializes_crypto_store_access():
     active = 0
     max_active = 0
