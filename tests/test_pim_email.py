@@ -2880,7 +2880,12 @@ def test_parse_message_returns_plain_sanitized_html_and_markdown_views():
     assert parsed["headers"]["subject"] == "Hello ✓"
     assert parsed["views"]["plain"] == "Plain body"
     assert parsed["views"]["markdown"] == "Plain body"
-    assert parsed["views_available"] == {"plain": True, "html": True, "markdown": False}
+    assert parsed["views_available"] == {
+        "plain": True,
+        "html": True,
+        "markdown": False,
+        "raw": True,
+    }
     assert "Subject: =?utf-8?q?Hello_=E2=9C=93?=" in parsed["views"]["raw"]
     assert "<script>" not in parsed["views"]["html"]
     assert "<p>HTML body</p>" in parsed["views"]["html"]
@@ -3042,7 +3047,12 @@ def test_parse_message_marks_real_markdown_view_available():
 
     assert parsed["views"]["plain"] == "# Heading\n\nMarkdown body"
     assert parsed["views"]["markdown"] == "# Heading\n\nMarkdown body"
-    assert parsed["views_available"] == {"plain": True, "html": False, "markdown": True}
+    assert parsed["views_available"] == {
+        "plain": True,
+        "html": False,
+        "markdown": True,
+        "raw": True,
+    }
 
 
 def test_parse_message_raw_view_omits_attachment_payloads_but_keeps_security_headers():

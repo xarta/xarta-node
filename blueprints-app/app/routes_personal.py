@@ -4525,6 +4525,7 @@ def _compact_work_failure_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "event_count",
         "first_failed_at",
         "last_failed_at",
+        "last_error",
         "failed_at",
         "next_retry_at",
         "scheduled_retry_at",

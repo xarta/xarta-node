@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from app.auth import DEFAULT_SKEW_WINDOWS, TOKEN_WINDOW_SECONDS
 
 
 def test_auth_time_returns_token_clock_metadata():
-    data = routes_auth_time.auth_time()
+    data = asyncio.run(routes_auth_time.auth_time())
 
     assert isinstance(data["server_epoch_ms"], int)
     assert isinstance(data["server_epoch_seconds"], int)

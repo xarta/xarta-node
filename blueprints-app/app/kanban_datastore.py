@@ -88,7 +88,7 @@ def load_kanban_datastore_config(
 ) -> KanbanDatastoreConfig:
     """Load and validate datastore config without selecting a live candidate store."""
 
-    source = env or os.environ
+    source = os.environ if env is None else env
     active_store = _clean_env_value(source.get(KANBAN_DATASTORE_MODE_ENV), ACTIVE_STORE_SQLITE)
     if active_store not in SUPPORTED_ACTIVE_STORES:
         supported = ", ".join(sorted(SUPPORTED_ACTIVE_STORES))
