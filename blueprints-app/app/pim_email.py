@@ -452,6 +452,12 @@ class PgEmailStore:
                       ('pim_email_external_image_derivatives', 'canonical_url_digest'),
                       ('pim_email_external_image_derivatives', 'shared_asset_uid'),
                       ('pim_email_external_image_derivatives', 'next_retry_at'),
+                      ('pim_email_external_image_url_assignments', 'canonical_url_digest'),
+                      ('pim_email_external_image_url_assignments', 'assignment_batch_id'),
+                      ('pim_email_external_image_url_assignments', 'assignment_token'),
+                      ('pim_email_external_image_url_assignments', 'assignment_status'),
+                      ('pim_email_external_image_url_assignments', 'expires_at'),
+                      ('pim_email_external_image_url_assignments', 'next_retry_at'),
                       ('pim_email_shared_assets', 'canonical_url_digest'),
                       ('pim_email_shared_assets', 'storage_relpath'),
                       ('pim_email_shared_assets', 'encrypted_size'),
@@ -935,6 +941,154 @@ class PgEmailStore:
             )
             await conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_images_claim_due
+                ON pim_email_external_image_derivatives(
+                    mailbox_id, status, next_retry_at, canonical_url_digest, updated_at DESC
+                )
+                WHERE canonical_url_digest <> ''
+                  AND status IN ('pending','fetched','transformed','failed');
+                """
+            )
+            await conn.execute(
+                """
+                DO $$
+                BEGIN
+                    IF to_regclass('public.pim_email_external_image_url_assignments') IS NULL
+                       AND to_regclass('public.pim_email_external_image_url_leases') IS NOT NULL THEN
+                        ALTER TABLE pim_email_external_image_url_leases
+                        RENAME TO pim_email_external_image_url_assignments;
+                    END IF;
+
+                    IF to_regclass('public.pim_email_external_image_url_assignments') IS NOT NULL THEN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'pim_email_external_image_url_assignments'
+                              AND column_name = 'lease_id'
+                        ) THEN
+                            ALTER TABLE pim_email_external_image_url_assignments
+                            RENAME COLUMN lease_id TO assignment_id;
+                        END IF;
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'pim_email_external_image_url_assignments'
+                              AND column_name = 'lease_batch_id'
+                        ) THEN
+                            ALTER TABLE pim_email_external_image_url_assignments
+                            RENAME COLUMN lease_batch_id TO assignment_batch_id;
+                        END IF;
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'pim_email_external_image_url_assignments'
+                              AND column_name = 'lease_status'
+                        ) THEN
+                            ALTER TABLE pim_email_external_image_url_assignments
+                            RENAME COLUMN lease_status TO assignment_status;
+                        END IF;
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'pim_email_external_image_url_assignments'
+                              AND column_name = 'lease_token'
+                        ) THEN
+                            ALTER TABLE pim_email_external_image_url_assignments
+                            RENAME COLUMN lease_token TO assignment_token;
+                        END IF;
+                    END IF;
+                END $$;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_external_image_url_assignments (
+                    assignment_id TEXT PRIMARY KEY,
+                    assignment_batch_id TEXT NOT NULL,
+                    mailbox_id TEXT NOT NULL,
+                    canonical_url_digest TEXT NOT NULL,
+                    canonical_url TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    email_uid TEXT NOT NULL DEFAULT '',
+                    input_raw_sha256 TEXT NOT NULL DEFAULT '',
+                    transform_version TEXT NOT NULL DEFAULT 'jpeg-v1',
+                    assignment_status TEXT NOT NULL DEFAULT 'unassigned',
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    assignment_token TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result_status TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    claimed_at TIMESTAMPTZ,
+                    renewed_at TIMESTAMPTZ,
+                    expires_at TIMESTAMPTZ,
+                    next_retry_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (mailbox_id, canonical_url_digest, transform_version)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE pim_email_external_image_url_assignments
+                ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE pim_email_external_image_url_assignments
+                SET assignment_status = CASE assignment_status
+                        WHEN 'leased' THEN 'assigned'
+                        WHEN 'released' THEN 'unassigned'
+                        ELSE assignment_status
+                    END,
+                    assignment_id = regexp_replace(
+                        assignment_id,
+                        '^email-image-url-lease-',
+                        'email-image-url-assignment-'
+                    ),
+                    assignment_batch_id = regexp_replace(
+                        assignment_batch_id,
+                        '^email-image-url-lease-batch-',
+                        'email-image-url-assignment-batch-'
+                    )
+                WHERE assignment_status IN ('leased','released')
+                   OR assignment_id LIKE 'email-image-url-lease-%'
+                   OR assignment_batch_id LIKE 'email-image-url-lease-batch-%';
+                """
+            )
+            await conn.execute(
+                """
+                DROP INDEX IF EXISTS idx_pim_email_external_image_url_leases_claim;
+                DROP INDEX IF EXISTS idx_pim_email_external_image_url_leases_batch;
+                DROP INDEX IF EXISTS idx_pim_email_external_image_url_leases_worker;
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_image_url_assignments_claim
+                ON pim_email_external_image_url_assignments(
+                    mailbox_id, assignment_status, next_retry_at, updated_at DESC
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_image_url_assignments_batch
+                ON pim_email_external_image_url_assignments(
+                    assignment_batch_id, worker_id, assignment_status
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_external_image_url_assignments_worker
+                ON pim_email_external_image_url_assignments(
+                    mailbox_id, worker_id, run_id, assignment_status, updated_at DESC
+                );
+                """
+            )
+            await conn.execute(
+                """
                 UPDATE pim_email_external_image_derivatives
                 SET status = 'pending',
                     reason = 'legacy_non_downloaded_state_reset_for_real_download',
@@ -1003,6 +1157,15 @@ class PgEmailStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_pim_email_backfill_items_status
                 ON pim_email_backfill_items(mailbox_id, artifact_type, status, updated_at DESC);
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_backfill_items_running_identity
+                ON pim_email_backfill_items(
+                    mailbox_id, email_uid, raw_sha256, artifact_type
+                )
+                WHERE status = 'running';
                 """
             )
             if schema_cache_key:
@@ -3099,62 +3262,629 @@ class PgEmailStore:
             await conn.close()
         return len(rows)
 
+    async def claim_external_image_url_assignment_block(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        worker_id: str,
+        run_id: str = "",
+        limit: int = 1000,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        safe_limit = max(1, min(int(limit or 1), 5000))
+        clean_worker = re.sub(r"[^A-Za-z0-9_.:@-]+", "-", str(worker_id or "").strip())[:160]
+        if not clean_worker:
+            raise EmailOperationError("External image worker id is required")
+        clean_run_id = str(run_id or "")[:180]
+        assignment_token = secrets.token_urlsafe(32)
+        assignment_batch_id = _stable_id(
+            "email-image-url-assignment-batch",
+            configured_mailbox_id,
+            clean_worker,
+            clean_run_id,
+            str(time.time_ns()),
+            assignment_token,
+        )
+        claim_metadata = {
+            "schema": "xarta.pim_email.external_image_url_assignment.claim.v1",
+            **(metadata or {}),
+        }
+        conn = await self._connect()
+        try:
+            rows = []
+            if clean_run_id:
+                rows = await conn.fetch(
+                    """
+                    WITH selected AS (
+                        SELECT assignment_id
+                        FROM pim_email_external_image_url_assignments
+                        WHERE mailbox_id = $1
+                          AND worker_id = $2
+                          AND run_id = $3
+                          AND assignment_status = 'assigned'
+                        ORDER BY claimed_at ASC, updated_at ASC
+                        LIMIT $4
+                    )
+                    UPDATE pim_email_external_image_url_assignments l
+                    SET assignment_batch_id = $5,
+                        assignment_token = $6,
+                        renewed_at = now(),
+                        expires_at = NULL,
+                        metadata_json = metadata_json || jsonb_build_object(
+                            'resumed', $7::jsonb
+                        ),
+                        updated_at = now()
+                    FROM selected
+                    WHERE l.assignment_id = selected.assignment_id
+                    RETURNING l.assignment_id, l.assignment_batch_id, l.mailbox_id,
+                              l.canonical_url_digest, l.canonical_url, l.source_url,
+                              l.email_uid, l.input_raw_sha256, l.transform_version,
+                              l.assignment_status, l.worker_id, l.assignment_token, l.run_id,
+                              l.attempts, l.result_status, l.reason, l.metadata_json,
+                              l.claimed_at, l.renewed_at, l.expires_at,
+                              l.next_retry_at, l.completed_at, l.updated_at
+                    """,
+                    configured_mailbox_id,
+                    clean_worker,
+                    clean_run_id,
+                    safe_limit,
+                    assignment_batch_id,
+                    assignment_token,
+                    _json_dumps(claim_metadata, sort_keys=True, separators=(",", ":")),
+                )
+            if not rows:
+                rows = await conn.fetch(
+                    """
+                WITH shared_digest AS (
+                    SELECT DISTINCT mailbox_id, canonical_url_digest
+                    FROM pim_email_shared_assets
+                    WHERE mailbox_id = $1 AND canonical_url_digest <> ''
+                ), representatives AS (
+                    SELECT DISTINCT ON (d.canonical_url_digest)
+                           d.canonical_url_digest,
+                           d.canonical_url,
+                           d.source_url,
+                           d.email_uid,
+                           d.input_raw_sha256,
+                           d.updated_at
+                    FROM pim_email_external_image_derivatives d
+                    LEFT JOIN shared_digest sd
+                      ON sd.mailbox_id = d.mailbox_id
+                     AND sd.canonical_url_digest = d.canonical_url_digest
+                    WHERE d.mailbox_id = $1
+                      AND d.canonical_url_digest <> ''
+                      AND d.status IN ('pending','fetched','transformed','failed')
+                      AND sd.canonical_url_digest IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_external_image_derivatives waiting
+                          WHERE waiting.mailbox_id = d.mailbox_id
+                            AND waiting.canonical_url_digest = d.canonical_url_digest
+                            AND waiting.status = 'pending'
+                            AND COALESCE(waiting.reason, '') <> 'captured_waiting_for_real_download'
+                            AND waiting.next_retry_at IS NOT NULL
+                            AND waiting.next_retry_at > now()
+                      )
+                    ORDER BY d.canonical_url_digest, d.updated_at DESC, d.email_uid DESC
+                ), candidates AS (
+                    SELECT r.*
+                    FROM representatives r
+                    LEFT JOIN pim_email_external_image_url_assignments l
+                      ON l.mailbox_id = $1
+                     AND l.canonical_url_digest = r.canonical_url_digest
+                     AND l.transform_version = 'jpeg-v1'
+                    WHERE l.assignment_id IS NULL
+                       OR l.assignment_status = 'unassigned'
+                    ORDER BY r.updated_at DESC
+                    LIMIT $2
+                )
+                INSERT INTO pim_email_external_image_url_assignments (
+                    assignment_id, assignment_batch_id, mailbox_id, canonical_url_digest,
+                    canonical_url, source_url, email_uid, input_raw_sha256,
+                    transform_version, assignment_status, worker_id, assignment_token,
+                    run_id, attempts, result_status, reason, metadata_json,
+                    claimed_at, renewed_at, expires_at, next_retry_at, completed_at, updated_at
+                )
+                SELECT
+                    'email-image-url-assignment-' || md5($1 || ':' || c.canonical_url_digest),
+                    $3, $1, c.canonical_url_digest,
+                    c.canonical_url, c.source_url, c.email_uid, c.input_raw_sha256,
+                    'jpeg-v1', 'assigned', $4, $5,
+                    $6, 1, '', '', $7::jsonb,
+                    now(), now(), NULL, NULL, NULL, now()
+                FROM candidates c
+                ON CONFLICT (mailbox_id, canonical_url_digest, transform_version)
+                DO UPDATE SET
+                    assignment_batch_id = EXCLUDED.assignment_batch_id,
+                    canonical_url = EXCLUDED.canonical_url,
+                    source_url = EXCLUDED.source_url,
+                    email_uid = EXCLUDED.email_uid,
+                    input_raw_sha256 = EXCLUDED.input_raw_sha256,
+                    assignment_status = 'assigned',
+                    worker_id = EXCLUDED.worker_id,
+                    assignment_token = EXCLUDED.assignment_token,
+                    run_id = EXCLUDED.run_id,
+                    attempts = pim_email_external_image_url_assignments.attempts + 1,
+                    result_status = '',
+                    reason = '',
+                    metadata_json = EXCLUDED.metadata_json,
+                    claimed_at = now(),
+                    renewed_at = now(),
+                    expires_at = EXCLUDED.expires_at,
+                    next_retry_at = NULL,
+                    completed_at = NULL,
+                    updated_at = now()
+                WHERE pim_email_external_image_url_assignments.assignment_status = 'unassigned'
+                RETURNING assignment_id, assignment_batch_id, mailbox_id, canonical_url_digest,
+                          canonical_url, source_url, email_uid, input_raw_sha256,
+                          transform_version, assignment_status, worker_id, assignment_token,
+                          run_id, attempts, result_status, reason, metadata_json,
+                          claimed_at, renewed_at, expires_at, next_retry_at,
+                          completed_at, updated_at
+                """,
+                    configured_mailbox_id,
+                    safe_limit,
+                    assignment_batch_id,
+                    clean_worker,
+                    assignment_token,
+                    clean_run_id,
+                    _json_dumps(claim_metadata, sort_keys=True, separators=(",", ":")),
+                )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.block.v1",
+            "mailbox_id": configured_mailbox_id,
+            "assignment_batch_id": assignment_batch_id,
+            "assignment_token": assignment_token,
+            "worker_id": clean_worker,
+            "run_id": clean_run_id,
+            "claimed": len(rows),
+            "items": [
+                _external_image_url_assignment_row_public(row, include_token=False) for row in rows
+            ],
+        }
+
+    async def _active_external_image_url_assignment(
+        self,
+        *,
+        mailbox_id: str,
+        canonical_url_digest: str,
+        worker_id: str,
+        assignment_token: str,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT assignment_id, assignment_batch_id, mailbox_id, canonical_url_digest,
+                       canonical_url, source_url, email_uid, input_raw_sha256,
+                       transform_version, assignment_status, worker_id, assignment_token,
+                       run_id, attempts, result_status, reason, metadata_json,
+                       claimed_at, renewed_at, expires_at, next_retry_at,
+                       completed_at, updated_at
+                FROM pim_email_external_image_url_assignments
+                WHERE mailbox_id = $1
+                  AND canonical_url_digest = $2
+                  AND worker_id = $3
+                  AND assignment_token = $4
+                  AND assignment_status = 'assigned'
+                LIMIT 1
+                """,
+                mailbox_id,
+                str(canonical_url_digest or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("External image URL assignment is not active")
+        return _external_image_url_assignment_row_public(row, include_token=True)
+
+    async def heartbeat_external_image_url_assignment_block(
+        self,
+        *,
+        assignment_batch_id: str,
+        worker_id: str,
+        assignment_token: str,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_external_image_url_assignments
+                SET renewed_at = now(),
+                    expires_at = NULL,
+                    updated_at = now()
+                WHERE assignment_batch_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                RETURNING assignment_id, canonical_url_digest, renewed_at
+                """,
+                str(assignment_batch_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.heartbeat.v1",
+            "assignment_batch_id": str(assignment_batch_id or ""),
+            "worker_id": str(worker_id or ""),
+            "heartbeat_rows": len(rows),
+            "heartbeat_at": _iso_datetime(_row_get(rows[0], "renewed_at")) if rows else "",
+        }
+
+    async def release_external_image_url_assignment_block(
+        self,
+        *,
+        assignment_batch_id: str,
+        worker_id: str,
+        assignment_token: str,
+        reason: str = "worker_released_assignment",
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_external_image_url_assignments
+                SET assignment_status = 'unassigned',
+                    result_status = 'unassigned',
+                    reason = $4,
+                    assignment_token = '',
+                    expires_at = NULL,
+                    next_retry_at = NULL,
+                    updated_at = now()
+                WHERE assignment_batch_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                RETURNING assignment_id
+                """,
+                str(assignment_batch_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+                str(reason or "worker_released_assignment")[:1000],
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.release.v1",
+            "assignment_batch_id": str(assignment_batch_id or ""),
+            "worker_id": str(worker_id or ""),
+            "unassigned": len(rows),
+        }
+
+    async def _finish_external_image_url_assignment(
+        self,
+        *,
+        mailbox_id: str,
+        canonical_url_digest: str,
+        worker_id: str,
+        assignment_token: str,
+        assignment_status: str,
+        result_status: str,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                UPDATE pim_email_external_image_url_assignments
+                SET assignment_status = $5,
+                    result_status = $6,
+                    reason = $7,
+                    metadata_json = metadata_json || jsonb_build_object(
+                        'finish', $8::jsonb
+                    ),
+                    assignment_token = CASE WHEN $5 = 'assigned' THEN assignment_token ELSE '' END,
+                    expires_at = NULL,
+                    next_retry_at = CASE
+                        WHEN $5 = 'retryable' THEN now() + ($9::integer * interval '1 second')
+                        ELSE NULL
+                    END,
+                    completed_at = CASE
+                        WHEN $5 IN ('completed','failed','retryable') THEN now()
+                        ELSE completed_at
+                    END,
+                    updated_at = now()
+                WHERE mailbox_id = $1
+                  AND canonical_url_digest = $2
+                  AND worker_id = $3
+                  AND assignment_token = $4
+                  AND assignment_status = 'assigned'
+                RETURNING assignment_id, assignment_batch_id, mailbox_id, canonical_url_digest,
+                          canonical_url, source_url, email_uid, input_raw_sha256,
+                          transform_version, assignment_status, worker_id, assignment_token,
+                          run_id, attempts, result_status, reason, metadata_json,
+                          claimed_at, renewed_at, expires_at, next_retry_at,
+                          completed_at, updated_at
+                """,
+                mailbox_id,
+                str(canonical_url_digest or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+                str(assignment_status or ""),
+                str(result_status or ""),
+                str(reason or "")[:1000],
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                EXTERNAL_IMAGE_RETRY_DELAY_SECONDS,
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("External image URL assignment is not active")
+        return _external_image_url_assignment_row_public(row, include_token=False)
+
+    async def complete_external_image_url_assignment_with_content(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        canonical_url_digest: str,
+        worker_id: str,
+        assignment_token: str,
+        content: bytes,
+        fetched_content_type: str = "",
+        fetched_final_url: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        assignment = await self._active_external_image_url_assignment(
+            mailbox_id=configured_mailbox_id,
+            canonical_url_digest=canonical_url_digest,
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+        )
+        canonical = assignment["canonical_url"] or assignment["source_url"]
+        source = assignment["source_url"] or canonical
+        asset = build_transformed_external_image_asset(
+            mailbox_id=configured_mailbox_id,
+            email_uid=assignment["email_uid"],
+            source_url=canonical,
+            content=bytes(content or b""),
+            metadata={
+                **(metadata or {}),
+                "input_raw_sha256": assignment["input_raw_sha256"],
+                "source_url": source,
+                "canonical_url": canonical,
+                "fetched_content_type": str(fetched_content_type or ""),
+                "fetched_final_url": str(fetched_final_url or ""),
+                "unique_canonical_asset_fetch": True,
+                "assignment_batch_id": assignment["assignment_batch_id"],
+            },
+        )
+        shared = await self.store_shared_asset(asset=asset, ensure_schema=False)
+        link_result = await self.link_external_image_references_from_shared_assets(
+            mailbox_id=configured_mailbox_id,
+            canonical_url_digest=assignment["canonical_url_digest"],
+            limit=5000,
+            metadata={
+                **(metadata or {}),
+                "phase": "external-image-url-assignment-complete",
+                "assignment_batch_id": assignment["assignment_batch_id"],
+                "canonical_url": canonical,
+                "shared_asset_uid": str(shared.get("shared_asset_uid") or ""),
+            },
+        )
+        finished = await self._finish_external_image_url_assignment(
+            mailbox_id=configured_mailbox_id,
+            canonical_url_digest=assignment["canonical_url_digest"],
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+            assignment_status="completed",
+            result_status="stored",
+            metadata={
+                **(metadata or {}),
+                "shared_asset_uid": str(shared.get("shared_asset_uid") or ""),
+                "references_linked": int(link_result.get("linked") or 0),
+                "references_link_failed": int(link_result.get("failed") or 0),
+            },
+        )
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.complete.v1",
+            "ok": int(link_result.get("failed") or 0) == 0,
+            "assignment": finished,
+            "shared_asset": shared,
+            "references_linked": int(link_result.get("linked") or 0),
+            "references_link_failed": int(link_result.get("failed") or 0),
+        }
+
+    async def fail_external_image_url_assignment(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        canonical_url_digest: str,
+        worker_id: str,
+        assignment_token: str,
+        status: str,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        assignment = await self._active_external_image_url_assignment(
+            mailbox_id=configured_mailbox_id,
+            canonical_url_digest=canonical_url_digest,
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+        )
+        clean_status = str(status or "").strip().lower()
+        if clean_status == "retryable":
+            clean_status = "pending"
+        if clean_status not in {"pending", "unavailable", "blocked", "failed"}:
+            clean_status = _external_image_error_status(EmailOperationError(reason))
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise EmailOperationError("External image failure reason is required")
+        canonical = assignment["canonical_url"] or assignment["source_url"]
+        source = assignment["source_url"] or canonical
+        references_terminal = 0
+        if clean_status in {"blocked", "unavailable"}:
+            references_terminal = await self.record_external_image_canonical_terminal_state(
+                mailbox_id=configured_mailbox_id,
+                canonical_url_digest=assignment["canonical_url_digest"],
+                status=clean_status,
+                reason=reason_text,
+                safety_decision=f"{clean_status}_reported_by_external_image_url_worker",
+                transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                metadata={
+                    **(metadata or {}),
+                    "schema": "xarta.pim_email.external_image_url_assignment.failure.v1",
+                    "assignment_batch_id": assignment["assignment_batch_id"],
+                    "canonical_url": canonical,
+                    "source_url": source,
+                },
+                ensure_schema=False,
+            )
+            assignment_status = "completed"
+        else:
+            await self.record_external_image_derivative_state(
+                mailbox_id=configured_mailbox_id,
+                email_uid=assignment["email_uid"],
+                input_raw_sha256=assignment["input_raw_sha256"],
+                source_url=source,
+                status=clean_status,
+                reason=reason_text,
+                safety_decision=f"{clean_status}_reported_by_external_image_url_worker",
+                transform_version=EXTERNAL_IMAGE_DERIVATIVE_VERSION,
+                metadata={
+                    **(metadata or {}),
+                    "schema": "xarta.pim_email.external_image_url_assignment.failure.v1",
+                    "assignment_batch_id": assignment["assignment_batch_id"],
+                    "canonical_url": canonical,
+                    "source_url": source,
+                },
+                ensure_schema=False,
+            )
+            assignment_status = "retryable" if clean_status == "pending" else "failed"
+        finished = await self._finish_external_image_url_assignment(
+            mailbox_id=configured_mailbox_id,
+            canonical_url_digest=assignment["canonical_url_digest"],
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+            assignment_status=assignment_status,
+            result_status=clean_status,
+            reason=reason_text,
+            metadata={
+                **(metadata or {}),
+                "references_terminal": references_terminal,
+            },
+        )
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.fail.v1",
+            "ok": True,
+            "assignment": finished,
+            "status": clean_status,
+            "reason": reason_text,
+            "references_terminal": references_terminal,
+        }
+
+    async def external_image_url_assignment_status_counts(
+        self,
+        *,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT assignment_status, result_status, count(*) AS count
+                FROM pim_email_external_image_url_assignments
+                WHERE mailbox_id = $1
+                GROUP BY assignment_status, result_status
+                ORDER BY assignment_status, result_status
+                """,
+                configured_mailbox_id,
+            )
+            worker_rows = await conn.fetch(
+                """
+                SELECT worker_id, run_id, assignment_batch_id, assignment_status, result_status,
+                       count(*) AS count,
+                       min(claimed_at) AS first_assigned_at,
+                       max(renewed_at) AS last_heartbeat_at,
+                       max(updated_at) AS last_updated_at,
+                       max(completed_at) AS last_completed_at
+                FROM pim_email_external_image_url_assignments
+                WHERE mailbox_id = $1
+                GROUP BY worker_id, run_id, assignment_batch_id, assignment_status, result_status
+                ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id, assignment_batch_id
+                LIMIT 200
+                """,
+                configured_mailbox_id,
+            )
+        finally:
+            await conn.close()
+        counts: dict[str, int] = {}
+        results: dict[str, int] = {}
+        for row in rows:
+            status = str(_row_get(row, "assignment_status", "") or "unknown")
+            result = str(_row_get(row, "result_status", "") or "none")
+            count = int(_row_get(row, "count", 0) or 0)
+            counts[status] = counts.get(status, 0) + count
+            results[result] = results.get(result, 0) + count
+        return {
+            "schema": "xarta.pim_email.external_image_url_assignment.status.v1",
+            "mailbox_id": configured_mailbox_id,
+            "assignment_status": counts,
+            "result_status": results,
+            "worker_blocks": [
+                {
+                    "worker_id": str(_row_get(row, "worker_id", "") or ""),
+                    "run_id": str(_row_get(row, "run_id", "") or ""),
+                    "assignment_batch_id": str(_row_get(row, "assignment_batch_id", "") or ""),
+                    "assignment_status": str(_row_get(row, "assignment_status", "") or ""),
+                    "result_status": str(_row_get(row, "result_status", "") or ""),
+                    "count": int(_row_get(row, "count", 0) or 0),
+                    "first_assigned_at": _iso_datetime(_row_get(row, "first_assigned_at")),
+                    "last_heartbeat_at": _iso_datetime(_row_get(row, "last_heartbeat_at")),
+                    "last_updated_at": _iso_datetime(_row_get(row, "last_updated_at")),
+                    "last_completed_at": _iso_datetime(_row_get(row, "last_completed_at")),
+                }
+                for row in worker_rows
+            ],
+        }
+
     async def process_external_image_unique_canonical_assets(
         self,
         *,
         mailbox_id: str | None = None,
         limit: int = 50,
+        worker_id: str | None = None,
+        run_id: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
-        safe_limit = max(1, min(int(limit or 1), 500))
-        conn = await self._connect()
-        try:
-            rows = await conn.fetch(
-                """
-                WITH shared_digest AS (
-                    SELECT DISTINCT mailbox_id, canonical_url_digest
-                    FROM pim_email_shared_assets
-                    WHERE mailbox_id = $1 AND canonical_url_digest <> ''
-                )
-                SELECT DISTINCT ON (d.canonical_url_digest)
-                       d.canonical_url_digest,
-                       d.canonical_url,
-                       d.source_url,
-                       d.email_uid,
-                       d.input_raw_sha256,
-                       d.updated_at
-                FROM pim_email_external_image_derivatives d
-                LEFT JOIN shared_digest sd
-                  ON sd.mailbox_id = d.mailbox_id
-                 AND sd.canonical_url_digest = d.canonical_url_digest
-                WHERE d.mailbox_id = $1
-                  AND d.canonical_url_digest <> ''
-                  AND d.status IN ('pending','fetched','transformed','failed')
-                  AND sd.canonical_url_digest IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM pim_email_external_image_derivatives waiting
-                      WHERE waiting.mailbox_id = d.mailbox_id
-                        AND waiting.canonical_url_digest = d.canonical_url_digest
-                        AND waiting.status = 'pending'
-                        AND COALESCE(waiting.reason, '') <> 'captured_waiting_for_real_download'
-                        AND waiting.next_retry_at IS NOT NULL
-                        AND waiting.next_retry_at > now()
-                  )
-                ORDER BY d.canonical_url_digest, d.email_uid DESC, d.updated_at DESC
-                LIMIT $2
-                """,
-                configured_mailbox_id,
-                safe_limit,
-            )
-        finally:
-            await conn.close()
+        safe_limit = max(1, min(int(limit or 1), 5000))
+        actual_worker = worker_id or f"{socket.gethostname()}:{os.getpid()}:unique-images"
+        assignment_block = await self.claim_external_image_url_assignment_block(
+            mailbox_id=configured_mailbox_id,
+            worker_id=actual_worker,
+            run_id=run_id or str((metadata or {}).get("run_id") or ""),
+            limit=safe_limit,
+            metadata={
+                **(metadata or {}),
+                "source": "process_external_image_unique_canonical_assets",
+            },
+        )
+        rows = assignment_block["items"]
+        assignment_token = str(assignment_block.get("assignment_token") or "")
 
         summary: dict[str, Any] = {
             "schema": "xarta.pim_email.external_image_unique_asset.summary.v1",
             "mailbox_id": configured_mailbox_id,
+            "assignment_batch_id": str(assignment_block.get("assignment_batch_id") or ""),
+            "worker_id": actual_worker,
             "planned_unique_urls": len(rows),
             "attempted_unique_urls": 0,
             "stored_unique_urls": 0,
@@ -3197,10 +3927,28 @@ class PgEmailStore:
             if not canonical or not canonical_digest:
                 continue
 
-            lock_conn, lock_key = await self._acquire_external_image_canonical_lock(
-                mailbox_id=configured_mailbox_id,
-                canonical_url=canonical,
-            )
+            async def finish_assignment(
+                *,
+                assignment_status: str,
+                result_status: str,
+                reason: str = "",
+                finish_metadata: dict[str, Any] | None = None,
+            ) -> None:
+                await self._finish_external_image_url_assignment(
+                    mailbox_id=configured_mailbox_id,
+                    canonical_url_digest=canonical_digest,
+                    worker_id=actual_worker,
+                    assignment_token=assignment_token,
+                    assignment_status=assignment_status,
+                    result_status=result_status,
+                    reason=reason,
+                    metadata={
+                        **(metadata or {}),
+                        **(finish_metadata or {}),
+                        "canonical_url": canonical,
+                    },
+                )
+
             try:
                 reused = await reuse_existing_canonical_work(canonical)
                 if reused:
@@ -3219,6 +3967,15 @@ class PgEmailStore:
                         )
                         summary["references_linked"] += int(link_result.get("linked") or 0)
                         summary["references_link_failed"] += int(link_result.get("failed") or 0)
+                        await finish_assignment(
+                            assignment_status="completed",
+                            result_status="stored",
+                            finish_metadata={
+                                "completion_kind": "reused-verified-shared-asset",
+                                "references_linked": int(link_result.get("linked") or 0),
+                                "references_link_failed": int(link_result.get("failed") or 0),
+                            },
+                        )
                     elif status in {"blocked", "unavailable"}:
                         terminal = int(
                             await self.record_external_image_canonical_terminal_state(
@@ -3240,6 +3997,15 @@ class PgEmailStore:
                         )
                         summary[f"{status}_unique_urls"] += 1
                         summary["references_terminal"] += terminal
+                        await finish_assignment(
+                            assignment_status="completed",
+                            result_status=status,
+                            reason=str((reused.get("outcome") or {}).get("reason") or ""),
+                            finish_metadata={
+                                "completion_kind": f"reused-canonical-{status}-outcome",
+                                "references_terminal": terminal,
+                            },
+                        )
                     continue
 
                 summary["attempted_unique_urls"] += 1
@@ -3275,6 +4041,16 @@ class PgEmailStore:
                 )
                 summary["references_linked"] += int(link_result.get("linked") or 0)
                 summary["references_link_failed"] += int(link_result.get("failed") or 0)
+                await finish_assignment(
+                    assignment_status="completed",
+                    result_status="stored",
+                    finish_metadata={
+                        "completion_kind": "downloaded-transformed-encrypted-stored",
+                        "shared_asset_uid": str(asset.get("shared_asset_uid") or ""),
+                        "references_linked": int(link_result.get("linked") or 0),
+                        "references_link_failed": int(link_result.get("failed") or 0),
+                    },
+                )
             except Exception as exc:
                 state = _external_image_error_status(exc)
                 if state in {"blocked", "unavailable"}:
@@ -3296,6 +4072,16 @@ class PgEmailStore:
                     )
                     summary[f"{state}_unique_urls"] += 1
                     summary["references_terminal"] += terminal_count
+                    await finish_assignment(
+                        assignment_status="completed",
+                        result_status=state,
+                        reason=str(exc),
+                        finish_metadata={
+                            "completion_kind": state,
+                            "references_terminal": terminal_count,
+                            "error_class": exc.__class__.__name__,
+                        },
+                    )
                 elif state == "pending":
                     await self.record_external_image_derivative_state(
                         mailbox_id=configured_mailbox_id,
@@ -3325,6 +4111,15 @@ class PgEmailStore:
                                 "error_message": str(exc)[:300],
                             }
                         )
+                    await finish_assignment(
+                        assignment_status="retryable",
+                        result_status=state,
+                        reason=str(exc),
+                        finish_metadata={
+                            "completion_kind": "retryable-failure",
+                            "error_class": exc.__class__.__name__,
+                        },
+                    )
                 else:
                     await self.record_external_image_derivative_state(
                         mailbox_id=configured_mailbox_id,
@@ -3354,8 +4149,15 @@ class PgEmailStore:
                                 "error_message": str(exc)[:300],
                             }
                         )
-            finally:
-                await self._release_external_image_canonical_lock(lock_conn, lock_key)
+                    await finish_assignment(
+                        assignment_status="failed",
+                        result_status=state,
+                        reason=str(exc),
+                        finish_metadata={
+                            "completion_kind": "failed",
+                            "error_class": exc.__class__.__name__,
+                        },
+                    )
         return summary
 
     async def migrate_existing_transformed_assets_to_shared_store(
@@ -3961,7 +4763,7 @@ class PgEmailStore:
         try:
             existing_rows = await conn.fetch(
                 """
-                SELECT canonical_url, status, reason
+                SELECT canonical_url, status, reason, next_retry_at
                 FROM pim_email_external_image_derivatives
                 WHERE mailbox_id = $1
                   AND email_uid = $2
@@ -3977,6 +4779,7 @@ class PgEmailStore:
                 str(_row_get(row, "canonical_url", "")): {
                     "status": str(_row_get(row, "status", "") or ""),
                     "reason": str(_row_get(row, "reason", "") or ""),
+                    "next_retry_at": _row_get(row, "next_retry_at"),
                 }
                 for row in existing_rows
             }
@@ -4107,6 +4910,14 @@ class PgEmailStore:
             existing_state = existing.get(canonical, {})
             status = str(existing_state.get("status") or "")
             reason = str(existing_state.get("reason") or "")
+            next_retry_at = existing_state.get("next_retry_at")
+            if status == "pending" and next_retry_at and hasattr(next_retry_at, "timestamp"):
+                retry_at = next_retry_at
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                if retry_at > datetime.now(timezone.utc):
+                    counts["pending"] += 1
+                    continue
             if _external_image_existing_state_is_terminal(status, reason):
                 if status == "stored":
                     counts["already_stored"] += 1
@@ -4692,7 +5503,18 @@ class PgEmailStore:
                             WHERE d.mailbox_id = $1
                               AND d.email_uid = $2
                               AND d.input_raw_sha256 = $3
-                              AND d.status IN ('pending','fetched','transformed','failed')
+                              AND (
+                                  d.status IN ('fetched','transformed','failed')
+                                  OR (
+                                      d.status = 'pending'
+                                      AND (
+                                          d.next_retry_at IS NULL
+                                          OR d.next_retry_at <= now()
+                                          OR COALESCE(d.reason, '') =
+                                             'captured_waiting_for_real_download'
+                                      )
+                                  )
+                              )
                           )
                           ELSE FALSE
                         END
@@ -4845,7 +5667,18 @@ class PgEmailStore:
                             WHERE d.mailbox_id = f.mailbox_id
                               AND d.email_uid = f.email_uid
                               AND d.input_raw_sha256 = f.raw_sha256
-                              AND d.status IN ('pending','fetched','transformed','failed')
+                              AND (
+                                  d.status IN ('fetched','transformed','failed')
+                                  OR (
+                                      d.status = 'pending'
+                                      AND (
+                                          d.next_retry_at IS NULL
+                                          OR d.next_retry_at <= now()
+                                          OR COALESCE(d.reason, '') =
+                                             'captured_waiting_for_real_download'
+                                      )
+                                  )
+                              )
                         )
                         AND (
                             CASE
@@ -5309,7 +6142,18 @@ class PgEmailStore:
                             WHERE d.mailbox_id = m.mailbox_id
                               AND d.email_uid = m.email_uid
                               AND d.input_raw_sha256 = m.raw_sha256
-                              AND d.status IN ('pending','fetched','transformed','failed')
+                              AND (
+                                  d.status IN ('fetched','transformed','failed')
+                                  OR (
+                                      d.status = 'pending'
+                                      AND (
+                                          d.next_retry_at IS NULL
+                                          OR d.next_retry_at <= now()
+                                          OR COALESCE(d.reason, '') =
+                                             'captured_waiting_for_real_download'
+                                      )
+                                  )
+                              )
                         ) AS external_pending,
                         EXISTS (
                             SELECT 1
@@ -6106,6 +6950,41 @@ def _shared_asset_row_public(row: Any) -> dict[str, Any]:
         "created_at": _iso_datetime(_row_get(row, "created_at")),
         "updated_at": _iso_datetime(_row_get(row, "updated_at")),
     }
+
+
+def _external_image_url_assignment_row_public(
+    row: Any,
+    *,
+    include_token: bool = False,
+) -> dict[str, Any]:
+    metadata = _json_value(_row_get(row, "metadata_json"), {})
+    public = {
+        "assignment_id": str(_row_get(row, "assignment_id", "")),
+        "assignment_batch_id": str(_row_get(row, "assignment_batch_id", "")),
+        "mailbox_id": str(_row_get(row, "mailbox_id", "")),
+        "canonical_url_digest": str(_row_get(row, "canonical_url_digest", "")),
+        "canonical_url": str(_row_get(row, "canonical_url", "")),
+        "source_url": str(_row_get(row, "source_url", "")),
+        "email_uid": str(_row_get(row, "email_uid", "")),
+        "input_raw_sha256": str(_row_get(row, "input_raw_sha256", "")),
+        "transform_version": str(_row_get(row, "transform_version", "jpeg-v1")),
+        "assignment_status": str(_row_get(row, "assignment_status", "")),
+        "worker_id": str(_row_get(row, "worker_id", "")),
+        "run_id": str(_row_get(row, "run_id", "")),
+        "attempts": int(_row_get(row, "attempts", 0) or 0),
+        "result_status": str(_row_get(row, "result_status", "")),
+        "reason": str(_row_get(row, "reason", "")),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "claimed_at": _iso_datetime(_row_get(row, "claimed_at")),
+        "renewed_at": _iso_datetime(_row_get(row, "renewed_at")),
+        "expires_at": _iso_datetime(_row_get(row, "expires_at")),
+        "next_retry_at": _iso_datetime(_row_get(row, "next_retry_at")),
+        "completed_at": _iso_datetime(_row_get(row, "completed_at")),
+        "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+    }
+    if include_token:
+        public["assignment_token"] = str(_row_get(row, "assignment_token", ""))
+    return public
 
 
 def _sanitized_artifact_row_public(row: Any) -> dict[str, Any]:

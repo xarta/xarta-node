@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
+import os
 import re
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .events import AppEvent
@@ -48,6 +51,56 @@ class DownloadMailboxRequest(BaseModel):
     convergence_passes: int = Field(2, ge=1, le=5)
 
 
+class ExternalImageAssignmentClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    run_id: str = Field("", max_length=180)
+    limit: int = Field(1000, ge=1, le=5000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExternalImageAssignmentHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_batch_id: str = Field(..., min_length=8, max_length=180)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+
+
+class ExternalImageAssignmentReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_batch_id: str = Field(..., min_length=8, max_length=180)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    reason: str = Field("worker_released_assignment", max_length=1000)
+
+
+class ExternalImageAssignmentCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    image_base64: str = Field(..., min_length=1)
+    fetched_content_type: str = Field("", max_length=180)
+    fetched_final_url: str = Field("", max_length=4096)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExternalImageAssignmentFailRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    status: str = Field(..., min_length=3, max_length=40)
+    reason: str = Field(..., min_length=1, max_length=1000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 def _store() -> PgEmailStore:
     return PgEmailStore()
 
@@ -67,6 +120,37 @@ def _clean_security_run_id(value: str | None = None) -> str:
     if re.fullmatch(r"[A-Za-z0-9_.:-]{8,120}", clean):
         return clean
     return uuid.uuid4().hex
+
+
+def _email_worker_secret() -> str:
+    return (
+        os.environ.get("BLUEPRINTS_PIM_EMAIL_WORKER_SECRET")
+        or os.environ.get("BLUEPRINTS_EMAIL_WORKER_SECRET")
+        or ""
+    ).strip()
+
+
+def _require_email_worker_token(token: str | None) -> None:
+    secret = _email_worker_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PIM Email worker auth is not configured")
+    if not token or not hmac.compare_digest(str(token), secret):
+        raise HTTPException(status_code=401, detail="PIM Email worker token is invalid")
+
+
+def _worker_safe_assignment(item: dict[str, Any]) -> dict[str, Any]:
+    public = dict(item or {})
+    public.pop("assignment_token", None)
+    public.pop("email_uid", None)
+    public.pop("input_raw_sha256", None)
+    return public
+
+
+def _worker_safe_shared_asset(item: dict[str, Any]) -> dict[str, Any]:
+    public = dict(item or {})
+    public.pop("storage_relpath", None)
+    public.pop("encryption", None)
+    return public
 
 
 def _event_severity_for_tone(tone: str) -> str:
@@ -158,6 +242,158 @@ async def email_local_status(
         store = _store()
         status = await store.local_corpus_status(mailbox_id=mailbox_id)
         return {"ok": True, "status": status}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/workers/external-images/status")
+async def email_external_image_worker_status(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_derivatives: bool = Query(False),
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        store = _store()
+        assignments = await store.external_image_url_assignment_status_counts(mailbox_id=mailbox_id)
+        response = {
+            "ok": True,
+            "url_assignments": assignments,
+        }
+        if include_derivatives:
+            local = await store.local_corpus_status(mailbox_id=mailbox_id)
+            response["external_image_derivatives"] = local.get("external_image_derivatives", {})
+        return response
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/assignments/claim")
+async def email_external_image_worker_claim_assignments(
+    body: ExternalImageAssignmentClaimRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        result = await _store().claim_external_image_url_assignment_block(
+            mailbox_id=body.mailbox_id,
+            worker_id=body.worker_id,
+            run_id=body.run_id,
+            limit=body.limit,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        return {
+            "ok": True,
+            "schema": "xarta.pim_email.external_image_url_assignment.block.v1",
+            "mailbox_id": result.get("mailbox_id"),
+            "assignment_batch_id": result.get("assignment_batch_id"),
+            "assignment_token": result.get("assignment_token"),
+            "worker_id": result.get("worker_id"),
+            "run_id": result.get("run_id"),
+            "claimed": result.get("claimed"),
+            "items": [_worker_safe_assignment(item) for item in result.get("items", [])],
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/assignments/heartbeat")
+async def email_external_image_worker_heartbeat_assignments(
+    body: ExternalImageAssignmentHeartbeatRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        result = await _store().heartbeat_external_image_url_assignment_block(
+            assignment_batch_id=body.assignment_batch_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+        )
+        return {"ok": True, "result": result}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/assignments/release")
+async def email_external_image_worker_release_assignments(
+    body: ExternalImageAssignmentReleaseRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        result = await _store().release_external_image_url_assignment_block(
+            assignment_batch_id=body.assignment_batch_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            reason=body.reason,
+        )
+        return {"ok": True, "result": result}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/assignments/{canonical_url_digest}/complete")
+async def email_external_image_worker_complete_assignment(
+    canonical_url_digest: str,
+    body: ExternalImageAssignmentCompleteRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        try:
+            content = base64.b64decode(body.image_base64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="image_base64 is invalid") from exc
+        result = await _store().complete_external_image_url_assignment_with_content(
+            mailbox_id=body.mailbox_id,
+            canonical_url_digest=canonical_url_digest,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            content=content,
+            fetched_content_type=body.fetched_content_type,
+            fetched_final_url=body.fetched_final_url,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        if "assignment" in result:
+            result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
+        if "shared_asset" in result:
+            result["shared_asset"] = _worker_safe_shared_asset(result["shared_asset"])
+        return {"ok": bool(result.get("ok", True)), "result": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/assignments/{canonical_url_digest}/fail")
+async def email_external_image_worker_fail_assignment(
+    canonical_url_digest: str,
+    body: ExternalImageAssignmentFailRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+) -> dict[str, Any]:
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        result = await _store().fail_external_image_url_assignment(
+            mailbox_id=body.mailbox_id,
+            canonical_url_digest=canonical_url_digest,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            status=body.status,
+            reason=body.reason,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        if "assignment" in result:
+            result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
+        return {"ok": True, "result": result}
     except Exception as exc:
         raise _http_error(exc) from exc
 
