@@ -84,7 +84,12 @@ class ExternalImageAssignmentCompleteRequest(BaseModel):
     mailbox_id: str | None = Field(None, min_length=1, max_length=120)
     worker_id: str = Field(..., min_length=1, max_length=160)
     assignment_token: str = Field(..., min_length=16, max_length=240)
-    image_base64: str = Field(..., min_length=1)
+    transformed_image_base64: str = Field(..., min_length=1)
+    raw_image_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    transformed_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    width: int = Field(..., ge=1, le=1800)
+    height: int = Field(..., ge=1, le=2400)
+    transform_version: str = Field("jpeg-v1", min_length=1, max_length=80)
     fetched_content_type: str = Field("", max_length=180)
     fetched_final_url: str = Field("", max_length=4096)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -344,15 +349,26 @@ async def email_external_image_worker_complete_assignment(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         try:
-            content = base64.b64decode(body.image_base64, validate=True)
+            transformed_content = base64.b64decode(
+                body.transformed_image_base64,
+                validate=True,
+            )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail="image_base64 is invalid") from exc
-        result = await _store().complete_external_image_url_assignment_with_content(
+            raise HTTPException(
+                status_code=400,
+                detail="transformed_image_base64 is invalid",
+            ) from exc
+        result = await _store().complete_external_image_url_assignment_with_transformed_payload(
             mailbox_id=body.mailbox_id,
             canonical_url_digest=canonical_url_digest,
             worker_id=body.worker_id,
             assignment_token=body.assignment_token,
-            content=content,
+            transformed_content=transformed_content,
+            raw_image_sha256=body.raw_image_sha256,
+            transformed_sha256=body.transformed_sha256,
+            width=body.width,
+            height=body.height,
+            transform_version=body.transform_version,
             fetched_content_type=body.fetched_content_type,
             fetched_final_url=body.fetched_final_url,
             metadata={

@@ -165,6 +165,66 @@ def test_encrypted_content_and_transformed_external_asset_round_trip(tmp_path, m
     assert b"PNG" not in (tmp_path / asset["storage_relpath"]).read_bytes()
 
 
+def test_worker_transformed_external_asset_round_trip_and_rejects_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
+    monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
+    image_source = BytesIO()
+    Image.new("RGBA", (3, 2), (0, 160, 240, 255)).save(image_source, format="PNG")
+    raw = image_source.getvalue()
+    transformed = pim_email.transform_image_to_jpeg(raw)
+    width, height = pim_email.jpeg_dimensions(transformed)
+
+    asset = pim_email.build_transformed_external_image_asset_from_worker_payload(
+        mailbox_id="test-mailbox",
+        email_uid="20260701-0123456789abcdef0123456789abcdef01234567",
+        source_url="https://images.example.test/banner.png?utm=1",
+        transformed_content=transformed,
+        raw_image_sha256=pim_email.hashlib.sha256(raw).hexdigest(),
+        transformed_sha256=pim_email.hashlib.sha256(transformed).hexdigest(),
+        width=width,
+        height=height,
+        transform_version="jpeg-v1",
+        metadata={"proof": "worker"},
+    )
+
+    stored = pim_email.read_encrypted_bytes(
+        asset["storage_relpath"],
+        purpose=pim_email.ASSET_PURPOSE,
+    )
+    assert stored == transformed
+    assert asset["metadata"]["worker_transformed"] is True
+    assert asset["transform_version"] == "jpeg-v1"
+
+    with pytest.raises(pim_email.EmailOperationError, match="transformed_sha256"):
+        pim_email.build_transformed_external_image_asset_from_worker_payload(
+            mailbox_id="test-mailbox",
+            email_uid="20260701-0123456789abcdef0123456789abcdef01234567",
+            source_url="https://images.example.test/banner.png?utm=1",
+            transformed_content=transformed,
+            raw_image_sha256=pim_email.hashlib.sha256(raw).hexdigest(),
+            transformed_sha256="0" * 64,
+            width=width,
+            height=height,
+            transform_version="jpeg-v1",
+        )
+
+    with pytest.raises(pim_email.EmailOperationError, match="dimensions"):
+        pim_email.build_transformed_external_image_asset_from_worker_payload(
+            mailbox_id="test-mailbox",
+            email_uid="20260701-0123456789abcdef0123456789abcdef01234567",
+            source_url="https://images.example.test/banner.png?utm=1",
+            transformed_content=transformed,
+            raw_image_sha256=pim_email.hashlib.sha256(raw).hexdigest(),
+            transformed_sha256=pim_email.hashlib.sha256(transformed).hexdigest(),
+            width=width + 1,
+            height=height,
+            transform_version="jpeg-v1",
+        )
+
+
 def test_completed_security_contract_rejects_placeholders_and_requires_exact_hash():
     email_uid = "20260701-0123456789abcdef0123456789abcdef01234567"
     raw_sha256 = "a" * 64
@@ -1843,14 +1903,13 @@ def test_external_image_materializer_creates_missing_rows_without_overwriting_ex
     assert {item["reason"] for item in inserted} == {"captured_waiting_for_real_download"}
 
 
-def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, monkeypatch):
+def test_external_image_failed_rows_are_requeued_as_worker_candidates(tmp_path, monkeypatch):
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
     failed_url = "https://cdn.example.test/retry.png"
     transient_url = "https://cdn.example.test/transient.png"
     gone_url = "https://cdn.example.test/gone.png"
     stored_url = "https://cdn.example.test/already.jpg"
-    attempted = []
     recorded = []
 
     class FakeConnection:
@@ -1910,27 +1969,10 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
         async def find_external_image_canonical_terminal_state(self, **kwargs):
             return None
 
-    async def fake_fetch(source):
-        attempted.append(source)
-        return {"content": b"image-bytes", "content_type": "image/png", "final_url": source}
+    async def fail_fetch(source):
+        raise AssertionError("message-level image handling must not fetch directly")
 
-    def fake_asset(**kwargs):
-        return {
-            "transform_version": "jpeg-v1",
-            "raw_sha256": "raw-image-hash",
-            "raw_image_sha256": "raw-image-hash",
-            "transformed_sha256": "transformed-image-hash",
-            "storage_relpath": "assets/retry.jpg.enc",
-            "shared_asset_uid": "email-shared-asset-test",
-            "canonical_url_digest": "digest-test",
-            "encrypted_size": 123,
-            "content_type": "image/jpeg",
-            "width": 2,
-            "height": 1,
-        }
-
-    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fake_fetch)
-    monkeypatch.setattr(pim_email, "build_transformed_external_image_asset", fake_asset)
+    monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fail_fetch)
 
     counts = asyncio.run(
         FakeStore().process_external_image_derivatives(
@@ -1942,19 +1984,17 @@ def test_external_image_failed_rows_are_retried_not_counted_terminal(tmp_path, m
         )
     )
 
-    assert attempted == [failed_url, transient_url]
-    assert counts["attempted"] == 2
-    assert counts["stored"] == 2
+    assert counts["attempted"] == 0
+    assert counts["pending"] == 2
+    assert counts["stored"] == 0
     assert counts["unavailable"] == 0
     assert counts["already_stored"] == 1
     assert counts["already_unavailable"] == 1
     assert counts["failed"] == 0
     assert {item["source_url"] for item in recorded} == {failed_url, transient_url}
-    assert {item["status"] for item in recorded} == {"stored"}
-    assert {item["safety_decision"] for item in recorded} == {
-        "fetched_transformed_encrypted_stored"
-    }
-    assert {item["shared_asset_uid"] for item in recorded} == {"email-shared-asset-test"}
+    assert {item["status"] for item in recorded} == {"pending"}
+    assert {item["safety_decision"] for item in recorded} == {"pending_real_download"}
+    assert {item["reason"] for item in recorded} == {"captured_waiting_for_real_download"}
 
 
 def test_external_image_derivative_reuses_verified_shared_asset_without_refetch(monkeypatch):
@@ -2031,11 +2071,10 @@ def test_external_image_derivative_reuses_verified_shared_asset_without_refetch(
     assert recorded[0]["shared_asset_uid"] == "email-shared-asset-existing"
 
 
-def test_external_image_derivative_rechecks_shared_asset_under_url_lock(monkeypatch):
+def test_external_image_derivative_records_pending_without_url_lock_or_fetch(monkeypatch):
     stored = []
     recorded = []
     executed = []
-    find_calls = []
 
     class FakeConnection:
         async def fetch(self, query, *args):
@@ -2061,26 +2100,7 @@ def test_external_image_derivative_rechecks_shared_asset_under_url_lock(monkeypa
             return self.connection
 
         async def find_shared_asset_for_url(self, **kwargs):
-            find_calls.append(kwargs["source_url"])
-            if len(find_calls) == 1:
-                return None
-            return {
-                "shared_asset_uid": "email-shared-asset-locked",
-                "source_url": kwargs["source_url"],
-                "canonical_url": kwargs["source_url"],
-                "canonical_url_digest": pim_email._external_image_canonical_digest(
-                    kwargs["source_url"]
-                ),
-                "content_type": "image/jpeg",
-                "raw_image_sha256": "raw-image-hash",
-                "transformed_sha256": "transformed-image-hash",
-                "storage_relpath": "assets/aa/existing/image.jpg.enc",
-                "encrypted_size": 456,
-                "width": 12,
-                "height": 9,
-                "transform_version": "jpeg-v1",
-                "encryption": {"alg": "test"},
-            }
+            return None
 
         async def find_external_image_canonical_terminal_state(self, **kwargs):
             return None
@@ -2094,7 +2114,7 @@ def test_external_image_derivative_rechecks_shared_asset_under_url_lock(monkeypa
             return kwargs
 
     async def fail_fetch(source):
-        raise AssertionError("URL lock recheck should find shared asset before fetching")
+        raise AssertionError("message-level image handling must not fetch directly")
 
     monkeypatch.setattr(pim_email, "fetch_remote_image_bytes", fail_fetch)
 
@@ -2108,13 +2128,13 @@ def test_external_image_derivative_rechecks_shared_asset_under_url_lock(monkeypa
         )
     )
 
-    assert counts["stored"] == 1
+    assert counts["pending"] == 1
+    assert counts["stored"] == 0
     assert counts["attempted"] == 0
-    assert len(find_calls) == 2
-    assert any("pg_advisory_lock" in query for query in executed)
-    assert any("pg_advisory_unlock" in query for query in executed)
-    assert stored[0]["shared_asset_uid"] == "email-shared-asset-locked"
-    assert recorded[0]["safety_decision"] == "reused_verified_shared_encrypted_asset"
+    assert executed == []
+    assert stored == []
+    assert recorded[0]["safety_decision"] == "pending_real_download"
+    assert recorded[0]["reason"] == "captured_waiting_for_real_download"
 
 
 def test_external_image_derivative_reuses_canonical_unavailable_outcome(monkeypatch):
@@ -2419,6 +2439,7 @@ def test_unique_external_image_asset_fetches_once_and_links_all_references(tmp_p
             mailbox_id="test-mailbox",
             limit=10,
             metadata={"run_id": "unique-run", "batch_id": "unique-batch"},
+            allow_coordinator_transform_fallback=True,
         )
     )
 
@@ -2502,6 +2523,7 @@ def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
             mailbox_id="test-mailbox",
             limit=10,
             metadata={"run_id": "unique-run"},
+            allow_coordinator_transform_fallback=True,
         )
     )
 
@@ -2518,6 +2540,40 @@ def test_unique_external_image_asset_timeout_is_pending_retryable(monkeypatch):
     assert finished_assignments
     assert finished_assignments[0]["assignment_status"] == "retryable"
     assert finished_assignments[0]["result_status"] == "pending"
+
+
+def test_unique_external_image_asset_fallback_is_explicit(monkeypatch):
+    monkeypatch.delenv(
+        "BLUEPRINTS_EMAIL_ALLOW_COORDINATOR_IMAGE_TRANSFORM_FALLBACK",
+        raising=False,
+    )
+
+    class FakeStore(pim_email.PgEmailStore):
+        def __init__(self):
+            return None
+
+        async def ensure_schema(self):
+            return None
+
+        async def claim_external_image_url_assignment_block(self, **kwargs):
+            raise AssertionError("fallback guard should fire before assignment claim")
+
+    with pytest.raises(pim_email.EmailOperationError, match="fallback is disabled"):
+        asyncio.run(
+            FakeStore().process_external_image_unique_canonical_assets(
+                mailbox_id="test-mailbox",
+                limit=10,
+            )
+        )
+
+
+def test_message_external_image_path_feeds_assignment_flow_without_direct_download():
+    source = inspect.getsource(pim_email.PgEmailStore.process_external_image_derivatives)
+
+    assert "fetch_remote_image_bytes" not in source
+    assert "build_transformed_external_image_asset" not in source
+    assert "captured_waiting_for_real_download" in source
+    assert "pending_real_download" in source
 
 
 def test_external_image_url_assignment_block_claim_uses_unique_resumable_assignments():
@@ -3242,19 +3298,19 @@ class CaptureDownloadStore:
                     "email_uid": email_uid,
                     "input_raw_sha256": input_raw_sha256,
                     "source_url": source,
-                    "status": "stored",
-                    "reason": "",
-                    "safety_decision": "fetched_transformed_encrypted_stored",
+                    "status": "pending",
+                    "reason": "captured_waiting_for_real_download",
+                    "safety_decision": "pending_real_download",
                     "metadata": metadata or {},
                 }
             )
         return {
-            "stored": len(unique),
+            "stored": 0,
             "blocked": 0,
             "failed": 0,
             "unavailable": 0,
-            "pending": 0,
-            "attempted": len(unique),
+            "pending": len(unique),
+            "attempted": 0,
             "already_stored": 0,
             "already_blocked": 0,
             "already_unavailable": 0,
@@ -3264,7 +3320,7 @@ class CaptureDownloadStore:
         self.moved.append(kwargs)
 
 
-def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_proof(
+def test_safe_downloader_converges_stores_verifies_and_enqueues_image_candidates(
     tmp_path,
     monkeypatch,
 ):
@@ -3294,7 +3350,7 @@ def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_pr
         store=store,
         run_id="test-download-run",
         apply_remote_moves=True,
-        convergence_passes=2,
+        convergence_passes=1,
         security_mode="run",
     )
 
@@ -3302,22 +3358,28 @@ def test_safe_downloader_converges_stores_verifies_and_moves_only_after_local_pr
     assert result["ok"] is True
     assert result["run_id"] == "test-download-run"
     assert store.run_start["run_id"] == "test-download-run"
-    assert result["summary"]["stored_messages"] == 6
-    assert result["summary"]["moved_messages"] == 2
-    assert result["summary"]["sanitized_views_stored"] >= 4
-    assert result["summary"]["external_image_derivatives_stored"] >= 4
-    assert {item["imap_uid"] for item in store.saved} == {"8", "9", "41", "42"}
+    assert result["summary"]["stored_messages"] == 3
+    assert result["summary"]["moved_messages"] == 0
+    assert result["summary"]["move_blocked"] == 1
+    assert result["summary"]["sanitized_views_stored"] >= 3
+    assert result["summary"]["external_image_derivatives_stored"] == 0
+    assert result["summary"]["external_image_derivatives_pending"] >= 3
+    assert {item["imap_uid"] for item in store.saved} == {"8", "9", "41"}
     assert {item["folder_snapshot"]["folder_name"] for item in store.saved} == {
         "INBOX",
         "Archive",
         "Drafts",
     }
-    assert ("INBOX", "41", "Downloaded") in instance.moves
-    assert ("INBOX", "42", "Downloaded") in instance.moves
+    assert instance.moves == []
     assert not any(folder == "Archive" for folder, _, _ in instance.moves)
     assert not any(folder == "Drafts" for folder, _, _ in instance.moves)
     assert all(item["storage"]["verified"] for item in store.saved)
     assert all(item["metadata"]["remote_image_sources"] for item in store.saved)
+    assert store.external_derivatives
+    assert {item["status"] for item in store.external_derivatives} == {"pending"}
+    assert {item["safety_decision"] for item in store.external_derivatives} == {
+        "pending_real_download"
+    }
     assert all((tmp_path / item["storage"]["storage_relpath"]).exists() for item in store.saved)
     assert not any(item["event_type"] == "folder-skip-special-use" for item in store.events)
     assert store.run_finish["status"] == "completed"
@@ -3734,8 +3796,13 @@ def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch)
                 ],
             }
 
-        async def complete_external_image_url_assignment_with_content(self, **kwargs):
-            assert kwargs["content"] == b"image-bytes"
+        async def complete_external_image_url_assignment_with_transformed_payload(self, **kwargs):
+            assert kwargs["transformed_content"] == b"jpeg-bytes"
+            assert kwargs["raw_image_sha256"] == "a" * 64
+            assert kwargs["transformed_sha256"] == "b" * 64
+            assert kwargs["width"] == 1
+            assert kwargs["height"] == 1
+            assert kwargs["transform_version"] == "jpeg-v1"
             return {
                 "ok": True,
                 "assignment": {
@@ -3794,7 +3861,12 @@ def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch)
             routes_pim_email.ExternalImageAssignmentCompleteRequest(
                 worker_id="tb3-worker-01",
                 assignment_token="assignment-token-worker-needs",
-                image_base64="aW1hZ2UtYnl0ZXM=",
+                transformed_image_base64="anBlZy1ieXRlcw==",
+                raw_image_sha256="a" * 64,
+                transformed_sha256="b" * 64,
+                width=1,
+                height=1,
+                transform_version="jpeg-v1",
             ),
             x_pim_email_worker_token="worker-secret-123456",
         )
@@ -3807,6 +3879,36 @@ def test_external_image_worker_api_auth_and_private_field_scrubbing(monkeypatch)
     assert "assignment_token" not in complete["result"]["assignment"]
     assert "storage_relpath" not in complete["result"]["shared_asset"]
     assert "encryption" not in complete["result"]["shared_asset"]
+
+    with pytest.raises(routes_pim_email.HTTPException) as bad_base64:
+        asyncio.run(
+            routes_pim_email.email_external_image_worker_complete_assignment(
+                digest,
+                routes_pim_email.ExternalImageAssignmentCompleteRequest(
+                    worker_id="tb3-worker-01",
+                    assignment_token="assignment-token-worker-needs",
+                    transformed_image_base64="not-base64!!!",
+                    raw_image_sha256="a" * 64,
+                    transformed_sha256="b" * 64,
+                    width=1,
+                    height=1,
+                    transform_version="jpeg-v1",
+                ),
+                x_pim_email_worker_token="worker-secret-123456",
+            )
+        )
+    assert bad_base64.value.status_code == 400
+
+    with pytest.raises(ValidationError):
+        routes_pim_email.ExternalImageAssignmentCompleteRequest(
+            worker_id="tb3-worker-01",
+            assignment_token="assignment-token-worker-needs",
+            transformed_image_base64="not-base64",
+            raw_image_sha256="not-a-sha",
+            transformed_sha256="b" * 64,
+            width=1,
+            height=1,
+        )
 
 
 def test_status_route_reports_disabled_send_delete_capabilities(monkeypatch):
