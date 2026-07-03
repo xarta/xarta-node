@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -25,10 +26,34 @@ log = logging.getLogger(__name__)
 
 _SYSTEM_ACTION_TYPES = ("sync_git_outer", "sync_git_non_root", "sync_git_inner")
 _KANBAN_FLEET_SYNC_TABLES = frozenset(KANBAN_DATASTORE_TABLES)
+_MARK_SENT_BUSY_TIMEOUT_MS = 50
 
 
 def _utc_sqlite_now() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sqlite_database_locked(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+@contextmanager
+def _mark_sent_nowait_conn() -> Any:
+    conn = sqlite3.connect(
+        cfg.DB_PATH,
+        timeout=_MARK_SENT_BUSY_TIMEOUT_MS / 1000,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_MARK_SENT_BUSY_TIMEOUT_MS}")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def kanban_table_fleet_sync_disabled(table_name: str) -> bool:
@@ -353,24 +378,46 @@ def get_queue_depths(peer_ids: list[str]) -> dict[str, int]:
     return {pid: get_queue_depth(pid) for pid in peer_ids}
 
 
-def mark_sent(queue_ids: list[int]) -> None:
-    """Mark a batch of queue_ids as sent=1."""
+def _mark_sent_with_conn(conn: sqlite3.Connection, queue_ids: list[int]) -> None:
     if not queue_ids:
         return
     placeholders = ", ".join("?" * len(queue_ids))
+    try:
+        conn.execute(
+            f"UPDATE sync_queue SET sent=1, sent_at=? WHERE queue_id IN ({placeholders})",
+            [_utc_sqlite_now(), *queue_ids],
+        )
+    except sqlite3.OperationalError as exc:
+        if "sent_at" not in str(exc):
+            raise
+        conn.execute(
+            f"UPDATE sync_queue SET sent=1 WHERE queue_id IN ({placeholders})",
+            queue_ids,
+        )
+
+
+def mark_sent(queue_ids: list[int]) -> None:
+    """Mark a batch of queue_ids as sent=1."""
     with get_conn() as conn:
-        try:
-            conn.execute(
-                f"UPDATE sync_queue SET sent=1, sent_at=? WHERE queue_id IN ({placeholders})",
-                [_utc_sqlite_now(), *queue_ids],
-            )
-        except sqlite3.OperationalError as exc:
-            if "sent_at" not in str(exc):
-                raise
-            conn.execute(
-                f"UPDATE sync_queue SET sent=1 WHERE queue_id IN ({placeholders})",
-                queue_ids,
-            )
+        _mark_sent_with_conn(conn, queue_ids)
+
+
+def try_mark_sent(queue_ids: list[int]) -> bool:
+    """Best-effort sent marker for background drain; returns False if SQLite is busy."""
+    if not queue_ids:
+        return True
+    try:
+        with _mark_sent_nowait_conn() as conn:
+            _mark_sent_with_conn(conn, queue_ids)
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_database_locked(exc):
+            raise
+        log.warning(
+            "sync_queue mark-sent deferred: sqlite writer busy for %d row(s); will retry",
+            len(queue_ids),
+        )
+        return False
+    return True
 
 
 def get_peers_with_pending() -> list[str]:

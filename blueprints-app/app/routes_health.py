@@ -26,16 +26,20 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
-        commit_ts = int(subprocess.check_output(
-            ["git", "-C", path, "log", "-1", "--format=%ct"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip())
-        dirty = bool(subprocess.check_output(
-            ["git", "-C", path, "status", "--short"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip())
+        commit_ts = int(
+            subprocess.check_output(
+                ["git", "-C", path, "log", "-1", "--format=%ct"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        )
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "-C", path, "status", "--short"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        )
 
         upstream = None
         upstream_tracked = None
@@ -44,7 +48,15 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
         try:
             upstream = subprocess.check_output(
-                ["git", "-C", path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+                [
+                    "git",
+                    "-C",
+                    path,
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
                 stderr=subprocess.DEVNULL,
                 text=True,
             ).strip()
@@ -54,11 +66,23 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
         if upstream_tracked:
             try:
-                counts = subprocess.check_output(
-                    ["git", "-C", path, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                ).strip().split()
+                counts = (
+                    subprocess.check_output(
+                        [
+                            "git",
+                            "-C",
+                            path,
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            "@{upstream}...HEAD",
+                        ],
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    .strip()
+                    .split()
+                )
                 if len(counts) >= 2:
                     behind = int(counts[0])
                     ahead = int(counts[1])
@@ -84,7 +108,7 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
 
 @router.get("/health", response_model=HealthOut)
-async def health() -> HealthOut:
+def health() -> HealthOut:
     with get_conn() as conn:
         gen = get_gen(conn)
         integrity_ok = get_meta(conn, "integrity_ok") == "true"
@@ -101,7 +125,7 @@ async def health() -> HealthOut:
 
 
 @router.get("/health/repos", response_model=RepoVersionsOut)
-async def repo_versions() -> RepoVersionsOut:
+def repo_versions() -> RepoVersionsOut:
     return RepoVersionsOut(
         node_id=cfg.NODE_ID,
         outer=_repo_version(cfg.REPO_OUTER_PATH, "outer"),

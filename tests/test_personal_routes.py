@@ -6473,6 +6473,43 @@ def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     assert {"kanban_items:work-commit-a", "kanban_items:work-commit-b"}.issubset(targets)
 
 
+def test_work_automation_status_delegates_sync_payload_off_event_loop(monkeypatch):
+    calls = []
+
+    def fake_status(clean_item_id, limit, **kwargs):
+        return {
+            "ok": True,
+            "schema": "xarta.kanban.automation_status.v1",
+            "item_id": clean_item_id,
+            "limit": limit,
+            "kwargs": kwargs,
+        }
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append((func.__name__, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(routes_personal, "_get_work_automation_status_sync", fake_status)
+    monkeypatch.setattr(routes_personal.asyncio, "to_thread", fake_to_thread)
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(
+            item_id="slow-route",
+            limit=3,
+            include_contracts=False,
+            metrics=True,
+        )
+    )
+
+    assert calls[0][0] == "fake_status"
+    assert calls[0][1] == ("slow-route", 3)
+    assert calls[0][2]["include_contracts"] is False
+    assert status["ok"] is True
+    assert status["server_metrics"]["schema"] == "xarta.kanban.automation_status.metrics.v1"
+    assert status["server_metrics"]["status_thread_seconds"] >= 0
+
+
 def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -7211,6 +7248,129 @@ def test_work_review_processor_idle_scan_queues_changed_reviews(monkeypatch, tmp
         row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
     }
     assert "trigger_review_processor_idle_scan" in audit_actions
+
+
+def test_work_review_processor_claim_empty_eligible_ids_uses_boolean_false(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-empty-eligible-root",
+                title="Empty eligible root",
+                body="Root item for empty eligible marker claim proof",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-review-empty-eligible-child",
+                parent_item_id="work-review-empty-eligible-root",
+                title="Empty eligible child",
+                body="Child item with Review data",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-review-empty-eligible-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Operator Review: queue this marker but filter it out during claim.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-review-write",
+            ),
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-review-empty-eligible-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-scan",
+            )
+        )
+    )
+    marker_id = scan["queued_markers"][0]["marker_id"]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-empty-eligible",
+                item_id="work-review-empty-eligible-root",
+                lease_token="empty-eligible-token",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-lease",
+            )
+        )
+    )
+    assert acquired["acquired"] is True
+
+    class CapturingConnection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.sql = []
+
+        def execute(self, sql, *args):
+            if isinstance(sql, str):
+                self.sql.append(sql)
+            return self.wrapped.execute(sql, *args)
+
+        def commit(self):
+            return self.wrapped.commit()
+
+        def rollback(self):
+            return self.wrapped.rollback()
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    capture = CapturingConnection(conn)
+    monkeypatch.setattr(routes_personal, "get_conn", lambda: _conn_context(capture))
+    claim = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-empty-eligible",
+                lease_token="empty-eligible-token",
+                item_id="work-review-empty-eligible-root",
+                eligible_marker_ids=[],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="review-empty-eligible-claim",
+            )
+        )
+    )
+    assert claim["claimed"] is False
+    assert claim["reason"] == "no_queued_marker"
+    marker_queries = [
+        sql
+        for sql in capture.sql
+        if "SELECT marker.* FROM kanban_review_processor_markers marker" in sql
+        and "CASE marker.processor_kind" in sql
+    ]
+    assert marker_queries
+    assert "AND FALSE" in marker_queries[-1]
+    assert "AND 0" not in marker_queries[-1]
+    marker_status = conn.execute(
+        "SELECT status FROM kanban_review_processor_markers WHERE marker_id=?",
+        (marker_id,),
+    ).fetchone()["status"]
+    assert marker_status == "queued"
 
 
 def test_work_automation_exclusion_skips_review_scan_and_marker_claim(monkeypatch, tmp_path):

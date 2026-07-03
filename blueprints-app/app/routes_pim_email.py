@@ -7,6 +7,7 @@ import base64
 import hmac
 import os
 import re
+import time
 import uuid
 from typing import Any
 
@@ -158,6 +159,25 @@ def _worker_safe_shared_asset(item: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def _decode_transformed_image_base64(value: str) -> bytes:
+    return base64.b64decode(value, validate=True)
+
+
+def _attach_server_metrics(
+    response: dict[str, Any],
+    *,
+    metrics: bool,
+    started_at: float,
+    stages: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    if metrics:
+        response["server_metrics"] = {
+            "total_seconds": round(time.perf_counter() - started_at, 6),
+            **{name: round(duration, 6) for name, duration in (stages or {}).items()},
+        }
+    return response
+
+
 def _event_severity_for_tone(tone: str) -> str:
     if str(tone or "").lower() == "red":
         return "error"
@@ -256,19 +276,28 @@ async def email_external_image_worker_status(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     include_derivatives: bool = Query(False),
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    stages: dict[str, float] = {}
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         store = _store()
+        stage_started = time.perf_counter()
         assignments = await store.external_image_url_assignment_status_counts(mailbox_id=mailbox_id)
+        stages["assignment_status_seconds"] = time.perf_counter() - stage_started
         response = {
             "ok": True,
             "url_assignments": assignments,
         }
         if include_derivatives:
+            stage_started = time.perf_counter()
             local = await store.local_corpus_status(mailbox_id=mailbox_id)
+            stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
             response["external_image_derivatives"] = local.get("external_image_derivatives", {})
-        return response
+        return _attach_server_metrics(
+            response, metrics=metrics, started_at=started_at, stages=stages
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -277,9 +306,12 @@ async def email_external_image_worker_status(
 async def email_external_image_worker_claim_assignments(
     body: ExternalImageAssignmentClaimRequest,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     _require_email_worker_token(x_pim_email_worker_token)
     try:
+        stage_started = time.perf_counter()
         result = await _store().claim_external_image_url_assignment_block(
             mailbox_id=body.mailbox_id,
             worker_id=body.worker_id,
@@ -290,7 +322,7 @@ async def email_external_image_worker_claim_assignments(
                 "source_surface": "pim-email-worker-api",
             },
         )
-        return {
+        response = {
             "ok": True,
             "schema": "xarta.pim_email.external_image_url_assignment.block.v1",
             "mailbox_id": result.get("mailbox_id"),
@@ -301,6 +333,12 @@ async def email_external_image_worker_claim_assignments(
             "claimed": result.get("claimed"),
             "items": [_worker_safe_assignment(item) for item in result.get("items", [])],
         }
+        return _attach_server_metrics(
+            response,
+            metrics=metrics,
+            started_at=started_at,
+            stages={"claim_seconds": time.perf_counter() - stage_started},
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -309,15 +347,23 @@ async def email_external_image_worker_claim_assignments(
 async def email_external_image_worker_heartbeat_assignments(
     body: ExternalImageAssignmentHeartbeatRequest,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     _require_email_worker_token(x_pim_email_worker_token)
     try:
+        stage_started = time.perf_counter()
         result = await _store().heartbeat_external_image_url_assignment_block(
             assignment_batch_id=body.assignment_batch_id,
             worker_id=body.worker_id,
             assignment_token=body.assignment_token,
         )
-        return {"ok": True, "result": result}
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"heartbeat_seconds": time.perf_counter() - stage_started},
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -326,16 +372,24 @@ async def email_external_image_worker_heartbeat_assignments(
 async def email_external_image_worker_release_assignments(
     body: ExternalImageAssignmentReleaseRequest,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     _require_email_worker_token(x_pim_email_worker_token)
     try:
+        stage_started = time.perf_counter()
         result = await _store().release_external_image_url_assignment_block(
             assignment_batch_id=body.assignment_batch_id,
             worker_id=body.worker_id,
             assignment_token=body.assignment_token,
             reason=body.reason,
         )
-        return {"ok": True, "result": result}
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"release_seconds": time.perf_counter() - stage_started},
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -345,19 +399,25 @@ async def email_external_image_worker_complete_assignment(
     canonical_url_digest: str,
     body: ExternalImageAssignmentCompleteRequest,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    stages: dict[str, float] = {}
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         try:
-            transformed_content = base64.b64decode(
+            stage_started = time.perf_counter()
+            transformed_content = await asyncio.to_thread(
+                _decode_transformed_image_base64,
                 body.transformed_image_base64,
-                validate=True,
             )
+            stages["decode_base64_seconds"] = time.perf_counter() - stage_started
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
                 detail="transformed_image_base64 is invalid",
             ) from exc
+        stage_started = time.perf_counter()
         result = await _store().complete_external_image_url_assignment_with_transformed_payload(
             mailbox_id=body.mailbox_id,
             canonical_url_digest=canonical_url_digest,
@@ -376,11 +436,17 @@ async def email_external_image_worker_complete_assignment(
                 "source_surface": "pim-email-worker-api",
             },
         )
+        stages["complete_assignment_seconds"] = time.perf_counter() - stage_started
         if "assignment" in result:
             result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
         if "shared_asset" in result:
             result["shared_asset"] = _worker_safe_shared_asset(result["shared_asset"])
-        return {"ok": bool(result.get("ok", True)), "result": result}
+        return _attach_server_metrics(
+            {"ok": bool(result.get("ok", True)), "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages=stages,
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -392,9 +458,12 @@ async def email_external_image_worker_fail_assignment(
     canonical_url_digest: str,
     body: ExternalImageAssignmentFailRequest,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     _require_email_worker_token(x_pim_email_worker_token)
     try:
+        stage_started = time.perf_counter()
         result = await _store().fail_external_image_url_assignment(
             mailbox_id=body.mailbox_id,
             canonical_url_digest=canonical_url_digest,
@@ -409,7 +478,12 @@ async def email_external_image_worker_fail_assignment(
         )
         if "assignment" in result:
             result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
-        return {"ok": True, "result": result}
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"fail_assignment_seconds": time.perf_counter() - stage_started},
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 

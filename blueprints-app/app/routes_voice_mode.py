@@ -1947,51 +1947,63 @@ def _clean_active_browser_function_capability(item: Any) -> dict[str, Any] | Non
     }
 
 
-def _clean_active_browser_menu_capability(menu: Any) -> dict[str, Any] | None:
+def _clean_active_browser_menu_capability(
+    menu: Any,
+    *,
+    include_items: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(menu, dict):
         return None
     group = _clean_active_browser_group(menu.get("group"))
     if not group:
         return None
-    pages = [
-        clean
-        for clean in (
-            _clean_active_browser_page_capability(item)
-            for item in (menu.get("pages") if isinstance(menu.get("pages"), list) else [])
-        )
-        if clean
-    ][:120]
-    function_items = [
-        clean
-        for clean in (
-            _clean_active_browser_function_capability(item)
-            for item in (
-                menu.get("function_items") if isinstance(menu.get("function_items"), list) else []
+    raw_pages = menu.get("pages") if isinstance(menu.get("pages"), list) else []
+    raw_function_items = (
+        menu.get("function_items") if isinstance(menu.get("function_items"), list) else []
+    )
+    raw_current_functions = (
+        menu.get("current_functions") if isinstance(menu.get("current_functions"), list) else []
+    )
+    pages = (
+        [
+            clean
+            for clean in (_clean_active_browser_page_capability(item) for item in raw_pages)
+            if clean
+        ][:120]
+        if include_items
+        else []
+    )
+    function_items = (
+        [
+            clean
+            for clean in (
+                _clean_active_browser_function_capability(item) for item in raw_function_items
             )
-        )
-        if clean
-    ][:160]
-    current_functions = [
-        clean
-        for clean in (
-            _clean_active_browser_function_capability(item)
-            for item in (
-                menu.get("current_functions")
-                if isinstance(menu.get("current_functions"), list)
-                else []
+            if clean
+        ][:160]
+        if include_items
+        else []
+    )
+    current_functions = (
+        [
+            clean
+            for clean in (
+                _clean_active_browser_function_capability(item) for item in raw_current_functions
             )
-        )
-        if clean
-    ][:48]
+            if clean
+        ][:48]
+        if include_items
+        else []
+    )
     page_count = (
         _clean_browser_page_int(menu.get("page_count"), maximum=10000)
         if menu.get("page_count") is not None
-        else len(pages)
+        else len(raw_pages)
     )
     function_count = (
         _clean_browser_page_int(menu.get("function_count"), maximum=10000)
         if menu.get("function_count") is not None
-        else len(function_items)
+        else len(raw_function_items)
     )
     return {
         "group": group,
@@ -2275,7 +2287,152 @@ def _clean_active_browser_personal_graph(raw: Any) -> dict[str, Any]:
     }
 
 
-def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
+def _clean_active_browser_matrix_metric_block(raw: Any) -> dict[str, Any]:
+    metrics = raw if isinstance(raw, dict) else {}
+    server_id = _clean_string(metrics.get("server_id"), "", 16).lower()
+    if server_id not in {"tb1", "vps"}:
+        server_id = ""
+    return {
+        "generation": _clean_browser_page_int(metrics.get("generation"), maximum=100000000),
+        "server_id": server_id,
+        "room_id": _clean_string(metrics.get("room_id"), "", 255),
+        "started_at_ms": _clean_browser_page_int(
+            metrics.get("started_at_ms"), maximum=9999999999999
+        ),
+        "limit": _clean_browser_page_int(metrics.get("limit"), maximum=1000),
+        "total_ms": _clean_browser_page_int(metrics.get("total_ms"), maximum=600000),
+        "status_ms": _clean_browser_page_int(metrics.get("status_ms"), maximum=600000),
+        "rooms_ms": _clean_browser_page_int(metrics.get("rooms_ms"), maximum=600000),
+        "messages_ms": _clean_browser_page_int(metrics.get("messages_ms"), maximum=600000),
+        "room_count": _clean_browser_page_int(metrics.get("room_count"), maximum=10000),
+        "invite_count": _clean_browser_page_int(metrics.get("invite_count"), maximum=10000),
+        "response_message_count": _clean_browser_page_int(
+            metrics.get("response_message_count"), maximum=10000
+        ),
+        "visible_message_count": _clean_browser_page_int(
+            metrics.get("visible_message_count"), maximum=10000
+        ),
+        "message_load_ok": bool(metrics.get("message_load_ok")),
+        "end_present": bool(metrics.get("end_present")),
+        "ok": bool(metrics.get("ok")),
+        "aborted": bool(metrics.get("aborted")),
+        "stale": bool(metrics.get("stale")),
+        "error": _clean_string(metrics.get("error"), "", 180),
+        "server_metrics": _clean_active_browser_matrix_server_metrics(
+            metrics.get("server_metrics")
+        ),
+    }
+
+
+def _clean_active_browser_matrix_metric_map(raw: Any, *, maximum: float) -> dict[str, float]:
+    values = raw if isinstance(raw, dict) else {}
+    clean: dict[str, float] = {}
+    for key, value in list(values.items())[:40]:
+        clean_key = _clean_string(key, "", 80)
+        if not clean_key:
+            continue
+        clean[clean_key] = _clean_viewport_number(value, maximum=maximum, decimals=6)
+    return clean
+
+
+def _clean_active_browser_matrix_server_metrics(raw: Any) -> dict[str, Any]:
+    metrics = raw if isinstance(raw, dict) else {}
+    return {
+        "total_seconds": _clean_viewport_number(
+            metrics.get("total_seconds"), maximum=600.0, decimals=6
+        ),
+        "raw_event_count": _clean_browser_page_int(metrics.get("raw_event_count"), maximum=10000),
+        "filtered_event_count": _clean_browser_page_int(
+            metrics.get("filtered_event_count"), maximum=10000
+        ),
+        "encrypted_event_count": _clean_browser_page_int(
+            metrics.get("encrypted_event_count"), maximum=10000
+        ),
+        "decoded_message_count": _clean_browser_page_int(
+            metrics.get("decoded_message_count"), maximum=10000
+        ),
+        "undecryptable_event_count": _clean_browser_page_int(
+            metrics.get("undecryptable_event_count"), maximum=10000
+        ),
+        "skipped_event_count": _clean_browser_page_int(
+            metrics.get("skipped_event_count"), maximum=10000
+        ),
+        "stage_seconds": _clean_active_browser_matrix_metric_map(
+            metrics.get("stage_seconds"), maximum=600.0
+        ),
+        "stage_counts": {
+            key: int(value)
+            for key, value in _clean_active_browser_matrix_metric_map(
+                metrics.get("stage_counts"), maximum=100000.0
+            ).items()
+        },
+    }
+
+
+def _clean_active_browser_matrix_chat(raw: Any) -> dict[str, Any]:
+    matrix = raw if isinstance(raw, dict) else {}
+    server_id = _clean_string(matrix.get("server_id"), "", 16).lower()
+    if server_id not in {"tb1", "vps"}:
+        server_id = ""
+    inline_images = (
+        matrix.get("inline_images") if isinstance(matrix.get("inline_images"), dict) else {}
+    )
+    return {
+        "server_id": server_id,
+        "loading": bool(matrix.get("loading")),
+        "active_room_id": _clean_string(matrix.get("active_room_id"), "", 255),
+        "active_room_title": _clean_string(matrix.get("active_room_title"), "", 160),
+        "room_count": _clean_browser_page_int(matrix.get("room_count"), maximum=10000),
+        "invite_count": _clean_browser_page_int(matrix.get("invite_count"), maximum=10000),
+        "known_message_count": _clean_browser_page_int(
+            matrix.get("known_message_count"), maximum=10000
+        ),
+        "rendered_message_count": _clean_browser_page_int(
+            matrix.get("rendered_message_count"), maximum=10000
+        ),
+        "poll_generation": _clean_browser_page_int(
+            matrix.get("poll_generation"), maximum=100000000
+        ),
+        "refresh_generation": _clean_browser_page_int(
+            matrix.get("refresh_generation"), maximum=100000000
+        ),
+        "message_load_generation": _clean_browser_page_int(
+            matrix.get("message_load_generation"), maximum=100000000
+        ),
+        "history_backfill_generation": _clean_browser_page_int(
+            matrix.get("history_backfill_generation"), maximum=100000000
+        ),
+        "last_refresh": _clean_active_browser_matrix_metric_block(matrix.get("last_refresh")),
+        "last_message_load": _clean_active_browser_matrix_metric_block(
+            matrix.get("last_message_load")
+        ),
+        "last_history_backfill": _clean_active_browser_matrix_metric_block(
+            matrix.get("last_history_backfill")
+        ),
+        "inline_images": {
+            "generation": _clean_browser_page_int(
+                inline_images.get("generation"), maximum=100000000
+            ),
+            "scheduled": _clean_browser_page_int(inline_images.get("scheduled"), maximum=10000),
+            "requested": _clean_browser_page_int(inline_images.get("requested"), maximum=10000),
+            "loaded": _clean_browser_page_int(inline_images.get("loaded"), maximum=10000),
+            "unavailable": _clean_browser_page_int(inline_images.get("unavailable"), maximum=10000),
+            "aborted": _clean_browser_page_int(inline_images.get("aborted"), maximum=10000),
+            "dom_total": _clean_browser_page_int(inline_images.get("dom_total"), maximum=10000),
+            "dom_loading": _clean_browser_page_int(inline_images.get("dom_loading"), maximum=10000),
+            "dom_ready": _clean_browser_page_int(inline_images.get("dom_ready"), maximum=10000),
+            "dom_unavailable": _clean_browser_page_int(
+                inline_images.get("dom_unavailable"), maximum=10000
+            ),
+        },
+    }
+
+
+def _clean_active_browser_automation_report(
+    raw: Any,
+    *,
+    include_capability_items: bool = True,
+) -> dict[str, Any]:
     automation = raw if isinstance(raw, dict) else {}
     last_command_raw = (
         automation.get("last_command") if isinstance(automation.get("last_command"), dict) else {}
@@ -2301,14 +2458,17 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
     menus = [
         clean
         for clean in (
-            _clean_active_browser_menu_capability(item)
+            _clean_active_browser_menu_capability(item, include_items=False)
             for item in (
                 automation.get("menus") if isinstance(automation.get("menus"), list) else []
             )
         )
         if clean
     ][:8]
-    current_menu = _clean_active_browser_menu_capability(automation.get("current_menu"))
+    current_menu = _clean_active_browser_menu_capability(
+        automation.get("current_menu"),
+        include_items=include_capability_items,
+    )
     selector_actions = [
         clean
         for clean in (
@@ -2341,6 +2501,7 @@ def _clean_active_browser_automation_report(raw: Any) -> dict[str, Any]:
                 surfaces.get("personal_search")
             ),
             "personal_graph": _clean_active_browser_personal_graph(surfaces.get("personal_graph")),
+            "matrix_chat": _clean_active_browser_matrix_chat(surfaces.get("matrix_chat")),
         },
     }
 
@@ -2469,12 +2630,22 @@ def _fallback_frontend_expectation() -> dict[str, Any]:
     }
 
 
-def _annotate_browser_view(report: dict[str, Any] | None) -> dict[str, Any] | None:
+def _annotate_browser_view(
+    report: dict[str, Any] | None,
+    *,
+    include_capability_items: bool = True,
+    include_automation: bool = True,
+    frontend_expected: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if not isinstance(report, dict):
         return None
     public = dict(report)
     frontend = dict(public.get("frontend") if isinstance(public.get("frontend"), dict) else {})
-    expected = _fallback_frontend_expectation()
+    expected = (
+        dict(frontend_expected)
+        if isinstance(frontend_expected, dict)
+        else _fallback_frontend_expectation()
+    )
     reported_asset = _clean_string(frontend.get("asset_version"), "", 180)
     expected_asset = _clean_string(expected.get("asset_version"), "", 180)
     public["frontend"] = frontend
@@ -2482,6 +2653,13 @@ def _annotate_browser_view(report: dict[str, Any] | None) -> dict[str, Any] | No
     public["frontend_asset_version_match"] = bool(
         reported_asset and expected_asset and reported_asset == expected_asset
     )
+    if include_automation and isinstance(public.get("automation"), dict):
+        public["automation"] = _clean_active_browser_automation_report(
+            public.get("automation"),
+            include_capability_items=include_capability_items,
+        )
+    elif not include_automation:
+        public.pop("automation", None)
     return public
 
 
@@ -2498,8 +2676,15 @@ def _annotate_browser_client(
     *,
     now: float | None = None,
     max_age_seconds: int | None = None,
+    include_automation: bool = True,
+    frontend_expected: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    public = _annotate_browser_view(report)
+    public = _annotate_browser_view(
+        report,
+        include_capability_items=False,
+        include_automation=include_automation,
+        frontend_expected=frontend_expected,
+    )
     if not public:
         return None
     timestamp = float(now if now is not None else time.time())
@@ -2531,17 +2716,63 @@ def _annotate_browser_client(
     return public
 
 
+def _compact_public_browser_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
+        return None
+    keys = (
+        "browser_id",
+        "browser_label",
+        "tab_id",
+        "client_key",
+        "reported_at",
+        "server_now",
+        "age_seconds",
+        "fresh",
+        "stale",
+        "active_browser",
+        "active_tab",
+        "lease_status",
+        "visibility_state",
+        "has_focus",
+        "url_path",
+        "url_search",
+        "url_hash",
+        "page",
+        "modals",
+        "viewport",
+        "viewport_class",
+        "viewport_flags",
+        "viewport_classification",
+        "frontend",
+        "frontend_expected",
+        "frontend_asset_version_match",
+        "voice",
+        "docs",
+        "body_shade",
+    )
+    return {key: report[key] for key in keys if key in report}
+
+
 def _browser_client_inventory(
     state: dict[str, Any],
     *,
     now: float | None = None,
     max_age_seconds: int | None = None,
+    include_automation: bool = True,
+    frontend_expected: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
     active = state.get("active") if isinstance(state.get("active"), dict) else None
     timestamp = float(now if now is not None else time.time())
     clients = [
-        _annotate_browser_client(report, active, now=timestamp, max_age_seconds=max_age_seconds)
+        _annotate_browser_client(
+            report,
+            active,
+            now=timestamp,
+            max_age_seconds=max_age_seconds,
+            include_automation=include_automation,
+            frontend_expected=frontend_expected,
+        )
         for report in reports.values()
         if isinstance(report, dict)
     ]
@@ -2605,7 +2836,13 @@ async def publish_kanban_external_refresh_commands(
     async with _state_lock:
         state = _read_state_unlocked()
         active = state.get("active") if isinstance(state.get("active"), dict) else None
-        clients = _browser_client_inventory(state, now=now, max_age_seconds=max_age)
+        expected = _fallback_frontend_expectation()
+        clients = _browser_client_inventory(
+            state,
+            now=now,
+            max_age_seconds=max_age,
+            frontend_expected=expected,
+        )
 
     active_browser_id = _clean_browser_id(active.get("browser_id") if active else "")
     active_tab_id = _clean_string(active.get("tab_id") if active else "", "", 120)
@@ -2681,7 +2918,12 @@ def _find_browser_client_report(
         return None, "Missing browser_id"
     clients = [
         client
-        for client in _browser_client_inventory(state, now=now, max_age_seconds=max_age_seconds)
+        for client in _browser_client_inventory(
+            state,
+            now=now,
+            max_age_seconds=max_age_seconds,
+            frontend_expected=_fallback_frontend_expectation(),
+        )
         if _clean_browser_id(client.get("browser_id")) == clean_browser_id
         and (not clean_tab_id or _clean_string(client.get("tab_id"), "", 120) == clean_tab_id)
     ]
@@ -2700,19 +2942,31 @@ def _public_browser_clients(
 ) -> dict[str, Any]:
     max_age = max(1, int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS))
     now = time.time()
-    clients = _browser_client_inventory(state, now=now, max_age_seconds=max_age)
+    expected = _fallback_frontend_expectation()
+    clients = _browser_client_inventory(
+        state,
+        now=now,
+        max_age_seconds=max_age,
+        include_automation=False,
+        frontend_expected=expected,
+    )
+    public_clients = [
+        client
+        for client in (_compact_public_browser_report(client) for client in clients)
+        if client
+    ]
     return {
         "ok": True,
         "active": _public_active(
             state.get("active") if isinstance(state.get("active"), dict) else None
         ),
-        "clients": clients,
+        "clients": public_clients,
         "count": len(clients),
         "fresh_count": sum(1 for client in clients if client.get("fresh")),
         "stale_count": sum(1 for client in clients if client.get("stale")),
         "max_age_seconds": max_age,
         "server_now": now,
-        "frontend_expected": _fallback_frontend_expectation(),
+        "frontend_expected": expected,
         "viewport_thresholds": dict(_ACTIVE_BROWSER_VIEWPORT_THRESHOLDS),
     }
 
@@ -2749,30 +3003,65 @@ def _selected_active_browser_view(state: dict[str, Any]) -> dict[str, Any] | Non
     return max(candidates, key=_score)
 
 
-def _public_active_browser_view(state: dict[str, Any]) -> dict[str, Any]:
+def _public_active_browser_view(
+    state: dict[str, Any],
+    *,
+    include_capability_items: bool = False,
+    include_recent: bool = True,
+) -> dict[str, Any]:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
     now = time.time()
-    recent = sorted(
-        (_annotate_browser_view(report) for report in reports.values() if isinstance(report, dict)),
-        key=lambda report: float(report.get("reported_at") or 0.0) if report else 0.0,
-        reverse=True,
+    expected = _fallback_frontend_expectation()
+    recent = (
+        sorted(
+            (
+                _annotate_browser_view(
+                    report,
+                    include_capability_items=False,
+                    include_automation=False,
+                    frontend_expected=expected,
+                )
+                for report in reports.values()
+                if isinstance(report, dict)
+            ),
+            key=lambda report: float(report.get("reported_at") or 0.0) if report else 0.0,
+            reverse=True,
+        )
+        if include_recent
+        else []
     )
     clients = _browser_client_inventory(
         state,
         now=now,
         max_age_seconds=_ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
+        include_automation=False,
+        frontend_expected=expected,
     )
     return {
         "ok": True,
         "active": _public_active(
             state.get("active") if isinstance(state.get("active"), dict) else None
         ),
-        "view": _annotate_browser_view(_selected_active_browser_view(state)),
-        "reports": [report for report in recent if report][:10],
-        "clients": clients[:10],
+        "view": _annotate_browser_view(
+            _selected_active_browser_view(state),
+            include_capability_items=include_capability_items,
+            frontend_expected=expected,
+        ),
+        "reports": [
+            report
+            for report in (_compact_public_browser_report(report) for report in recent)
+            if report
+        ][:10],
+        "clients": [
+            client
+            for client in (_compact_public_browser_report(client) for client in clients)
+            if client
+        ][:10]
+        if include_recent
+        else [],
         "client_count": len(clients),
         "client_max_age_seconds": _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
-        "frontend_expected": _fallback_frontend_expectation(),
+        "frontend_expected": expected,
         "automation": {
             "default_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_DEFAULT_SECONDS,
             "minimum_step_timeout_seconds": _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS,
@@ -3200,30 +3489,110 @@ async def _publish_changed(state: dict[str, Any], action: str) -> None:
     await publish_event(event)
 
 
+def _voice_mode_status_locked_sync() -> dict[str, Any]:
+    state = _read_state_unlocked()
+    return _public_state(state)
+
+
+def _active_browser_view_locked_sync(
+    *,
+    include_capabilities: bool,
+    include_recent: bool,
+) -> dict[str, Any]:
+    state = _read_state_unlocked()
+    return _public_active_browser_view(
+        state,
+        include_capability_items=include_capabilities,
+        include_recent=include_recent,
+    )
+
+
+def _active_browser_clients_locked_sync(*, max_age_seconds: int) -> dict[str, Any]:
+    state = _read_state_unlocked()
+    return _public_browser_clients(state, max_age_seconds=max_age_seconds)
+
+
+def _update_browser_view_locked_sync(
+    body: BrowserViewBody,
+    browser_id: str,
+) -> dict[str, Any]:
+    state = _read_state_unlocked()
+    now = time.time()
+    report = _clean_browser_view_report(body, now)
+    active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
+    persisted = _maybe_write_state_telemetry_unlocked(state)
+    public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+    ack = {
+        "ok": True,
+        "stored": True,
+        "persisted": persisted,
+        "updated_at": now,
+        "active_tab_changed": active_tab_changed,
+        "browser_id": browser_id,
+    }
+    if public:
+        return {**public, **ack}
+    return ack
+
+
 @router.get("/status")
 async def voice_mode_status() -> dict[str, Any]:
     async with _state_lock:
-        state = _read_state_unlocked()
-        return _public_state(state)
+        return await asyncio.to_thread(_voice_mode_status_locked_sync)
 
 
 @router.get("/active-browser-view")
-async def active_browser_view() -> dict[str, Any]:
+async def active_browser_view(
+    include_capabilities: bool = False,
+    include_recent: bool = False,
+    metrics: bool = False,
+) -> dict[str, Any]:
+    started = time.monotonic()
     async with _state_lock:
-        state = _read_state_unlocked()
-        return _public_active_browser_view(state)
+        lock_acquired = time.monotonic()
+        payload = await asyncio.to_thread(
+            _active_browser_view_locked_sync,
+            include_capabilities=include_capabilities,
+            include_recent=include_recent,
+        )
+    finished = time.monotonic()
+    if metrics:
+        payload["server_metrics"] = {
+            "schema": "xarta.active_browser_view.metrics.v1",
+            "total_seconds": round(finished - started, 6),
+            "state_lock_wait_seconds": round(lock_acquired - started, 6),
+            "state_read_and_payload_seconds": round(finished - lock_acquired, 6),
+            "include_capabilities": bool(include_capabilities),
+            "include_recent": bool(include_recent),
+        }
+    return payload
 
 
 @router.get("/browser-clients")
 async def active_browser_clients(
     max_age_seconds: int = _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
+    metrics: bool = False,
 ) -> dict[str, Any]:
     max_age = max(
         1, min(int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS), 3600)
     )
+    started = time.monotonic()
     async with _state_lock:
-        state = _read_state_unlocked()
-        return _public_browser_clients(state, max_age_seconds=max_age)
+        lock_acquired = time.monotonic()
+        payload = await asyncio.to_thread(
+            _active_browser_clients_locked_sync,
+            max_age_seconds=max_age,
+        )
+    finished = time.monotonic()
+    if metrics:
+        payload["server_metrics"] = {
+            "schema": "xarta.active_browser_clients.metrics.v1",
+            "total_seconds": round(finished - started, 6),
+            "state_lock_wait_seconds": round(lock_acquired - started, 6),
+            "state_read_and_payload_seconds": round(finished - lock_acquired, 6),
+            "max_age_seconds": max_age,
+        }
+    return payload
 
 
 @router.post("/browser-view")
@@ -3233,23 +3602,7 @@ async def update_browser_view(body: BrowserViewBody):
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
 
     async with _state_lock:
-        state = _read_state_unlocked()
-        now = time.time()
-        report = _clean_browser_view_report(body, now)
-        active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
-        persisted = _maybe_write_state_telemetry_unlocked(state)
-        public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
-
-    ack = {
-        "ok": True,
-        "stored": True,
-        "persisted": persisted,
-        "updated_at": now,
-        "active_tab_changed": active_tab_changed,
-    }
-    if public:
-        return {**public, **ack}
-    return ack
+        return await asyncio.to_thread(_update_browser_view_locked_sync, body, browser_id)
 
 
 @router.post("/browser-clients/activate")

@@ -9,7 +9,7 @@ router = APIRouter()
 
 
 @router.get("/auth/time")
-def auth_time() -> dict[str, int | str]:
+async def auth_time() -> dict[str, int | str]:
     """
     Return the server clock used for TOTP-style Blueprints API tokens.
 

@@ -15,8 +15,10 @@ import asyncio
 import json
 import logging
 import random
+import sqlite3
 import ssl
 import time
+from contextlib import contextmanager
 
 import httpx
 
@@ -28,13 +30,14 @@ from ..sync.queue import (
     get_peers_with_pending,
     get_pending_actions,
     get_queue_depth,
-    mark_sent,
+    try_mark_sent,
 )
 
 log = logging.getLogger(__name__)
 
 _drain_task: asyncio.Task | None = None
 _last_guid_cleanup: float = 0.0
+_DRAIN_SQLITE_BUSY_TIMEOUT_MS = 50
 
 
 # ── mTLS client factory ──────────────────────────────────────────────────────
@@ -89,6 +92,29 @@ async def stop_drain_loop() -> None:
 # ── Internal ──────────────────────────────────────────────────────────────────
 
 
+def _sqlite_database_locked(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+@contextmanager
+def _drain_housekeeping_conn_nowait() -> object:
+    conn = sqlite3.connect(
+        cfg.DB_PATH,
+        timeout=_DRAIN_SQLITE_BUSY_TIMEOUT_MS / 1000,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_DRAIN_SQLITE_BUSY_TIMEOUT_MS}")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _maybe_cleanup_guids() -> None:
     """Delete sync_seen_guids entries older than 3 days.
 
@@ -98,11 +124,17 @@ def _maybe_cleanup_guids() -> None:
     now = time.time()
     if now - _last_guid_cleanup < 3600:
         return
-    _last_guid_cleanup = now
     cutoff = int(now) - 3 * 86400
-    with get_conn() as conn:
-        result = conn.execute("DELETE FROM sync_seen_guids WHERE received_at < ?", (cutoff,))
-        n = result.rowcount
+    try:
+        with _drain_housekeeping_conn_nowait() as conn:
+            result = conn.execute("DELETE FROM sync_seen_guids WHERE received_at < ?", (cutoff,))
+            n = result.rowcount
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_database_locked(exc):
+            raise
+        log.warning("guid cleanup deferred: sqlite writer busy; will retry")
+        return
+    _last_guid_cleanup = now
     if n:
         log.info("guid cleanup: removed %d expired seen-GUID entries", n)
 
@@ -114,14 +146,50 @@ def _discard_self_target_actions() -> None:
     without node identity and creates rows addressed to this node, those rows
     can never drain because self is not a configured peer.
     """
-    with get_conn() as conn:
-        result = conn.execute(
-            "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
-            (cfg.NODE_ID,),
-        )
-        discarded = result.rowcount
+    try:
+        with _drain_housekeeping_conn_nowait() as conn:
+            result = conn.execute(
+                "UPDATE sync_queue SET sent=1 WHERE target_node_id=? AND sent=0",
+                (cfg.NODE_ID,),
+            )
+            discarded = result.rowcount
+    except sqlite3.OperationalError as exc:
+        if not _sqlite_database_locked(exc):
+            raise
+        log.warning("self-target sync_queue cleanup deferred: sqlite writer busy; will retry")
+        return
     if discarded:
         log.warning("discarded %d self-targeted sync_queue action(s)", discarded)
+
+
+def _drain_integrity_ok_sync() -> bool:
+    with get_conn() as conn:
+        return get_meta(conn, "integrity_ok") == "true"
+
+
+def _drain_peer_payload_sync(node_id: str) -> tuple[int, list[int], dict[str, object] | None]:
+    depth = get_queue_depth(node_id)
+    actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
+    if not actions:
+        return depth, [], None
+    queue_ids = [a["queue_id"] for a in actions]
+    payload = {
+        "source_node_id": cfg.NODE_ID,
+        "source_commit_ts": cfg.COMMIT_TS,
+        "actions": [
+            {
+                "action_type": a["action_type"],
+                "table_name": a["table_name"],
+                "row_id": a["row_id"],
+                "row_data": json.loads(a["row_data"]) if a["row_data"] else None,
+                "gen": a["gen"],
+                "source_node_id": cfg.NODE_ID,
+                "guid": a.get("guid", ""),
+            }
+            for a in actions
+        ],
+    }
+    return depth, queue_ids, payload
 
 
 async def _drain_loop() -> None:
@@ -141,19 +209,18 @@ async def _drain_all_peers() -> None:
     """Find all peers with pending actions and drain each one."""
     # Guard: don't send anything if our own DB is degraded — we could
     # propagate corrupt state to healthy peers.
-    with get_conn() as conn:
-        if get_meta(conn, "integrity_ok") != "true":
-            log.warning("drain suspended: integrity_ok=false — waiting for recovery")
-            return
+    if not await asyncio.to_thread(_drain_integrity_ok_sync):
+        log.warning("drain suspended: integrity_ok=false — waiting for recovery")
+        return
 
-    _maybe_cleanup_guids()
-    _discard_self_target_actions()
-    pending_peers = get_peers_with_pending()
+    await asyncio.to_thread(_maybe_cleanup_guids)
+    await asyncio.to_thread(_discard_self_target_actions)
+    pending_peers = await asyncio.to_thread(get_peers_with_pending)
     if not pending_peers:
         return
 
     for node_id in pending_peers:
-        peer_urls = get_peer_urls(node_id)
+        peer_urls = await asyncio.to_thread(get_peer_urls, node_id)
         if not peer_urls:
             log.debug("no URLs configured for peer %s — skipping drain", node_id)
             continue
@@ -175,7 +242,7 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     sending row actions. A generation counter is not a whole-database freshness
     proof, so queue overflow must never trigger a DB replacement.
     """
-    depth = get_queue_depth(node_id)
+    depth, queue_ids, payload = await asyncio.to_thread(_drain_peer_payload_sync, node_id)
     log.debug("draining peer %s: %d pending actions", node_id, depth)
 
     if depth >= cfg.SYNC_QUEUE_MAX_DEPTH:
@@ -187,26 +254,9 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
             cfg.SYNC_QUEUE_MAX_DEPTH,
         )
 
-    actions = get_pending_actions(node_id, limit=cfg.SYNC_BATCH_SIZE)
-    if not actions:
+    if not payload:
         return
-
-    payload = {
-        "source_node_id": cfg.NODE_ID,
-        "source_commit_ts": cfg.COMMIT_TS,
-        "actions": [
-            {
-                "action_type": a["action_type"],
-                "table_name": a["table_name"],
-                "row_id": a["row_id"],
-                "row_data": json.loads(a["row_data"]) if a["row_data"] else None,
-                "gen": a["gen"],
-                "source_node_id": cfg.NODE_ID,
-                "guid": a.get("guid", ""),
-            }
-            for a in actions
-        ],
-    }
+    action_count = len(payload["actions"]) if isinstance(payload.get("actions"), list) else 0
 
     async with _make_sync_client(15.0) as client:
         for url in peer_urls:
@@ -219,11 +269,18 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                     else {},
                 )
                 if resp.status_code == 204:
-                    queue_ids = [a["queue_id"] for a in actions]
-                    mark_sent(queue_ids)
+                    marked_sent = await asyncio.to_thread(try_mark_sent, queue_ids)
+                    if not marked_sent:
+                        log.debug(
+                            "sent %d actions to peer %s via %s; mark-sent deferred until SQLite is free",
+                            action_count,
+                            node_id,
+                            url,
+                        )
+                        return
                     log.debug(
                         "drained %d actions to peer %s via %s",
-                        len(actions),
+                        action_count,
                         node_id,
                         url,
                     )
@@ -238,7 +295,7 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                         "commit guard: peer %s rejected actions (409) — "
                         "leaving %d outgoing action(s) queued. Local code is behind.",
                         node_id,
-                        len(actions),
+                        action_count,
                     )
                     return
                 else:

@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
@@ -170,6 +171,54 @@ def test_mark_sent_stamps_sent_at(monkeypatch):
     ).fetchone()
     assert row["sent"] == 1
     assert row["sent_at"]
+
+
+def test_try_mark_sent_returns_false_quickly_when_sqlite_writer_busy(monkeypatch, tmp_path):
+    db_path = tmp_path / "sync-queue.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE sync_queue (
+                queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent INTEGER DEFAULT 0,
+                sent_at TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute("INSERT INTO sync_queue (sent, sent_at) VALUES (0, '')")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(queue.cfg, "DB_PATH", str(db_path))
+
+    locker = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+
+        assert queue.try_mark_sent([1]) is False
+        assert time.monotonic() - started < 0.5
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT sent FROM sync_queue WHERE queue_id=1").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    assert queue.try_mark_sent([1]) is True
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT sent, sent_at FROM sync_queue WHERE queue_id=1").fetchone()
+        assert row[0] == 1
+        assert row[1]
+    finally:
+        conn.close()
 
 
 def test_sent_queue_retention_preview_and_apply_preserves_unsent(monkeypatch):

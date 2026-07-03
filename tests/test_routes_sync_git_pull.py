@@ -42,6 +42,7 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import routes_sync  # noqa: E402
+from app.models import SyncAction  # noqa: E402
 
 
 def test_git_pull_batch_skips_restart_when_heads_unchanged(monkeypatch):
@@ -145,6 +146,45 @@ def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
 
     assert calls == ["outer"]
     assert restarts == ["restart"]
+
+
+def test_receive_actions_offloads_db_apply(monkeypatch):
+    to_thread_calls = []
+    applied = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    def fake_receive_db_actions_sync(payload, db_actions):
+        applied.append((payload.source_node_id, len(db_actions)))
+        return len(db_actions)
+
+    monkeypatch.setattr(routes_sync, "_receive_actions_apply_lock", None)
+    monkeypatch.setattr(routes_sync.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(routes_sync, "_receive_db_actions_sync", fake_receive_db_actions_sync)
+
+    payload = routes_sync.SyncActionsPayload(
+        source_node_id="peer-1",
+        source_commit_ts=routes_sync.cfg.COMMIT_TS,
+        actions=[
+            SyncAction(
+                action_type="UPDATE",
+                table_name="settings",
+                row_id="sync-proof",
+                row_data={"key": "sync-proof", "value": "ok"},
+                gen=1,
+                source_node_id="peer-1",
+                guid="guid-sync-proof",
+            )
+        ],
+    )
+
+    response = asyncio.run(routes_sync.receive_actions(payload))
+
+    assert response.status_code == 204
+    assert to_thread_calls == ["fake_receive_db_actions_sync"]
+    assert applied == [("peer-1", 1)]
 
 
 def test_runtime_stale_check_uses_scope_specific_running_head(monkeypatch):
