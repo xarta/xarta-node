@@ -4205,6 +4205,78 @@ def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeyp
     )
 
 
+def test_work_kanban_mutation_routes_offload_blocking_work(monkeypatch):
+    calls = []
+
+    async def fake_run_personal_sync_work(func, *args, **kwargs):
+        calls.append((func.__name__, args, kwargs))
+        return {"ok": True, "worker": func.__name__}
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_run_personal_sync_work",
+        fake_run_personal_sync_work,
+    )
+
+    create_body = routes_personal.WorkItemCreateRequest(
+        item_id="offload-create",
+        title="Offload create",
+        actor="codex-test",
+        source_surface="pytest",
+    )
+    update_body = routes_personal.WorkItemUpdateRequest(
+        title="Offload update",
+        actor="codex-test",
+        source_surface="pytest",
+    )
+    detail_body = routes_personal.WorkItemDetailDocumentUpdateRequest(
+        body="# Offload detail",
+        actor="codex-test",
+        source_surface="pytest",
+    )
+    review_body = routes_personal.WorkItemDetailDocumentUpdateRequest(
+        body="## Offload review",
+        actor="codex-test",
+        source_surface="pytest",
+    )
+    archive_body = routes_personal.WorkItemActionRequest(
+        actor="codex-test",
+        source_surface="pytest",
+    )
+
+    assert asyncio.run(routes_personal.create_work_item(create_body)) == {
+        "ok": True,
+        "worker": "_create_work_item_sync",
+    }
+    assert asyncio.run(routes_personal.update_work_item("offload-create", update_body)) == {
+        "ok": True,
+        "worker": "_update_work_item_sync",
+    }
+    assert asyncio.run(
+        routes_personal.update_work_item_detail_document("offload-create", detail_body)
+    ) == {
+        "ok": True,
+        "worker": "_update_work_item_detail_document_sync",
+    }
+    assert asyncio.run(
+        routes_personal.update_work_item_review_document("offload-create", review_body)
+    ) == {
+        "ok": True,
+        "worker": "_update_work_item_review_document_sync",
+    }
+    assert asyncio.run(routes_personal.archive_work_item("offload-create", archive_body)) == {
+        "ok": True,
+        "worker": "_archive_work_item_sync",
+    }
+    assert calls == [
+        ("_create_work_item_sync", (create_body,), {}),
+        ("_update_work_item_sync", ("offload-create", update_body), {}),
+        ("_update_work_item_detail_document_sync", ("offload-create", detail_body), {}),
+        ("_update_work_item_review_document_sync", ("offload-create", review_body), {}),
+        ("_archive_work_item_sync", ("offload-create", archive_body), {}),
+    ]
+
+
 def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

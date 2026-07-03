@@ -12100,6 +12100,10 @@ async def replace_work_priorities(
 
 @router.post("/kanban/items")
 async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
+    return await _run_personal_sync_work(_create_work_item_sync, body)
+
+
+def _create_work_item_sync(body: WorkItemCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -12244,6 +12248,10 @@ async def create_work_item(body: WorkItemCreateRequest) -> dict[str, Any]:
 
 @router.patch("/kanban/items/{item_id}")
 async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[str, Any]:
+    return await _run_personal_sync_work(_update_work_item_sync, item_id, body)
+
+
+def _update_work_item_sync(item_id: str, body: WorkItemUpdateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -12485,6 +12493,12 @@ async def update_work_item(item_id: str, body: WorkItemUpdateRequest) -> dict[st
 async def update_work_item_detail_document(
     item_id: str, body: WorkItemDetailDocumentUpdateRequest
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_update_work_item_detail_document_sync, item_id, body)
+
+
+def _update_work_item_detail_document_sync(
+    item_id: str, body: WorkItemDetailDocumentUpdateRequest
+) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -12541,6 +12555,12 @@ async def update_work_item_detail_document(
 
 @router.put("/kanban/items/{item_id}/review")
 async def update_work_item_review_document(
+    item_id: str, body: WorkItemDetailDocumentUpdateRequest
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_update_work_item_review_document_sync, item_id, body)
+
+
+def _update_work_item_review_document_sync(
     item_id: str, body: WorkItemDetailDocumentUpdateRequest
 ) -> dict[str, Any]:
     now = _utc_now_iso()
@@ -13574,6 +13594,10 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
 
 @router.post("/kanban/items/{item_id}/archive")
 async def archive_work_item(item_id: str, body: WorkItemActionRequest) -> dict[str, Any]:
+    return await _run_personal_sync_work(_archive_work_item_sync, item_id, body)
+
+
+def _archive_work_item_sync(item_id: str, body: WorkItemActionRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
