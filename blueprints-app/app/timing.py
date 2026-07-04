@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Generator
+from concurrent.futures import Executor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
@@ -237,7 +238,13 @@ def span(event_type: str, **fields: Any) -> Generator[None, None, None]:
         )
 
 
-async def to_thread(label: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+async def to_thread(
+    label: str,
+    func: Callable[..., T],
+    *args: Any,
+    _executor: Executor | None = None,
+    **kwargs: Any,
+) -> T:
     submitted = time.perf_counter_ns()
     submitted_wall = time.time_ns()
     trace_id = current_trace_id()
@@ -259,7 +266,11 @@ async def to_thread(label: str, func: Callable[..., T], *args: Any, **kwargs: An
             run_finished_wall = time.time_ns()
 
     try:
-        return await asyncio.to_thread(runner)
+        if _executor is None:
+            return await asyncio.to_thread(runner)
+        loop = asyncio.get_running_loop()
+        context = contextvars.copy_context()
+        return await loop.run_in_executor(_executor, context.run, runner)
     except Exception as exc:
         ok = False
         error_type = type(exc).__name__

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,6 +44,31 @@ def test_timing_to_thread_records_queue_and_run_boundaries():
     assert row["submitted_perf_ns"] <= row["run_start_perf_ns"] <= row["run_end_perf_ns"]
     assert row["queue_wait_ms"] >= 0
     assert row["run_ms"] >= 0
+
+
+def test_timing_to_thread_custom_executor_preserves_trace_context():
+    timing.reset_for_tests()
+
+    async def run():
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            token = timing.set_current_trace_id("unit-trace")
+            try:
+                return await timing.to_thread(
+                    "unit.custom_executor",
+                    timing.current_trace_id,
+                    _executor=executor,
+                )
+            finally:
+                timing.reset_current_trace_id(token)
+
+    assert asyncio.run(run()) == "unit-trace"
+
+    rows = timing.snapshot()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event"] == "thread_work"
+    assert row["label"] == "unit.custom_executor"
+    assert row["trace_id"] == "unit-trace"
 
 
 def test_timing_jsonl_endpoint_returns_memory_buffer():

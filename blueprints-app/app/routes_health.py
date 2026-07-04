@@ -1,16 +1,25 @@
 """routes_health.py — GET /health"""
 
 import os
+import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from typing import Generator
+from urllib.parse import quote
 
 from fastapi import APIRouter
 
 from . import config as cfg
 from . import timing
-from .db import get_conn, get_gen, get_meta
+from .db import get_gen, get_meta
 from .models import HealthOut, RepoVersionOut, RepoVersionsOut
 
 router = APIRouter(tags=["health"])
+_HEALTH_SQLITE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="health-sqlite",
+)
 
 
 def _repo_version(path: str, label: str) -> RepoVersionOut:
@@ -110,14 +119,37 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
 @router.get("/health", response_model=HealthOut)
 async def health() -> HealthOut:
-    return await timing.to_thread("health.sqlite", _health_sync)
+    return await timing.to_thread(
+        "health.sqlite",
+        _health_sync,
+        _executor=_HEALTH_SQLITE_EXECUTOR,
+    )
+
+
+@contextmanager
+def get_health_conn() -> Generator[sqlite3.Connection, None, None]:
+    """Open a read-only health connection without per-request WAL pragmas."""
+    db_uri = f"file:{quote(cfg.DB_PATH)}?mode=ro"
+    with timing.span(
+        "sqlite_connection",
+        db_path=cfg.DB_PATH,
+        readonly=True,
+        operation="health",
+    ):
+        conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _health_sync() -> HealthOut:
     with timing.span("handler", route="health"):
-        with get_conn() as conn:
-            gen = get_gen(conn)
-            integrity_ok = get_meta(conn, "integrity_ok") == "true"
+        with get_health_conn() as conn:
+            with timing.span("health.sqlite.read_meta"):
+                gen = get_gen(conn)
+                integrity_ok = get_meta(conn, "integrity_ok") == "true"
         return HealthOut(
             status="ok",
             node_id=cfg.NODE_ID,
