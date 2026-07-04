@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +44,98 @@ os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import routes_sync  # noqa: E402
 from app.models import SyncAction  # noqa: E402
+
+
+def _sync_status_payload(gen: int = 1) -> routes_sync.SyncStatus:
+    return routes_sync.SyncStatus(
+        node_id="self",
+        node_name="Self Node",
+        gen=gen,
+        integrity_ok=True,
+        last_write_at="2026-07-04 14:00:00",
+        last_write_by="test",
+        queue_depths={"peer-a": 2},
+        peer_count=1,
+    )
+
+
+def test_sync_status_reads_queue_depths_with_single_sqlite_connection(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE nodes (node_id TEXT PRIMARY KEY);
+        CREATE TABLE sync_queue (
+            queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_node_id TEXT NOT NULL,
+            sent INTEGER DEFAULT 0
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO sync_meta (key, value) VALUES (?, ?)",
+        [
+            ("gen", "42"),
+            ("integrity_ok", "true"),
+            ("last_write_at", "2026-07-04 14:00:00"),
+            ("last_write_by", "unit"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO nodes (node_id) VALUES (?)", [("self",), ("peer-a",), ("peer-b",)]
+    )
+    conn.executemany(
+        "INSERT INTO sync_queue (target_node_id, sent) VALUES (?, ?)",
+        [("peer-a", 0), ("peer-a", 0), ("peer-a", 1)],
+    )
+    opened = []
+
+    @contextmanager
+    def fake_get_conn():
+        opened.append("open")
+        yield conn
+        conn.commit()
+
+    monkeypatch.setattr(routes_sync, "get_conn", fake_get_conn)
+    monkeypatch.setattr(routes_sync.cfg, "NODE_ID", "self")
+    monkeypatch.setattr(routes_sync.cfg, "NODE_NAME", "Self Node")
+
+    status = routes_sync._sync_status_sync()
+
+    assert opened == ["open"]
+    assert status.gen == 42
+    assert status.queue_depths == {"peer-a": 2, "peer-b": 0}
+    assert status.peer_count == 2
+
+
+def test_sync_status_coalesces_inflight_and_short_cache(monkeypatch):
+    routes_sync._invalidate_sync_status_cache()
+    monkeypatch.setattr(routes_sync, "_sync_status_inflight_task", None)
+    calls = []
+
+    async def fake_to_thread(label, func):
+        calls.append((label, func))
+        await asyncio.sleep(0.01)
+        return _sync_status_payload(gen=len(calls))
+
+    monkeypatch.setattr(routes_sync.timing, "to_thread", fake_to_thread)
+
+    async def run_probe():
+        first, second = await asyncio.gather(
+            routes_sync._sync_status_coalesced(),
+            routes_sync._sync_status_coalesced(),
+        )
+        third = await routes_sync._sync_status_coalesced()
+        return first, second, third
+
+    first, second, third = asyncio.run(run_probe())
+
+    assert len(calls) == 1
+    assert calls[0][0] == "sync.status"
+    assert first.gen == second.gen == third.gen == 1
+    assert first is not second
+    assert second is not third
 
 
 def test_git_pull_batch_skips_restart_when_heads_unchanged(monkeypatch):

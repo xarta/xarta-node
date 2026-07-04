@@ -30,6 +30,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from . import config as cfg
+from . import timing
 from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, increment_gen
 from .events import bus as events_bus
@@ -37,7 +38,6 @@ from .models import GitPullRequest, SyncActionsPayload, SyncStatus
 from .sync.queue import (
     enqueue,
     enqueue_for_all_peers,
-    get_queue_depths,
     get_sent_queue_retention_summary,
     kanban_table_fleet_sync_disabled,
     prune_sent_actions,
@@ -53,6 +53,11 @@ _FORCE_RESTORE_HEADER = "x-blueprints-force-restore"
 _RESTORE_OP_HEADER = "x-blueprints-restore-op"
 _SAFE_BACKUP_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}-blueprints\.db\.tar\.gz$")
 _receive_actions_apply_lock: asyncio.Lock | None = None
+_SYNC_STATUS_CACHE_TTL_SECONDS = 0.1
+_sync_status_cache_lock = asyncio.Lock()
+_sync_status_cache_payload: SyncStatus | None = None
+_sync_status_cache_expires_monotonic = 0.0
+_sync_status_inflight_task: asyncio.Task[SyncStatus] | None = None
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
 # NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
@@ -662,6 +667,105 @@ def _get_receive_actions_apply_lock() -> asyncio.Lock:
     return _receive_actions_apply_lock
 
 
+def _copy_sync_status(status: SyncStatus) -> SyncStatus:
+    return status.model_copy(deep=True)
+
+
+def _invalidate_sync_status_cache() -> None:
+    global _sync_status_cache_payload, _sync_status_cache_expires_monotonic
+    _sync_status_cache_payload = None
+    _sync_status_cache_expires_monotonic = 0.0
+
+
+def _sync_status_sync() -> SyncStatus:
+    """Build sync status in one SQLite read transaction."""
+    with get_conn() as conn:
+        with timing.span("sync.status.read_meta"):
+            gen = get_gen(conn)
+            integrity_ok = get_meta(conn, "integrity_ok") == "true"
+            last_write_at = get_meta(conn, "last_write_at")
+            last_write_by = get_meta(conn, "last_write_by")
+            peer_rows = conn.execute(
+                "SELECT node_id FROM nodes WHERE node_id != ?", (cfg.NODE_ID,)
+            ).fetchall()
+            peer_ids = [r["node_id"] for r in peer_rows]
+
+        with timing.span("sync.status.queue_depths", peer_count=len(peer_ids)):
+            queue_depths = {peer_id: 0 for peer_id in peer_ids}
+            if peer_ids:
+                placeholders = ", ".join("?" for _ in peer_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT target_node_id, COUNT(*) AS pending_count
+                    FROM sync_queue
+                    WHERE sent=0 AND target_node_id IN ({placeholders})
+                    GROUP BY target_node_id
+                    """,
+                    peer_ids,
+                ).fetchall()
+                for row in rows:
+                    queue_depths[str(row["target_node_id"])] = int(row["pending_count"] or 0)
+
+    return SyncStatus(
+        node_id=cfg.NODE_ID,
+        node_name=cfg.NODE_NAME,
+        gen=gen,
+        integrity_ok=integrity_ok,
+        last_write_at=last_write_at,
+        last_write_by=last_write_by,
+        queue_depths=queue_depths,
+        peer_count=len(peer_ids),
+    )
+
+
+async def _sync_status_coalesced() -> SyncStatus:
+    """Coalesce bursty GUI status reads while bounding freshness to 100ms."""
+    global _sync_status_cache_payload, _sync_status_cache_expires_monotonic
+    global _sync_status_inflight_task
+
+    now = time.monotonic()
+    if _sync_status_cache_payload is not None and now < _sync_status_cache_expires_monotonic:
+        with timing.span(
+            "sync.status.cache",
+            result="hit",
+            ttl_ms=round(_SYNC_STATUS_CACHE_TTL_SECONDS * 1000),
+        ):
+            return _copy_sync_status(_sync_status_cache_payload)
+
+    async with _sync_status_cache_lock:
+        now = time.monotonic()
+        if _sync_status_cache_payload is not None and now < _sync_status_cache_expires_monotonic:
+            with timing.span(
+                "sync.status.cache",
+                result="hit_after_lock",
+                ttl_ms=round(_SYNC_STATUS_CACHE_TTL_SECONDS * 1000),
+            ):
+                return _copy_sync_status(_sync_status_cache_payload)
+        if _sync_status_inflight_task is None or _sync_status_inflight_task.done():
+            _sync_status_inflight_task = asyncio.create_task(
+                timing.to_thread("sync.status", _sync_status_sync)
+            )
+            cache_result = "miss"
+        else:
+            cache_result = "coalesced_inflight"
+        task = _sync_status_inflight_task
+
+    with timing.span(
+        "sync.status.cache",
+        result=cache_result,
+        ttl_ms=round(_SYNC_STATUS_CACHE_TTL_SECONDS * 1000),
+    ):
+        status = await task
+
+    async with _sync_status_cache_lock:
+        if _sync_status_inflight_task is task:
+            _sync_status_inflight_task = None
+        _sync_status_cache_payload = _copy_sync_status(status)
+        _sync_status_cache_expires_monotonic = time.monotonic() + _SYNC_STATUS_CACHE_TTL_SECONDS
+
+    return _copy_sync_status(status)
+
+
 def _receive_db_actions_sync(payload: SyncActionsPayload, db_actions: list) -> int:
     with get_conn() as conn:
         # Check own integrity — if not OK, refuse to accept (corrupt state)
@@ -796,6 +900,9 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
     async with _get_receive_actions_apply_lock():
         applied_count = await asyncio.to_thread(_receive_db_actions_sync, payload, db_actions)
 
+    if applied_count:
+        _invalidate_sync_status_cache()
+
     log.info(
         "applied %d sync actions from %s",
         applied_count,
@@ -827,6 +934,7 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
             action_type = f"sync_git_{scope}"
             enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
 
+    _invalidate_sync_status_cache()
     asyncio.create_task(_git_pull_scopes_and_maybe_restart(scopes, source="local trigger"))
     log.info("triggered git pull scopes %s locally + queued for all peers", ",".join(scopes))
 
@@ -864,6 +972,7 @@ async def retouch_table(table_name: str):
             row_dict = dict(row)
             row_id = str(row_dict[pk_col])
             enqueue_for_all_peers(conn, "UPDATE", table_name, row_id, row_dict, gen)
+    _invalidate_sync_status_cache()
     log.info("retouch: re-queued %d rows from %s", len(rows), table_name)
     return {"requeued": len(rows), "table": table_name}
 
@@ -1031,6 +1140,7 @@ async def receive_restore(request: Request) -> Response:
         )
     else:
         log.info("full DB restore applied (%d bytes)", len(zip_bytes))
+    _invalidate_sync_status_cache()
     return Response(status_code=204)
 
 
@@ -1189,28 +1299,8 @@ async def runtime_readiness(
 @router.get("/status", response_model=SyncStatus)
 async def sync_status() -> SyncStatus:
     """Return current sync state: gen, integrity, queue depths per peer."""
-    with get_conn() as conn:
-        gen = get_gen(conn)
-        integrity_ok = get_meta(conn, "integrity_ok") == "true"
-        last_write_at = get_meta(conn, "last_write_at")
-        last_write_by = get_meta(conn, "last_write_by")
-        peer_rows = conn.execute(
-            "SELECT node_id FROM nodes WHERE node_id != ?", (cfg.NODE_ID,)
-        ).fetchall()
-        peer_ids = [r["node_id"] for r in peer_rows]
-
-    queue_depths = get_queue_depths(peer_ids)
-
-    return SyncStatus(
-        node_id=cfg.NODE_ID,
-        node_name=cfg.NODE_NAME,
-        gen=gen,
-        integrity_ok=integrity_ok,
-        last_write_at=last_write_at,
-        last_write_by=last_write_by,
-        queue_depths=queue_depths,
-        peer_count=len(peer_ids),
-    )
+    with timing.span("handler", route="sync_status"):
+        return await _sync_status_coalesced()
 
 
 def _validated_backup_confirmation(filename: str) -> dict:
@@ -1295,6 +1385,7 @@ async def prune_sent_sync_queue(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if apply:
+        _invalidate_sync_status_cache()
         log.info(
             "sync_queue sent-row prune applied: deleted=%d older_than_hours=%d limit=%d backup=%s",
             result["deleted_rows"],
@@ -1816,6 +1907,7 @@ async def sync_roundtrip_test() -> dict:
                 (canary_key, canary_row["value"], canary_row["description"]),
             )
             enqueue_for_all_peers(conn, "INSERT", "settings", canary_key, canary_row, gen)
+        _invalidate_sync_status_cache()
         log.info("roundtrip-test: wrote canary '%s', polling %s", canary_key, peer["node_id"])
 
         # Poll peer for canary; 12 x 2s = 24s max
@@ -1874,6 +1966,7 @@ async def sync_roundtrip_test() -> dict:
                 conn.execute("DELETE FROM settings WHERE key=?", (canary_key,))
                 gen = increment_gen(conn, "human")
                 enqueue_for_all_peers(conn, "DELETE", "settings", canary_key, None, gen)
+            _invalidate_sync_status_cache()
             log.info("roundtrip-test: canary '%s' deleted", canary_key)
         except Exception as cleanup_err:
             log.warning("roundtrip-test: cleanup failed: %s", cleanup_err)
