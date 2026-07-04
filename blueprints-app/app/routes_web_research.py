@@ -137,17 +137,36 @@ Rules:
 
 Depth = Literal["quick", "standard", "deep"]
 SearxngProfile = str
-_EGRESS_PROFILE_CONFIG = (
+_LEGACY_EGRESS_PROFILE_CONFIG = (
     _NODE_LOCAL_ROOT / "docs" / "networking" / "web-research-egress-profiles.json"
 )
-_EGRESS_PROFILE_AUDIT_LOG = (
-    _NODE_LOCAL_ROOT / "docs" / "networking" / "web-research-egress-profile-audit.jsonl"
+_EGRESS_PROFILE_CONFIG = Path(
+    os.environ.get(
+        "XARTA_WEB_RESEARCH_EGRESS_CONFIG",
+        str(_NODE_LOCAL_ROOT / "config" / "web-research-egress" / "profiles.json"),
+    )
 )
-_EGRESS_PROFILE_APPLY_SCRIPT = (
-    _NODE_LOCAL_ROOT / "docs" / "networking" / "scripts" / "apply-web-research-egress-profile.sh"
+_EGRESS_PROFILE_STATE = Path(
+    os.environ.get(
+        "XARTA_WEB_RESEARCH_EGRESS_STATE",
+        str(_NODE_LOCAL_ROOT / "state" / "web-research-egress" / "state.json"),
+    )
+)
+_EGRESS_PROFILE_AUDIT_LOG = Path(
+    os.environ.get(
+        "XARTA_WEB_RESEARCH_EGRESS_AUDIT",
+        str(_NODE_LOCAL_ROOT / "state" / "web-research-egress" / "audit.jsonl"),
+    )
+)
+_EGRESS_PROFILE_APPLY_SCRIPT = Path(
+    os.environ.get(
+        "XARTA_WEB_RESEARCH_EGRESS_APPLY_SCRIPT",
+        str(_NODE_LOCAL_ROOT / "scripts" / "web-research-egress" / "apply-profile.sh"),
+    )
 )
 _BRIDGE_EGRESS_PROFILE = "bridge"
-_FALLBACK_VPN_EGRESS_PROFILE = "vlan99"
+_DEFAULT_EGRESS_PROFILE = "normal"
+_VPN_EGRESS_PROFILE = "vpn"
 
 
 class WebResearchQueryBody(BaseModel):
@@ -194,22 +213,56 @@ def _timeout_seconds() -> float:
 
 
 def _read_egress_profile_config() -> dict[str, Any]:
+    config_path = _EGRESS_PROFILE_CONFIG
+    if not config_path.exists() and _LEGACY_EGRESS_PROFILE_CONFIG.exists():
+        config_path = _LEGACY_EGRESS_PROFILE_CONFIG
     try:
-        data = json.loads(_EGRESS_PROFILE_CONFIG.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        data = {}
-    return data if isinstance(data, dict) else {}
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    try:
+        state = json.loads(_EGRESS_PROFILE_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if isinstance(state, dict):
+        merged = dict(config)
+        for key in (
+            "active_profile",
+            "default_profile",
+            "intended_default_profile",
+            "updated_at",
+            "updated_by",
+            "update_reason",
+        ):
+            if key in state:
+                merged[key] = state[key]
+        return merged
+    return config
 
 
 def _write_egress_profile_config(config: dict[str, Any]) -> None:
+    state = {
+        key: config[key]
+        for key in (
+            "active_profile",
+            "default_profile",
+            "intended_default_profile",
+            "updated_at",
+            "updated_by",
+            "update_reason",
+        )
+        if key in config
+    }
     try:
-        _EGRESS_PROFILE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        _EGRESS_PROFILE_CONFIG.write_text(
-            json.dumps(config, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        _EGRESS_PROFILE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        _EGRESS_PROFILE_STATE.write_text(
+            json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     except OSError as exc:
-        raise HTTPException(500, f"Could not write egress profile config: {exc}") from exc
+        raise HTTPException(500, f"Could not write egress profile state: {exc}") from exc
 
 
 def _append_egress_profile_audit(entry: dict[str, Any]) -> None:
@@ -221,7 +274,13 @@ def _append_egress_profile_audit(entry: dict[str, Any]) -> None:
         log.warning("web-research egress profile audit write failed: %s", exc)
 
 
-async def _apply_egress_profile(profile: str) -> dict[str, Any]:
+async def _apply_egress_profile(
+    profile: str,
+    *,
+    set_default: bool = False,
+    operator: str = "blueprints-web-research",
+    reason: str = "Blueprints web research egress profile apply",
+) -> dict[str, Any]:
     if profile == "bridge":
         return {"ok": True, "stdout": "profile=bridge route_apply=noop\n", "stderr": ""}
     if not _EGRESS_PROFILE_APPLY_SCRIPT.exists():
@@ -230,12 +289,24 @@ async def _apply_egress_profile(profile: str) -> dict[str, Any]:
         )
 
     def run() -> subprocess.CompletedProcess[str]:
+        args = [str(_EGRESS_PROFILE_APPLY_SCRIPT), profile, "--restart"]
+        if set_default:
+            args.append("--set-default")
+        env = {
+            **os.environ,
+            "XARTA_WEB_RESEARCH_EGRESS_CONFIG": str(_EGRESS_PROFILE_CONFIG),
+            "XARTA_WEB_RESEARCH_EGRESS_STATE": str(_EGRESS_PROFILE_STATE),
+            "XARTA_WEB_RESEARCH_EGRESS_AUDIT": str(_EGRESS_PROFILE_AUDIT_LOG),
+            "XARTA_WEB_RESEARCH_EGRESS_OPERATOR": operator,
+            "XARTA_WEB_RESEARCH_EGRESS_REASON": reason,
+        }
         return subprocess.run(
-            [str(_EGRESS_PROFILE_APPLY_SCRIPT), profile, "--restart"],
+            args,
             check=False,
             capture_output=True,
             text=True,
             timeout=300,
+            env=env,
         )
 
     try:
@@ -351,7 +422,7 @@ def _default_searxng_profile() -> SearxngProfile:
     raw = (
         os.environ.get("WEB_RESEARCH_SEARXNG_PROFILE")
         or config.get("default_profile")
-        or _FALLBACK_VPN_EGRESS_PROFILE
+        or _DEFAULT_EGRESS_PROFILE
     )
     return _resolve_egress_profile(str(raw), config=config)
 
@@ -367,7 +438,7 @@ def _configured_egress_profiles(config: dict[str, Any]) -> set[str]:
     names = {str(name).strip().lower() for name in profiles if str(name).strip()}
     names.add(_BRIDGE_EGRESS_PROFILE)
     if not profiles:
-        names.add(_FALLBACK_VPN_EGRESS_PROFILE)
+        names.update({_DEFAULT_EGRESS_PROFILE, _VPN_EGRESS_PROFILE})
     return names
 
 
@@ -387,8 +458,8 @@ def _egress_profile_aliases(config: dict[str, Any]) -> dict[str, str]:
             aliases.setdefault(alias, default_profile)
 
     vpn_profile = aliases.get("vpn")
-    if not vpn_profile and _FALLBACK_VPN_EGRESS_PROFILE in _configured_egress_profiles(config):
-        vpn_profile = _FALLBACK_VPN_EGRESS_PROFILE
+    if not vpn_profile and _VPN_EGRESS_PROFILE in _configured_egress_profiles(config):
+        vpn_profile = _VPN_EGRESS_PROFILE
     if vpn_profile:
         for alias in ("vpn", "nordvpn", "nord"):
             aliases.setdefault(alias, vpn_profile)
@@ -402,7 +473,7 @@ def _resolve_egress_profile(value: str, *, config: dict[str, Any] | None = None)
     config = config if config is not None else _read_egress_profile_config()
     raw = value.strip().lower()
     if raw == "default":
-        raw = str(config.get("default_profile") or _FALLBACK_VPN_EGRESS_PROFILE).strip().lower()
+        raw = str(config.get("default_profile") or _DEFAULT_EGRESS_PROFILE).strip().lower()
     resolved = _egress_profile_aliases(config).get(raw, raw)
     if resolved not in _configured_egress_profiles(config):
         raise HTTPException(
@@ -1159,9 +1230,14 @@ async def set_web_research_egress_profile(body: WebResearchEgressProfileBody) ->
             409,
             f"egress profile {requested} is documented but not marked ready for activation",
         )
-    previous = str(config.get("default_profile") or _FALLBACK_VPN_EGRESS_PROFILE)
+    previous = str(config.get("default_profile") or _DEFAULT_EGRESS_PROFILE)
     now = _now_iso()
-    apply_result = await _apply_egress_profile(requested)
+    apply_result = await _apply_egress_profile(
+        requested,
+        set_default=True,
+        operator=body.operator,
+        reason=body.reason,
+    )
     config["default_profile"] = requested
     config["active_profile"] = requested
     config["updated_at"] = now
