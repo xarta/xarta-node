@@ -3382,10 +3382,25 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     assert issue_card["state_id"] == "todo"
     assert issue_card["source_ref"] == "kanban_items:issue-step16"
     assert json.loads(issue_card["tags_json"]) == ["issue", "kanban"]
-    root_rollup_with_open_issue = asyncio.run(routes_personal.get_work_item_rollup("work-root"))[
-        "rollup"
-    ]
+    root_rollup_with_open_issue_payload = asyncio.run(
+        routes_personal.get_work_item_rollup("work-root")
+    )
+    root_rollup_with_open_issue = root_rollup_with_open_issue_payload["rollup"]
     assert root_rollup_with_open_issue["issues"]["open"] == 1
+    root_and_child_rollups = asyncio.run(
+        routes_personal.get_work_item_rollups(item_id=["work-root", "work-child", "work-root"])
+    )
+    assert root_and_child_rollups["count"] == 2
+    assert set(root_and_child_rollups["rollups"]) == {"work-root", "work-child"}
+    assert root_and_child_rollups["rollups"]["work-root"] == root_rollup_with_open_issue
+    allowed_visible_card_ids = [f"visible-card-{index}" for index in range(200)]
+    assert len(routes_personal._clean_work_rollup_item_ids(allowed_visible_card_ids)) == 200
+    with pytest.raises(routes_personal.HTTPException) as exc_info:
+        routes_personal._clean_work_rollup_item_ids(
+            [f"visible-card-{index}" for index in range(201)]
+        )
+    assert exc_info.value.status_code == 400
+    assert "200 item_id values" in exc_info.value.detail
 
     done_issue = asyncio.run(
         routes_personal.update_work_issue(
@@ -3967,11 +3982,13 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         "board": 0,
         "item_detail": 0,
         "priority_recommendations": 0,
+        "rollup": 0,
     }
     original_config = routes_personal.SQLiteKanbanStore.config
     original_board = routes_personal.SQLiteKanbanStore.board
     original_item_detail = routes_personal.SQLiteKanbanStore.item_detail
     original_priority_recommendations = routes_personal.SQLiteKanbanStore.priority_recommendations
+    original_rollup = routes_personal.SQLiteKanbanStore.rollup
 
     def spy_config(self):
         calls["config"] += 1
@@ -3989,6 +4006,10 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         calls["priority_recommendations"] += 1
         return original_priority_recommendations(self, *args, **kwargs)
 
+    def spy_rollup(self, *args, **kwargs):
+        calls["rollup"] += 1
+        return original_rollup(self, *args, **kwargs)
+
     monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "config", spy_config)
     monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "board", spy_board)
     monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_detail", spy_item_detail)
@@ -3997,12 +4018,17 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         "priority_recommendations",
         spy_priority_recommendations,
     )
+    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "rollup", spy_rollup)
 
     config = asyncio.run(routes_personal.get_work_config())
     board = asyncio.run(routes_personal.get_work_root_board())
     child_board = asyncio.run(routes_personal.get_work_child_board("store-root"))
     detail = asyncio.run(routes_personal.get_work_item_detail("store-root"))
     priorities = asyncio.run(routes_personal.get_work_priorities())
+    single_rollup = asyncio.run(routes_personal.get_work_item_rollup("store-root"))
+    batch_rollups = asyncio.run(
+        routes_personal.get_work_item_rollups(item_id=["store-root", "store-child"])
+    )
 
     assert [state["state_id"] for state in config["states"]] == [
         "backlog",
@@ -4020,11 +4046,15 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
     assert detail["counts"]["children"] == 1
     assert detail["counts"]["todos"] == 1
     assert priorities["recommendations"][0]["canonical_code"] == "xarta-kanban:item:store-root"
+    assert single_rollup["rollup"]["items"]["total"] == 2
+    assert batch_rollups["rollups"]["store-root"]["items"]["total"] == 2
+    assert batch_rollups["rollups"]["store-child"]["items"]["total"] == 1
     assert calls == {
         "config": 1,
         "board": 2,
         "item_detail": 1,
         "priority_recommendations": 1,
+        "rollup": 6,
     }
 
 
