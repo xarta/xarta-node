@@ -113,7 +113,7 @@ def test_bookmarks_health_degrades_when_seekdb_counts_fail(monkeypatch):
 
 
 def test_normal_health_does_not_call_seekdb(monkeypatch):
-    monkeypatch.setattr(routes_health, "get_conn", _bookmark_counts_conn)
+    monkeypatch.setattr(routes_health, "get_health_conn", _bookmark_counts_conn)
 
     payload = asyncio.run(routes_health.health())
 

@@ -146,9 +146,15 @@ class ProcessTimingHeaderMiddleware:
         status_code = 0
         response_start_ns = 0
         response_start_wall_ns = 0
+        response_body_first_ns = 0
+        response_body_first_wall_ns = 0
+        response_body_messages = 0
+        response_body_bytes = 0
 
         async def send_with_timing(message):
             nonlocal status_code, response_start_ns, response_start_wall_ns
+            nonlocal response_body_first_ns, response_body_first_wall_ns
+            nonlocal response_body_messages, response_body_bytes
             if message["type"] == "http.response.start":
                 response_start_ns = time.perf_counter_ns()
                 response_start_wall_ns = time.time_ns()
@@ -158,6 +164,13 @@ class ProcessTimingHeaderMiddleware:
                 headers.append((b"x-blueprints-app-ms", f"{elapsed_ms:.3f}".encode("ascii")))
                 headers.append((b"x-blueprints-trace-id", trace_id.encode("ascii")))
                 message["headers"] = headers
+            elif message["type"] == "http.response.body":
+                if not response_body_first_ns:
+                    response_body_first_ns = time.perf_counter_ns()
+                    response_body_first_wall_ns = time.time_ns()
+                response_body_messages += 1
+                body = message.get("body") or b""
+                response_body_bytes += len(body)
             await send(message)
 
         ok = True
@@ -188,6 +201,20 @@ class ProcessTimingHeaderMiddleware:
                 response_start_ms=round(max(0, response_start_ns - started) / 1_000_000, 3)
                 if response_start_ns
                 else None,
+                response_send_ms=round(max(0, finished - response_start_ns) / 1_000_000, 3)
+                if response_start_ns
+                else None,
+                response_first_body_ms=round(
+                    max(0, response_body_first_ns - started) / 1_000_000, 3
+                )
+                if response_body_first_ns
+                else None,
+                response_body_ms=round(max(0, finished - response_body_first_ns) / 1_000_000, 3)
+                if response_body_first_ns
+                else None,
+                response_body_first_time_ns=response_body_first_wall_ns,
+                response_body_messages=response_body_messages,
+                response_body_bytes=response_body_bytes,
             )
             timing.reset_current_trace_id(token)
 

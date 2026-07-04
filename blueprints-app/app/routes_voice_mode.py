@@ -129,6 +129,7 @@ _DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS = _bounded_float_env(
     0.0,
     60.0,
 )
+_DEV_STATUS_MAX_REPORTS = _bounded_int_env("VOICE_MODE_DEV_STATUS_MAX_REPORTS", 32, 8, 2048)
 _VOICE_MODE_HOT_POST_FULL_RESPONSE = _truthy_env("VOICE_MODE_HOT_POST_FULL_RESPONSE")
 _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
     # Provisional first-pass thresholds. Keep raw dimensions in reports so these
@@ -1487,8 +1488,7 @@ def _read_state_unlocked() -> dict[str, Any]:
     if not isinstance(state.get("active"), dict):
         state["active"] = None
     state["policy"] = _clean_policy(state.get("policy"))
-    if not isinstance(state.get("browser_views"), dict):
-        state["browser_views"] = {}
+    state["browser_views"] = _clean_cached_browser_views(state.get("browser_views"))
     state["browser_view_updated_at"] = float(state.get("browser_view_updated_at") or 0.0)
     _STATE_CACHE = state
     return state
@@ -1552,13 +1552,18 @@ def _write_wake_dev_debug_unlocked(debug: dict[str, Any]) -> None:
     _WAKE_DEV_DEBUG_LAST_PERSISTED_AT = time.monotonic()
 
 
-def _maybe_write_wake_dev_debug_telemetry_unlocked(debug: dict[str, Any]) -> bool:
+def _maybe_write_wake_dev_debug_telemetry_unlocked(
+    debug: dict[str, Any],
+    *,
+    force: bool = False,
+) -> bool:
     global _WAKE_DEV_DEBUG_CACHE
     _WAKE_DEV_DEBUG_CACHE = debug
     interval = _DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS
     now = time.monotonic()
     if (
-        interval <= 0.0
+        force
+        or interval <= 0.0
         or not _WAKE_DEV_DEBUG_LAST_PERSISTED_AT
         or now - _WAKE_DEV_DEBUG_LAST_PERSISTED_AT >= interval
     ):
@@ -2610,10 +2615,30 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     return report
 
 
+def _prepare_browser_view_report_sync(body: BrowserViewBody, now: float) -> dict[str, Any]:
+    with timing.span("voice_mode.browser_view.report_build"):
+        return _clean_browser_view_report(body, now)
+
+
 def _browser_view_key(report: dict[str, Any]) -> str:
     browser_id = _clean_browser_id(report.get("browser_id"))
     tab_id = _clean_string(report.get("tab_id"), "", 120)
     return f"{browser_id}::{tab_id}" if tab_id else browser_id
+
+
+def _clean_cached_browser_views(value: Any) -> dict[str, dict[str, Any]]:
+    reports = value if isinstance(value, dict) else {}
+    cleaned: list[tuple[str, dict[str, Any]]] = []
+    for key, report in reports.items():
+        if not isinstance(report, dict):
+            continue
+        clean = dict(report)
+        if isinstance(clean.get("automation"), dict):
+            clean["automation"] = _clean_active_browser_automation_report(clean.get("automation"))
+        report_key = _browser_view_key(clean) or str(key)
+        cleaned.append((report_key, clean))
+    cleaned.sort(key=lambda item: float(item[1].get("reported_at") or 0.0), reverse=True)
+    return dict(cleaned[:_BROWSER_VIEW_MAX_REPORTS])
 
 
 def _fallback_frontend_expectation() -> dict[str, Any]:
@@ -3080,14 +3105,7 @@ def _store_browser_view_report_unlocked(
     if "diagnostics" not in report and isinstance(prior_report.get("diagnostics"), dict):
         report["diagnostics"] = prior_report["diagnostics"]
     reports[report_key] = report
-    sorted_items = sorted(
-        reports.items(),
-        key=lambda item: (
-            float(item[1].get("reported_at") or 0.0) if isinstance(item[1], dict) else 0.0
-        ),
-        reverse=True,
-    )
-    state["browser_views"] = dict(sorted_items[:_BROWSER_VIEW_MAX_REPORTS])
+    state["browser_views"] = _clean_cached_browser_views(reports)
     state["browser_view_updated_at"] = now
 
     active = state.get("active") if isinstance(state.get("active"), dict) else None
@@ -3147,6 +3165,46 @@ def _dev_debug_report_key(report: dict[str, Any]) -> str:
     tab_id = _clean_string(report.get("tab_id"), "", 120)
     parts = [part for part in (browser_id, tab_id, surface) if part]
     return ":".join(parts)
+
+
+def _prune_dev_debug_reports(reports: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], int]:
+    clean_reports = {str(key): value for key, value in reports.items() if isinstance(value, dict)}
+    max_reports = _DEV_STATUS_MAX_REPORTS
+    if len(clean_reports) <= max_reports:
+        return clean_reports, 0
+    newest = sorted(
+        clean_reports.items(),
+        key=lambda item: float(item[1].get("reported_at") or 0.0),
+        reverse=True,
+    )[:max_reports]
+    return dict(newest), len(clean_reports) - len(newest)
+
+
+def _voice_mode_prepare_dev_status_report_sync(
+    body: WakeDevDebugBody,
+    browser_id: str,
+    now: float,
+) -> dict[str, Any]:
+    with timing.span("voice_mode.dev_status.snapshot_bound", max_chars=120000):
+        snapshot = _bounded_json(body.snapshot or {}, 120000)
+    with timing.span("voice_mode.dev_status.report_build"):
+        report = {
+            "browser_id": browser_id,
+            "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
+            "tab_id": _clean_string(body.tab_id, "", 120),
+            "surface": _clean_dev_command_surface(body.surface),
+            "mode": _clean_dev_command_mode(body.mode),
+            "source": _clean_string(body.source, "", 120),
+            "status": _clean_string(body.status, "", 240),
+            "transcript": _clean_string(body.transcript, "", 4000),
+            "snapshot": snapshot,
+            "client_now_ms": float(body.client_now_ms or 0),
+            "reported_at": now,
+        }
+        return {
+            "report": report,
+            "report_key": _dev_debug_report_key(report),
+        }
 
 
 def _selected_browser_report(state: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any] | None:
@@ -3513,23 +3571,26 @@ def _active_browser_clients_locked_sync(*, max_age_seconds: int) -> dict[str, An
 
 
 def _update_browser_view_locked_sync(
-    body: BrowserViewBody,
+    report: dict[str, Any],
     browser_id: str,
+    now: float,
 ) -> dict[str, Any]:
-    state = _read_state_unlocked()
-    now = time.time()
-    report = _clean_browser_view_report(body, now)
-    active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
-    persisted = _maybe_write_state_telemetry_unlocked(state)
-    public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
-    ack = {
-        "ok": True,
-        "stored": True,
-        "persisted": persisted,
-        "updated_at": now,
-        "active_tab_changed": active_tab_changed,
-        "browser_id": browser_id,
-    }
+    with timing.span("voice_mode.browser_view.state_read"):
+        state = _read_state_unlocked()
+    with timing.span("voice_mode.browser_view.store"):
+        active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
+    with timing.span("voice_mode.browser_view.persist"):
+        persisted = _maybe_write_state_telemetry_unlocked(state)
+    with timing.span("voice_mode.browser_view.response_build"):
+        public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+        ack = {
+            "ok": True,
+            "stored": True,
+            "persisted": persisted,
+            "updated_at": now,
+            "active_tab_changed": active_tab_changed,
+            "browser_id": browser_id,
+        }
     if public:
         return {**public, **ack}
     return ack
@@ -3600,9 +3661,34 @@ async def update_browser_view(body: BrowserViewBody):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
+    now = time.time()
+    report = await timing.to_thread(
+        "voice_mode.browser_view.prepare",
+        _prepare_browser_view_report_sync,
+        body,
+        now,
+    )
 
+    lock_wait_start_perf_ns = time.perf_counter_ns()
+    lock_wait_start_time_ns = time.time_ns()
     async with _state_lock:
-        return await asyncio.to_thread(_update_browser_view_locked_sync, body, browser_id)
+        lock_acquired_perf_ns = time.perf_counter_ns()
+        lock_acquired_time_ns = time.time_ns()
+        timing.record_span(
+            "voice_mode.browser_view.state_lock_wait",
+            start_perf_ns=lock_wait_start_perf_ns,
+            end_perf_ns=lock_acquired_perf_ns,
+            start_time_ns=lock_wait_start_time_ns,
+            end_time_ns=lock_acquired_time_ns,
+            browser_id=browser_id,
+        )
+        return await timing.to_thread(
+            "voice_mode.browser_view.update",
+            _update_browser_view_locked_sync,
+            report,
+            browser_id,
+            now,
+        )
 
 
 @router.post("/browser-clients/activate")
@@ -3805,52 +3891,73 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
     now = time.time()
+    prepared = await timing.to_thread(
+        "voice_mode.update_dev_status.prepare",
+        _voice_mode_prepare_dev_status_report_sync,
+        body,
+        browser_id,
+        now,
+    )
+    lock_wait_start_perf_ns = time.perf_counter_ns()
+    lock_wait_start_time_ns = time.time_ns()
     async with _state_lock:
+        lock_acquired_perf_ns = time.perf_counter_ns()
+        lock_acquired_time_ns = time.time_ns()
+        report = prepared.get("report") if isinstance(prepared, dict) else {}
+        timing.record_span(
+            "voice_mode.dev_status.state_lock_wait",
+            start_perf_ns=lock_wait_start_perf_ns,
+            end_perf_ns=lock_acquired_perf_ns,
+            start_time_ns=lock_wait_start_time_ns,
+            end_time_ns=lock_acquired_time_ns,
+            browser_id=browser_id,
+            surface=report.get("surface") if isinstance(report, dict) else "",
+        )
         return await timing.to_thread(
             "voice_mode.update_dev_status",
             _voice_mode_update_dev_status_locked_sync,
-            body,
-            browser_id,
+            prepared,
             now,
         )
 
 
 def _voice_mode_update_dev_status_locked_sync(
-    body: WakeDevDebugBody,
-    browser_id: str,
+    prepared: dict[str, Any],
     now: float,
 ) -> dict[str, Any]:
-    report = {
-        "browser_id": browser_id,
-        "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
-        "tab_id": _clean_string(body.tab_id, "", 120),
-        "surface": _clean_dev_command_surface(body.surface),
-        "mode": _clean_dev_command_mode(body.mode),
-        "source": _clean_string(body.source, "", 120),
-        "status": _clean_string(body.status, "", 240),
-        "transcript": _clean_string(body.transcript, "", 4000),
-        "snapshot": _bounded_json(body.snapshot or {}, 120000),
-        "client_now_ms": float(body.client_now_ms or 0),
-        "reported_at": now,
-    }
-    state = _read_state_unlocked()
-    debug = _read_wake_dev_debug_unlocked()
-    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-    reports[_dev_debug_report_key(report)] = report
-    debug = {
-        "reports": reports,
-        "updated_at": now,
-    }
-    persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(debug)
-    public = _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
-    ack = {
-        "ok": True,
-        "stored": True,
-        "persisted": persisted,
-        "updated_at": now,
-        "surface": report["surface"],
-        "reports_count": len(reports),
-    }
+    report = prepared.get("report") if isinstance(prepared, dict) else {}
+    if not isinstance(report, dict):
+        report = {}
+    report_key = str(prepared.get("report_key") or _dev_debug_report_key(report))
+    with timing.span("voice_mode.dev_status.state_read"):
+        state = _read_state_unlocked()
+        debug = _read_wake_dev_debug_unlocked()
+    with timing.span("voice_mode.dev_status.debug_update"):
+        reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+        reports[report_key] = report
+        reports, pruned_count = _prune_dev_debug_reports(reports)
+        debug = {
+            "reports": reports,
+            "updated_at": now,
+        }
+    with timing.span("voice_mode.dev_status.persist", forced=pruned_count > 0):
+        persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(
+            debug,
+            force=pruned_count > 0,
+        )
+    with timing.span("voice_mode.dev_status.response_build"):
+        public = (
+            _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+        )
+        ack = {
+            "ok": True,
+            "stored": True,
+            "persisted": persisted,
+            "updated_at": now,
+            "surface": report.get("surface", ""),
+            "reports_count": len(reports),
+            "pruned_reports_count": pruned_count,
+        }
     if public:
         return {**public, **ack}
     return ack

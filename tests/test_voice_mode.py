@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -8,7 +10,38 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 
-from app import routes_voice_mode as voice_mode
+NODES_JSON = Path(tempfile.gettempdir()) / "blueprints-test-voice-mode-nodes.json"
+NODES_JSON.write_text(
+    """
+    {
+      "nodes": [
+        {
+          "node_id": "test-node",
+          "display_name": "Test Node",
+          "host_machine": "test-host",
+          "primary_hostname": "test-node.local",
+          "tailnet_hostname": "test-node.tailnet",
+          "primary_ip": "127.0.0.1",
+          "sync_port": 8080,
+          "tailnet": "test",
+          "tailnet_ip": "100.64.0.1",
+          "active": true
+        }
+      ]
+    }
+    """,
+    encoding="utf-8",
+)
+os.environ.setdefault("BLUEPRINTS_NODE_ID", "test-node")
+os.environ.setdefault("NODES_JSON_PATH", str(NODES_JSON))
+os.environ.setdefault("BLUEPRINTS_DB_DIR", tempfile.mkdtemp(prefix="blueprints-test-db-"))
+os.environ.setdefault("SEEKDB_HOST", "127.0.0.1")
+os.environ.setdefault("SEEKDB_PORT", "5432")
+os.environ.setdefault("SEEKDB_DB", "blueprints_test")
+os.environ.setdefault("SEEKDB_USER", "blueprints_test")
+os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
+
+from app import routes_voice_mode as voice_mode  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -1697,6 +1730,52 @@ def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persist
     live = asyncio.run(voice_mode.voice_mode_dev_status(surface="vad_dev", browser_id="browser-a"))
     assert live["debug"]["status"] == "second"
     assert live["debug"]["snapshot"]["fsm_state"] == "VAD_REARM_STT_FINALIZING"
+
+
+def test_voice_mode_dev_status_prunes_stale_reports_and_forces_persist(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(
+        voice_mode,
+        "_WAKE_DEV_DEBUG_CACHE",
+        {
+            "reports": {
+                "old-a": {"browser_id": "old-a", "surface": "wake_dev", "reported_at": 1},
+                "old-b": {"browser_id": "old-b", "surface": "wake_dev", "reported_at": 2},
+                "old-c": {"browser_id": "old-c", "surface": "wake_dev", "reported_at": 3},
+            },
+            "updated_at": 3,
+        },
+    )
+    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", time.monotonic())
+    monkeypatch.setattr(voice_mode, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(voice_mode, "_DEV_STATUS_MAX_REPORTS", 2)
+    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+
+    result = asyncio.run(
+        voice_mode.voice_mode_update_dev_status(
+            voice_mode.WakeDevDebugBody(
+                browser_id="browser-new",
+                tab_id="tab-1",
+                surface="vad_dev",
+                status="fresh",
+                snapshot={"fsm_state": "fresh"},
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["persisted"] is True
+    assert result["reports_count"] == 2
+    assert result["pruned_reports_count"] == 2
+    persisted = json.loads(debug_path.read_text(encoding="utf-8"))
+    assert len(persisted["reports"]) == 2
+    assert "browser-new:tab-1:vad_dev" in persisted["reports"]
+    assert "old-c" in persisted["reports"]
 
 
 def test_voice_mode_dev_status_update_runs_off_event_loop(monkeypatch):
