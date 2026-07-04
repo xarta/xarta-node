@@ -119,6 +119,14 @@ increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
 negative signals to report and review before commit/push; do not hide them with
 larger timeouts or stale caches.
 
+When the report is browser-visible page lag, measure the actual page/menu/card
+transition as well as cheap sentinels. Fast `/health` and `/api/v1/auth/time`
+do not exclude slow target APIs, response send, browser main-thread long tasks,
+hidden DOM rendering, stale frontend assets, or client/socket scheduling. On
+xarta-node, use the node-local runbook
+`/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/BROWSER-PAGE-LAG-TROUBLESHOOTING.md`
+when available.
+
 ## Sync protocol & commit guard
 
 The sync system uses a persistent queue in `sync_queue` (SQLite). Each data write is enqueued for all peer nodes and drained in the background every 1–20 s.

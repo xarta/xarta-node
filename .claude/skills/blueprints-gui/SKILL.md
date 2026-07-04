@@ -28,6 +28,15 @@ opportunities, but the orchestrator owns edits, browser checks, and final
 testing. Configure helper models through environment-driven LiteLLM-compatible
 aliases only.
 
+For perceived page lag, measure the actual page/menu/card transition the
+operator reports, not only cheap API sentinels. Fast `/health` and
+`/api/v1/auth/time` do not exclude browser main-thread long tasks, hidden DOM
+rendering, stale frontend assets, or slow target APIs. Shared bulk renderers
+must skip hidden hosts, inactive modals, and unopened details during ordinary
+page switches. On xarta-node, use
+`/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/BROWSER-PAGE-LAG-TROUBLESHOOTING.md`
+when available.
+
 ---
 
 ## File layout
