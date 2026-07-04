@@ -8141,6 +8141,37 @@ async def list_personal_events(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _list_personal_events_sync,
+        date_start,
+        date_end,
+        source_type,
+        status,
+        privacy_level,
+        tag,
+        related_kanban_item,
+        import_batch,
+        mode,
+        kind,
+        limit,
+        offset,
+    )
+
+
+def _list_personal_events_sync(
+    date_start: str | None,
+    date_end: str | None,
+    source_type: str | None,
+    status: str | None,
+    privacy_level: str | None,
+    tag: str | None,
+    related_kanban_item: str | None,
+    import_batch: str | None,
+    mode: str | None,
+    kind: str | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
     if date_start:
@@ -8352,6 +8383,35 @@ async def list_personal_tasks(
     source_type: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _list_personal_tasks_sync,
+        date_start,
+        date_end,
+        status,
+        privacy_level,
+        tag,
+        related_kanban_item,
+        import_batch,
+        mode,
+        source_type,
+        limit,
+        offset,
+    )
+
+
+def _list_personal_tasks_sync(
+    date_start: str | None,
+    date_end: str | None,
+    status: str | None,
+    privacy_level: str | None,
+    tag: str | None,
+    related_kanban_item: str | None,
+    import_batch: str | None,
+    mode: str | None,
+    source_type: str | None,
+    limit: int,
+    offset: int,
 ) -> dict[str, Any]:
     task_where, task_params = _task_mode_where(mode)
     event_where, event_params = _event_task_where(mode)
@@ -11811,6 +11871,10 @@ def _get_work_kanban_datastore_parity_sync(
 
 @router.get("/kanban/config")
 async def get_work_config() -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_config_sync)
+
+
+def _get_work_config_sync() -> dict[str, Any]:
     with get_conn() as conn:
         with _kanban_read_store(conn) as store:
             read = store.config()
@@ -11825,6 +11889,10 @@ async def get_work_config() -> dict[str, Any]:
 
 @router.get("/kanban/preferences")
 async def get_kanban_preferences() -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_kanban_preferences_sync)
+
+
+def _get_kanban_preferences_sync() -> dict[str, Any]:
     with get_conn() as conn:
         return {"ok": True, "preferences": _kanban_preferences(conn)}
 
@@ -11868,6 +11936,10 @@ async def update_kanban_preferences(body: WorkPreferencesUpdateRequest) -> dict[
 async def get_work_root_board(
     show_test_entries: Annotated[bool | None, Query()] = None,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_root_board_sync, show_test_entries)
+
+
+def _get_work_root_board_sync(show_test_entries: bool | None = None) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_board_payload(conn, show_test_entries=show_test_entries)
 
@@ -11877,12 +11949,27 @@ async def get_work_child_board(
     item_id: str,
     show_test_entries: Annotated[bool | None, Query()] = None,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _get_work_child_board_sync,
+        item_id,
+        show_test_entries,
+    )
+
+
+def _get_work_child_board_sync(
+    item_id: str,
+    show_test_entries: bool | None = None,
+) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_board_payload(conn, item_id, show_test_entries=show_test_entries)
 
 
 @router.get("/kanban/items/{item_id}")
 async def get_work_item_detail(item_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_item_detail_sync, item_id)
+
+
+def _get_work_item_detail_sync(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         try:
             with _kanban_read_store(conn) as store:
@@ -11950,6 +12037,10 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
 async def get_work_priorities(
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_priorities_sync, limit)
+
+
+def _get_work_priorities_sync(limit: int = 10) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_priority_recommendations_payload(conn, limit=limit)
 
@@ -13668,6 +13759,10 @@ def _archive_work_item_sync(item_id: str, body: WorkItemActionRequest) -> dict[s
 
 @router.get("/kanban/items/{item_id}/rollup")
 async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_item_rollup_sync, item_id)
+
+
+def _get_work_item_rollup_sync(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
         return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
 
@@ -14154,6 +14249,19 @@ async def list_work_item_issues(
     scope: str = "local",
     view: str = "flat",
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _list_work_item_issues_sync,
+        item_id,
+        scope,
+        view,
+    )
+
+
+def _list_work_item_issues_sync(
+    item_id: str,
+    scope: str = "local",
+    view: str = "flat",
+) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_scoped_leaf_payload(
             conn, item_id=item_id, kind="issues", scope=scope, view=view
@@ -14166,6 +14274,19 @@ async def list_work_item_todos(
     scope: str = "local",
     view: str = "flat",
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _list_work_item_todos_sync,
+        item_id,
+        scope,
+        view,
+    )
+
+
+def _list_work_item_todos_sync(
+    item_id: str,
+    scope: str = "local",
+    view: str = "flat",
+) -> dict[str, Any]:
     with get_conn() as conn:
         return _work_scoped_leaf_payload(
             conn, item_id=item_id, kind="todos", scope=scope, view=view
@@ -14174,6 +14295,10 @@ async def list_work_item_todos(
 
 @router.get("/kanban/issues/{issue_id}")
 async def get_work_issue(issue_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_issue_sync, issue_id)
+
+
+def _get_work_issue_sync(issue_id: str) -> dict[str, Any]:
     clean_issue_id = _clean_short_text(issue_id, "", limit=180)
     with get_conn() as conn:
         row = _work_typed_leaf_item_row(conn, "issue", clean_issue_id)
@@ -14199,6 +14324,10 @@ async def get_work_issue(issue_id: str) -> dict[str, Any]:
 
 @router.get("/kanban/todos/{todo_id}")
 async def get_work_todo(todo_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_todo_sync, todo_id)
+
+
+def _get_work_todo_sync(todo_id: str) -> dict[str, Any]:
     clean_todo_id = _clean_short_text(todo_id, "", limit=180)
     with get_conn() as conn:
         row = _work_typed_leaf_item_row(conn, "todo", clean_todo_id)
@@ -14319,6 +14448,10 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
 
 @router.get("/kanban/items/{item_id}/commits")
 async def list_work_item_commits(item_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_list_work_item_commits_sync, item_id)
+
+
+def _list_work_item_commits_sync(item_id: str) -> dict[str, Any]:
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     with get_conn() as conn:
         try:
@@ -14481,6 +14614,13 @@ async def record_work_item_commit(
 async def list_work_item_review_decisions(
     item_id: str,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_list_work_item_review_decisions_sync, item_id, limit)
+
+
+def _list_work_item_review_decisions_sync(
+    item_id: str,
+    limit: int = 50,
 ) -> dict[str, Any]:
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     with get_conn() as conn:
@@ -15498,6 +15638,46 @@ def _work_preprocessing_normalise_decomposition_items(
     return normalised
 
 
+def _work_preprocessing_parent_automation_excluded_sync(parent_item_id: str) -> bool:
+    with get_conn() as conn:
+        return _work_item_automation_excluded(conn, parent_item_id)
+
+
+def _work_preprocessing_child_candidate_sync(
+    parent_item_id: str,
+    expected_child_depth: int,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        sibling_rows = conn.execute(
+            """
+            SELECT * FROM kanban_items
+            WHERE parent_item_id=?
+              AND status!='archived'
+            ORDER BY created_at ASC, item_id
+            """,
+            (parent_item_id,),
+        ).fetchall()
+        sibling_by_title = {
+            _work_preprocessing_title_key(row["title"]): row for row in sibling_rows
+        }
+        existing_row = sibling_by_title.get(_work_preprocessing_title_key(candidate["title"]))
+        if existing_row is not None:
+            existing_item = _row_to_work_item(existing_row)
+            _work_preprocessing_assert_child_placement(
+                existing_item,
+                parent_item_id=parent_item_id,
+                expected_depth=expected_child_depth,
+            )
+            return {"existing_item": existing_item}
+        item_id = _work_preprocessing_unique_child_id(
+            conn,
+            parent_item_id,
+            candidate["title"],
+        )
+        return {"item_id": item_id}
+
+
 async def _work_preprocessing_create_decomposition_children(
     *,
     parent_item: Any,
@@ -15508,18 +15688,20 @@ async def _work_preprocessing_create_decomposition_children(
 ) -> dict[str, Any]:
     parent_item_id = parent_item["item_id"]
     expected_child_depth = int(parent_item["depth"] or 0) + 1
-    with get_conn() as conn:
-        if _work_item_automation_excluded(conn, parent_item_id):
-            return {
-                "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
-                "created_count": 0,
-                "existing_count": 0,
-                "total_count": 0,
-                "created_items": [],
-                "existing_items": [],
-                "items": [],
-                "skipped_reason": "automation_excluded",
-            }
+    if await _run_personal_sync_work(
+        _work_preprocessing_parent_automation_excluded_sync,
+        parent_item_id,
+    ):
+        return {
+            "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
+            "created_count": 0,
+            "existing_count": 0,
+            "total_count": 0,
+            "created_items": [],
+            "existing_items": [],
+            "items": [],
+            "skipped_reason": "automation_excluded",
+        }
     candidates = _work_preprocessing_normalise_decomposition_items(
         payload,
         parent_item=parent_item,
@@ -15527,38 +15709,17 @@ async def _work_preprocessing_create_decomposition_children(
     created: list[dict[str, Any]] = []
     existing: list[dict[str, Any]] = []
     for candidate in candidates:
-        with get_conn() as conn:
-            sibling_rows = conn.execute(
-                """
-                SELECT * FROM kanban_items
-                WHERE parent_item_id=?
-                  AND status!='archived'
-                ORDER BY created_at ASC, item_id
-                """,
-                (parent_item_id,),
-            ).fetchall()
-            sibling_by_title = {
-                _work_preprocessing_title_key(row["title"]): row for row in sibling_rows
-            }
-            existing_row = sibling_by_title.get(_work_preprocessing_title_key(candidate["title"]))
-            item_id = (
-                existing_row["item_id"]
-                if existing_row is not None
-                else _work_preprocessing_unique_child_id(
-                    conn,
-                    parent_item_id,
-                    candidate["title"],
-                )
-            )
-        if existing_row is not None:
-            existing_item = _row_to_work_item(existing_row)
-            _work_preprocessing_assert_child_placement(
-                existing_item,
-                parent_item_id=parent_item_id,
-                expected_depth=expected_child_depth,
-            )
+        candidate_result = await _run_personal_sync_work(
+            _work_preprocessing_child_candidate_sync,
+            parent_item_id,
+            expected_child_depth,
+            candidate,
+        )
+        existing_item = candidate_result.get("existing_item")
+        if existing_item is not None:
             existing.append(existing_item)
             continue
+        item_id = str(candidate_result["item_id"])
         result = await create_work_item(
             WorkItemCreateRequest(
                 item_id=item_id,
@@ -15753,6 +15914,21 @@ def _work_preprocessing_idle_marker_context_sync(item_id: str) -> dict[str, Any]
         "recent_decisions": recent_decisions,
         "hints": hints,
         "ancestor_context": ancestor_context,
+    }
+
+
+def _work_preprocessing_updated_context_sync(item_id: str) -> dict[str, Any]:
+    with get_conn() as conn:
+        updated_item = _work_item_or_404(conn, item_id)
+        updated_source = _work_preprocessing_context_source(conn, updated_item)
+        hints_row = conn.execute(
+            "SELECT * FROM kanban_agent_hints WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        updated_hints = _row_to_work_agent_hints(hints_row, item_id)
+    return {
+        "updated_source": updated_source,
+        "updated_hints": updated_hints,
     }
 
 
@@ -16037,14 +16213,12 @@ async def _process_work_preprocessing_idle_marker(
                     run_id=run_id,
                 ),
             )
-        with get_conn() as conn:
-            updated_item = _work_item_or_404(conn, item_id)
-            updated_source = _work_preprocessing_context_source(conn, updated_item)
-            hints_row = conn.execute(
-                "SELECT * FROM kanban_agent_hints WHERE item_id=?",
-                (item_id,),
-            ).fetchone()
-            updated_hints = _row_to_work_agent_hints(hints_row, item_id)
+        updated_context = await _run_personal_sync_work(
+            _work_preprocessing_updated_context_sync,
+            item_id,
+        )
+        updated_source = updated_context["updated_source"]
+        updated_hints = updated_context["updated_hints"]
         readiness_marker = _preprocessing_readiness_marker(
             item_id=item_id,
             source=updated_source,
