@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from . import timing, wake_stt_direct
 from .db import get_conn, get_setting
 from .events import AppEvent
+from .node_local_ownership import normalize_node_local_ownership as _normalize_node_local_ownership
 from .routes_events import publish_event
 from .routes_matrix_chat import _matrix_chat_stt_relay
 from .routes_matrix_chat import _settings as _matrix_chat_settings
@@ -1500,7 +1501,9 @@ def _write_state_unlocked(state: dict[str, Any]) -> None:
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _normalize_node_local_ownership(tmp)
     tmp.replace(_STATE_PATH)
+    _normalize_node_local_ownership(_STATE_PATH)
     _STATE_LAST_PERSISTED_AT = time.monotonic()
 
 
@@ -1548,7 +1551,9 @@ def _write_wake_dev_debug_unlocked(debug: dict[str, Any]) -> None:
     _WAKE_DEV_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = _WAKE_DEV_DEBUG_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(debug, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _normalize_node_local_ownership(tmp)
     tmp.replace(_WAKE_DEV_DEBUG_PATH)
+    _normalize_node_local_ownership(_WAKE_DEV_DEBUG_PATH)
     _WAKE_DEV_DEBUG_LAST_PERSISTED_AT = time.monotonic()
 
 
