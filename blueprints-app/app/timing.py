@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import parse_qsl, urlencode
 
+from .node_local_ownership import normalize_node_local_ownership as _normalize_node_local_ownership
+
 T = TypeVar("T")
 
 _DEFAULT_CAPACITY = 4096
@@ -363,7 +365,9 @@ def _write_events_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with tmp_path.open("w", encoding="utf-8") as handle:
         handle.write(content)
     os.chmod(tmp_path, 0o600)
+    _normalize_node_local_ownership(tmp_path, root=_LONE_WOLF_ROOT)
     tmp_path.replace(path)
+    _normalize_node_local_ownership(path, root=_LONE_WOLF_ROOT)
 
 
 def _pending_disk_events() -> list[dict[str, Any]]:

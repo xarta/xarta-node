@@ -94,7 +94,13 @@ def test_sanitize_query_redacts_sensitive_values():
 def test_flush_disk_logs_writes_lone_wolf_day_file(tmp_path, monkeypatch):
     timing.reset_for_tests()
     log_root = tmp_path / "blueprints-event-loop-logs"
+    normalized = []
     monkeypatch.setattr(timing, "_LONE_WOLF_ROOT", tmp_path.resolve())
+    monkeypatch.setattr(
+        timing,
+        "_normalize_node_local_ownership",
+        lambda path, *, root=None: normalized.append((Path(path), root)),
+    )
     monkeypatch.setenv("BLUEPRINTS_TIMING_LOG_ROOT", str(log_root))
     monkeypatch.setenv("BLUEPRINTS_TIMING_DISK_ENABLED", "true")
 
@@ -110,6 +116,10 @@ def test_flush_disk_logs_writes_lone_wolf_day_file(tmp_path, monkeypatch):
     assert payload["detail"] == "hello"
     assert stat_mode(path) == 0o600
     assert stat_mode(path.parent) == 0o700
+    assert normalized == [
+        (path.with_suffix(path.suffix + ".tmp"), tmp_path.resolve()),
+        (path, tmp_path.resolve()),
+    ]
 
 
 def test_state_reports_guard_error_for_log_root_outside_lone_wolf(tmp_path, monkeypatch):

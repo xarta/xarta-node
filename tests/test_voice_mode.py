@@ -1732,6 +1732,31 @@ def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persist
     assert live["debug"]["snapshot"]["fsm_state"] == "VAD_REARM_STT_FINALIZING"
 
 
+def test_voice_mode_state_writes_normalize_node_local_ownership(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-voice-mode.json"
+    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
+    normalized = []
+    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(
+        voice_mode,
+        "_normalize_node_local_ownership",
+        lambda path: normalized.append(Path(path)),
+    )
+
+    voice_mode._write_state_unlocked({"revision": 1})
+    voice_mode._write_wake_dev_debug_unlocked({"reports": {}})
+
+    assert normalized == [
+        state_path.with_suffix(".tmp"),
+        state_path,
+        debug_path.with_suffix(".tmp"),
+        debug_path,
+    ]
+
+
 def test_voice_mode_dev_status_prunes_stale_reports_and_forces_persist(tmp_path, monkeypatch):
     state_path = tmp_path / "blueprints-voice-mode.json"
     debug_path = tmp_path / "blueprints-wake-dev-debug.json"
