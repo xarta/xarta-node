@@ -109,10 +109,15 @@ logs:
 
 The helper uses the shared `xarta_time_spans` parser for high-level windows and
 buckets (`--last 30m`, `--day today`, `--since ... --until ...`, `--bucket
-hour`, `--bucket 5m`). Meaningful increases in `/health`,
-`/api/v1/auth/time`, `x-blueprints-app-ms`, `event_loop_lag`, thread queue wait,
-DB wait, or serialization time are negative signals to report and review before
-commit/push; do not hide them with larger timeouts or stale caches.
+hour`, `--bucket 5m`). Use
+`/root/xarta-node/.xarta/.agents/bin/blueprints-event-loop-logs trends --last 1w --interval 1h`
+for drift and step-change review, and intervals down to `10s` for fresh
+contention probes. Nearby commits from `--include-git` are correlation
+candidates only until workload, spans, and diffs support causation. Meaningful
+increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
+`event_loop_lag`, thread queue wait, DB wait, or serialization time are
+negative signals to report and review before commit/push; do not hide them with
+larger timeouts or stale caches.
 
 ## Sync protocol & commit guard
 
