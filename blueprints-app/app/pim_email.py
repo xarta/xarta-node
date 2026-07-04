@@ -3592,6 +3592,10 @@ class PgEmailStore:
                      AND l.transform_version = 'jpeg-v1'
                     WHERE l.assignment_id IS NULL
                        OR l.assignment_status = 'unassigned'
+                       OR (
+                            l.assignment_status = 'retryable'
+                            AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
+                       )
                     ORDER BY r.updated_at DESC
                     LIMIT $2
                 )
@@ -3632,6 +3636,13 @@ class PgEmailStore:
                     completed_at = NULL,
                     updated_at = now()
                 WHERE pim_email_external_image_url_assignments.assignment_status = 'unassigned'
+                   OR (
+                        pim_email_external_image_url_assignments.assignment_status = 'retryable'
+                        AND (
+                            pim_email_external_image_url_assignments.next_retry_at IS NULL
+                            OR pim_email_external_image_url_assignments.next_retry_at <= now()
+                        )
+                   )
                 RETURNING assignment_id, assignment_batch_id, mailbox_id, canonical_url_digest,
                           canonical_url, source_url, email_uid, input_raw_sha256,
                           transform_version, assignment_status, worker_id, assignment_token,
@@ -4086,6 +4097,176 @@ class PgEmailStore:
                 for row in worker_rows
             ],
         }
+
+    async def reconcile_external_image_url_assignments_from_shared_assets(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        limit: int = 500,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        safe_limit = max(1, min(int(limit or 1), 5000))
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT l.assignment_id, l.mailbox_id, l.canonical_url_digest,
+                       l.transform_version, l.assignment_status, l.result_status,
+                       l.reason, l.metadata_json, s.shared_asset_uid
+                FROM pim_email_external_image_url_assignments l
+                JOIN LATERAL (
+                    SELECT shared_asset_uid
+                    FROM pim_email_shared_assets s
+                    WHERE s.mailbox_id = l.mailbox_id
+                      AND s.canonical_url_digest = l.canonical_url_digest
+                      AND s.transform_version = l.transform_version
+                    ORDER BY s.reference_count DESC, s.updated_at DESC
+                    LIMIT 1
+                ) s ON true
+                WHERE l.mailbox_id = $1
+                  AND l.assignment_status IN ('retryable','unassigned')
+                  AND (
+                      l.assignment_status <> 'retryable'
+                      OR l.next_retry_at IS NULL
+                      OR l.next_retry_at <= now()
+                  )
+                ORDER BY l.next_retry_at ASC NULLS FIRST, l.updated_at ASC
+                LIMIT $2
+                """,
+                configured_mailbox_id,
+                safe_limit,
+            )
+        finally:
+            await conn.close()
+
+        summary: dict[str, Any] = {
+            "schema": "xarta.pim_email.external_image_url_assignment.shared_asset_reconcile.summary.v1",
+            "mailbox_id": configured_mailbox_id,
+            "planned": len(rows),
+            "completed": 0,
+            "retryable": 0,
+            "skipped_race": 0,
+            "references_linked": 0,
+            "references_link_failed": 0,
+            "failures": [],
+        }
+        assignment_ids = [
+            str(_row_get(row, "assignment_id", "") or "")
+            for row in rows
+            if str(_row_get(row, "assignment_id", "") or "")
+        ]
+        if not assignment_ids:
+            return summary
+        try:
+            link_result = await self.link_external_image_references_from_shared_assets(
+                mailbox_id=configured_mailbox_id,
+                limit=safe_limit,
+                metadata={
+                    **(metadata or {}),
+                    "phase": "external-image-url-assignment-shared-asset-reconcile",
+                    "assignment_count": len(assignment_ids),
+                },
+            )
+            summary["references_linked"] += int(link_result.get("linked") or 0)
+            summary["references_link_failed"] += int(link_result.get("failed") or 0)
+            if summary["references_link_failed"] and len(summary["failures"]) < 20:
+                summary["failures"].append(
+                    {
+                        "error_class": "SharedAssetLinkFailure",
+                        "error_message": (
+                            f"{summary['references_link_failed']} shared-asset reference "
+                            "link(s) failed during assignment reconciliation"
+                        ),
+                    }
+                )
+        except Exception as exc:
+            summary["references_link_failed"] += 1
+            summary["failures"].append(
+                {
+                    "error_class": exc.__class__.__name__,
+                    "error_message": str(exc)[:300],
+                }
+            )
+
+        reconcile_metadata = {
+            **(metadata or {}),
+            "schema": "xarta.pim_email.external_image_url_assignment.shared_asset_reconcile.v1",
+            "assignment_count": len(assignment_ids),
+            "references_linked": int(summary["references_linked"]),
+            "references_link_failed": int(summary["references_link_failed"]),
+        }
+        conn = await self._connect()
+        try:
+            updated_rows = await conn.fetch(
+                """
+                WITH candidate AS (
+                    SELECT l.assignment_id
+                    FROM pim_email_external_image_url_assignments l
+                    WHERE l.assignment_id = ANY($1::text[])
+                      AND l.mailbox_id = $2
+                      AND l.assignment_status IN ('retryable','unassigned')
+                      AND (
+                          l.assignment_status <> 'retryable'
+                          OR l.next_retry_at IS NULL
+                          OR l.next_retry_at <= now()
+                      )
+                      AND EXISTS (
+                          SELECT 1
+                          FROM pim_email_shared_assets s
+                          WHERE s.mailbox_id = l.mailbox_id
+                            AND s.canonical_url_digest = l.canonical_url_digest
+                            AND s.transform_version = l.transform_version
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_external_image_derivatives d
+                          WHERE d.mailbox_id = l.mailbox_id
+                            AND d.canonical_url_digest = l.canonical_url_digest
+                            AND d.status IN ('pending','fetched','transformed','failed')
+                      )
+                )
+                UPDATE pim_email_external_image_url_assignments l
+                SET assignment_status = 'completed',
+                    result_status = 'stored',
+                    reason = '',
+                    assignment_token = '',
+                    next_retry_at = NULL,
+                    expires_at = NULL,
+                    completed_at = COALESCE(l.completed_at, now()),
+                    metadata_json = l.metadata_json || jsonb_build_object(
+                        'shared_asset_reconcile', $3::jsonb
+                    ),
+                    updated_at = now()
+                FROM candidate c
+                WHERE l.assignment_id = c.assignment_id
+                RETURNING l.assignment_id
+                """,
+                assignment_ids,
+                configured_mailbox_id,
+                _json_dumps(reconcile_metadata, sort_keys=True, separators=(",", ":")),
+            )
+            summary["completed"] = len(updated_rows)
+            remaining = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM pim_email_external_image_url_assignments l
+                WHERE l.assignment_id = ANY($1::text[])
+                  AND l.mailbox_id = $2
+                  AND l.assignment_status IN ('retryable','unassigned')
+                """,
+                assignment_ids,
+                configured_mailbox_id,
+            )
+            summary["retryable"] = int(remaining or 0)
+        finally:
+            await conn.close()
+        summary["skipped_race"] = max(
+            0,
+            int(summary["planned"]) - int(summary["completed"]) - int(summary["retryable"]),
+        )
+        return summary
 
     async def process_external_image_unique_canonical_assets(
         self,
@@ -7020,6 +7201,11 @@ def _download_run_public(row: Any) -> dict[str, Any]:
     }
 
 
+_PIM_EMAIL_STACK_DOWNLOAD_CLI = (
+    "/xarta-node/.lone-wolf/stacks/pim-email/stack_cli/pim_email_download_mailbox.py"
+)
+
+
 def _active_download_run_ids_from_proc(proc_root: str | Path = "/proc") -> set[str]:
     active: set[str] = set()
     root = Path(proc_root)
@@ -7032,7 +7218,7 @@ def _active_download_run_ids_from_proc(proc_root: str | Path = "/proc") -> set[s
             raw = cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
         except Exception:
             continue
-        if "pim_email_download_mailbox.py" not in raw or "--run-id" not in raw:
+        if _PIM_EMAIL_STACK_DOWNLOAD_CLI not in raw or "--run-id" not in raw:
             continue
         match = re.search(r"(?:^|\s)--run-id\s+(\S+)", raw)
         if match:

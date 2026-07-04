@@ -7,11 +7,13 @@ import base64
 import hmac
 import os
 import re
+import subprocess
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from .events import AppEvent
@@ -21,19 +23,19 @@ from .pim_email import (
     EmailCredentialError,
     EmailOperationError,
     PgEmailStore,
-    download_mailbox,
     fetch_message,
     fetch_message_security,
-    fetch_remote_image_as_jpeg,
     list_folder_messages,
     list_folders,
     list_inbox,
     smtp_self_send,
-    verify_email_image_signature,
 )
 from .pim_email_security import security_status
 
 router = APIRouter(prefix="/personal/email", tags=["personal-email"])
+
+PIM_EMAIL_STACK_DIR = Path("/xarta-node/.lone-wolf/stacks/pim-email")
+PIM_EMAIL_STACK_COMMAND_TIMEOUT_SECONDS = 25.0
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -105,6 +107,15 @@ class ExternalImageAssignmentFailRequest(BaseModel):
     status: str = Field(..., min_length=3, max_length=40)
     reason: str = Field(..., min_length=1, max_length=1000)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExternalImageMaintenanceStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    batch_size: int = Field(250, ge=1, le=5000)
+    max_batches: int | None = Field(None, ge=1, le=100000)
+    repeat_until_idle: bool = True
 
 
 def _store() -> PgEmailStore:
@@ -228,6 +239,102 @@ def _attach_security_run_id(security: dict[str, Any], run_id: str) -> None:
     progress["run_id"] = run_id
 
 
+def _parse_stack_control_output(stdout: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in str(stdout or "").splitlines():
+        for part in line.strip().split():
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            if key:
+                parsed[key] = value
+    return parsed
+
+
+def _run_stack_control_script(script_name: str, args: list[str]) -> dict[str, Any]:
+    script = (PIM_EMAIL_STACK_DIR / "scripts" / script_name).resolve()
+    try:
+        script.relative_to(PIM_EMAIL_STACK_DIR.resolve())
+    except ValueError as exc:
+        raise EmailOperationError("PIM Email stack script path escaped stack root") from exc
+    if not script.exists():
+        raise EmailOperationError(f"PIM Email stack script is missing: {script_name}")
+    completed = subprocess.run(
+        [str(script), *args],
+        cwd=str(PIM_EMAIL_STACK_DIR),
+        text=True,
+        capture_output=True,
+        timeout=PIM_EMAIL_STACK_COMMAND_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise EmailOperationError(
+            "PIM Email stack control command failed: "
+            f"exit={completed.returncode} stderr={completed.stderr.strip()[:500]}"
+        )
+    parsed = _parse_stack_control_output(completed.stdout)
+    return {
+        "schema": "xarta.pim_email.stack_control.command_result.v1",
+        "script": script_name,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+        "parsed": parsed,
+    }
+
+
+async def _start_stack_download(body: DownloadMailboxRequest) -> dict[str, Any]:
+    store = _store()
+    mailbox = await store.get_mailbox(body.mailbox_id)
+    run_id = f"pim-email-stack-download-{uuid.uuid4().hex}"
+    args = [run_id, "--mailbox-id", mailbox.mailbox_id]
+    if body.apply_remote_moves:
+        args.append("--apply-remote-moves")
+    if body.downloaded_folder:
+        args.extend(["--downloaded-folder", body.downloaded_folder])
+    for folder in body.folder_allowlist or []:
+        args.extend(["--folder", folder])
+    if body.limit_per_folder is not None:
+        args.extend(["--limit-per-folder", str(body.limit_per_folder)])
+    if body.max_messages is not None:
+        args.extend(["--max-messages", str(body.max_messages)])
+    args.extend(["--convergence-passes", str(body.convergence_passes)])
+    command = await asyncio.to_thread(_run_stack_control_script, "start-download.sh", args)
+    return {
+        "schema": "xarta.pim_email.stack_control.download_start.v1",
+        "mailbox": mailbox.public_dict(),
+        "run_id": run_id,
+        "log": command.get("parsed", {}).get("log", ""),
+        "stack": str(PIM_EMAIL_STACK_DIR),
+        "command": command,
+    }
+
+
+async def _start_stack_external_image_maintenance(
+    body: ExternalImageMaintenanceStartRequest,
+) -> dict[str, Any]:
+    mailbox_public: dict[str, Any] | None = None
+    args: list[str] = [f"pim-email-stack-shared-assets-{uuid.uuid4().hex}"]
+    if body.mailbox_id:
+        mailbox = await _store().get_mailbox(body.mailbox_id)
+        mailbox_public = mailbox.public_dict()
+        args.extend(["--mailbox-id", mailbox.mailbox_id])
+    args.extend(["--batch-size", str(body.batch_size)])
+    if body.repeat_until_idle:
+        args.append("--repeat-until-idle")
+    if body.max_batches is not None:
+        args.extend(["--max-batches", str(body.max_batches)])
+    command = await asyncio.to_thread(_run_stack_control_script, "start-shared-assets.sh", args)
+    return {
+        "schema": "xarta.pim_email.stack_control.external_image_maintenance_start.v1",
+        "mailbox": mailbox_public,
+        "run_id": command.get("parsed", {}).get("run_id", args[0]),
+        "log": command.get("parsed", {}).get("log", ""),
+        "stack": str(PIM_EMAIL_STACK_DIR),
+        "command": command,
+    }
+
+
 @router.get("/status")
 async def email_status() -> dict[str, Any]:
     try:
@@ -298,6 +405,17 @@ async def email_external_image_worker_status(
         return _attach_server_metrics(
             response, metrics=metrics, started_at=started_at, stages=stages
         )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/external-images/maintenance/start")
+async def email_external_image_maintenance_start(
+    body: ExternalImageMaintenanceStartRequest,
+) -> dict[str, Any]:
+    try:
+        result = await _start_stack_external_image_maintenance(body)
+        return {"ok": True, "started": True, "result": result}
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -627,21 +745,8 @@ async def email_folder_messages(
 @router.post("/download/run")
 async def email_download_run(body: DownloadMailboxRequest) -> dict[str, Any]:
     try:
-        store = _store()
-        mailbox = await store.get_mailbox(body.mailbox_id)
-        result = await download_mailbox(
-            mailbox,
-            store=store,
-            apply_remote_moves=body.apply_remote_moves,
-            downloaded_folder=body.downloaded_folder,
-            folder_allowlist=body.folder_allowlist,
-            limit_per_folder=body.limit_per_folder,
-            max_messages=body.max_messages,
-            convergence_passes=body.convergence_passes,
-            include_special_use=True,
-            security_mode="run",
-        )
-        return {"ok": True, "result": result}
+        result = await _start_stack_download(body)
+        return {"ok": True, "started": True, "result": result}
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -725,21 +830,14 @@ async def email_message_security(
 async def email_image_proxy(
     src: str = Query(..., min_length=8, max_length=4096),
     sig: str = Query(..., min_length=32, max_length=128),
-) -> Response:
-    if not verify_email_image_signature(src, sig):
-        raise HTTPException(status_code=403, detail="image proxy signature is invalid")
-    try:
-        jpeg = await fetch_remote_image_as_jpeg(src)
-        return Response(
-            content=jpeg,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "private, max-age=86400",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-    except EmailOperationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "PIM Email remote image proxying is disabled. Remote images must be "
+            "downloaded and transformed by the Dockge remote image worker pipeline."
+        ),
+    )
 
 
 @router.post("/smtp-self-test")
