@@ -6565,6 +6565,118 @@ def test_work_kanban_commit_associations_are_item_scoped(monkeypatch):
     assert {"kanban_items:work-commit-a", "kanban_items:work-commit-b"}.issubset(targets)
 
 
+def test_postgres_active_kanban_commit_link_skips_sqlite_sync_bookkeeping(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    conn.execute(
+        """
+        INSERT INTO kanban_items (item_id, title, body_excerpt, state_id, priority_id, tags_json)
+        VALUES (
+            'work-postgres-commit-link',
+            'Postgres commit link',
+            'Proof card',
+            'doing',
+            'high',
+            '["kanban"]'
+        )
+        """
+    )
+    config = type("Config", (), {"active_store": "postgres"})()
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", config)
+
+    def fail_increment_gen(*args, **kwargs):
+        raise AssertionError("Postgres-active Kanban commit links must not increment sync_meta")
+
+    monkeypatch.setattr(routes_personal, "increment_gen", fail_increment_gen)
+    gen_before = conn.execute("SELECT value FROM sync_meta WHERE key='gen'").fetchone()[0]
+    last_write_by_before = conn.execute(
+        "SELECT value FROM sync_meta WHERE key='last_write_by'"
+    ).fetchone()[0]
+
+    sha = "d" * 40
+    result = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-postgres-commit-link",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha,
+                message_subject="Postgres-active commit link proof",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="postgres-active-commit-link",
+            ),
+        )
+    )
+
+    assert result["commit"]["sha"] == sha
+    assert conn.execute("SELECT COUNT(*) FROM kanban_item_commits").fetchone()[0] == 1
+    audit_actions = {
+        row["action"] for row in conn.execute("SELECT action FROM kanban_audit_log").fetchall()
+    }
+    assert "record_work_commit" in audit_actions
+    assert conn.execute("SELECT value FROM sync_meta WHERE key='gen'").fetchone()[0] == gen_before
+    assert (
+        conn.execute("SELECT value FROM sync_meta WHERE key='last_write_by'").fetchone()[0]
+        == last_write_by_before
+    )
+    assert conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0] == 0
+
+
+def test_sqlite_kanban_commit_link_keeps_generation_and_fanout(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    conn.execute(
+        """
+        INSERT INTO kanban_items (item_id, title, body_excerpt, state_id, priority_id, tags_json)
+        VALUES (
+            'work-sqlite-commit-link',
+            'SQLite commit link',
+            'Proof card',
+            'doing',
+            'high',
+            '["kanban"]'
+        )
+        """
+    )
+    config = type("Config", (), {"active_store": "sqlite"})()
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", config)
+    original_increment_gen = routes_personal.increment_gen
+    gen_sources: list[str] = []
+
+    def spy_increment_gen(conn_arg, source="human"):
+        gen_sources.append(source)
+        return original_increment_gen(conn_arg, source)
+
+    monkeypatch.setattr(routes_personal, "increment_gen", spy_increment_gen)
+
+    sha = "e" * 40
+    result = asyncio.run(
+        routes_personal.record_work_item_commit(
+            "work-sqlite-commit-link",
+            routes_personal.WorkItemCommitCreateRequest(
+                repo_full_name="xarta/xarta-node",
+                sha=sha,
+                message_subject="SQLite commit link proof",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="sqlite-commit-link",
+            ),
+        )
+    )
+
+    assert result["commit"]["sha"] == sha
+    assert gen_sources == ["kanban-item-commit"]
+    sync_tables = {
+        row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
+    }
+    assert {"kanban_item_commits", "kanban_audit_log"}.issubset(sync_tables)
+    assert conn.execute("SELECT value FROM sync_meta WHERE key='gen'").fetchone()[0] == "1"
+
+
 def test_work_automation_status_delegates_sync_payload_off_event_loop(monkeypatch):
     calls = []
 

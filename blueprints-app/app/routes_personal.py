@@ -300,6 +300,13 @@ def _kanban_active_store_is_postgres() -> bool:
     return cfg.KANBAN_DATASTORE_CONFIG.active_store == ACTIVE_STORE_POSTGRES
 
 
+def _kanban_table_sync_gen(conn: Any, source: str) -> int | None:
+    """Return a SQLite sync generation only while Kanban tables are SQLite-backed."""
+    if _kanban_active_store_is_postgres():
+        return None
+    return increment_gen(conn, source)
+
+
 def _params_contain_value(params: Any, value: str) -> bool:
     if isinstance(params, dict):
         return any(_params_contain_value(item, value) for item in params.values())
@@ -2274,7 +2281,7 @@ def _write_work_review_processor_lease_audit(
         source_hash=source_hash,
         metadata=metadata,
     )
-    gen = increment_gen(conn, "kanban-review-processor-lease")
+    gen = _kanban_table_sync_gen(conn, "kanban-review-processor-lease")
     if lease_row is not None:
         enqueue_for_all_peers(
             conn,
@@ -12069,7 +12076,7 @@ async def replace_work_priorities(
             source_hash=_hash_json_payload(audit_metadata),
             metadata=audit_metadata,
         )
-        gen = increment_gen(conn, "kanban-priority-recommendations")
+        gen = _kanban_table_sync_gen(conn, "kanban-priority-recommendations")
         for row in upserted_rows:
             enqueue_for_all_peers(
                 conn,
@@ -12207,7 +12214,7 @@ def _create_work_item_sync(body: WorkItemCreateRequest) -> dict[str, Any]:
                     },
                 },
             )
-        gen = increment_gen(conn, "kanban-item")
+        gen = _kanban_table_sync_gen(conn, "kanban-item")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_items", payload["item_id"], dict(item_row), gen
         )
@@ -12446,7 +12453,7 @@ def _update_work_item_sync(item_id: str, body: WorkItemUpdateRequest) -> dict[st
                 "lane_order": order_ids,
             },
         )
-        gen = increment_gen(conn, "kanban-item")
+        gen = _kanban_table_sync_gen(conn, "kanban-item")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
         for action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
@@ -12543,7 +12550,7 @@ def _update_work_item_detail_document_sync(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "kanban-item-detail")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-detail")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
@@ -12609,7 +12616,7 @@ def _update_work_item_review_document_sync(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "kanban-item-review")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-review")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
@@ -12727,7 +12734,7 @@ async def append_work_item_review_feedback(
                 ),
             },
         )
-        gen = increment_gen(conn, "kanban-item-review-feedback")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-review-feedback")
         if review_marker_schedule.get("queued") and review_marker_schedule.get("marker_row"):
             marker_row = review_marker_schedule["marker_row"]
             enqueue_for_all_peers(
@@ -12854,7 +12861,7 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "kanban-discussion")
+        gen = _kanban_table_sync_gen(conn, "kanban-discussion")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_discussions", clean_discussion_id, dict(discussion_row), gen
         )
@@ -12973,7 +12980,7 @@ async def update_work_discussion(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
             },
         )
-        gen = increment_gen(conn, "kanban-discussion")
+        gen = _kanban_table_sync_gen(conn, "kanban-discussion")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_discussions", clean_discussion_id, dict(discussion_row), gen
         )
@@ -13024,7 +13031,7 @@ async def delete_work_discussion(
         store.delete_discussion_row(clean_discussion_id)
         with suppress(OSError):
             _kanban_discussion_path(conn, existing["item_id"], clean_discussion_id).unlink()
-        gen = increment_gen(conn, "kanban-discussion")
+        gen = _kanban_table_sync_gen(conn, "kanban-discussion")
         enqueue_for_all_peers(conn, "DELETE", "kanban_discussions", clean_discussion_id, {}, gen)
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
         deleted = _row_to_work_discussion(existing, conn)
@@ -13248,7 +13255,7 @@ def _work_preprocessing_scoped_decomposition_reparent(
                 },
             },
         )
-        gen = increment_gen(conn, "kanban-preprocessing-decomposition-move")
+        gen = _kanban_table_sync_gen(conn, "kanban-preprocessing-decomposition-move")
         for row in moved_rows:
             enqueue_for_all_peers(conn, "UPDATE", "kanban_items", row["item_id"], dict(row), gen)
         for action, row_id, row_data in order_sync_changes:
@@ -13464,7 +13471,7 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
                 },
             },
         )
-        gen = increment_gen(conn, "kanban-item")
+        gen = _kanban_table_sync_gen(conn, "kanban-item")
         for row in moved_rows:
             enqueue_for_all_peers(conn, "UPDATE", "kanban_items", row["item_id"], dict(row), gen)
         for action, row_id, row_data in order_sync_changes:
@@ -13578,7 +13585,7 @@ async def order_work_item(item_id: str, body: WorkItemOrderRequest) -> dict[str,
                 "lane_order": ordered_ids,
             },
         )
-        gen = increment_gen(conn, "kanban-item-order")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-order")
         for action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(conn, action, "kanban_item_order_edges", row_id, row_data, gen)
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
@@ -13636,7 +13643,7 @@ def _archive_work_item_sync(item_id: str, body: WorkItemActionRequest) -> dict[s
                 "cancelled_review_marker_ids": [row["marker_id"] for row in cancelled_marker_rows],
             },
         )
-        gen = increment_gen(conn, "kanban-item")
+        gen = _kanban_table_sync_gen(conn, "kanban-item")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
         for marker_row in cancelled_marker_rows:
             enqueue_for_all_peers(
@@ -14079,7 +14086,7 @@ async def repair_work_blocked_leaf_invariant(
                         )
                     )
                 repaired.append({**plan, "applied": True, "state_id": "todo"})
-        gen = increment_gen(conn, "kanban-blocked-leaf-repair")
+        gen = _kanban_table_sync_gen(conn, "kanban-blocked-leaf-repair")
         for blocker_row, blocker_audit in changed_blockers:
             enqueue_for_all_peers(
                 conn,
@@ -14292,7 +14299,7 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
                 "link_type": link_type,
             },
         )
-        gen = increment_gen(conn, "kanban-item-link")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-link")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_item_links", link_id, dict(link_row), gen)
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
@@ -14453,7 +14460,7 @@ async def record_work_item_commit(
                 "upsert": "updated" if updated_existing else "inserted",
             },
         )
-        gen = increment_gen(conn, "kanban-item-commit")
+        gen = _kanban_table_sync_gen(conn, "kanban-item-commit")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -14607,7 +14614,7 @@ async def record_work_item_review_decision(
                 "upsert": "updated" if existing else "inserted",
             },
         )
-        gen = increment_gen(conn, "kanban-review-decision")
+        gen = _kanban_table_sync_gen(conn, "kanban-review-decision")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -16867,7 +16874,7 @@ def _trigger_work_review_processor_idle_scan_sync(
                 "provider_mode": _work_review_processing_policy()["active_mode"],
             },
         )
-        gen = increment_gen(conn, "kanban-review-idle-scan")
+        gen = _kanban_table_sync_gen(conn, "kanban-review-idle-scan")
         for marker_row in cancelled_rows:
             enqueue_for_all_peers(
                 conn,
@@ -16980,7 +16987,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                     "provider_mode": _work_review_processing_policy()["active_mode"],
                 },
             )
-            gen = increment_gen(conn, "kanban-preprocessing-idle-scan")
+            gen = _kanban_table_sync_gen(conn, "kanban-preprocessing-idle-scan")
             for marker_row in cancelled_invalid_rows:
                 enqueue_for_all_peers(
                     conn,
@@ -17239,7 +17246,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "provider_mode": _work_review_processing_policy()["active_mode"],
             },
         )
-        gen = increment_gen(conn, "kanban-preprocessing-idle-scan")
+        gen = _kanban_table_sync_gen(conn, "kanban-preprocessing-idle-scan")
         for marker_row in cancelled_invalid_rows:
             enqueue_for_all_peers(
                 conn,
@@ -17487,7 +17494,7 @@ def _claim_next_work_review_processor_marker_sync(
                     else None,
                 },
             )
-            gen = increment_gen(conn, "kanban-review-marker-claim")
+            gen = _kanban_table_sync_gen(conn, "kanban-review-marker-claim")
             enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
             return {
                 "ok": True,
@@ -17550,7 +17557,7 @@ def _claim_next_work_review_processor_marker_sync(
                 else None,
             },
         )
-        gen = increment_gen(conn, "kanban-review-marker-claim")
+        gen = _kanban_table_sync_gen(conn, "kanban-review-marker-claim")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -17683,7 +17690,7 @@ def _complete_work_review_processor_marker_sync(
                     "reason": "automation_excluded",
                 },
             )
-            gen = increment_gen(conn, "kanban-review-marker-complete")
+            gen = _kanban_table_sync_gen(conn, "kanban-review-marker-complete")
             enqueue_for_all_peers(
                 conn,
                 "UPDATE",
@@ -17785,7 +17792,7 @@ def _complete_work_review_processor_marker_sync(
                     "requeued": True,
                 },
             )
-            gen = increment_gen(conn, "kanban-review-marker-complete-superseded")
+            gen = _kanban_table_sync_gen(conn, "kanban-review-marker-complete-superseded")
             enqueue_for_all_peers(
                 conn,
                 "UPDATE",
@@ -17996,7 +18003,7 @@ def _complete_work_review_processor_marker_sync(
                 else "",
             },
         )
-        gen = increment_gen(conn, "kanban-review-marker-complete")
+        gen = _kanban_table_sync_gen(conn, "kanban-review-marker-complete")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -18226,7 +18233,7 @@ def _requeue_timed_out_work_review_processor_markers_sync(
                 ],
             },
         )
-        gen = increment_gen(conn, "kanban-review-marker-timeout")
+        gen = _kanban_table_sync_gen(conn, "kanban-review-marker-timeout")
         for row in cancelled_excluded_rows:
             enqueue_for_all_peers(
                 conn,
@@ -19115,7 +19122,7 @@ async def prune_work_automation_failure_events(
         deleted_count = 0
         if body.apply and candidates:
             store = _kanban_write_store(conn)
-            gen = increment_gen(conn, "kanban-review-failure-prune")
+            gen = _kanban_table_sync_gen(conn, "kanban-review-failure-prune")
             for row in candidates:
                 store.delete_review_failure_event_row(row["failure_event_id"])
                 enqueue_for_all_peers(
@@ -19143,7 +19150,7 @@ async def prune_work_automation_failure_events(
             source_hash=source_hash,
             metadata={**audit_metadata, "deleted_count": deleted_count},
         )
-        gen = increment_gen(conn, "kanban-audit")
+        gen = _kanban_table_sync_gen(conn, "kanban-audit")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
@@ -19279,7 +19286,7 @@ async def update_work_item_agent_hints(
                 "visibility": "agent",
             },
         )
-        gen = increment_gen(conn, "kanban-agent-hints")
+        gen = _kanban_table_sync_gen(conn, "kanban-agent-hints")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -19402,7 +19409,7 @@ async def create_work_item_agent_session(
                 "upsert": "updated" if existing is not None else "inserted",
             },
         )
-        gen = increment_gen(conn, "kanban-agent-session")
+        gen = _kanban_table_sync_gen(conn, "kanban-agent-session")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -19538,7 +19545,7 @@ async def update_work_agent_session(
                 "status": row["status"],
             },
         )
-        gen = increment_gen(conn, "kanban-agent-session")
+        gen = _kanban_table_sync_gen(conn, "kanban-agent-session")
         enqueue_for_all_peers(
             conn,
             "UPDATE",
@@ -19629,7 +19636,7 @@ def _upsert_work_issue(
                 "item_card_ref": f"kanban_items:{typed_item_row['item_id']}",
             },
         )
-        gen = increment_gen(conn, "kanban-issue")
+        gen = _kanban_table_sync_gen(conn, "kanban-issue")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_items", typed_item_row["item_id"], dict(typed_item_row), gen
         )
@@ -19721,7 +19728,7 @@ def _upsert_work_todo(
                 "item_card_ref": f"kanban_items:{typed_item_row['item_id']}",
             },
         )
-        gen = increment_gen(conn, "kanban-todo")
+        gen = _kanban_table_sync_gen(conn, "kanban-todo")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_items", typed_item_row["item_id"], dict(typed_item_row), gen
         )
@@ -19863,7 +19870,7 @@ def _upsert_work_blocker(
                 "blocked_by_ref": blocker_row["blocked_by_ref"],
             },
         )
-        gen = increment_gen(conn, "kanban-blocker")
+        gen = _kanban_table_sync_gen(conn, "kanban-blocker")
         enqueue_for_all_peers(
             conn, "UPDATE", "kanban_blockers", clean_blocker_id, dict(blocker_row), gen
         )
@@ -20138,7 +20145,7 @@ async def promote_work_item(body: WorkPromoteRequest) -> dict[str, Any]:
                 conn, payload, action="promote_work_item", audit_id=audit_id, now=now
             )
             sync_item_id = payload["item_id"]
-        gen = increment_gen(conn, "kanban-promote")
+        gen = _kanban_table_sync_gen(conn, "kanban-promote")
         enqueue_for_all_peers(conn, "UPDATE", "kanban_items", sync_item_id, dict(item_row), gen)
         for order_action, row_id, row_data in order_sync_changes:
             enqueue_for_all_peers(
