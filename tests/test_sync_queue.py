@@ -6,6 +6,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
@@ -281,3 +283,20 @@ def test_active_postgres_skips_kanban_table_enqueue(monkeypatch):
 
     rows = conn.execute("SELECT table_name, row_id FROM sync_queue ORDER BY queue_id").fetchall()
     assert [dict(row) for row in rows] == [{"table_name": "settings", "row_id": "setting-1"}]
+
+
+def test_non_kanban_enqueue_requires_generation(monkeypatch):
+    conn = _make_queue_db()
+    config = type("Config", (), {"active_store": "postgres"})()
+
+    monkeypatch.setattr(queue.cfg, "KANBAN_DATASTORE_CONFIG", config)
+
+    with pytest.raises(ValueError, match="sync generation is required"):
+        queue.enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "settings",
+            "setting-1",
+            {"key": "setting-1"},
+            None,
+        )

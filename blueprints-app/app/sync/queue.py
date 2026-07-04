@@ -284,7 +284,7 @@ def enqueue_for_all_peers(
     table_name: str,
     row_id: str,
     row_data: dict[str, Any] | None,
-    gen: int,
+    gen: int | None,
     exclude_node_id: str | None = None,
     guid: str | None = None,
 ) -> None:
@@ -306,6 +306,8 @@ def enqueue_for_all_peers(
             ACTIVE_STORE_POSTGRES,
         )
         return
+    if gen is None:
+        raise ValueError("sync generation is required for SQLite sync fanout")
     shared_guid = guid if guid is not None else uuid.uuid4().hex
     try:
         peer_rows = conn.execute(
