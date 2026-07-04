@@ -79,7 +79,7 @@ bash /root/xarta-node/.claude/skills/setup-visibility-control/scripts/setup-reme
 - `baseline`: ssh-and-git, certificates, blueprints, caddy, python-dev-tools
 - `network`: lxc-failover, tailscale-up, firewall
 - `ops`: shellcheck, rsync, github-cli
-- `vps-ops-tools`: explicit include for external VPS hosts; installs `rsync`, `jq`, `ripgrep`, `tcpdump`, DNS tools, Python venv support, and archive utilities without running Blueprints setup
+- `vps-ops-tools`: explicit include for external VPS hosts; installs `rsync`, `jq`, `pv`, `ripgrep`, `tcpdump`, DNS tools, Python venv support, and archive utilities without running Blueprints setup
 - `desktop`: user-xarta, ssh-and-git-xarta, xfce-xrdp, desktop-apps
 - `containers`: docker, dockge
 - `sync`: syncthing
