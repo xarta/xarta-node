@@ -109,7 +109,11 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
 
 @router.get("/health", response_model=HealthOut)
-def health() -> HealthOut:
+async def health() -> HealthOut:
+    return await timing.to_thread("health.sqlite", _health_sync)
+
+
+def _health_sync() -> HealthOut:
     with timing.span("handler", route="health"):
         with get_conn() as conn:
             gen = get_gen(conn)

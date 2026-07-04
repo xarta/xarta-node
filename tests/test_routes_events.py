@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -79,3 +80,28 @@ def test_publish_event_best_effort_still_publishes_when_sqlite_locked(monkeypatc
 
     assert result.event_id == event.event_id
     assert published == [event.event_id]
+
+
+def test_publish_event_persistence_runs_off_event_loop(monkeypatch):
+    AppEvent, routes_events = app_event_modules()
+    event = AppEvent.create("unit.event", "Unit", "Unit event.")
+
+    def slow_persist(_event):
+        time.sleep(0.15)
+
+    async def fake_publish(_app_event):
+        return None
+
+    async def run():
+        monkeypatch.setattr(routes_events, "_persist", slow_persist)
+        monkeypatch.setattr(routes_events.bus, "publish", fake_publish)
+
+        started = time.perf_counter()
+        task = asyncio.create_task(routes_events.publish_event(event))
+        await asyncio.sleep(0.02)
+
+        assert time.perf_counter() - started < 0.08
+        assert not task.done()
+        await task
+
+    asyncio.run(run())

@@ -44,6 +44,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from . import timing
 from .db import get_conn
 from .events import AppEvent, bus
 
@@ -188,15 +189,28 @@ async def _sse_generator(
     try:
         # ── Catch-up replay ───────────────────────────────────────────────────
         if last_event_id:
-            after_ts = _ts_for_event_id(last_event_id)
+            after_ts = await timing.to_thread(
+                "events.ts_for_event_id",
+                _ts_for_event_id,
+                last_event_id,
+            )
             if after_ts is not None:
-                replays = _load_events(_RECENT_MAX, after_ts=after_ts)
+                replays = await timing.to_thread(
+                    "events.load_replays",
+                    _load_events,
+                    _RECENT_MAX,
+                    after_ts=after_ts,
+                )
             else:
                 # Browser localStorage can outlive server-side event retention or
                 # node-local database resets. Replaying a bounded recent window is
                 # safer than opening a gap; clients deduplicate by event_id and
                 # command payloads carry max-age guards.
-                replays = _load_events(_RECENT_MAX)
+                replays = await timing.to_thread(
+                    "events.load_replays",
+                    _load_events,
+                    _RECENT_MAX,
+                )
             for ev in reversed(replays):  # chronological order for the client
                 yield ev.to_sse()
 
@@ -257,8 +271,10 @@ async def get_recent_events(
     """
     after_ts: float | None = None
     if since_id:
-        after_ts = _ts_for_event_id(since_id)
-    return _load_events(limit=limit, after_ts=after_ts)
+        after_ts = await timing.to_thread("events.ts_for_event_id", _ts_for_event_id, since_id)
+    return await timing.to_thread(
+        "events.load_recent", _load_events, limit=limit, after_ts=after_ts
+    )
 
 
 @router.post("/close-all")
@@ -304,7 +320,7 @@ async def publish_event(event: AppEvent, *, persistence_required: bool = True) -
     every live SSE subscriber.
     """
     try:
-        _persist(event)
+        await timing.to_thread("events.persist", _persist, event)
     except sqlite3.OperationalError as exc:
         if persistence_required or "locked" not in str(exc).lower():
             raise
