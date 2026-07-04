@@ -18,7 +18,7 @@ from fastapi import APIRouter, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import wake_stt_direct
+from . import timing, wake_stt_direct
 from .db import get_conn, get_setting
 from .events import AppEvent
 from .routes_events import publish_event
@@ -3805,6 +3805,21 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
     now = time.time()
+    async with _state_lock:
+        return await timing.to_thread(
+            "voice_mode.update_dev_status",
+            _voice_mode_update_dev_status_locked_sync,
+            body,
+            browser_id,
+            now,
+        )
+
+
+def _voice_mode_update_dev_status_locked_sync(
+    body: WakeDevDebugBody,
+    browser_id: str,
+    now: float,
+) -> dict[str, Any]:
     report = {
         "browser_id": browser_id,
         "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
@@ -3818,19 +3833,16 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
         "client_now_ms": float(body.client_now_ms or 0),
         "reported_at": now,
     }
-    async with _state_lock:
-        state = _read_state_unlocked()
-        debug = _read_wake_dev_debug_unlocked()
-        reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
-        reports[_dev_debug_report_key(report)] = report
-        debug = {
-            "reports": reports,
-            "updated_at": now,
-        }
-        persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(debug)
-        public = (
-            _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
-        )
+    state = _read_state_unlocked()
+    debug = _read_wake_dev_debug_unlocked()
+    reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
+    reports[_dev_debug_report_key(report)] = report
+    debug = {
+        "reports": reports,
+        "updated_at": now,
+    }
+    persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(debug)
+    public = _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
     ack = {
         "ok": True,
         "stored": True,

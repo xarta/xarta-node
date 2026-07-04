@@ -4,8 +4,11 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 APP_ROOT = Path(__file__).resolve().parents[1] / "blueprints-app"
 if str(APP_ROOT) not in sys.path:
@@ -43,7 +46,7 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import routes_bookmarks, routes_health, seekdb_sync  # noqa: E402
-from app.models import BookmarkCreate  # noqa: E402
+from app.models import BookmarkCreate, VisitCreate  # noqa: E402
 
 
 @contextmanager
@@ -112,7 +115,7 @@ def test_bookmarks_health_degrades_when_seekdb_counts_fail(monkeypatch):
 def test_normal_health_does_not_call_seekdb(monkeypatch):
     monkeypatch.setattr(routes_health, "get_conn", _bookmark_counts_conn)
 
-    payload = routes_health.health()
+    payload = asyncio.run(routes_health.health())
 
     assert payload.status == "ok"
     assert payload.node_id == "test-node"
@@ -235,6 +238,28 @@ def test_async_paths_use_seekdb_isolation_wrappers():
     assert "keyword_search_bookmarks_async" in search_source
     assert "vector_search_visits_async" in search_source
     assert "await init_seekdb_async" in sync_source
+
+
+def test_create_visit_sqlite_work_runs_off_event_loop(monkeypatch):
+    async def run():
+        def slow_create_visit_sync(*args, **kwargs):
+            time.sleep(0.15)
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(routes_bookmarks, "_create_visit_sync", slow_create_visit_sync)
+
+        started = time.perf_counter()
+        task = asyncio.create_task(
+            routes_bookmarks.create_visit(VisitCreate(url="https://example.test/slow"))
+        )
+        await asyncio.sleep(0.02)
+
+        assert time.perf_counter() - started < 0.08
+        assert not task.done()
+        with pytest.raises(sqlite3.OperationalError):
+            await task
+
+    asyncio.run(run())
 
 
 def test_bookmark_create_accepts_modal_null_fields():

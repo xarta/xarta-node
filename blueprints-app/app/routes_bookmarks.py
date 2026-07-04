@@ -16,6 +16,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from . import timing
 from .ai_client import complete, embed, rerank
 from .db import get_conn, get_setting, increment_gen, set_setting
 from .models import (
@@ -1084,6 +1085,18 @@ async def import_bookmarks(body: BookmarkImportRequest) -> BookmarkImportResult:
 async def create_visit(body: VisitCreate) -> VisitOut:
     normalized_url = _normalize_url(body.url)
     visited_at = body.visited_at or _now_iso()
+    row = await timing.to_thread(
+        "bookmarks.create_visit",
+        _create_visit_sync,
+        body,
+        normalized_url,
+        visited_at,
+    )
+    trigger_seekdb_sync()
+    return _row_to_visit_out(row)
+
+
+def _create_visit_sync(body: VisitCreate, normalized_url: str, visited_at: str):
     with get_conn() as conn:
         bm = conn.execute(
             "SELECT bookmark_id FROM bookmarks WHERE normalized_url=? LIMIT 1",
@@ -1159,8 +1172,7 @@ async def create_visit(body: VisitCreate) -> VisitOut:
             gen = increment_gen(conn, "human")
             enqueue_for_all_peers(conn, "INSERT", "visits", visit_id, dict(row), gen)
 
-    trigger_seekdb_sync()
-    return _row_to_visit_out(row)
+    return row
 
 
 @router.post("/check-dead-links", response_model=dict)

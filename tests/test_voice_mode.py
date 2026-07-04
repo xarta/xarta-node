@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -646,7 +647,7 @@ def test_active_browser_command_accepts_matrix_chat_room_payload(tmp_path, monke
         def model_dump(self):
             return {"event_id": "active-browser-command-test"}
 
-    async def fake_publish(event):
+    async def fake_publish(event, **kwargs):
         captured["event"] = event
         return Published()
 
@@ -1339,7 +1340,7 @@ def test_publish_kanban_external_refresh_targets_safe_kanban_tabs(tmp_path, monk
     monkeypatch.setattr(voice_mode.time, "time", lambda: 100.0)
     published = []
 
-    async def fake_publish(event):
+    async def fake_publish(event, **kwargs):
         published.append(event.payload)
         return event
 
@@ -1696,6 +1697,38 @@ def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persist
     live = asyncio.run(voice_mode.voice_mode_dev_status(surface="vad_dev", browser_id="browser-a"))
     assert live["debug"]["status"] == "second"
     assert live["debug"]["snapshot"]["fsm_state"] == "VAD_REARM_STT_FINALIZING"
+
+
+def test_voice_mode_dev_status_update_runs_off_event_loop(monkeypatch):
+    async def run():
+        def slow_update_sync(*args, **kwargs):
+            time.sleep(0.15)
+            return {"ok": True, "stored": True}
+
+        monkeypatch.setattr(
+            voice_mode,
+            "_voice_mode_update_dev_status_locked_sync",
+            slow_update_sync,
+        )
+
+        started = time.perf_counter()
+        task = asyncio.create_task(
+            voice_mode.voice_mode_update_dev_status(
+                voice_mode.WakeDevDebugBody(
+                    browser_id="browser-a",
+                    surface="vad_dev",
+                    status="slow",
+                    snapshot={"fsm_state": "VAD_REARM_STT_ARMED"},
+                )
+            )
+        )
+        await asyncio.sleep(0.02)
+
+        assert time.perf_counter() - started < 0.08
+        assert not task.done()
+        assert await task == {"ok": True, "stored": True}
+
+    asyncio.run(run())
 
 
 def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():
