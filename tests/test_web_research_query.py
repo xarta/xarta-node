@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -139,3 +141,103 @@ def test_web_research_default_profile_comes_from_node_local_config(monkeypatch):
     )
 
     assert routes_web_research._searxng_profile("default") == "normal-egress"
+
+
+def test_web_research_egress_profile_paths_default_to_new_layout():
+    assert (
+        str(routes_web_research._EGRESS_PROFILE_CONFIG)
+        == "/xarta-node/.lone-wolf/config/web-research-egress/profiles.json"
+    )
+    assert (
+        str(routes_web_research._EGRESS_PROFILE_STATE)
+        == "/xarta-node/.lone-wolf/state/web-research-egress/state.json"
+    )
+    assert (
+        str(routes_web_research._EGRESS_PROFILE_AUDIT_LOG)
+        == "/xarta-node/.lone-wolf/state/web-research-egress/audit.jsonl"
+    )
+    assert (
+        str(routes_web_research._EGRESS_PROFILE_APPLY_SCRIPT)
+        == "/xarta-node/.lone-wolf/scripts/web-research-egress/apply-profile.sh"
+    )
+
+
+def test_web_research_default_profile_comes_from_state_config_split(monkeypatch, tmp_path):
+    config_path = tmp_path / "profiles.json"
+    state_path = tmp_path / "state.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "normal-egress": {"ready": True},
+                    "vpn-egress": {"ready": True},
+                    "bridge": {"ready": True},
+                },
+                "aliases": {
+                    "normal": "normal-egress",
+                    "vpn": "vpn-egress",
+                    "nordvpn": "vpn-egress",
+                    "bridge": "bridge",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                "active_profile": "normal-egress",
+                "default_profile": "normal-egress",
+                "intended_default_profile": "normal-egress",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("WEB_RESEARCH_SEARXNG_PROFILE", raising=False)
+    monkeypatch.setattr(routes_web_research, "_EGRESS_PROFILE_CONFIG", config_path)
+    monkeypatch.setattr(routes_web_research, "_EGRESS_PROFILE_STATE", state_path)
+    monkeypatch.setattr(
+        routes_web_research, "_LEGACY_EGRESS_PROFILE_CONFIG", tmp_path / "missing.json"
+    )
+
+    config = routes_web_research._read_egress_profile_config()
+    assert config["profiles"]["normal-egress"]["ready"] is True
+    assert config["default_profile"] == "normal-egress"
+    assert config["active_profile"] == "normal-egress"
+    assert routes_web_research._searxng_profile("default") == "normal-egress"
+
+
+def test_web_research_egress_profile_aliases_for_live_profiles(monkeypatch):
+    monkeypatch.delenv("WEB_RESEARCH_SEARXNG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        routes_web_research,
+        "_read_egress_profile_config",
+        lambda: {
+            "active_profile": "normal-egress",
+            "default_profile": "normal-egress",
+            "profiles": {
+                "normal-egress": {"ready": True},
+                "vpn-egress": {"ready": True},
+                "bridge": {"ready": True},
+            },
+            "aliases": {
+                "normal": "normal-egress",
+                "vpn": "vpn-egress",
+                "nordvpn": "vpn-egress",
+                "bridge": "bridge",
+            },
+        },
+    )
+
+    assert routes_web_research._searxng_profile("default") == "normal-egress"
+    assert routes_web_research._searxng_profile("normal") == "normal-egress"
+    assert routes_web_research._searxng_profile("vpn") == "vpn-egress"
+    assert routes_web_research._searxng_profile("nordvpn") == "vpn-egress"
+    assert routes_web_research._searxng_profile("bridge") == "bridge"
+
+
+def test_web_research_bridge_profile_is_search_only():
+    result = asyncio.run(routes_web_research._apply_egress_profile("bridge"))
+
+    assert result["ok"] is True
+    assert "route_apply=noop" in result["stdout"]
