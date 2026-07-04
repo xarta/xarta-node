@@ -99,11 +99,20 @@ For backend, Kanban, Active Browser, or browser-polling changes that may affect
 request scheduling or cheap-route responsiveness, compare relevant timing JSONL
 or contention-probe output before and after the change. The central node-local
 contract is
-`/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md`. Meaningful
-increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
-`event_loop_lag`, thread queue wait, DB wait, or serialization time are negative
-signals to report and review before commit/push; do not hide them with larger
-timeouts or stale caches.
+`/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md`. Use the
+maintained span-based helper instead of ad hoc JSONL parsing when reading disk
+logs:
+
+```bash
+/root/xarta-node/.xarta/.agents/bin/blueprints-event-loop-logs summary --last 2h --bucket 15m --top 8
+```
+
+The helper uses the shared `xarta_time_spans` parser for high-level windows and
+buckets (`--last 30m`, `--day today`, `--since ... --until ...`, `--bucket
+hour`, `--bucket 5m`). Meaningful increases in `/health`,
+`/api/v1/auth/time`, `x-blueprints-app-ms`, `event_loop_lag`, thread queue wait,
+DB wait, or serialization time are negative signals to report and review before
+commit/push; do not hide them with larger timeouts or stale caches.
 
 ## Sync protocol & commit guard
 
