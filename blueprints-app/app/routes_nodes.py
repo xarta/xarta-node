@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from starlette.responses import Response
 
 from . import config as cfg
+from . import timing
 from .auth import compute_token
 from .db import get_conn
 from .models import NodeOut, RepoVersionsOut
@@ -31,6 +32,12 @@ router = APIRouter(prefix="/nodes", tags=["nodes"])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+async def _run_nodes_sync_work(label: str, func, *args, **kwargs):
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return func(*args, **kwargs)
+    return await timing.to_thread(f"nodes.{label}", func, *args, **kwargs)
 
 
 def _row_to_out(row) -> NodeOut:
@@ -83,6 +90,10 @@ async def get_self() -> NodeOut:
 @router.get("", response_model=list[NodeOut])
 async def list_nodes() -> list[NodeOut]:
     """List all peer nodes registered in the local DB."""
+    return await _run_nodes_sync_work("list_nodes", _list_nodes_sync)
+
+
+def _list_nodes_sync() -> list[NodeOut]:
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -101,7 +112,7 @@ async def refresh_nodes() -> dict:
     Re-read .nodes.json and upsert all active nodes into the local DB.
     Called by the Refresh button in the Nodes UI tab.
     """
-    _upsert_nodes_from_config()
+    await _run_nodes_sync_work("upsert_nodes_from_config", _upsert_nodes_from_config)
     log.info("nodes refreshed from .nodes.json via API")
     return {
         "status": "ok",
@@ -204,11 +215,9 @@ async def purge_node_sync_queue(node_id: str) -> Response:
 @router.post("/{node_id}/git-pull", status_code=204)
 async def proxy_node_git_pull(node_id: str) -> Response:
     """Proxy a git-pull (scope=outer) request to the named peer node."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
-    if not row or not row["addresses"]:
+    addrs = await _run_nodes_sync_work("node_addresses", _node_addresses_sync, node_id)
+    if addrs is None:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
-    addrs: list[str] = json.loads(row["addresses"])
     if not addrs:
         raise HTTPException(422, f"node '{node_id}' has no addresses configured")
     target = addrs[0].rstrip("/")
@@ -230,11 +239,9 @@ async def proxy_node_git_pull(node_id: str) -> Response:
 @router.post("/{node_id}/restart", status_code=204)
 async def proxy_node_restart(node_id: str) -> Response:
     """Proxy a service restart request to the named peer node."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
-    if not row or not row["addresses"]:
+    addrs = await _run_nodes_sync_work("node_addresses", _node_addresses_sync, node_id)
+    if addrs is None:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
-    addrs: list[str] = json.loads(row["addresses"])
     if not addrs:
         raise HTTPException(422, f"node '{node_id}' has no addresses configured")
     target = addrs[0].rstrip("/")
@@ -260,11 +267,9 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
 
         return await asyncio.to_thread(repo_versions)
 
-    with get_conn() as conn:
-        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
-    if not row or not row["addresses"]:
+    addrs = await _run_nodes_sync_work("node_addresses", _node_addresses_sync, node_id)
+    if addrs is None:
         raise HTTPException(404, f"node '{node_id}' not found or has no addresses")
-    addrs: list[str] = json.loads(row["addresses"])
     if not addrs:
         raise HTTPException(422, f"node '{node_id}' has no addresses configured")
     target = addrs[0].rstrip("/")
@@ -279,6 +284,15 @@ async def proxy_node_repo_versions(node_id: str) -> RepoVersionsOut:
     if resp.status_code != 200:
         raise HTTPException(502, f"remote {node_id} returned HTTP {resp.status_code}")
     return RepoVersionsOut(**resp.json())
+
+
+def _node_addresses_sync(node_id: str) -> list[str] | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT addresses FROM nodes WHERE node_id=?", (node_id,)).fetchone()
+    if not row or not row["addresses"]:
+        return None
+    addrs: list[str] = json.loads(row["addresses"])
+    return addrs
 
 
 class PctAction(BaseModel):
@@ -462,7 +476,7 @@ def _make_pve_ssh_args(pve_host: str, connect_timeout: int = 10) -> list[str]:
         raise HTTPException(503, f"SSH key not available: {exc}") from exc
 
 
-async def _run_pct_command(
+def _run_pct_command_sync(
     pve_host: str,
     vmid: int,
     pct_args: str,
@@ -473,8 +487,7 @@ async def _run_pct_command(
     ssh_args = _make_pve_ssh_args(pve_host, connect_timeout=connect_timeout)
     cmd = ["ssh"] + ssh_args + [f"root@{pve_host}", f"pct {pct_args} {vmid}"]
     try:
-        return await asyncio.to_thread(
-            subprocess.run,
+        return subprocess.run(
             cmd,
             capture_output=True,
             text=True,
@@ -484,11 +497,34 @@ async def _run_pct_command(
         raise HTTPException(504, "SSH command timed out") from exc
 
 
+async def _run_pct_command(
+    pve_host: str,
+    vmid: int,
+    pct_args: str,
+    *,
+    connect_timeout: int = 10,
+    command_timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    return await _run_nodes_sync_work(
+        "pct_command",
+        _run_pct_command_sync,
+        pve_host,
+        vmid,
+        pct_args,
+        connect_timeout=connect_timeout,
+        command_timeout=command_timeout,
+    )
+
+
 @router.get("/{node_id}/pct-status", status_code=200)
 async def get_node_pct_status(node_id: str) -> dict:
     """Return the live pct status of the LXC for this node via SSH to its PVE host."""
     try:
-        _, pve_host, vmid = _get_node_lxc_target(node_id)
+        _, pve_host, vmid = await _run_nodes_sync_work(
+            "get_lxc_target",
+            _get_node_lxc_target,
+            node_id,
+        )
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
