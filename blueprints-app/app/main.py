@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
@@ -24,9 +25,10 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import config as cfg
-from . import db
+from . import db, timing
 from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .events import bus as events_bus
@@ -100,6 +102,7 @@ from .routes_ssh_terminal import router as ssh_terminal_router
 from .routes_ssh_terminal import run_terminal_process_reaper
 from .routes_sync import router as sync_router
 from .routes_table_layouts import router as table_layouts_router
+from .routes_timing import router as timing_router
 from .routes_todo import router as todo_router
 from .routes_tts import router as tts_router
 from .routes_tts_pool import router as tts_pool_router
@@ -119,6 +122,74 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+class ProcessTimingHeaderMiddleware:
+    """Attach timing headers and memory timeline spans for local contention probes."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        trace_id = timing.new_trace_id()
+        token = timing.set_current_trace_id(trace_id)
+        started = time.perf_counter_ns()
+        started_wall = time.time_ns()
+        method = str(scope.get("method") or "")
+        path = str(scope.get("path") or "")
+        query_string = scope.get("query_string") or b""
+        query = timing.sanitize_query(query_string.decode("ascii", errors="replace"))[:500]
+        status_code = 0
+        response_start_ns = 0
+        response_start_wall_ns = 0
+
+        async def send_with_timing(message):
+            nonlocal status_code, response_start_ns, response_start_wall_ns
+            if message["type"] == "http.response.start":
+                response_start_ns = time.perf_counter_ns()
+                response_start_wall_ns = time.time_ns()
+                status_code = int(message.get("status") or 0)
+                elapsed_ms = (response_start_ns - started) / 1_000_000
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-blueprints-app-ms", f"{elapsed_ms:.3f}".encode("ascii")))
+                headers.append((b"x-blueprints-trace-id", trace_id.encode("ascii")))
+                message["headers"] = headers
+            await send(message)
+
+        ok = True
+        error_type = ""
+        try:
+            await self.app(scope, receive, send_with_timing)
+        except Exception as exc:
+            ok = False
+            error_type = type(exc).__name__
+            raise
+        finally:
+            finished = time.perf_counter_ns()
+            timing.record_span(
+                "asgi_request",
+                trace_id=trace_id,
+                start_perf_ns=started,
+                end_perf_ns=finished,
+                start_time_ns=started_wall,
+                end_time_ns=time.time_ns(),
+                method=method,
+                path=path,
+                query=query,
+                ok=ok,
+                error_type=error_type,
+                status_code=status_code,
+                response_start_perf_ns=response_start_ns,
+                response_start_time_ns=response_start_wall_ns,
+                response_start_ms=round(max(0, response_start_ns - started) / 1_000_000, 3)
+                if response_start_ns
+                else None,
+            )
+            timing.reset_current_trace_id(token)
 
 
 async def _cancel_background_task(task: asyncio.Task | None, label: str) -> None:
@@ -146,6 +217,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     alarm_scheduler_task: asyncio.Task | None = None
     disks_offline_browse_reaper_task: asyncio.Task | None = None
     kanban_automation_idle_task: asyncio.Task | None = None
+    timing_lag_task: asyncio.Task | None = None
+    timing_disk_task: asyncio.Task | None = None
 
     # Ensure data directories exist (may already exist via volume mounts)
     os.makedirs(cfg.DB_DIR, exist_ok=True)
@@ -196,6 +269,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Review/preprocessing markers are processed by the local AI Kanban worker.
     kanban_automation_idle_task = asyncio.create_task(run_work_kanban_automation_idle_loop())
 
+    # In-memory timing sampler for reconstructing event-loop stalls.
+    timing_lag_task = asyncio.create_task(timing.run_event_loop_lag_sampler())
+
+    # Optional off-loop JSONL persistence and pruning for timing spans.
+    timing_disk_task = asyncio.create_task(timing.run_disk_log_writer_and_pruner())
+
     # Fan Matrix /sync updates into the existing browser SSE stream.
     await start_matrix_chat_sync_workers()
 
@@ -214,6 +293,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(disks_offline_browse_reaper_task, "disks_offline_browse_reaper")
     await _cancel_background_task(alarm_scheduler_task, "alarm_scheduler")
     await _cancel_background_task(kanban_automation_idle_task, "kanban_automation_idle_worker")
+    await _cancel_background_task(timing_lag_task, "timing_event_loop_lag_sampler")
+    await _cancel_background_task(timing_disk_task, "timing_disk_log_writer")
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 
@@ -376,6 +457,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # App-side timing header used by local contention probes to distinguish
+    # route/serialization time from client-observed wait.
+    application.add_middleware(ProcessTimingHeaderMiddleware)
+
     # Auth — IP allowlist + TOTP token check (secrets from .env).
     # Must be added BEFORE CORS so authenticated preflight requests pass through.
     application.add_middleware(AuthMiddleware)
@@ -437,6 +522,7 @@ def create_app() -> FastAPI:
     application.include_router(tts_pool_router, prefix="/api/v1")
     application.include_router(pwa_router, prefix="/api/v1")
     application.include_router(table_layouts_router, prefix="/api/v1")
+    application.include_router(timing_router, prefix="/api/v1")
     application.include_router(ui_cache_router, prefix="/api/v1")
     application.include_router(litellm_router, prefix="/api/v1")
     application.include_router(litellm_hook_router, prefix="/api/v1")

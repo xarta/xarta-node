@@ -95,6 +95,16 @@ the test workflow, without waiting for an explicit user reminder.
 Do not trust API/UI test results until restart completes and `/health` is green.
 This avoids stale-process false negatives such as 404 on newly added routes.
 
+For backend, Kanban, Active Browser, or browser-polling changes that may affect
+request scheduling or cheap-route responsiveness, compare relevant timing JSONL
+or contention-probe output before and after the change. The central node-local
+contract is
+`/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md`. Meaningful
+increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
+`event_loop_lag`, thread queue wait, DB wait, or serialization time are negative
+signals to report and review before commit/push; do not hide them with larger
+timeouts or stale caches.
+
 ## Sync protocol & commit guard
 
 The sync system uses a persistent queue in `sync_queue` (SQLite). Each data write is enqueued for all peer nodes and drained in the background every 1–20 s.

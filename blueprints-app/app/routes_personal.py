@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from starlette.responses import FileResponse
 
 from . import config as cfg
-from . import hermes_minutes
+from . import hermes_minutes, timing
 from .db import get_conn as _sqlite_get_conn
 from .db import get_setting, increment_gen, set_setting
 from .kanban_datastore import (
@@ -64,7 +64,8 @@ log = logging.getLogger(__name__)
 async def _run_personal_sync_work(func: Any, *args: Any, **kwargs: Any) -> Any:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return func(*args, **kwargs)
-    return await asyncio.to_thread(func, *args, **kwargs)
+    label = getattr(func, "__name__", "personal_sync_work")
+    return await timing.to_thread(f"personal.{label}", func, *args, **kwargs)
 
 
 DIARY_ROOT = Path(os.environ.get("BLUEPRINTS_DIARY_DIR", "/xarta-node/.lone-wolf/diary"))
@@ -16656,7 +16657,8 @@ async def run_work_kanban_automation_idle_loop() -> None:
         await asyncio.sleep(initial_delay)
     while True:
         try:
-            result = await run_work_kanban_automation_idle_tick()
+            with timing.span("background_task_cycle", task="kanban_automation_idle_tick"):
+                result = await run_work_kanban_automation_idle_tick()
             if int(result.get("processed_count") or 0) > 0:
                 log.info(
                     "Kanban automation idle worker processed %s marker(s)",
@@ -18676,20 +18678,37 @@ async def get_work_automation_status(
 ) -> dict[str, Any]:
     started = time.monotonic()
     clean_item_id = _clean_short_text(item_id, "", limit=180)
-    payload = await _run_personal_sync_work(
-        _get_work_automation_status_sync,
-        clean_item_id,
-        limit,
-        include_contracts=include_contracts,
-        include_auth_drift=include_auth_drift,
-        include_decision_metadata=include_decision_metadata,
-    )
+    thread_started = 0.0
+    thread_finished = 0.0
+
+    def run_status_sync() -> dict[str, Any]:
+        nonlocal thread_started, thread_finished
+        thread_started = time.monotonic()
+        try:
+            return _get_work_automation_status_sync(
+                clean_item_id,
+                limit,
+                include_contracts=include_contracts,
+                include_auth_drift=include_auth_drift,
+                include_decision_metadata=include_decision_metadata,
+            )
+        finally:
+            thread_finished = time.monotonic()
+
+    payload = await _run_personal_sync_work(run_status_sync)
     finished = time.monotonic()
     if metrics:
+        sync_seconds = max(0.0, thread_finished - thread_started) if thread_started else 0.0
         payload["server_metrics"] = {
             "schema": "xarta.kanban.automation_status.metrics.v1",
             "total_seconds": round(finished - started, 6),
-            "status_thread_seconds": round(finished - started, 6),
+            "thread_queue_wait_seconds": (
+                round(max(0.0, thread_started - started), 6) if thread_started else 0.0
+            ),
+            "status_thread_seconds": round(sync_seconds, 6),
+            "response_assembly_wait_seconds": (
+                round(max(0.0, finished - thread_finished), 6) if thread_finished else 0.0
+            ),
             "limit": limit,
             "item_id_present": bool(clean_item_id),
             "include_contracts": bool(include_contracts),

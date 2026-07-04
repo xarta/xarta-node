@@ -6557,13 +6557,13 @@ def test_work_automation_status_delegates_sync_payload_off_event_loop(monkeypatc
             "kwargs": kwargs,
         }
 
-    async def fake_to_thread(func, *args, **kwargs):
-        calls.append((func.__name__, args, kwargs))
+    async def fake_to_thread(label, func, *args, **kwargs):
+        calls.append((label, func.__name__, args, kwargs))
         return func(*args, **kwargs)
 
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setattr(routes_personal, "_get_work_automation_status_sync", fake_status)
-    monkeypatch.setattr(routes_personal.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(routes_personal.timing, "to_thread", fake_to_thread)
 
     status = asyncio.run(
         routes_personal.get_work_automation_status(
@@ -6574,10 +6574,14 @@ def test_work_automation_status_delegates_sync_payload_off_event_loop(monkeypatc
         )
     )
 
-    assert calls[0][0] == "fake_status"
-    assert calls[0][1] == ("slow-route", 3)
-    assert calls[0][2]["include_contracts"] is False
+    assert calls[0][0] == "personal.run_status_sync"
+    assert calls[0][1] == "run_status_sync"
+    assert calls[0][2] == ()
+    assert calls[0][3] == {}
     assert status["ok"] is True
+    assert status["item_id"] == "slow-route"
+    assert status["limit"] == 3
+    assert status["kwargs"]["include_contracts"] is False
     assert status["server_metrics"]["schema"] == "xarta.kanban.automation_status.metrics.v1"
     assert status["server_metrics"]["status_thread_seconds"] >= 0
 
