@@ -20214,6 +20214,15 @@ def _personal_filter_registry_payload(conn: Any) -> dict[str, Any]:
         "SELECT * FROM personal_filter_meta_tags ORDER BY priority DESC, label, meta_tag_id"
     ).fetchall()
     tag_rows = conn.execute("SELECT * FROM personal_filter_tags ORDER BY label, tag_id").fetchall()
+    now = _utc_now_iso()
+    meta_tag_ids = {row["meta_tag_id"] for row in meta_rows}
+    orphan_meta_tag_ids = sorted(
+        {
+            row["meta_tag_id"]
+            for row in tag_rows
+            if row["meta_tag_id"] and row["meta_tag_id"] not in meta_tag_ids
+        }
+    )
     tags = {
         row["tag_id"]: _row_to_filter_tag(
             row,
@@ -20222,10 +20231,11 @@ def _personal_filter_registry_payload(conn: Any) -> dict[str, Any]:
         )
         for row in tag_rows
     }
-    now = _utc_now_iso()
+    discovered_tag_ids: list[str] = []
     for tag_id, count in usage_counts.items():
         if tag_id in tags:
             continue
+        discovered_tag_ids.append(tag_id)
         tags[tag_id] = {
             "tag_id": tag_id,
             "id": tag_id,
@@ -20246,14 +20256,40 @@ def _personal_filter_registry_payload(conn: Any) -> dict[str, Any]:
             "created_at": "",
             "updated_at": now,
         }
+    meta_tags = [_row_to_filter_meta_tag(row) for row in meta_rows]
+    for meta_tag_id in orphan_meta_tag_ids:
+        meta_tags.append(
+            {
+                "meta_tag_id": meta_tag_id,
+                "id": meta_tag_id,
+                "label": _filter_title(meta_tag_id) or meta_tag_id,
+                "color": "blue",
+                "priority": 0,
+                "source": "orphaned-assignment",
+                "custom": False,
+                "provenance": {
+                    "schema": "xarta.personal.filter_meta_tag.orphaned_assignment.v1",
+                    "note": (
+                        "Meta tag discovered from filter tag assignments; save it to persist "
+                        "presentation settings."
+                    ),
+                },
+                "created_at": "",
+                "updated_at": now,
+            }
+        )
     return {
         "ok": True,
         "schema": "xarta.personal.filters.v1",
-        "meta_tags": [_row_to_filter_meta_tag(row) for row in meta_rows],
+        "meta_tags": meta_tags,
         "tags": sorted(
             tags.values(), key=lambda item: (str(item["label"]).lower(), item["tag_id"])
         ),
         "usage_counts": usage_counts,
+        "integrity": {
+            "discovered_tag_ids": sorted(discovered_tag_ids),
+            "orphan_meta_tag_ids": orphan_meta_tag_ids,
+        },
     }
 
 

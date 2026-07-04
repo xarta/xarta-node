@@ -1950,12 +1950,32 @@ def test_personal_filter_tags_and_meta_tags_are_server_backed_and_synced(monkeyp
     )
     assert "national-holiday" in created["event"]["tags"]
 
+    conn.execute(
+        """
+        INSERT INTO personal_events (event_id, title, local_date, tags_json)
+        VALUES ('friend-birthday-test', 'Friend birthday', '2026-06-27', '["birthdays-friends"]')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_filter_tags (
+            tag_id, label, color, shape, fill, meta_tag_id, builtin
+        )
+        VALUES ('orphaned-meta-tag-proof', 'Orphaned Meta Tag Proof', 'gold', 'circle', 'filled', 'important', 0)
+        """
+    )
+
     registry = asyncio.run(routes_personal.list_personal_filters())
     meta_by_id = {item["meta_tag_id"]: item for item in registry["meta_tags"]}
     tags_by_id = {item["tag_id"]: item for item in registry["tags"]}
     assert meta_by_id["calendar"]["color"] == "blue"
+    assert meta_by_id["important"]["source"] == "orphaned-assignment"
     assert tags_by_id["national-holiday"]["meta_tag_id"] == "calendar"
     assert tags_by_id["national-holiday"]["usage_count"] == 1
+    assert tags_by_id["birthdays-friends"]["source"] == "discovered"
+    assert tags_by_id["birthdays-friends"]["usage_count"] == 1
+    assert "birthdays-friends" in registry["integrity"]["discovered_tag_ids"]
+    assert "important" in registry["integrity"]["orphan_meta_tag_ids"]
 
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()

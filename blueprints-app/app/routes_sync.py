@@ -403,6 +403,72 @@ def _should_skip_stale_kanban_item_upsert(conn, action) -> bool:
     return False
 
 
+def _sync_normalise_filter_id(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+
+
+def _sync_tags_json_contains(tags_json: object, tag_id: str) -> bool:
+    clean = _sync_normalise_filter_id(tag_id)
+    if not clean:
+        return False
+    try:
+        tags = json.loads(str(tags_json or "[]"))
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(tags, list):
+        return False
+    return any(_sync_normalise_filter_id(tag) == clean for tag in tags)
+
+
+def _personal_filter_tag_assignment_count(conn, tag_id: str) -> int:
+    count = 0
+    for table_name in ("personal_events", "personal_time_tasks", "kanban_items"):
+        try:
+            rows = conn.execute(f"SELECT tags_json FROM {table_name}").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for row in rows:
+            if _sync_tags_json_contains(row["tags_json"], tag_id):
+                count += 1
+    return count
+
+
+def _personal_filter_meta_tag_assignment_count(conn, meta_tag_id: str) -> int:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM personal_filter_tags WHERE meta_tag_id=?",
+            (_sync_normalise_filter_id(meta_tag_id),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row["count"] if row else 0)
+
+
+def _should_skip_personal_filter_delete(conn, action) -> bool:
+    if action.action_type != "DELETE":
+        return False
+    if action.table_name == "personal_filter_tags":
+        usage_count = _personal_filter_tag_assignment_count(conn, action.row_id)
+        if usage_count:
+            log.warning(
+                "skipping incoming delete for assigned personal filter tag %s (usage_count=%d)",
+                action.row_id,
+                usage_count,
+            )
+            return True
+    if action.table_name == "personal_filter_meta_tags":
+        assignment_count = _personal_filter_meta_tag_assignment_count(conn, action.row_id)
+        if assignment_count:
+            log.warning(
+                "skipping incoming delete for assigned personal filter meta tag %s "
+                "(filter_tag_count=%d)",
+                action.row_id,
+                assignment_count,
+            )
+            return True
+    return False
+
+
 def _full_restore_allowed(*, force_restore: bool, integrity_ok: bool) -> bool:
     """Full DB replacement is recovery-only unless explicitly forced."""
     return bool(force_restore or not integrity_ok)
@@ -419,6 +485,8 @@ def _apply_action(conn, action) -> None:
         return
 
     if action.action_type == "DELETE":
+        if _should_skip_personal_filter_delete(conn, action):
+            return
         pk_col = _pk_for_table(table)
         conn.execute(f"DELETE FROM {table} WHERE {pk_col}=?", (action.row_id,))
 
