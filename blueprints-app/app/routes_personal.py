@@ -13764,7 +13764,64 @@ async def get_work_item_rollup(item_id: str) -> dict[str, Any]:
 
 def _get_work_item_rollup_sync(item_id: str) -> dict[str, Any]:
     with get_conn() as conn:
-        return {"ok": True, "item_id": item_id, "rollup": _work_rollup(conn, item_id)}
+        try:
+            with _kanban_read_store(conn) as store:
+                return {"ok": True, "item_id": item_id, "rollup": store.rollup(item_id)}
+        except (KanbanItemNotFound, KanbanItemCycleError) as exc:
+            _raise_kanban_store_error(exc)
+
+
+@router.get("/kanban/rollups")
+async def get_work_item_rollups(
+    item_id: Annotated[list[str] | None, Query()] = None,
+    show_test_entries: Annotated[bool | None, Query()] = None,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _get_work_item_rollups_sync,
+        item_id or [],
+        show_test_entries,
+    )
+
+
+def _clean_work_rollup_item_ids(item_ids: list[str]) -> list[str]:
+    clean_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_item_id in item_ids:
+        for part in str(raw_item_id or "").split(","):
+            clean_item_id = _clean_short_text(part, "", limit=180)
+            if not clean_item_id or clean_item_id in seen:
+                continue
+            seen.add(clean_item_id)
+            clean_ids.append(clean_item_id)
+    if len(clean_ids) > 200:
+        raise HTTPException(400, "Kanban rollup batch is limited to 200 item_id values")
+    return clean_ids
+
+
+def _get_work_item_rollups_sync(
+    item_ids: list[str],
+    show_test_entries: bool | None = None,
+) -> dict[str, Any]:
+    clean_ids = _clean_work_rollup_item_ids(item_ids)
+    effective_show_test_entries = True if show_test_entries is None else bool(show_test_entries)
+    with get_conn() as conn:
+        try:
+            with _kanban_read_store(conn) as store:
+                with timing.span(
+                    "kanban.rollups.batch",
+                    item_count=len(clean_ids),
+                    show_test_entries=effective_show_test_entries,
+                ):
+                    rollups = {
+                        clean_item_id: store.rollup(
+                            clean_item_id,
+                            show_test_entries=effective_show_test_entries,
+                        )
+                        for clean_item_id in clean_ids
+                    }
+        except (KanbanItemNotFound, KanbanItemCycleError) as exc:
+            _raise_kanban_store_error(exc)
+    return {"ok": True, "count": len(rollups), "rollups": rollups}
 
 
 def _work_audit_rollback_recipe(row: Any) -> dict[str, Any]:
