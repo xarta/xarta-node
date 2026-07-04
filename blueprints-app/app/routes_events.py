@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from typing import Any, AsyncIterator
 
@@ -295,13 +296,21 @@ async def create_event(body: EventIn) -> EventOut:
     return await publish_event(event)
 
 
-async def publish_event(event: AppEvent) -> EventOut:
+async def publish_event(event: AppEvent, *, persistence_required: bool = True) -> EventOut:
     """Persist and fan out an app event.
 
     Background monitors use this helper so their events behave exactly like
     loopback-posted events: they are stored in recent history and delivered to
     every live SSE subscriber.
     """
-    _persist(event)
+    try:
+        _persist(event)
+    except sqlite3.OperationalError as exc:
+        if persistence_required or "locked" not in str(exc).lower():
+            raise
+        log.warning(
+            "events: skipped recent-history persistence for %s because SQLite was locked",
+            event.event_id,
+        )
     await bus.publish(event)
     return _event_out(event)

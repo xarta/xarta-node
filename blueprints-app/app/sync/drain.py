@@ -23,6 +23,7 @@ from contextlib import contextmanager
 import httpx
 
 from .. import config as cfg
+from .. import timing
 from ..auth import compute_token
 from ..db import get_conn, get_meta
 from ..sync.queue import (
@@ -207,27 +208,30 @@ async def _drain_loop() -> None:
 
 async def _drain_all_peers() -> None:
     """Find all peers with pending actions and drain each one."""
-    # Guard: don't send anything if our own DB is degraded — we could
-    # propagate corrupt state to healthy peers.
-    if not await asyncio.to_thread(_drain_integrity_ok_sync):
-        log.warning("drain suspended: integrity_ok=false — waiting for recovery")
-        return
+    with timing.span("background_task_cycle", task="sync_drain_all_peers"):
+        # Guard: don't send anything if our own DB is degraded — we could
+        # propagate corrupt state to healthy peers.
+        if not await timing.to_thread("sync.drain_integrity_ok", _drain_integrity_ok_sync):
+            log.warning("drain suspended: integrity_ok=false — waiting for recovery")
+            return
 
-    await asyncio.to_thread(_maybe_cleanup_guids)
-    await asyncio.to_thread(_discard_self_target_actions)
-    pending_peers = await asyncio.to_thread(get_peers_with_pending)
-    if not pending_peers:
-        return
+        await timing.to_thread("sync.cleanup_guids", _maybe_cleanup_guids)
+        await timing.to_thread("sync.discard_self_target_actions", _discard_self_target_actions)
+        pending_peers = await timing.to_thread(
+            "sync.get_peers_with_pending", get_peers_with_pending
+        )
+        if not pending_peers:
+            return
 
-    for node_id in pending_peers:
-        peer_urls = await asyncio.to_thread(get_peer_urls, node_id)
-        if not peer_urls:
-            log.debug("no URLs configured for peer %s — skipping drain", node_id)
-            continue
-        try:
-            await _drain_peer(node_id, peer_urls)
-        except Exception:
-            log.exception("drain failed for peer %s", node_id)
+        for node_id in pending_peers:
+            peer_urls = await timing.to_thread("sync.get_peer_urls", get_peer_urls, node_id)
+            if not peer_urls:
+                log.debug("no URLs configured for peer %s — skipping drain", node_id)
+                continue
+            try:
+                await _drain_peer(node_id, peer_urls)
+            except Exception:
+                log.exception("drain failed for peer %s", node_id)
 
 
 async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
@@ -242,7 +246,11 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
     sending row actions. A generation counter is not a whole-database freshness
     proof, so queue overflow must never trigger a DB replacement.
     """
-    depth, queue_ids, payload = await asyncio.to_thread(_drain_peer_payload_sync, node_id)
+    depth, queue_ids, payload = await timing.to_thread(
+        "sync.drain_peer_payload",
+        _drain_peer_payload_sync,
+        node_id,
+    )
     log.debug("draining peer %s: %d pending actions", node_id, depth)
 
     if depth >= cfg.SYNC_QUEUE_MAX_DEPTH:
@@ -269,7 +277,9 @@ async def _drain_peer(node_id: str, peer_urls: list[str]) -> None:
                     else {},
                 )
                 if resp.status_code == 204:
-                    marked_sent = await asyncio.to_thread(try_mark_sent, queue_ids)
+                    marked_sent = await timing.to_thread(
+                        "sync.try_mark_sent", try_mark_sent, queue_ids
+                    )
                     if not marked_sent:
                         log.debug(
                             "sent %d actions to peer %s via %s; mark-sent deferred until SQLite is free",

@@ -6,6 +6,7 @@ import subprocess
 from fastapi import APIRouter
 
 from . import config as cfg
+from . import timing
 from .db import get_conn, get_gen, get_meta
 from .models import HealthOut, RepoVersionOut, RepoVersionsOut
 
@@ -109,19 +110,20 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
 @router.get("/health", response_model=HealthOut)
 def health() -> HealthOut:
-    with get_conn() as conn:
-        gen = get_gen(conn)
-        integrity_ok = get_meta(conn, "integrity_ok") == "true"
-    return HealthOut(
-        status="ok",
-        node_id=cfg.NODE_ID,
-        node_name=cfg.NODE_NAME,
-        gen=gen,
-        integrity_ok=integrity_ok,
-        ui_url=cfg.UI_URL or None,
-        commit=cfg.COMMIT_HASH,
-        commit_ts=cfg.COMMIT_TS,
-    )
+    with timing.span("handler", route="health"):
+        with get_conn() as conn:
+            gen = get_gen(conn)
+            integrity_ok = get_meta(conn, "integrity_ok") == "true"
+        return HealthOut(
+            status="ok",
+            node_id=cfg.NODE_ID,
+            node_name=cfg.NODE_NAME,
+            gen=gen,
+            integrity_ok=integrity_ok,
+            ui_url=cfg.UI_URL or None,
+            commit=cfg.COMMIT_HASH,
+            commit_ts=cfg.COMMIT_TS,
+        )
 
 
 @router.get("/health/repos", response_model=RepoVersionsOut)

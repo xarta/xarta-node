@@ -156,12 +156,15 @@ def _fetch(base_url: str, spec: RequestSpec, timeout: float) -> dict[str, Any]:
     status = 0
     body_bytes = b""
     error = ""
+    response_headers: dict[str, str] = {}
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = int(response.status)
+            response_headers = {str(k).lower(): str(v) for k, v in response.headers.items()}
             body_bytes = response.read()
     except urllib.error.HTTPError as exc:
         status = int(exc.code)
+        response_headers = {str(k).lower(): str(v) for k, v in exc.headers.items()}
         body_bytes = exc.read(8192)
         error = f"http_{exc.code}"
     except TimeoutError:
@@ -178,6 +181,24 @@ def _fetch(base_url: str, spec: RequestSpec, timeout: float) -> dict[str, Any]:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             json_error = type(exc).__name__
     json_elapsed = time.monotonic() - json_started
+    app_ms = _float_header(response_headers, "x-blueprints-app-ms")
+    header_metrics = {
+        "app_ms": app_ms,
+        "client_minus_app_ms": round((elapsed * 1000) - app_ms, 3) if app_ms is not None else None,
+    }
+    trace_id = response_headers.get("x-blueprints-trace-id", "")
+    for key in (
+        "x-blueprints-help-build-ms",
+        "x-blueprints-help-json-ms",
+        "x-blueprints-help-bytes",
+    ):
+        if key in response_headers:
+            header_key = key.removeprefix("x-blueprints-").replace("-", "_")
+            header_metrics[header_key] = (
+                int(response_headers[key])
+                if key == "x-blueprints-help-bytes"
+                else _float_header(response_headers, key)
+            )
     return {
         "name": spec.name,
         "category": spec.category,
@@ -188,9 +209,18 @@ def _fetch(base_url: str, spec: RequestSpec, timeout: float) -> dict[str, Any]:
         "json_parse_ms": round(json_elapsed * 1000, 3),
         "error": error,
         "json_error": json_error,
+        "header_metrics": header_metrics,
+        "trace_id": trace_id,
         "metrics": _json_metrics(body),
         "hints": _status_hints(body),
     }
+
+
+def _float_header(headers: dict[str, str], key: str) -> float | None:
+    try:
+        return round(float(headers[key]), 3)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 async def fetch_one(
@@ -287,6 +317,11 @@ def build_specs(args: argparse.Namespace, room_id: str | None) -> dict[str, Requ
             "/api/v1/voice-mode/active-browser-view?metrics=true",
             "browser",
         ),
+        "help_catalog": RequestSpec(
+            "help_catalog",
+            "/api/v1/help/catalog?metrics=true",
+            "catalog",
+        ),
         "browser_clients": RequestSpec(
             "browser_clients",
             "/api/v1/voice-mode/browser-clients?metrics=true",
@@ -366,6 +401,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         for key in (
             "matrix_messages",
             "kanban_status",
+            "help_catalog",
             "browser_view",
             "browser_clients",
             "kanban_datastore",
@@ -381,7 +417,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
 
-    for slow_key in ("matrix_messages", "kanban_status", "browser_view"):
+    for slow_key in ("matrix_messages", "kanban_status", "help_catalog", "browser_view"):
         if slow_key not in specs:
             continue
         sentinel_specs: list[RequestSpec] = [specs[slow_key]]

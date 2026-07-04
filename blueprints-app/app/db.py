@@ -11,10 +11,12 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import contextmanager, suppress
 from typing import Generator
 
 from . import config as cfg
+from . import timing
 from .url_identity import normalize_url_identity
 
 log = logging.getLogger(__name__)
@@ -2497,18 +2499,43 @@ def get_conn() -> Generator[sqlite3.Connection, None, None]:
     Yield a WAL-mode SQLite connection with row_factory set.
     Commits on clean exit; rolls back on exception.
     """
+    start_perf_ns = time.perf_counter_ns()
+    start_time_ns = time.time_ns()
     conn = sqlite3.connect(cfg.DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    ok = True
+    error_type = ""
+    commit_start_ns = 0
+    commit_end_ns = 0
     try:
         yield conn
+        commit_start_ns = time.perf_counter_ns()
         conn.commit()
+        commit_end_ns = time.perf_counter_ns()
     except Exception:
+        ok = False
+        error_type = "rollback"
         conn.rollback()
         raise
     finally:
         conn.close()
+        timing.record_span(
+            "sqlite_connection",
+            start_perf_ns=start_perf_ns,
+            end_perf_ns=time.perf_counter_ns(),
+            start_time_ns=start_time_ns,
+            end_time_ns=time.time_ns(),
+            db_path=cfg.DB_PATH,
+            ok=ok,
+            error_type=error_type,
+            commit_start_perf_ns=commit_start_ns,
+            commit_end_perf_ns=commit_end_ns,
+            commit_ms=round(max(0, commit_end_ns - commit_start_ns) / 1_000_000, 3)
+            if commit_start_ns and commit_end_ns
+            else None,
+        )
 
 
 def increment_gen(conn: sqlite3.Connection, source: str = "human") -> int:

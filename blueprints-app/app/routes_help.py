@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from fastapi import APIRouter
+from fastapi.responses import Response
 from pydantic import Field
 
+from . import timing as timing_recorder
 from .db import get_conn
 from .nullclaw_docs_search import (
     SynthesisControls,
@@ -258,7 +261,12 @@ def build_help_catalog() -> dict[str, Any]:
         "version": _CATALOG_VERSION,
         "source": "blueprints_app",
         "contract": {
-            "action_targets": ["blueprints_page", "blueprints_modal", "blueprints_doc", "docs_path"],
+            "action_targets": [
+                "blueprints_page",
+                "blueprints_modal",
+                "blueprints_doc",
+                "docs_path",
+            ],
             "catalog_only_targets": ["blueprints_menu_function"],
             "target_schema": {
                 "blueprints_page": {"required": ["kind", "route"]},
@@ -287,6 +295,35 @@ def build_help_catalog() -> dict[str, Any]:
     }
 
 
+def _build_help_catalog_response_sync(*, metrics: bool = False) -> tuple[bytes, dict[str, Any]]:
+    started = time.perf_counter()
+    catalog = build_help_catalog()
+    built = time.perf_counter()
+    body = json.dumps(
+        catalog,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = time.perf_counter()
+    metrics_payload = {
+        "schema": "xarta.help_catalog.metrics.v1",
+        "build_seconds": round(built - started, 6),
+        "json_encode_seconds": round(encoded - built, 6),
+        "response_bytes": len(body),
+    }
+    if metrics:
+        catalog["server_metrics"] = metrics_payload
+        body = json.dumps(
+            catalog,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        metrics_payload["response_bytes"] = len(body)
+    return body, metrics_payload
+
+
 def _catalog_modal_lookup(catalog: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
     lookup: dict[tuple[str, str], dict[str, Any]] = {}
     for modal in catalog.get("modals") or []:
@@ -307,7 +344,9 @@ def _catalog_page_lookup(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
-def _catalog_doc_lookup(catalog: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+def _catalog_doc_lookup(
+    catalog: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     by_id: dict[str, dict[str, Any]] = {}
     by_path: dict[str, dict[str, Any]] = {}
     for doc in catalog.get("documents") or []:
@@ -389,7 +428,11 @@ def _catalog_action(action: dict[str, Any], catalog: dict[str, Any]) -> dict[str
         if not match:
             return None
         if match.get("dispatchable") is False:
-            return {**action, "catalog_match": match["catalog_id"], "dispatch_blocked": "context_required"}
+            return {
+                **action,
+                "catalog_match": match["catalog_id"],
+                "dispatch_blocked": "context_required",
+            }
         return {
             **action,
             "catalog_match": match["catalog_id"],
@@ -465,7 +508,9 @@ def enforce_help_action_catalog(response: dict[str, Any]) -> dict[str, Any]:
         "minimum_dispatch_confidence": _MIN_DISPATCH_CONFIDENCE,
         "ambiguity_confidence_margin": _AMBIGUITY_CONFIDENCE_MARGIN,
     }
-    alternatives = response.get("alternatives") if isinstance(response.get("alternatives"), list) else []
+    alternatives = (
+        response.get("alternatives") if isinstance(response.get("alternatives"), list) else []
+    )
     action = response.get("action")
     if action is None:
         response["alternatives"] = _catalog_alternatives(alternatives, catalog)
@@ -581,10 +626,26 @@ async def help_modal(body: HelpTurnBody) -> dict[str, Any]:
 @router.get("/turns/{task_id}", response_model=dict)
 async def get_help_turn(task_id: str) -> dict[str, Any]:
     task = await fetch_query_synthesis_task(task_id)
-    response = blueprints_synthesis_response(task, route="/api/v1/help/turns/{id}", projection="turn")
+    response = blueprints_synthesis_response(
+        task, route="/api/v1/help/turns/{id}", projection="turn"
+    )
     return enforce_help_action_catalog(response)
 
 
-@router.get("/catalog", response_model=dict)
-async def help_catalog() -> dict[str, Any]:
-    return build_help_catalog()
+@router.get("/catalog")
+async def help_catalog(metrics: bool = False) -> Response:
+    with timing_recorder.span("handler", route="help_catalog", metrics=metrics):
+        body, timing = await timing_recorder.to_thread(
+            "help.catalog_build",
+            _build_help_catalog_response_sync,
+            metrics=metrics,
+        )
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "x-blueprints-help-build-ms": f"{timing['build_seconds'] * 1000:.3f}",
+            "x-blueprints-help-json-ms": f"{timing['json_encode_seconds'] * 1000:.3f}",
+            "x-blueprints-help-bytes": str(timing["response_bytes"]),
+        },
+    )

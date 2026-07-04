@@ -2892,7 +2892,7 @@ async def publish_kanban_external_refresh_commands(
             payload=payload,
             event_id=f"active-browser-command-{command_id}",
         )
-        await publish_event(event)
+        await publish_event(event, persistence_required=False)
         published_payloads.append(payload)
     return {
         "ok": True,
@@ -3940,7 +3940,7 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         payload=payload,
         event_id=f"voice-dev-command-{command_id}",
     )
-    published = await publish_event(event)
+    published = await publish_event(event, persistence_required=False)
     return {
         "ok": True,
         "event": published.model_dump(),
@@ -4065,7 +4065,7 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
         payload=payload,
         event_id=f"active-browser-command-{command_id}",
     )
-    published = await publish_event(event)
+    published = await publish_event(event, persistence_required=False)
     return {
         "ok": True,
         "event": published.model_dump(),
