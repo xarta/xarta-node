@@ -307,6 +307,78 @@ def _kanban_sync_conn() -> sqlite3.Connection:
     return conn
 
 
+def _personal_filter_sync_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE personal_events (
+            event_id TEXT PRIMARY KEY,
+            tags_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE personal_filter_meta_tags (
+            meta_tag_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE personal_filter_tags (
+            tag_id TEXT PRIMARY KEY,
+            label TEXT NOT NULL DEFAULT '',
+            meta_tag_id TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    return conn
+
+
+def test_assigned_personal_filter_tag_sync_delete_is_skipped():
+    conn = _personal_filter_sync_conn()
+    conn.execute(
+        "INSERT INTO personal_filter_tags (tag_id, label) VALUES ('birthdays-friends', 'Birthdays Friends')"
+    )
+    conn.execute(
+        "INSERT INTO personal_events (event_id, tags_json) VALUES ('birthday-event', '[\"birthdays-friends\"]')"
+    )
+
+    action = SimpleNamespace(
+        action_type="DELETE",
+        table_name="personal_filter_tags",
+        row_id="birthdays-friends",
+        row_data=None,
+    )
+    routes_sync._apply_action(conn, action)
+
+    row = conn.execute(
+        "SELECT tag_id FROM personal_filter_tags WHERE tag_id='birthdays-friends'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_assigned_personal_filter_meta_tag_sync_delete_is_skipped():
+    conn = _personal_filter_sync_conn()
+    conn.execute(
+        "INSERT INTO personal_filter_meta_tags (meta_tag_id, label) VALUES ('important', 'Important')"
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_filter_tags (tag_id, label, meta_tag_id)
+        VALUES ('birthdays-friends', 'Birthdays Friends', 'important')
+        """
+    )
+
+    action = SimpleNamespace(
+        action_type="DELETE",
+        table_name="personal_filter_meta_tags",
+        row_id="important",
+        row_data=None,
+    )
+    routes_sync._apply_action(conn, action)
+
+    row = conn.execute(
+        "SELECT meta_tag_id FROM personal_filter_meta_tags WHERE meta_tag_id='important'"
+    ).fetchone()
+    assert row is not None
+
+
 def test_stale_kanban_item_sync_update_is_skipped():
     conn = _kanban_sync_conn()
     action = SimpleNamespace(
