@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import os
 import time
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 
 import httpx
 import websockets
-from fastapi import APIRouter, WebSocket
+from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -522,6 +523,58 @@ def _clean_stt_mode(value: str | None, stt_enabled: bool = False) -> str:
 def _clean_string(value: Any, fallback: str = "", max_length: int = 255) -> str:
     text = " ".join(str(value if value is not None else fallback).strip().split())
     return (text or fallback)[:max_length]
+
+
+def _clean_request_ip(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw.split(",", 1)[0].strip()
+    if candidate.startswith("[") and "]" in candidate:
+        candidate = candidate[1 : candidate.index("]")]
+    elif candidate.count(":") == 1 and "." in candidate:
+        candidate = candidate.rsplit(":", 1)[0]
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return ""
+    return candidate
+
+
+def _request_forwarded_for(value: Any) -> list[str]:
+    seen: set[str] = set()
+    addresses: list[str] = []
+    for part in str(value or "").split(","):
+        address = _clean_request_ip(part)
+        if not address or address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+        if len(addresses) >= 4:
+            break
+    return addresses
+
+
+def _browser_request_network(request: Request) -> dict[str, Any]:
+    direct_ip = _clean_request_ip(request.client.host if request.client else "")
+    forwarded_for = _request_forwarded_for(request.headers.get("x-forwarded-for"))
+    real_ip = _clean_request_ip(request.headers.get("x-real-ip"))
+    client_ip = forwarded_for[0] if forwarded_for else (real_ip or direct_ip)
+    if not client_ip:
+        return {}
+    source = "x_forwarded_for" if forwarded_for else ("x_real_ip" if real_ip else "direct")
+    network: dict[str, Any] = {
+        "schema": "xarta.browser_request_network.v1",
+        "client_ip": client_ip,
+        "source": source,
+    }
+    if direct_ip and direct_ip != client_ip:
+        network["direct_client_ip"] = direct_ip
+    if forwarded_for:
+        network["forwarded_for"] = forwarded_for
+    if real_ip and real_ip not in {client_ip, direct_ip}:
+        network["real_ip"] = real_ip
+    return network
 
 
 def _clean_sound_asset_path(value: Any) -> str:
@@ -1811,7 +1864,13 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
                 "landscape_1080p_like": False,
                 "desktop_portrait": False,
                 "widescreen": False,
+                "screen_widescreen": False,
+                "viewport_wide_shape": False,
             },
+            "aspect_ratio": 0.0,
+            "viewport_aspect_ratio": 0.0,
+            "screen_aspect_ratio": 0.0,
+            "classification_aspect_source": "none",
             "provisional": True,
             "thresholds": dict(_ACTIVE_BROWSER_VIEWPORT_THRESHOLDS),
         }
@@ -1821,7 +1880,11 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
     portrait = height > width
     landscape = width >= height
     aspect = round(width / height, 4) if height else 0.0
-    screen_short = min(int(screen.get("width") or 0), int(screen.get("height") or 0))
+    screen_width = int(screen.get("width") or 0)
+    screen_height = int(screen.get("height") or 0)
+    screen_short = min(screen_width, screen_height) if screen_width and screen_height else 0
+    screen_long = max(screen_width, screen_height) if screen_width and screen_height else 0
+    screen_aspect = round(screen_long / screen_short, 4) if screen_short else 0.0
     effective_short = (
         min(value for value in [short_side, screen_short] if value > 0)
         if screen_short
@@ -1831,6 +1894,8 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
         pointer.get("coarse") or pointer.get("touch") or int(pointer.get("maxTouchPoints") or 0) > 0
     )
     thresholds = _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS
+    classification_aspect = screen_aspect or aspect
+    classification_aspect_source = "screen" if screen_aspect else "viewport"
     mobile = bool(
         (
             effective_short <= thresholds["mobile_short_side_max_px"]
@@ -1847,14 +1912,16 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
         and landscape
         and width >= thresholds["desktop_min_landscape_width_px"]
         and thresholds["standard_landscape_min_aspect"]
-        <= aspect
+        <= classification_aspect
         <= thresholds["standard_landscape_max_aspect"]
     )
+    screen_widescreen = bool(screen_aspect and screen_aspect >= thresholds["widescreen_min_aspect"])
+    viewport_wide_shape = bool(landscape and aspect >= thresholds["widescreen_min_aspect"])
     widescreen = bool(
         not mobile
         and landscape
         and width >= thresholds["desktop_min_landscape_width_px"]
-        and aspect >= thresholds["widescreen_min_aspect"]
+        and (screen_widescreen if screen_aspect else viewport_wide_shape)
     )
     flags = {
         "mobile_portrait": bool(mobile and portrait),
@@ -1863,6 +1930,8 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
         "landscape_1080p_like": standard_landscape,
         "desktop_portrait": bool(not mobile and portrait),
         "widescreen": widescreen,
+        "screen_widescreen": screen_widescreen,
+        "viewport_wide_shape": viewport_wide_shape,
     }
     primary = "desktop_landscape"
     for name in [
@@ -1880,6 +1949,9 @@ def _classify_browser_viewport(viewport: dict[str, Any]) -> dict[str, Any]:
         "primary": primary,
         "flags": flags,
         "aspect_ratio": aspect,
+        "viewport_aspect_ratio": aspect,
+        "screen_aspect_ratio": screen_aspect,
+        "classification_aspect_source": classification_aspect_source,
         "provisional": True,
         "thresholds": dict(thresholds),
     }
@@ -2516,7 +2588,11 @@ def _clean_active_browser_automation_report(
     }
 
 
-def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, Any]:
+def _clean_browser_view_report(
+    body: BrowserViewBody,
+    now: float,
+    request_network: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     page = body.page if isinstance(body.page, dict) else {}
     frontend = body.frontend if isinstance(body.frontend, dict) else {}
     tts = _bounded_json(body.tts if isinstance(body.tts, dict) else {}, 8000)
@@ -2617,12 +2693,18 @@ def _clean_browser_view_report(body: BrowserViewBody, now: float) -> dict[str, A
     }
     if diagnostics:
         report["diagnostics"] = diagnostics
+    if request_network:
+        report["network"] = request_network
     return report
 
 
-def _prepare_browser_view_report_sync(body: BrowserViewBody, now: float) -> dict[str, Any]:
+def _prepare_browser_view_report_sync(
+    body: BrowserViewBody,
+    now: float,
+    request_network: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     with timing.span("voice_mode.browser_view.report_build"):
-        return _clean_browser_view_report(body, now)
+        return _clean_browser_view_report(body, now, request_network=request_network)
 
 
 def _browser_view_key(report: dict[str, Any]) -> str:
@@ -2665,11 +2747,20 @@ def _annotate_browser_view(
     *,
     include_capability_items: bool = True,
     include_automation: bool = True,
+    include_network: bool = False,
     frontend_expected: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(report, dict):
         return None
     public = dict(report)
+    if not include_network:
+        public.pop("network", None)
+    viewport = public.get("viewport") if isinstance(public.get("viewport"), dict) else {}
+    if viewport:
+        viewport_classification = _classify_browser_viewport(viewport)
+        public["viewport_classification"] = viewport_classification
+        public["viewport_class"] = viewport_classification["primary"]
+        public["viewport_flags"] = viewport_classification["flags"]
     frontend = dict(public.get("frontend") if isinstance(public.get("frontend"), dict) else {})
     expected = (
         dict(frontend_expected)
@@ -2707,12 +2798,14 @@ def _annotate_browser_client(
     now: float | None = None,
     max_age_seconds: int | None = None,
     include_automation: bool = True,
+    include_network: bool = False,
     frontend_expected: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     public = _annotate_browser_view(
         report,
         include_capability_items=False,
         include_automation=include_automation,
+        include_network=include_network,
         frontend_expected=frontend_expected,
     )
     if not public:
@@ -2746,7 +2839,11 @@ def _annotate_browser_client(
     return public
 
 
-def _compact_public_browser_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
+def _compact_public_browser_report(
+    report: dict[str, Any] | None,
+    *,
+    include_network: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(report, dict):
         return None
     keys = (
@@ -2780,7 +2877,10 @@ def _compact_public_browser_report(report: dict[str, Any] | None) -> dict[str, A
         "docs",
         "body_shade",
     )
-    return {key: report[key] for key in keys if key in report}
+    public = {key: report[key] for key in keys if key in report}
+    if include_network and isinstance(report.get("network"), dict):
+        public["network"] = report["network"]
+    return public
 
 
 def _browser_client_inventory(
@@ -2789,6 +2889,7 @@ def _browser_client_inventory(
     now: float | None = None,
     max_age_seconds: int | None = None,
     include_automation: bool = True,
+    include_network: bool = False,
     frontend_expected: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
@@ -2801,6 +2902,7 @@ def _browser_client_inventory(
             now=timestamp,
             max_age_seconds=max_age_seconds,
             include_automation=include_automation,
+            include_network=include_network,
             frontend_expected=frontend_expected,
         )
         for report in reports.values()
@@ -2969,6 +3071,7 @@ def _public_browser_clients(
     state: dict[str, Any],
     *,
     max_age_seconds: int | None = None,
+    include_network: bool = False,
 ) -> dict[str, Any]:
     max_age = max(1, int(max_age_seconds or _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS))
     now = time.time()
@@ -2978,11 +3081,15 @@ def _public_browser_clients(
         now=now,
         max_age_seconds=max_age,
         include_automation=False,
+        include_network=include_network,
         frontend_expected=expected,
     )
     public_clients = [
         client
-        for client in (_compact_public_browser_report(client) for client in clients)
+        for client in (
+            _compact_public_browser_report(client, include_network=include_network)
+            for client in clients
+        )
         if client
     ]
     return {
@@ -3038,6 +3145,7 @@ def _public_active_browser_view(
     *,
     include_capability_items: bool = False,
     include_recent: bool = True,
+    include_network: bool = False,
 ) -> dict[str, Any]:
     reports = state.get("browser_views") if isinstance(state.get("browser_views"), dict) else {}
     now = time.time()
@@ -3049,6 +3157,7 @@ def _public_active_browser_view(
                     report,
                     include_capability_items=False,
                     include_automation=False,
+                    include_network=include_network,
                     frontend_expected=expected,
                 )
                 for report in reports.values()
@@ -3065,6 +3174,7 @@ def _public_active_browser_view(
         now=now,
         max_age_seconds=_ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
         include_automation=False,
+        include_network=include_network,
         frontend_expected=expected,
     )
     return {
@@ -3075,16 +3185,23 @@ def _public_active_browser_view(
         "view": _annotate_browser_view(
             _selected_active_browser_view(state),
             include_capability_items=include_capability_items,
+            include_network=include_network,
             frontend_expected=expected,
         ),
         "reports": [
             report
-            for report in (_compact_public_browser_report(report) for report in recent)
+            for report in (
+                _compact_public_browser_report(report, include_network=include_network)
+                for report in recent
+            )
             if report
         ][:10],
         "clients": [
             client
-            for client in (_compact_public_browser_report(client) for client in clients)
+            for client in (
+                _compact_public_browser_report(client, include_network=include_network)
+                for client in clients
+            )
             if client
         ][:10]
         if include_recent
@@ -3561,18 +3678,28 @@ def _active_browser_view_locked_sync(
     *,
     include_capabilities: bool,
     include_recent: bool,
+    include_network: bool,
 ) -> dict[str, Any]:
     state = _read_state_unlocked()
     return _public_active_browser_view(
         state,
         include_capability_items=include_capabilities,
         include_recent=include_recent,
+        include_network=include_network,
     )
 
 
-def _active_browser_clients_locked_sync(*, max_age_seconds: int) -> dict[str, Any]:
+def _active_browser_clients_locked_sync(
+    *,
+    max_age_seconds: int,
+    include_network: bool,
+) -> dict[str, Any]:
     state = _read_state_unlocked()
-    return _public_browser_clients(state, max_age_seconds=max_age_seconds)
+    return _public_browser_clients(
+        state,
+        max_age_seconds=max_age_seconds,
+        include_network=include_network,
+    )
 
 
 def _update_browser_view_locked_sync(
@@ -3611,6 +3738,7 @@ async def voice_mode_status() -> dict[str, Any]:
 async def active_browser_view(
     include_capabilities: bool = False,
     include_recent: bool = False,
+    include_network: bool = False,
     metrics: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
@@ -3620,6 +3748,7 @@ async def active_browser_view(
             _active_browser_view_locked_sync,
             include_capabilities=include_capabilities,
             include_recent=include_recent,
+            include_network=include_network,
         )
     finished = time.monotonic()
     if metrics:
@@ -3630,6 +3759,7 @@ async def active_browser_view(
             "state_read_and_payload_seconds": round(finished - lock_acquired, 6),
             "include_capabilities": bool(include_capabilities),
             "include_recent": bool(include_recent),
+            "include_network": bool(include_network),
         }
     return payload
 
@@ -3637,6 +3767,7 @@ async def active_browser_view(
 @router.get("/browser-clients")
 async def active_browser_clients(
     max_age_seconds: int = _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS,
+    include_network: bool = False,
     metrics: bool = False,
 ) -> dict[str, Any]:
     max_age = max(
@@ -3648,6 +3779,7 @@ async def active_browser_clients(
         payload = await asyncio.to_thread(
             _active_browser_clients_locked_sync,
             max_age_seconds=max_age,
+            include_network=include_network,
         )
     finished = time.monotonic()
     if metrics:
@@ -3657,21 +3789,24 @@ async def active_browser_clients(
             "state_lock_wait_seconds": round(lock_acquired - started, 6),
             "state_read_and_payload_seconds": round(finished - lock_acquired, 6),
             "max_age_seconds": max_age,
+            "include_network": bool(include_network),
         }
     return payload
 
 
 @router.post("/browser-view")
-async def update_browser_view(body: BrowserViewBody):
+async def update_browser_view(body: BrowserViewBody, request: Request):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
     now = time.time()
+    request_network = _browser_request_network(request)
     report = await timing.to_thread(
         "voice_mode.browser_view.prepare",
         _prepare_browser_view_report_sync,
         body,
         now,
+        request_network,
     )
 
     lock_wait_start_perf_ns = time.perf_counter_ns()
