@@ -3920,7 +3920,7 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
     }.issubset(sync_tables)
 
 
-def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+def test_work_kanban_read_routes_delegate_to_kanban_store_boundary(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
@@ -3983,12 +3983,15 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         "item_detail": 0,
         "priority_recommendations": 0,
         "rollup": 0,
+        "rollups": 0,
+        "multi_rollups": 0,
     }
-    original_config = routes_personal.SQLiteKanbanStore.config
-    original_board = routes_personal.SQLiteKanbanStore.board
-    original_item_detail = routes_personal.SQLiteKanbanStore.item_detail
-    original_priority_recommendations = routes_personal.SQLiteKanbanStore.priority_recommendations
-    original_rollup = routes_personal.SQLiteKanbanStore.rollup
+    original_config = routes_personal.KanbanStore.config
+    original_board = routes_personal.KanbanStore.board
+    original_item_detail = routes_personal.KanbanStore.item_detail
+    original_priority_recommendations = routes_personal.KanbanStore.priority_recommendations
+    original_rollup = routes_personal.KanbanStore.rollup
+    original_rollups = routes_personal.KanbanStore.rollups
 
     def spy_config(self):
         calls["config"] += 1
@@ -4010,15 +4013,22 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         calls["rollup"] += 1
         return original_rollup(self, *args, **kwargs)
 
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "config", spy_config)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "board", spy_board)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_detail", spy_item_detail)
+    def spy_rollups(self, *args, **kwargs):
+        calls["rollups"] += 1
+        if args and len(args[0]) > 1:
+            calls["multi_rollups"] += 1
+        return original_rollups(self, *args, **kwargs)
+
+    monkeypatch.setattr(routes_personal.KanbanStore, "config", spy_config)
+    monkeypatch.setattr(routes_personal.KanbanStore, "board", spy_board)
+    monkeypatch.setattr(routes_personal.KanbanStore, "item_detail", spy_item_detail)
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "priority_recommendations",
         spy_priority_recommendations,
     )
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "rollup", spy_rollup)
+    monkeypatch.setattr(routes_personal.KanbanStore, "rollup", spy_rollup)
+    monkeypatch.setattr(routes_personal.KanbanStore, "rollups", spy_rollups)
 
     config = asyncio.run(routes_personal.get_work_config())
     board = asyncio.run(routes_personal.get_work_root_board())
@@ -4054,11 +4064,13 @@ def test_work_kanban_read_routes_delegate_to_sqlite_store_boundary(monkeypatch, 
         "board": 2,
         "item_detail": 1,
         "priority_recommendations": 1,
-        "rollup": 6,
+        "rollup": 4,
+        "rollups": 4,
+        "multi_rollups": 1,
     }
 
 
-def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+def test_work_kanban_core_write_routes_delegate_to_kanban_store_boundary(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
@@ -4074,13 +4086,13 @@ def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeyp
         "upsert_priority_recommendation": 0,
         "delete_priority_recommendation": 0,
     }
-    original_insert = routes_personal.SQLiteKanbanStore.insert_item_row
-    original_update = routes_personal.SQLiteKanbanStore.update_item_row
-    original_move = routes_personal.SQLiteKanbanStore.move_item_row
-    original_archive = routes_personal.SQLiteKanbanStore.archive_item_row
-    original_priority_rows = routes_personal.SQLiteKanbanStore.priority_recommendation_rows
-    original_upsert_priority = routes_personal.SQLiteKanbanStore.upsert_priority_recommendation
-    original_delete_priority = routes_personal.SQLiteKanbanStore.delete_priority_recommendation
+    original_insert = routes_personal.KanbanStore.insert_item_row
+    original_update = routes_personal.KanbanStore.update_item_row
+    original_move = routes_personal.KanbanStore.move_item_row
+    original_archive = routes_personal.KanbanStore.archive_item_row
+    original_priority_rows = routes_personal.KanbanStore.priority_recommendation_rows
+    original_upsert_priority = routes_personal.KanbanStore.upsert_priority_recommendation
+    original_delete_priority = routes_personal.KanbanStore.delete_priority_recommendation
 
     def spy_insert(self, *args, **kwargs):
         calls["insert_item_row"] += 1
@@ -4110,22 +4122,22 @@ def test_work_kanban_core_write_routes_delegate_to_sqlite_store_boundary(monkeyp
         calls["delete_priority_recommendation"] += 1
         return original_delete_priority(self, *args, **kwargs)
 
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "insert_item_row", spy_insert)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "update_item_row", spy_update)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "move_item_row", spy_move)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "archive_item_row", spy_archive)
+    monkeypatch.setattr(routes_personal.KanbanStore, "insert_item_row", spy_insert)
+    monkeypatch.setattr(routes_personal.KanbanStore, "update_item_row", spy_update)
+    monkeypatch.setattr(routes_personal.KanbanStore, "move_item_row", spy_move)
+    monkeypatch.setattr(routes_personal.KanbanStore, "archive_item_row", spy_archive)
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "priority_recommendation_rows",
         spy_priority_rows,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "upsert_priority_recommendation",
         spy_upsert_priority,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "delete_priority_recommendation",
         spy_delete_priority,
     )
@@ -4327,7 +4339,7 @@ def test_work_kanban_mutation_routes_offload_blocking_work(monkeypatch):
     ]
 
 
-def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+def test_work_kanban_discussion_writes_delegate_to_kanban_store_boundary(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
@@ -4340,10 +4352,10 @@ def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeyp
         "update_discussion_provenance": 0,
         "delete_discussion_row": 0,
     }
-    original_create = routes_personal.SQLiteKanbanStore.create_discussion_row
-    original_update = routes_personal.SQLiteKanbanStore.update_discussion_row
-    original_update_provenance = routes_personal.SQLiteKanbanStore.update_discussion_provenance
-    original_delete = routes_personal.SQLiteKanbanStore.delete_discussion_row
+    original_create = routes_personal.KanbanStore.create_discussion_row
+    original_update = routes_personal.KanbanStore.update_discussion_row
+    original_update_provenance = routes_personal.KanbanStore.update_discussion_provenance
+    original_delete = routes_personal.KanbanStore.delete_discussion_row
 
     def spy_create(self, *args, **kwargs):
         calls["create_discussion_row"] += 1
@@ -4362,22 +4374,22 @@ def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeyp
         return original_delete(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "create_discussion_row",
         spy_create,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "update_discussion_row",
         spy_update,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "update_discussion_provenance",
         spy_update_provenance,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "delete_discussion_row",
         spy_delete,
     )
@@ -4467,7 +4479,7 @@ def test_work_kanban_discussion_writes_delegate_to_sqlite_store_boundary(monkeyp
     assert {"kanban_discussions", "kanban_audit_log"}.issubset(sync_tables)
 
 
-def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
+def test_work_kanban_detail_review_documents_delegate_to_kanban_store_boundary(
     monkeypatch, tmp_path
 ):
     conn = _make_conn()
@@ -4482,10 +4494,10 @@ def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
         "write_item_detail_document": 0,
         "write_item_review_document": 0,
     }
-    original_detail = routes_personal.SQLiteKanbanStore.item_detail_document
-    original_review = routes_personal.SQLiteKanbanStore.item_review_document
-    original_write_detail = routes_personal.SQLiteKanbanStore.write_item_detail_document
-    original_write_review = routes_personal.SQLiteKanbanStore.write_item_review_document
+    original_detail = routes_personal.KanbanStore.item_detail_document
+    original_review = routes_personal.KanbanStore.item_review_document
+    original_write_detail = routes_personal.KanbanStore.write_item_detail_document
+    original_write_review = routes_personal.KanbanStore.write_item_review_document
 
     def spy_detail(self, *args, **kwargs):
         calls["item_detail_document"] += 1
@@ -4503,15 +4515,15 @@ def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
         calls["write_item_review_document"] += 1
         return original_write_review(self, *args, **kwargs)
 
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_detail_document", spy_detail)
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "item_review_document", spy_review)
+    monkeypatch.setattr(routes_personal.KanbanStore, "item_detail_document", spy_detail)
+    monkeypatch.setattr(routes_personal.KanbanStore, "item_review_document", spy_review)
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "write_item_detail_document",
         spy_write_detail,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "write_item_review_document",
         spy_write_review,
     )
@@ -4609,7 +4621,7 @@ def test_work_kanban_detail_review_documents_delegate_to_sqlite_store_boundary(
     assert {"kanban_audit_log", "kanban_review_processor_markers"}.issubset(sync_tables)
 
 
-def test_work_kanban_relationship_writes_delegate_to_sqlite_store_boundary(monkeypatch, tmp_path):
+def test_work_kanban_relationship_writes_delegate_to_kanban_store_boundary(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
@@ -4622,10 +4634,10 @@ def test_work_kanban_relationship_writes_delegate_to_sqlite_store_boundary(monke
         "upsert_blocker_row": 0,
         "upsert_item_commit_row": 0,
     }
-    original_create_link = routes_personal.SQLiteKanbanStore.create_item_link_row
-    original_blocker_row = routes_personal.SQLiteKanbanStore.blocker_row
-    original_upsert_blocker = routes_personal.SQLiteKanbanStore.upsert_blocker_row
-    original_upsert_commit = routes_personal.SQLiteKanbanStore.upsert_item_commit_row
+    original_create_link = routes_personal.KanbanStore.create_item_link_row
+    original_blocker_row = routes_personal.KanbanStore.blocker_row
+    original_upsert_blocker = routes_personal.KanbanStore.upsert_blocker_row
+    original_upsert_commit = routes_personal.KanbanStore.upsert_item_commit_row
 
     def spy_create_link(self, *args, **kwargs):
         calls["create_item_link_row"] += 1
@@ -4644,18 +4656,18 @@ def test_work_kanban_relationship_writes_delegate_to_sqlite_store_boundary(monke
         return original_upsert_commit(self, *args, **kwargs)
 
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "create_item_link_row",
         spy_create_link,
     )
-    monkeypatch.setattr(routes_personal.SQLiteKanbanStore, "blocker_row", spy_blocker_row)
+    monkeypatch.setattr(routes_personal.KanbanStore, "blocker_row", spy_blocker_row)
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "upsert_blocker_row",
         spy_upsert_blocker,
     )
     monkeypatch.setattr(
-        routes_personal.SQLiteKanbanStore,
+        routes_personal.KanbanStore,
         "upsert_item_commit_row",
         spy_upsert_commit,
     )
