@@ -2572,7 +2572,7 @@ def set_setting(
         VALUES (?, ?, ?, datetime('now'))
         ON CONFLICT(key) DO UPDATE SET
             value       = excluded.value,
-            description = COALESCE(excluded.description, description),
+            description = COALESCE(excluded.description, settings.description),
             updated_at  = datetime('now')
         """,
         (key, value, description),

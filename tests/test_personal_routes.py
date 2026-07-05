@@ -50,6 +50,7 @@ os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 from app import db as app_db  # noqa: E402
 from app import (  # noqa: E402
     kanban_parity,
+    kanban_postgres,
     routes_kanban_backups,
     routes_kanban_postgres,
     routes_personal,
@@ -5271,6 +5272,32 @@ def test_work_kanban_active_postgres_write_through_and_read_preference(monkeypat
         if item["item_id"] == "active-postgres-write"
     ]
     assert root_items[0]["title"] == "Postgres authoritative title"
+
+
+def test_settings_upsert_sql_is_unambiguous_for_kanban_postgres_support_setting():
+    class CaptureConn:
+        def __init__(self):
+            self.sql = ""
+            self.params = ()
+
+        def execute(self, sql, params=None):
+            self.sql = sql
+            self.params = params or ()
+
+    capture = CaptureConn()
+    app_db.set_setting(
+        capture,
+        routes_personal.KANBAN_SHOW_TEST_ENTRIES_SETTING,
+        "true",
+        None,
+    )
+
+    statement, _args = kanban_postgres.prepare_sqlite_query_for_postgres(
+        capture.sql,
+        capture.params,
+    )
+
+    assert "COALESCE(excluded.description, settings.description)" in statement
 
 
 def test_work_kanban_postgres_read_replica_rejects_local_writes(monkeypatch, tmp_path):
