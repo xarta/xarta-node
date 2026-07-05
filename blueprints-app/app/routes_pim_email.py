@@ -13,7 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import timing
@@ -31,12 +32,18 @@ from .pim_email import (
     list_inbox,
     smtp_self_send,
 )
-from .pim_email_security import security_status
 
 router = APIRouter(prefix="/personal/email", tags=["personal-email"])
 
 PIM_EMAIL_STACK_DIR = Path("/xarta-node/.lone-wolf/stacks/pim-email")
 PIM_EMAIL_STACK_COMMAND_TIMEOUT_SECONDS = 25.0
+PIM_EMAIL_STACK_API_BASE = os.environ.get(
+    "PIM_EMAIL_STACK_API_BASE",
+    "http://127.0.0.1:18085",
+).rstrip("/")
+PIM_EMAIL_STACK_API_TIMEOUT_SECONDS = float(
+    os.environ.get("PIM_EMAIL_STACK_API_TIMEOUT_SECONDS", "10")
+)
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -194,6 +201,95 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, EmailOperationError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=502, detail="Email middleware operation failed")
+
+
+def _stack_params(**params: Any) -> dict[str, Any]:
+    return {key: value for key, value in params.items() if value is not None}
+
+
+async def _stack_get_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, params=params or {})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    if response.status_code >= 400:
+        detail: Any
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text or "PIM Email stack API request failed"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502, detail="PIM Email stack API returned invalid JSON"
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
+    return data
+
+
+async def _stack_post_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
+            response = await client.post(url, params=params or {}, json=json_body or {})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    if response.status_code >= 400:
+        detail: Any
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text or "PIM Email stack API request failed"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502, detail="PIM Email stack API returned invalid JSON"
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
+    return data
+
+
+async def _stack_get_binary(path: str, *, params: dict[str, Any] | None = None) -> Response:
+    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
+            response = await client.get(url, params=params or {})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    if response.status_code >= 400:
+        detail: Any
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text or "PIM Email stack API request failed"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    headers = {
+        key: value
+        for key, value in {
+            "Cache-Control": response.headers.get("cache-control"),
+            "ETag": response.headers.get("etag"),
+            "X-Content-Type-Options": response.headers.get("x-content-type-options"),
+        }.items()
+        if value
+    }
+    return Response(
+        content=response.content,
+        media_type=response.headers.get("content-type", "application/octet-stream"),
+        headers=headers,
+    )
 
 
 def _clean_security_run_id(value: str | None = None) -> str:
@@ -412,51 +508,19 @@ async def email_status(
     metrics: bool = Query(False),
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
-    stages: dict[str, float] = {}
-    try:
-        store = _store()
-        stage_started = time.perf_counter()
-        await store.ensure_schema()
-        stages["ensure_schema_seconds"] = time.perf_counter() - stage_started
-        stage_started = time.perf_counter()
-        mailboxes = await store.public_mailboxes()
-        stages["mailboxes_seconds"] = time.perf_counter() - stage_started
-        if hasattr(store, "local_corpus_status"):
-            stage_started = time.perf_counter()
-            with timing.span(
-                "pim_email.status.local_corpus",
-                include_external_images=include_external_images,
-                include_security_details=include_security_details,
-            ):
-                local = await store.local_corpus_status(
-                    include_external_images=include_external_images,
-                    include_security_details=include_security_details,
-                )
-            stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
-        else:
-            local = {"available": False, "message_count": 0}
-        response = {
-            "ok": True,
-            "storage": "postgres",
-            "mailboxes": mailboxes,
-            "local_corpus": local,
-            "capabilities": {
-                "imap_read": True,
-                "local_corpus_read": True,
-                "safe_local_download": True,
-                "imap_uid_move_after_local_commit": True,
-                "smtp_self_test": True,
-                "smtp_general_send": False,
-                "delete": False,
-                "ai_send": False,
-                "security_checks": security_status(),
-            },
-        }
-        return _attach_server_metrics(
-            response, metrics=metrics, started_at=started_at, stages=stages
-        )
-    except Exception as exc:
-        raise _http_error(exc) from exc
+    response = await _stack_get_json(
+        "/status",
+        params=_stack_params(
+            include_external_images=include_external_images,
+            include_security_details=include_security_details,
+        ),
+    )
+    return _attach_server_metrics(
+        response,
+        metrics=metrics,
+        started_at=started_at,
+        stages={"stack_proxy_seconds": time.perf_counter() - started_at},
+    )
 
 
 @router.get("/local/status")
@@ -467,29 +531,20 @@ async def email_local_status(
     metrics: bool = Query(False),
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
-    stages: dict[str, float] = {}
-    try:
-        store = _store()
-        stage_started = time.perf_counter()
-        with timing.span(
-            "pim_email.local_status.local_corpus",
+    response = await _stack_get_json(
+        "/local/status",
+        params=_stack_params(
+            mailbox_id=mailbox_id,
             include_external_images=include_external_images,
             include_security_details=include_security_details,
-        ):
-            status = await store.local_corpus_status(
-                mailbox_id=mailbox_id,
-                include_external_images=include_external_images,
-                include_security_details=include_security_details,
-            )
-        stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
-        return _attach_server_metrics(
-            {"ok": True, "status": status},
-            metrics=metrics,
-            started_at=started_at,
-            stages=stages,
-        )
-    except Exception as exc:
-        raise _http_error(exc) from exc
+        ),
+    )
+    return _attach_server_metrics(
+        response,
+        metrics=metrics,
+        started_at=started_at,
+        stages={"stack_proxy_seconds": time.perf_counter() - started_at},
+    )
 
 
 @router.get("/workers/security/status")
@@ -989,39 +1044,22 @@ async def email_external_image_worker_fail_assignment(
 async def email_local_folders(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> dict[str, Any]:
-    try:
-        store = _store()
-        mailbox = await store.get_mailbox(mailbox_id)
-        folders = await store.local_folders(mailbox_id=mailbox.mailbox_id)
-        return {"ok": True, "mailbox": mailbox.public_dict(), "folders": folders}
-    except Exception as exc:
-        raise _http_error(exc) from exc
+    return await _stack_get_json(
+        "/local/folders",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
 
 
 @router.get("/local/folder-messages")
 async def email_local_folder_messages(
     folder: str = Query("INBOX", min_length=1, max_length=180),
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
-    limit: int = Query(25, ge=1, le=200),
+    limit: int = Query(100, ge=1, le=200),
 ) -> dict[str, Any]:
-    try:
-        store = _store()
-        mailbox = await store.get_mailbox(mailbox_id)
-        messages = await store.local_folder_messages(
-            mailbox_id=mailbox.mailbox_id,
-            folder=folder,
-            limit=limit,
-            ensure_schema=False,
-        )
-        return {
-            "ok": True,
-            "mailbox": mailbox.public_dict(),
-            "folder": folder,
-            "messages": messages,
-            "source": "local-corpus",
-        }
-    except Exception as exc:
-        raise _http_error(exc) from exc
+    return await _stack_get_json(
+        "/local/folder-messages",
+        params=_stack_params(folder=folder, mailbox_id=mailbox_id, limit=limit),
+    )
 
 
 @router.get("/local/messages/{email_uid}")
@@ -1029,17 +1067,32 @@ async def email_local_message(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> dict[str, Any]:
-    try:
-        store = _store()
-        mailbox = await store.get_mailbox(mailbox_id)
-        message = await store.read_local_message(
-            email_uid,
-            mailbox_id=mailbox.mailbox_id,
-            ensure_schema=False,
-        )
-        return {"ok": True, "mailbox": mailbox.public_dict(), "message": message}
-    except Exception as exc:
-        raise _http_error(exc) from exc
+    return await _stack_get_json(
+        f"/local/messages/{email_uid}",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.get("/local/images/{shared_asset_uid}")
+async def email_local_image(
+    shared_asset_uid: str,
+    email_uid: str = Query(..., min_length=8, max_length=80),
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> Response:
+    return await _stack_get_binary(
+        f"/local/images/{shared_asset_uid}",
+        params=_stack_params(email_uid=email_uid, mailbox_id=mailbox_id),
+    )
+
+
+@router.get("/local/health")
+async def email_local_health(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/health",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
 
 
 @router.post("/local/messages/{email_uid}/security")
@@ -1048,25 +1101,10 @@ async def email_local_message_security(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     security_run_id: str | None = Query(None, min_length=8, max_length=120),
 ) -> dict[str, Any]:
-    try:
-        store = _store()
-        mailbox = await store.get_mailbox(mailbox_id)
-        run_id = _clean_security_run_id(security_run_id)
-        result = await store.run_local_security_check(
-            email_uid,
-            mailbox_id=mailbox.mailbox_id,
-            progress_callback=_security_progress_emitter(
-                loop=asyncio.get_running_loop(),
-                run_id=run_id,
-                mailbox_id=mailbox.mailbox_id,
-                folder="local-corpus",
-                uid=email_uid,
-            ),
-        )
-        _attach_security_run_id(result["security"], run_id)
-        return {"ok": True, "mailbox": mailbox.public_dict(), **result}
-    except Exception as exc:
-        raise _http_error(exc) from exc
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/security",
+        params=_stack_params(mailbox_id=mailbox_id, security_run_id=security_run_id),
+    )
 
 
 @router.get("/folders")
