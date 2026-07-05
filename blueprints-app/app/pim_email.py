@@ -45,6 +45,12 @@ from .pim_email_image_transform import (
     transform_image_to_jpeg as _transform_image_to_jpeg,
 )
 from .pim_email_security import (
+    DETERMINISTIC_SCHEMA as SECURITY_DETERMINISTIC_SCHEMA,
+)
+from .pim_email_security import (
+    LLM_PHASE_SCHEMA as SECURITY_LLM_PHASE_SCHEMA,
+)
+from .pim_email_security import (
     SCHEMA as SECURITY_CHECK_SCHEMA,
 )
 from .pim_email_security import (
@@ -68,6 +74,8 @@ SANITIZED_VIEW_PURPOSE = b"xarta-pim-email-sanitized-view-v1"
 SANITIZED_VIEW_POLICY_VERSION = "sanitized-view-v1"
 SANITIZED_VIEW_TRANSFORM_VERSION = "email-sanitized-raw-v1"
 SECURITY_POLICY_VERSION = "pim-email-security-v1"
+SECURITY_ASSIGNMENT_LEASE_SECONDS = 15 * 60
+SECURITY_ASSIGNMENT_RETRY_DELAY_SECONDS = 15 * 60
 EXTERNAL_IMAGE_DERIVATIVE_VERSION = "external-image-derivative-v1"
 EXTERNAL_IMAGE_RETRY_DELAY_SECONDS = 15 * 60
 PIM_EMAIL_SCHEMA_LOCK_ID = 917_202_607_020_001
@@ -477,7 +485,11 @@ class PgEmailStore:
                       ('pim_email_shared_assets', 'reference_count'),
                       ('pim_email_backfill_runs', 'summary_json'),
                       ('pim_email_backfill_batches', 'batch_id'),
-                      ('pim_email_backfill_items', 'item_id')
+                      ('pim_email_backfill_items', 'item_id'),
+                      ('pim_email_security_phase_assignments', 'assignment_id'),
+                      ('pim_email_security_phase_assignments', 'assignment_token'),
+                      ('pim_email_security_phase_assignments', 'lease_expires_at'),
+                      ('pim_email_security_phase_assignments', 'next_retry_at')
                 )
                 SELECT COALESCE(bool_and(c.column_name IS NOT NULL), false)
                 FROM required r
@@ -614,6 +626,61 @@ class PgEmailStore:
                 CREATE INDEX IF NOT EXISTS idx_pim_email_security_phases_lookup
                 ON pim_email_security_phases(
                     mailbox_id, email_uid, raw_sha256, phase, phase_status, updated_at DESC
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pim_email_security_phase_assignments (
+                    assignment_id TEXT PRIMARY KEY,
+                    assignment_batch_id TEXT NOT NULL DEFAULT '',
+                    mailbox_id TEXT NOT NULL,
+                    email_uid TEXT NOT NULL,
+                    raw_sha256 TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    policy_version TEXT NOT NULL DEFAULT '',
+                    schema_version TEXT NOT NULL DEFAULT '',
+                    assignment_status TEXT NOT NULL DEFAULT 'unassigned',
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    assignment_token TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result_status TEXT NOT NULL DEFAULT '',
+                    error_class TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    claimed_at TIMESTAMPTZ,
+                    renewed_at TIMESTAMPTZ,
+                    lease_expires_at TIMESTAMPTZ,
+                    next_retry_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (mailbox_id, email_uid, raw_sha256, phase, policy_version)
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_security_phase_assignments_claim
+                ON pim_email_security_phase_assignments(
+                    mailbox_id, phase, assignment_status, next_retry_at, lease_expires_at, updated_at DESC
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_security_phase_assignments_batch
+                ON pim_email_security_phase_assignments(
+                    assignment_batch_id, worker_id, assignment_status
+                );
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pim_email_security_phase_assignments_worker
+                ON pim_email_security_phase_assignments(
+                    mailbox_id, worker_id, run_id, assignment_status, updated_at DESC
                 );
                 """
             )
@@ -1818,6 +1885,15 @@ class PgEmailStore:
                 """,
                 configured_mailbox_id,
             )
+            security_assignment_rows = await conn.fetch(
+                """
+                SELECT phase, assignment_status, count(*) AS row_count
+                FROM pim_email_security_phase_assignments
+                WHERE mailbox_id = $1
+                GROUP BY phase, assignment_status
+                """,
+                configured_mailbox_id,
+            )
             sanitized_counts = await conn.fetchrow(
                 """
                 WITH current_sanitized AS (
@@ -2048,6 +2124,13 @@ class PgEmailStore:
             ).strip("_")
             if key:
                 security_phase_counts[key] = int(_row_get(phase_row, "row_count", 0) or 0)
+        security_assignment_counts: dict[str, dict[str, int]] = {}
+        for assignment_row in security_assignment_rows:
+            phase = str(_row_get(assignment_row, "phase", "") or "unknown")
+            status = str(_row_get(assignment_row, "assignment_status", "") or "unknown")
+            security_assignment_counts.setdefault(phase, {})[status] = int(
+                _row_get(assignment_row, "row_count", 0) or 0
+            )
         return {
             "schema": "xarta.pim_email.local_corpus.status.v1",
             "mailbox_id": configured_mailbox_id,
@@ -2076,6 +2159,7 @@ class PgEmailStore:
                 "llm_complete": security_phase_counts.get("llm_complete", 0),
                 "llm_failed_retryable": security_phase_counts.get("llm_failed_retryable", 0),
             },
+            "security_phase_assignments": security_assignment_counts,
             "sanitized_derivatives": {
                 "completed": sanitized_completed,
                 "pending": int(_row_get(sanitized_counts, "pending", 0) or 0),
@@ -5476,11 +5560,12 @@ class PgEmailStore:
             await conn.close()
         if row is None:
             raise EmailOperationError("Local email message is not stored")
-        raw = read_encrypted_bytes(str(row["storage_relpath"]))
+        raw = await asyncio.to_thread(read_encrypted_bytes, str(row["storage_relpath"]))
         raw_sha256 = hashlib.sha256(raw).hexdigest()
         if raw_sha256 != str(row["raw_sha256"]):
             raise EmailOperationError("Local email content hash verification failed")
-        parsed = parse_message(
+        parsed = await asyncio.to_thread(
+            parse_message,
             raw,
             folder=str(_row_get(membership, "folder_name", "")) if membership else "",
             uid=str(_row_get(membership, "imap_uid", "")) if membership else "",
@@ -5752,6 +5837,1065 @@ class PgEmailStore:
             mailbox_id=configured_mailbox_id,
             progress_callback=progress_callback,
         )
+
+    async def enqueue_security_phase_assignments(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        phase: str = "security",
+        email_uid: str | None = None,
+        limit: int = 500,
+        run_id: str = "",
+        metadata: dict[str, Any] | None = None,
+        ensure_schema: bool = True,
+    ) -> dict[str, Any]:
+        if ensure_schema:
+            await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        requested = str(phase or "security").strip().lower().replace("-", "_")
+        if requested in {"security", "both", "all"}:
+            phases = ["deterministic", "llm"]
+        elif requested in {"security_deterministic", "deterministic"}:
+            phases = ["deterministic"]
+        elif requested in {"security_llm", "llm"}:
+            phases = ["llm"]
+        else:
+            raise EmailOperationError("Invalid security assignment phase")
+        clean_email_filter = clean_email_uid(email_uid) if email_uid else ""
+        safe_limit = max(1, min(int(limit or 1), 5000))
+        base_metadata = {
+            "schema": "xarta.pim_email.security_phase_assignment.reconcile.v1",
+            "requested_phase": requested,
+            "run_id": str(run_id or "")[:180],
+            **(metadata or {}),
+        }
+        summary: dict[str, Any] = {
+            "schema": "xarta.pim_email.security_phase_assignment.reconcile.summary.v1",
+            "mailbox_id": configured_mailbox_id,
+            "requested_phase": requested,
+            "email_uid": clean_email_filter,
+            "limit": safe_limit,
+            "inserted": 0,
+            "requeued": 0,
+            "phases": {item: {"inserted": 0, "requeued": 0} for item in phases},
+        }
+        conn = await self._connect()
+        try:
+            for clean_phase in phases:
+                params: list[Any] = [configured_mailbox_id]
+                where = "m.mailbox_id = $1"
+                if clean_email_filter:
+                    params.append(clean_email_filter)
+                    where += f" AND m.email_uid = ${len(params)}"
+                params.append(safe_limit)
+                limit_param = f"${len(params)}"
+                phase_metadata = {
+                    **base_metadata,
+                    "phase": clean_phase,
+                    "schema_version": _security_phase_schema_version(clean_phase),
+                }
+                params.append(_json_dumps(phase_metadata, sort_keys=True, separators=(",", ":")))
+                metadata_param = f"${len(params)}"
+                phase_gate = ""
+                if clean_phase == "llm":
+                    phase_gate = f"""
+                      AND EXISTS (
+                          SELECT 1
+                          FROM pim_email_security_phases det
+                          WHERE det.mailbox_id = m.mailbox_id
+                            AND det.email_uid = m.email_uid
+                            AND det.raw_sha256 = m.raw_sha256
+                            AND det.phase = 'deterministic'
+                            AND det.phase_status = 'complete'
+                            AND det.policy_version = '{SECURITY_POLICY_VERSION}'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_security_phases llm
+                          WHERE llm.mailbox_id = m.mailbox_id
+                            AND llm.email_uid = m.email_uid
+                            AND llm.raw_sha256 = m.raw_sha256
+                            AND llm.phase = 'llm'
+                            AND llm.phase_status = 'complete'
+                            AND llm.policy_version = '{SECURITY_POLICY_VERSION}'
+                      )
+                    """
+                else:
+                    phase_gate = f"""
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_security_phases det
+                          WHERE det.mailbox_id = m.mailbox_id
+                            AND det.email_uid = m.email_uid
+                            AND det.raw_sha256 = m.raw_sha256
+                            AND det.phase = 'deterministic'
+                            AND det.phase_status = 'complete'
+                            AND det.policy_version = '{SECURITY_POLICY_VERSION}'
+                      )
+                    """
+                params.append(str(run_id or "")[:180])
+                run_param = f"${len(params)}"
+                rows = await conn.fetch(
+                    f"""
+                    WITH candidates AS (
+                        SELECT m.mailbox_id, m.email_uid, m.raw_sha256, m.updated_at
+                        FROM pim_email_messages m
+                        WHERE {where}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM pim_email_security_checks s
+                              WHERE s.email_uid = m.email_uid
+                                AND s.raw_sha256 = m.raw_sha256
+                                AND s.security_status = 'stored'
+                                AND s.result_json->>'available' = 'true'
+                                AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
+                                AND COALESCE(s.result_json->>'placeholder', 'false') <> 'true'
+                                AND s.result_json->>'email_uid' = m.email_uid
+                                AND s.result_json->>'raw_sha256' = m.raw_sha256
+                                AND COALESCE(s.result_json->>'checked_at', '') <> ''
+                                AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
+                          )
+                          {phase_gate}
+                        ORDER BY m.updated_at DESC, m.email_uid DESC
+                        LIMIT {limit_param}
+                    ), upserted AS (
+                        INSERT INTO pim_email_security_phase_assignments (
+                            assignment_id, assignment_batch_id, mailbox_id, email_uid,
+                            raw_sha256, phase, policy_version, schema_version,
+                            assignment_status, worker_id, assignment_token, run_id,
+                            attempts, result_status, error_class, error_message,
+                            metadata_json, claimed_at, renewed_at, lease_expires_at,
+                            next_retry_at, completed_at, updated_at
+                        )
+                        SELECT
+                            'email-security-phase-assignment-' ||
+                                md5(
+                                    c.mailbox_id || ':' || c.email_uid || ':' ||
+                                    c.raw_sha256 || ':{clean_phase}:{SECURITY_POLICY_VERSION}'
+                                ),
+                            '', c.mailbox_id, c.email_uid, c.raw_sha256,
+                            '{clean_phase}', '{SECURITY_POLICY_VERSION}',
+                            '{_security_phase_schema_version(clean_phase)}',
+                            'unassigned', '', '', {run_param}, 0, '', '', '',
+                            {metadata_param}::jsonb, NULL, NULL, NULL, NULL, NULL, now()
+                        FROM candidates c
+                        ON CONFLICT (mailbox_id, email_uid, raw_sha256, phase, policy_version)
+                        DO UPDATE SET
+                            schema_version = EXCLUDED.schema_version,
+                            assignment_status = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN 'unassigned'
+                                ELSE pim_email_security_phase_assignments.assignment_status
+                            END,
+                            result_status = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN ''
+                                ELSE pim_email_security_phase_assignments.result_status
+                            END,
+                            error_class = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN ''
+                                ELSE pim_email_security_phase_assignments.error_class
+                            END,
+                            error_message = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN ''
+                                ELSE pim_email_security_phase_assignments.error_message
+                            END,
+                            metadata_json = pim_email_security_phase_assignments.metadata_json ||
+                                jsonb_build_object('last_reconcile', EXCLUDED.metadata_json),
+                            next_retry_at = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN NULL
+                                ELSE pim_email_security_phase_assignments.next_retry_at
+                            END,
+                            completed_at = CASE
+                                WHEN pim_email_security_phase_assignments.assignment_status
+                                     IN ('completed','failed')
+                                THEN NULL
+                                ELSE pim_email_security_phase_assignments.completed_at
+                            END,
+                            updated_at = now()
+                        WHERE pim_email_security_phase_assignments.assignment_status
+                              IN ('unassigned','retryable','failed','completed')
+                        RETURNING assignment_id, (xmax = 0) AS inserted
+                    )
+                    SELECT inserted, count(*) AS row_count
+                    FROM upserted
+                    GROUP BY inserted
+                    """,
+                    *params,
+                )
+                for row in rows:
+                    count = int(_row_get(row, "row_count", 0) or 0)
+                    if bool(_row_get(row, "inserted", False)):
+                        summary["inserted"] += count
+                        summary["phases"][clean_phase]["inserted"] += count
+                    else:
+                        summary["requeued"] += count
+                        summary["phases"][clean_phase]["requeued"] += count
+        finally:
+            await conn.close()
+        return summary
+
+    async def claim_security_phase_assignment_block(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        phase: str,
+        worker_id: str,
+        run_id: str = "",
+        limit: int = 5,
+        lease_seconds: int = SECURITY_ASSIGNMENT_LEASE_SECONDS,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        clean_phase = str(phase or "").strip().lower().replace("-", "_")
+        if clean_phase in {"security_deterministic"}:
+            clean_phase = "deterministic"
+        if clean_phase in {"security_llm"}:
+            clean_phase = "llm"
+        if clean_phase not in {"deterministic", "llm"}:
+            raise EmailOperationError("Invalid security assignment phase")
+        safe_limit = max(1, min(int(limit or 1), 25))
+        safe_lease = max(60, min(int(lease_seconds or SECURITY_ASSIGNMENT_LEASE_SECONDS), 3600))
+        clean_worker = re.sub(r"[^A-Za-z0-9_.:@-]+", "-", str(worker_id or "").strip())[:160]
+        if not clean_worker:
+            raise EmailOperationError("Security worker id is required")
+        clean_run_id = str(run_id or "")[:180]
+        conn = await self._connect()
+        try:
+            due_assignment_exists = bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pim_email_security_phase_assignments
+                        WHERE mailbox_id = $1
+                          AND phase = $2
+                          AND policy_version = $3
+                          AND (
+                              assignment_status = 'unassigned'
+                              OR (
+                                  assignment_status = 'retryable'
+                                  AND (next_retry_at IS NULL OR next_retry_at <= now())
+                              )
+                              OR (
+                                  assignment_status = 'assigned'
+                                  AND lease_expires_at IS NOT NULL
+                                  AND lease_expires_at <= now()
+                              )
+                          )
+                        LIMIT 1
+                    )
+                    """,
+                    configured_mailbox_id,
+                    clean_phase,
+                    SECURITY_POLICY_VERSION,
+                )
+            )
+        finally:
+            await conn.close()
+        if due_assignment_exists:
+            reconcile = {
+                "schema": "xarta.pim_email.security_phase_assignment.reconcile.summary.v1",
+                "mailbox_id": configured_mailbox_id,
+                "requested_phase": clean_phase,
+                "skipped": True,
+                "reason": "due_assignments_already_available",
+            }
+        else:
+            reconcile = {
+                "schema": "xarta.pim_email.security_phase_assignment.reconcile.summary.v1",
+                "mailbox_id": configured_mailbox_id,
+                "requested_phase": clean_phase,
+                "skipped": True,
+                "reason": "no_due_assignments",
+            }
+        assignment_token = secrets.token_urlsafe(32)
+        assignment_batch_id = _stable_id(
+            "email-security-phase-assignment-batch",
+            configured_mailbox_id,
+            clean_phase,
+            clean_worker,
+            clean_run_id,
+            str(time.time_ns()),
+            assignment_token,
+        )
+        claim_metadata = {
+            "schema": "xarta.pim_email.security_phase_assignment.claim.v1",
+            "phase": clean_phase,
+            **(metadata or {}),
+        }
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                f"""
+                WITH candidates AS (
+                    SELECT a.assignment_id
+                    FROM pim_email_security_phase_assignments a
+                    JOIN pim_email_messages m
+                      ON m.mailbox_id = a.mailbox_id
+                     AND m.email_uid = a.email_uid
+                     AND m.raw_sha256 = a.raw_sha256
+                    WHERE a.mailbox_id = $1
+                      AND a.phase = $2
+                      AND a.policy_version = $3
+                      AND (
+                          a.assignment_status = 'unassigned'
+                          OR (
+                              a.assignment_status = 'retryable'
+                              AND (a.next_retry_at IS NULL OR a.next_retry_at <= now())
+                          )
+                          OR (
+                              a.assignment_status = 'assigned'
+                              AND a.lease_expires_at IS NOT NULL
+                              AND a.lease_expires_at <= now()
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pim_email_security_checks s
+                          WHERE s.email_uid = m.email_uid
+                            AND s.raw_sha256 = m.raw_sha256
+                            AND s.security_status = 'stored'
+                            AND s.result_json->>'available' = 'true'
+                            AND COALESCE(s.result_json->>'queued', 'false') <> 'true'
+                            AND COALESCE(s.result_json->>'placeholder', 'false') <> 'true'
+                            AND s.result_json->>'email_uid' = m.email_uid
+                            AND s.result_json->>'raw_sha256' = m.raw_sha256
+                            AND COALESCE(s.result_json->>'checked_at', '') <> ''
+                            AND jsonb_typeof(s.result_json->'checker_versions') = 'object'
+                      )
+                      AND (
+                          $2 <> 'deterministic'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM pim_email_security_phases det
+                              WHERE det.mailbox_id = m.mailbox_id
+                                AND det.email_uid = m.email_uid
+                                AND det.raw_sha256 = m.raw_sha256
+                                AND det.phase = 'deterministic'
+                                AND det.phase_status = 'complete'
+                                AND det.policy_version = '{SECURITY_POLICY_VERSION}'
+                          )
+                      )
+                      AND (
+                          $2 <> 'llm'
+                          OR (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM pim_email_security_phases det
+                                  WHERE det.mailbox_id = m.mailbox_id
+                                    AND det.email_uid = m.email_uid
+                                    AND det.raw_sha256 = m.raw_sha256
+                                    AND det.phase = 'deterministic'
+                                    AND det.phase_status = 'complete'
+                                    AND det.policy_version = '{SECURITY_POLICY_VERSION}'
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM pim_email_security_phases llm
+                                  WHERE llm.mailbox_id = m.mailbox_id
+                                    AND llm.email_uid = m.email_uid
+                                    AND llm.raw_sha256 = m.raw_sha256
+                                    AND llm.phase = 'llm'
+                                    AND llm.phase_status = 'complete'
+                                    AND llm.policy_version = '{SECURITY_POLICY_VERSION}'
+                              )
+                          )
+                      )
+                    ORDER BY
+                      CASE
+                        WHEN a.assignment_status = 'assigned' THEN 0
+                        WHEN a.assignment_status = 'retryable' THEN 1
+                        ELSE 2
+                      END,
+                      a.next_retry_at ASC NULLS FIRST,
+                      a.updated_at ASC
+                    LIMIT $4
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE pim_email_security_phase_assignments a
+                SET assignment_batch_id = $5,
+                    assignment_status = 'assigned',
+                    worker_id = $6,
+                    assignment_token = $7,
+                    run_id = $8,
+                    attempts = a.attempts + 1,
+                    result_status = '',
+                    error_class = '',
+                    error_message = '',
+                    metadata_json = a.metadata_json ||
+                        jsonb_build_object('claim', $9::jsonb),
+                    claimed_at = now(),
+                    renewed_at = now(),
+                    lease_expires_at = now() + ($10::integer * interval '1 second'),
+                    next_retry_at = NULL,
+                    completed_at = NULL,
+                    updated_at = now()
+                FROM candidates
+                WHERE a.assignment_id = candidates.assignment_id
+                RETURNING a.assignment_id, a.assignment_batch_id, a.mailbox_id,
+                          a.email_uid, a.raw_sha256, a.phase, a.policy_version,
+                          a.schema_version, a.assignment_status, a.worker_id,
+                          a.assignment_token, a.run_id, a.attempts, a.result_status,
+                          a.error_class, a.error_message, a.metadata_json,
+                          a.claimed_at, a.renewed_at, a.lease_expires_at,
+                          a.next_retry_at, a.completed_at, a.created_at, a.updated_at
+                """,
+                configured_mailbox_id,
+                clean_phase,
+                SECURITY_POLICY_VERSION,
+                safe_limit,
+                assignment_batch_id,
+                clean_worker,
+                assignment_token,
+                clean_run_id,
+                _json_dumps(claim_metadata, sort_keys=True, separators=(",", ":")),
+                safe_lease,
+            )
+        finally:
+            await conn.close()
+        items: list[dict[str, Any]] = []
+        payload_failures = 0
+        for row in rows:
+            item = _security_phase_assignment_row_public(row, include_token=False)
+            try:
+                item.update(await self._security_phase_assignment_payload(item))
+            except Exception as exc:
+                payload_failures += 1
+                await self._finish_security_phase_assignment(
+                    assignment_id=item["assignment_id"],
+                    worker_id=clean_worker,
+                    assignment_token=assignment_token,
+                    assignment_status="retryable",
+                    result_status="payload_error",
+                    error_class=exc.__class__.__name__,
+                    error_message=str(exc),
+                    metadata={"phase": "payload-build", "error": str(exc)[:300]},
+                    retry_delay_seconds=SECURITY_ASSIGNMENT_RETRY_DELAY_SECONDS,
+                )
+                continue
+            items.append(item)
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.block.v1",
+            "mailbox_id": configured_mailbox_id,
+            "phase": clean_phase,
+            "assignment_batch_id": assignment_batch_id,
+            "assignment_token": assignment_token,
+            "worker_id": clean_worker,
+            "run_id": clean_run_id,
+            "lease_seconds": safe_lease,
+            "claimed": len(items),
+            "payload_failures": payload_failures,
+            "reconcile": reconcile,
+            "items": items,
+        }
+
+    async def _security_phase_assignment_payload(
+        self,
+        assignment: dict[str, Any],
+    ) -> dict[str, Any]:
+        source = await self._load_local_security_source(
+            str(assignment.get("email_uid") or ""),
+            mailbox_id=str(assignment.get("mailbox_id") or ""),
+        )
+        raw = bytes(source["raw"])
+        raw_sha256 = str(source["raw_sha256"])
+        if raw_sha256 != str(assignment.get("raw_sha256") or ""):
+            raise EmailOperationError("Security assignment raw hash is stale")
+        parsed = source.get("parsed") if isinstance(source.get("parsed"), dict) else {}
+        payload: dict[str, Any] = {
+            "payload_schema": "xarta.pim_email.security_phase_assignment.payload.v1",
+            "raw_email_base64": base64.b64encode(raw).decode("ascii"),
+            "raw_size_bytes": len(raw),
+            "body_text": str((parsed.get("views") or {}).get("plain") or ""),
+            "headers": parsed.get("headers") if isinstance(parsed.get("headers"), dict) else {},
+        }
+        if str(assignment.get("phase") or "") == "llm":
+            deterministic = await self.completed_security_phase_result(
+                mailbox_id=str(assignment.get("mailbox_id") or ""),
+                email_uid=str(assignment.get("email_uid") or ""),
+                raw_sha256=raw_sha256,
+                phase="deterministic",
+            )
+            if deterministic is None:
+                raise EmailOperationError("Deterministic security phase is not complete")
+            payload["deterministic"] = deterministic
+        return payload
+
+    async def _active_security_phase_assignment(
+        self,
+        *,
+        assignment_id: str,
+        worker_id: str,
+        assignment_token: str,
+    ) -> dict[str, Any]:
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT assignment_id, assignment_batch_id, mailbox_id, email_uid,
+                       raw_sha256, phase, policy_version, schema_version,
+                       assignment_status, worker_id, assignment_token, run_id,
+                       attempts, result_status, error_class, error_message,
+                       metadata_json, claimed_at, renewed_at, lease_expires_at,
+                       next_retry_at, completed_at, created_at, updated_at
+                FROM pim_email_security_phase_assignments
+                WHERE assignment_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                  AND lease_expires_at > now()
+                LIMIT 1
+                """,
+                str(assignment_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("Security phase assignment is not active")
+        return _security_phase_assignment_row_public(row, include_token=True)
+
+    async def heartbeat_security_phase_assignment_block(
+        self,
+        *,
+        assignment_batch_id: str,
+        worker_id: str,
+        assignment_token: str,
+        lease_seconds: int = SECURITY_ASSIGNMENT_LEASE_SECONDS,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        safe_lease = max(60, min(int(lease_seconds or SECURITY_ASSIGNMENT_LEASE_SECONDS), 3600))
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_security_phase_assignments
+                SET renewed_at = now(),
+                    lease_expires_at = now() + ($4::integer * interval '1 second'),
+                    updated_at = now()
+                WHERE assignment_batch_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                  AND lease_expires_at > now()
+                RETURNING assignment_id, renewed_at, lease_expires_at
+                """,
+                str(assignment_batch_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+                safe_lease,
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.heartbeat.v1",
+            "assignment_batch_id": str(assignment_batch_id or ""),
+            "worker_id": str(worker_id or ""),
+            "heartbeat_rows": len(rows),
+            "heartbeat_at": _iso_datetime(_row_get(rows[0], "renewed_at")) if rows else "",
+            "lease_expires_at": _iso_datetime(_row_get(rows[0], "lease_expires_at"))
+            if rows
+            else "",
+        }
+
+    async def release_security_phase_assignment_block(
+        self,
+        *,
+        assignment_batch_id: str,
+        worker_id: str,
+        assignment_token: str,
+        reason: str = "worker_released_assignment",
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                UPDATE pim_email_security_phase_assignments
+                SET assignment_status = 'unassigned',
+                    result_status = 'unassigned',
+                    error_message = $4,
+                    assignment_token = '',
+                    lease_expires_at = NULL,
+                    next_retry_at = NULL,
+                    updated_at = now()
+                WHERE assignment_batch_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                  AND lease_expires_at > now()
+                RETURNING assignment_id
+                """,
+                str(assignment_batch_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+                str(reason or "worker_released_assignment")[:1000],
+            )
+        finally:
+            await conn.close()
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.release.v1",
+            "assignment_batch_id": str(assignment_batch_id or ""),
+            "worker_id": str(worker_id or ""),
+            "unassigned": len(rows),
+        }
+
+    async def _finish_security_phase_assignment(
+        self,
+        *,
+        assignment_id: str,
+        worker_id: str,
+        assignment_token: str,
+        assignment_status: str,
+        result_status: str,
+        error_class: str = "",
+        error_message: str = "",
+        metadata: dict[str, Any] | None = None,
+        retry_delay_seconds: int = SECURITY_ASSIGNMENT_RETRY_DELAY_SECONDS,
+    ) -> dict[str, Any]:
+        clean_status = str(assignment_status or "").strip().lower()
+        if clean_status not in {"completed", "failed", "retryable", "unassigned"}:
+            raise EmailOperationError("Invalid security assignment finish status")
+        safe_retry = max(
+            60, min(int(retry_delay_seconds or SECURITY_ASSIGNMENT_RETRY_DELAY_SECONDS), 86400)
+        )
+        conn = await self._connect()
+        try:
+            row = await conn.fetchrow(
+                """
+                UPDATE pim_email_security_phase_assignments
+                SET assignment_status = $4,
+                    result_status = $5,
+                    error_class = $6,
+                    error_message = $7,
+                    metadata_json = metadata_json ||
+                        jsonb_build_object('finish', $8::jsonb),
+                    assignment_token = '',
+                    lease_expires_at = NULL,
+                    next_retry_at = CASE
+                        WHEN $4 = 'retryable' THEN now() + ($9::integer * interval '1 second')
+                        ELSE NULL
+                    END,
+                    completed_at = CASE
+                        WHEN $4 IN ('completed','failed','retryable') THEN now()
+                        ELSE completed_at
+                    END,
+                    updated_at = now()
+                WHERE assignment_id = $1
+                  AND worker_id = $2
+                  AND assignment_token = $3
+                  AND assignment_status = 'assigned'
+                  AND lease_expires_at > now()
+                RETURNING assignment_id, assignment_batch_id, mailbox_id, email_uid,
+                          raw_sha256, phase, policy_version, schema_version,
+                          assignment_status, worker_id, assignment_token, run_id,
+                          attempts, result_status, error_class, error_message,
+                          metadata_json, claimed_at, renewed_at, lease_expires_at,
+                          next_retry_at, completed_at, created_at, updated_at
+                """,
+                str(assignment_id or ""),
+                str(worker_id or ""),
+                str(assignment_token or ""),
+                clean_status,
+                str(result_status or "")[:120],
+                str(error_class or "")[:200],
+                str(error_message or "")[:1000],
+                _json_dumps(metadata or {}, sort_keys=True, separators=(",", ":")),
+                safe_retry,
+            )
+        finally:
+            await conn.close()
+        if row is None:
+            raise EmailOperationError("Security phase assignment is not active")
+        return _security_phase_assignment_row_public(row, include_token=False)
+
+    async def record_completed_security_result_from_worker(
+        self,
+        *,
+        mailbox_id: str,
+        email_uid: str,
+        raw_sha256: str,
+        security: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        source = await self._load_local_security_source(
+            email_uid,
+            mailbox_id=mailbox_id,
+        )
+        clean_uid = str(source["email_uid"])
+        if clean_uid != clean_email_uid(email_uid) or str(source["raw_sha256"]) != str(raw_sha256):
+            raise EmailOperationError("Security worker result is stale")
+        parsed = source["parsed"]
+        membership = source["membership"]
+        storage_security = _security_result_for_storage(
+            security,
+            email_uid=clean_uid,
+            raw_sha256=str(raw_sha256 or ""),
+            parsed=parsed,
+        )
+        if storage_security.get("available") is not True:
+            raise EmailOperationError("Security worker result is incomplete")
+        aggregate = (
+            storage_security.get("aggregate")
+            if isinstance(storage_security.get("aggregate"), dict)
+            else {}
+        )
+        folder = clean_folder_name(str(_row_get(membership, "folder_name", "local") or "local"))
+        uid = str(_row_get(membership, "imap_uid", clean_uid) if membership else clean_uid)
+        message_id = str((parsed.get("headers") or {}).get("message_id") or "")
+        security_check_id = _stable_id("email-security", clean_uid, raw_sha256)
+        conn = await self._connect()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO pim_email_security_checks (
+                    security_check_id, mailbox_id, folder, uid, message_id, raw_sha256,
+                    aggregate_status, aggregate_score, llm_called, result_json, checked_at,
+                    email_uid, security_status, checker_versions_json, metadata_json
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),$11,'stored',$12::jsonb,$13::jsonb)
+                ON CONFLICT (security_check_id) DO UPDATE SET
+                    mailbox_id = EXCLUDED.mailbox_id,
+                    folder = EXCLUDED.folder,
+                    uid = EXCLUDED.uid,
+                    message_id = EXCLUDED.message_id,
+                    raw_sha256 = EXCLUDED.raw_sha256,
+                    aggregate_status = EXCLUDED.aggregate_status,
+                    aggregate_score = EXCLUDED.aggregate_score,
+                    llm_called = EXCLUDED.llm_called,
+                    result_json = EXCLUDED.result_json,
+                    email_uid = EXCLUDED.email_uid,
+                    security_status = EXCLUDED.security_status,
+                    checker_versions_json = EXCLUDED.checker_versions_json,
+                    metadata_json = EXCLUDED.metadata_json,
+                    error_message = '',
+                    checked_at = now();
+                """,
+                security_check_id,
+                mailbox_id,
+                folder,
+                uid,
+                message_id,
+                str(raw_sha256 or ""),
+                str(aggregate.get("status") or "amber"),
+                int(aggregate.get("score") or aggregate.get("risk_score") or 0),
+                bool(
+                    aggregate.get("llm_called") or (storage_security.get("llm") or {}).get("called")
+                ),
+                _json_dumps(storage_security, sort_keys=True, separators=(",", ":")),
+                clean_uid,
+                _json_dumps(
+                    _security_checker_versions(storage_security),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                _json_dumps(
+                    {
+                        "schema": "xarta.pim_email.security_result.metadata.v1",
+                        "email_uid": clean_uid,
+                        "raw_sha256": str(raw_sha256 or ""),
+                        "policy_version": SECURITY_POLICY_VERSION,
+                        "source": "security-phase-worker",
+                        **(metadata or {}),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        finally:
+            await conn.close()
+        sanitized_artifact = build_sanitized_view_artifact(
+            mailbox_id=mailbox_id,
+            email_uid=clean_uid,
+            raw=bytes(source["raw"]),
+            raw_sha256=str(raw_sha256 or ""),
+        )
+        artifact_public = await self.store_sanitized_view_artifact(artifact=sanitized_artifact)
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.final_result.v1",
+            "email_uid": clean_uid,
+            "raw_sha256": str(raw_sha256 or ""),
+            "security": storage_security,
+            "sanitized_view": artifact_public,
+        }
+
+    async def complete_security_phase_assignment(
+        self,
+        *,
+        assignment_id: str,
+        worker_id: str,
+        assignment_token: str,
+        phase_result: dict[str, Any],
+        security_result: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        assignment = await self._active_security_phase_assignment(
+            assignment_id=assignment_id,
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+        )
+        phase = str(assignment.get("phase") or "")
+        result = phase_result if isinstance(phase_result, dict) else {}
+        if str(result.get("raw_sha256") or assignment["raw_sha256"]) != assignment["raw_sha256"]:
+            raise EmailOperationError("Security phase result raw hash does not match assignment")
+        if phase == "deterministic":
+            if result.get("deterministic_complete") is not True:
+                raise EmailOperationError("Deterministic security phase result is incomplete")
+            await self.record_security_phase_result(
+                mailbox_id=assignment["mailbox_id"],
+                email_uid=assignment["email_uid"],
+                raw_sha256=assignment["raw_sha256"],
+                phase="deterministic",
+                phase_status="complete",
+                phase_result=result,
+                ensure_schema=False,
+            )
+            finished = await self._finish_security_phase_assignment(
+                assignment_id=assignment["assignment_id"],
+                worker_id=worker_id,
+                assignment_token=assignment_token,
+                assignment_status="completed",
+                result_status="phase_complete",
+                metadata=metadata,
+            )
+            llm_reconcile = await self.enqueue_security_phase_assignments(
+                mailbox_id=assignment["mailbox_id"],
+                phase="llm",
+                email_uid=assignment["email_uid"],
+                limit=1,
+                run_id=assignment.get("run_id", ""),
+                metadata={"source": "deterministic-phase-complete"},
+                ensure_schema=False,
+            )
+            return {
+                "schema": "xarta.pim_email.security_phase_assignment.complete.v1",
+                "ok": True,
+                "phase": phase,
+                "assignment": finished,
+                "llm_reconcile": llm_reconcile,
+            }
+        if phase != "llm":
+            raise EmailOperationError("Invalid security assignment phase")
+        security = security_result if isinstance(security_result, dict) else {}
+        if security.get("available") is not True:
+            raise EmailOperationError("LLM security worker result is incomplete")
+        if str(security.get("raw_sha256") or assignment["raw_sha256"]) != assignment["raw_sha256"]:
+            raise EmailOperationError("LLM security result raw hash does not match assignment")
+        await self.record_security_phase_result(
+            mailbox_id=assignment["mailbox_id"],
+            email_uid=assignment["email_uid"],
+            raw_sha256=assignment["raw_sha256"],
+            phase="llm",
+            phase_status="complete",
+            phase_result=result or security.get("llm") or {},
+            ensure_schema=False,
+        )
+        final_result = await self.record_completed_security_result_from_worker(
+            mailbox_id=assignment["mailbox_id"],
+            email_uid=assignment["email_uid"],
+            raw_sha256=assignment["raw_sha256"],
+            security=security,
+            metadata={
+                "assignment_id": assignment["assignment_id"],
+                "worker_id": worker_id,
+                **(metadata or {}),
+            },
+        )
+        finished = await self._finish_security_phase_assignment(
+            assignment_id=assignment["assignment_id"],
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+            assignment_status="completed",
+            result_status="security_complete",
+            metadata=metadata,
+        )
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.complete.v1",
+            "ok": True,
+            "phase": phase,
+            "assignment": finished,
+            "final_result": final_result,
+        }
+
+    async def fail_security_phase_assignment(
+        self,
+        *,
+        assignment_id: str,
+        worker_id: str,
+        assignment_token: str,
+        status: str,
+        reason: str,
+        error_class: str = "",
+        retry_delay_seconds: int = SECURITY_ASSIGNMENT_RETRY_DELAY_SECONDS,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        assignment = await self._active_security_phase_assignment(
+            assignment_id=assignment_id,
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+        )
+        clean_status = str(status or "").strip().lower()
+        assignment_status = "retryable" if clean_status in {"retryable", "pending"} else "failed"
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise EmailOperationError("Security assignment failure reason is required")
+        deterministic_result = None
+        if assignment["phase"] == "llm":
+            deterministic_result = await self.completed_security_phase_result(
+                mailbox_id=assignment["mailbox_id"],
+                email_uid=assignment["email_uid"],
+                raw_sha256=assignment["raw_sha256"],
+                phase="deterministic",
+            )
+        await self.record_security_phase_result(
+            mailbox_id=assignment["mailbox_id"],
+            email_uid=assignment["email_uid"],
+            raw_sha256=assignment["raw_sha256"],
+            phase=assignment["phase"],
+            phase_status="failed_retryable",
+            phase_result={
+                "schema": _security_phase_schema_version(assignment["phase"]),
+                "available": False,
+                "status": "failed_retryable",
+                "error_class": str(error_class or "SecurityWorkerError")[:200],
+                "error_message": reason_text[:1000],
+            },
+            error_class=str(error_class or "SecurityWorkerError"),
+            error_message=reason_text,
+            ensure_schema=False,
+        )
+        try:
+            source = await self._load_local_security_source(
+                assignment["email_uid"],
+                mailbox_id=assignment["mailbox_id"],
+            )
+            parsed = source["parsed"]
+            membership = source["membership"]
+            await self.record_security_incomplete_result(
+                mailbox_id=assignment["mailbox_id"],
+                email_uid=assignment["email_uid"],
+                raw_sha256=assignment["raw_sha256"],
+                folder=clean_folder_name(
+                    str(_row_get(membership, "folder_name", "local") or "local")
+                ),
+                uid=str(_row_get(membership, "imap_uid", assignment["email_uid"]))
+                if membership
+                else assignment["email_uid"],
+                message_id=str((parsed.get("headers") or {}).get("message_id") or ""),
+                phase=assignment["phase"],
+                error_class=str(error_class or "SecurityWorkerError"),
+                error_message=reason_text,
+                deterministic_result=deterministic_result,
+            )
+        except Exception:
+            pass
+        finished = await self._finish_security_phase_assignment(
+            assignment_id=assignment["assignment_id"],
+            worker_id=worker_id,
+            assignment_token=assignment_token,
+            assignment_status=assignment_status,
+            result_status=clean_status or assignment_status,
+            error_class=str(error_class or "SecurityWorkerError"),
+            error_message=reason_text,
+            metadata=metadata,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.fail.v1",
+            "ok": True,
+            "assignment": finished,
+            "status": clean_status or assignment_status,
+            "reason": reason_text,
+        }
+
+    async def security_phase_assignment_status_counts(
+        self,
+        *,
+        mailbox_id: str | None = None,
+    ) -> dict[str, Any]:
+        await self.ensure_schema()
+        configured_mailbox_id = _configured_mailbox_id(mailbox_id)
+        conn = await self._connect()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT phase, assignment_status, result_status, count(*) AS count
+                FROM pim_email_security_phase_assignments
+                WHERE mailbox_id = $1
+                GROUP BY phase, assignment_status, result_status
+                ORDER BY phase, assignment_status, result_status
+                """,
+                configured_mailbox_id,
+            )
+            worker_rows = await conn.fetch(
+                """
+                SELECT worker_id, run_id, assignment_batch_id, phase, assignment_status,
+                       result_status, count(*) AS count,
+                       min(claimed_at) AS first_assigned_at,
+                       max(renewed_at) AS last_heartbeat_at,
+                       max(lease_expires_at) AS latest_lease_expires_at,
+                       max(updated_at) AS last_updated_at,
+                       max(completed_at) AS last_completed_at
+                FROM pim_email_security_phase_assignments
+                WHERE mailbox_id = $1
+                GROUP BY worker_id, run_id, assignment_batch_id, phase,
+                         assignment_status, result_status
+                ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id, assignment_batch_id
+                LIMIT 200
+                """,
+                configured_mailbox_id,
+            )
+        finally:
+            await conn.close()
+        by_phase: dict[str, dict[str, int]] = {}
+        by_result: dict[str, int] = {}
+        for row in rows:
+            phase = str(_row_get(row, "phase", "") or "unknown")
+            status = str(_row_get(row, "assignment_status", "") or "unknown")
+            result = str(_row_get(row, "result_status", "") or "none")
+            count = int(_row_get(row, "count", 0) or 0)
+            by_phase.setdefault(phase, {})[status] = (
+                by_phase.setdefault(phase, {}).get(status, 0) + count
+            )
+            by_result[result] = by_result.get(result, 0) + count
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.status.v1",
+            "mailbox_id": configured_mailbox_id,
+            "assignment_status": by_phase,
+            "result_status": by_result,
+            "worker_blocks": [
+                {
+                    "worker_id": str(_row_get(row, "worker_id", "") or ""),
+                    "run_id": str(_row_get(row, "run_id", "") or ""),
+                    "assignment_batch_id": str(_row_get(row, "assignment_batch_id", "") or ""),
+                    "phase": str(_row_get(row, "phase", "") or ""),
+                    "assignment_status": str(_row_get(row, "assignment_status", "") or ""),
+                    "result_status": str(_row_get(row, "result_status", "") or ""),
+                    "count": int(_row_get(row, "count", 0) or 0),
+                    "first_assigned_at": _iso_datetime(_row_get(row, "first_assigned_at")),
+                    "last_heartbeat_at": _iso_datetime(_row_get(row, "last_heartbeat_at")),
+                    "latest_lease_expires_at": _iso_datetime(
+                        _row_get(row, "latest_lease_expires_at")
+                    ),
+                    "last_updated_at": _iso_datetime(_row_get(row, "last_updated_at")),
+                    "last_completed_at": _iso_datetime(_row_get(row, "last_completed_at")),
+                }
+                for row in worker_rows
+            ],
+        }
 
     async def _record_backfill_item(
         self,
@@ -6718,12 +7862,15 @@ class PgEmailStore:
             "raw_originals_failed": 0,
             "security_deterministic_completed": 0,
             "security_deterministic_already_completed": 0,
+            "security_deterministic_assignments_enqueued": 0,
             "security_deterministic_failed": 0,
             "security_llm_completed": 0,
             "security_llm_already_completed": 0,
+            "security_llm_assignments_enqueued": 0,
             "security_llm_failed": 0,
             "security_completed": 0,
             "security_already_completed": 0,
+            "security_assignments_enqueued": 0,
             "security_failed": 0,
             "sanitized_views_stored": 0,
             "sanitized_views_already_current": 0,
@@ -6809,18 +7956,75 @@ class PgEmailStore:
                     claimed_artifacts.append(artifact)
             if not claimed_artifacts:
                 continue
-            raw = b""
-            try:
-                raw = read_encrypted_bytes(str(row["storage_relpath"]))
-                actual_hash = hashlib.sha256(raw).hexdigest()
-                if actual_hash != expected_hash:
-                    raise EmailOperationError("Backfill raw hash verification failed")
-                summary["raw_originals_verified"] += 1
-            except Exception as exc:
-                run_status = "completed-with-errors"
-                summary["raw_originals_failed"] += 1
-                summary["failed_messages"] += 1
-                for artifact in claimed_artifacts:
+            security_artifacts = {
+                "security",
+                "security_deterministic",
+                "security_llm",
+            }
+            for artifact in [item for item in claimed_artifacts if item in security_artifacts]:
+                try:
+                    assignment_phase = {
+                        "security": "security",
+                        "security_deterministic": "deterministic",
+                        "security_llm": "llm",
+                    }[artifact]
+                    completed = await self.completed_security_result(
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                    )
+                    if completed is not None:
+                        summary[f"{artifact}_already_completed"] += 1
+                        assignment_result = {
+                            "schema": "xarta.pim_email.security_phase_assignment.reconcile.summary.v1",
+                            "inserted": 0,
+                            "requeued": 0,
+                            "already_completed": True,
+                        }
+                    else:
+                        assignment_result = await self.enqueue_security_phase_assignments(
+                            mailbox_id=configured_mailbox_id,
+                            phase=assignment_phase,
+                            email_uid=email_uid,
+                            limit=1,
+                            run_id=actual_run_id,
+                            metadata={
+                                "source": "pim-email-backfill",
+                                "batch_id": batch_id,
+                                "artifact_type": artifact,
+                            },
+                            ensure_schema=False,
+                        )
+                        phases = (
+                            assignment_result.get("phases")
+                            if isinstance(assignment_result, dict)
+                            else {}
+                        )
+                        enqueued = 0
+                        if isinstance(phases, dict):
+                            enqueued = sum(
+                                int((counts or {}).get(key) or 0)
+                                for counts in phases.values()
+                                if isinstance(counts, dict)
+                                for key in ("inserted", "requeued")
+                            )
+                        summary[f"{artifact}_assignments_enqueued"] += enqueued
+                        summary[f"{artifact}_completed"] += 1
+                    await self._record_backfill_item(
+                        run_id=actual_run_id,
+                        batch_id=batch_id,
+                        mailbox_id=configured_mailbox_id,
+                        email_uid=email_uid,
+                        raw_sha256=expected_hash,
+                        artifact_type=artifact,
+                        status="completed",
+                        metadata={
+                            "phase": artifact_phases.get(artifact, artifact),
+                            "security_assignment_reconcile": assignment_result,
+                        },
+                    )
+                except Exception as exc:
+                    run_status = "completed-with-errors"
+                    summary[f"{artifact}_failed"] += 1
                     await self._record_backfill_item(
                         run_id=actual_run_id,
                         batch_id=batch_id,
@@ -6831,9 +8035,37 @@ class PgEmailStore:
                         status="failed",
                         error_class=exc.__class__.__name__,
                         error_message=str(exc),
-                        metadata={"phase": "raw-verification"},
+                        metadata={"phase": artifact_phases.get(artifact, artifact)},
                     )
-                continue
+            claimed_artifacts = [
+                item for item in claimed_artifacts if item not in security_artifacts
+            ]
+            raw = b""
+            if claimed_artifacts:
+                try:
+                    raw = read_encrypted_bytes(str(row["storage_relpath"]))
+                    actual_hash = hashlib.sha256(raw).hexdigest()
+                    if actual_hash != expected_hash:
+                        raise EmailOperationError("Backfill raw hash verification failed")
+                    summary["raw_originals_verified"] += 1
+                except Exception as exc:
+                    run_status = "completed-with-errors"
+                    summary["raw_originals_failed"] += 1
+                    summary["failed_messages"] += 1
+                    for artifact in claimed_artifacts:
+                        await self._record_backfill_item(
+                            run_id=actual_run_id,
+                            batch_id=batch_id,
+                            mailbox_id=configured_mailbox_id,
+                            email_uid=email_uid,
+                            raw_sha256=expected_hash,
+                            artifact_type=artifact,
+                            status="failed",
+                            error_class=exc.__class__.__name__,
+                            error_message=str(exc),
+                            metadata={"phase": "raw-verification"},
+                        )
+                    continue
 
             if "security_deterministic" in claimed_artifacts:
                 try:
@@ -7368,6 +8600,51 @@ def _external_image_url_assignment_row_public(
         "expires_at": _iso_datetime(_row_get(row, "expires_at")),
         "next_retry_at": _iso_datetime(_row_get(row, "next_retry_at")),
         "completed_at": _iso_datetime(_row_get(row, "completed_at")),
+        "updated_at": _iso_datetime(_row_get(row, "updated_at")),
+    }
+    if include_token:
+        public["assignment_token"] = str(_row_get(row, "assignment_token", ""))
+    return public
+
+
+def _security_phase_schema_version(phase: str) -> str:
+    clean = str(phase or "").strip().lower()
+    if clean == "deterministic":
+        return SECURITY_DETERMINISTIC_SCHEMA
+    if clean == "llm":
+        return SECURITY_LLM_PHASE_SCHEMA
+    return ""
+
+
+def _security_phase_assignment_row_public(
+    row: Any,
+    *,
+    include_token: bool = False,
+) -> dict[str, Any]:
+    metadata = _json_value(_row_get(row, "metadata_json"), {})
+    public = {
+        "assignment_id": str(_row_get(row, "assignment_id", "")),
+        "assignment_batch_id": str(_row_get(row, "assignment_batch_id", "")),
+        "mailbox_id": str(_row_get(row, "mailbox_id", "")),
+        "email_uid": str(_row_get(row, "email_uid", "")),
+        "raw_sha256": str(_row_get(row, "raw_sha256", "")),
+        "phase": str(_row_get(row, "phase", "")),
+        "policy_version": str(_row_get(row, "policy_version", "")),
+        "schema_version": str(_row_get(row, "schema_version", "")),
+        "assignment_status": str(_row_get(row, "assignment_status", "")),
+        "worker_id": str(_row_get(row, "worker_id", "")),
+        "run_id": str(_row_get(row, "run_id", "")),
+        "attempts": int(_row_get(row, "attempts", 0) or 0),
+        "result_status": str(_row_get(row, "result_status", "")),
+        "error_class": str(_row_get(row, "error_class", "")),
+        "error_message": str(_row_get(row, "error_message", "")),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "claimed_at": _iso_datetime(_row_get(row, "claimed_at")),
+        "renewed_at": _iso_datetime(_row_get(row, "renewed_at")),
+        "lease_expires_at": _iso_datetime(_row_get(row, "lease_expires_at")),
+        "next_retry_at": _iso_datetime(_row_get(row, "next_retry_at")),
+        "completed_at": _iso_datetime(_row_get(row, "completed_at")),
+        "created_at": _iso_datetime(_row_get(row, "created_at")),
         "updated_at": _iso_datetime(_row_get(row, "updated_at")),
     }
     if include_token:
@@ -8400,20 +9677,9 @@ def _download_security_for_message(
     security_mode: str,
 ) -> tuple[dict[str, Any] | None, str]:
     clean_mode = str(security_mode or "run").strip().lower()
-    if clean_mode not in {"run", "require", "required", "sync"}:
-        raise EmailConfigError(
-            "Email downloader security_mode must run the checker; queue/defer modes are disabled."
-        )
-    try:
-        security = check_email_security_sync(
-            raw,
-            body_text=str((parsed.get("views") or {}).get("plain") or ""),
-        )
-        if not security or not security.get("available"):
-            raise EmailOperationError("Email security checker did not produce a completed result")
-        return security, ""
-    except EmailSecurityUnavailableError as exc:
-        raise EmailConfigError("Email security checks are unavailable") from exc
+    if clean_mode not in {"run", "require", "required", "sync", "enqueue", "queue", "defer"}:
+        raise EmailConfigError("Email downloader security_mode is invalid")
+    return None, "security_phase_assignment_pending"
 
 
 def download_mailbox_sync(
@@ -8432,10 +9698,16 @@ def download_mailbox_sync(
 ) -> dict[str, Any]:
     store = store or PgEmailStore()
     clean_security_mode = str(security_mode or "run").strip().lower()
-    if clean_security_mode not in {"run", "require", "required", "sync"}:
-        raise EmailConfigError(
-            "Email downloader security_mode must run the checker; queue/defer modes are disabled."
-        )
+    if clean_security_mode not in {
+        "run",
+        "require",
+        "required",
+        "sync",
+        "enqueue",
+        "queue",
+        "defer",
+    }:
+        raise EmailConfigError("Email downloader security_mode is invalid")
     if not include_special_use:
         raise EmailConfigError(
             "Special-use folders must be downloaded; include_special_use cannot be false"
@@ -8466,6 +9738,7 @@ def download_mailbox_sync(
         "stored_messages": 0,
         "security_completed": 0,
         "security_incomplete": 0,
+        "security_assignments_enqueued": 0,
         "sanitized_views_stored": 0,
         "external_image_derivatives_stored": 0,
         "external_image_derivatives_blocked": 0,
@@ -8491,6 +9764,7 @@ def download_mailbox_sync(
             metadata={
                 "schema": "xarta.pim_email.download_run.metadata.v1",
                 "security_mode": clean_security_mode,
+                "security_assignment_mode": "stack-owned-remote-worker",
                 "include_special_use": include_special_use,
                 "folder_allowlist": sorted(allowed_folders),
                 "limit_per_folder": limit_per_folder,
@@ -8662,28 +9936,54 @@ def download_mailbox_sync(
                         if verified_hash != str(storage.get("raw_sha256") or ""):
                             raise EmailOperationError("Post-commit local verification failed")
                         summary["stored_messages"] += 1
-                        security_complete = False
-                        if security and security.get("available"):
-                            if not hasattr(store, "completed_security_result"):
-                                raise EmailOperationError(
-                                    "Store cannot verify completed security result after download"
-                                )
-                            security_complete = bool(
-                                _run_store(
-                                    store.completed_security_result(
-                                        email_uid=email_uid,
-                                        raw_sha256=raw_sha256,
-                                    )
-                                )
-                            )
-                            if security_complete:
-                                summary["security_completed"] += 1
-                            else:
-                                summary["security_incomplete"] += 1
-                        else:
+                        if not hasattr(store, "enqueue_security_phase_assignments"):
                             raise EmailOperationError(
-                                "Email security checker did not produce a completed result"
+                                "Store cannot enqueue security phase assignments after download"
                             )
+                        security_assignment = _run_store(
+                            store.enqueue_security_phase_assignments(
+                                mailbox_id=mailbox.mailbox_id,
+                                phase="security",
+                                email_uid=email_uid,
+                                limit=1,
+                                run_id=run_id,
+                                metadata={
+                                    "source": "imap-download",
+                                    "batch_id": batch_id,
+                                    "folder": folder_name,
+                                    "imap_uid": uid,
+                                },
+                            )
+                        )
+                        phases = (
+                            security_assignment.get("phases")
+                            if isinstance(security_assignment, dict)
+                            else {}
+                        )
+                        if isinstance(phases, dict):
+                            summary["security_assignments_enqueued"] += sum(
+                                int((counts or {}).get(key) or 0)
+                                for counts in phases.values()
+                                if isinstance(counts, dict)
+                                for key in ("inserted", "requeued")
+                            )
+                        security_complete = False
+                        if not hasattr(store, "completed_security_result"):
+                            raise EmailOperationError(
+                                "Store cannot verify completed security result after download"
+                            )
+                        security_complete = bool(
+                            _run_store(
+                                store.completed_security_result(
+                                    email_uid=email_uid,
+                                    raw_sha256=raw_sha256,
+                                )
+                            )
+                        )
+                        if security_complete:
+                            summary["security_completed"] += 1
+                        else:
+                            summary["security_incomplete"] += 1
                         sanitized_complete = False
                         if hasattr(store, "current_sanitized_view_artifact") and hasattr(
                             store, "store_sanitized_view_artifact"
@@ -8857,6 +10157,7 @@ def download_mailbox_sync(
                                     "security_status": "completed"
                                     if security_complete
                                     else "incomplete",
+                                    "security_assignment": security_assignment,
                                     "move_allowed": move_allowed,
                                     "move_ready": move_ready,
                                     "move_gate": move_gate,

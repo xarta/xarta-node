@@ -950,6 +950,8 @@ def test_local_corpus_status_reports_missing_security_without_placeholder_result
         async def fetch(self, query, *args):
             if "UPDATE pim_email_download_runs" in query:
                 return []
+            if "FROM pim_email_security_phase_assignments" in query:
+                return []
             if "FROM pim_email_security_phases" in query:
                 return []
             raise AssertionError(query)
@@ -3081,6 +3083,7 @@ class CaptureDownloadStore:
         self.saved = []
         self.sanitized = {}
         self.external_derivatives = []
+        self.security_assignments = []
         self.verified = set()
         self.moved = []
         self.events = []
@@ -3150,6 +3153,20 @@ class CaptureDownloadStore:
             }
         return None
 
+    async def enqueue_security_phase_assignments(self, **kwargs):
+        self.security_assignments.append(kwargs)
+        return {
+            "schema": "xarta.pim_email.security_phase_assignment.reconcile.summary.v1",
+            "mailbox_id": kwargs.get("mailbox_id", "test-mailbox"),
+            "requested_phase": kwargs.get("phase", "security"),
+            "inserted": 1,
+            "requeued": 0,
+            "phases": {
+                "deterministic": {"inserted": 1, "requeued": 0},
+                "llm": {"inserted": 0, "requeued": 0},
+            },
+        }
+
     async def current_sanitized_view_artifact(self, *, mailbox_id, email_uid, raw_sha256):
         return self.sanitized.get((mailbox_id, email_uid, raw_sha256))
 
@@ -3200,7 +3217,7 @@ class CaptureDownloadStore:
         self.moved.append(kwargs)
 
 
-def test_safe_downloader_converges_stores_verifies_and_enqueues_image_candidates(
+def test_safe_downloader_converges_stores_verifies_and_enqueues_worker_candidates(
     tmp_path,
     monkeypatch,
 ):
@@ -3239,6 +3256,9 @@ def test_safe_downloader_converges_stores_verifies_and_enqueues_image_candidates
     assert result["run_id"] == "test-download-run"
     assert store.run_start["run_id"] == "test-download-run"
     assert result["summary"]["stored_messages"] == 3
+    assert result["summary"]["security_completed"] == 0
+    assert result["summary"]["security_incomplete"] == 3
+    assert result["summary"]["security_assignments_enqueued"] == 3
     assert result["summary"]["moved_messages"] == 0
     assert result["summary"]["move_blocked"] == 1
     assert result["summary"]["sanitized_views_stored"] >= 3
@@ -3256,6 +3276,8 @@ def test_safe_downloader_converges_stores_verifies_and_enqueues_image_candidates
     assert all(item["storage"]["verified"] for item in store.saved)
     assert all(item["metadata"]["remote_image_sources"] for item in store.saved)
     assert store.external_derivatives
+    assert len(store.security_assignments) == 3
+    assert {item["phase"] for item in store.security_assignments} == {"security"}
     assert {item["status"] for item in store.external_derivatives} == {"pending"}
     assert {item["safety_decision"] for item in store.external_derivatives} == {
         "pending_real_download"
@@ -3381,6 +3403,15 @@ def test_downloader_moves_when_external_image_is_proven_unavailable(
     )
 
     class UnavailableExternalImageStore(CaptureDownloadStore):
+        async def completed_security_result(self, *, email_uid, raw_sha256):
+            return {
+                "available": True,
+                "email_uid": email_uid,
+                "raw_sha256": raw_sha256,
+                "checked_at": "2026-07-02T00:00:00Z",
+                "checker_versions": {"schema": "test"},
+            }
+
         async def process_external_image_derivatives(self, **kwargs):
             return {
                 "stored": 0,
@@ -3410,6 +3441,7 @@ def test_downloader_moves_when_external_image_is_proven_unavailable(
     assert result["summary"]["stored_messages"] == 1
     assert result["summary"]["external_image_derivatives_unavailable"] == 1
     assert result["summary"]["external_image_derivatives_failed"] == 0
+    assert result["summary"]["security_completed"] == 1
     assert result["summary"]["moved_messages"] == 1
     assert result["summary"]["move_blocked"] == 0
     assert DownloadFakeIMAP.instances[0].moves == [("INBOX", "41", "Downloaded")]
@@ -3468,23 +3500,25 @@ def test_safe_downloader_resume_idempotence_keeps_duplicate_identity_singleton(
     assert result["summary"]["moved_messages"] == 0
     assert len(store.saved) == 7
     assert len(set(email_uids)) == 4
-    assert result["summary"]["security_completed"] == 7
+    assert result["summary"]["security_completed"] == 0
+    assert result["summary"]["security_incomplete"] == 7
+    assert result["summary"]["security_assignments_enqueued"] == 7
 
 
-def test_downloader_rejects_security_queue_modes(tmp_path, monkeypatch):
+def test_downloader_rejects_invalid_security_modes(tmp_path, monkeypatch):
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CREDENTIAL_KEY", pim_email.generate_credential_key())
     monkeypatch.setenv("BLUEPRINTS_EMAIL_CONTENT_ROOT", str(tmp_path))
     DownloadFakeIMAP.instances = []
     monkeypatch.setattr(pim_email.imaplib, "IMAP4_SSL", DownloadFakeIMAP)
 
-    with pytest.raises(pim_email.EmailConfigError, match="must run the checker"):
+    with pytest.raises(pim_email.EmailConfigError, match="security_mode is invalid"):
         pim_email.download_mailbox_sync(
             _mailbox(),
             store=CaptureDownloadStore(),
             folder_allowlist=["INBOX"],
             limit_per_folder=1,
             max_messages=1,
-            security_mode="queue",
+            security_mode="off",
         )
 
 
