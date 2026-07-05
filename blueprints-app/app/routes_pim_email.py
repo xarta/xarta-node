@@ -109,6 +109,69 @@ class ExternalImageAssignmentFailRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class SecurityAssignmentClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    phase: str = Field(..., min_length=3, max_length=40)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    run_id: str = Field("", max_length=180)
+    limit: int = Field(5, ge=1, le=25)
+    lease_seconds: int = Field(900, ge=60, le=3600)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SecurityAssignmentHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_batch_id: str = Field(..., min_length=8, max_length=180)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    lease_seconds: int = Field(900, ge=60, le=3600)
+
+
+class SecurityAssignmentReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_batch_id: str = Field(..., min_length=8, max_length=180)
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    reason: str = Field("worker_released_assignment", max_length=1000)
+
+
+class SecurityAssignmentCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    phase_result: dict[str, Any] = Field(default_factory=dict)
+    security_result: dict[str, Any] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SecurityAssignmentFailRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(..., min_length=1, max_length=160)
+    assignment_token: str = Field(..., min_length=16, max_length=240)
+    status: str = Field("retryable", min_length=3, max_length=40)
+    reason: str = Field(..., min_length=1, max_length=1000)
+    error_class: str = Field("SecurityWorkerError", max_length=200)
+    retry_delay_seconds: int = Field(900, ge=60, le=86400)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SecurityAssignmentReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    phase: str = Field("security", min_length=3, max_length=40)
+    email_uid: str | None = Field(None, min_length=1, max_length=120)
+    limit: int = Field(100, ge=1, le=500)
+    run_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExternalImageMaintenanceStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -167,6 +230,12 @@ def _worker_safe_shared_asset(item: dict[str, Any]) -> dict[str, Any]:
     public = dict(item or {})
     public.pop("storage_relpath", None)
     public.pop("encryption", None)
+    return public
+
+
+def _worker_safe_security_assignment(item: dict[str, Any]) -> dict[str, Any]:
+    public = dict(item or {})
+    public.pop("assignment_token", None)
     return public
 
 
@@ -374,6 +443,233 @@ async def email_local_status(
         store = _store()
         status = await store.local_corpus_status(mailbox_id=mailbox_id)
         return {"ok": True, "status": status}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.get("/workers/security/status")
+async def email_security_worker_status(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_local: bool = Query(False),
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    stages: dict[str, float] = {}
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        store = _store()
+        stage_started = time.perf_counter()
+        assignments = await store.security_phase_assignment_status_counts(mailbox_id=mailbox_id)
+        stages["assignment_status_seconds"] = time.perf_counter() - stage_started
+        response: dict[str, Any] = {"ok": True, "assignments": assignments}
+        if include_local:
+            stage_started = time.perf_counter()
+            response["local_corpus"] = await store.local_corpus_status(mailbox_id=mailbox_id)
+            stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
+        return _attach_server_metrics(
+            response, metrics=metrics, started_at=started_at, stages=stages
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/reconcile")
+async def email_security_worker_reconcile_assignments(
+    body: SecurityAssignmentReconcileRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().enqueue_security_phase_assignments(
+            mailbox_id=body.mailbox_id,
+            phase=body.phase,
+            email_uid=body.email_uid,
+            limit=body.limit,
+            run_id=body.run_id,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"reconcile_seconds": time.perf_counter() - stage_started},
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/claim")
+async def email_security_worker_claim_assignments(
+    body: SecurityAssignmentClaimRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().claim_security_phase_assignment_block(
+            mailbox_id=body.mailbox_id,
+            phase=body.phase,
+            worker_id=body.worker_id,
+            run_id=body.run_id,
+            limit=body.limit,
+            lease_seconds=body.lease_seconds,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        response = {
+            "ok": True,
+            "schema": "xarta.pim_email.security_phase_assignment.block.v1",
+            "mailbox_id": result.get("mailbox_id"),
+            "phase": result.get("phase"),
+            "assignment_batch_id": result.get("assignment_batch_id"),
+            "assignment_token": result.get("assignment_token"),
+            "worker_id": result.get("worker_id"),
+            "run_id": result.get("run_id"),
+            "lease_seconds": result.get("lease_seconds"),
+            "claimed": result.get("claimed"),
+            "payload_failures": result.get("payload_failures"),
+            "reconcile": result.get("reconcile"),
+            "items": [_worker_safe_security_assignment(item) for item in result.get("items", [])],
+        }
+        return _attach_server_metrics(
+            response,
+            metrics=metrics,
+            started_at=started_at,
+            stages={"claim_seconds": time.perf_counter() - stage_started},
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/heartbeat")
+async def email_security_worker_heartbeat_assignments(
+    body: SecurityAssignmentHeartbeatRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().heartbeat_security_phase_assignment_block(
+            assignment_batch_id=body.assignment_batch_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            lease_seconds=body.lease_seconds,
+        )
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"heartbeat_seconds": time.perf_counter() - stage_started},
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/release")
+async def email_security_worker_release_assignments(
+    body: SecurityAssignmentReleaseRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().release_security_phase_assignment_block(
+            assignment_batch_id=body.assignment_batch_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            reason=body.reason,
+        )
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"release_seconds": time.perf_counter() - stage_started},
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/{assignment_id}/complete")
+async def email_security_worker_complete_assignment(
+    assignment_id: str,
+    body: SecurityAssignmentCompleteRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().complete_security_phase_assignment(
+            assignment_id=assignment_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            phase_result=body.phase_result,
+            security_result=body.security_result,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        if "assignment" in result:
+            result["assignment"] = _worker_safe_security_assignment(result["assignment"])
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"complete_seconds": time.perf_counter() - stage_started},
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.post("/workers/security/assignments/{assignment_id}/fail")
+async def email_security_worker_fail_assignment(
+    assignment_id: str,
+    body: SecurityAssignmentFailRequest,
+    x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    _require_email_worker_token(x_pim_email_worker_token)
+    try:
+        stage_started = time.perf_counter()
+        result = await _store().fail_security_phase_assignment(
+            assignment_id=assignment_id,
+            worker_id=body.worker_id,
+            assignment_token=body.assignment_token,
+            status=body.status,
+            reason=body.reason,
+            error_class=body.error_class,
+            retry_delay_seconds=body.retry_delay_seconds,
+            metadata={
+                **body.metadata,
+                "source_surface": "pim-email-worker-api",
+            },
+        )
+        if "assignment" in result:
+            result["assignment"] = _worker_safe_security_assignment(result["assignment"])
+        return _attach_server_metrics(
+            {"ok": True, "result": result},
+            metrics=metrics,
+            started_at=started_at,
+            stages={"fail_seconds": time.perf_counter() - stage_started},
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
