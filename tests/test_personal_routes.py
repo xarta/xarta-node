@@ -3066,6 +3066,40 @@ def test_kanban_idle_worker_singleton_override_allows_non_owner_node(monkeypatch
     assert config["effective_enabled"] is True
 
 
+def test_kanban_idle_worker_max_scan_items_range_metadata(monkeypatch):
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        routes_personal._work_automation_current_node_id(),
+    )
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS", "250")
+
+    config = routes_personal._work_automation_idle_worker_config()
+
+    range_config = config["range_config"]["max_scan_items"]
+    assert config["max_scan_items"] == routes_personal.KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP
+    assert range_config["env_name"] == "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS"
+    assert range_config["raw_value"] == "250"
+    assert range_config["default"] == routes_personal.KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS
+    assert range_config["min"] == 1
+    assert range_config["max"] == routes_personal.KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP
+    assert range_config["effective"] == routes_personal.KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP
+    assert range_config["source"] == "env"
+    assert range_config["state"] == "clamped"
+    assert range_config["valid"] is False
+    assert range_config["clamped"] is True
+    assert range_config["error"] == "above_max"
+
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS", "not-an-int")
+    error_config = routes_personal._work_automation_idle_worker_config()
+    error_range = error_config["range_config"]["max_scan_items"]
+    assert (
+        error_config["max_scan_items"] == routes_personal.KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS
+    )
+    assert error_range["state"] == "error"
+    assert error_range["error"] == "not_an_integer"
+    assert error_range["raw_value"] == "not-an-int"
+
+
 def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -9512,6 +9546,12 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert scan["scheduler"]["queue_length"] == 1
 
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-preprocess-root"))
+    max_scan_range = status["idle_worker"]["range_config"]["max_scan_items"]
+    assert status["idle_worker"]["max_scan_items"] == max_scan_range["effective"]
+    assert max_scan_range["env_name"] == "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS"
+    assert max_scan_range["default"] == routes_personal.KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS
+    assert max_scan_range["min"] == 1
+    assert max_scan_range["max"] == routes_personal.KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP
     assert status["preprocessing"]["queue_length"] == 1
     assert status["preprocessing"]["scheduler"]["queue_length"] == 1
     assert status["preprocessing"]["markers"][0]["processor_kind"] == "preprocessing"

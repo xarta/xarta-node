@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -423,6 +424,71 @@ class _KanbanActivePostgresConnection:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sqlite_conn, name)
+
+
+@contextmanager
+def _kanban_postgres_get_conn(*, operation: str) -> Any:
+    start_perf_ns = time.perf_counter_ns()
+    start_time_ns = time.time_ns()
+    conn = None
+    ok = True
+    error_type = ""
+    commit_start_ns = 0
+    commit_end_ns = 0
+    try:
+        conn = postgres_candidate_connection(cfg.KANBAN_DATASTORE_CONFIG.candidate_database_url)
+        conn.begin()
+        yield conn
+        commit_start_ns = time.perf_counter_ns()
+        conn.commit()
+        commit_end_ns = time.perf_counter_ns()
+    except Exception as exc:
+        ok = False
+        error_type = type(exc).__name__
+        if conn is not None:
+            with suppress(Exception):
+                conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            with suppress(Exception):
+                conn.close()
+        timing.record_span(
+            "kanban_postgres_connection",
+            start_perf_ns=start_perf_ns,
+            end_perf_ns=time.perf_counter_ns(),
+            start_time_ns=start_time_ns,
+            end_time_ns=time.time_ns(),
+            active_store=ACTIVE_STORE_POSTGRES,
+            operation=operation,
+            ok=ok,
+            error_type=error_type,
+            commit_start_perf_ns=commit_start_ns,
+            commit_end_perf_ns=commit_end_ns,
+            commit_ms=round(max(0, commit_end_ns - commit_start_ns) / 1_000_000, 3)
+            if commit_start_ns and commit_end_ns
+            else None,
+        )
+
+
+@contextmanager
+def _kanban_automation_scan_conn(*, operation: str) -> Any:
+    if _kanban_active_store_is_postgres() and getattr(
+        cfg.KANBAN_DATASTORE_CONFIG,
+        "candidate_database_url",
+        "",
+    ):
+        with _kanban_postgres_get_conn(operation=operation) as conn:
+            yield conn
+        return
+    with get_conn() as conn:
+        yield conn
+
+
+def _kanban_begin_write_transaction(conn: Any) -> None:
+    if _kanban_active_store_is_postgres():
+        return
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def _is_kanban_active_postgres_connection(conn: Any) -> bool:
@@ -2701,6 +2767,105 @@ def _preprocessing_count(conn: Any, sql: str, args: tuple[Any, ...]) -> int:
     return int(row["count"] if row else 0)
 
 
+def _work_preprocessing_counts_by_item(
+    conn: Any,
+    item_rows: list[Any],
+) -> dict[str, dict[str, int]]:
+    item_ids = [str(row["item_id"] or "") for row in item_rows if str(row["item_id"] or "")]
+    counts = {
+        item_id: {
+            "blocker_count": 0,
+            "child_count": 0,
+            "commit_count": 0,
+            "discussion_count": 0,
+            "issue_count": 0,
+            "link_count": 0,
+            "open_descendant_count": 0,
+            "open_leaf_descendant_count": 0,
+            "todo_count": 0,
+        }
+        for item_id in item_ids
+    }
+    for row in item_rows:
+        item_id = str(row["item_id"] or "")
+        if not item_id:
+            continue
+        counts[item_id]["issue_count"] = len(_json_value(row["related_issue_ids_json"], []))
+        counts[item_id]["todo_count"] = len(_json_value(row["related_task_ids_json"], []))
+    if not item_ids:
+        return counts
+
+    placeholders = ",".join("?" for _ in item_ids)
+    blocker_rows = conn.execute(
+        f"""
+        SELECT item_id, COUNT(*) AS count FROM kanban_blockers
+        WHERE item_id IN ({placeholders})
+          AND status NOT IN ('resolved', 'closed', 'done')
+          AND COALESCE(json_extract(provenance_json, '$.schema'), '') != ?
+        GROUP BY item_id
+        """,
+        [*item_ids, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA],
+    ).fetchall()
+    for row in blocker_rows:
+        counts[str(row["item_id"])]["blocker_count"] = int(row["count"] or 0)
+
+    child_rows = conn.execute(
+        f"""
+        SELECT parent_item_id AS item_id, COUNT(*) AS count
+        FROM kanban_items
+        WHERE parent_item_id IN ({placeholders})
+          AND status!='archived'
+        GROUP BY parent_item_id
+        """,
+        item_ids,
+    ).fetchall()
+    for row in child_rows:
+        counts[str(row["item_id"])]["child_count"] = int(row["count"] or 0)
+
+    commit_rows = conn.execute(
+        f"""
+        SELECT item_id, COUNT(*) AS count
+        FROM kanban_item_commits
+        WHERE item_id IN ({placeholders})
+        GROUP BY item_id
+        """,
+        item_ids,
+    ).fetchall()
+    for row in commit_rows:
+        counts[str(row["item_id"])]["commit_count"] = int(row["count"] or 0)
+
+    discussion_rows = conn.execute(
+        f"""
+        SELECT item_id, COUNT(*) AS count
+        FROM kanban_discussions
+        WHERE item_id IN ({placeholders})
+        GROUP BY item_id
+        """,
+        item_ids,
+    ).fetchall()
+    for row in discussion_rows:
+        counts[str(row["item_id"])]["discussion_count"] = int(row["count"] or 0)
+
+    link_rows = conn.execute(
+        f"""
+        SELECT source_item_id, target_item_id
+        FROM kanban_item_links
+        WHERE source_item_id IN ({placeholders})
+           OR target_item_id IN ({placeholders})
+        """,
+        [*item_ids, *item_ids],
+    ).fetchall()
+    item_id_set = set(item_ids)
+    for row in link_rows:
+        linked_ids = {
+            str(row["source_item_id"] or ""),
+            str(row["target_item_id"] or ""),
+        }
+        for item_id in linked_ids & item_id_set:
+            counts[item_id]["link_count"] += 1
+    return counts
+
+
 def _work_preprocessing_ancestor_rows(
     conn: Any,
     item_row: Any,
@@ -2747,6 +2912,7 @@ def _work_preprocessing_ancestor_source_refs(
     item_row: Any,
     *,
     limit: int = KANBAN_DEPTH_LIMIT + 2,
+    document_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     source_refs: list[dict[str, Any]] = []
     for index, ancestor in enumerate(
@@ -2755,8 +2921,8 @@ def _work_preprocessing_ancestor_source_refs(
     ):
         prefix = "parent" if index == 1 else f"ancestor_{index}"
         ancestor_id = ancestor["item_id"]
-        detail = _work_item_detail_document(conn, ancestor_id)
-        review = _work_item_review_document(conn, ancestor_id)
+        detail = _work_item_detail_document(conn, ancestor_id, cache=document_cache)
+        review = _work_item_review_document(conn, ancestor_id, cache=document_cache)
         source_refs.extend(
             [
                 _preprocessing_source_ref(
@@ -2792,6 +2958,7 @@ def _work_preprocessing_ancestor_context(
     item_row: Any,
     *,
     limit: int = KANBAN_DEPTH_LIMIT + 2,
+    document_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ancestors: list[dict[str, Any]] = []
     for index, ancestor in enumerate(
@@ -2799,8 +2966,8 @@ def _work_preprocessing_ancestor_context(
         start=1,
     ):
         ancestor_id = ancestor["item_id"]
-        detail = _work_item_detail_document(conn, ancestor_id)
-        review = _work_item_review_document(conn, ancestor_id)
+        detail = _work_item_detail_document(conn, ancestor_id, cache=document_cache)
+        review = _work_item_review_document(conn, ancestor_id, cache=document_cache)
         decision_rows = conn.execute(
             """
             SELECT * FROM kanban_review_decisions
@@ -2987,10 +3154,16 @@ def _work_preprocessing_source_classification(
     }
 
 
-def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, Any]:
+def _work_preprocessing_context_source(
+    conn: Any,
+    item_row: Any,
+    *,
+    counts: dict[str, int] | None = None,
+    document_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     item_id = item_row["item_id"]
-    detail = _work_item_detail_document(conn, item_id)
-    review = _work_item_review_document(conn, item_id)
+    detail = _work_item_detail_document(conn, item_id, cache=document_cache)
+    review = _work_item_review_document(conn, item_id, cache=document_cache)
     hints_row = conn.execute(
         "SELECT * FROM kanban_agent_hints WHERE item_id=?",
         (item_id,),
@@ -3024,46 +3197,56 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
             file_ref=review.get("file_ref") if isinstance(review, dict) else {},
         ),
     ]
-    source_refs.extend(_work_preprocessing_ancestor_source_refs(conn, item_row))
-    counts = {
-        "blocker_count": _preprocessing_count(
+    source_refs.extend(
+        _work_preprocessing_ancestor_source_refs(
             conn,
-            """
+            item_row,
+            document_cache=document_cache,
+        )
+    )
+    source_counts = (
+        counts
+        if counts is not None
+        else {
+            "blocker_count": _preprocessing_count(
+                conn,
+                """
             SELECT COUNT(*) AS count FROM kanban_blockers
             WHERE item_id=?
               AND status NOT IN ('resolved', 'closed', 'done')
               AND COALESCE(json_extract(provenance_json, '$.schema'), '') != ?
             """,
-            (item_id, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA),
-        ),
-        "child_count": _preprocessing_count(
-            conn,
-            "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=? AND status!='archived'",
-            (item_id,),
-        ),
-        "commit_count": _preprocessing_count(
-            conn,
-            "SELECT COUNT(*) AS count FROM kanban_item_commits WHERE item_id=?",
-            (item_id,),
-        ),
-        "discussion_count": _preprocessing_count(
-            conn,
-            "SELECT COUNT(*) AS count FROM kanban_discussions WHERE item_id=?",
-            (item_id,),
-        ),
-        "issue_count": len(_json_value(item_row["related_issue_ids_json"], [])),
-        "link_count": _preprocessing_count(
-            conn,
-            """
+                (item_id, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA),
+            ),
+            "child_count": _preprocessing_count(
+                conn,
+                "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=? AND status!='archived'",
+                (item_id,),
+            ),
+            "commit_count": _preprocessing_count(
+                conn,
+                "SELECT COUNT(*) AS count FROM kanban_item_commits WHERE item_id=?",
+                (item_id,),
+            ),
+            "discussion_count": _preprocessing_count(
+                conn,
+                "SELECT COUNT(*) AS count FROM kanban_discussions WHERE item_id=?",
+                (item_id,),
+            ),
+            "issue_count": len(_json_value(item_row["related_issue_ids_json"], [])),
+            "link_count": _preprocessing_count(
+                conn,
+                """
             SELECT COUNT(*) AS count FROM kanban_item_links
             WHERE source_item_id=? OR target_item_id=?
             """,
-            (item_id, item_id),
-        ),
-        "open_descendant_count": 0,
-        "open_leaf_descendant_count": 0,
-        "todo_count": len(_json_value(item_row["related_task_ids_json"], [])),
-    }
+                (item_id, item_id),
+            ),
+            "open_descendant_count": 0,
+            "open_leaf_descendant_count": 0,
+            "todo_count": len(_json_value(item_row["related_task_ids_json"], [])),
+        }
+    )
     marker_refs = {
         str(ref.get("name") or ""): ref
         for ref in marker.get("source_refs", [])
@@ -3088,7 +3271,7 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
     missing_refs = [name for name in marker_refs if name not in source_ref_names]
     marker_counts = marker.get("counts") if isinstance(marker.get("counts"), dict) else {}
     count_drift = [
-        key for key, value in counts.items() if int(marker_counts.get(key) or 0) != value
+        key for key, value in source_counts.items() if int(marker_counts.get(key) or 0) != value
     ]
     marker_schema = str(marker.get("schema") or "")
     marker_item_id = str(marker.get("item_id") or "")
@@ -3117,7 +3300,7 @@ def _work_preprocessing_context_source(conn: Any, item_row: Any) -> dict[str, An
         "state_id": item_row["state_id"],
         "status": item_row["status"],
         "source_refs": source_refs,
-        "counts": counts,
+        "counts": source_counts,
         "marker": {
             "exists": bool(marker),
             "schema": marker_schema,
@@ -9575,11 +9758,19 @@ def _kanban_document_ref(path: Path) -> dict[str, Any]:
     }
 
 
-def _work_item_detail_document(conn: Any, item_id: str) -> dict[str, Any]:
+def _work_item_detail_document(
+    conn: Any,
+    item_id: str,
+    *,
+    cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    cache_key = ("detail", item_id)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     item = _work_item_or_404(conn, item_id)
     path = _kanban_item_detail_path(conn, item_id)
     metadata, body, exists = _read_kanban_markdown_document(path)
-    return {
+    document = {
         "schema": metadata.get("schema") or KANBAN_ITEM_DETAIL_SCHEMA,
         "item_id": item_id,
         "body": body,
@@ -9588,13 +9779,24 @@ def _work_item_detail_document(conn: Any, item_id: str) -> dict[str, Any]:
         "metadata": metadata,
         "updated_at": metadata.get("updated_at") or item["updated_at"],
     }
+    if cache is not None:
+        cache[cache_key] = document
+    return document
 
 
-def _work_item_review_document(conn: Any, item_id: str) -> dict[str, Any]:
+def _work_item_review_document(
+    conn: Any,
+    item_id: str,
+    *,
+    cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    cache_key = ("review", item_id)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     item = _work_item_or_404(conn, item_id)
     path = _kanban_item_review_path(conn, item_id)
     metadata, body, exists = _read_kanban_markdown_document(path)
-    return {
+    document = {
         "schema": metadata.get("schema") or KANBAN_ITEM_REVIEW_SCHEMA,
         "item_id": item_id,
         "body": body,
@@ -9603,6 +9805,9 @@ def _work_item_review_document(conn: Any, item_id: str) -> dict[str, Any]:
         "metadata": metadata,
         "updated_at": metadata.get("updated_at") or item["updated_at"],
     }
+    if cache is not None:
+        cache[cache_key] = document
+    return document
 
 
 def _write_work_item_markdown_document(
@@ -10596,12 +10801,9 @@ def _resolve_satisfied_work_preprocessing_parent_context_blockers(
     item_row: Any,
     meta: dict[str, str],
     now: str,
+    document_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     store = _kanban_write_store(conn)
-    ancestor_context = _work_preprocessing_ancestor_context(conn, item_row)
-    ancestors = ancestor_context.get("ancestors") if isinstance(ancestor_context, dict) else []
-    if not isinstance(ancestors, list) or not ancestors:
-        return []
     item_id = item_row["item_id"]
     rows = conn.execute(
         """
@@ -10613,6 +10815,17 @@ def _resolve_satisfied_work_preprocessing_parent_context_blockers(
         """,
         (item_id, KANBAN_PREPROCESSING_BLOCKER_PROVENANCE_SCHEMA),
     ).fetchall()
+    rows = [row for row in rows if _work_preprocessing_blocker_requests_parent_context(row)]
+    if not rows:
+        return []
+    ancestor_context = _work_preprocessing_ancestor_context(
+        conn,
+        item_row,
+        document_cache=document_cache,
+    )
+    ancestors = ancestor_context.get("ancestors") if isinstance(ancestor_context, dict) else []
+    if not isinstance(ancestors, list) or not ancestors:
+        return []
     resolved: list[dict[str, Any]] = []
     ancestor_ids = [
         str((ancestor.get("item") or {}).get("item_id") or "")
@@ -10621,8 +10834,6 @@ def _resolve_satisfied_work_preprocessing_parent_context_blockers(
     ]
     ancestor_ids = [ancestor_id for ancestor_id in ancestor_ids if ancestor_id]
     for blocker in rows:
-        if not _work_preprocessing_blocker_requests_parent_context(blocker):
-            continue
         provenance = _json_value(blocker["provenance_json"], {})
         title = "Resolved parent context preprocessing blocker"
         body_excerpt = (
@@ -13217,7 +13428,7 @@ def _work_preprocessing_scoped_decomposition_reparent(
     }
     now = _utc_now_iso()
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         source_item = _work_item_or_404(conn, clean_source_item_id)
         moving_item = _work_item_or_404(conn, clean_item_id)
         _work_item_or_404(conn, clean_target_parent)
@@ -14102,7 +14313,7 @@ async def repair_work_blocked_leaf_invariant(
                 "count": len(plans),
                 "plans": plans,
             }
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         repaired: list[dict[str, Any]] = []
         changed_blockers: list[tuple[Any, dict[str, Any]]] = []
         changed_items: list[tuple[Any, dict[str, Any]]] = []
@@ -14842,6 +15053,113 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
+@dataclass(frozen=True)
+class _EnvIntRangeConfig:
+    env_name: str
+    raw_value: str | None
+    default: int
+    minimum: int
+    maximum: int
+    effective: int
+    source: str
+    state: str
+    error: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return self.state in {"default", "valid"}
+
+    @property
+    def clamped(self) -> bool:
+        return self.state == "clamped"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "xarta.blueprints.env_range_config.v1",
+            "env_name": self.env_name,
+            "raw_value": self.raw_value,
+            "default": self.default,
+            "min": self.minimum,
+            "max": self.maximum,
+            "effective": self.effective,
+            "source": self.source,
+            "state": self.state,
+            "valid": self.valid,
+            "clamped": self.clamped,
+            "error": self.error,
+        }
+
+
+def _env_int_range_config(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> _EnvIntRangeConfig:
+    raw = os.environ.get(name)
+    if raw is None:
+        return _EnvIntRangeConfig(
+            env_name=name,
+            raw_value=None,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            effective=default,
+            source="default",
+            state="default",
+        )
+    clean_raw = raw.strip()
+    try:
+        parsed = int(clean_raw)
+    except (TypeError, ValueError):
+        return _EnvIntRangeConfig(
+            env_name=name,
+            raw_value=raw,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            effective=default,
+            source="env",
+            state="error",
+            error="not_an_integer",
+        )
+    if parsed < minimum:
+        return _EnvIntRangeConfig(
+            env_name=name,
+            raw_value=raw,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            effective=minimum,
+            source="env",
+            state="clamped",
+            error="below_min",
+        )
+    if parsed > maximum:
+        return _EnvIntRangeConfig(
+            env_name=name,
+            raw_value=raw,
+            default=default,
+            minimum=minimum,
+            maximum=maximum,
+            effective=maximum,
+            source="env",
+            state="clamped",
+            error="above_max",
+        )
+    return _EnvIntRangeConfig(
+        env_name=name,
+        raw_value=raw,
+        default=default,
+        minimum=minimum,
+        maximum=maximum,
+        effective=parsed,
+        source="env",
+        state="valid",
+    )
+
+
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -14925,6 +15243,12 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
     override_state = _work_automation_singleton_override_state()
     owner_match = bool(current_node_id and owner_node_id and current_node_id == owner_node_id)
     runs_on_this_node = bool(owner_match or override_state["active"])
+    max_scan_items_config = _env_int_range_config(
+        "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS",
+        KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS,
+        minimum=1,
+        maximum=KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP,
+    )
     return {
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
         "enabled": enabled,
@@ -14969,12 +15293,10 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
             minimum=5,
             maximum=86400,
         ),
-        "max_scan_items": _env_int(
-            "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS",
-            KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS,
-            minimum=1,
-            maximum=KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP,
-        ),
+        "max_scan_items": max_scan_items_config.effective,
+        "range_config": {
+            "max_scan_items": max_scan_items_config.as_dict(),
+        },
         "max_process_items": _env_int(
             "BLUEPRINTS_KANBAN_AUTOMATION_MAX_PROCESS_ITEMS",
             5,
@@ -16939,7 +17261,7 @@ def _trigger_work_review_processor_idle_scan_sync(
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
     scan_limit = _clean_review_scan_limit(body.max_items)
     include_empty = bool(body.include_empty)
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(operation="review_processor_idle_scan") as conn:
         root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
@@ -16984,7 +17306,7 @@ def _trigger_work_review_processor_idle_scan_sync(
                 }
             )
 
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
         unchanged_current = 0
@@ -17168,10 +17490,10 @@ def _trigger_work_preprocessing_idle_scan_sync(
     meta = _work_request_meta(body)
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
     scan_limit = _clean_review_scan_limit(body.max_items)
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(operation="preprocessing_idle_scan") as conn:
         root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         (
             cancelled_invalid_rows,
             cancelled_invalid_marker_blockers,
@@ -17288,41 +17610,68 @@ def _trigger_work_preprocessing_idle_scan_sync(
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND item.item_id IN ({placeholders})"
             args.extend(scope_ids)
-        item_rows = conn.execute(
-            f"""
-            SELECT item.* FROM kanban_items item
-            {where}
-            ORDER BY
-              CASE item.priority_id
-                WHEN 'critical' THEN 0
-                WHEN 'high' THEN 1
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 3
-                ELSE 4
-              END,
-              item.updated_at ASC,
-              item.item_id
-            LIMIT ?
-            """,
-            [*args, scan_limit],
-        ).fetchall()
+        with timing.span(
+            "kanban.preprocessing.idle_scan.phase",
+            phase="candidate_detection",
+            active_store=cfg.KANBAN_DATASTORE_CONFIG.active_store,
+            scan_limit=scan_limit,
+            scoped=bool(scope_ids),
+        ):
+            item_rows = conn.execute(
+                f"""
+                SELECT item.* FROM kanban_items item
+                {where}
+                ORDER BY
+                  CASE item.priority_id
+                    WHEN 'critical' THEN 0
+                    WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2
+                    WHEN 'low' THEN 3
+                    ELSE 4
+                  END,
+                  item.updated_at ASC,
+                  item.item_id
+                LIMIT ?
+                """,
+                [*args, scan_limit],
+            ).fetchall()
+        document_cache: dict[tuple[str, str], dict[str, Any]] = {}
         satisfied_parent_context_blockers: list[dict[str, Any]] = []
-        for item_row in item_rows:
-            satisfied_parent_context_blockers.extend(
-                _resolve_satisfied_work_preprocessing_parent_context_blockers(
-                    conn,
-                    item_row=item_row,
-                    meta=meta,
-                    now=now,
+        with timing.span(
+            "kanban.preprocessing.idle_scan.phase",
+            phase="parent_context_blockers",
+            active_store=cfg.KANBAN_DATASTORE_CONFIG.active_store,
+            item_count=len(item_rows),
+        ):
+            for item_row in item_rows:
+                satisfied_parent_context_blockers.extend(
+                    _resolve_satisfied_work_preprocessing_parent_context_blockers(
+                        conn,
+                        item_row=item_row,
+                        meta=meta,
+                        now=now,
+                        document_cache=document_cache,
+                    )
                 )
-            )
-        scan_entries = [
-            {
-                "item": item_row,
-                "source": _work_preprocessing_context_source(conn, item_row),
-            }
-            for item_row in item_rows
-        ]
+        counts_by_item = _work_preprocessing_counts_by_item(conn, item_rows)
+        with timing.span(
+            "kanban.preprocessing.idle_scan.phase",
+            phase="source_build",
+            active_store=cfg.KANBAN_DATASTORE_CONFIG.active_store,
+            item_count=len(item_rows),
+        ):
+            scan_entries = [
+                {
+                    "item": item_row,
+                    "source": _work_preprocessing_context_source(
+                        conn,
+                        item_row,
+                        counts=counts_by_item.get(str(item_row["item_id"] or "")),
+                        document_cache=document_cache,
+                    ),
+                }
+                for item_row in item_rows
+            ]
 
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
@@ -17333,6 +17682,18 @@ def _trigger_work_preprocessing_idle_scan_sync(
         unchanged_failed = 0
         current_ready = 0
         eligible_preprocessing = 0
+        marker_ids = [_preprocessing_marker_id(entry["item"]["item_id"]) for entry in scan_entries]
+        existing_markers_by_id: dict[str, Any] = {}
+        if marker_ids:
+            placeholders = ",".join("?" for _ in marker_ids)
+            marker_rows = conn.execute(
+                f"""
+                SELECT * FROM kanban_review_processor_markers
+                WHERE marker_id IN ({placeholders})
+                """,
+                marker_ids,
+            ).fetchall()
+            existing_markers_by_id = {row["marker_id"]: row for row in marker_rows}
         for entry in scan_entries:
             item_id = entry["item"]["item_id"]
             source = entry["source"]
@@ -17346,10 +17707,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 )
             )
             marker_id = _preprocessing_marker_id(item_id)
-            existing = conn.execute(
-                "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
-                (marker_id,),
-            ).fetchone()
+            existing = existing_markers_by_id.get(marker_id)
             same_source = bool(
                 existing is not None
                 and existing["document_source_hash"] == source["document_source_hash"]
@@ -18975,7 +19333,7 @@ def _get_work_automation_status_sync(
         )
     )
     idle_worker_config = _work_automation_idle_worker_config()
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(operation="automation_status") as conn:
         scope_ids: list[str] = []
         item_payload: dict[str, Any] | None = None
         if clean_item_id:
