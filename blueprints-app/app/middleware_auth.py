@@ -52,6 +52,7 @@ _TOKEN_EXEMPT_PREFIXES = (
     "/api/v1/pwa/manifest",
     "/api/v1/personal/rich-doc/images/file/",
     "/api/v1/personal/email/image-proxy",
+    "/api/v1/personal/email/local/images",
     "/api/v1/personal/email/workers/external-images",
     "/api/v1/personal/email/workers/security",
 )
