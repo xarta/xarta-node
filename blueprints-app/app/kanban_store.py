@@ -101,12 +101,11 @@ def _bool_setting_value(value: str | None, default: bool = True) -> bool:
     return default
 
 
-class SQLiteKanbanStore:
+class KanbanStore:
     """Repository facade for Kanban reads and writes.
 
-    The class name is retained for compatibility with the original SQLite
-    implementation, but active Postgres mode supplies a Postgres-backed
-    DB-API-compatible connection.
+    Active Postgres mode supplies a Postgres-backed connection that implements
+    the DB-API methods used here.
     """
 
     def __init__(
@@ -1425,83 +1424,187 @@ class SQLiteKanbanStore:
         *,
         show_test_entries: bool = True,
     ) -> dict[str, Any]:
-        item_ids = self.scope_item_ids(item_id, show_test_entries=show_test_entries)
-        if not item_ids:
-            return {
-                "items": {
-                    "total": 0,
-                    "by_state": {},
-                    "by_status": {},
-                    "leaf_metrics": self._leaf_metrics([]),
-                },
-                "issues": {
-                    "open": 0,
-                    "leaf_metrics": self._leaf_metrics([]),
-                },
-                "todos": {"open": 0},
-                "blockers": {"open": 0},
-                "depth_limit": self.depth_limit,
+        clean_item_id = self._clean_id(item_id) or None
+        if clean_item_id:
+            return self.rollups(
+                [clean_item_id],
+                show_test_entries=show_test_entries,
+            )[clean_item_id]
+
+        raw_rows = self.conn.execute(
+            "SELECT * FROM kanban_items WHERE status != 'archived'"
+        ).fetchall()
+        rows, _hidden = self._filter_test_rows(raw_rows, show_test_entries)
+        child_parent_ids = {str(row["parent_item_id"]) for row in raw_rows if row["parent_item_id"]}
+        blocker_counts_by_item = self._blocker_counts_by_item([str(row["item_id"]) for row in rows])
+        return self._rollup_from_scope_rows(
+            rows,
+            root_item_id=None,
+            child_parent_ids=child_parent_ids,
+            blocker_counts_by_item=blocker_counts_by_item,
+        )
+
+    def rollups(
+        self,
+        item_ids: list[str],
+        *,
+        show_test_entries: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        clean_ids: list[str] = []
+        seen: set[str] = set()
+        for item_id in item_ids:
+            clean_item_id = self._clean_id(item_id)
+            if not clean_item_id or clean_item_id in seen:
+                continue
+            seen.add(clean_item_id)
+            clean_ids.append(clean_item_id)
+        if not clean_ids:
+            return {}
+
+        roots = ",".join("(?)" for _ in clean_ids)
+        raw_rows = self.conn.execute(
+            f"""
+            WITH RECURSIVE roots(root_id) AS (
+                VALUES {roots}
+            ),
+            scoped(root_id, item_id) AS (
+                SELECT roots.root_id, w.item_id
+                FROM roots
+                JOIN kanban_items w ON w.item_id = roots.root_id
+                UNION ALL
+                SELECT scoped.root_id, child.item_id
+                FROM scoped
+                JOIN kanban_items child ON child.parent_item_id = scoped.item_id
+                WHERE child.status != 'archived'
+            )
+            SELECT scoped.root_id AS rollup_root_id, w.*
+            FROM scoped
+            JOIN kanban_items w ON w.item_id = scoped.item_id
+            ORDER BY scoped.root_id, w.depth, w.item_id
+            """,
+            clean_ids,
+        ).fetchall()
+
+        raw_rows_by_root: dict[str, list[Any]] = {root_id: [] for root_id in clean_ids}
+        for row in raw_rows:
+            raw_rows_by_root.setdefault(str(row["rollup_root_id"]), []).append(row)
+        if any(not raw_rows_by_root[root_id] for root_id in clean_ids):
+            raise KanbanItemNotFound("Kanban item not found")
+
+        rows_by_root: dict[str, list[Any]] = {}
+        child_parent_ids_by_root: dict[str, set[str]] = {}
+        all_visible_item_ids: set[str] = set()
+        for root_id, root_rows in raw_rows_by_root.items():
+            rows, _hidden = self._filter_test_rows(root_rows, show_test_entries)
+            rows_by_root[root_id] = rows
+            child_parent_ids_by_root[root_id] = {
+                str(row["parent_item_id"]) for row in root_rows if row["parent_item_id"]
             }
-        placeholders = ",".join("?" for _ in item_ids)
-        state_rows = self.conn.execute(
-            f"SELECT state_id, COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
-            "GROUP BY state_id",
-            item_ids,
-        ).fetchall()
-        status_rows = self.conn.execute(
-            f"SELECT status, COUNT(*) AS count FROM kanban_items WHERE item_id IN ({placeholders}) "
-            "GROUP BY status",
-            item_ids,
-        ).fetchall()
-        descendant_item_ids = [
-            scope_item_id for scope_item_id in item_ids if not item_id or scope_item_id != item_id
-        ]
-        if descendant_item_ids:
-            descendant_placeholders = ",".join("?" for _ in descendant_item_ids)
-            issue_open = self.conn.execute(
-                f"SELECT COUNT(*) AS count FROM kanban_items WHERE item_id IN ({descendant_placeholders}) "
-                "AND item_type='issue' AND status NOT IN ('done', 'closed', 'archived')",
-                descendant_item_ids,
-            ).fetchone()
-            todo_open = self.conn.execute(
-                f"""
-                SELECT COUNT(*) AS count
-                FROM kanban_items w
-                WHERE w.item_id IN ({descendant_placeholders})
-                  AND w.state_id='todo'
-                  AND w.status != 'archived'
-                  AND w.item_type != 'issue'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM kanban_items child
-                      WHERE child.parent_item_id=w.item_id
-                        AND child.status != 'archived'
-                  )
-                """,
-                descendant_item_ids,
-            ).fetchone()
-        else:
-            issue_open = {"count": 0}
-            todo_open = {"count": 0}
-        item_leaf_metrics = self._rollup_leaf_metrics(descendant_item_ids, issue_cards=False)
-        issue_leaf_metrics = self._rollup_leaf_metrics(descendant_item_ids, issue_cards=True)
-        blocker_open = self.conn.execute(
-            f"SELECT COUNT(*) AS count FROM kanban_blockers WHERE item_id IN ({placeholders}) "
-            "AND status NOT IN ('resolved', 'archived')",
-            item_ids,
-        ).fetchone()
+            all_visible_item_ids.update(str(row["item_id"]) for row in rows)
+
+        blocker_counts_by_item = self._blocker_counts_by_item(sorted(all_visible_item_ids))
+        return {
+            root_id: self._rollup_from_scope_rows(
+                rows_by_root[root_id],
+                root_item_id=root_id,
+                child_parent_ids=child_parent_ids_by_root[root_id],
+                blocker_counts_by_item=blocker_counts_by_item,
+            )
+            for root_id in clean_ids
+        }
+
+    def _empty_rollup(self) -> dict[str, Any]:
         return {
             "items": {
-                "total": len(item_ids),
-                "by_state": {row["state_id"]: row["count"] for row in state_rows},
-                "by_status": {row["status"]: row["count"] for row in status_rows},
+                "total": 0,
+                "by_state": {},
+                "by_status": {},
+                "leaf_metrics": self._leaf_metrics([]),
+            },
+            "issues": {
+                "open": 0,
+                "leaf_metrics": self._leaf_metrics([]),
+            },
+            "todos": {"open": 0},
+            "blockers": {"open": 0},
+            "depth_limit": self.depth_limit,
+        }
+
+    def _blocker_counts_by_item(self, item_ids: list[str]) -> dict[str, int]:
+        if not item_ids:
+            return {}
+        placeholders = ",".join("?" for _ in item_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT item_id, COUNT(*) AS count
+            FROM kanban_blockers
+            WHERE item_id IN ({placeholders})
+              AND status NOT IN ('resolved', 'archived')
+            GROUP BY item_id
+            """,
+            item_ids,
+        ).fetchall()
+        return {str(row["item_id"]): int(row["count"] or 0) for row in rows}
+
+    def _rollup_from_scope_rows(
+        self,
+        rows: list[Any],
+        *,
+        root_item_id: str | None,
+        child_parent_ids: set[str],
+        blocker_counts_by_item: dict[str, int],
+    ) -> dict[str, Any]:
+        if not rows:
+            return self._empty_rollup()
+
+        by_state: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        for row in rows:
+            state_id = str(row["state_id"] or "")
+            status = str(row["status"] or "")
+            by_state[state_id] = by_state.get(state_id, 0) + 1
+            by_status[status] = by_status.get(status, 0) + 1
+
+        descendant_rows = [
+            row for row in rows if not root_item_id or str(row["item_id"]) != root_item_id
+        ]
+        issue_open = sum(
+            1
+            for row in descendant_rows
+            if row["item_type"] == "issue" and row["status"] not in {"done", "closed", "archived"}
+        )
+        leaf_rows = [
+            row
+            for row in descendant_rows
+            if row["status"] != "archived" and str(row["item_id"]) not in child_parent_ids
+        ]
+        item_leaf_metrics = self._leaf_metrics(
+            [row for row in leaf_rows if row["item_type"] != "issue"]
+        )
+        issue_leaf_metrics = self._leaf_metrics(
+            [row for row in leaf_rows if row["item_type"] == "issue"]
+        )
+        todo_open = sum(
+            1
+            for row in leaf_rows
+            if row["state_id"] == "todo"
+            and row["status"] != "archived"
+            and row["item_type"] != "issue"
+        )
+        blocker_open = sum(blocker_counts_by_item.get(str(row["item_id"]), 0) for row in rows)
+        return {
+            "items": {
+                "total": len(rows),
+                "by_state": by_state,
+                "by_status": by_status,
                 "leaf_metrics": item_leaf_metrics,
             },
             "issues": {
-                "open": int(issue_open["count"] if issue_open else 0),
+                "open": issue_open,
                 "leaf_metrics": issue_leaf_metrics,
             },
-            "todos": {"open": int(todo_open["count"] if todo_open else 0)},
-            "blockers": {"open": int(blocker_open["count"] if blocker_open else 0)},
+            "todos": {"open": todo_open},
+            "blockers": {"open": blocker_open},
             "depth_limit": self.depth_limit,
         }
 
@@ -1563,33 +1666,6 @@ class SQLiteKanbanStore:
         for priority_id in priority_ids:
             ordered.extend(self._order_priority_group(groups[priority_id]))
         return ordered
-
-    def _rollup_leaf_metrics(
-        self,
-        descendant_item_ids: list[str],
-        *,
-        issue_cards: bool,
-    ) -> dict[str, Any]:
-        if not descendant_item_ids:
-            return self._leaf_metrics([])
-        descendant_placeholders = ",".join("?" for _ in descendant_item_ids)
-        issue_predicate = "w.item_type='issue'" if issue_cards else "w.item_type!='issue'"
-        rows = self.conn.execute(
-            f"""
-            SELECT w.*
-            FROM kanban_items w
-            WHERE w.item_id IN ({descendant_placeholders})
-              AND w.status != 'archived'
-              AND {issue_predicate}
-              AND NOT EXISTS (
-                  SELECT 1 FROM kanban_items child
-                  WHERE child.parent_item_id=w.item_id
-                    AND child.status != 'archived'
-              )
-            """,
-            descendant_item_ids,
-        ).fetchall()
-        return self._leaf_metrics(rows)
 
     def _leaf_metrics(self, rows: list[Any]) -> dict[str, Any]:
         by_state: dict[str, int] = {}

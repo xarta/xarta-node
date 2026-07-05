@@ -21,7 +21,7 @@ from .kanban_postgres import postgres_candidate_connection
 from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
-    SQLiteKanbanStore,
+    KanbanStore,
 )
 
 KANBAN_SHADOW_PARITY_SCHEMA = "xarta.kanban.datastore.shadow_parity.v1"
@@ -325,8 +325,8 @@ def _priority_snapshot(row: Any) -> dict[str, Any]:
     }
 
 
-def _store(conn: sqlite3.Connection, config: dict[str, Any]) -> SQLiteKanbanStore:
-    return SQLiteKanbanStore(
+def _store(conn: sqlite3.Connection, config: dict[str, Any]) -> KanbanStore:
+    return KanbanStore(
         conn,
         depth_limit=int(config["depth_limit"]),
         show_test_entries_setting=str(config["show_test_entries_setting"]),

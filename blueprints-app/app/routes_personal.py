@@ -53,7 +53,7 @@ from .kanban_store import (
     KanbanItemCycleError,
     KanbanItemNotFound,
     KanbanPriorityRecommendationRead,
-    SQLiteKanbanStore,
+    KanbanStore,
 )
 from .sync.queue import enqueue_for_all_peers
 
@@ -194,6 +194,8 @@ KANBAN_AUTOMATION_SINGLETON_OVERRIDE_DEFAULT_PATH = (
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
     Path(__file__).resolve().parent / "contracts" / "kanban_automation_idle_worker.v1.json"
 )
+KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS = 25
+KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP = 100
 KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
     "xarta.kanban.processor_marker_blocker.provenance.v1"
 )
@@ -444,8 +446,8 @@ def get_conn() -> Any:
             conn.close()
 
 
-def _kanban_store(conn: Any) -> SQLiteKanbanStore:
-    return SQLiteKanbanStore(
+def _kanban_store(conn: Any) -> KanbanStore:
+    return KanbanStore(
         conn,
         depth_limit=KANBAN_DEPTH_LIMIT,
         show_test_entries_setting=KANBAN_SHOW_TEST_ENTRIES_SETTING,
@@ -457,7 +459,7 @@ def _kanban_store(conn: Any) -> SQLiteKanbanStore:
     )
 
 
-def _kanban_write_store(conn: Any) -> SQLiteKanbanStore:
+def _kanban_write_store(conn: Any) -> KanbanStore:
     return _kanban_store(conn)
 
 
@@ -13812,13 +13814,10 @@ def _get_work_item_rollups_sync(
                     item_count=len(clean_ids),
                     show_test_entries=effective_show_test_entries,
                 ):
-                    rollups = {
-                        clean_item_id: store.rollup(
-                            clean_item_id,
-                            show_test_entries=effective_show_test_entries,
-                        )
-                        for clean_item_id in clean_ids
-                    }
+                    rollups = store.rollups(
+                        clean_ids,
+                        show_test_entries=effective_show_test_entries,
+                    )
         except (KanbanItemNotFound, KanbanItemCycleError) as exc:
             _raise_kanban_store_error(exc)
     return {"ok": True, "count": len(rollups), "rollups": rollups}
@@ -14972,9 +14971,9 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
         ),
         "max_scan_items": _env_int(
             "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS",
-            100,
+            KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS,
             minimum=1,
-            maximum=500,
+            maximum=KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP,
         ),
         "max_process_items": _env_int(
             "BLUEPRINTS_KANBAN_AUTOMATION_MAX_PROCESS_ITEMS",
