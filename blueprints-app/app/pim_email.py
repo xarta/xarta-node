@@ -33,6 +33,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 import asyncpg
 import httpx
 
+from . import timing
 from .pim_email_image_transform import (
     TRANSFORM_VERSION as EXTERNAL_IMAGE_TRANSFORM_VERSION,
 )
@@ -1787,334 +1788,354 @@ class PgEmailStore:
         finally:
             await conn.close()
 
-    async def local_corpus_status(self, *, mailbox_id: str | None = None) -> dict[str, Any]:
+    async def local_corpus_status(
+        self,
+        *,
+        mailbox_id: str | None = None,
+        include_external_images: bool = True,
+        include_security_details: bool = True,
+    ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
-        download_orphan_reconcile = await self.reconcile_orphaned_download_runs(
-            active_run_ids=_active_download_run_ids_from_proc(),
-            reason="local_corpus_status_process_set_reconciliation",
-            mailbox_id=configured_mailbox_id,
-        )
+        with timing.span("pim_email.local_corpus_status.reconcile_download_runs"):
+            download_orphan_reconcile = await self.reconcile_orphaned_download_runs(
+                active_run_ids=_active_download_run_ids_from_proc(),
+                reason="local_corpus_status_process_set_reconciliation",
+                mailbox_id=configured_mailbox_id,
+            )
         conn = await self._connect()
         try:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                  (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1) AS messages,
-                  (SELECT count(*) FROM pim_email_local_folders WHERE mailbox_id = $1 AND tombstoned_at IS NULL) AS folders,
-                  (SELECT count(*) FROM pim_email_folder_memberships WHERE mailbox_id = $1) AS memberships,
-                  (SELECT count(*) FROM pim_email_transformed_assets WHERE mailbox_id = $1) AS transformed_assets,
-                  (SELECT count(*) FROM pim_email_shared_assets WHERE mailbox_id = $1) AS shared_assets,
-                  (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1 AND storage_relpath <> '') AS raw_originals_stored
-                """,
-                configured_mailbox_id,
-            )
-            security_counts = await conn.fetchrow(
-                """
-                WITH latest_current AS (
-                    SELECT DISTINCT ON (m.email_uid)
-                           m.email_uid,
-                           m.raw_sha256 AS message_raw_sha256,
-                           s.raw_sha256 AS security_raw_sha256,
-                           s.security_status,
-                           s.aggregate_status,
-                           s.error_message,
-                           s.result_json,
-                           s.checked_at
-                    FROM pim_email_messages m
-                    LEFT JOIN pim_email_security_checks s
-                      ON s.email_uid = m.email_uid AND s.raw_sha256 = m.raw_sha256
-                    WHERE m.mailbox_id = $1
-                    ORDER BY m.email_uid, s.checked_at DESC NULLS LAST
-                ), classified AS (
+            with timing.span("pim_email.local_corpus_status.base_counts"):
+                row = await conn.fetchrow(
+                    """
                     SELECT
-                        email_uid,
-                        CASE
-                            WHEN security_raw_sha256 IS NULL THEN 'missing'
-                            WHEN security_status = 'stored'
-                              AND result_json->>'available' = 'true'
-                              AND COALESCE(result_json->>'queued', 'false') <> 'true'
-                              AND COALESCE(result_json->>'placeholder', 'false') <> 'true'
-                              AND result_json->>'email_uid' = email_uid
-                              AND result_json->>'raw_sha256' = message_raw_sha256
-                              AND COALESCE(result_json->>'checked_at', '') <> ''
-                              AND jsonb_typeof(result_json->'checker_versions') = 'object'
-                            THEN 'completed'
-                            WHEN security_status IN ('pending_retryable', 'failed_retryable')
-                            THEN 'pending_retryable'
-                            WHEN COALESCE(result_json->>'queued', 'false') = 'true'
-                              OR COALESCE(result_json->>'placeholder', 'false') = 'true'
-                              OR result_json->>'available' = 'false'
-                              OR aggregate_status = 'queued'
-                            THEN 'pending'
-                            WHEN security_status LIKE 'failed%' OR COALESCE(error_message, '') <> ''
-                            THEN 'failed'
-                            ELSE 'pending'
-                        END AS state
-                    FROM latest_current
-                ), stale AS (
-                    SELECT count(DISTINCT m.email_uid) AS stale_hash
-                    FROM pim_email_messages m
-                    JOIN pim_email_security_checks s
-                      ON s.email_uid = m.email_uid AND s.raw_sha256 <> m.raw_sha256
-                    WHERE m.mailbox_id = $1
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM pim_email_security_checks current_s
-                          WHERE current_s.email_uid = m.email_uid
-                            AND current_s.raw_sha256 = m.raw_sha256
-                      )
+                      (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1) AS messages,
+                      (SELECT count(*) FROM pim_email_local_folders WHERE mailbox_id = $1 AND tombstoned_at IS NULL) AS folders,
+                      (SELECT count(*) FROM pim_email_folder_memberships WHERE mailbox_id = $1) AS memberships,
+                      (SELECT count(*) FROM pim_email_transformed_assets WHERE mailbox_id = $1) AS transformed_assets,
+                      (SELECT count(*) FROM pim_email_shared_assets WHERE mailbox_id = $1) AS shared_assets,
+                      (SELECT count(*) FROM pim_email_messages WHERE mailbox_id = $1 AND storage_relpath <> '') AS raw_originals_stored
+                    """,
+                    configured_mailbox_id,
                 )
-                SELECT
-                    count(*) FILTER (WHERE state = 'completed') AS completed,
-                    count(*) FILTER (WHERE state IN ('pending', 'pending_retryable')) AS pending,
-                    count(*) FILTER (WHERE state = 'pending_retryable') AS pending_retryable,
-                    count(*) FILTER (WHERE state = 'failed') AS failed,
-                    count(*) FILTER (WHERE state = 'missing') AS missing,
-                    (SELECT stale_hash FROM stale) AS stale_hash
-                FROM classified
-                """,
-                configured_mailbox_id,
-            )
-            security_phase_rows = await conn.fetch(
-                """
-                SELECT phase, phase_status, count(*) AS row_count
-                FROM pim_email_security_phases
-                WHERE mailbox_id = $1
-                GROUP BY phase, phase_status
-                """,
-                configured_mailbox_id,
-            )
-            security_assignment_rows = await conn.fetch(
-                """
-                SELECT phase, assignment_status, count(*) AS row_count
-                FROM pim_email_security_phase_assignments
-                WHERE mailbox_id = $1
-                GROUP BY phase, assignment_status
-                """,
-                configured_mailbox_id,
-            )
-            sanitized_counts = await conn.fetchrow(
-                """
-                WITH current_sanitized AS (
-                    SELECT DISTINCT m.email_uid
+            security_counts = None
+            security_phase_rows = []
+            security_assignment_rows = []
+            if include_security_details:
+                with timing.span("pim_email.local_corpus_status.security_counts"):
+                    security_counts = await conn.fetchrow(
+                        """
+                        WITH latest_current AS (
+                            SELECT DISTINCT ON (m.email_uid)
+                                   m.email_uid,
+                                   m.raw_sha256 AS message_raw_sha256,
+                                   s.raw_sha256 AS security_raw_sha256,
+                                   s.security_status,
+                                   s.aggregate_status,
+                                   s.error_message,
+                                   s.result_json,
+                                   s.checked_at
+                            FROM pim_email_messages m
+                            LEFT JOIN pim_email_security_checks s
+                              ON s.email_uid = m.email_uid AND s.raw_sha256 = m.raw_sha256
+                            WHERE m.mailbox_id = $1
+                            ORDER BY m.email_uid, s.checked_at DESC NULLS LAST
+                        ), classified AS (
+                            SELECT
+                                email_uid,
+                                CASE
+                                    WHEN security_raw_sha256 IS NULL THEN 'missing'
+                                    WHEN security_status = 'stored'
+                                      AND result_json->>'available' = 'true'
+                                      AND COALESCE(result_json->>'queued', 'false') <> 'true'
+                                      AND COALESCE(result_json->>'placeholder', 'false') <> 'true'
+                                      AND result_json->>'email_uid' = email_uid
+                                      AND result_json->>'raw_sha256' = message_raw_sha256
+                                      AND COALESCE(result_json->>'checked_at', '') <> ''
+                                      AND jsonb_typeof(result_json->'checker_versions') = 'object'
+                                    THEN 'completed'
+                                    WHEN security_status IN ('pending_retryable', 'failed_retryable')
+                                    THEN 'pending_retryable'
+                                    WHEN COALESCE(result_json->>'queued', 'false') = 'true'
+                                      OR COALESCE(result_json->>'placeholder', 'false') = 'true'
+                                      OR result_json->>'available' = 'false'
+                                      OR aggregate_status = 'queued'
+                                    THEN 'pending'
+                                    WHEN security_status LIKE 'failed%' OR COALESCE(error_message, '') <> ''
+                                    THEN 'failed'
+                                    ELSE 'pending'
+                                END AS state
+                            FROM latest_current
+                        ), stale AS (
+                            SELECT count(DISTINCT m.email_uid) AS stale_hash
+                            FROM pim_email_messages m
+                            JOIN pim_email_security_checks s
+                              ON s.email_uid = m.email_uid AND s.raw_sha256 <> m.raw_sha256
+                            WHERE m.mailbox_id = $1
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM pim_email_security_checks current_s
+                                  WHERE current_s.email_uid = m.email_uid
+                                    AND current_s.raw_sha256 = m.raw_sha256
+                              )
+                        )
+                        SELECT
+                            count(*) FILTER (WHERE state = 'completed') AS completed,
+                            count(*) FILTER (WHERE state IN ('pending', 'pending_retryable')) AS pending,
+                            count(*) FILTER (WHERE state = 'pending_retryable') AS pending_retryable,
+                            count(*) FILTER (WHERE state = 'failed') AS failed,
+                            count(*) FILTER (WHERE state = 'missing') AS missing,
+                            (SELECT stale_hash FROM stale) AS stale_hash
+                        FROM classified
+                        """,
+                        configured_mailbox_id,
+                    )
+                with timing.span("pim_email.local_corpus_status.security_phase_counts"):
+                    security_phase_rows = await conn.fetch(
+                        """
+                        SELECT phase, phase_status, count(*) AS row_count
+                        FROM pim_email_security_phases
+                        WHERE mailbox_id = $1
+                        GROUP BY phase, phase_status
+                        """,
+                        configured_mailbox_id,
+                    )
+                with timing.span("pim_email.local_corpus_status.security_assignment_counts"):
+                    security_assignment_rows = await conn.fetch(
+                        """
+                        SELECT phase, assignment_status, count(*) AS row_count
+                        FROM pim_email_security_phase_assignments
+                        WHERE mailbox_id = $1
+                        GROUP BY phase, assignment_status
+                        """,
+                        configured_mailbox_id,
+                    )
+            with timing.span("pim_email.local_corpus_status.sanitized_counts"):
+                sanitized_counts = await conn.fetchrow(
+                    """
+                    WITH current_sanitized AS (
+                        SELECT DISTINCT m.email_uid
+                        FROM pim_email_messages m
+                        JOIN pim_email_sanitized_view_artifacts a
+                          ON a.mailbox_id = m.mailbox_id
+                         AND a.email_uid = m.email_uid
+                         AND a.input_raw_sha256 = m.raw_sha256
+                         AND a.sanitizer_policy_version = $2
+                         AND a.transform_version = $3
+                        WHERE m.mailbox_id = $1
+                    ), latest_failures AS (
+                        SELECT DISTINCT ON (email_uid, raw_sha256)
+                               email_uid, raw_sha256, status
+                        FROM pim_email_backfill_items
+                        WHERE mailbox_id = $1 AND artifact_type = 'sanitized_view'
+                        ORDER BY email_uid, raw_sha256, updated_at DESC
+                    )
+                    SELECT
+                        (SELECT count(*) FROM current_sanitized) AS completed,
+                        count(*) FILTER (
+                            WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
+                              AND f.status = 'failed'
+                        ) AS failed,
+                        count(*) FILTER (
+                            WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
+                              AND COALESCE(f.status, '') <> 'failed'
+                        ) AS pending
                     FROM pim_email_messages m
-                    JOIN pim_email_sanitized_view_artifacts a
-                      ON a.mailbox_id = m.mailbox_id
-                     AND a.email_uid = m.email_uid
-                     AND a.input_raw_sha256 = m.raw_sha256
-                     AND a.sanitizer_policy_version = $2
-                     AND a.transform_version = $3
+                    LEFT JOIN latest_failures f
+                      ON f.email_uid = m.email_uid AND f.raw_sha256 = m.raw_sha256
                     WHERE m.mailbox_id = $1
-                ), latest_failures AS (
-                    SELECT DISTINCT ON (email_uid, raw_sha256)
-                           email_uid, raw_sha256, status
-                    FROM pim_email_backfill_items
-                    WHERE mailbox_id = $1 AND artifact_type = 'sanitized_view'
-                    ORDER BY email_uid, raw_sha256, updated_at DESC
+                    """,
+                    configured_mailbox_id,
+                    SANITIZED_VIEW_POLICY_VERSION,
+                    SANITIZED_VIEW_TRANSFORM_VERSION,
                 )
-                SELECT
-                    (SELECT count(*) FROM current_sanitized) AS completed,
-                    count(*) FILTER (
-                        WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
-                          AND f.status = 'failed'
-                    ) AS failed,
-                    count(*) FILTER (
-                        WHERE m.email_uid NOT IN (SELECT email_uid FROM current_sanitized)
-                          AND COALESCE(f.status, '') <> 'failed'
-                    ) AS pending
-                FROM pim_email_messages m
-                LEFT JOIN latest_failures f
-                  ON f.email_uid = m.email_uid AND f.raw_sha256 = m.raw_sha256
-                WHERE m.mailbox_id = $1
-                """,
-                configured_mailbox_id,
-                SANITIZED_VIEW_POLICY_VERSION,
-                SANITIZED_VIEW_TRANSFORM_VERSION,
-            )
-            external_counts = await conn.fetchrow(
-                """
-                WITH captured AS (
-                    SELECT COALESCE(sum(
-                        CASE
-                          WHEN jsonb_typeof(metadata_json->'remote_image_sources') = 'array'
-                          THEN jsonb_array_length(metadata_json->'remote_image_sources')
-                          ELSE 0
-                        END
-                    ), 0) AS captured_count
-                    FROM pim_email_messages
+            external_counts = None
+            if include_external_images:
+                with timing.span("pim_email.local_corpus_status.external_image_counts"):
+                    external_counts = await conn.fetchrow(
+                        """
+                        WITH captured AS (
+                            SELECT COALESCE(sum(
+                                CASE
+                                  WHEN jsonb_typeof(metadata_json->'remote_image_sources') = 'array'
+                                  THEN jsonb_array_length(metadata_json->'remote_image_sources')
+                                  ELSE 0
+                                END
+                            ), 0) AS captured_count
+                            FROM pim_email_messages
+                            WHERE mailbox_id = $1
+                        ), shared_digest AS (
+                            SELECT DISTINCT mailbox_id, canonical_url_digest
+                            FROM pim_email_shared_assets
+                            WHERE mailbox_id = $1 AND canonical_url_digest <> ''
+                        ), derivatives AS (
+                            SELECT
+                                d.mailbox_id,
+                                d.status,
+                                d.canonical_url_digest,
+                                d.shared_asset_uid,
+                                sd.canonical_url_digest IS NOT NULL AS has_shared_asset
+                            FROM pim_email_external_image_derivatives
+                            d
+                            LEFT JOIN shared_digest sd
+                              ON sd.mailbox_id = d.mailbox_id
+                             AND sd.canonical_url_digest = d.canonical_url_digest
+                            WHERE d.mailbox_id = $1
+                        ), rows AS (
+                            SELECT status, count(*) AS row_count
+                            FROM derivatives
+                            GROUP BY status
+                        ), totals AS (
+                            SELECT
+                                count(*) AS recorded_count,
+                                count(DISTINCT canonical_url_digest) FILTER (
+                                    WHERE canonical_url_digest <> ''
+                                ) AS recorded_unique_canonical_urls,
+                                count(DISTINCT canonical_url_digest) FILTER (
+                                    WHERE canonical_url_digest <> '' AND status = 'stored'
+                                ) AS stored_unique_canonical_urls,
+                                count(DISTINCT canonical_url_digest) FILTER (
+                                    WHERE canonical_url_digest <> ''
+                                      AND status IN ('pending','fetched','transformed')
+                                ) AS pending_recorded_unique_canonical_urls,
+                                count(*) FILTER (
+                                    WHERE status IN ('pending','fetched','transformed')
+                                      AND canonical_url_digest <> ''
+                                      AND has_shared_asset
+                                ) AS pending_reference_rows_with_shared_asset,
+                                count(DISTINCT canonical_url_digest) FILTER (
+                                    WHERE canonical_url_digest <> ''
+                                      AND status IN ('pending','fetched','transformed')
+                                      AND has_shared_asset
+                                ) AS pending_unique_canonical_urls_with_shared_asset,
+                                count(*) FILTER (
+                                    WHERE status IN ('pending','fetched','transformed')
+                                      AND canonical_url_digest <> ''
+                                      AND NOT has_shared_asset
+                                ) AS pending_reference_rows_needing_fetch,
+                                count(DISTINCT canonical_url_digest) FILTER (
+                                    WHERE canonical_url_digest <> ''
+                                      AND status IN ('pending','fetched','transformed')
+                                      AND NOT has_shared_asset
+                                ) AS pending_unique_canonical_urls_needing_fetch,
+                                count(*) FILTER (
+                                    WHERE status = 'stored' AND shared_asset_uid <> ''
+                                ) AS stored_shared_asset_links,
+                                count(*) FILTER (
+                                    WHERE status = 'stored' AND shared_asset_uid = ''
+                                ) AS unlinked_stored_reference_rows
+                            FROM derivatives
+                        ), shared AS (
+                            SELECT
+                                count(*) AS shared_assets_stored,
+                                COALESCE(sum(encrypted_size), 0) AS shared_asset_encrypted_bytes
+                            FROM pim_email_shared_assets
+                            WHERE mailbox_id = $1
+                        )
+                        SELECT
+                            (SELECT captured_count FROM captured) AS captured,
+                            (SELECT recorded_count FROM totals) AS recorded_reference_rows,
+                            COALESCE((SELECT row_count FROM rows WHERE status = 'stored'), 0) AS stored,
+                            COALESCE((SELECT row_count FROM rows WHERE status = 'blocked'), 0) AS blocked,
+                            COALESCE((SELECT row_count FROM rows WHERE status = 'failed'), 0) AS failed,
+                            COALESCE((SELECT row_count FROM rows WHERE status = 'unavailable'), 0) AS unavailable,
+                            COALESCE((SELECT sum(row_count) FROM rows WHERE status IN ('pending','fetched','transformed')), 0)
+                              + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending,
+                            (SELECT recorded_unique_canonical_urls FROM totals) AS recorded_unique_canonical_urls,
+                            (SELECT stored_unique_canonical_urls FROM totals) AS stored_unique_canonical_urls,
+                            (SELECT pending_recorded_unique_canonical_urls FROM totals)
+                                AS pending_recorded_unique_canonical_urls,
+                            (SELECT pending_reference_rows_with_shared_asset FROM totals)
+                                AS pending_reference_rows_with_shared_asset,
+                            (SELECT pending_unique_canonical_urls_with_shared_asset FROM totals)
+                                AS pending_unique_canonical_urls_with_shared_asset,
+                            (SELECT pending_reference_rows_needing_fetch FROM totals)
+                                AS pending_reference_rows_needing_fetch,
+                            (SELECT pending_unique_canonical_urls_needing_fetch FROM totals)
+                                AS pending_unique_canonical_urls_needing_fetch,
+                            GREATEST(
+                                (SELECT recorded_count FROM totals)
+                                - (SELECT recorded_unique_canonical_urls FROM totals),
+                                0
+                            ) AS recorded_duplicate_reference_rows,
+                            (SELECT stored_shared_asset_links FROM totals) AS stored_shared_asset_links,
+                            (SELECT unlinked_stored_reference_rows FROM totals)
+                                AS unlinked_stored_reference_rows,
+                            (SELECT shared_assets_stored FROM shared) AS shared_assets_stored,
+                            (SELECT shared_asset_encrypted_bytes FROM shared)
+                                AS shared_asset_encrypted_bytes
+                        """,
+                        configured_mailbox_id,
+                    )
+            with timing.span("pim_email.local_corpus_status.folder_counts"):
+                folder_counts = await conn.fetchrow(
+                    """
+                    WITH folder_effective AS (
+                        SELECT
+                            fm.folder_name,
+                            fm.remote_moved_at,
+                            CASE
+                                WHEN f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                                THEN f.special_use_role
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     IN ('archive','archives','archived')
+                                THEN 'archive'
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     IN ('draft','drafts')
+                                THEN 'drafts'
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     IN ('sent','sentmail','sentmessages','sentitems')
+                                THEN 'sent'
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     IN ('trash','rubbish','bin','deleted','deleteditems')
+                                THEN 'trash'
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     = 'junk'
+                                THEN 'junk'
+                                WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
+                                     = 'spam'
+                                THEN 'spam'
+                                ELSE ''
+                            END AS effective_special_use_role
+                        FROM pim_email_folder_memberships fm
+                        JOIN pim_email_local_folders f
+                          ON f.mailbox_id = fm.mailbox_id AND f.folder_uid = fm.folder_uid
+                        WHERE fm.mailbox_id = $1
+                    )
+                    SELECT
+                        count(*) FILTER (
+                            WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                        ) AS special_use_downloaded,
+                        count(*) FILTER (
+                            WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                              AND remote_moved_at IS NULL
+                        ) AS special_use_unmoved,
+                        count(*) FILTER (
+                            WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
+                              AND remote_moved_at IS NOT NULL
+                        ) AS special_use_moved,
+                        count(*) FILTER (
+                            WHERE (folder_name = 'INBOX' OR folder_name LIKE 'INBOX/%')
+                              AND remote_moved_at IS NOT NULL
+                        ) AS inbox_subfolders_moved
+                    FROM folder_effective
+                    """,
+                    configured_mailbox_id,
+                )
+            with timing.span("pim_email.local_corpus_status.last_run"):
+                last_run = await conn.fetchrow(
+                    """
+                    SELECT run_id, status, started_at, finished_at, summary_json
+                    FROM pim_email_download_runs
                     WHERE mailbox_id = $1
-                ), shared_digest AS (
-                    SELECT DISTINCT mailbox_id, canonical_url_digest
-                    FROM pim_email_shared_assets
-                    WHERE mailbox_id = $1 AND canonical_url_digest <> ''
-                ), derivatives AS (
-                    SELECT
-                        d.mailbox_id,
-                        d.status,
-                        d.canonical_url_digest,
-                        d.shared_asset_uid,
-                        sd.canonical_url_digest IS NOT NULL AS has_shared_asset
-                    FROM pim_email_external_image_derivatives
-                    d
-                    LEFT JOIN shared_digest sd
-                      ON sd.mailbox_id = d.mailbox_id
-                     AND sd.canonical_url_digest = d.canonical_url_digest
-                    WHERE d.mailbox_id = $1
-                ), rows AS (
-                    SELECT status, count(*) AS row_count
-                    FROM derivatives
-                    GROUP BY status
-                ), totals AS (
-                    SELECT
-                        count(*) AS recorded_count,
-                        count(DISTINCT canonical_url_digest) FILTER (
-                            WHERE canonical_url_digest <> ''
-                        ) AS recorded_unique_canonical_urls,
-                        count(DISTINCT canonical_url_digest) FILTER (
-                            WHERE canonical_url_digest <> '' AND status = 'stored'
-                        ) AS stored_unique_canonical_urls,
-                        count(DISTINCT canonical_url_digest) FILTER (
-                            WHERE canonical_url_digest <> ''
-                              AND status IN ('pending','fetched','transformed')
-                        ) AS pending_recorded_unique_canonical_urls,
-                        count(*) FILTER (
-                            WHERE status IN ('pending','fetched','transformed')
-                              AND canonical_url_digest <> ''
-                              AND has_shared_asset
-                        ) AS pending_reference_rows_with_shared_asset,
-                        count(DISTINCT canonical_url_digest) FILTER (
-                            WHERE canonical_url_digest <> ''
-                              AND status IN ('pending','fetched','transformed')
-                              AND has_shared_asset
-                        ) AS pending_unique_canonical_urls_with_shared_asset,
-                        count(*) FILTER (
-                            WHERE status IN ('pending','fetched','transformed')
-                              AND canonical_url_digest <> ''
-                              AND NOT has_shared_asset
-                        ) AS pending_reference_rows_needing_fetch,
-                        count(DISTINCT canonical_url_digest) FILTER (
-                            WHERE canonical_url_digest <> ''
-                              AND status IN ('pending','fetched','transformed')
-                              AND NOT has_shared_asset
-                        ) AS pending_unique_canonical_urls_needing_fetch,
-                        count(*) FILTER (
-                            WHERE status = 'stored' AND shared_asset_uid <> ''
-                        ) AS stored_shared_asset_links,
-                        count(*) FILTER (
-                            WHERE status = 'stored' AND shared_asset_uid = ''
-                        ) AS unlinked_stored_reference_rows
-                    FROM derivatives
-                ), shared AS (
-                    SELECT
-                        count(*) AS shared_assets_stored,
-                        COALESCE(sum(encrypted_size), 0) AS shared_asset_encrypted_bytes
-                    FROM pim_email_shared_assets
-                    WHERE mailbox_id = $1
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    configured_mailbox_id,
                 )
-                SELECT
-                    (SELECT captured_count FROM captured) AS captured,
-                    (SELECT recorded_count FROM totals) AS recorded_reference_rows,
-                    COALESCE((SELECT row_count FROM rows WHERE status = 'stored'), 0) AS stored,
-                    COALESCE((SELECT row_count FROM rows WHERE status = 'blocked'), 0) AS blocked,
-                    COALESCE((SELECT row_count FROM rows WHERE status = 'failed'), 0) AS failed,
-                    COALESCE((SELECT row_count FROM rows WHERE status = 'unavailable'), 0) AS unavailable,
-                    COALESCE((SELECT sum(row_count) FROM rows WHERE status IN ('pending','fetched','transformed')), 0)
-                      + GREATEST((SELECT captured_count FROM captured) - (SELECT recorded_count FROM totals), 0) AS pending,
-                    (SELECT recorded_unique_canonical_urls FROM totals) AS recorded_unique_canonical_urls,
-                    (SELECT stored_unique_canonical_urls FROM totals) AS stored_unique_canonical_urls,
-                    (SELECT pending_recorded_unique_canonical_urls FROM totals)
-                        AS pending_recorded_unique_canonical_urls,
-                    (SELECT pending_reference_rows_with_shared_asset FROM totals)
-                        AS pending_reference_rows_with_shared_asset,
-                    (SELECT pending_unique_canonical_urls_with_shared_asset FROM totals)
-                        AS pending_unique_canonical_urls_with_shared_asset,
-                    (SELECT pending_reference_rows_needing_fetch FROM totals)
-                        AS pending_reference_rows_needing_fetch,
-                    (SELECT pending_unique_canonical_urls_needing_fetch FROM totals)
-                        AS pending_unique_canonical_urls_needing_fetch,
-                    GREATEST(
-                        (SELECT recorded_count FROM totals)
-                        - (SELECT recorded_unique_canonical_urls FROM totals),
-                        0
-                    ) AS recorded_duplicate_reference_rows,
-                    (SELECT stored_shared_asset_links FROM totals) AS stored_shared_asset_links,
-                    (SELECT unlinked_stored_reference_rows FROM totals)
-                        AS unlinked_stored_reference_rows,
-                    (SELECT shared_assets_stored FROM shared) AS shared_assets_stored,
-                    (SELECT shared_asset_encrypted_bytes FROM shared)
-                        AS shared_asset_encrypted_bytes
-                """,
-                configured_mailbox_id,
-            )
-            folder_counts = await conn.fetchrow(
-                """
-                WITH folder_effective AS (
-                    SELECT
-                        fm.folder_name,
-                        fm.remote_moved_at,
-                        CASE
-                            WHEN f.special_use_role IN ('archive','drafts','sent','trash','junk','spam')
-                            THEN f.special_use_role
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 IN ('archive','archives','archived')
-                            THEN 'archive'
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 IN ('draft','drafts')
-                            THEN 'drafts'
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 IN ('sent','sentmail','sentmessages','sentitems')
-                            THEN 'sent'
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 IN ('trash','rubbish','bin','deleted','deleteditems')
-                            THEN 'trash'
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 = 'junk'
-                            THEN 'junk'
-                            WHEN regexp_replace(lower(split_part(f.folder_name, '/', 1)), '[^a-z0-9]+', '', 'g')
-                                 = 'spam'
-                            THEN 'spam'
-                            ELSE ''
-                        END AS effective_special_use_role
-                    FROM pim_email_folder_memberships fm
-                    JOIN pim_email_local_folders f
-                      ON f.mailbox_id = fm.mailbox_id AND f.folder_uid = fm.folder_uid
-                    WHERE fm.mailbox_id = $1
-                )
-                SELECT
-                    count(*) FILTER (
-                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
-                    ) AS special_use_downloaded,
-                    count(*) FILTER (
-                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
-                          AND remote_moved_at IS NULL
-                    ) AS special_use_unmoved,
-                    count(*) FILTER (
-                        WHERE effective_special_use_role IN ('archive','drafts','sent','trash','junk','spam')
-                          AND remote_moved_at IS NOT NULL
-                    ) AS special_use_moved,
-                    count(*) FILTER (
-                        WHERE (folder_name = 'INBOX' OR folder_name LIKE 'INBOX/%')
-                          AND remote_moved_at IS NOT NULL
-                    ) AS inbox_subfolders_moved
-                FROM folder_effective
-                """,
-                configured_mailbox_id,
-            )
-            last_run = await conn.fetchrow(
-                """
-                SELECT run_id, status, started_at, finished_at, summary_json
-                FROM pim_email_download_runs
-                WHERE mailbox_id = $1
-                ORDER BY started_at DESC
-                LIMIT 1
-                """,
-                configured_mailbox_id,
-            )
         finally:
             await conn.close()
         message_count = int(row["messages"] or 0) if row else 0
-        security_completed = int(_row_get(security_counts, "completed", 0) or 0)
         sanitized_completed = int(_row_get(sanitized_counts, "completed", 0) or 0)
         security_phase_counts: dict[str, int] = {}
         for phase_row in security_phase_rows:
@@ -2131,43 +2152,63 @@ class PgEmailStore:
             security_assignment_counts.setdefault(phase, {})[status] = int(
                 _row_get(assignment_row, "row_count", 0) or 0
             )
-        return {
-            "schema": "xarta.pim_email.local_corpus.status.v1",
-            "mailbox_id": configured_mailbox_id,
-            "message_count": message_count,
-            "folder_count": int(row["folders"] or 0) if row else 0,
-            "membership_count": int(row["memberships"] or 0) if row else 0,
-            "transformed_asset_count": int(row["transformed_assets"] or 0) if row else 0,
-            "shared_asset_count": int(row["shared_assets"] or 0) if row else 0,
-            "raw_originals": {
-                "stored": int(row["raw_originals_stored"] or 0) if row else 0,
-                "messages": message_count,
-            },
-            "security_results": {
+        if security_counts is None:
+            security_completed = None
+            security_results = {
+                "included": False,
+                "reason": "omitted_by_default",
+                "detail_query": "include_security_details=true",
+            }
+            security_phase_summary = {
+                "included": False,
+                "reason": "omitted_by_default",
+                "detail_query": "include_security_details=true",
+            }
+            security_phase_assignment_summary = {
+                "included": False,
+                "reason": "omitted_by_default",
+                "detail_query": "include_security_details=true",
+            }
+            render_gate = {
+                "included": False,
+                "reason": "security_details_omitted",
+                "detail_query": "include_security_details=true",
+            }
+        else:
+            security_completed = int(_row_get(security_counts, "completed", 0) or 0)
+            security_results = {
+                "included": True,
                 "completed": security_completed,
                 "pending": int(_row_get(security_counts, "pending", 0) or 0),
                 "pending_retryable": int(_row_get(security_counts, "pending_retryable", 0) or 0),
                 "failed": int(_row_get(security_counts, "failed", 0) or 0),
                 "missing": int(_row_get(security_counts, "missing", 0) or 0),
                 "stale_hash": int(_row_get(security_counts, "stale_hash", 0) or 0),
-            },
-            "security_phases": {
+            }
+            security_phase_summary = {
+                "included": True,
                 "deterministic_complete": security_phase_counts.get("deterministic_complete", 0),
                 "deterministic_failed_retryable": security_phase_counts.get(
                     "deterministic_failed_retryable", 0
                 ),
                 "llm_complete": security_phase_counts.get("llm_complete", 0),
                 "llm_failed_retryable": security_phase_counts.get("llm_failed_retryable", 0),
-            },
-            "security_phase_assignments": security_assignment_counts,
-            "sanitized_derivatives": {
-                "completed": sanitized_completed,
-                "pending": int(_row_get(sanitized_counts, "pending", 0) or 0),
-                "failed": int(_row_get(sanitized_counts, "failed", 0) or 0),
-                "policy_version": SANITIZED_VIEW_POLICY_VERSION,
-                "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
-            },
-            "external_image_derivatives": {
+            }
+            security_phase_assignment_summary = {"included": True, **security_assignment_counts}
+            render_gate = {
+                "included": True,
+                "blocked_security_incomplete": max(message_count - security_completed, 0),
+                "blocked_sanitized_missing": max(security_completed - sanitized_completed, 0),
+            }
+        if external_counts is None:
+            external_image_derivatives = {
+                "included": False,
+                "reason": "omitted_by_default",
+                "detail_query": "include_external_images=true",
+            }
+        else:
+            external_image_derivatives = {
+                "included": True,
                 "captured": int(_row_get(external_counts, "captured", 0) or 0),
                 "recorded_reference_rows": int(
                     _row_get(external_counts, "recorded_reference_rows", 0) or 0
@@ -2216,7 +2257,30 @@ class PgEmailStore:
                 "shared_asset_encrypted_bytes": int(
                     _row_get(external_counts, "shared_asset_encrypted_bytes", 0) or 0
                 ),
+            }
+        return {
+            "schema": "xarta.pim_email.local_corpus.status.v1",
+            "mailbox_id": configured_mailbox_id,
+            "message_count": message_count,
+            "folder_count": int(row["folders"] or 0) if row else 0,
+            "membership_count": int(row["memberships"] or 0) if row else 0,
+            "transformed_asset_count": int(row["transformed_assets"] or 0) if row else 0,
+            "shared_asset_count": int(row["shared_assets"] or 0) if row else 0,
+            "raw_originals": {
+                "stored": int(row["raw_originals_stored"] or 0) if row else 0,
+                "messages": message_count,
             },
+            "security_results": security_results,
+            "security_phases": security_phase_summary,
+            "security_phase_assignments": security_phase_assignment_summary,
+            "sanitized_derivatives": {
+                "completed": sanitized_completed,
+                "pending": int(_row_get(sanitized_counts, "pending", 0) or 0),
+                "failed": int(_row_get(sanitized_counts, "failed", 0) or 0),
+                "policy_version": SANITIZED_VIEW_POLICY_VERSION,
+                "transform_version": SANITIZED_VIEW_TRANSFORM_VERSION,
+            },
+            "external_image_derivatives": external_image_derivatives,
             "special_use_folders": {
                 "downloaded_memberships": int(
                     _row_get(folder_counts, "special_use_downloaded", 0) or 0
@@ -2227,10 +2291,7 @@ class PgEmailStore:
             "inbox_subfolders": {
                 "moved_memberships": int(_row_get(folder_counts, "inbox_subfolders_moved", 0) or 0),
             },
-            "render_gate": {
-                "blocked_security_incomplete": max(message_count - security_completed, 0),
-                "blocked_sanitized_missing": max(security_completed - sanitized_completed, 0),
-            },
+            "render_gate": render_gate,
             "available": bool(row and message_count > 0),
             "last_run": _download_run_public(last_run) if last_run else None,
             "download_orphan_reconcile": download_orphan_reconcile,
@@ -4119,6 +4180,7 @@ class PgEmailStore:
         self,
         *,
         mailbox_id: str | None = None,
+        include_worker_blocks: bool = False,
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
@@ -4134,22 +4196,30 @@ class PgEmailStore:
                 """,
                 configured_mailbox_id,
             )
-            worker_rows = await conn.fetch(
-                """
-                SELECT worker_id, run_id, assignment_batch_id, assignment_status, result_status,
-                       count(*) AS count,
-                       min(claimed_at) AS first_assigned_at,
-                       max(renewed_at) AS last_heartbeat_at,
-                       max(updated_at) AS last_updated_at,
-                       max(completed_at) AS last_completed_at
-                FROM pim_email_external_image_url_assignments
-                WHERE mailbox_id = $1
-                GROUP BY worker_id, run_id, assignment_batch_id, assignment_status, result_status
-                ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id, assignment_batch_id
-                LIMIT 200
-                """,
-                configured_mailbox_id,
-            )
+            worker_rows = []
+            if include_worker_blocks:
+                worker_rows = await conn.fetch(
+                    """
+                    SELECT worker_id, run_id, assignment_batch_id, assignment_status,
+                           result_status, count(*) AS count,
+                           min(claimed_at) AS first_assigned_at,
+                           max(renewed_at) AS last_heartbeat_at,
+                           max(updated_at) AS last_updated_at,
+                           max(completed_at) AS last_completed_at
+                    FROM pim_email_external_image_url_assignments
+                    WHERE mailbox_id = $1
+                      AND (
+                          assignment_status = 'assigned'
+                          OR updated_at >= now() - interval '24 hours'
+                      )
+                    GROUP BY worker_id, run_id, assignment_batch_id,
+                             assignment_status, result_status
+                    ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id,
+                             assignment_batch_id
+                    LIMIT 200
+                    """,
+                    configured_mailbox_id,
+                )
         finally:
             await conn.close()
         counts: dict[str, int] = {}
@@ -4165,6 +4235,7 @@ class PgEmailStore:
             "mailbox_id": configured_mailbox_id,
             "assignment_status": counts,
             "result_status": results,
+            "worker_blocks_included": bool(include_worker_blocks),
             "worker_blocks": [
                 {
                     "worker_id": str(_row_get(row, "worker_id", "") or ""),
@@ -6777,31 +6848,22 @@ class PgEmailStore:
             error_message=reason_text,
             ensure_schema=False,
         )
-        try:
-            source = await self._load_local_security_source(
-                assignment["email_uid"],
-                mailbox_id=assignment["mailbox_id"],
-            )
-            parsed = source["parsed"]
-            membership = source["membership"]
-            await self.record_security_incomplete_result(
-                mailbox_id=assignment["mailbox_id"],
-                email_uid=assignment["email_uid"],
-                raw_sha256=assignment["raw_sha256"],
-                folder=clean_folder_name(
-                    str(_row_get(membership, "folder_name", "local") or "local")
-                ),
-                uid=str(_row_get(membership, "imap_uid", assignment["email_uid"]))
-                if membership
-                else assignment["email_uid"],
-                message_id=str((parsed.get("headers") or {}).get("message_id") or ""),
-                phase=assignment["phase"],
-                error_class=str(error_class or "SecurityWorkerError"),
-                error_message=reason_text,
-                deterministic_result=deterministic_result,
-            )
-        except Exception:
-            pass
+        if assignment_status == "failed":
+            try:
+                await self.record_security_incomplete_result(
+                    mailbox_id=assignment["mailbox_id"],
+                    email_uid=assignment["email_uid"],
+                    raw_sha256=assignment["raw_sha256"],
+                    folder="local",
+                    uid=assignment["email_uid"],
+                    message_id="",
+                    phase=assignment["phase"],
+                    error_class=str(error_class or "SecurityWorkerError"),
+                    error_message=reason_text,
+                    deterministic_result=deterministic_result,
+                )
+            except Exception:
+                pass
         finished = await self._finish_security_phase_assignment(
             assignment_id=assignment["assignment_id"],
             worker_id=worker_id,
@@ -6825,6 +6887,7 @@ class PgEmailStore:
         self,
         *,
         mailbox_id: str | None = None,
+        include_worker_blocks: bool = False,
     ) -> dict[str, Any]:
         await self.ensure_schema()
         configured_mailbox_id = _configured_mailbox_id(mailbox_id)
@@ -6840,24 +6903,31 @@ class PgEmailStore:
                 """,
                 configured_mailbox_id,
             )
-            worker_rows = await conn.fetch(
-                """
-                SELECT worker_id, run_id, assignment_batch_id, phase, assignment_status,
-                       result_status, count(*) AS count,
-                       min(claimed_at) AS first_assigned_at,
-                       max(renewed_at) AS last_heartbeat_at,
-                       max(lease_expires_at) AS latest_lease_expires_at,
-                       max(updated_at) AS last_updated_at,
-                       max(completed_at) AS last_completed_at
-                FROM pim_email_security_phase_assignments
-                WHERE mailbox_id = $1
-                GROUP BY worker_id, run_id, assignment_batch_id, phase,
-                         assignment_status, result_status
-                ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id, assignment_batch_id
-                LIMIT 200
-                """,
-                configured_mailbox_id,
-            )
+            worker_rows = []
+            if include_worker_blocks:
+                worker_rows = await conn.fetch(
+                    """
+                    SELECT worker_id, run_id, assignment_batch_id, phase, assignment_status,
+                           result_status, count(*) AS count,
+                           min(claimed_at) AS first_assigned_at,
+                           max(renewed_at) AS last_heartbeat_at,
+                           max(lease_expires_at) AS latest_lease_expires_at,
+                           max(updated_at) AS last_updated_at,
+                           max(completed_at) AS last_completed_at
+                    FROM pim_email_security_phase_assignments
+                    WHERE mailbox_id = $1
+                      AND (
+                          assignment_status = 'assigned'
+                          OR updated_at >= now() - interval '24 hours'
+                      )
+                    GROUP BY worker_id, run_id, assignment_batch_id, phase,
+                             assignment_status, result_status
+                    ORDER BY last_updated_at DESC NULLS LAST, worker_id, run_id,
+                             assignment_batch_id
+                    LIMIT 200
+                    """,
+                    configured_mailbox_id,
+                )
         finally:
             await conn.close()
         by_phase: dict[str, dict[str, int]] = {}
@@ -6876,6 +6946,7 @@ class PgEmailStore:
             "mailbox_id": configured_mailbox_id,
             "assignment_status": by_phase,
             "result_status": by_result,
+            "worker_blocks_included": bool(include_worker_blocks),
             "worker_blocks": [
                 {
                     "worker_id": str(_row_get(row, "worker_id", "") or ""),

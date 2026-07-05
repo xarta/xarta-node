@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import timing
 from .events import AppEvent
 from .pim_email import (
     DEFAULT_DOWNLOADED_FOLDER,
@@ -405,16 +406,36 @@ async def _start_stack_external_image_maintenance(
 
 
 @router.get("/status")
-async def email_status() -> dict[str, Any]:
+async def email_status(
+    include_external_images: bool = Query(False),
+    include_security_details: bool = Query(False),
+    metrics: bool = Query(False),
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    stages: dict[str, float] = {}
     try:
         store = _store()
+        stage_started = time.perf_counter()
         await store.ensure_schema()
+        stages["ensure_schema_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         mailboxes = await store.public_mailboxes()
+        stages["mailboxes_seconds"] = time.perf_counter() - stage_started
         if hasattr(store, "local_corpus_status"):
-            local = await store.local_corpus_status()
+            stage_started = time.perf_counter()
+            with timing.span(
+                "pim_email.status.local_corpus",
+                include_external_images=include_external_images,
+                include_security_details=include_security_details,
+            ):
+                local = await store.local_corpus_status(
+                    include_external_images=include_external_images,
+                    include_security_details=include_security_details,
+                )
+            stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
         else:
             local = {"available": False, "message_count": 0}
-        return {
+        response = {
             "ok": True,
             "storage": "postgres",
             "mailboxes": mailboxes,
@@ -431,6 +452,9 @@ async def email_status() -> dict[str, Any]:
                 "security_checks": security_status(),
             },
         }
+        return _attach_server_metrics(
+            response, metrics=metrics, started_at=started_at, stages=stages
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -438,11 +462,32 @@ async def email_status() -> dict[str, Any]:
 @router.get("/local/status")
 async def email_local_status(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_external_images: bool = Query(False),
+    include_security_details: bool = Query(False),
+    metrics: bool = Query(False),
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    stages: dict[str, float] = {}
     try:
         store = _store()
-        status = await store.local_corpus_status(mailbox_id=mailbox_id)
-        return {"ok": True, "status": status}
+        stage_started = time.perf_counter()
+        with timing.span(
+            "pim_email.local_status.local_corpus",
+            include_external_images=include_external_images,
+            include_security_details=include_security_details,
+        ):
+            status = await store.local_corpus_status(
+                mailbox_id=mailbox_id,
+                include_external_images=include_external_images,
+                include_security_details=include_security_details,
+            )
+        stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
+        return _attach_server_metrics(
+            {"ok": True, "status": status},
+            metrics=metrics,
+            started_at=started_at,
+            stages=stages,
+        )
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -451,6 +496,7 @@ async def email_local_status(
 async def email_security_worker_status(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     include_local: bool = Query(False),
+    include_worker_blocks: bool = Query(False),
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
     metrics: bool = Query(False),
 ) -> dict[str, Any]:
@@ -460,12 +506,24 @@ async def email_security_worker_status(
     try:
         store = _store()
         stage_started = time.perf_counter()
-        assignments = await store.security_phase_assignment_status_counts(mailbox_id=mailbox_id)
+        with timing.span(
+            "pim_email.worker.security.assignment_status",
+            include_worker_blocks=include_worker_blocks,
+        ):
+            assignments = await store.security_phase_assignment_status_counts(
+                mailbox_id=mailbox_id,
+                include_worker_blocks=include_worker_blocks,
+            )
         stages["assignment_status_seconds"] = time.perf_counter() - stage_started
         response: dict[str, Any] = {"ok": True, "assignments": assignments}
         if include_local:
             stage_started = time.perf_counter()
-            response["local_corpus"] = await store.local_corpus_status(mailbox_id=mailbox_id)
+            with timing.span("pim_email.worker.security.local_status"):
+                response["local_corpus"] = await store.local_corpus_status(
+                    mailbox_id=mailbox_id,
+                    include_external_images=False,
+                    include_security_details=False,
+                )
             stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
         return _attach_server_metrics(
             response, metrics=metrics, started_at=started_at, stages=stages
@@ -484,17 +542,18 @@ async def email_security_worker_reconcile_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().enqueue_security_phase_assignments(
-            mailbox_id=body.mailbox_id,
-            phase=body.phase,
-            email_uid=body.email_uid,
-            limit=body.limit,
-            run_id=body.run_id,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.security.reconcile", phase=body.phase):
+            result = await _store().enqueue_security_phase_assignments(
+                mailbox_id=body.mailbox_id,
+                phase=body.phase,
+                email_uid=body.email_uid,
+                limit=body.limit,
+                run_id=body.run_id,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         return _attach_server_metrics(
             {"ok": True, "result": result},
             metrics=metrics,
@@ -515,18 +574,19 @@ async def email_security_worker_claim_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().claim_security_phase_assignment_block(
-            mailbox_id=body.mailbox_id,
-            phase=body.phase,
-            worker_id=body.worker_id,
-            run_id=body.run_id,
-            limit=body.limit,
-            lease_seconds=body.lease_seconds,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.security.claim", phase=body.phase):
+            result = await _store().claim_security_phase_assignment_block(
+                mailbox_id=body.mailbox_id,
+                phase=body.phase,
+                worker_id=body.worker_id,
+                run_id=body.run_id,
+                limit=body.limit,
+                lease_seconds=body.lease_seconds,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         response = {
             "ok": True,
             "schema": "xarta.pim_email.security_phase_assignment.block.v1",
@@ -562,12 +622,13 @@ async def email_security_worker_heartbeat_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().heartbeat_security_phase_assignment_block(
-            assignment_batch_id=body.assignment_batch_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            lease_seconds=body.lease_seconds,
-        )
+        with timing.span("pim_email.worker.security.heartbeat"):
+            result = await _store().heartbeat_security_phase_assignment_block(
+                assignment_batch_id=body.assignment_batch_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                lease_seconds=body.lease_seconds,
+            )
         return _attach_server_metrics(
             {"ok": True, "result": result},
             metrics=metrics,
@@ -588,12 +649,13 @@ async def email_security_worker_release_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().release_security_phase_assignment_block(
-            assignment_batch_id=body.assignment_batch_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            reason=body.reason,
-        )
+        with timing.span("pim_email.worker.security.release"):
+            result = await _store().release_security_phase_assignment_block(
+                assignment_batch_id=body.assignment_batch_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                reason=body.reason,
+            )
         return _attach_server_metrics(
             {"ok": True, "result": result},
             metrics=metrics,
@@ -615,17 +677,18 @@ async def email_security_worker_complete_assignment(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().complete_security_phase_assignment(
-            assignment_id=assignment_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            phase_result=body.phase_result,
-            security_result=body.security_result,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.security.complete"):
+            result = await _store().complete_security_phase_assignment(
+                assignment_id=assignment_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                phase_result=body.phase_result,
+                security_result=body.security_result,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         if "assignment" in result:
             result["assignment"] = _worker_safe_security_assignment(result["assignment"])
         return _attach_server_metrics(
@@ -649,19 +712,20 @@ async def email_security_worker_fail_assignment(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().fail_security_phase_assignment(
-            assignment_id=assignment_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            status=body.status,
-            reason=body.reason,
-            error_class=body.error_class,
-            retry_delay_seconds=body.retry_delay_seconds,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.security.fail"):
+            result = await _store().fail_security_phase_assignment(
+                assignment_id=assignment_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                status=body.status,
+                reason=body.reason,
+                error_class=body.error_class,
+                retry_delay_seconds=body.retry_delay_seconds,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         if "assignment" in result:
             result["assignment"] = _worker_safe_security_assignment(result["assignment"])
         return _attach_server_metrics(
@@ -678,6 +742,7 @@ async def email_security_worker_fail_assignment(
 async def email_external_image_worker_status(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     include_derivatives: bool = Query(False),
+    include_worker_blocks: bool = Query(False),
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
     metrics: bool = Query(False),
 ) -> dict[str, Any]:
@@ -687,7 +752,14 @@ async def email_external_image_worker_status(
     try:
         store = _store()
         stage_started = time.perf_counter()
-        assignments = await store.external_image_url_assignment_status_counts(mailbox_id=mailbox_id)
+        with timing.span(
+            "pim_email.worker.external_images.assignment_status",
+            include_worker_blocks=include_worker_blocks,
+        ):
+            assignments = await store.external_image_url_assignment_status_counts(
+                mailbox_id=mailbox_id,
+                include_worker_blocks=include_worker_blocks,
+            )
         stages["assignment_status_seconds"] = time.perf_counter() - stage_started
         response = {
             "ok": True,
@@ -695,7 +767,12 @@ async def email_external_image_worker_status(
         }
         if include_derivatives:
             stage_started = time.perf_counter()
-            local = await store.local_corpus_status(mailbox_id=mailbox_id)
+            with timing.span("pim_email.worker.external_images.local_status"):
+                local = await store.local_corpus_status(
+                    mailbox_id=mailbox_id,
+                    include_external_images=True,
+                    include_security_details=False,
+                )
             stages["local_corpus_status_seconds"] = time.perf_counter() - stage_started
             response["external_image_derivatives"] = local.get("external_image_derivatives", {})
         return _attach_server_metrics(
@@ -726,16 +803,17 @@ async def email_external_image_worker_claim_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().claim_external_image_url_assignment_block(
-            mailbox_id=body.mailbox_id,
-            worker_id=body.worker_id,
-            run_id=body.run_id,
-            limit=body.limit,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.external_images.claim"):
+            result = await _store().claim_external_image_url_assignment_block(
+                mailbox_id=body.mailbox_id,
+                worker_id=body.worker_id,
+                run_id=body.run_id,
+                limit=body.limit,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         response = {
             "ok": True,
             "schema": "xarta.pim_email.external_image_url_assignment.block.v1",
@@ -767,11 +845,12 @@ async def email_external_image_worker_heartbeat_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().heartbeat_external_image_url_assignment_block(
-            assignment_batch_id=body.assignment_batch_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-        )
+        with timing.span("pim_email.worker.external_images.heartbeat"):
+            result = await _store().heartbeat_external_image_url_assignment_block(
+                assignment_batch_id=body.assignment_batch_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+            )
         return _attach_server_metrics(
             {"ok": True, "result": result},
             metrics=metrics,
@@ -792,12 +871,13 @@ async def email_external_image_worker_release_assignments(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().release_external_image_url_assignment_block(
-            assignment_batch_id=body.assignment_batch_id,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            reason=body.reason,
-        )
+        with timing.span("pim_email.worker.external_images.release"):
+            result = await _store().release_external_image_url_assignment_block(
+                assignment_batch_id=body.assignment_batch_id,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                reason=body.reason,
+            )
         return _attach_server_metrics(
             {"ok": True, "result": result},
             metrics=metrics,
@@ -821,10 +901,11 @@ async def email_external_image_worker_complete_assignment(
     try:
         try:
             stage_started = time.perf_counter()
-            transformed_content = await asyncio.to_thread(
-                _decode_transformed_image_base64,
-                body.transformed_image_base64,
-            )
+            with timing.span("pim_email.worker.external_images.decode_payload"):
+                transformed_content = await asyncio.to_thread(
+                    _decode_transformed_image_base64,
+                    body.transformed_image_base64,
+                )
             stages["decode_base64_seconds"] = time.perf_counter() - stage_started
         except Exception as exc:
             raise HTTPException(
@@ -832,24 +913,25 @@ async def email_external_image_worker_complete_assignment(
                 detail="transformed_image_base64 is invalid",
             ) from exc
         stage_started = time.perf_counter()
-        result = await _store().complete_external_image_url_assignment_with_transformed_payload(
-            mailbox_id=body.mailbox_id,
-            canonical_url_digest=canonical_url_digest,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            transformed_content=transformed_content,
-            raw_image_sha256=body.raw_image_sha256,
-            transformed_sha256=body.transformed_sha256,
-            width=body.width,
-            height=body.height,
-            transform_version=body.transform_version,
-            fetched_content_type=body.fetched_content_type,
-            fetched_final_url=body.fetched_final_url,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.external_images.complete"):
+            result = await _store().complete_external_image_url_assignment_with_transformed_payload(
+                mailbox_id=body.mailbox_id,
+                canonical_url_digest=canonical_url_digest,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                transformed_content=transformed_content,
+                raw_image_sha256=body.raw_image_sha256,
+                transformed_sha256=body.transformed_sha256,
+                width=body.width,
+                height=body.height,
+                transform_version=body.transform_version,
+                fetched_content_type=body.fetched_content_type,
+                fetched_final_url=body.fetched_final_url,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         stages["complete_assignment_seconds"] = time.perf_counter() - stage_started
         if "assignment" in result:
             result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
@@ -878,18 +960,19 @@ async def email_external_image_worker_fail_assignment(
     _require_email_worker_token(x_pim_email_worker_token)
     try:
         stage_started = time.perf_counter()
-        result = await _store().fail_external_image_url_assignment(
-            mailbox_id=body.mailbox_id,
-            canonical_url_digest=canonical_url_digest,
-            worker_id=body.worker_id,
-            assignment_token=body.assignment_token,
-            status=body.status,
-            reason=body.reason,
-            metadata={
-                **body.metadata,
-                "source_surface": "pim-email-worker-api",
-            },
-        )
+        with timing.span("pim_email.worker.external_images.fail"):
+            result = await _store().fail_external_image_url_assignment(
+                mailbox_id=body.mailbox_id,
+                canonical_url_digest=canonical_url_digest,
+                worker_id=body.worker_id,
+                assignment_token=body.assignment_token,
+                status=body.status,
+                reason=body.reason,
+                metadata={
+                    **body.metadata,
+                    "source_surface": "pim-email-worker-api",
+                },
+            )
         if "assignment" in result:
             result["assignment"] = _worker_safe_assignment(result.pop("assignment"))
         return _attach_server_metrics(
