@@ -1475,6 +1475,17 @@ async def email_local_message_security(
     )
 
 
+@router.post("/local/messages/{email_uid}/probable-trusted-sender")
+async def email_local_message_probable_trusted_sender(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/probable-trusted-sender",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
 @router.get("/folders")
 async def email_folders(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
