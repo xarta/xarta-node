@@ -194,6 +194,14 @@ class LocalCacheWarmRequest(BaseModel):
     limit: int = Field(100, ge=1, le=200)
 
 
+class TrustedProbableSenderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    sender_email: str = Field(..., min_length=3, max_length=254)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExternalImageAssignmentClaimRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -374,6 +382,35 @@ async def _stack_post_json(
     try:
         async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
             response = await client.post(url, params=params or {}, json=json_body or {})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    if response.status_code >= 400:
+        detail: Any
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text or "PIM Email stack API request failed"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502, detail="PIM Email stack API returned invalid JSON"
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
+    return data
+
+
+async def _stack_delete_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
+            response = await client.delete(url, params=params or {})
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
     if response.status_code >= 400:
@@ -1483,6 +1520,41 @@ async def email_local_message_probable_trusted_sender(
     return await _stack_post_json(
         f"/local/messages/{email_uid}/probable-trusted-sender",
         params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.get("/local/trusted/probable-senders")
+async def email_local_trusted_probable_senders(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/trusted/probable-senders",
+        params=_stack_params(mailbox_id=mailbox_id, limit=limit),
+    )
+
+
+@router.post("/local/trusted/probable-senders")
+async def email_local_add_trusted_probable_sender(
+    request: TrustedProbableSenderRequest,
+) -> dict[str, Any]:
+    payload = request.model_dump(exclude_none=True)
+    mailbox_id = payload.pop("mailbox_id", None)
+    return await _stack_post_json(
+        "/local/trusted/probable-senders",
+        params=_stack_params(mailbox_id=mailbox_id),
+        json_body=payload,
+    )
+
+
+@router.delete("/local/trusted/probable-senders")
+async def email_local_remove_trusted_probable_sender(
+    sender_email: str = Query(..., min_length=3, max_length=254),
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_delete_json(
+        "/local/trusted/probable-senders",
+        params=_stack_params(mailbox_id=mailbox_id, sender_email=sender_email),
     )
 
 
