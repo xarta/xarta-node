@@ -54,11 +54,31 @@ PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY = int(
 PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES = int(
     os.environ.get("PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES", str(256 * 1024 * 1024))
 )
+PIM_EMAIL_PROXY_IMAGE_CACHE_HEADROOM_BYTES = int(
+    os.environ.get("PIM_EMAIL_PROXY_IMAGE_CACHE_HEADROOM_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+PIM_EMAIL_PROXY_IMAGE_WARM_MAX_TASKS = int(
+    os.environ.get("PIM_EMAIL_PROXY_IMAGE_WARM_MAX_TASKS", "16")
+)
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return max(0, int(parts[1]) * 1024)
+    except Exception:
+        return None
+    return None
 
 
 class _ProxyImageCache:
     def __init__(self, *, capacity_bytes: int) -> None:
-        self.capacity_bytes = max(0, int(capacity_bytes))
+        self.max_bytes = max(0, int(capacity_bytes))
         self._items: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
         self._bytes = 0
         self._hits = 0
@@ -67,8 +87,20 @@ class _ProxyImageCache:
         self._evictions = 0
         self._lock = RLock()
 
-    def _evict_until_room(self, needed_bytes: int) -> None:
-        while self._items and self._bytes + needed_bytes > self.capacity_bytes:
+    def capacity_bytes(self) -> int:
+        available = _available_memory_bytes()
+        if available is None:
+            return 0
+        return max(
+            0,
+            min(
+                self.max_bytes,
+                available - PIM_EMAIL_PROXY_IMAGE_CACHE_HEADROOM_BYTES,
+            ),
+        )
+
+    def _evict_until_room(self, needed_bytes: int, capacity: int) -> None:
+        while self._items and self._bytes + needed_bytes > capacity:
             _, removed = self._items.popitem(last=False)
             self._bytes -= int(removed.get("size") or 0)
             self._evictions += 1
@@ -89,14 +121,15 @@ class _ProxyImageCache:
         content = bytes(value.get("content") or b"")
         size = len(content) + 512
         with self._lock:
+            capacity = self.capacity_bytes()
             if key in self._items:
                 removed = self._items.pop(key)
                 self._bytes -= int(removed.get("size") or 0)
-            if self.capacity_bytes <= 0 or size > self.capacity_bytes:
+            if capacity <= 0 or size > capacity:
                 self._bytes = max(0, self._bytes)
                 return False
-            self._evict_until_room(size)
-            if self._bytes + size > self.capacity_bytes:
+            self._evict_until_room(size, capacity)
+            if self._bytes + size > capacity:
                 return False
             self._items[key] = {"value": dict(value), "size": size}
             self._bytes += size
@@ -123,7 +156,9 @@ class _ProxyImageCache:
                 "schema": "xarta.pim_email.proxy_image_cache.stats.v1",
                 "items": len(self._items),
                 "bytes": self._bytes,
-                "capacity_bytes": self.capacity_bytes,
+                "capacity_bytes": self.capacity_bytes(),
+                "max_bytes": self.max_bytes,
+                "headroom_bytes": PIM_EMAIL_PROXY_IMAGE_CACHE_HEADROOM_BYTES,
                 "hits": self._hits,
                 "misses": self._misses,
                 "puts": self._puts,
@@ -132,6 +167,7 @@ class _ProxyImageCache:
 
 
 PIM_EMAIL_PROXY_IMAGE_CACHE = _ProxyImageCache(capacity_bytes=PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES)
+PIM_EMAIL_PROXY_IMAGE_WARM_TASKS: set[asyncio.Task[dict[str, int]]] = set()
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -154,8 +190,8 @@ class LocalCacheWarmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mailbox_id: str | None = Field(None, min_length=1, max_length=120)
-    email_uids: list[str] = Field(default_factory=list, max_length=50)
-    limit: int = Field(20, ge=1, le=50)
+    email_uids: list[str] = Field(default_factory=list, max_length=200)
+    limit: int = Field(100, ge=1, le=200)
 
 
 class ExternalImageAssignmentClaimRequest(BaseModel):
@@ -493,6 +529,51 @@ async def _warm_proxy_images_for_message(
             summary["warmed"] += 1
         else:
             summary["failed"] += 1
+    return summary
+
+
+def _schedule_proxy_image_warm(
+    message: dict[str, Any] | None,
+    *,
+    mailbox_id: str | None,
+    email_uid: str,
+) -> dict[str, Any]:
+    html_value = str(((message or {}).get("views") or {}).get("html") or "")
+    refs = _proxy_local_image_refs_from_html(
+        html_value,
+        fallback_email_uid=email_uid,
+    )
+    summary: dict[str, Any] = {
+        "planned": len(refs),
+        "scheduled": False,
+        "active_tasks": len(PIM_EMAIL_PROXY_IMAGE_WARM_TASKS),
+    }
+    if not refs:
+        return summary
+    if len(PIM_EMAIL_PROXY_IMAGE_WARM_TASKS) >= max(1, PIM_EMAIL_PROXY_IMAGE_WARM_MAX_TASKS):
+        summary["reason"] = "proxy_image_warm_backlog_full"
+        return summary
+
+    async def run() -> dict[str, int]:
+        return await _warm_proxy_images_for_message(
+            message,
+            mailbox_id=mailbox_id,
+            email_uid=email_uid,
+        )
+
+    task = asyncio.create_task(run())
+    PIM_EMAIL_PROXY_IMAGE_WARM_TASKS.add(task)
+
+    def cleanup(done: asyncio.Task[dict[str, int]]) -> None:
+        PIM_EMAIL_PROXY_IMAGE_WARM_TASKS.discard(done)
+        try:
+            done.result()
+        except Exception:
+            pass
+
+    task.add_done_callback(cleanup)
+    summary["scheduled"] = True
+    summary["active_tasks"] = len(PIM_EMAIL_PROXY_IMAGE_WARM_TASKS)
     return summary
 
 
@@ -1299,7 +1380,7 @@ async def email_local_message(
     )
     message = data.get("message") if isinstance(data.get("message"), dict) else None
     if message and not message.get("body_blocked"):
-        data["proxy_image_warm"] = await _warm_proxy_images_for_message(
+        data["proxy_image_warm"] = _schedule_proxy_image_warm(
             message,
             mailbox_id=mailbox_id,
             email_uid=email_uid,
