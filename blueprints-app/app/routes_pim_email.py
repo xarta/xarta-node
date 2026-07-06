@@ -1055,10 +1055,11 @@ async def email_local_folder_messages(
     folder: str = Query("INBOX", min_length=1, max_length=180),
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=1000000),
 ) -> dict[str, Any]:
     return await _stack_get_json(
         "/local/folder-messages",
-        params=_stack_params(folder=folder, mailbox_id=mailbox_id, limit=limit),
+        params=_stack_params(folder=folder, mailbox_id=mailbox_id, limit=limit, offset=offset),
     )
 
 
@@ -1069,6 +1070,17 @@ async def email_local_message(
 ) -> dict[str, Any]:
     return await _stack_get_json(
         f"/local/messages/{email_uid}",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.post("/local/messages/{email_uid}/force-refresh")
+async def email_local_message_force_refresh(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/force-refresh",
         params=_stack_params(mailbox_id=mailbox_id),
     )
 
