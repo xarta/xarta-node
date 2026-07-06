@@ -10,8 +10,11 @@ import re
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
+from threading import RLock
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Response
@@ -44,6 +47,91 @@ PIM_EMAIL_STACK_API_BASE = os.environ.get(
 PIM_EMAIL_STACK_API_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_API_TIMEOUT_SECONDS", "10")
 )
+PIM_EMAIL_LOCAL_IMAGE_PATH = "/api/v1/personal/email/local/images"
+PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY = int(
+    os.environ.get("PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY", "8")
+)
+PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES = int(
+    os.environ.get("PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES", str(256 * 1024 * 1024))
+)
+
+
+class _ProxyImageCache:
+    def __init__(self, *, capacity_bytes: int) -> None:
+        self.capacity_bytes = max(0, int(capacity_bytes))
+        self._items: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._puts = 0
+        self._evictions = 0
+        self._lock = RLock()
+
+    def _evict_until_room(self, needed_bytes: int) -> None:
+        while self._items and self._bytes + needed_bytes > self.capacity_bytes:
+            _, removed = self._items.popitem(last=False)
+            self._bytes -= int(removed.get("size") or 0)
+            self._evictions += 1
+        self._bytes = max(0, self._bytes)
+
+    def get(self, key: tuple[str, str, str]) -> dict[str, Any] | None:
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                self._misses += 1
+                return None
+            self._items.move_to_end(key)
+            self._hits += 1
+            value = item.get("value")
+            return dict(value) if isinstance(value, dict) else None
+
+    def put(self, key: tuple[str, str, str], value: dict[str, Any]) -> bool:
+        content = bytes(value.get("content") or b"")
+        size = len(content) + 512
+        with self._lock:
+            if key in self._items:
+                removed = self._items.pop(key)
+                self._bytes -= int(removed.get("size") or 0)
+            if self.capacity_bytes <= 0 or size > self.capacity_bytes:
+                self._bytes = max(0, self._bytes)
+                return False
+            self._evict_until_room(size)
+            if self._bytes + size > self.capacity_bytes:
+                return False
+            self._items[key] = {"value": dict(value), "size": size}
+            self._bytes += size
+            self._puts += 1
+            return True
+
+    def invalidate_email(self, mailbox_id: str | None, email_uid: str) -> int:
+        mailbox = str(mailbox_id or "")
+        uid = str(email_uid or "")
+        removed_count = 0
+        with self._lock:
+            for key in list(self._items):
+                if key[0] == mailbox and key[1] == uid:
+                    removed = self._items.pop(key)
+                    self._bytes -= int(removed.get("size") or 0)
+                    self._evictions += 1
+                    removed_count += 1
+            self._bytes = max(0, self._bytes)
+        return removed_count
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "schema": "xarta.pim_email.proxy_image_cache.stats.v1",
+                "items": len(self._items),
+                "bytes": self._bytes,
+                "capacity_bytes": self.capacity_bytes,
+                "hits": self._hits,
+                "misses": self._misses,
+                "puts": self._puts,
+                "evictions": self._evictions,
+            }
+
+
+PIM_EMAIL_PROXY_IMAGE_CACHE = _ProxyImageCache(capacity_bytes=PIM_EMAIL_PROXY_IMAGE_CACHE_MAX_BYTES)
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -60,6 +148,14 @@ class DownloadMailboxRequest(BaseModel):
     limit_per_folder: int | None = Field(None, ge=1, le=5000)
     max_messages: int | None = Field(None, ge=1, le=1000000)
     convergence_passes: int = Field(2, ge=1, le=5)
+
+
+class LocalCacheWarmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    email_uids: list[str] = Field(default_factory=list, max_length=50)
+    limit: int = Field(20, ge=1, le=50)
 
 
 class ExternalImageAssignmentClaimRequest(BaseModel):
@@ -290,6 +386,114 @@ async def _stack_get_binary(path: str, *, params: dict[str, Any] | None = None) 
         media_type=response.headers.get("content-type", "application/octet-stream"),
         headers=headers,
     )
+
+
+def _proxy_local_image_ref_from_src(
+    src: str, *, fallback_email_uid: str = ""
+) -> tuple[str, str] | None:
+    clean = str(src or "").strip()
+    if not clean:
+        return None
+    parsed = urlsplit(clean)
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        return None
+    path = unquote(parsed.path or "")
+    if not path.startswith(f"{PIM_EMAIL_LOCAL_IMAGE_PATH}/"):
+        return None
+    shared_uid = path[len(f"{PIM_EMAIL_LOCAL_IMAGE_PATH}/") :]
+    email_uid = (parse_qs(parsed.query or "").get("email_uid") or [fallback_email_uid or ""])[0]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,179}", shared_uid):
+        return None
+    if not re.fullmatch(r"[0-9]{8}-[0-9a-f]{40}", email_uid):
+        return None
+    return shared_uid, email_uid
+
+
+def _proxy_local_image_refs_from_html(
+    html_value: str,
+    *,
+    fallback_email_uid: str,
+    limit: int = 120,
+) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in re.finditer(
+        r"<img\b[^>]*\bsrc\s*=\s*(['\"])(.*?)\1", str(html_value or ""), re.I | re.S
+    ):
+        ref = _proxy_local_image_ref_from_src(
+            match.group(2),
+            fallback_email_uid=fallback_email_uid,
+        )
+        if ref is None or ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+        if len(refs) >= limit:
+            break
+    return refs
+
+
+async def _warm_proxy_images_for_message(
+    message: dict[str, Any] | None,
+    *,
+    mailbox_id: str | None,
+    email_uid: str,
+) -> dict[str, int]:
+    html_value = str(((message or {}).get("views") or {}).get("html") or "")
+    refs = _proxy_local_image_refs_from_html(
+        html_value,
+        fallback_email_uid=email_uid,
+    )
+    summary = {
+        "planned": len(refs),
+        "warmed": 0,
+        "already_cached": 0,
+        "failed": 0,
+    }
+    if not refs:
+        return summary
+    semaphore = asyncio.Semaphore(max(1, PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY))
+
+    async def warm_one(ref: tuple[str, str]) -> str:
+        shared_uid, ref_email_uid = ref
+        key = (str(mailbox_id or ""), ref_email_uid, shared_uid)
+        if PIM_EMAIL_PROXY_IMAGE_CACHE.get(key) is not None:
+            return "already_cached"
+        async with semaphore:
+            try:
+                response = await _stack_get_binary(
+                    f"/local/images/{shared_uid}",
+                    params=_stack_params(email_uid=ref_email_uid, mailbox_id=mailbox_id),
+                )
+                headers = {
+                    name: value
+                    for name, value in {
+                        "Cache-Control": response.headers.get("cache-control"),
+                        "ETag": response.headers.get("etag"),
+                        "X-Content-Type-Options": response.headers.get("x-content-type-options"),
+                    }.items()
+                    if value
+                }
+                PIM_EMAIL_PROXY_IMAGE_CACHE.put(
+                    key,
+                    {
+                        "content": bytes(response.body or b""),
+                        "media_type": response.media_type or "image/jpeg",
+                        "headers": headers,
+                    },
+                )
+                return "warmed"
+            except Exception:
+                return "failed"
+
+    for status in await asyncio.gather(*(warm_one(ref) for ref in refs)):
+        if status == "already_cached":
+            summary["already_cached"] += 1
+        elif status == "warmed":
+            summary["warmed"] += 1
+        else:
+            summary["failed"] += 1
+    return summary
 
 
 def _clean_security_run_id(value: str | None = None) -> str:
@@ -1063,15 +1267,44 @@ async def email_local_folder_messages(
     )
 
 
+@router.get("/local/cache/status")
+async def email_local_cache_status(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    data = await _stack_get_json(
+        "/local/cache/status",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+    data["proxy_image_cache"] = PIM_EMAIL_PROXY_IMAGE_CACHE.stats()
+    return data
+
+
+@router.post("/local/cache/warm")
+async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/cache/warm",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
 @router.get("/local/messages/{email_uid}")
 async def email_local_message(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> dict[str, Any]:
-    return await _stack_get_json(
+    data = await _stack_get_json(
         f"/local/messages/{email_uid}",
         params=_stack_params(mailbox_id=mailbox_id),
     )
+    message = data.get("message") if isinstance(data.get("message"), dict) else None
+    if message and not message.get("body_blocked"):
+        data["proxy_image_warm"] = await _warm_proxy_images_for_message(
+            message,
+            mailbox_id=mailbox_id,
+            email_uid=email_uid,
+        )
+    return data
 
 
 @router.post("/local/messages/{email_uid}/force-refresh")
@@ -1079,10 +1312,19 @@ async def email_local_message_force_refresh(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> dict[str, Any]:
-    return await _stack_post_json(
-        f"/local/messages/{email_uid}/force-refresh",
-        params=_stack_params(mailbox_id=mailbox_id),
-    )
+    proxy_invalidated = PIM_EMAIL_PROXY_IMAGE_CACHE.invalidate_email(mailbox_id, email_uid)
+    try:
+        data = await _stack_post_json(
+            f"/local/messages/{email_uid}/force-refresh",
+            params=_stack_params(mailbox_id=mailbox_id),
+        )
+    except HTTPException as exc:
+        if isinstance(exc.detail, dict):
+            exc.detail["proxy_image_cache_invalidated"] = proxy_invalidated
+        raise
+    proxy_invalidated += PIM_EMAIL_PROXY_IMAGE_CACHE.invalidate_email(mailbox_id, email_uid)
+    data["proxy_image_cache_invalidated"] = proxy_invalidated
+    return data
 
 
 @router.get("/local/images/{shared_asset_uid}")
@@ -1091,9 +1333,42 @@ async def email_local_image(
     email_uid: str = Query(..., min_length=8, max_length=80),
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> Response:
-    return await _stack_get_binary(
+    cache_key = (str(mailbox_id or ""), str(email_uid or ""), str(shared_asset_uid or ""))
+    cached = PIM_EMAIL_PROXY_IMAGE_CACHE.get(cache_key)
+    if cached is not None:
+        headers = dict(cached.get("headers") or {})
+        headers["X-PIM-Email-Image-Cache"] = "hit"
+        return Response(
+            content=bytes(cached.get("content") or b""),
+            media_type=str(cached.get("media_type") or "image/jpeg"),
+            headers=headers,
+        )
+    response = await _stack_get_binary(
         f"/local/images/{shared_asset_uid}",
         params=_stack_params(email_uid=email_uid, mailbox_id=mailbox_id),
+    )
+    headers = {
+        key: value
+        for key, value in {
+            "Cache-Control": response.headers.get("cache-control"),
+            "ETag": response.headers.get("etag"),
+            "X-Content-Type-Options": response.headers.get("x-content-type-options"),
+        }.items()
+        if value
+    }
+    PIM_EMAIL_PROXY_IMAGE_CACHE.put(
+        cache_key,
+        {
+            "content": bytes(response.body or b""),
+            "media_type": response.media_type or "image/jpeg",
+            "headers": headers,
+        },
+    )
+    headers["X-PIM-Email-Image-Cache"] = "miss"
+    return Response(
+        content=bytes(response.body or b""),
+        media_type=response.media_type or "image/jpeg",
+        headers=headers,
     )
 
 
