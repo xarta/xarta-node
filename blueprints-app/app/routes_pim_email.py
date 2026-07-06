@@ -47,6 +47,9 @@ PIM_EMAIL_STACK_API_BASE = os.environ.get(
 PIM_EMAIL_STACK_API_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_API_TIMEOUT_SECONDS", "10")
 )
+PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS = float(
+    os.environ.get("PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS", "45")
+)
 PIM_EMAIL_LOCAL_IMAGE_PATH = "/api/v1/personal/email/local/images"
 PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY = int(
     os.environ.get("PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY", "8")
@@ -352,6 +355,8 @@ async def _stack_get_json(path: str, *, params: dict[str, Any] | None = None) ->
     try:
         async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
             response = await client.get(url, params=params or {})
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
     if response.status_code >= 400:
@@ -377,11 +382,17 @@ async def _stack_post_json(
     *,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    timeout = (
+        timeout_seconds if timeout_seconds is not None else PIM_EMAIL_STACK_API_TIMEOUT_SECONDS
+    )
     try:
-        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url, params=params or {}, json=json_body or {})
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
     if response.status_code >= 400:
@@ -411,6 +422,8 @@ async def _stack_delete_json(
     try:
         async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
             response = await client.delete(url, params=params or {})
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
     if response.status_code >= 400:
@@ -436,6 +449,8 @@ async def _stack_get_binary(path: str, *, params: dict[str, Any] | None = None) 
     try:
         async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
             response = await client.get(url, params=params or {})
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
     if response.status_code >= 400:
@@ -1435,6 +1450,7 @@ async def email_local_message_force_refresh(
         data = await _stack_post_json(
             f"/local/messages/{email_uid}/force-refresh",
             params=_stack_params(mailbox_id=mailbox_id),
+            timeout_seconds=PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS,
         )
     except HTTPException as exc:
         if isinstance(exc.detail, dict):
