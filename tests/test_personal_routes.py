@@ -860,6 +860,67 @@ def test_personal_events_filters_and_shape(monkeypatch):
     assert item["related"]["kanban_items"] == ["work-1"]
 
 
+def test_personal_event_date_filters_include_calendar_spans(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, kind, title, local_date, timezone, status,
+            tags_json, provenance_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-span",
+            "manual",
+            "personal-log",
+            "Liz visiting Hilary",
+            "2026-07-23",
+            "Europe/London",
+            "open",
+            json.dumps(["diary", "all-day"]),
+            json.dumps(
+                {
+                    "calendar": {
+                        "all_day": True,
+                        "local_start_time": "",
+                        "local_end_time": "",
+                        "local_end_date": "2026-07-29",
+                        "timezone": "Europe/London",
+                    }
+                }
+            ),
+        ),
+    )
+
+    visible = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-07-26",
+            date_end="2026-07-26",
+            tag="diary",
+            limit=20,
+            offset=0,
+        )
+    )
+    outside = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-07-30",
+            date_end="2026-07-30",
+            tag="diary",
+            limit=20,
+            offset=0,
+        )
+    )
+    day_events, pin_hidden, source_counts = routes_personal._visible_day_events("2026-07-26")
+
+    assert [item["event_id"] for item in visible["items"]] == ["evt-span"]
+    assert outside["items"] == []
+    assert [item["event_id"] for item in day_events] == ["evt-span"]
+    assert pin_hidden == 0
+    assert source_counts["manual"] == 1
+
+
 def test_personal_import_batches_and_sources(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -1509,6 +1570,103 @@ def test_diary_entry_write_projects_audit_and_rehydrates(monkeypatch, tmp_path):
         (event["event_id"],),
     ).fetchone()
     assert delete_sync is not None
+
+
+def test_diary_entry_write_keeps_date_range_as_one_event(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    monkeypatch.setattr(routes_personal, "DIARY_ROOT", tmp_path)
+
+    created = asyncio.run(
+        routes_personal.create_diary_day_entry(
+            routes_personal.DiaryEntryCreateRequest(
+                body="Liz visiting Hilary",
+                local_date="2026-07-24",
+                range_start_date="2026-07-23",
+                range_end_date="2026-07-29",
+                all_day=True,
+                tags=["liz-away"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="range-write-test",
+            )
+        )
+    )
+
+    event = created["event"]
+    rows = conn.execute(
+        "SELECT event_id, local_date, provenance_json FROM personal_events"
+    ).fetchall()
+    day_events, _, source_counts = routes_personal._visible_day_events("2026-07-26")
+
+    assert created["ok"] is True
+    assert event["local_date"] == "2026-07-23"
+    assert event["provenance"]["calendar"]["local_end_date"] == "2026-07-29"
+    assert "liz-away" in event["tags"]
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == event["event_id"]
+    assert rows[0]["local_date"] == "2026-07-23"
+    assert json.loads(rows[0]["provenance_json"])["calendar"]["local_end_date"] == "2026-07-29"
+    assert [item["event_id"] for item in day_events] == [event["event_id"]]
+    assert source_counts["manual"] == 1
+
+
+def test_calendar_event_write_keeps_date_range_as_one_event(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    created = asyncio.run(
+        routes_personal.create_calendar_event(
+            routes_personal.CalendarEventUpsertRequest(
+                title="Liz visiting Hilary",
+                body="Away",
+                local_date="2026-07-24",
+                range_start_date="2026-07-23",
+                range_end_date="2026-07-29",
+                all_day=True,
+                tags=["liz-away"],
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="calendar-range-write-test",
+            )
+        )
+    )
+
+    event = created["event"]
+    rows = conn.execute(
+        "SELECT event_id, local_date, provenance_json FROM personal_events"
+    ).fetchall()
+    visible = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-07-26",
+            date_end="2026-07-26",
+            source_type="manual-calendar",
+            limit=20,
+            offset=0,
+        )
+    )
+    outside = asyncio.run(
+        routes_personal.list_personal_events(
+            date_start="2026-07-30",
+            date_end="2026-07-30",
+            source_type="manual-calendar",
+            limit=20,
+            offset=0,
+        )
+    )
+
+    assert created["ok"] is True
+    assert event["local_date"] == "2026-07-23"
+    assert event["provenance"]["calendar"]["local_end_date"] == "2026-07-29"
+    assert "liz-away" in event["tags"]
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == event["event_id"]
+    assert rows[0]["local_date"] == "2026-07-23"
+    assert json.loads(rows[0]["provenance_json"])["calendar"]["local_end_date"] == "2026-07-29"
+    assert [item["event_id"] for item in visible["items"]] == [event["event_id"]]
+    assert outside["items"] == []
 
 
 def test_diary_entry_write_classifies_automation_proof_outside_personal_log(monkeypatch, tmp_path):
