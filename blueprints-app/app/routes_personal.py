@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
@@ -7799,6 +7799,24 @@ def _personal_search_where(
     return where, params
 
 
+def _is_short_personal_search_window(
+    date_start: str | None,
+    date_end: str | None,
+    *,
+    max_days: int = 31,
+) -> bool:
+    if not date_start and not date_end:
+        return False
+    try:
+        start = date.fromisoformat(date_start or date_end or "")
+        end = date.fromisoformat(date_end or date_start or "")
+    except ValueError:
+        return False
+    if end < start:
+        start, end = end, start
+    return (end - start).days <= max_days
+
+
 def _personal_exact_candidates(
     conn: Any,
     q: str,
@@ -8079,14 +8097,14 @@ async def search_personal_activity(
     tag: str | None = None,
     include_vector: bool = True,
     rerank_results: bool = True,
-    sync: bool = True,
+    sync: bool = False,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> dict[str, Any]:
     query = (q or "").strip()
     sync_summary = None
     if sync:
         sync_summary = await _sync_personal_search_index(
-            include_embeddings=include_vector,
+            include_embeddings=False,
             limit=max(limit * 4, 40),
         )
     where, params = _personal_search_where(
@@ -8125,7 +8143,8 @@ async def search_personal_activity(
     document_rows = {row["document_id"]: row for row in all_doc_rows}
     vector_rows: list[dict[str, Any]] = []
     vector_status = {"status": "skipped", "error": "", "candidate_count": 0}
-    if include_vector:
+    short_date_window = _is_short_personal_search_window(date_start, date_end)
+    if include_vector and not short_date_window:
         vector_rows, vector_status = await _personal_vector_candidates(query, limit=window)
     results = _merge_personal_candidates(
         exact_rows=exact_rows,
@@ -8135,7 +8154,7 @@ async def search_personal_activity(
         limit=window,
     )
     rerank_status = {"status": "skipped", "error": "", "candidate_count": len(results)}
-    if rerank_results:
+    if rerank_results and not short_date_window:
         results, rerank_status = await _rerank_personal_results(query, results, limit=limit)
     else:
         results = results[:limit]

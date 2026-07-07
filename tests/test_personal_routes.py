@@ -2628,6 +2628,144 @@ def test_personal_search_vector_sync_does_not_hold_sqlite_across_await(monkeypat
     assert row["vector_index_status"] == "indexed"
 
 
+def test_personal_search_get_sync_skips_embedding_indexing(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _disable_import_status_sync(monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO personal_events (
+            event_id, source_type, source_ref, source_hash, kind, title,
+            body_excerpt, content_projection, local_date, timezone, status, tags_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "evt-fast-search-sync",
+            "manual-calendar",
+            "calendar:fast-search-sync",
+            "sha256:fast-search-sync",
+            "calendar-event",
+            "Dentist proof",
+            "Search should not rebuild embeddings interactively",
+            "Search should not rebuild embeddings interactively",
+            "2026-07-09",
+            "Europe/London",
+            "open",
+            json.dumps(["health"]),
+        ),
+    )
+
+    async def fail_vector_sync(**_kwargs):
+        raise AssertionError("GET /personal/search must not perform embedding sync")
+
+    vector_called = False
+
+    async def fake_vector_candidates(q: str, *, limit: int):
+        nonlocal vector_called
+        vector_called = True
+        return [], {"status": "ok", "error": "", "candidate_count": 0}
+
+    monkeypatch.setattr(routes_personal, "_sync_personal_search_vectors", fail_vector_sync)
+    monkeypatch.setattr(routes_personal, "_personal_vector_candidates", fake_vector_candidates)
+
+    result = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="dentist",
+            date_start="2026-07-06",
+            date_end="2026-07-12",
+            include_vector=True,
+            rerank_results=True,
+            sync=True,
+            limit=10,
+        )
+    )
+
+    assert result["subsystems"]["sync"]["documents"]["document_count"] == 1
+    assert result["subsystems"]["sync"]["vector"]["status"] == "skipped"
+    assert result["subsystems"]["vector"]["status"] == "skipped"
+    assert result["subsystems"]["rerank"]["status"] == "skipped"
+    assert vector_called is False
+    assert result["results"][0]["document_id"] == "personal_events:evt-fast-search-sync"
+
+
+def test_personal_search_get_defaults_to_no_sync(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _disable_import_status_sync(monkeypatch)
+    conn.execute(
+        """
+        INSERT INTO personal_search_documents (
+            document_id, record_type, record_table, record_id, source_type,
+            source_ref, source_hash, title, body, search_text, local_date,
+            status, mode, privacy_level, tags_json, related_refs_json,
+            page_ref_json, source_refs_json, provenance_json, score_metadata_json,
+            vector_index_key
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "personal_events:evt-default-nosync",
+            "calendar",
+            "personal_events",
+            "evt-default-nosync",
+            "manual-calendar",
+            "calendar:default-nosync",
+            "sha256:default-nosync",
+            "Dentist default proof",
+            "Existing indexed document",
+            "Dentist default proof Existing indexed document",
+            "2026-07-09",
+            "open",
+            "calendar",
+            "normal",
+            json.dumps(["health"]),
+            "[]",
+            json.dumps({"group": "dave", "tab": "calendar", "date": "2026-07-09"}),
+            json.dumps(["personal_events:evt-default-nosync"]),
+            "{}",
+            "{}",
+            "personal_events:evt-default-nosync",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO personal_search_fts (
+            document_id, title, body, search_text, tags, source_type, record_type
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "personal_events:evt-default-nosync",
+            "Dentist default proof",
+            "Existing indexed document",
+            "Dentist default proof Existing indexed document",
+            "health",
+            "manual-calendar",
+            "calendar",
+        ),
+    )
+
+    async def fail_search_sync(**_kwargs):
+        raise AssertionError("GET /personal/search should not sync by default")
+
+    monkeypatch.setattr(routes_personal, "_sync_personal_search_index", fail_search_sync)
+
+    result = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="dentist",
+            date_start="2026-07-06",
+            date_end="2026-07-12",
+            include_vector=False,
+            rerank_results=False,
+            limit=10,
+        )
+    )
+
+    assert result["subsystems"]["sync"] is None
+    assert result["results"][0]["document_id"] == "personal_events:evt-default-nosync"
+
+
 def test_personal_search_vector_only_candidate_and_reranker(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
