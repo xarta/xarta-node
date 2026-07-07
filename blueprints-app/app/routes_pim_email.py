@@ -200,6 +200,30 @@ class LocalCacheWarmRequest(BaseModel):
     limit: int = Field(100, ge=1, le=200)
 
 
+class LocalMessageOpenedRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    request_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LocalVirtualPathRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    virtual_path: str = Field("", max_length=180)
+    operation: str = Field("add", max_length=24)
+    source_virtual_path: str = Field("", max_length=180)
+    destination_virtual_path: str = Field("", max_length=180)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    request_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class EmailSearchRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1444,6 +1468,16 @@ async def email_local_cache_status(
     return data
 
 
+@router.get("/local/virtual-paths/audit-gate")
+async def email_local_virtual_paths_audit_gate(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/virtual-paths/audit-gate",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
 @router.post("/local/cache/warm")
 async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
     return await _stack_post_json(
@@ -1457,19 +1491,56 @@ async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
 async def email_local_message(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    opened: bool = Query(True),
 ) -> dict[str, Any]:
     data = await _stack_get_json(
         f"/local/messages/{email_uid}",
-        params=_stack_params(mailbox_id=mailbox_id),
+        params=_stack_params(mailbox_id=mailbox_id, opened=opened),
     )
     message = data.get("message") if isinstance(data.get("message"), dict) else None
-    if message and not message.get("body_blocked"):
+    if opened and message and not message.get("body_blocked"):
         data["proxy_image_warm"] = _schedule_proxy_image_warm(
             message,
             mailbox_id=mailbox_id,
             email_uid=email_uid,
         )
     return data
+
+
+@router.post("/local/messages/{email_uid}/opened")
+async def email_local_message_opened(
+    email_uid: str,
+    body: LocalMessageOpenedRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/opened",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.get("/local/messages/{email_uid}/actions")
+async def email_local_message_actions(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        f"/local/messages/{email_uid}/actions",
+        params=_stack_params(mailbox_id=mailbox_id, limit=limit),
+    )
+
+
+@router.post("/local/messages/{email_uid}/virtual-path")
+async def email_local_message_virtual_path(
+    email_uid: str,
+    body: LocalVirtualPathRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/virtual-path",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
 
 
 @router.post("/local/messages/{email_uid}/force-refresh")
