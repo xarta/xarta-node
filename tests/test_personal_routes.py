@@ -2628,7 +2628,7 @@ def test_personal_search_vector_sync_does_not_hold_sqlite_across_await(monkeypat
     assert row["vector_index_status"] == "indexed"
 
 
-def test_personal_search_get_sync_skips_embedding_indexing(monkeypatch):
+def test_personal_search_get_sync_skips_embedding_indexing_but_runs_requested_vector(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     _disable_import_status_sync(monkeypatch)
@@ -2664,7 +2664,16 @@ def test_personal_search_get_sync_skips_embedding_indexing(monkeypatch):
     async def fake_vector_candidates(q: str, *, limit: int):
         nonlocal vector_called
         vector_called = True
-        return [], {"status": "ok", "error": "", "candidate_count": 0}
+        return (
+            [
+                {
+                    "id": "personal_events:evt-fast-search-sync",
+                    "metadata": {"document_id": "personal_events:evt-fast-search-sync"},
+                    "distance": 0.07,
+                }
+            ],
+            {"status": "ok", "error": "", "candidate_count": 1},
+        )
 
     monkeypatch.setattr(routes_personal, "_sync_personal_search_vectors", fail_vector_sync)
     monkeypatch.setattr(routes_personal, "_personal_vector_candidates", fake_vector_candidates)
@@ -2683,9 +2692,9 @@ def test_personal_search_get_sync_skips_embedding_indexing(monkeypatch):
 
     assert result["subsystems"]["sync"]["documents"]["document_count"] == 1
     assert result["subsystems"]["sync"]["vector"]["status"] == "skipped"
-    assert result["subsystems"]["vector"]["status"] == "skipped"
+    assert result["subsystems"]["vector"]["status"] == "ok"
     assert result["subsystems"]["rerank"]["status"] == "skipped"
-    assert vector_called is False
+    assert vector_called is True
     assert result["results"][0]["document_id"] == "personal_events:evt-fast-search-sync"
 
 
