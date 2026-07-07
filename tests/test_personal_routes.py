@@ -2394,7 +2394,12 @@ def test_personal_search_sync_exact_fts_and_filters(monkeypatch):
             "open",
             json.dumps(["diary", "proof"]),
             json.dumps(["work-search"]),
-            json.dumps({"file_ref": "2026/06/18/10-20-personal-log.md"}),
+            json.dumps(
+                {
+                    "file_ref": "2026/06/18/10-20-personal-log.md",
+                    "calendar": {"local_end_date": "2026-06-20"},
+                }
+            ),
         ),
     )
     conn.execute(
@@ -2438,7 +2443,26 @@ def test_personal_search_sync_exact_fts_and_filters(monkeypatch):
     )
     assert needle["subsystems"]["fts"]["candidate_count"] >= 1
     assert needle["results"][0]["document_id"] == "personal_events:evt-diary-search"
+    assert needle["results"][0]["date_span"] == {
+        "start": "2026-06-18",
+        "end": "2026-06-20",
+        "is_range": True,
+        "label": "2026-06-18 to 2026-06-20",
+    }
     assert {"exact", "fts_bm25"}.issubset(set(needle["results"][0]["score"]["score_sources"]))
+
+    overlap = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="Needle",
+            date_start="2026-06-19",
+            date_end="2026-06-19",
+            include_vector=False,
+            rerank_results=False,
+            sync=False,
+            limit=10,
+        )
+    )
+    assert overlap["results"][0]["document_id"] == "personal_events:evt-diary-search"
 
     imports = asyncio.run(
         routes_personal.search_personal_activity(

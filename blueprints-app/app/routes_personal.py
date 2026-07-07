@@ -7773,10 +7773,17 @@ def _personal_search_where(
 ) -> tuple[list[str], list[Any]]:
     where = ["d.privacy_level != 'pin'"]
     params: list[Any] = []
-    if date_start:
-        where.append("d.local_date >= ?")
+    local_end_expr = (
+        "COALESCE(NULLIF(json_extract(d.provenance_json, '$.calendar.local_end_date'), ''), "
+        "d.local_date)"
+    )
+    if date_start and date_end:
+        where.append(f"d.local_date <= ? AND {local_end_expr} >= ?")
+        params.extend([date_end, date_start])
+    elif date_start:
+        where.append(f"{local_end_expr} >= ?")
         params.append(date_start)
-    if date_end:
+    elif date_end:
         where.append("d.local_date <= ?")
         params.append(date_end)
     if source_type:
@@ -7909,6 +7916,32 @@ async def _personal_vector_candidates(
         return [], {"status": "error", "error": err, "candidate_count": 0}
 
 
+def _clean_search_date(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else ""
+
+
+def _row_date_span(row: dict[str, Any]) -> dict[str, Any] | None:
+    start = _clean_search_date(row.get("local_date"))
+    provenance = _json_value(row.get("provenance_json"), {})
+    calendar = provenance.get("calendar") if isinstance(provenance, dict) else {}
+    end = _clean_search_date(calendar.get("local_end_date")) if isinstance(calendar, dict) else ""
+    if not start and not end:
+        return None
+    if start and not end:
+        end = start
+    if end and not start:
+        start = end
+    if end < start:
+        start, end = end, start
+    return {
+        "start": start,
+        "end": end,
+        "is_range": start != end,
+        "label": f"{start} to {end}" if start != end else start,
+    }
+
+
 def _row_to_search_result(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "document_id": row["document_id"],
@@ -7918,6 +7951,7 @@ def _row_to_search_result(row: dict[str, Any]) -> dict[str, Any]:
         "title": row["title"],
         "body_excerpt": _body_excerpt(row["body"] or row["search_text"], limit=360),
         "local_date": row["local_date"],
+        "date_span": _row_date_span(row),
         "status": row["status"],
         "mode": row["mode"],
         "source": {
