@@ -50,6 +50,9 @@ PIM_EMAIL_STACK_API_TIMEOUT_SECONDS = float(
 PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS", "45")
 )
+PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS = float(
+    os.environ.get("PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS", "60")
+)
 PIM_EMAIL_LOCAL_IMAGE_PATH = "/api/v1/personal/email/local/images"
 PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY = int(
     os.environ.get("PIM_EMAIL_PROXY_IMAGE_WARM_CONCURRENCY", "8")
@@ -195,6 +198,26 @@ class LocalCacheWarmRequest(BaseModel):
     mailbox_id: str | None = Field(None, min_length=1, max_length=120)
     email_uids: list[str] = Field(default_factory=list, max_length=200)
     limit: int = Field(100, ge=1, le=200)
+
+
+class EmailSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    mode: str = Field("simple", max_length=20)
+    query: str = Field("", max_length=1000)
+    terms: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    folder: str = Field("", max_length=180)
+    folder_uid: str = Field("", max_length=180)
+    sent_from: str = Field("", max_length=80)
+    sent_to: str = Field("", max_length=80)
+    received_from: str = Field("", max_length=80)
+    received_to: str = Field("", max_length=80)
+    date_ranges: dict[str, Any] = Field(default_factory=dict)
+    hybrid: bool = True
+    rerank: bool = True
+    limit: int = Field(50, ge=1, le=200)
+    offset: int = Field(0, ge=0, le=1000000)
 
 
 class TrustedProbableSenderRequest(BaseModel):
@@ -1397,6 +1420,15 @@ async def email_local_folder_messages(
     return await _stack_get_json(
         "/local/folder-messages",
         params=_stack_params(folder=folder, mailbox_id=mailbox_id, limit=limit, offset=offset),
+    )
+
+
+@router.post("/local/search")
+async def email_local_search(body: EmailSearchRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/search",
+        json_body=body.model_dump(exclude_none=True),
+        timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
     )
 
 
