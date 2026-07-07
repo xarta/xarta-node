@@ -219,6 +219,9 @@ DEFAULT_PERSONAL_GIT_REPOS: tuple[tuple[str, str, str], ...] = (
     ("p100", "/root/xarta-node/.xarta", "Private inner workspace"),
     ("p400", "/xarta-node/.lone-wolf", "Node-local lone-wolf workspace"),
 )
+PERSONAL_EVENT_LOCAL_END_DATE_SQL = (
+    "COALESCE(NULLIF(json_extract(provenance_json, '$.calendar.local_end_date'), ''), local_date)"
+)
 
 PERSONAL_MODES: dict[str, dict[str, Any]] = {
     "today": {
@@ -672,6 +675,8 @@ class CalendarEventUpsertRequest(BaseModel):
     title: str
     body: str | None = None
     local_date: str
+    range_start_date: str | None = None
+    range_end_date: str | None = None
     start_time: str | None = None
     end_time: str | None = None
     timezone: str | None = None
@@ -8359,10 +8364,13 @@ def _list_personal_events_sync(
 ) -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
-    if date_start:
-        where.append("local_date >= ?")
+    if date_start and date_end:
+        where.append(f"local_date <= ? AND {PERSONAL_EVENT_LOCAL_END_DATE_SQL} >= ?")
+        params.extend([date_end, date_start])
+    elif date_start:
+        where.append(f"{PERSONAL_EVENT_LOCAL_END_DATE_SQL} >= ?")
         params.append(date_start)
-    if date_end:
+    elif date_end:
         where.append("local_date <= ?")
         params.append(date_end)
     if source_type:
@@ -21217,12 +21225,17 @@ def _calendar_event_payload(
     *,
     event_id: str | None = None,
 ) -> dict[str, Any]:
-    local_date = _validate_local_date(body.local_date)
+    raw_local_date = _validate_local_date(body.local_date)
+    range_start_date = _validate_local_date(body.range_start_date or raw_local_date)
+    range_end_date = _validate_local_date(body.range_end_date or range_start_date)
+    if range_end_date < range_start_date:
+        range_start_date, range_end_date = range_end_date, range_start_date
+    local_date = range_start_date
     timezone_name = _validate_timezone_name(body.timezone)
     start_time = None if body.all_day else _validate_local_time(body.start_time)
     end_time = None if body.all_day else _validate_local_time(body.end_time)
     start_at = _calendar_utc_iso(local_date, start_time, timezone_name)
-    end_at = _calendar_utc_iso(local_date, end_time, timezone_name) if end_time else None
+    end_at = _calendar_utc_iso(range_end_date, end_time, timezone_name) if end_time else None
     if end_at and end_at < start_at:
         raise HTTPException(400, "end time must not be before start time")
     title = _clean_short_text(body.title, "", limit=180)
@@ -21249,6 +21262,7 @@ def _calendar_event_payload(
             "all_day": bool(body.all_day),
             "local_start_time": start_time or "",
             "local_end_time": end_time or "",
+            "local_end_date": range_end_date,
             "timezone": timezone_name,
         },
         "actor": _clean_short_text(body.actor, "blueprints-ui"),
@@ -21392,6 +21406,7 @@ def _upsert_calendar_event(
             source_hash=payload["source_hash"],
             metadata={
                 "local_date": payload["local_date"],
+                "range_end_date": payload["provenance"]["calendar"].get("local_end_date"),
                 "kind": payload["kind"],
                 "all_day": bool(payload["provenance"]["calendar"]["all_day"]),
             },
@@ -21451,7 +21466,12 @@ async def update_calendar_event(event_id: str, body: CalendarEventUpsertRequest)
         if result:
             return result
     if existing["source_type"] != "manual-calendar":
-        local_date = _validate_local_date(body.local_date)
+        raw_local_date = _validate_local_date(body.local_date)
+        range_start_date = _validate_local_date(body.range_start_date or raw_local_date)
+        range_end_date = _validate_local_date(body.range_end_date or range_start_date)
+        if range_end_date < range_start_date:
+            range_start_date, range_end_date = range_end_date, range_start_date
+        local_date = range_start_date
         all_day = bool(body.all_day)
         start_time = None if all_day else _validate_local_time(body.start_time)
         end_time = None if all_day else _validate_local_time(body.end_time)
@@ -21472,7 +21492,7 @@ async def update_calendar_event(event_id: str, body: CalendarEventUpsertRequest)
             body_text=str(body.body or "").strip(),
             content_text=str(body.body or "").strip(),
             local_date=local_date,
-            range_end_date=local_date,
+            range_end_date=range_end_date,
             local_time=start_time,
             end_time=end_time,
             all_day=all_day,
@@ -21634,6 +21654,7 @@ def _operator_update_personal_event_row(
             "title": title,
             "content": content_text,
             "local_date": local_date,
+            "range_end_date": range_end_date,
             "local_time": local_time,
             "end_time": end_time,
             "tags": tags,
@@ -21843,8 +21864,9 @@ def _visible_day_events(
     source_filter: str = "all",
     limit: int = 200,
 ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
-    where = ["local_date = ?", "privacy_level != 'pin'"]
-    params: list[Any] = [local_date]
+    day_overlap = f"local_date <= ? AND {PERSONAL_EVENT_LOCAL_END_DATE_SQL} >= ?"
+    where = [day_overlap, "privacy_level != 'pin'"]
+    params: list[Any] = [local_date, local_date]
     if source_filter == "manual":
         where.append("source_type IN ('manual', 'diary-file')")
     elif source_filter == "sources":
@@ -21870,17 +21892,21 @@ def _visible_day_events(
             (*params, limit),
         ).fetchall()
         pin_hidden = conn.execute(
-            "SELECT COUNT(*) AS count FROM personal_events WHERE local_date=? AND privacy_level='pin'",
-            (local_date,),
+            f"""
+            SELECT COUNT(*) AS count
+            FROM personal_events
+            WHERE {day_overlap} AND privacy_level='pin'
+            """,
+            (local_date, local_date),
         ).fetchone()
         source_rows = conn.execute(
-            """
+            f"""
             SELECT source_type, COUNT(*) AS count
             FROM personal_events
-            WHERE local_date=? AND privacy_level != 'pin'
+            WHERE {day_overlap} AND privacy_level != 'pin'
             GROUP BY source_type
             """,
-            (local_date,),
+            (local_date, local_date),
         ).fetchall()
     return (
         [_row_to_event(row) for row in rows],
@@ -24073,9 +24099,11 @@ def _project_personal_log_event(
     all_day: bool = True,
     local_time: str | None = None,
     end_time: str | None = None,
+    range_end_date: str | None = None,
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
     local_date = result["local_date"]
+    range_end_date = range_end_date or local_date
     filename = result["filename"]
     event_id = f"diary-{local_date}-{Path(filename).stem}"
     timezone_name = result.get("timezone") or os.environ.get(
@@ -24097,6 +24125,7 @@ def _project_personal_log_event(
             "all_day": bool(all_day),
             "local_start_time": local_time or "",
             "local_end_time": end_time or "",
+            "local_end_date": range_end_date,
             "timezone": timezone_name,
         },
         "audit_id": audit_id,
@@ -24107,17 +24136,23 @@ def _project_personal_log_event(
         "day_path": result.get("day_path", ""),
         "schema": result.get("schema", ""),
     }
+    start_at = _calendar_utc_iso(local_date, local_time, timezone_name)
+    end_at = (
+        _calendar_utc_iso(range_end_date, end_time, timezone_name)
+        if end_time and not all_day
+        else None
+    )
     with get_conn() as conn:
         _upsert_personal_source(conn, now)
         conn.execute(
             """
             INSERT INTO personal_events (
                 event_id, source_type, source_ref, source_hash, kind, title, body_excerpt,
-                content_projection, start_at, local_date, timezone, status, privacy_level,
+                content_projection, start_at, end_at, local_date, timezone, status, privacy_level,
                 tags_json, file_refs_json, db_refs_json, provenance_json, projection_state,
                 provenance_state, last_rendered_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 source_type=excluded.source_type,
                 source_ref=excluded.source_ref,
@@ -24127,6 +24162,7 @@ def _project_personal_log_event(
                 body_excerpt=excluded.body_excerpt,
                 content_projection=excluded.content_projection,
                 start_at=excluded.start_at,
+                end_at=excluded.end_at,
                 local_date=excluded.local_date,
                 timezone=excluded.timezone,
                 status=excluded.status,
@@ -24149,7 +24185,8 @@ def _project_personal_log_event(
                 _entry_title(body, result.get("local_time")),
                 _body_excerpt(body),
                 body.strip(),
-                _calendar_utc_iso(local_date, local_time, timezone_name),
+                start_at,
+                end_at,
                 local_date,
                 timezone_name,
                 "open",
@@ -24181,6 +24218,7 @@ def _project_personal_log_event(
             source_hash=source_hash,
             metadata={
                 "local_date": local_date,
+                "range_end_date": range_end_date,
                 "kind": event_kind,
                 "body_chars": len(body.strip()),
             },
@@ -24201,7 +24239,12 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
         raise HTTPException(400, "entry body is required")
     if len(text) > 20000:
         raise HTTPException(400, "entry body is too long")
-    local_date = _validate_local_date(body.local_date)
+    raw_local_date = _validate_local_date(body.local_date)
+    range_start_date = _validate_local_date(body.range_start_date or raw_local_date)
+    range_end_date = _validate_local_date(body.range_end_date or range_start_date)
+    if range_end_date < range_start_date:
+        range_start_date, range_end_date = range_end_date, range_start_date
+    local_date = range_start_date
     all_day = bool(body.all_day) if body.all_day is not None else not bool(body.local_time)
     local_time = None if all_day else _validate_local_time(body.local_time)
     end_time = None if all_day else _validate_local_time(body.end_time)
@@ -24262,6 +24305,7 @@ async def create_diary_day_entry(body: DiaryEntryCreateRequest) -> dict[str, Any
         all_day=all_day,
         local_time=local_time,
         end_time=end_time,
+        range_end_date=range_end_date,
         tags=tags,
     )
     return {
