@@ -9,10 +9,13 @@ GET  /api/v1/nodes/{id}/pct-status — return current pct status from proxmox_co
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -306,6 +309,284 @@ class FleetHealthCheckRequest(BaseModel):
     timeout_seconds: int = 190
 
 
+class FleetHealthClearRequest(BaseModel):
+    issues: list[dict[str, object]] | None = None
+
+
+_FLEET_HEALTH_ACK_PATH = Path(
+    os.environ.get(
+        "XARTA_FLEET_HEALTH_ACK_PATH",
+        "/xarta-node/.lone-wolf/state/fleet-health-checks/acknowledged-issues.json",
+    )
+)
+_FLEET_HEALTH_OK_STATUSES = {"", "ok", "pass", "info", "skipped"}
+_FLEET_HEALTH_REPO_LABELS = {
+    "repo:/root/xarta-node": "outer",
+    "repo:/root/xarta-node/.xarta": "inner",
+    "repo:/xarta-node": "non_root",
+}
+
+
+def _fleet_health_ack_path() -> Path:
+    return Path(os.environ.get("XARTA_FLEET_HEALTH_ACK_PATH", str(_FLEET_HEALTH_ACK_PATH)))
+
+
+def _fleet_health_is_problem_check(check: dict) -> bool:
+    return str(check.get("status") or "").lower() not in _FLEET_HEALTH_OK_STATUSES
+
+
+def _fleet_health_issue_fingerprint(report: dict, check: dict) -> str:
+    payload = {
+        "node_id": report.get("node_id"),
+        "target_ip": report.get("target_ip"),
+        "check_name": check.get("name"),
+        "check_status": check.get("status"),
+        "check_detail": check.get("detail"),
+        "check_metrics": check.get("metrics") or {},
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _load_fleet_health_acknowledgements() -> dict[str, dict]:
+    path = _fleet_health_ack_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("failed to load fleet health acknowledgements from %s: %s", path, exc)
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("issues"), dict):
+        return {str(k): v for k, v in data["issues"].items() if isinstance(v, dict)}
+    if isinstance(data, dict):
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    return {}
+
+
+def _save_fleet_health_acknowledgements(issues: dict[str, dict]) -> None:
+    path = _fleet_health_ack_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "issues": issues,
+    }
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _fleet_health_issue_snapshot(report: dict, check: dict, fingerprint: str) -> dict:
+    return {
+        "fingerprint": fingerprint,
+        "node_id": report.get("node_id"),
+        "target_ip": report.get("target_ip"),
+        "check_name": check.get("name"),
+        "status": check.get("status"),
+        "detail": check.get("detail"),
+        "metrics": check.get("metrics") or {},
+    }
+
+
+def _fleet_health_report_status(report: dict, active_problem_count: int) -> str:
+    if active_problem_count <= 0 and int(report.get("checks_not_run") or 0) <= 0:
+        return "ok"
+    active_statuses = {
+        str(check.get("status") or "").lower()
+        for check in report.get("checks") or []
+        if isinstance(check, dict)
+        and _fleet_health_is_problem_check(check)
+        and not check.get("acknowledged")
+    }
+    if "fail" in active_statuses or "error" in active_statuses:
+        return "fail"
+    return "warn"
+
+
+def _fleet_health_report_commits(report: dict) -> str | None:
+    commits: dict[str, str] = {}
+    for check in report.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        label = _FLEET_HEALTH_REPO_LABELS.get(str(check.get("name") or ""))
+        if not label:
+            continue
+        metrics = check.get("metrics") if isinstance(check.get("metrics"), dict) else {}
+        head = metrics.get("head") or ""
+        if head:
+            commits[label] = str(head)
+    if not commits:
+        return None
+    return (
+        f"outer={commits.get('outer', '?')} "
+        f"non_root={commits.get('non_root', '?')} "
+        f"inner={commits.get('inner', '?')}"
+    )
+
+
+def _render_fleet_health_text_report(data: dict) -> str:
+    summary = data.get("summary") or {}
+    generated_at = data.get("generated_at") or data.get("completed_at") or "completed"
+    source = data.get("source") or "manual"
+    nodes_checked = int(summary.get("nodes_checked") or 0)
+    nodes_targeted = int(summary.get("nodes_targeted") or 0)
+    nodes_not_checked = summary.get("nodes_not_checked") or []
+    if isinstance(nodes_not_checked, list):
+        nodes_not_checked_text = (
+            ", ".join(map(str, nodes_not_checked)) if nodes_not_checked else "none"
+        )
+    else:
+        nodes_not_checked_text = str(nodes_not_checked or "none")
+    problems = int(summary.get("problems_found") or 0)
+    acknowledged = int(summary.get("acknowledged_problems_hidden") or 0)
+    checks_not_run = int(summary.get("checks_not_run") or 0)
+
+    lines = [
+        f"Fleet health check: {generated_at}",
+        f"Source: {source}",
+        f"Nodes checked: {nodes_checked}/{nodes_targeted}",
+        f"Nodes not checked: {nodes_not_checked_text}",
+        f"Problems found: {problems}",
+    ]
+    if acknowledged:
+        lines.append(f"Acknowledged old issues hidden: {acknowledged}")
+    lines.extend(
+        [
+            f"Checks not run: {checks_not_run}",
+            f"Harness return code: {data.get('helper_returncode', (data.get('harness') or {}).get('returncode', 0))}",
+            "",
+        ]
+    )
+
+    for report in data.get("reports") or []:
+        if not isinstance(report, dict):
+            continue
+        node_id = report.get("node_id") or "unknown-node"
+        status = str(report.get("status") or "ok").upper()
+        problem_count = int(report.get("problem_count") or 0)
+        blocked = int(report.get("checks_not_run") or 0)
+        lines.append(f"{node_id}: {status} problems={problem_count} blocked_checks={blocked}")
+        commits = _fleet_health_report_commits(report)
+        if commits:
+            lines.append(f"  Commits: {commits}")
+        for check in report.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            if not _fleet_health_is_problem_check(check) or check.get("acknowledged"):
+                continue
+            lines.append(
+                f"  {str(check.get('status') or 'WARN').upper()} "
+                f"{check.get('name') or 'unknown'}: {check.get('detail') or ''}"
+            )
+        hidden = int(report.get("acknowledged_problem_count") or 0)
+        if hidden:
+            lines.append(f"  Acknowledged old issues hidden: {hidden}")
+        lines.append("")
+
+    if data.get("log_path"):
+        lines.append(f"Saved text log: {data['log_path']}")
+    if data.get("json_log_path"):
+        lines.append(f"Saved JSON log: {data['json_log_path']}")
+    if "logs_pruned" in data:
+        lines.append(f"Pruned old logs: {data.get('logs_pruned')}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _apply_fleet_health_acknowledgements(data: dict) -> dict:
+    acknowledged = _load_fleet_health_acknowledgements()
+    summary = data.setdefault("summary", {})
+    data["raw_ok"] = data.get("ok")
+    data["raw_summary"] = dict(summary)
+    if "text_report" in data:
+        data["raw_text_report"] = data.get("text_report")
+
+    active_issues: list[dict] = []
+    acknowledged_issues: list[dict] = []
+    total_active = 0
+    total_acknowledged = 0
+
+    for report in data.get("reports") or []:
+        if not isinstance(report, dict):
+            continue
+        raw_problem_count = int(report.get("problem_count") or 0)
+        report["raw_problem_count"] = raw_problem_count
+        active_count = 0
+        acknowledged_count = 0
+        for check in report.get("checks") or []:
+            if not isinstance(check, dict) or not _fleet_health_is_problem_check(check):
+                continue
+            fingerprint = _fleet_health_issue_fingerprint(report, check)
+            check["issue_fingerprint"] = fingerprint
+            snapshot = _fleet_health_issue_snapshot(report, check, fingerprint)
+            if fingerprint in acknowledged:
+                check["acknowledged"] = True
+                acknowledged_count += 1
+                acknowledged_issues.append(snapshot)
+            else:
+                check["acknowledged"] = False
+                active_count += 1
+                active_issues.append(snapshot)
+        report["problem_count"] = active_count
+        report["acknowledged_problem_count"] = acknowledged_count
+        report["status"] = _fleet_health_report_status(report, active_count)
+        total_active += active_count
+        total_acknowledged += acknowledged_count
+
+    raw_problems_found = int(summary.get("problems_found") or 0)
+    summary["raw_problems_found"] = raw_problems_found
+    unmapped_problem_count = max(0, raw_problems_found - total_active - total_acknowledged)
+    if unmapped_problem_count:
+        data["fleet_health_unmapped_problem_count"] = unmapped_problem_count
+        total_active += unmapped_problem_count
+    summary["problems_found"] = total_active
+    summary["acknowledged_problems_hidden"] = total_acknowledged
+    checks_not_run = int(summary.get("checks_not_run") or 0)
+    data["ok"] = total_active == 0 and checks_not_run == 0
+    data["fleet_health_issues"] = active_issues
+    data["fleet_health_acknowledged_issues"] = acknowledged_issues
+    data["text_report"] = _render_fleet_health_text_report(data)
+    return data
+
+
+@router.post("/fleet-health-clear", status_code=200)
+async def clear_fleet_health_issues(body: FleetHealthClearRequest | None = None) -> dict:
+    """Acknowledge exact current fleet-health issue fingerprints."""
+    issues = (body.issues if body else None) or []
+    acknowledgements = await _run_nodes_sync_work(
+        "clear_fleet_health_issues", _clear_fleet_health_issues_sync, issues
+    )
+    return acknowledgements
+
+
+def _clear_fleet_health_issues_sync(issues: list[dict[str, object]]) -> dict:
+    stored = _load_fleet_health_acknowledgements()
+    acknowledged_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    count = 0
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        fingerprint = str(issue.get("fingerprint") or issue.get("issue_fingerprint") or "")
+        if not fingerprint:
+            continue
+        stored[fingerprint] = {
+            "acknowledged_at": acknowledged_at,
+            "node_id": issue.get("node_id"),
+            "target_ip": issue.get("target_ip"),
+            "check_name": issue.get("check_name") or issue.get("name"),
+            "status": issue.get("status"),
+            "detail": issue.get("detail"),
+            "metrics": issue.get("metrics") or {},
+        }
+        count += 1
+    _save_fleet_health_acknowledgements(stored)
+    return {
+        "ok": True,
+        "acknowledged": count,
+        "total_acknowledgements": len(stored),
+        "ack_path": str(_fleet_health_ack_path()),
+    }
+
+
 def _fleet_health_blocked_report(reason: str, *, source: str = "manual") -> dict:
     log_dir = "/xarta-node/.lone-wolf/state/fleet-health-checks"
     text = (
@@ -318,23 +599,25 @@ def _fleet_health_blocked_report(reason: str, *, source: str = "manual") -> dict
         f"Blocked: {reason}\n"
         f"Log directory: {log_dir}\n"
     )
-    return {
-        "ok": False,
-        "source": source,
-        "summary": {
-            "nodes_targeted": 0,
-            "nodes_checked": 0,
-            "nodes_not_checked": [],
-            "problems_found": 1,
-            "checks_not_run": 1,
-        },
-        "reports": [],
-        "text_report": text,
-        "log_dir": log_dir,
-        "log_path": None,
-        "json_log_path": None,
-        "harness": {"returncode": 127, "stdout": "", "stderr": reason},
-    }
+    return _apply_fleet_health_acknowledgements(
+        {
+            "ok": False,
+            "source": source,
+            "summary": {
+                "nodes_targeted": 0,
+                "nodes_checked": 0,
+                "nodes_not_checked": [],
+                "problems_found": 1,
+                "checks_not_run": 1,
+            },
+            "reports": [],
+            "text_report": text,
+            "log_dir": log_dir,
+            "log_path": None,
+            "json_log_path": None,
+            "harness": {"returncode": 127, "stdout": "", "stderr": reason},
+        }
+    )
 
 
 @router.post("/fleet-health-check", status_code=200)
@@ -398,34 +681,36 @@ async def run_fleet_health_check(body: FleetHealthCheckRequest | None = None) ->
             f"stdout: {(result.stdout or '').strip()[:1200]}\n"
             f"stderr: {(result.stderr or '').strip()[:1200]}\n"
         )
-        return {
-            "ok": False,
-            "source": source,
-            "summary": {
-                "nodes_targeted": 0,
-                "nodes_checked": 0,
-                "nodes_not_checked": [],
-                "problems_found": 1,
-                "checks_not_run": 1,
-            },
-            "reports": [],
-            "text_report": text,
-            "log_dir": "/xarta-node/.lone-wolf/state/fleet-health-checks",
-            "log_path": None,
-            "json_log_path": None,
-            "harness": {
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            },
-        }
+        return _apply_fleet_health_acknowledgements(
+            {
+                "ok": False,
+                "source": source,
+                "summary": {
+                    "nodes_targeted": 0,
+                    "nodes_checked": 0,
+                    "nodes_not_checked": [],
+                    "problems_found": 1,
+                    "checks_not_run": 1,
+                },
+                "reports": [],
+                "text_report": text,
+                "log_dir": "/xarta-node/.lone-wolf/state/fleet-health-checks",
+                "log_path": None,
+                "json_log_path": None,
+                "harness": {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                },
+            }
+        )
     data.setdefault("ok", result.returncode == 0)
     data.setdefault("source", source)
     data.setdefault("harness", {})
     data["helper_returncode"] = result.returncode
     if result.stderr:
         data["helper_stderr"] = result.stderr
-    return data
+    return _apply_fleet_health_acknowledgements(data)
 
 
 def _get_node_lxc_target(node_id: str) -> tuple[str, str, int]:

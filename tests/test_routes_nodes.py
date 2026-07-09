@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import os
 import sys
 import tempfile
@@ -72,3 +73,77 @@ def test_self_repo_versions_offloads_sync_health_route(monkeypatch):
     assert result.inner.commit == "inner1"
     assert result.non_root.commit == "nonroot1"
     assert calls == [("to_thread", "fake_repo_versions"), "repo_versions"]
+
+
+def _fleet_health_seekdb_restart_report(restarts: str = "1") -> dict:
+    return {
+        "ok": False,
+        "source": "manual",
+        "generated_at": "2026-07-09T17:22:04Z",
+        "summary": {
+            "nodes_targeted": 1,
+            "nodes_checked": 1,
+            "nodes_not_checked": [],
+            "problems_found": 1,
+            "checks_not_run": 0,
+        },
+        "reports": [
+            {
+                "node_id": "node-with-old-warning",
+                "target_ip": "test-target",
+                "status": "warn",
+                "problem_count": 1,
+                "checks_not_run": 0,
+                "checks": [
+                    {
+                        "name": "seekdb_systemd",
+                        "status": "warn",
+                        "detail": (
+                            "RestartUSec=10s TimeoutStopUSec=30s "
+                            f"NRestarts={restarts} ExecStartPre=/bin/sleep"
+                        ),
+                        "metrics": {
+                            "ActiveState": "active",
+                            "SubState": "running",
+                            "NRestarts": restarts,
+                            "ExecStartPre": "start_time=[Tue 2026-07-07 00:19:51 UTC]",
+                        },
+                    }
+                ],
+            }
+        ],
+        "harness": {"returncode": 0},
+    }
+
+
+def test_fleet_health_clear_hides_only_exact_issue_fingerprint(monkeypatch, tmp_path):
+    monkeypatch.setenv("XARTA_FLEET_HEALTH_ACK_PATH", str(tmp_path / "acknowledged.json"))
+
+    first = routes_nodes._apply_fleet_health_acknowledgements(
+        copy.deepcopy(_fleet_health_seekdb_restart_report("1"))
+    )
+    assert first["summary"]["problems_found"] == 1
+    assert first["fleet_health_issues"]
+    issue = first["fleet_health_issues"][0]
+
+    clear_result = routes_nodes._clear_fleet_health_issues_sync([issue])
+    assert clear_result["acknowledged"] == 1
+
+    same = routes_nodes._apply_fleet_health_acknowledgements(
+        copy.deepcopy(_fleet_health_seekdb_restart_report("1"))
+    )
+    assert same["ok"] is True
+    assert same["summary"]["problems_found"] == 0
+    assert same["summary"]["acknowledged_problems_hidden"] == 1
+    assert same["reports"][0]["status"] == "ok"
+    assert same["reports"][0]["problem_count"] == 0
+    assert "node-with-old-warning: OK problems=0 blocked_checks=0" in same["text_report"]
+
+    changed = routes_nodes._apply_fleet_health_acknowledgements(
+        copy.deepcopy(_fleet_health_seekdb_restart_report("2"))
+    )
+    assert changed["ok"] is False
+    assert changed["summary"]["problems_found"] == 1
+    assert changed["summary"]["acknowledged_problems_hidden"] == 0
+    assert changed["fleet_health_issues"][0]["fingerprint"] != issue["fingerprint"]
+    assert "WARN seekdb_systemd" in changed["text_report"]
