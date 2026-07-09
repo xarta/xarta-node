@@ -10,13 +10,15 @@ import os
 import subprocess
 import time
 import uuid
+from collections.abc import AsyncIterable
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import timing
 from .events import AppEvent, bus
 
 router = APIRouter(prefix="/personal/email", tags=["personal-email"])
@@ -45,8 +47,37 @@ PIM_EMAIL_CACHE_STATE_WATCH_SECONDS = float(
 PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS = float(
     os.environ.get("PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS", "0.75")
 )
+PIM_EMAIL_CACHE_STATE_WATCH_MAX_POLLS = int(
+    os.environ.get("PIM_EMAIL_CACHE_STATE_WATCH_MAX_POLLS", "5")
+)
+PIM_EMAIL_MESSAGE_OPEN_CACHE_STATE_WATCH_DELAY_SECONDS = float(
+    os.environ.get("PIM_EMAIL_MESSAGE_OPEN_CACHE_STATE_WATCH_DELAY_SECONDS", "1.0")
+)
 _CACHE_STATE_WATCH_KEYS: set[tuple[str, tuple[str, ...]]] = set()
 _CACHE_STATE_LAST_SIGNATURES: dict[str, str] = {}
+_STACK_HTTP_CLIENTS: dict[str, httpx.AsyncClient] = {}
+_STACK_HTTP_CLIENT_LOCK = asyncio.Lock()
+_STACK_HTTP_FOREGROUND_LIMITS = httpx.Limits(
+    max_connections=int(os.environ.get("PIM_EMAIL_STACK_PROXY_MAX_CONNECTIONS", "64")),
+    max_keepalive_connections=int(
+        os.environ.get("PIM_EMAIL_STACK_PROXY_MAX_KEEPALIVE_CONNECTIONS", "20")
+    ),
+    keepalive_expiry=float(os.environ.get("PIM_EMAIL_STACK_PROXY_KEEPALIVE_SECONDS", "30")),
+)
+_STACK_HTTP_WORKER_LIMITS = httpx.Limits(
+    max_connections=int(os.environ.get("PIM_EMAIL_STACK_PROXY_WORKER_MAX_CONNECTIONS", "4")),
+    max_keepalive_connections=int(
+        os.environ.get("PIM_EMAIL_STACK_PROXY_WORKER_MAX_KEEPALIVE_CONNECTIONS", "4")
+    ),
+    keepalive_expiry=float(os.environ.get("PIM_EMAIL_STACK_PROXY_KEEPALIVE_SECONDS", "30")),
+)
+_STACK_HTTP_BACKGROUND_LIMITS = httpx.Limits(
+    max_connections=int(os.environ.get("PIM_EMAIL_STACK_PROXY_BACKGROUND_MAX_CONNECTIONS", "1")),
+    max_keepalive_connections=int(
+        os.environ.get("PIM_EMAIL_STACK_PROXY_BACKGROUND_MAX_KEEPALIVE_CONNECTIONS", "1")
+    ),
+    keepalive_expiry=float(os.environ.get("PIM_EMAIL_STACK_PROXY_KEEPALIVE_SECONDS", "30")),
+)
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -152,23 +183,6 @@ class ExternalImageAssignmentReleaseRequest(BaseModel):
     reason: str = Field("worker_released_assignment", max_length=1000)
 
 
-class ExternalImageAssignmentCompleteRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
-    worker_id: str = Field(..., min_length=1, max_length=160)
-    assignment_token: str = Field(..., min_length=16, max_length=240)
-    transformed_image_base64: str = Field(..., min_length=1)
-    raw_image_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
-    transformed_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
-    width: int = Field(..., ge=1, le=1800)
-    height: int = Field(..., ge=1, le=2400)
-    transform_version: str = Field("jpeg-v1", min_length=1, max_length=80)
-    fetched_content_type: str = Field("", max_length=180)
-    fetched_final_url: str = Field("", max_length=4096)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
 class ExternalImageAssignmentFailRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -268,15 +282,132 @@ def _stack_params(**params: Any) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value is not None}
 
 
-async def _stack_get_json(path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def _stack_request_class(path: str) -> str:
+    if path.startswith("/workers/"):
+        return "worker"
+    if path.startswith("/local/cache/"):
+        return "cache"
+    if path.startswith("/local/messages/"):
+        return "message"
+    if path.startswith("/local/images/"):
+        return "background_asset"
+    return "control"
+
+
+def _message_request_class(priority: str | None) -> str:
+    clean = str(priority or "").strip().lower()
+    if clean in {"background", "low", "prefetch", "warm"}:
+        return "background_message"
+    return "message"
+
+
+def _stack_client_key(traffic_class: str) -> str:
+    if traffic_class == "worker":
+        return "worker"
+    if traffic_class in {"background_message", "background_cache", "background_asset"}:
+        return "background"
+    return "foreground"
+
+
+def _stack_client_limits(client_key: str) -> httpx.Limits:
+    if client_key == "worker":
+        return _STACK_HTTP_WORKER_LIMITS
+    if client_key == "background":
+        return _STACK_HTTP_BACKGROUND_LIMITS
+    return _STACK_HTTP_FOREGROUND_LIMITS
+
+
+async def _stack_http_client(traffic_class: str) -> httpx.AsyncClient:
+    client_key = _stack_client_key(traffic_class)
+    client = _STACK_HTTP_CLIENTS.get(client_key)
+    if client is not None and not client.is_closed:
+        return client
+    async with _STACK_HTTP_CLIENT_LOCK:
+        client = _STACK_HTTP_CLIENTS.get(client_key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                timeout=None,
+                limits=_stack_client_limits(client_key),
+                trust_env=False,
+            )
+            _STACK_HTTP_CLIENTS[client_key] = client
+        return client
+
+
+@router.on_event("shutdown")
+async def _close_stack_http_client() -> None:
+    clients = list(_STACK_HTTP_CLIENTS.values())
+    _STACK_HTTP_CLIENTS.clear()
+    for client in clients:
+        if not client.is_closed:
+            await client.aclose()
+
+
+async def _stack_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    content: bytes | AsyncIterable[bytes] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
+    traffic_class: str | None = None,
+) -> httpx.Response:
     url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
+    clean_method = method.upper()
+    clean_traffic_class = traffic_class or _stack_request_class(path)
+    client_key = _stack_client_key(clean_traffic_class)
+    timeout = httpx.Timeout(
+        timeout_seconds if timeout_seconds is not None else PIM_EMAIL_STACK_API_TIMEOUT_SECONDS
+    )
+    started_perf = time.perf_counter_ns()
+    started_wall = time.time_ns()
+    status_code = 0
+    response_bytes = 0
+    ok = True
+    error_type = ""
     try:
-        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
-            response = await client.get(url, params=params or {})
+        client = await _stack_http_client(clean_traffic_class)
+        response = await client.request(
+            clean_method,
+            url,
+            params=params or {},
+            json=json_body if json_body is not None else None,
+            content=content if json_body is None else None,
+            headers=headers or {},
+            timeout=timeout,
+        )
+        status_code = int(response.status_code)
+        response_bytes = len(response.content or b"")
+        return response
     except httpx.TimeoutException as exc:
+        ok = False
+        error_type = exc.__class__.__name__
         raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
     except httpx.HTTPError as exc:
+        ok = False
+        error_type = exc.__class__.__name__
         raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    finally:
+        timing.record_span(
+            "pim_email.stack_proxy",
+            start_perf_ns=started_perf,
+            end_perf_ns=time.perf_counter_ns(),
+            start_time_ns=started_wall,
+            end_time_ns=time.time_ns(),
+            method=clean_method,
+            upstream_path=path,
+            traffic_class=clean_traffic_class,
+            status_code=status_code,
+            response_bytes=response_bytes,
+            ok=ok,
+            error_type=error_type,
+            client_key=client_key,
+        )
+
+
+def _stack_response_json(response: httpx.Response) -> dict[str, Any]:
     if response.status_code >= 400:
         detail: Any
         try:
@@ -293,6 +424,16 @@ async def _stack_get_json(path: str, *, params: dict[str, Any] | None = None) ->
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
     return data
+
+
+async def _stack_get_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    traffic_class: str | None = None,
+) -> dict[str, Any]:
+    response = await _stack_request("GET", path, params=params, traffic_class=traffic_class)
+    return _stack_response_json(response)
 
 
 async def _stack_post_json(
@@ -301,34 +442,34 @@ async def _stack_post_json(
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
     timeout_seconds: float | None = None,
+    traffic_class: str | None = None,
 ) -> dict[str, Any]:
-    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
-    timeout = (
-        timeout_seconds if timeout_seconds is not None else PIM_EMAIL_STACK_API_TIMEOUT_SECONDS
+    response = await _stack_request(
+        "POST",
+        path,
+        params=params,
+        json_body=json_body or {},
+        timeout_seconds=timeout_seconds,
+        traffic_class=traffic_class,
     )
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, params=params or {}, json=json_body or {})
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
-    if response.status_code >= 400:
-        detail: Any
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text or "PIM Email stack API request failed"
-        raise HTTPException(status_code=response.status_code, detail=detail)
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502, detail="PIM Email stack API returned invalid JSON"
-        ) from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
-    return data
+    return _stack_response_json(response)
+
+
+async def _stack_post_streamed_json(
+    path: str,
+    request: Request,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    content_type = request.headers.get("content-type") or "application/json"
+    response = await _stack_request(
+        "POST",
+        path,
+        content=request.stream(),
+        headers={"Content-Type": content_type},
+        timeout_seconds=timeout_seconds,
+    )
+    return _stack_response_json(response)
 
 
 async def _stack_delete_json(
@@ -336,41 +477,12 @@ async def _stack_delete_json(
     *,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
-            response = await client.delete(url, params=params or {})
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
-    if response.status_code >= 400:
-        detail: Any
-        try:
-            detail = response.json().get("detail", response.text)
-        except Exception:
-            detail = response.text or "PIM Email stack API request failed"
-        raise HTTPException(status_code=response.status_code, detail=detail)
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502, detail="PIM Email stack API returned invalid JSON"
-        ) from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="PIM Email stack API returned invalid payload")
-    return data
+    response = await _stack_request("DELETE", path, params=params)
+    return _stack_response_json(response)
 
 
 async def _stack_get_binary(path: str, *, params: dict[str, Any] | None = None) -> Response:
-    url = f"{PIM_EMAIL_STACK_API_BASE}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=PIM_EMAIL_STACK_API_TIMEOUT_SECONDS) as client:
-            response = await client.get(url, params=params or {})
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="PIM Email stack API timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="PIM Email stack API is unavailable") from exc
+    response = await _stack_request("GET", path, params=params)
     if response.status_code >= 400:
         detail: Any
         try:
@@ -522,10 +634,17 @@ async def _watch_pim_email_cache_states(
     uids: tuple[str, ...],
     *,
     reason: str,
+    initial_delay_seconds: float = 0.0,
+    max_polls: int | None = None,
 ) -> None:
     deadline = time.monotonic() + max(1.0, PIM_EMAIL_CACHE_STATE_WATCH_SECONDS)
     interval = max(0.1, PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS)
-    while time.monotonic() <= deadline:
+    poll_limit = max(1, int(max_polls or PIM_EMAIL_CACHE_STATE_WATCH_MAX_POLLS))
+    if initial_delay_seconds > 0:
+        await asyncio.sleep(initial_delay_seconds)
+    polls = 0
+    while time.monotonic() <= deadline and polls < poll_limit:
+        polls += 1
         try:
             response = await _stack_post_json(
                 "/local/cache/messages",
@@ -535,6 +654,7 @@ async def _watch_pim_email_cache_states(
                     "email_uids": list(uids),
                     "limit": len(uids),
                 },
+                traffic_class="background_cache",
             )
         except Exception as exc:
             log.debug("pim email cache-state watch failed: %s", exc)
@@ -572,6 +692,8 @@ def _schedule_pim_email_cache_state_watch(
     uids: list[str] | tuple[str, ...],
     *,
     reason: str,
+    initial_delay_seconds: float = 0.0,
+    max_polls: int | None = None,
 ) -> None:
     clean_uids = tuple(
         dict.fromkeys(str(uid or "").strip() for uid in uids if str(uid or "").strip())
@@ -585,7 +707,13 @@ def _schedule_pim_email_cache_state_watch(
 
     async def run() -> None:
         try:
-            await _watch_pim_email_cache_states(mailbox_id, clean_uids, reason=reason)
+            await _watch_pim_email_cache_states(
+                mailbox_id,
+                clean_uids,
+                reason=reason,
+                initial_delay_seconds=initial_delay_seconds,
+                max_polls=max_polls,
+            )
         finally:
             _CACHE_STATE_WATCH_KEYS.discard(key)
 
@@ -986,15 +1114,15 @@ async def email_external_image_worker_release_assignments(
 @router.post("/workers/external-images/assignments/{canonical_url_digest}/complete")
 async def email_external_image_worker_complete_assignment(
     canonical_url_digest: str,
-    body: ExternalImageAssignmentCompleteRequest,
+    request: Request,
     x_pim_email_worker_token: str | None = Header(None, alias="X-PIM-Email-Worker-Token"),
     metrics: bool = Query(False),
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     _require_email_worker_token(x_pim_email_worker_token)
-    response = await _stack_post_json(
+    response = await _stack_post_streamed_json(
         f"/workers/external-images/assignments/{canonical_url_digest}/complete",
-        json_body=body.model_dump(exclude_none=True),
+        request,
     )
     return _attach_server_metrics(
         response,
@@ -1083,6 +1211,7 @@ async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
         "/local/cache/warm",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
+        traffic_class="background_cache",
     )
     uids = _cache_state_uids_from_body(body) or list(_message_states_from_response(response))
     _schedule_pim_email_cache_state_event(
@@ -1104,6 +1233,7 @@ async def email_local_cache_messages(body: LocalCacheWarmRequest) -> dict[str, A
         "/local/cache/messages",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
+        traffic_class="background_cache",
     )
     _schedule_pim_email_cache_state_event(
         response,
@@ -1118,15 +1248,19 @@ async def email_local_message(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     opened: bool = Query(True),
+    x_pim_email_client_priority: str | None = Header(None, alias="X-PIM-Email-Client-Priority"),
 ) -> dict[str, Any]:
     response = await _stack_get_json(
         f"/local/messages/{email_uid}",
         params=_stack_params(mailbox_id=mailbox_id, opened=opened),
+        traffic_class=_message_request_class(x_pim_email_client_priority),
     )
     _schedule_pim_email_cache_state_watch(
         mailbox_id,
         [email_uid],
         reason="message-open-watch" if opened else "message-read-watch",
+        initial_delay_seconds=PIM_EMAIL_MESSAGE_OPEN_CACHE_STATE_WATCH_DELAY_SECONDS,
+        max_polls=1,
     )
     return response
 
