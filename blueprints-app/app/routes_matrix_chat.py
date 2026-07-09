@@ -2240,24 +2240,27 @@ class _MatrixChatE2EEClient:
 
     async def close(self) -> None:
         async with self._lock:
-            self._started = False
-            api = self._api
-            crypto_db = self._crypto_db
-            self._api = None
-            self._client = None
-            self._crypto_db = None
+            await self._close_runtime_resources_unlocked()
 
-            async with self._crypto_lock:
-                if crypto_db is not None:
+    async def _close_runtime_resources_unlocked(self) -> None:
+        self._started = False
+        api = self._api
+        crypto_db = self._crypto_db
+        self._api = None
+        self._client = None
+        self._crypto_db = None
+
+        async with self._crypto_lock:
+            if crypto_db is not None:
+                with suppress(Exception):
+                    await crypto_db.stop()
+            session = getattr(api, "session", None)
+            close = getattr(session, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
                     with suppress(Exception):
-                        await crypto_db.stop()
-                session = getattr(api, "session", None)
-                close = getattr(session, "close", None)
-                if close is not None:
-                    result = close()
-                    if inspect.isawaitable(result):
-                        with suppress(Exception):
-                            await result
+                        await result
 
     async def _start(self) -> None:
         ok, detail = _check_e2ee_deps()
@@ -2275,74 +2278,88 @@ class _MatrixChatE2EEClient:
         from mautrix.types import TrustState, UserID
         from mautrix.util.async_db import Database
 
-        _secure_crypto_store(self._store_dir)
-
-        self._api = HTTPAPI(
-            base_url=self._settings["upstream"],
-            token=self._settings["access_token"],
-        )
-        state_store = MemoryStateStore()
-        sync_store = MemorySyncStore()
-        self._client = Client(
-            mxid=UserID(self._settings["user_id"]),
-            device_id=self._settings.get("device_id") or None,
-            api=self._api,
-            state_store=state_store,
-            sync_store=sync_store,
-        )
-
         try:
-            whoami = await self._client.whoami()
-        except Exception as exc:
-            if exc.__class__.__name__ != "MUnknownToken":
-                raise
-            refreshed = await _refresh_chat_access_token(self._settings)
-            self._settings.update(refreshed)
-            self._api.token = self._settings["access_token"]
-            whoami = await self._client.whoami()
-        resolved_user_id = getattr(whoami, "user_id", "") or self._settings["user_id"]
-        resolved_device_id = (
-            getattr(whoami, "device_id", "") or self._settings.get("device_id") or ""
-        )
-        self._settings["user_id"] = str(resolved_user_id)
-        self._client.mxid = UserID(self._settings["user_id"])
-        if resolved_device_id:
-            self._client.device_id = str(resolved_device_id)
+            _secure_crypto_store(self._store_dir)
 
-        self._crypto_db = Database.create(
-            f"sqlite:///{self._crypto_db_path}",
-            upgrade_table=PgCryptoStore.upgrade_table,
-        )
-        await self._crypto_db.start()
-        _secure_crypto_store(self._store_dir)
+            self._api = HTTPAPI(
+                base_url=self._settings["upstream"],
+                token=self._settings["access_token"],
+            )
+            state_store = MemoryStateStore()
+            sync_store = MemorySyncStore()
+            self._client = Client(
+                mxid=UserID(self._settings["user_id"]),
+                device_id=self._settings.get("device_id") or None,
+                api=self._api,
+                state_store=state_store,
+                sync_store=sync_store,
+            )
 
-        account_id = self._settings["user_id"] or "blueprints-chat"
-        pickle_key = f"{account_id}:{self._client.device_id or 'default'}"
-        crypto_store = PgCryptoStore(
-            account_id=account_id, pickle_key=pickle_key, db=self._crypto_db
-        )
-        await crypto_store.open()
-        if self._client.device_id:
-            await crypto_store.put_device_id(self._client.device_id)
+            try:
+                whoami = await self._client.whoami()
+            except Exception as exc:
+                if exc.__class__.__name__ != "MUnknownToken":
+                    raise
+                refreshed = await _refresh_chat_access_token(self._settings)
+                self._settings.update(refreshed)
+                self._api.token = self._settings["access_token"]
+                whoami = await self._client.whoami()
+            resolved_user_id = getattr(whoami, "user_id", "") or self._settings["user_id"]
+            resolved_device_id = (
+                getattr(whoami, "device_id", "") or self._settings.get("device_id") or ""
+            )
+            self._settings["user_id"] = str(resolved_user_id)
+            self._client.mxid = UserID(self._settings["user_id"])
+            if resolved_device_id:
+                self._client.device_id = str(resolved_device_id)
 
-        olm = OlmMachine(
-            self._client,
-            crypto_store,
-            _MatrixCryptoStateStore(state_store, self._joined_rooms),
-        )
-        _configure_history_decrypt_fast_path(olm)
-        olm.share_keys_min_trust = TrustState.UNVERIFIED
-        olm.send_keys_min_trust = TrustState.UNVERIFIED
-        await olm.load()
-        await olm.share_keys()
-        await self._ensure_cross_signing(olm)
-        self._client.crypto = olm
+            self._crypto_db = Database.create(
+                f"sqlite:///{self._crypto_db_path}",
+                upgrade_table=PgCryptoStore.upgrade_table,
+            )
+            await self._crypto_db.start()
+            _secure_crypto_store(self._store_dir)
 
-        startup_filter = json.dumps({"room": {"timeline": {"limit": 0}}}, separators=(",", ":"))
-        data = await self._client.sync(timeout=1000, full_state=True, filter_id=startup_filter)
-        await self._handle_sync_data(data if isinstance(data, dict) else {})
-        self._started = True
-        _secure_crypto_store(self._store_dir)
+            account_id = self._settings["user_id"] or "blueprints-chat"
+            pickle_key = f"{account_id}:{self._client.device_id or 'default'}"
+            crypto_store = PgCryptoStore(
+                account_id=account_id, pickle_key=pickle_key, db=self._crypto_db
+            )
+            await crypto_store.open()
+            if self._client.device_id:
+                await crypto_store.put_device_id(self._client.device_id)
+
+            olm = OlmMachine(
+                self._client,
+                crypto_store,
+                _MatrixCryptoStateStore(state_store, self._joined_rooms),
+            )
+            _configure_history_decrypt_fast_path(olm)
+            olm.share_keys_min_trust = TrustState.UNVERIFIED
+            olm.send_keys_min_trust = TrustState.UNVERIFIED
+            await olm.load()
+            await olm.share_keys()
+            await self._ensure_cross_signing(olm)
+            self._client.crypto = olm
+
+            startup_filter = json.dumps(
+                {"room": {"timeline": {"limit": 0}}},
+                separators=(",", ":"),
+            )
+            data = await self._client.sync(
+                timeout=1000,
+                full_state=True,
+                filter_id=startup_filter,
+            )
+            await self._handle_sync_data(data if isinstance(data, dict) else {})
+            self._started = True
+            _secure_crypto_store(self._store_dir)
+        except asyncio.CancelledError:
+            await self._close_runtime_resources_unlocked()
+            raise
+        except Exception:
+            await self._close_runtime_resources_unlocked()
+            raise
 
     async def _ensure_cross_signing(self, olm: Any) -> None:
         """Bootstrap or restore cross-signing for the server-side Matrix device."""
