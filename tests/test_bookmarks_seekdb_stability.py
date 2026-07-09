@@ -123,6 +123,21 @@ def test_normal_health_does_not_call_seekdb(monkeypatch):
     assert payload.integrity_ok is True
 
 
+def test_normal_health_fails_fast_when_sqlite_is_locked(monkeypatch):
+    @contextmanager
+    def locked_health_conn():
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr(routes_health, "get_health_conn", locked_health_conn)
+
+    with pytest.raises(routes_health.HTTPException) as exc:
+        asyncio.run(routes_health.health())
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "database_locked"
+
+
 def test_sync_single_flight_coalesces_followup(monkeypatch):
     async def run():
         seekdb_sync._reset_sync_controller_for_tests()

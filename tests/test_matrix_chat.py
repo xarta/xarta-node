@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -73,6 +74,25 @@ def _default_wake_stt_profile_classifier(monkeypatch):
         matrix_chat.wake_stt_direct,
         "classify_wake_stt_profile",
         fake_classifier,
+    )
+
+
+def _stub_wake_stt_background_matrix_posts(monkeypatch):
+    async def fake_report(**_kwargs):
+        return {"ok": True, "event_id": "$test-wake-stt-report"}
+
+    async def fake_minutes(_summary):
+        return {"ok": True, "event_id": "$test-wake-stt-minutes"}
+
+    monkeypatch.setattr(
+        matrix_chat,
+        "_send_wake_stt_direct_response_report_safely",
+        fake_report,
+    )
+    monkeypatch.setattr(
+        matrix_chat,
+        "_post_wake_stt_minutes_summary_safely",
+        fake_minutes,
     )
 
 
@@ -3244,6 +3264,7 @@ def test_matrix_chat_wake_stt_wrong_malformed_extra_and_stale_codes_do_not_retry
     monkeypatch,
 ):
     matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    _stub_wake_stt_background_matrix_posts(monkeypatch)
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
     monkeypatch.setenv(
@@ -3358,6 +3379,7 @@ def test_matrix_chat_wake_stt_intervening_turn_preserves_pending_across_instance
     monkeypatch,
 ):
     matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    _stub_wake_stt_background_matrix_posts(monkeypatch)
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
     monkeypatch.setenv(
@@ -3582,6 +3604,7 @@ def test_matrix_chat_wake_stt_authorised_retry_reports_profile_transport_error(
 
 def test_matrix_chat_wake_stt_bare_code_words_do_not_authorise_pending(monkeypatch):
     matrix_chat._WAKE_STT_PENDING_COMMAND_CODE_REQUESTS.clear()
+    _stub_wake_stt_background_matrix_posts(monkeypatch)
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "1")
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_PRE_ROLL_AFTER_MS", "0")
     monkeypatch.setenv(
@@ -5449,6 +5472,157 @@ async def test_matrix_chat_create_room_can_request_encryption(monkeypatch):
             "content": {"algorithm": "m.megolm.v1.aes-sha2"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_e2ee_start_failure_closes_partial_http_session(monkeypatch, tmp_path):
+    closed = False
+
+    class FakeSession:
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    class FakeHTTPAPI:
+        def __init__(self, *, base_url, token):
+            self.base_url = base_url
+            self.token = token
+            self.session = FakeSession()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        async def whoami(self):
+            raise RuntimeError("matrix upstream unavailable")
+
+    monkeypatch.setattr(matrix_chat, "_check_e2ee_deps", lambda: (True, ""))
+    monkeypatch.setitem(sys.modules, "mautrix", types.ModuleType("mautrix"))
+    monkeypatch.setitem(sys.modules, "mautrix.api", types.SimpleNamespace(HTTPAPI=FakeHTTPAPI))
+    monkeypatch.setitem(sys.modules, "mautrix.client", types.SimpleNamespace(Client=FakeClient))
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.client.state_store",
+        types.SimpleNamespace(MemoryStateStore=object, MemorySyncStore=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.crypto",
+        types.SimpleNamespace(OlmMachine=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.crypto.store.asyncpg",
+        types.SimpleNamespace(PgCryptoStore=types.SimpleNamespace(upgrade_table="upgrade")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.types",
+        types.SimpleNamespace(
+            TrustState=types.SimpleNamespace(UNVERIFIED="unverified"), UserID=str
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.util.async_db",
+        types.SimpleNamespace(Database=types.SimpleNamespace(create=lambda *args, **kwargs: None)),
+    )
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": str(tmp_path / "crypto"),
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="matrix upstream unavailable"):
+        await client.ensure_started()
+
+    assert closed is True
+    assert client._api is None
+    assert client._client is None
+    assert client._crypto_db is None
+    assert client._started is False
+
+
+@pytest.mark.asyncio
+async def test_matrix_chat_e2ee_start_cancellation_closes_partial_http_session(
+    monkeypatch, tmp_path
+):
+    closed = False
+    whoami_started = asyncio.Event()
+
+    class FakeSession:
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    class FakeHTTPAPI:
+        def __init__(self, *, base_url, token):
+            self.base_url = base_url
+            self.token = token
+            self.session = FakeSession()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        async def whoami(self):
+            whoami_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(matrix_chat, "_check_e2ee_deps", lambda: (True, ""))
+    monkeypatch.setitem(sys.modules, "mautrix", types.ModuleType("mautrix"))
+    monkeypatch.setitem(sys.modules, "mautrix.api", types.SimpleNamespace(HTTPAPI=FakeHTTPAPI))
+    monkeypatch.setitem(sys.modules, "mautrix.client", types.SimpleNamespace(Client=FakeClient))
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.client.state_store",
+        types.SimpleNamespace(MemoryStateStore=object, MemorySyncStore=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.crypto",
+        types.SimpleNamespace(OlmMachine=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.crypto.store.asyncpg",
+        types.SimpleNamespace(PgCryptoStore=types.SimpleNamespace(upgrade_table="upgrade")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.types",
+        types.SimpleNamespace(
+            TrustState=types.SimpleNamespace(UNVERIFIED="unverified"), UserID=str
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mautrix.util.async_db",
+        types.SimpleNamespace(Database=types.SimpleNamespace(create=lambda *args, **kwargs: None)),
+    )
+    client = matrix_chat._MatrixChatE2EEClient(
+        {
+            "crypto_store_dir": str(tmp_path / "crypto"),
+            "upstream": "https://matrix.test",
+            "user_id": "@codex:test",
+            "access_token": "token",
+        }
+    )
+
+    task = asyncio.create_task(client.ensure_started())
+    await asyncio.wait_for(whoami_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed is True
+    assert client._api is None
+    assert client._client is None
+    assert client._crypto_db is None
+    assert client._started is False
 
 
 @pytest.mark.asyncio

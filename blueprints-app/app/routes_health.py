@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import Generator
 from urllib.parse import quote
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from . import config as cfg
 from . import timing
@@ -16,6 +16,7 @@ from .db import get_gen, get_meta
 from .models import HealthOut, RepoVersionOut, RepoVersionsOut
 
 router = APIRouter(tags=["health"])
+_HEALTH_SQLITE_BUSY_TIMEOUT_MS = 100
 _HEALTH_SQLITE_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="health-sqlite",
@@ -119,11 +120,20 @@ def _repo_version(path: str, label: str) -> RepoVersionOut:
 
 @router.get("/health", response_model=HealthOut)
 async def health() -> HealthOut:
-    return await timing.to_thread(
-        "health.sqlite",
-        _health_sync,
-        _executor=_HEALTH_SQLITE_EXECUTOR,
-    )
+    try:
+        return await timing.to_thread(
+            "health.sqlite",
+            _health_sync,
+            _executor=_HEALTH_SQLITE_EXECUTOR,
+        )
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "database is locked" in message or "database is busy" in message:
+            raise HTTPException(
+                status_code=503,
+                detail="database_locked",
+            ) from exc
+        raise
 
 
 @contextmanager
@@ -136,8 +146,14 @@ def get_health_conn() -> Generator[sqlite3.Connection, None, None]:
         readonly=True,
         operation="health",
     ):
-        conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+        conn = sqlite3.connect(
+            db_uri,
+            uri=True,
+            check_same_thread=False,
+            timeout=_HEALTH_SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
         conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={_HEALTH_SQLITE_BUSY_TIMEOUT_MS}")
         try:
             yield conn
         finally:
