@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
+import logging
 import os
 import subprocess
 import time
@@ -15,7 +17,10 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from .events import AppEvent, bus
+
 router = APIRouter(prefix="/personal/email", tags=["personal-email"])
+log = logging.getLogger(__name__)
 
 DEFAULT_DOWNLOADED_FOLDER = "Downloaded"
 PIM_EMAIL_STACK_DIR = Path("/xarta-node/.lone-wolf/stacks/pim-email")
@@ -33,6 +38,15 @@ PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS = float(
 PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS", "60")
 )
+PIM_EMAIL_CACHE_STATE_EVENT = "pim.email.cache.state"
+PIM_EMAIL_CACHE_STATE_WATCH_SECONDS = float(
+    os.environ.get("PIM_EMAIL_CACHE_STATE_WATCH_SECONDS", "20")
+)
+PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS = float(
+    os.environ.get("PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS", "0.75")
+)
+_CACHE_STATE_WATCH_KEYS: set[tuple[str, tuple[str, ...]]] = set()
+_CACHE_STATE_LAST_SIGNATURES: dict[str, str] = {}
 
 
 class SmtpSelfTestRequest(BaseModel):
@@ -420,6 +434,163 @@ def _attach_server_metrics(
             **{name: round(duration, 6) for name, duration in (stages or {}).items()},
         }
     return response
+
+
+def _message_states_from_response(response: dict[str, Any] | None) -> dict[str, Any]:
+    states = response.get("message_states") if isinstance(response, dict) else None
+    if not isinstance(states, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    for uid, value in states.items():
+        if not isinstance(value, dict):
+            continue
+        clean_uid = str(uid or value.get("email_uid") or "").strip()
+        if clean_uid:
+            clean[clean_uid] = value
+    return clean
+
+
+def _cache_state_uids_from_body(body: LocalCacheWarmRequest | None) -> list[str]:
+    if body is None:
+        return []
+    seen: set[str] = set()
+    uids: list[str] = []
+    for uid in body.email_uids or []:
+        clean = str(uid or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        uids.append(clean)
+    return uids
+
+
+async def _publish_pim_email_cache_state(
+    states: dict[str, Any],
+    *,
+    mailbox_id: str | None,
+    reason: str,
+) -> None:
+    if not states:
+        return
+    event = AppEvent.create(
+        PIM_EMAIL_CACHE_STATE_EVENT,
+        "PIM Email Cache State",
+        f"{len(states)} message cache state update{'s' if len(states) != 1 else ''}",
+        source="pim-email-blueprints-proxy",
+        payload={
+            "schema": "xarta.pim_email.cache_state.event.v1",
+            "reason": reason,
+            "mailbox_id": str(mailbox_id or ""),
+            "message_states": states,
+            "count": len(states),
+            "sent_at": time.time(),
+        },
+    )
+    await bus.publish(event)
+
+
+def _schedule_pim_email_cache_state_event(
+    response: dict[str, Any] | None,
+    *,
+    reason: str,
+    mailbox_id: str | None = None,
+) -> None:
+    states = _message_states_from_response(response)
+    if not states:
+        return
+
+    async def run() -> None:
+        await _publish_pim_email_cache_state(states, mailbox_id=mailbox_id, reason=reason)
+
+    task = asyncio.create_task(run())
+    task.add_done_callback(_log_background_task_result)
+
+
+def _state_signature(value: dict[str, Any]) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        return repr(value)
+
+
+def _state_is_server_complete(value: dict[str, Any] | None) -> bool:
+    return bool(value and value.get("server_complete"))
+
+
+async def _watch_pim_email_cache_states(
+    mailbox_id: str | None,
+    uids: tuple[str, ...],
+    *,
+    reason: str,
+) -> None:
+    deadline = time.monotonic() + max(1.0, PIM_EMAIL_CACHE_STATE_WATCH_SECONDS)
+    interval = max(0.1, PIM_EMAIL_CACHE_STATE_WATCH_INTERVAL_SECONDS)
+    while time.monotonic() <= deadline:
+        try:
+            response = await _stack_post_json(
+                "/local/cache/messages",
+                params=_stack_params(mailbox_id=mailbox_id),
+                json_body={
+                    "mailbox_id": mailbox_id,
+                    "email_uids": list(uids),
+                    "limit": len(uids),
+                },
+            )
+        except Exception as exc:
+            log.debug("pim email cache-state watch failed: %s", exc)
+            await asyncio.sleep(interval)
+            continue
+        states = _message_states_from_response(response)
+        changed: dict[str, Any] = {}
+        for uid, value in states.items():
+            key = f"{mailbox_id or ''}:{uid}"
+            signature = _state_signature(value)
+            if _CACHE_STATE_LAST_SIGNATURES.get(key) == signature:
+                continue
+            _CACHE_STATE_LAST_SIGNATURES[key] = signature
+            changed[uid] = value
+        if changed:
+            await _publish_pim_email_cache_state(
+                changed,
+                mailbox_id=mailbox_id,
+                reason=reason,
+            )
+        if states and all(_state_is_server_complete(states.get(uid)) for uid in uids):
+            return
+        await asyncio.sleep(interval)
+
+
+def _log_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except Exception as exc:
+        log.debug("pim email background task failed: %s", exc)
+
+
+def _schedule_pim_email_cache_state_watch(
+    mailbox_id: str | None,
+    uids: list[str] | tuple[str, ...],
+    *,
+    reason: str,
+) -> None:
+    clean_uids = tuple(
+        dict.fromkeys(str(uid or "").strip() for uid in uids if str(uid or "").strip())
+    )
+    if not clean_uids:
+        return
+    key = (str(mailbox_id or ""), clean_uids)
+    if key in _CACHE_STATE_WATCH_KEYS:
+        return
+    _CACHE_STATE_WATCH_KEYS.add(key)
+
+    async def run() -> None:
+        try:
+            await _watch_pim_email_cache_states(mailbox_id, clean_uids, reason=reason)
+        finally:
+            _CACHE_STATE_WATCH_KEYS.discard(key)
+
+    task = asyncio.create_task(run())
+    task.add_done_callback(_log_background_task_result)
 
 
 def _parse_stack_control_output(stdout: str) -> dict[str, str]:
@@ -908,20 +1079,38 @@ async def email_local_virtual_paths_audit_gate(
 
 @router.post("/local/cache/warm")
 async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
-    return await _stack_post_json(
+    response = await _stack_post_json(
         "/local/cache/warm",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
     )
+    uids = _cache_state_uids_from_body(body) or list(_message_states_from_response(response))
+    _schedule_pim_email_cache_state_event(
+        response,
+        reason="cache-warm-response",
+        mailbox_id=body.mailbox_id,
+    )
+    _schedule_pim_email_cache_state_watch(
+        body.mailbox_id,
+        uids,
+        reason="cache-warm-watch",
+    )
+    return response
 
 
 @router.post("/local/cache/messages")
 async def email_local_cache_messages(body: LocalCacheWarmRequest) -> dict[str, Any]:
-    return await _stack_post_json(
+    response = await _stack_post_json(
         "/local/cache/messages",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
     )
+    _schedule_pim_email_cache_state_event(
+        response,
+        reason="cache-state-response",
+        mailbox_id=body.mailbox_id,
+    )
+    return response
 
 
 @router.get("/local/messages/{email_uid}")
@@ -930,10 +1119,16 @@ async def email_local_message(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
     opened: bool = Query(True),
 ) -> dict[str, Any]:
-    return await _stack_get_json(
+    response = await _stack_get_json(
         f"/local/messages/{email_uid}",
         params=_stack_params(mailbox_id=mailbox_id, opened=opened),
     )
+    _schedule_pim_email_cache_state_watch(
+        mailbox_id,
+        [email_uid],
+        reason="message-open-watch" if opened else "message-read-watch",
+    )
+    return response
 
 
 @router.post("/local/messages/{email_uid}/opened")
@@ -977,11 +1172,17 @@ async def email_local_message_force_refresh(
     email_uid: str,
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
 ) -> dict[str, Any]:
-    return await _stack_post_json(
+    response = await _stack_post_json(
         f"/local/messages/{email_uid}/force-refresh",
         params=_stack_params(mailbox_id=mailbox_id),
         timeout_seconds=PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS,
     )
+    _schedule_pim_email_cache_state_watch(
+        mailbox_id,
+        [email_uid],
+        reason="message-force-refresh-watch",
+    )
+    return response
 
 
 @router.get("/local/images/{shared_asset_uid}")
