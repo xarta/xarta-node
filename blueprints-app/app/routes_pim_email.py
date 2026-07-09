@@ -915,6 +915,15 @@ async def email_local_cache_warm(body: LocalCacheWarmRequest) -> dict[str, Any]:
     )
 
 
+@router.post("/local/cache/messages")
+async def email_local_cache_messages(body: LocalCacheWarmRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/cache/messages",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
 @router.get("/local/messages/{email_uid}")
 async def email_local_message(
     email_uid: str,
