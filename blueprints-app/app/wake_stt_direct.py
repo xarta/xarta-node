@@ -7137,7 +7137,7 @@ async def _collect_blueprints_nav_candidates(
         _blueprints_nav_request_json(
             client,
             "GET",
-            f"{api_base}/api/v1/voice-mode/active-browser-view",
+            f"{api_base}/api/v1/active-browser-runtime/active-browser-view",
         )
     )
     docs_task = asyncio.create_task(
@@ -7614,7 +7614,7 @@ async def _run_blueprints_nav_bounded_helper(
     dispatch = await _blueprints_nav_request_json(
         client,
         "POST",
-        f"{api_base}/api/v1/voice-mode/active-browser-command",
+        f"{api_base}/api/v1/active-browser-runtime/active-browser-command",
         payload=command_body,
         timeout_seconds=5.0,
     )

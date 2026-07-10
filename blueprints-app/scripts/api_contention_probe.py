@@ -314,7 +314,7 @@ def build_specs(args: argparse.Namespace, room_id: str | None) -> dict[str, Requ
         "health": RequestSpec("health", "/health", "cheap"),
         "browser_view": RequestSpec(
             "active_browser_view",
-            "/api/v1/voice-mode/active-browser-view?metrics=true",
+            "/api/v1/active-browser-runtime/active-browser-view?metrics=true",
             "browser",
         ),
         "help_catalog": RequestSpec(
@@ -324,7 +324,7 @@ def build_specs(args: argparse.Namespace, room_id: str | None) -> dict[str, Requ
         ),
         "browser_clients": RequestSpec(
             "browser_clients",
-            "/api/v1/voice-mode/browser-clients?metrics=true",
+            "/api/v1/active-browser-runtime/browser-clients?metrics=true",
             "browser",
         ),
         "kanban_status": RequestSpec(

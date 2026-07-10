@@ -84,7 +84,7 @@ _SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
 # tokens cannot access the rest of the Blueprints API.
 _TTS_SERVICE_ROUTES = frozenset(
     {
-        ("GET", "/api/v1/voice-mode/status"),
+        ("GET", "/api/v1/active-browser-runtime/status"),
         ("GET", "/api/v1/tts/status"),
         ("POST", "/api/v1/tts/utterances"),
         ("POST", "/api/v1/tts/stop"),

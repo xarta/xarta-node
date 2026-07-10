@@ -7,10 +7,11 @@ import time
 from pathlib import Path
 
 import pytest
+from starlette.requests import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blueprints-app"))
 
-NODES_JSON = Path(tempfile.gettempdir()) / "blueprints-test-voice-mode-nodes.json"
+NODES_JSON = Path(tempfile.gettempdir()) / "blueprints-test-active-browser-runtime-nodes.json"
 NODES_JSON.write_text(
     """
     {
@@ -41,7 +42,19 @@ os.environ.setdefault("SEEKDB_DB", "blueprints_test")
 os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
-from app import routes_voice_mode as voice_mode  # noqa: E402
+from app import routes_active_browser_runtime as active_browser_runtime  # noqa: E402
+
+
+def _test_request(client_host: str = "127.0.0.1") -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/active-browser-runtime/browser-view",
+            "headers": [],
+            "client": (client_host, 12345),
+        }
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +66,8 @@ def _isolate_wake_stt_direct_route_env(tmp_path, monkeypatch):
     monkeypatch.delenv("BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED", raising=False)
 
 
-def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
-    policy = voice_mode._clean_wake_to_talk_policy(
+def test_active_browser_runtime_wake_settings_defaults_and_bounds_are_sanitized():
+    policy = active_browser_runtime._clean_wake_to_talk_policy(
         {
             "instances": {
                 "local": {
@@ -109,10 +122,10 @@ def test_voice_mode_wake_settings_defaults_and_bounds_are_sanitized():
     assert "minime" in vps["wake_aliases"]
 
 
-def test_voice_mode_wake_direct_delivery_rolls_back_until_route_enabled(monkeypatch):
+def test_active_browser_runtime_wake_direct_delivery_rolls_back_until_route_enabled(monkeypatch):
     monkeypatch.delenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", raising=False)
 
-    policy = voice_mode._clean_wake_to_talk_policy(
+    policy = active_browser_runtime._clean_wake_to_talk_policy(
         {
             "instances": {
                 "local": {
@@ -144,10 +157,10 @@ def test_voice_mode_wake_direct_delivery_rolls_back_until_route_enabled(monkeypa
     assert vps["direct_rollback_reason"] == "direct_not_available"
 
 
-def test_voice_mode_wake_direct_delivery_can_survive_when_route_enabled(monkeypatch):
+def test_active_browser_runtime_wake_direct_delivery_can_survive_when_route_enabled(monkeypatch):
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_DIRECT_ROUTE_ENABLED", "true")
 
-    policy = voice_mode._clean_wake_to_talk_policy(
+    policy = active_browser_runtime._clean_wake_to_talk_policy(
         {
             "instances": {
                 "local": {
@@ -167,7 +180,9 @@ def test_voice_mode_wake_direct_delivery_can_survive_when_route_enabled(monkeypa
     assert local["direct_rollback_applied"] is False
 
 
-def test_voice_mode_wake_vps_direct_uses_instance_config_and_rollout_env(tmp_path, monkeypatch):
+def test_active_browser_runtime_wake_vps_direct_uses_instance_config_and_rollout_env(
+    tmp_path, monkeypatch
+):
     instances_file = tmp_path / "instances.json"
     instances_file.write_text(
         json.dumps(
@@ -187,7 +202,7 @@ def test_voice_mode_wake_vps_direct_uses_instance_config_and_rollout_env(tmp_pat
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_INSTANCES_FILE", str(instances_file))
     monkeypatch.setenv("BLUEPRINTS_WAKE_STT_VPS_DIRECT_ROUTE_ENABLED", "1")
 
-    policy = voice_mode._clean_wake_to_talk_policy(
+    policy = active_browser_runtime._clean_wake_to_talk_policy(
         {
             "instances": {
                 "vps": {
@@ -206,7 +221,7 @@ def test_voice_mode_wake_vps_direct_uses_instance_config_and_rollout_env(tmp_pat
     assert vps["direct_status"] == "enabled"
 
 
-def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
+def test_active_browser_runtime_stt_policy_sanitizes_aggregation_timeout():
     def expected(**overrides):
         base = {
             "speech_aggregation_timeout_ms": 80,
@@ -230,30 +245,39 @@ def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
         base.update(overrides)
         return base
 
-    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 83}) == expected()
-    assert voice_mode._clean_stt_policy({"speech_aggregation_timeout_ms": 999}) == expected(
-        speech_aggregation_timeout_ms=300
+    assert (
+        active_browser_runtime._clean_stt_policy({"speech_aggregation_timeout_ms": 83})
+        == expected()
     )
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 1}) == expected(
+    assert active_browser_runtime._clean_stt_policy(
+        {"speech_aggregation_timeout_ms": 999}
+    ) == expected(speech_aggregation_timeout_ms=300)
+    assert active_browser_runtime._clean_stt_policy({"vad_reset_timeout_ms": 1}) == expected(
         vad_reset_timeout_ms=0
     )
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 126}) == expected(
+    assert active_browser_runtime._clean_stt_policy({"vad_reset_timeout_ms": 126}) == expected(
         vad_reset_timeout_ms=150
     )
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 400}) == expected(
+    assert active_browser_runtime._clean_stt_policy({"vad_reset_timeout_ms": 400}) == expected(
         vad_reset_timeout_ms=400
     )
-    assert voice_mode._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == expected(
+    assert active_browser_runtime._clean_stt_policy({"vad_reset_timeout_ms": 9999}) == expected(
         vad_reset_timeout_ms=2000
     )
-    assert voice_mode._clean_stt_policy({"pre_roll_frames": 3}) == expected(pre_roll_frames=3)
-    assert voice_mode._clean_stt_policy({"num_pre_roll_frames": 99}) == expected(pre_roll_frames=4)
-    assert voice_mode._clean_stt_policy({"num_pre_roll": 0}) == expected()
-    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == expected()
-    assert voice_mode._clean_stt_policy({"silence_reset_timeout_ms": 1}) == expected(
+    assert active_browser_runtime._clean_stt_policy({"pre_roll_frames": 3}) == expected(
+        pre_roll_frames=3
+    )
+    assert active_browser_runtime._clean_stt_policy({"num_pre_roll_frames": 99}) == expected(
+        pre_roll_frames=4
+    )
+    assert active_browser_runtime._clean_stt_policy({"num_pre_roll": 0}) == expected()
+    assert (
+        active_browser_runtime._clean_stt_policy({"silence_reset_timeout_ms": 2000}) == expected()
+    )
+    assert active_browser_runtime._clean_stt_policy({"silence_reset_timeout_ms": 1}) == expected(
         silence_reset_timeout_ms=0
     )
-    assert voice_mode._clean_stt_policy(
+    assert active_browser_runtime._clean_stt_policy(
         {
             "word_detection_match_cue_enabled": "yes",
             "word_detection_match_cue_sound": "sounds/high.mp3",
@@ -270,17 +294,30 @@ def test_voice_mode_stt_policy_sanitizes_aggregation_timeout():
         word_detection_agent_candidate_cue_enabled=True,
         word_detection_agent_candidate_cue_sound="sounds/candidate.mp3",
     )
-    assert voice_mode._clean_stt_policy({"silero_vad_enabled": True})["silero_vad_enabled"] is True
-    assert voice_mode._clean_stt_policy({"silero_enabled": "yes"})["silero_vad_enabled"] is True
     assert (
-        voice_mode._clean_stt_policy({"always_pre_roll_enabled": True})["always_pre_roll_enabled"]
+        active_browser_runtime._clean_stt_policy({"silero_vad_enabled": True})["silero_vad_enabled"]
         is True
     )
-    assert voice_mode._clean_stt_policy({"always_pre_roll": "1"})["always_pre_roll_enabled"] is True
+    assert (
+        active_browser_runtime._clean_stt_policy({"silero_enabled": "yes"})["silero_vad_enabled"]
+        is True
+    )
+    assert (
+        active_browser_runtime._clean_stt_policy({"always_pre_roll_enabled": True})[
+            "always_pre_roll_enabled"
+        ]
+        is True
+    )
+    assert (
+        active_browser_runtime._clean_stt_policy({"always_pre_roll": "1"})[
+            "always_pre_roll_enabled"
+        ]
+        is True
+    )
 
 
-def test_voice_mode_stt_policy_update_preserves_unspecified_values():
-    current = voice_mode._clean_stt_policy(
+def test_active_browser_runtime_stt_policy_update_preserves_unspecified_values():
+    current = active_browser_runtime._clean_stt_policy(
         {
             "word_detection_payload0_timeout_ms": 2100,
             "silero_vad_enabled": True,
@@ -289,7 +326,7 @@ def test_voice_mode_stt_policy_update_preserves_unspecified_values():
         }
     )
 
-    updated = voice_mode._clean_stt_policy_update(
+    updated = active_browser_runtime._clean_stt_policy_update(
         current,
         {
             "vad_reset_timeout_ms": 126,
@@ -303,69 +340,94 @@ def test_voice_mode_stt_policy_update_preserves_unspecified_values():
     assert updated["word_detection_match_cue_sound"] == "sounds/tos_chirp_5.wav"
 
 
-def test_voice_mode_default_stt_reset_payload_detects_stale_combined_wake_save():
-    current = voice_mode._clean_stt_policy(
+def test_active_browser_runtime_default_stt_reset_payload_detects_stale_combined_wake_save():
+    current = active_browser_runtime._clean_stt_policy(
         {
             "word_detection_payload0_timeout_ms": 2100,
             "silero_vad_enabled": True,
         }
     )
 
-    assert voice_mode._is_default_stt_reset_payload(voice_mode._clean_stt_policy({}), current)
-    assert not voice_mode._is_default_stt_reset_payload(
-        {"word_detection_payload0_timeout_ms": 0},
-        voice_mode._clean_stt_policy({}),
+    assert active_browser_runtime._is_default_stt_reset_payload(
+        active_browser_runtime._clean_stt_policy({}), current
     )
-    assert voice_mode._is_default_stt_reset_payload(
+    assert not active_browser_runtime._is_default_stt_reset_payload(
+        {"word_detection_payload0_timeout_ms": 0},
+        active_browser_runtime._clean_stt_policy({}),
+    )
+    assert active_browser_runtime._is_default_stt_reset_payload(
         {"word_detection_payload0_timeout_ms": 0},
         current,
     )
 
 
-def test_voice_mode_aggregation_proxy_payload_uses_seconds_for_pipecat():
-    assert voice_mode._aggregation_timeout_payload(83) == {
+def test_active_browser_runtime_aggregation_proxy_payload_uses_seconds_for_pipecat():
+    assert active_browser_runtime._aggregation_timeout_payload(83) == {
         "aggregation_timeout": 0.08,
         "aggregation_timeout_ms": 80,
     }
-    assert voice_mode._aggregation_timeout_payload(301) == {
+    assert active_browser_runtime._aggregation_timeout_payload(301) == {
         "aggregation_timeout": 0.3,
         "aggregation_timeout_ms": 300,
     }
 
 
 def test_active_browser_command_action_aliases_are_sanitized():
-    assert voice_mode._clean_active_browser_command_action("refresh") == "hard_refresh"
-    assert voice_mode._clean_active_browser_command_action("hard-refresh") == "hard_refresh"
-    assert voice_mode._clean_active_browser_command_action("app refresh") == "hard_refresh"
-    assert voice_mode._clean_active_browser_command_action("vad-dev") == "open_vad_dev"
-    assert voice_mode._clean_active_browser_command_action("close-vad") == "close_vad_dev"
-    assert voice_mode._clean_active_browser_command_action("modal close") == "close_modal"
-    assert voice_mode._clean_active_browser_command_action("page") == "open_page"
-    assert voice_mode._clean_active_browser_command_action("open tab") == "open_page"
-    assert voice_mode._clean_active_browser_command_action("chat room") == "open_matrix_chat_room"
+    assert active_browser_runtime._clean_active_browser_command_action("refresh") == "hard_refresh"
     assert (
-        voice_mode._clean_active_browser_command_action("matrix-chat-room")
+        active_browser_runtime._clean_active_browser_command_action("hard-refresh")
+        == "hard_refresh"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("app refresh") == "hard_refresh"
+    )
+    assert active_browser_runtime._clean_active_browser_command_action("vad-dev") == "open_vad_dev"
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("close-vad") == "close_vad_dev"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("modal close") == "close_modal"
+    )
+    assert active_browser_runtime._clean_active_browser_command_action("page") == "open_page"
+    assert active_browser_runtime._clean_active_browser_command_action("open tab") == "open_page"
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("chat room")
         == "open_matrix_chat_room"
     )
-    assert voice_mode._clean_active_browser_command_action("modal") == "open_modal"
-    assert voice_mode._clean_active_browser_command_action("doc") == "open_doc"
-    assert voice_mode._clean_active_browser_command_action("document") == "open_doc"
-    assert voice_mode._clean_active_browser_command_action("fn") == "menu_function"
-    assert voice_mode._clean_active_browser_command_action("menu-fn") == "menu_function"
-    assert voice_mode._clean_active_browser_command_action("synthesis") == "open_synthesis"
-    assert voice_mode._clean_active_browser_command_action("probes") == "open_probes"
-    assert voice_mode._clean_active_browser_command_action("settings") == "open_settings"
-    assert voice_mode._clean_active_browser_command_action("selector") == "selector_action"
-    assert voice_mode._clean_active_browser_command_action("body shade") == "set_body_shade"
-    assert voice_mode._clean_active_browser_command_action("shade-up") == "set_body_shade"
     assert (
-        voice_mode._clean_active_browser_command_action("kanban lane update")
+        active_browser_runtime._clean_active_browser_command_action("matrix-chat-room")
+        == "open_matrix_chat_room"
+    )
+    assert active_browser_runtime._clean_active_browser_command_action("modal") == "open_modal"
+    assert active_browser_runtime._clean_active_browser_command_action("doc") == "open_doc"
+    assert active_browser_runtime._clean_active_browser_command_action("document") == "open_doc"
+    assert active_browser_runtime._clean_active_browser_command_action("fn") == "menu_function"
+    assert active_browser_runtime._clean_active_browser_command_action("menu-fn") == "menu_function"
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("synthesis") == "open_synthesis"
+    )
+    assert active_browser_runtime._clean_active_browser_command_action("probes") == "open_probes"
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("settings") == "open_settings"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("selector") == "selector_action"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("body shade")
+        == "set_body_shade"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("shade-up") == "set_body_shade"
+    )
+    assert (
+        active_browser_runtime._clean_active_browser_command_action("kanban lane update")
         == "kanban_external_refresh"
     )
 
 
 def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
-    cleaned = voice_mode._clean_active_browser_kanban(
+    cleaned = active_browser_runtime._clean_active_browser_kanban(
         {
             "automation_status_loaded": True,
             "automation_status_loading": False,
@@ -413,82 +475,98 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
 
 
 def test_voice_dev_vad_detector_actions_are_allowed():
-    assert voice_mode._clean_dev_command_action("set silero vad") == "set_silero_vad"
-    assert voice_mode._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
-    assert voice_mode._clean_dev_command_action("set auto pre roll") == "set_auto_pre_roll"
-    assert voice_mode._clean_dev_command_action("set always pre roll") == "set_always_pre_roll"
-    assert voice_mode._clean_dev_command_action("set num pre roll") == "set_num_pre_roll"
+    assert active_browser_runtime._clean_dev_command_action("set silero vad") == "set_silero_vad"
     assert (
-        voice_mode._clean_dev_command_action("set-noise-threshold-db") == "set_noise_threshold_db"
+        active_browser_runtime._clean_dev_command_action("set-vad-detector") == "set_vad_detector"
     )
-    assert voice_mode._clean_dev_command_action("set vad pre roll db") == "set_vad_pre_roll_db"
     assert (
-        voice_mode._clean_dev_command_action("set word detection match cue")
+        active_browser_runtime._clean_dev_command_action("set auto pre roll") == "set_auto_pre_roll"
+    )
+    assert (
+        active_browser_runtime._clean_dev_command_action("set always pre roll")
+        == "set_always_pre_roll"
+    )
+    assert (
+        active_browser_runtime._clean_dev_command_action("set num pre roll") == "set_num_pre_roll"
+    )
+    assert (
+        active_browser_runtime._clean_dev_command_action("set-noise-threshold-db")
+        == "set_noise_threshold_db"
+    )
+    assert (
+        active_browser_runtime._clean_dev_command_action("set vad pre roll db")
+        == "set_vad_pre_roll_db"
+    )
+    assert (
+        active_browser_runtime._clean_dev_command_action("set word detection match cue")
         == "set_word_detection_match_cue"
     )
-    assert "set_silero_vad" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_vad_detector" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_auto_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_always_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_pre_roll_frames" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_num_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_num_pre_roll_frames" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_noise_threshold" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_noise_threshold_db" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_vad_pre_roll" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_vad_pre_roll_db" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_vad_pre_roll_threshold" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_word_detection_match_cue" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_word_detection_payload0_timeout_cue" in voice_mode._DEV_COMMAND_ACTIONS
-    assert "set_word_detection_agent_candidate_cue" in voice_mode._DEV_COMMAND_ACTIONS
+    assert "set_silero_vad" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_vad_detector" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_auto_pre_roll" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_always_pre_roll" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_pre_roll_frames" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_num_pre_roll" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_num_pre_roll_frames" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_noise_threshold" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_noise_threshold_db" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll_db" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_vad_pre_roll_threshold" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_match_cue" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_payload0_timeout_cue" in active_browser_runtime._DEV_COMMAND_ACTIONS
+    assert "set_word_detection_agent_candidate_cue" in active_browser_runtime._DEV_COMMAND_ACTIONS
 
 
 def test_active_browser_command_parameters_are_sanitized():
-    assert voice_mode._clean_active_browser_event_kind("tap") == "click"
-    assert voice_mode._clean_active_browser_event_kind("double tap") == "double_click"
-    assert voice_mode._clean_active_browser_event_kind("long-press") == "long_press"
-    assert voice_mode._clean_active_browser_event_kind("something else") == "click"
-    assert voice_mode._clean_active_browser_body_shade("raise") == "up"
-    assert voice_mode._clean_active_browser_body_shade("lower") == "down"
-    assert voice_mode._clean_active_browser_body_shade("flip") == "toggle"
-    assert voice_mode._clean_active_browser_body_shade("unexpected") == "up"
-    assert voice_mode._clean_active_browser_body_shade(None) == ""
+    assert active_browser_runtime._clean_active_browser_event_kind("tap") == "click"
+    assert active_browser_runtime._clean_active_browser_event_kind("double tap") == "double_click"
+    assert active_browser_runtime._clean_active_browser_event_kind("long-press") == "long_press"
+    assert active_browser_runtime._clean_active_browser_event_kind("something else") == "click"
+    assert active_browser_runtime._clean_active_browser_body_shade("raise") == "up"
+    assert active_browser_runtime._clean_active_browser_body_shade("lower") == "down"
+    assert active_browser_runtime._clean_active_browser_body_shade("flip") == "toggle"
+    assert active_browser_runtime._clean_active_browser_body_shade("unexpected") == "up"
+    assert active_browser_runtime._clean_active_browser_body_shade(None) == ""
     assert (
-        voice_mode._clean_active_browser_modal_id("vad-dev-modal<script>") == "vad-dev-modalscript"
+        active_browser_runtime._clean_active_browser_modal_id("vad-dev-modal<script>")
+        == "vad-dev-modalscript"
     )
-    assert voice_mode._clean_active_browser_selector_action("API Key") == "api-key"
-    assert voice_mode._clean_active_browser_group("Settings Panel!") == "settings-panel"
+    assert active_browser_runtime._clean_active_browser_selector_action("API Key") == "api-key"
+    assert active_browser_runtime._clean_active_browser_group("Settings Panel!") == "settings-panel"
     assert (
-        voice_mode._clean_active_browser_page_id("manual-links-page:ABC_123<script>")
+        active_browser_runtime._clean_active_browser_page_id("manual-links-page:ABC_123<script>")
         == "manual-links-page:ABC_123script"
     )
     assert (
-        voice_mode._clean_active_browser_menu_item_id("chat-fn-vad-dev<script>")
+        active_browser_runtime._clean_active_browser_menu_item_id("chat-fn-vad-dev<script>")
         == "chat-fn-vad-devscript"
     )
     assert (
-        voice_mode._clean_active_browser_fn_key("nod.backupColumns<script>")
+        active_browser_runtime._clean_active_browser_fn_key("nod.backupColumns<script>")
         == "nod.backupColumnsscript"
     )
-    assert voice_mode._clean_active_browser_diagnostic_sources("search gpu provenance") == [
+    assert active_browser_runtime._clean_active_browser_diagnostic_sources(
+        "search gpu provenance"
+    ) == [
         "personal_search",
         "gpu_activity_sound",
         "personal_graph",
     ]
-    assert len(voice_mode._clean_active_browser_group("A" * 200)) == 80
-    assert len(voice_mode._clean_active_browser_page_id("p" * 220)) == 160
-    assert len(voice_mode._clean_active_browser_menu_item_id("m" * 220)) == 160
-    assert len(voice_mode._clean_active_browser_fn_key("f" * 220)) == 160
+    assert len(active_browser_runtime._clean_active_browser_group("A" * 200)) == 80
+    assert len(active_browser_runtime._clean_active_browser_page_id("p" * 220)) == 160
+    assert len(active_browser_runtime._clean_active_browser_menu_item_id("m" * 220)) == 160
+    assert len(active_browser_runtime._clean_active_browser_fn_key("f" * 220)) == 160
 
 
 def test_active_browser_automation_does_not_fabricate_empty_last_command():
-    report = voice_mode._clean_active_browser_automation_report({"last_command": {}})
+    report = active_browser_runtime._clean_active_browser_automation_report({"last_command": {}})
 
     assert report["last_command"] == {}
 
 
 def test_active_browser_automation_preserves_personal_search_graph_surfaces():
-    report = voice_mode._clean_active_browser_automation_report(
+    report = active_browser_runtime._clean_active_browser_automation_report(
         {
             "surfaces": {
                 "personal_search": {
@@ -531,7 +609,7 @@ def test_active_browser_automation_preserves_personal_search_graph_surfaces():
 
 
 def test_active_browser_automation_compacts_menu_lists_and_preserves_matrix_metrics():
-    report = voice_mode._clean_active_browser_automation_report(
+    report = active_browser_runtime._clean_active_browser_automation_report(
         {
             "menus": [
                 {
@@ -631,7 +709,7 @@ def test_active_browser_view_compacts_history_clients_and_reports():
         },
     }
 
-    public = voice_mode._public_active_browser_view(state)
+    public = active_browser_runtime._public_active_browser_view(state)
 
     assert public["view"]["automation"]["menus"][0]["pages"] == []
     assert "automation" not in public["clients"][0]
@@ -643,8 +721,8 @@ def test_active_browser_view_compacts_history_clients_and_reports():
 
 def test_active_browser_command_rejects_unsupported_actions():
     response = asyncio.run(
-        voice_mode.active_browser_command(
-            voice_mode.ActiveBrowserCommandBody(action="delete everything")
+        active_browser_runtime.active_browser_command(
+            active_browser_runtime.ActiveBrowserCommandBody(action="delete everything")
         )
     )
 
@@ -656,7 +734,7 @@ def test_active_browser_command_rejects_unsupported_actions():
 
 
 def test_active_browser_command_accepts_matrix_chat_room_payload(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
     state_path.write_text(
         json.dumps(
             {
@@ -672,8 +750,8 @@ def test_active_browser_command_accepts_matrix_chat_room_payload(tmp_path, monke
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
     captured = {}
 
     class Published:
@@ -684,11 +762,11 @@ def test_active_browser_command_accepts_matrix_chat_room_payload(tmp_path, monke
         captured["event"] = event
         return Published()
 
-    monkeypatch.setattr(voice_mode, "publish_event", fake_publish)
+    monkeypatch.setattr(active_browser_runtime, "publish_event", fake_publish)
 
     result = asyncio.run(
-        voice_mode.active_browser_command(
-            voice_mode.ActiveBrowserCommandBody(
+        active_browser_runtime.active_browser_command(
+            active_browser_runtime.ActiveBrowserCommandBody(
                 action="chat room",
                 group="settings",
                 page_id="matrix-chat",
@@ -720,7 +798,7 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "revision": 10,
         "updated_at": 10,
     }
-    body = voice_mode.BrowserViewBody(
+    body = active_browser_runtime.BrowserViewBody(
         browser_id="active-browser",
         browser_label="Browser on Win32",
         tab_id="tab-1",
@@ -986,10 +1064,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
             },
         },
     )
-    report = voice_mode._clean_browser_view_report(body, 20)
+    report = active_browser_runtime._clean_browser_view_report(body, 20)
 
-    changed = voice_mode._store_browser_view_report_unlocked(state, report, 20)
-    view = voice_mode._selected_active_browser_view(state)
+    changed = active_browser_runtime._store_browser_view_report_unlocked(state, report, 20)
+    view = active_browser_runtime._selected_active_browser_view(state)
 
     assert changed is True
     assert state["active"]["tab_id"] == "tab-1"
@@ -1159,7 +1237,9 @@ def test_active_browser_view_report_updates_active_tab_and_page():
 
 
 def test_active_browser_view_exposes_automation_defaults():
-    public = voice_mode._public_active_browser_view({"active": None, "browser_views": {}})
+    public = active_browser_runtime._public_active_browser_view(
+        {"active": None, "browser_views": {}}
+    )
 
     assert public["automation"]["default_step_timeout_seconds"] == 10
     assert public["automation"]["minimum_step_timeout_seconds"] == 1
@@ -1167,9 +1247,9 @@ def test_active_browser_view_exposes_automation_defaults():
 
 
 def test_active_browser_view_offloads_payload_build_and_reports_metrics(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
     state_path.write_text(
         json.dumps(
             {
@@ -1192,9 +1272,9 @@ def test_active_browser_view_offloads_payload_build_and_reports_metrics(tmp_path
         calls.append((func.__name__, args, kwargs))
         return func(*args, **kwargs)
 
-    monkeypatch.setattr(voice_mode.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(active_browser_runtime.asyncio, "to_thread", fake_to_thread)
 
-    public = asyncio.run(voice_mode.active_browser_view(metrics=True))
+    public = asyncio.run(active_browser_runtime.active_browser_view(metrics=True))
 
     assert calls[0][0] == "_active_browser_view_locked_sync"
     assert public["view"]["page"]["tab"] == "matrix-chat"
@@ -1203,24 +1283,29 @@ def test_active_browser_view_offloads_payload_build_and_reports_metrics(tmp_path
 
 
 def test_browser_view_post_returns_small_ack_and_coalesces_disk_persistence(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
-    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
-    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
-    monkeypatch.setattr(voice_mode, "_BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
+    debug_path = tmp_path / "blueprints-active-browser-runtime-dev-debug.json"
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(
+        active_browser_runtime, "_BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0
+    )
+    monkeypatch.setattr(
+        active_browser_runtime, "_ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE", False
+    )
 
     first = asyncio.run(
-        voice_mode.update_browser_view(
-            voice_mode.BrowserViewBody(
+        active_browser_runtime.update_browser_view(
+            active_browser_runtime.BrowserViewBody(
                 browser_id="browser-a",
                 tab_id="tab-1",
                 page={"group": "settings", "tab": "matrix-chat", "ready": True},
-            )
+            ),
+            _test_request(),
         )
     )
 
@@ -1230,12 +1315,13 @@ def test_browser_view_post_returns_small_ack_and_coalesces_disk_persistence(tmp_
     assert "reports" not in first
 
     second = asyncio.run(
-        voice_mode.update_browser_view(
-            voice_mode.BrowserViewBody(
+        active_browser_runtime.update_browser_view(
+            active_browser_runtime.BrowserViewBody(
                 browser_id="browser-a",
                 tab_id="tab-1",
                 page={"group": "settings", "tab": "agents", "ready": True},
-            )
+            ),
+            _test_request(),
         )
     )
 
@@ -1245,13 +1331,13 @@ def test_browser_view_post_returns_small_ack_and_coalesces_disk_persistence(tmp_
     persisted_report = next(iter(persisted["browser_views"].values()))
     assert persisted_report["page"]["tab"] == "matrix-chat"
 
-    live = asyncio.run(voice_mode.active_browser_view())
+    live = asyncio.run(active_browser_runtime.active_browser_view())
     assert live["view"]["page"]["tab"] == "agents"
 
 
 def test_active_browser_viewport_classification_flags_are_provisional():
-    mobile = voice_mode._clean_browser_view_report(
-        voice_mode.BrowserViewBody(
+    mobile = active_browser_runtime._clean_browser_view_report(
+        active_browser_runtime.BrowserViewBody(
             browser_id="phone",
             viewport={
                 "innerWidth": 390,
@@ -1262,8 +1348,8 @@ def test_active_browser_viewport_classification_flags_are_provisional():
         ),
         20,
     )
-    wide = voice_mode._clean_browser_view_report(
-        voice_mode.BrowserViewBody(
+    wide = active_browser_runtime._clean_browser_view_report(
+        active_browser_runtime.BrowserViewBody(
             browser_id="wide",
             viewport={
                 "innerWidth": 2560,
@@ -1307,7 +1393,7 @@ def test_active_browser_client_inventory_marks_active_fresh_and_stale():
         },
     }
 
-    clients = voice_mode._browser_client_inventory(state, now=100, max_age_seconds=30)
+    clients = active_browser_runtime._browser_client_inventory(state, now=100, max_age_seconds=30)
 
     assert clients[0]["browser_id"] == "active-browser"
     assert clients[0]["active_tab"] is True
@@ -1318,7 +1404,7 @@ def test_active_browser_client_inventory_marks_active_fresh_and_stale():
 
 
 def test_publish_kanban_external_refresh_targets_safe_kanban_tabs(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
     state_path.write_text(
         json.dumps(
             {
@@ -1368,19 +1454,19 @@ def test_publish_kanban_external_refresh_targets_safe_kanban_tabs(tmp_path, monk
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
-    monkeypatch.setattr(voice_mode.time, "time", lambda: 100.0)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime.time, "time", lambda: 100.0)
     published = []
 
     async def fake_publish(event, **kwargs):
         published.append(event.payload)
         return event
 
-    monkeypatch.setattr(voice_mode, "publish_event", fake_publish)
+    monkeypatch.setattr(active_browser_runtime, "publish_event", fake_publish)
 
     result = asyncio.run(
-        voice_mode.publish_kanban_external_refresh_commands(
+        active_browser_runtime.publish_kanban_external_refresh_commands(
             item_id="item-1",
             parent_item_id="parent-1",
             state_id="done",
@@ -1413,14 +1499,14 @@ def test_active_browser_client_lookup_rejects_missing_and_stale_reports():
         },
     }
 
-    stale, stale_reason = voice_mode._find_browser_client_report(
+    stale, stale_reason = active_browser_runtime._find_browser_client_report(
         state,
         browser_id="stale-browser",
         tab_id="tab-1",
         now=100,
         max_age_seconds=30,
     )
-    missing, missing_reason = voice_mode._find_browser_client_report(
+    missing, missing_reason = active_browser_runtime._find_browser_client_report(
         state,
         browser_id="missing-browser",
         now=100,
@@ -1446,12 +1532,12 @@ def test_active_browser_from_client_report_preserves_existing_voice_flags_for_sa
         "tts_enabled": True,
     }
 
-    active = voice_mode._active_browser_from_client_report(
+    active = active_browser_runtime._active_browser_from_client_report(
         report,
         25,
         current_active=current_active,
     )
-    fresh = voice_mode._active_browser_from_client_report(
+    fresh = active_browser_runtime._active_browser_from_client_report(
         {"browser_id": "other-browser", "browser_label": "Other", "tab_id": "tab-3"},
         30,
     )
@@ -1465,7 +1551,7 @@ def test_active_browser_from_client_report_preserves_existing_voice_flags_for_sa
 
 
 def test_active_browser_from_client_report_uses_reported_voice_state_for_new_browser():
-    active = voice_mode._active_browser_from_client_report(
+    active = active_browser_runtime._active_browser_from_client_report(
         {
             "browser_id": "phone-browser",
             "browser_label": "Phone",
@@ -1487,14 +1573,14 @@ def test_active_browser_from_client_report_uses_reported_voice_state_for_new_bro
 
 
 def test_active_browser_from_client_report_allows_explicit_voice_override():
-    body = voice_mode.BrowserClientSelectionBody(
+    body = active_browser_runtime.BrowserClientSelectionBody(
         browser_id="phone-browser",
         stt_enabled=False,
         stt_mode="",
         tts_enabled=False,
     )
 
-    active = voice_mode._active_browser_from_client_report(
+    active = active_browser_runtime._active_browser_from_client_report(
         {
             "browser_id": "phone-browser",
             "browser_label": "Phone",
@@ -1514,7 +1600,7 @@ def test_active_browser_from_client_report_allows_explicit_voice_override():
     assert active["tts_enabled"] is False
 
 
-def test_voice_mode_wake_dev_debug_prefers_active_browser_report():
+def test_active_browser_runtime_wake_dev_debug_prefers_active_browser_report():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1540,7 +1626,7 @@ def test_voice_mode_wake_dev_debug_prefers_active_browser_report():
         }
     }
 
-    public = voice_mode._public_wake_dev_debug(state, debug)
+    public = active_browser_runtime._public_wake_dev_debug(state, debug)
 
     assert public["ok"] is True
     assert public["has_debug"] is True
@@ -1549,7 +1635,7 @@ def test_voice_mode_wake_dev_debug_prefers_active_browser_report():
     assert public["debug"]["queues"]["message_queue"][0]["text"] == "hello"
 
 
-def test_voice_mode_dev_status_surface_prefers_active_browser_matching_surface():
+def test_active_browser_runtime_dev_status_surface_prefers_active_browser_matching_surface():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1582,7 +1668,7 @@ def test_voice_mode_dev_status_surface_prefers_active_browser_matching_surface()
         }
     }
 
-    public = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+    public = active_browser_runtime._public_wake_dev_debug(state, debug, surface="wake_dev")
 
     assert public["ok"] is True
     assert public["has_debug"] is True
@@ -1592,7 +1678,7 @@ def test_voice_mode_dev_status_surface_prefers_active_browser_matching_surface()
     assert public["debug"]["authoritative_browser_active"] is True
 
 
-def test_voice_mode_dev_status_surface_can_select_browser_specific_report():
+def test_active_browser_runtime_dev_status_surface_can_select_browser_specific_report():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1619,7 +1705,7 @@ def test_voice_mode_dev_status_surface_can_select_browser_specific_report():
         }
     }
 
-    public = voice_mode._public_wake_dev_debug(
+    public = active_browser_runtime._public_wake_dev_debug(
         state,
         debug,
         surface="wake_dev",
@@ -1631,7 +1717,7 @@ def test_voice_mode_dev_status_surface_can_select_browser_specific_report():
     assert public["debug"]["authoritative_browser_active"] is False
 
 
-def test_voice_mode_dev_status_surface_prefers_active_tab_report():
+def test_active_browser_runtime_dev_status_surface_prefers_active_tab_report():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1661,29 +1747,33 @@ def test_voice_mode_dev_status_surface_prefers_active_tab_report():
         }
     }
 
-    public = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+    public = active_browser_runtime._public_wake_dev_debug(state, debug, surface="wake_dev")
 
     assert public["debug"]["tab_id"] == "tab-1"
     assert public["debug"]["status"] == "active tab"
 
 
-def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persistence(
+def test_active_browser_runtime_dev_status_post_returns_small_ack_and_coalesces_disk_persistence(
     tmp_path, monkeypatch
 ):
-    state_path = tmp_path / "blueprints-voice-mode.json"
-    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
-    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
-    monkeypatch.setattr(voice_mode, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
+    debug_path = tmp_path / "blueprints-active-browser-runtime-dev-debug.json"
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(
+        active_browser_runtime, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0
+    )
+    monkeypatch.setattr(
+        active_browser_runtime, "_ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE", False
+    )
 
     first = asyncio.run(
-        voice_mode.voice_mode_update_dev_status(
-            voice_mode.WakeDevDebugBody(
+        active_browser_runtime.active_browser_runtime_update_dev_status(
+            active_browser_runtime.WakeDevDebugBody(
                 browser_id="browser-a",
                 tab_id="tab-1",
                 surface="vad_dev",
@@ -1701,15 +1791,15 @@ def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persist
     assert first["surface"] == "vad_dev"
     assert "debug" not in first
     assert (
-        voice_mode._dev_debug_report_key(
+        active_browser_runtime._dev_debug_report_key(
             {"browser_id": "browser-a", "tab_id": "tab-1", "surface": "vad_dev"}
         )
         == "browser-a:tab-1:vad_dev"
     )
 
     second = asyncio.run(
-        voice_mode.voice_mode_update_dev_status(
-            voice_mode.WakeDevDebugBody(
+        active_browser_runtime.active_browser_runtime_update_dev_status(
+            active_browser_runtime.WakeDevDebugBody(
                 browser_id="browser-a",
                 tab_id="tab-1",
                 surface="vad_dev",
@@ -1727,27 +1817,31 @@ def test_voice_mode_dev_status_post_returns_small_ack_and_coalesces_disk_persist
     persisted_report = persisted["reports"]["browser-a:tab-1:vad_dev"]
     assert persisted_report["status"] == "first"
 
-    live = asyncio.run(voice_mode.voice_mode_dev_status(surface="vad_dev", browser_id="browser-a"))
+    live = asyncio.run(
+        active_browser_runtime.active_browser_runtime_dev_status(
+            surface="vad_dev", browser_id="browser-a"
+        )
+    )
     assert live["debug"]["status"] == "second"
     assert live["debug"]["snapshot"]["fsm_state"] == "VAD_REARM_STT_FINALIZING"
 
 
-def test_voice_mode_state_writes_normalize_node_local_ownership(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
-    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
+def test_active_browser_runtime_state_writes_normalize_node_local_ownership(tmp_path, monkeypatch):
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
+    debug_path = tmp_path / "blueprints-active-browser-runtime-dev-debug.json"
     normalized = []
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_CACHE", None)
     monkeypatch.setattr(
-        voice_mode,
+        active_browser_runtime,
         "_normalize_node_local_ownership",
         lambda path: normalized.append(Path(path)),
     )
 
-    voice_mode._write_state_unlocked({"revision": 1})
-    voice_mode._write_wake_dev_debug_unlocked({"reports": {}})
+    active_browser_runtime._write_state_unlocked({"revision": 1})
+    active_browser_runtime._write_wake_dev_debug_unlocked({"reports": {}})
 
     assert normalized == [
         state_path.with_suffix(".tmp"),
@@ -1757,14 +1851,16 @@ def test_voice_mode_state_writes_normalize_node_local_ownership(tmp_path, monkey
     ]
 
 
-def test_voice_mode_dev_status_prunes_stale_reports_and_forces_persist(tmp_path, monkeypatch):
-    state_path = tmp_path / "blueprints-voice-mode.json"
-    debug_path = tmp_path / "blueprints-wake-dev-debug.json"
-    monkeypatch.setattr(voice_mode, "_STATE_PATH", state_path)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_PATH", debug_path)
-    monkeypatch.setattr(voice_mode, "_STATE_CACHE", None)
+def test_active_browser_runtime_dev_status_prunes_stale_reports_and_forces_persist(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "blueprints-active-browser-runtime.json"
+    debug_path = tmp_path / "blueprints-active-browser-runtime-dev-debug.json"
+    monkeypatch.setattr(active_browser_runtime, "_STATE_PATH", state_path)
+    monkeypatch.setattr(active_browser_runtime, "_WAKE_DEV_DEBUG_PATH", debug_path)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_CACHE", None)
     monkeypatch.setattr(
-        voice_mode,
+        active_browser_runtime,
         "_WAKE_DEV_DEBUG_CACHE",
         {
             "reports": {
@@ -1775,15 +1871,21 @@ def test_voice_mode_dev_status_prunes_stale_reports_and_forces_persist(tmp_path,
             "updated_at": 3,
         },
     )
-    monkeypatch.setattr(voice_mode, "_STATE_LAST_PERSISTED_AT", 0.0)
-    monkeypatch.setattr(voice_mode, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", time.monotonic())
-    monkeypatch.setattr(voice_mode, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(voice_mode, "_DEV_STATUS_MAX_REPORTS", 2)
-    monkeypatch.setattr(voice_mode, "_VOICE_MODE_HOT_POST_FULL_RESPONSE", False)
+    monkeypatch.setattr(active_browser_runtime, "_STATE_LAST_PERSISTED_AT", 0.0)
+    monkeypatch.setattr(
+        active_browser_runtime, "_WAKE_DEV_DEBUG_LAST_PERSISTED_AT", time.monotonic()
+    )
+    monkeypatch.setattr(
+        active_browser_runtime, "_DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS", 60.0
+    )
+    monkeypatch.setattr(active_browser_runtime, "_DEV_STATUS_MAX_REPORTS", 2)
+    monkeypatch.setattr(
+        active_browser_runtime, "_ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE", False
+    )
 
     result = asyncio.run(
-        voice_mode.voice_mode_update_dev_status(
-            voice_mode.WakeDevDebugBody(
+        active_browser_runtime.active_browser_runtime_update_dev_status(
+            active_browser_runtime.WakeDevDebugBody(
                 browser_id="browser-new",
                 tab_id="tab-1",
                 surface="vad_dev",
@@ -1803,22 +1905,22 @@ def test_voice_mode_dev_status_prunes_stale_reports_and_forces_persist(tmp_path,
     assert "old-c" in persisted["reports"]
 
 
-def test_voice_mode_dev_status_update_runs_off_event_loop(monkeypatch):
+def test_active_browser_runtime_dev_status_update_runs_off_event_loop(monkeypatch):
     async def run():
         def slow_update_sync(*args, **kwargs):
             time.sleep(0.15)
             return {"ok": True, "stored": True}
 
         monkeypatch.setattr(
-            voice_mode,
-            "_voice_mode_update_dev_status_locked_sync",
+            active_browser_runtime,
+            "_active_browser_runtime_update_dev_status_locked_sync",
             slow_update_sync,
         )
 
         started = time.perf_counter()
         task = asyncio.create_task(
-            voice_mode.voice_mode_update_dev_status(
-                voice_mode.WakeDevDebugBody(
+            active_browser_runtime.active_browser_runtime_update_dev_status(
+                active_browser_runtime.WakeDevDebugBody(
                     browser_id="browser-a",
                     surface="vad_dev",
                     status="slow",
@@ -1835,7 +1937,7 @@ def test_voice_mode_dev_status_update_runs_off_event_loop(monkeypatch):
     asyncio.run(run())
 
 
-def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():
+def test_active_browser_runtime_wake_dev_debug_report_cannot_override_authoritative_active_wake_status():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1858,8 +1960,8 @@ def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_w
         }
     }
 
-    status = voice_mode._public_state(state, debug)
-    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
+    status = active_browser_runtime._public_state(state, debug)
+    wake_debug = active_browser_runtime._public_wake_dev_debug(state, debug)
 
     assert status["active"]["stt_enabled"] is True
     assert status["active"]["stt_mode"] == "wake_to_talk"
@@ -1868,7 +1970,7 @@ def test_voice_mode_wake_dev_debug_report_cannot_override_authoritative_active_w
     assert wake_debug["debug"]["authoritative_browser_active"] is True
 
 
-def test_voice_mode_wake_dev_debug_does_not_treat_stt_mode_as_a_separate_activation():
+def test_active_browser_runtime_wake_dev_debug_does_not_treat_stt_mode_as_a_separate_activation():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1892,7 +1994,7 @@ def test_voice_mode_wake_dev_debug_does_not_treat_stt_mode_as_a_separate_activat
         }
     }
 
-    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
+    wake_debug = active_browser_runtime._public_wake_dev_debug(state, debug)
 
     assert wake_debug["active"]["stt_enabled"] is False
     assert wake_debug["active"]["stt_mode"] == ""
@@ -1901,7 +2003,7 @@ def test_voice_mode_wake_dev_debug_does_not_treat_stt_mode_as_a_separate_activat
     assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
-def test_voice_mode_wake_dev_debug_reports_non_active_browser_as_non_authoritative():
+def test_active_browser_runtime_wake_dev_debug_reports_non_active_browser_as_non_authoritative():
     state = {"active": None}
     debug = {
         "reports": {
@@ -1917,7 +2019,7 @@ def test_voice_mode_wake_dev_debug_reports_non_active_browser_as_non_authoritati
         }
     }
 
-    wake_debug = voice_mode._public_wake_dev_debug(state, debug)
+    wake_debug = active_browser_runtime._public_wake_dev_debug(state, debug)
 
     assert wake_debug["active"] is None
     assert wake_debug["debug"]["authoritative_browser_active"] is False
@@ -1926,7 +2028,7 @@ def test_voice_mode_wake_dev_debug_reports_non_active_browser_as_non_authoritati
     assert wake_debug["debug"]["fsm_state"] == "ARMED_IDLE"
 
 
-def test_voice_mode_wake_dev_debug_flags_auto_execute_policy_mismatch():
+def test_active_browser_runtime_wake_dev_debug_flags_auto_execute_policy_mismatch():
     state = {
         "active": {
             "browser_id": "active-browser",
@@ -1966,7 +2068,7 @@ def test_voice_mode_wake_dev_debug_flags_auto_execute_policy_mismatch():
         }
     }
 
-    wake_debug = voice_mode._public_wake_dev_debug(state, debug, surface="wake_dev")
+    wake_debug = active_browser_runtime._public_wake_dev_debug(state, debug, surface="wake_dev")
 
     guard = wake_debug["debug"]["auto_execute_guard"]
     assert wake_debug["debug"]["authoritative_browser_active"] is True
@@ -1989,25 +2091,25 @@ def test_active_browser_activation_fsm_replaces_existing_active_browser():
         "revision": 10,
         "updated_at": 10,
     }
-    body = voice_mode.BrowserVoiceState(
+    body = active_browser_runtime.ActiveBrowserActivationBody(
         browser_id="new-browser",
         browser_label="New Browser",
         stt_enabled=True,
         stt_mode="wake_to_talk",
         tts_enabled=False,
     )
-    active_browser = voice_mode._active_browser_from_body(body, 20)
+    active_browser = active_browser_runtime._active_browser_from_body(body, 20)
 
-    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
-        voice_mode._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
+    result = active_browser_runtime._ActiveBrowserActivationFsm(state).dispatch(
+        active_browser_runtime._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
         browser_id="new-browser",
         active_browser=active_browser,
         now=20,
     )
 
     assert result["changed"] is True
-    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
-    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["from"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["to"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "new-browser"
     assert state["active"]["stt_mode"] == "wake_to_talk"
     assert state["active"]["tts_enabled"] is False
@@ -2017,7 +2119,7 @@ def test_active_browser_activation_fsm_replaces_existing_active_browser():
 
 def test_active_browser_activation_fsm_activates_from_idle():
     state = {"active": None, "revision": 0, "updated_at": 0}
-    body = voice_mode.BrowserVoiceState(
+    body = active_browser_runtime.ActiveBrowserActivationBody(
         browser_id="new-browser",
         browser_label="New Browser",
         tab_id="new-tab",
@@ -2025,18 +2127,18 @@ def test_active_browser_activation_fsm_activates_from_idle():
         stt_mode="",
         tts_enabled=True,
     )
-    active_browser = voice_mode._active_browser_from_body(body, 20)
+    active_browser = active_browser_runtime._active_browser_from_body(body, 20)
 
-    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
-        voice_mode._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
+    result = active_browser_runtime._ActiveBrowserActivationFsm(state).dispatch(
+        active_browser_runtime._ActiveBrowserActivationFsm.INPUT_ACTIVATE_REQUEST,
         browser_id="new-browser",
         active_browser=active_browser,
         now=20,
     )
 
     assert result["changed"] is True
-    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_IDLE
-    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["from"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_IDLE
+    assert result["to"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "new-browser"
     assert state["active"]["tab_id"] == "new-tab"
     assert state["active"]["tts_enabled"] is True
@@ -2056,24 +2158,24 @@ def test_active_browser_activation_fsm_only_deactivates_current_browser():
         "updated_at": 10,
     }
 
-    ignored = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
-        voice_mode._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
+    ignored = active_browser_runtime._ActiveBrowserActivationFsm(state).dispatch(
+        active_browser_runtime._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
         browser_id="other-browser",
         now=20,
     )
     assert ignored["changed"] is False
-    assert ignored["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
-    assert ignored["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert ignored["from"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert ignored["to"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
     assert state["active"]["browser_id"] == "current-browser"
     assert state["revision"] == 10
 
-    result = voice_mode._ActiveBrowserActivationFsm(state).dispatch(
-        voice_mode._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
+    result = active_browser_runtime._ActiveBrowserActivationFsm(state).dispatch(
+        active_browser_runtime._ActiveBrowserActivationFsm.INPUT_DEACTIVATE_REQUEST,
         browser_id="current-browser",
         now=30,
     )
     assert result["changed"] is True
-    assert result["from"] == voice_mode._ActiveBrowserActivationFsm.STATE_ACTIVATED
-    assert result["to"] == voice_mode._ActiveBrowserActivationFsm.STATE_IDLE
+    assert result["from"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_ACTIVATED
+    assert result["to"] == active_browser_runtime._ActiveBrowserActivationFsm.STATE_IDLE
     assert state["active"] is None
     assert state["revision"] == 30

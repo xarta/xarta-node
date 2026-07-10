@@ -33,6 +33,7 @@ from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .events import bus as events_bus
 from .middleware_auth import AuthMiddleware
+from .routes_active_browser_runtime import router as active_browser_runtime_router
 from .routes_ai_project_assignments import router as ai_project_assignments_router
 from .routes_ai_providers import router as ai_providers_router
 from .routes_alarms import router as alarms_router
@@ -108,7 +109,6 @@ from .routes_tts import router as tts_router
 from .routes_tts_pool import router as tts_pool_router
 from .routes_ui_cache import router as ui_cache_router
 from .routes_vlans import router as vlans_router
-from .routes_voice_mode import router as voice_mode_router
 from .routes_vps_dockge import router as vps_dockge_router
 from .routes_web_research import router as web_research_router
 from .seekdb_sync import start_seekdb_sync_loop, stop_seekdb_sync_loop
@@ -547,7 +547,7 @@ def create_app() -> FastAPI:
     application.include_router(embed_menu_items_router, prefix="/api/v1")
     application.include_router(pockettts_router, prefix="/api/v1")
     application.include_router(tts_router, prefix="/api/v1")
-    application.include_router(voice_mode_router, prefix="/api/v1")
+    application.include_router(active_browser_runtime_router, prefix="/api/v1")
     application.include_router(tts_pool_router, prefix="/api/v1")
     application.include_router(pwa_router, prefix="/api/v1")
     application.include_router(table_layouts_router, prefix="/api/v1")

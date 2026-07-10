@@ -13849,7 +13849,7 @@ async def move_work_item(item_id: str, body: WorkItemMoveRequest) -> dict[str, A
         }
     else:
         try:
-            from .routes_voice_mode import publish_kanban_external_refresh_commands
+            from .routes_active_browser_runtime import publish_kanban_external_refresh_commands
 
             browser_refresh = await publish_kanban_external_refresh_commands(
                 item_id=item_id,

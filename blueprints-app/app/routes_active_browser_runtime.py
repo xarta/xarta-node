@@ -1,4 +1,4 @@
-"""Node-local Active Browser, voice-mode, and Wake/VAD development endpoints."""
+"""Node-local Active Browser, active-browser-runtime, and Wake/VAD development endpoints."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from .routes_matrix_chat import _matrix_chat_stt_relay
 from .routes_matrix_chat import _settings as _matrix_chat_settings
 from .routes_ui_cache import _read_status as _read_fallback_ui_cache_status
 
-router = APIRouter(prefix="/voice-mode", tags=["voice-mode"])
+router = APIRouter(prefix="/active-browser-runtime", tags=["active-browser-runtime"])
 
 
 def _bounded_int_env(name: str, fallback: int, minimum: int, maximum: int) -> int:
@@ -54,8 +54,10 @@ def _truthy_env(name: str, fallback: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-_STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-voice-mode.json")
-_WAKE_DEV_DEBUG_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-wake-dev-debug.json")
+_STATE_PATH = Path("/xarta-node/.lone-wolf/state/blueprints-active-browser-runtime.json")
+_WAKE_DEV_DEBUG_PATH = Path(
+    "/xarta-node/.lone-wolf/state/blueprints-active-browser-runtime-dev-debug.json"
+)
 _state_lock = asyncio.Lock()
 _STATE_CACHE: dict[str, Any] | None = None
 _WAKE_DEV_DEBUG_CACHE: dict[str, Any] | None = None
@@ -73,8 +75,10 @@ _HEALTHY_CACHE_SECONDS = 30.0
 _UNHEALTHY_CACHE_SECONDS = 2.0
 _NOISE_STACK_NAMES = {"xarta-voice-agent-integration", "blueprints-dfn-stt-noise"}
 _LOCAL_TTS_STACK_NAME = "pockettts-openai"
-_PIPECAT_API_BASE = os.getenv("VOICE_MODE_PIPECAT_API_BASE", "").rstrip("/")
-_PIPECAT_VERIFY_TLS = str(os.getenv("VOICE_MODE_PIPECAT_VERIFY_TLS", "false")).strip().lower() in {
+_PIPECAT_API_BASE = os.getenv("ACTIVE_BROWSER_RUNTIME_PIPECAT_API_BASE", "").rstrip("/")
+_PIPECAT_VERIFY_TLS = str(
+    os.getenv("ACTIVE_BROWSER_RUNTIME_PIPECAT_VERIFY_TLS", "false")
+).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -102,7 +106,7 @@ _WORD_DETECTION_PAYLOAD0_TIMEOUT_MAX_MS = 3000
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_STEP_MS = 300
 _WORD_DETECTION_PAYLOAD0_TIMEOUT_DEFAULT_MS = 0
 _WORD_DETECTION_CUE_SOUND_MAX_LENGTH = 255
-_VOICE_DEV_COMMAND_EVENT_TYPE = "voice.mode.dev.command"
+_ACTIVE_BROWSER_RUNTIME_DEV_COMMAND_EVENT_TYPE = "active_browser.runtime.dev.command"
 _ACTIVE_BROWSER_COMMAND_EVENT_TYPE = "blueprints.active_browser.command"
 _BROWSER_VIEW_MAX_REPORTS = 32
 _ACTIVE_BROWSER_AUTOMATION_STEP_TIMEOUT_MIN_SECONDS = 1
@@ -120,19 +124,23 @@ _ACTIVE_BROWSER_CLIENT_MAX_AGE_DEFAULT_SECONDS = _bounded_int_env(
     3600,
 )
 _BROWSER_VIEW_TELEMETRY_PERSIST_INTERVAL_SECONDS = _bounded_float_env(
-    "VOICE_MODE_BROWSER_VIEW_PERSIST_INTERVAL_SECONDS",
+    "ACTIVE_BROWSER_RUNTIME_BROWSER_VIEW_PERSIST_INTERVAL_SECONDS",
     2.0,
     0.0,
     60.0,
 )
 _DEV_STATUS_TELEMETRY_PERSIST_INTERVAL_SECONDS = _bounded_float_env(
-    "VOICE_MODE_DEV_STATUS_PERSIST_INTERVAL_SECONDS",
+    "ACTIVE_BROWSER_RUNTIME_DEV_STATUS_PERSIST_INTERVAL_SECONDS",
     2.0,
     0.0,
     60.0,
 )
-_DEV_STATUS_MAX_REPORTS = _bounded_int_env("VOICE_MODE_DEV_STATUS_MAX_REPORTS", 32, 8, 2048)
-_VOICE_MODE_HOT_POST_FULL_RESPONSE = _truthy_env("VOICE_MODE_HOT_POST_FULL_RESPONSE")
+_DEV_STATUS_MAX_REPORTS = _bounded_int_env(
+    "ACTIVE_BROWSER_RUNTIME_DEV_STATUS_MAX_REPORTS", 32, 8, 2048
+)
+_ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE = _truthy_env(
+    "ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE"
+)
 _ACTIVE_BROWSER_VIEWPORT_THRESHOLDS = {
     # Provisional first-pass thresholds. Keep raw dimensions in reports so these
     # can be tuned against the actual operator monitors and handheld devices.
@@ -295,7 +303,7 @@ _ACTIVE_BROWSER_BODY_SHADE_STATES = {"up", "down", "toggle"}
 _WAKE_DELIVERY_MODES = {"matrix", "direct_local", "direct_vps"}
 
 
-class BrowserVoiceState(BaseModel):
+class ActiveBrowserActivationBody(BaseModel):
     browser_id: str
     browser_label: str | None = None
     tab_id: str | None = None
@@ -304,7 +312,7 @@ class BrowserVoiceState(BaseModel):
     tts_enabled: bool = False
 
 
-class VoiceModePolicy(BaseModel):
+class ActiveBrowserRuntimePolicy(BaseModel):
     tts_companion_model_preference: str | None = None
 
 
@@ -321,7 +329,7 @@ class AggregationTimeoutBody(BaseModel):
     )
 
 
-class VoiceDevCommandBody(BaseModel):
+class RuntimeDevCommandBody(BaseModel):
     surface: str = "wake_dev"
     mode: str = "manual"
     action: str = "record"
@@ -586,7 +594,7 @@ def _clean_sound_asset_path(value: Any) -> str:
 def _clean_dev_command_id(value: str | None = None) -> str:
     raw = str(value or "").strip()
     clean = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_", ":", "."})[:100]
-    return clean or f"voice-dev-{uuid.uuid4().hex}"
+    return clean or f"active-browser-runtime-dev-{uuid.uuid4().hex}"
 
 
 def _clean_active_browser_command_id(value: str | None = None) -> str:
@@ -1110,14 +1118,14 @@ def _url_for_host(host: str, port: int, path: str = "") -> str:
 
 
 def _lxc_api_base_for_machine(machine: dict[str, Any]) -> str:
-    explicit = os.getenv("VOICE_MODE_LXC_API_BASE", "").strip().rstrip("/")
+    explicit = os.getenv("ACTIVE_BROWSER_RUNTIME_LXC_API_BASE", "").strip().rstrip("/")
     if explicit:
         return explicit
     return _url_for_host(str(machine.get("pve_host") or ""), 7871)
 
 
 def _gpu_monitor_health_url_for_machine(machine: dict[str, Any]) -> str:
-    explicit = os.getenv("VOICE_MODE_GPU_MONITOR_HEALTH_URL", "").strip()
+    explicit = os.getenv("ACTIVE_BROWSER_RUNTIME_GPU_MONITOR_HEALTH_URL", "").strip()
     if explicit:
         return explicit
     return _url_for_host(str(machine.get("pve_host") or ""), 7870, "/health")
@@ -2703,7 +2711,7 @@ def _prepare_browser_view_report_sync(
     now: float,
     request_network: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    with timing.span("voice_mode.browser_view.report_build"):
+    with timing.span("active_browser_runtime.browser_view.report_build"):
         return _clean_browser_view_report(body, now, request_network=request_network)
 
 
@@ -3302,14 +3310,14 @@ def _prune_dev_debug_reports(reports: dict[str, Any]) -> tuple[dict[str, dict[st
     return dict(newest), len(clean_reports) - len(newest)
 
 
-def _voice_mode_prepare_dev_status_report_sync(
+def _active_browser_runtime_prepare_dev_status_report_sync(
     body: WakeDevDebugBody,
     browser_id: str,
     now: float,
 ) -> dict[str, Any]:
-    with timing.span("voice_mode.dev_status.snapshot_bound", max_chars=120000):
+    with timing.span("active_browser_runtime.dev_status.snapshot_bound", max_chars=120000):
         snapshot = _bounded_json(body.snapshot or {}, 120000)
-    with timing.span("voice_mode.dev_status.report_build"):
+    with timing.span("active_browser_runtime.dev_status.report_build"):
         report = {
             "browser_id": browser_id,
             "browser_label": _clean_label(body.browser_label, "Blueprints browser"),
@@ -3516,7 +3524,7 @@ def _public_state(state: dict[str, Any], debug: dict[str, Any] | None = None) ->
     }
 
 
-def _active_browser_from_body(body: BrowserVoiceState, now: float) -> dict[str, Any]:
+def _active_browser_from_body(body: ActiveBrowserActivationBody, now: float) -> dict[str, Any]:
     stt_mode = _clean_stt_mode(body.stt_mode, body.stt_enabled)
     return {
         "browser_id": _clean_browser_id(body.browser_id),
@@ -3653,7 +3661,7 @@ class _ActiveBrowserActivationFsm:
 async def _publish_changed(state: dict[str, Any], action: str) -> None:
     public = _public_state(state)
     event = AppEvent.create(
-        "voice.mode.changed",
+        "active_browser.runtime.changed",
         "Active Browser Changed",
         "Blueprints Active Browser changed.",
         severity="info",
@@ -3669,7 +3677,7 @@ async def _publish_changed(state: dict[str, Any], action: str) -> None:
     await publish_event(event)
 
 
-def _voice_mode_status_locked_sync() -> dict[str, Any]:
+def _active_browser_runtime_status_locked_sync() -> dict[str, Any]:
     state = _read_state_unlocked()
     return _public_state(state)
 
@@ -3707,14 +3715,18 @@ def _update_browser_view_locked_sync(
     browser_id: str,
     now: float,
 ) -> dict[str, Any]:
-    with timing.span("voice_mode.browser_view.state_read"):
+    with timing.span("active_browser_runtime.browser_view.state_read"):
         state = _read_state_unlocked()
-    with timing.span("voice_mode.browser_view.store"):
+    with timing.span("active_browser_runtime.browser_view.store"):
         active_tab_changed = _store_browser_view_report_unlocked(state, report, now)
-    with timing.span("voice_mode.browser_view.persist"):
+    with timing.span("active_browser_runtime.browser_view.persist"):
         persisted = _maybe_write_state_telemetry_unlocked(state)
-    with timing.span("voice_mode.browser_view.response_build"):
-        public = _public_active_browser_view(state) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+    with timing.span("active_browser_runtime.browser_view.response_build"):
+        public = (
+            _public_active_browser_view(state)
+            if _ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE
+            else None
+        )
         ack = {
             "ok": True,
             "stored": True,
@@ -3729,9 +3741,9 @@ def _update_browser_view_locked_sync(
 
 
 @router.get("/status")
-async def voice_mode_status() -> dict[str, Any]:
+async def active_browser_runtime_status() -> dict[str, Any]:
     async with _state_lock:
-        return await asyncio.to_thread(_voice_mode_status_locked_sync)
+        return await asyncio.to_thread(_active_browser_runtime_status_locked_sync)
 
 
 @router.get("/active-browser-view")
@@ -3802,7 +3814,7 @@ async def update_browser_view(body: BrowserViewBody, request: Request):
     now = time.time()
     request_network = _browser_request_network(request)
     report = await timing.to_thread(
-        "voice_mode.browser_view.prepare",
+        "active_browser_runtime.browser_view.prepare",
         _prepare_browser_view_report_sync,
         body,
         now,
@@ -3815,7 +3827,7 @@ async def update_browser_view(body: BrowserViewBody, request: Request):
         lock_acquired_perf_ns = time.perf_counter_ns()
         lock_acquired_time_ns = time.time_ns()
         timing.record_span(
-            "voice_mode.browser_view.state_lock_wait",
+            "active_browser_runtime.browser_view.state_lock_wait",
             start_perf_ns=lock_wait_start_perf_ns,
             end_perf_ns=lock_acquired_perf_ns,
             start_time_ns=lock_wait_start_time_ns,
@@ -3823,7 +3835,7 @@ async def update_browser_view(body: BrowserViewBody, request: Request):
             browser_id=browser_id,
         )
         return await timing.to_thread(
-            "voice_mode.browser_view.update",
+            "active_browser_runtime.browser_view.update",
             _update_browser_view_locked_sync,
             report,
             browser_id,
@@ -3933,7 +3945,7 @@ async def active_browser_client_deactivate(body: BrowserClientSelectionBody | No
 
 
 @router.get("/dependency-health")
-async def voice_mode_dependency_health(
+async def active_browser_runtime_dependency_health(
     force: bool = False,
     deep_noise_probe: bool = False,
 ) -> dict[str, Any]:
@@ -3941,7 +3953,7 @@ async def voice_mode_dependency_health(
 
 
 @router.post("/activate")
-async def voice_mode_activate(body: BrowserVoiceState):
+async def active_browser_runtime_activate(body: ActiveBrowserActivationBody):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
@@ -3966,7 +3978,7 @@ async def voice_mode_activate(body: BrowserVoiceState):
 
 
 @router.post("/deactivate")
-async def voice_mode_deactivate(body: BrowserVoiceState):
+async def active_browser_runtime_deactivate(body: ActiveBrowserActivationBody):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
@@ -3987,7 +3999,7 @@ async def voice_mode_deactivate(body: BrowserVoiceState):
 
 
 @router.post("/policy")
-async def voice_mode_policy(body: VoiceModePolicy):
+async def active_browser_runtime_policy(body: ActiveBrowserRuntimePolicy):
     async with _state_lock:
         state = _read_state_unlocked()
         policy = _clean_policy(state.get("policy"))
@@ -4005,7 +4017,7 @@ async def voice_mode_policy(body: VoiceModePolicy):
 
 
 @router.get("/wake-settings")
-async def voice_mode_wake_settings() -> dict[str, Any]:
+async def active_browser_runtime_wake_settings() -> dict[str, Any]:
     async with _state_lock:
         policy = _clean_policy(_read_state_unlocked().get("policy"))
     return {
@@ -4016,7 +4028,7 @@ async def voice_mode_wake_settings() -> dict[str, Any]:
 
 
 @router.get("/dev-status")
-async def voice_mode_dev_status(
+async def active_browser_runtime_dev_status(
     surface: str | None = None, browser_id: str | None = None
 ) -> dict[str, Any]:
     async with _state_lock:
@@ -4026,14 +4038,14 @@ async def voice_mode_dev_status(
 
 
 @router.post("/dev-status")
-async def voice_mode_update_dev_status(body: WakeDevDebugBody):
+async def active_browser_runtime_update_dev_status(body: WakeDevDebugBody):
     browser_id = _clean_browser_id(body.browser_id)
     if not browser_id:
         return JSONResponse(status_code=400, content={"ok": False, "detail": "Missing browser_id"})
     now = time.time()
     prepared = await timing.to_thread(
-        "voice_mode.update_dev_status.prepare",
-        _voice_mode_prepare_dev_status_report_sync,
+        "active_browser_runtime.update_dev_status.prepare",
+        _active_browser_runtime_prepare_dev_status_report_sync,
         body,
         browser_id,
         now,
@@ -4045,7 +4057,7 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
         lock_acquired_time_ns = time.time_ns()
         report = prepared.get("report") if isinstance(prepared, dict) else {}
         timing.record_span(
-            "voice_mode.dev_status.state_lock_wait",
+            "active_browser_runtime.dev_status.state_lock_wait",
             start_perf_ns=lock_wait_start_perf_ns,
             end_perf_ns=lock_acquired_perf_ns,
             start_time_ns=lock_wait_start_time_ns,
@@ -4054,14 +4066,14 @@ async def voice_mode_update_dev_status(body: WakeDevDebugBody):
             surface=report.get("surface") if isinstance(report, dict) else "",
         )
         return await timing.to_thread(
-            "voice_mode.update_dev_status",
-            _voice_mode_update_dev_status_locked_sync,
+            "active_browser_runtime.update_dev_status",
+            _active_browser_runtime_update_dev_status_locked_sync,
             prepared,
             now,
         )
 
 
-def _voice_mode_update_dev_status_locked_sync(
+def _active_browser_runtime_update_dev_status_locked_sync(
     prepared: dict[str, Any],
     now: float,
 ) -> dict[str, Any]:
@@ -4069,10 +4081,10 @@ def _voice_mode_update_dev_status_locked_sync(
     if not isinstance(report, dict):
         report = {}
     report_key = str(prepared.get("report_key") or _dev_debug_report_key(report))
-    with timing.span("voice_mode.dev_status.state_read"):
+    with timing.span("active_browser_runtime.dev_status.state_read"):
         state = _read_state_unlocked()
         debug = _read_wake_dev_debug_unlocked()
-    with timing.span("voice_mode.dev_status.debug_update"):
+    with timing.span("active_browser_runtime.dev_status.debug_update"):
         reports = debug.get("reports") if isinstance(debug.get("reports"), dict) else {}
         reports[report_key] = report
         reports, pruned_count = _prune_dev_debug_reports(reports)
@@ -4080,14 +4092,16 @@ def _voice_mode_update_dev_status_locked_sync(
             "reports": reports,
             "updated_at": now,
         }
-    with timing.span("voice_mode.dev_status.persist", forced=pruned_count > 0):
+    with timing.span("active_browser_runtime.dev_status.persist", forced=pruned_count > 0):
         persisted = _maybe_write_wake_dev_debug_telemetry_unlocked(
             debug,
             force=pruned_count > 0,
         )
-    with timing.span("voice_mode.dev_status.response_build"):
+    with timing.span("active_browser_runtime.dev_status.response_build"):
         public = (
-            _public_wake_dev_debug(state, debug) if _VOICE_MODE_HOT_POST_FULL_RESPONSE else None
+            _public_wake_dev_debug(state, debug)
+            if _ACTIVE_BROWSER_RUNTIME_HOT_POST_FULL_RESPONSE
+            else None
         )
         ack = {
             "ok": True,
@@ -4104,7 +4118,7 @@ def _voice_mode_update_dev_status_locked_sync(
 
 
 @router.post("/dev-command")
-async def voice_mode_dev_command(body: VoiceDevCommandBody):
+async def active_browser_runtime_dev_command(body: RuntimeDevCommandBody):
     """Publish a browser-directed Wake/VAD dev command over the SSE bus."""
     surface = _clean_dev_command_surface(body.surface)
     mode = _clean_dev_command_mode(body.mode)
@@ -4143,7 +4157,7 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
 
     now = time.time()
     payload = {
-        "schema": "xarta.voice_mode.dev_command.v1",
+        "schema": "xarta.active_browser_runtime.dev_command.v1",
         "command_id": command_id,
         "surface": surface,
         "mode": mode,
@@ -4191,13 +4205,13 @@ async def voice_mode_dev_command(body: VoiceDevCommandBody):
         "max_age_seconds": int(body.max_age_seconds),
     }
     event = AppEvent.create(
-        _VOICE_DEV_COMMAND_EVENT_TYPE,
+        _ACTIVE_BROWSER_RUNTIME_DEV_COMMAND_EVENT_TYPE,
         "Active Browser Dev Command",
         f"Active Browser {surface} dev command {mode}:{action}.",
         severity="info",
         source="blueprints-active-browser",
         payload=payload,
-        event_id=f"voice-dev-command-{command_id}",
+        event_id=f"active-browser-runtime-dev-command-{command_id}",
     )
     published = await publish_event(event, persistence_required=False)
     return {
@@ -4333,7 +4347,7 @@ async def active_browser_command(body: ActiveBrowserCommandBody):
 
 
 @router.post("/wake-settings")
-async def voice_mode_update_wake_settings(body: WakeSettingsBody):
+async def active_browser_runtime_update_wake_settings(body: WakeSettingsBody):
     async with _state_lock:
         state = _read_state_unlocked()
         policy = _clean_policy(state.get("policy"))
@@ -4359,7 +4373,7 @@ async def voice_mode_update_wake_settings(body: WakeSettingsBody):
 
 
 @router.websocket("/stt/ws")
-async def voice_mode_stt_websocket(websocket: WebSocket) -> None:
+async def active_browser_runtime_stt_websocket(websocket: WebSocket) -> None:
     await _matrix_chat_stt_relay(
         websocket,
         room_id=None,
@@ -4389,13 +4403,13 @@ def _aggregation_timeout_payload(ms: int) -> dict[str, Any]:
 
 
 @router.get("/stt/aggregation-timeout")
-async def voice_mode_get_aggregation_timeout() -> dict[str, Any]:
+async def active_browser_runtime_get_aggregation_timeout() -> dict[str, Any]:
     url = _aggregation_timeout_url()
     if not url:
         return {
             "ok": False,
             "supported": False,
-            "detail": "VOICE_MODE_PIPECAT_API_BASE is not configured",
+            "detail": "ACTIVE_BROWSER_RUNTIME_PIPECAT_API_BASE is not configured",
             "url": "",
         }
     try:
@@ -4437,7 +4451,9 @@ async def voice_mode_get_aggregation_timeout() -> dict[str, Any]:
 
 
 @router.post("/stt/aggregation-timeout")
-async def voice_mode_set_aggregation_timeout(body: AggregationTimeoutBody) -> dict[str, Any]:
+async def active_browser_runtime_set_aggregation_timeout(
+    body: AggregationTimeoutBody,
+) -> dict[str, Any]:
     payload = _aggregation_timeout_payload(body.aggregation_timeout_ms)
     url = _aggregation_timeout_url()
     if not url:
@@ -4446,7 +4462,7 @@ async def voice_mode_set_aggregation_timeout(body: AggregationTimeoutBody) -> di
             content={
                 "ok": False,
                 "supported": False,
-                "detail": "VOICE_MODE_PIPECAT_API_BASE is not configured",
+                "detail": "ACTIVE_BROWSER_RUNTIME_PIPECAT_API_BASE is not configured",
                 "url": "",
             },
         )
