@@ -37,6 +37,9 @@ PIM_EMAIL_STACK_API_TIMEOUT_SECONDS = float(
 PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_FORCE_REFRESH_TIMEOUT_SECONDS", "45")
 )
+PIM_EMAIL_STACK_LOCAL_VIEW_REFRESH_TIMEOUT_SECONDS = float(
+    os.environ.get("PIM_EMAIL_STACK_LOCAL_VIEW_REFRESH_TIMEOUT_SECONDS", "30")
+)
 PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS = float(
     os.environ.get("PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS", "60")
 )
@@ -1315,6 +1318,24 @@ async def email_local_message_force_refresh(
         mailbox_id,
         [email_uid],
         reason="message-force-refresh-watch",
+    )
+    return response
+
+
+@router.post("/local/messages/{email_uid}/refresh-local-view")
+async def email_local_message_refresh_local_view(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    response = await _stack_post_json(
+        f"/local/messages/{email_uid}/refresh-local-view",
+        params=_stack_params(mailbox_id=mailbox_id),
+        timeout_seconds=PIM_EMAIL_STACK_LOCAL_VIEW_REFRESH_TIMEOUT_SECONDS,
+    )
+    _schedule_pim_email_cache_state_watch(
+        mailbox_id,
+        [email_uid],
+        reason="message-local-view-refresh-watch",
     )
     return response
 
