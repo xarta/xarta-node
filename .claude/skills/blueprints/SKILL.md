@@ -119,6 +119,18 @@ increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
 negative signals to report and review before commit/push; do not hide them with
 larger timeouts or stale caches.
 
+Specific 2026-07-09 lessons to preserve in event-loop reviews: PIM Email stack
+API timeouts can be Postgres connection churn, even for a single-user-facing
+system, so preserve bounded long-lived asyncpg pools and check `pg_stat_activity`
+or `TooManyConnectionsError` before raising timeouts. For the PIM Email
+downloader, also verify the sync-to-async bridge: blocking IMAP can run in
+`asyncio.to_thread`, but store/Postgres coroutines must be scheduled onto the
+owning event loop, not wrapped in repeated `asyncio.run()` calls. Also, a
+post-restart burst showed `/health` and `/api/v1/sync/status` SQLite reads plus sync-drain
+integrity work aligning with multi-second `event_loop_lag`; Active Browser had
+high await time but low run time. Use bounded windows and optimized helper
+queries before scanning large timing logs.
+
 When the report is browser-visible page lag, measure the actual page/menu/card
 transition as well as cheap sentinels. Fast `/health` and `/api/v1/auth/time`
 do not exclude slow target APIs, response send, browser main-thread long tasks,

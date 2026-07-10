@@ -3073,7 +3073,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_docs_result(monkeypatch, tm
                     "routes": {},
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -3129,7 +3132,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_docs_result(monkeypatch, tm
                     ]
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-command"
+        ):
             captured["command"] = json.loads(request.read().decode("utf-8"))
             return httpx.Response(200, json={"ok": True, "payload": captured["command"]})
         return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
@@ -3217,7 +3223,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_matrix_vps_shared_bridge(
                     "modals": [],
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
         if str(request.url) == "https://blueprints.test/api/v1/docs/search":
             return httpx.Response(200, json={"ok": True, "results": []})
@@ -3244,7 +3253,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_matrix_vps_shared_bridge(
                     ]
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-command"
+        ):
             captured["command"] = json.loads(request.read().decode("utf-8"))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
@@ -3337,7 +3349,10 @@ def test_submit_wake_stt_blueprints_nav_explicit_admin_can_open_admin_surface(
                     "modals": [],
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
         if str(request.url) == "https://blueprints.test/api/v1/docs/search":
             return httpx.Response(200, json={"ok": True, "results": []})
@@ -3363,7 +3378,10 @@ def test_submit_wake_stt_blueprints_nav_explicit_admin_can_open_admin_surface(
                     ]
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-command"
+        ):
             captured["command"] = json.loads(request.read().decode("utf-8"))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
@@ -3424,7 +3442,10 @@ def test_submit_wake_stt_blueprints_nav_ask_clarify_saves_context(monkeypatch, t
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
             return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -3571,7 +3592,10 @@ def test_submit_wake_stt_blueprints_nav_followup_dispatches_context_doc(
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
             return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(200, json={"ok": True, "view": {"automation": {}}})
         if str(request.url) == "https://blueprints.test/api/v1/docs/search":
             return httpx.Response(200, json={"ok": True, "results": []})
@@ -3598,7 +3622,10 @@ def test_submit_wake_stt_blueprints_nav_followup_dispatches_context_doc(
                     ]
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-command"
+        ):
             captured["command"] = json.loads(request.read().decode("utf-8"))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"ok": False, "detail": str(request.url)})
@@ -3666,7 +3693,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_live_selector(monkeypatch, 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "https://blueprints.test/api/v1/help/catalog":
             return httpx.Response(200, json={"ok": True, "pages": [], "modals": []})
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-view":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-view"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -3711,7 +3741,10 @@ def test_submit_wake_stt_blueprints_nav_target_opens_live_selector(monkeypatch, 
                     ]
                 },
             )
-        if str(request.url) == "https://blueprints.test/api/v1/voice-mode/active-browser-command":
+        if (
+            str(request.url)
+            == "https://blueprints.test/api/v1/active-browser-runtime/active-browser-command"
+        ):
             captured["command"] = json.loads(request.read().decode("utf-8"))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"ok": False, "detail": str(request.url)})

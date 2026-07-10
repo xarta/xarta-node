@@ -9,7 +9,7 @@ from app.node_local_ownership import normalize_node_local_ownership
 
 def test_normalize_node_local_ownership_chowns_target_and_parents(tmp_path, monkeypatch):
     root = tmp_path / "lone-wolf"
-    target = root / "state" / "blueprints-voice-mode.json"
+    target = root / "state" / "blueprints-active-browser-runtime.json"
     target.parent.mkdir(parents=True)
     target.write_text("{}\n", encoding="utf-8")
     calls = []
