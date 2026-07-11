@@ -131,6 +131,92 @@ class LocalVirtualPathRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class LocalVirtualPathCatalogRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    virtual_path: str = Field("", max_length=180)
+    path: str = Field("", max_length=180)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    request_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LocalVirtualPathMoveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    source_virtual_path: str = Field("", max_length=180)
+    destination_virtual_path: str = Field("", max_length=180)
+    source_path: str = Field("", max_length=180)
+    destination_path: str = Field("", max_length=180)
+    dry_run: bool = True
+    limit: int = Field(5000, ge=1, le=20000)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    request_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LocalVirtualPathsReplaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    virtual_paths: list[str] = Field(default_factory=list, max_length=100)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    request_id: str = Field("", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class VirtualPathRuleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    display_name: str = Field("Virtual path rule", max_length=180)
+    name: str = Field("", max_length=180)
+    description: str = Field("", max_length=2000)
+    predicate: dict[str, Any] = Field(default_factory=dict)
+    action: dict[str, Any] = Field(default_factory=dict)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    sequence: int = Field(1000, ge=0, le=1000000)
+    stop_on_match: bool = False
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-ui", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class VirtualPathRuleUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    display_name: str | None = Field(None, max_length=180)
+    name: str | None = Field(None, max_length=180)
+    description: str | None = Field(None, max_length=2000)
+    status: str | None = Field(None, max_length=24)
+    sequence: int | None = Field(None, ge=0, le=1000000)
+    stop_on_match: bool | None = None
+    predicate: dict[str, Any] | None = None
+    action: dict[str, Any] | None = None
+    scope: dict[str, Any] | None = None
+    actor: str = Field("email-ui", max_length=180)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class VirtualPathRuleApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    rule_ids: list[str] = Field(default_factory=list, max_length=100)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    dry_run: bool = True
+    actor: str = Field("pim-email-vpath-rule-worker", max_length=180)
+    source_surface: str = Field("pim-email-blueprints-proxy", max_length=180)
+    request_id: str = Field("", max_length=180)
+    run_id: str = Field("", max_length=220)
+
+
 class EmailSearchRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -288,6 +374,8 @@ def _stack_params(**params: Any) -> dict[str, Any]:
 def _stack_request_class(path: str) -> str:
     if path.startswith("/workers/"):
         return "worker"
+    if path.startswith("/local/activity"):
+        return "background_cache"
     if path.startswith("/local/cache/"):
         return "cache"
     if path.startswith("/local/messages/"):
@@ -449,6 +537,25 @@ async def _stack_post_json(
 ) -> dict[str, Any]:
     response = await _stack_request(
         "POST",
+        path,
+        params=params,
+        json_body=json_body or {},
+        timeout_seconds=timeout_seconds,
+        traffic_class=traffic_class,
+    )
+    return _stack_response_json(response)
+
+
+async def _stack_patch_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
+    traffic_class: str | None = None,
+) -> dict[str, Any]:
+    response = await _stack_request(
+        "PATCH",
         path,
         params=params,
         json_body=json_body or {},
@@ -787,6 +894,27 @@ async def _start_stack_download(body: DownloadMailboxRequest) -> dict[str, Any]:
         args.extend(["--max-messages", str(body.max_messages)])
     args.extend(["--convergence-passes", str(body.convergence_passes)])
     command = await asyncio.to_thread(_run_stack_control_script, "start-download.sh", args)
+    try:
+        await _stack_post_json(
+            "/local/activity/mark",
+            params=_stack_params(mailbox_id=mailbox_id),
+            json_body={
+                "kind": "download",
+                "activity_id": run_id,
+                "run_id": run_id,
+                "mailbox_id": mailbox_id,
+                "status": "active",
+                "label": "checking IMAP folders",
+                "tone": "green",
+                "active_seconds": 2.5,
+                "recent_seconds": 10.0,
+                "metadata": {"source": "blueprints-download-start"},
+            },
+            timeout_seconds=1.0,
+            traffic_class="background_cache",
+        )
+    except Exception:
+        pass
     return {
         "schema": "xarta.pim_email.stack_control.download_start.v1",
         "mailbox": mailbox,
@@ -1198,6 +1326,17 @@ async def email_local_cache_status(
     )
 
 
+@router.get("/local/activity")
+async def email_local_activity(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/activity",
+        params=_stack_params(mailbox_id=mailbox_id),
+        traffic_class="background_cache",
+    )
+
+
 @router.get("/local/virtual-paths/audit-gate")
 async def email_local_virtual_paths_audit_gate(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),
@@ -1205,6 +1344,62 @@ async def email_local_virtual_paths_audit_gate(
     return await _stack_get_json(
         "/local/virtual-paths/audit-gate",
         params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.get("/local/virtual-paths")
+async def email_local_virtual_paths(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/virtual-paths",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.post("/local/virtual-paths")
+async def email_local_virtual_path_create(
+    body: LocalVirtualPathCatalogRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-paths",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/virtual-paths/archive")
+async def email_local_virtual_path_archive(
+    body: LocalVirtualPathCatalogRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-paths/archive",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/virtual-paths/rename")
+async def email_local_virtual_path_rename(
+    body: LocalVirtualPathMoveRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-paths/rename",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+        timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
+    )
+
+
+@router.post("/local/virtual-paths/bulk-move")
+async def email_local_virtual_path_bulk_move(
+    body: LocalVirtualPathMoveRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-paths/bulk-move",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+        timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
     )
 
 
@@ -1301,6 +1496,101 @@ async def email_local_message_virtual_path(
         f"/local/messages/{email_uid}/virtual-path",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/messages/{email_uid}/virtual-paths/replace")
+async def email_local_message_virtual_paths_replace(
+    email_uid: str,
+    body: LocalVirtualPathsReplaceRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/messages/{email_uid}/virtual-paths/replace",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.get("/local/virtual-path-rules")
+async def email_local_virtual_path_rules(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_archived: bool = Query(False),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/virtual-path-rules",
+        params=_stack_params(mailbox_id=mailbox_id, include_archived=include_archived),
+    )
+
+
+@router.post("/local/virtual-path-rules")
+async def email_local_virtual_path_rule_create(
+    body: VirtualPathRuleCreateRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-path-rules",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.patch("/local/virtual-path-rules/{rule_id}")
+async def email_local_virtual_path_rule_update(
+    rule_id: str,
+    body: VirtualPathRuleUpdateRequest,
+) -> dict[str, Any]:
+    return await _stack_patch_json(
+        f"/local/virtual-path-rules/{rule_id}",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/virtual-path-rules/{rule_id}/archive")
+async def email_local_virtual_path_rule_archive(
+    rule_id: str,
+    body: VirtualPathRuleUpdateRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/virtual-path-rules/{rule_id}/archive",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/virtual-path-rules/apply")
+async def email_local_virtual_path_rules_apply(
+    body: VirtualPathRuleApplyRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-path-rules/apply",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+        timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
+        traffic_class="worker",
+    )
+
+
+@router.get("/local/virtual-path-rules/runs/{run_id}")
+async def email_local_virtual_path_rule_run(
+    run_id: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        f"/local/virtual-path-rules/runs/{run_id}",
+        params=_stack_params(mailbox_id=mailbox_id, limit=limit),
+    )
+
+
+@router.get("/local/messages/{email_uid}/virtual-path-rules/history")
+async def email_local_message_virtual_path_rule_history(
+    email_uid: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        f"/local/messages/{email_uid}/virtual-path-rules/history",
+        params=_stack_params(mailbox_id=mailbox_id, limit=limit),
     )
 
 
