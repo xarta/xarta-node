@@ -159,6 +159,10 @@ class LocalVirtualPathMoveRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class LocalVirtualPathSubtreeRequest(LocalVirtualPathMoveRequest):
+    operation: str = Field(..., pattern="^(copy|move|archive|delete)$")
+
+
 class LocalVirtualPathsReplaceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1385,6 +1389,18 @@ async def email_local_virtual_path_rename(
 ) -> dict[str, Any]:
     return await _stack_post_json(
         "/local/virtual-paths/rename",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+        timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
+    )
+
+
+@router.post("/local/virtual-paths/subtree")
+async def email_local_virtual_path_subtree_operation(
+    body: LocalVirtualPathSubtreeRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/virtual-paths/subtree",
         params=_stack_params(mailbox_id=body.mailbox_id),
         json_body=body.model_dump(exclude_none=True),
         timeout_seconds=PIM_EMAIL_STACK_SEARCH_TIMEOUT_SECONDS,
