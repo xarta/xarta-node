@@ -221,6 +221,15 @@ class VirtualPathRuleApplyRequest(BaseModel):
     run_id: str = Field("", max_length=220)
 
 
+class SchedulerRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    mailbox_id: str | None = Field(None, min_length=1, max_length=120)
+    actor: str = Field("email-ui", max_length=180)
+    source_surface: str = Field("pim-email-blueprints-proxy", max_length=180)
+    request_id: str = Field("", max_length=180)
+
+
 class EmailSearchRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1607,6 +1616,164 @@ async def email_local_message_virtual_path_rule_history(
     return await _stack_get_json(
         f"/local/messages/{email_uid}/virtual-path-rules/history",
         params=_stack_params(mailbox_id=mailbox_id, limit=limit),
+    )
+
+
+@router.get("/local/scheduler/health")
+async def email_local_scheduler_health() -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/scheduler/health",
+        traffic_class="background_cache",
+    )
+
+
+@router.get("/local/scheduler/targets")
+async def email_local_scheduler_targets(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/scheduler/targets",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.get("/local/scheduler/schedules")
+async def email_local_scheduler_schedules(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_archived: bool = Query(False),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/scheduler/schedules",
+        params=_stack_params(mailbox_id=mailbox_id, include_archived=include_archived),
+        traffic_class="background_cache",
+    )
+
+
+@router.post("/local/scheduler/validate")
+async def email_local_scheduler_validate(body: SchedulerRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/validate",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/preview")
+async def email_local_scheduler_preview(body: SchedulerRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/preview",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/next-run")
+async def email_local_scheduler_next_run(body: SchedulerRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/next-run",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules")
+async def email_local_scheduler_schedule_create(body: SchedulerRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/schedules",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.patch("/local/scheduler/schedules/{schedule_id}")
+async def email_local_scheduler_schedule_update(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_patch_json(
+        f"/local/scheduler/schedules/{schedule_id}",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules/{schedule_id}/enable")
+async def email_local_scheduler_schedule_enable(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/schedules/{schedule_id}/enable",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules/{schedule_id}/pause")
+async def email_local_scheduler_schedule_pause(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/schedules/{schedule_id}/pause",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules/{schedule_id}/duplicate")
+async def email_local_scheduler_schedule_duplicate(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/schedules/{schedule_id}/duplicate",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules/{schedule_id}/archive")
+async def email_local_scheduler_schedule_archive(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/schedules/{schedule_id}/archive",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/schedules/{schedule_id}/run-now")
+async def email_local_scheduler_schedule_run_now(
+    schedule_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/schedules/{schedule_id}/run-now",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.get("/local/scheduler/history")
+async def email_local_scheduler_history(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    schedule_id: str = Query("", max_length=220),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/scheduler/history",
+        params=_stack_params(mailbox_id=mailbox_id, schedule_id=schedule_id, limit=limit),
+        traffic_class="background_cache",
+    )
+
+
+@router.get("/local/scheduler/runs/{run_id}")
+async def email_local_scheduler_run_detail(
+    run_id: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    event_limit: int = Query(200, ge=1, le=500),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        f"/local/scheduler/runs/{run_id}",
+        params=_stack_params(mailbox_id=mailbox_id, event_limit=event_limit),
+        traffic_class="background_cache",
     )
 
 
