@@ -1637,6 +1637,114 @@ async def email_local_scheduler_targets(
     )
 
 
+@router.get("/local/scheduler/rule-sets")
+async def email_local_scheduler_rule_sets(
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+    include_archived: bool = Query(False),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        "/local/scheduler/rule-sets",
+        params=_stack_params(mailbox_id=mailbox_id, include_archived=include_archived),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/validate")
+async def email_local_scheduler_rule_set_definition_validate(
+    body: SchedulerRequest,
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/rule-sets/validate",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets")
+async def email_local_scheduler_rule_set_create(body: SchedulerRequest) -> dict[str, Any]:
+    return await _stack_post_json(
+        "/local/scheduler/rule-sets",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.get("/local/scheduler/rule-sets/{rule_set_id}")
+async def email_local_scheduler_rule_set_detail(
+    rule_set_id: str,
+    mailbox_id: str | None = Query(None, min_length=1, max_length=120),
+) -> dict[str, Any]:
+    return await _stack_get_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}",
+        params=_stack_params(mailbox_id=mailbox_id),
+    )
+
+
+@router.patch("/local/scheduler/rule-sets/{rule_set_id}")
+async def email_local_scheduler_rule_set_update(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_patch_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/{rule_set_id}/validate")
+async def email_local_scheduler_rule_set_validate(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}/validate",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/{rule_set_id}/duplicate")
+async def email_local_scheduler_rule_set_duplicate(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}/duplicate",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/{rule_set_id}/archive")
+async def email_local_scheduler_rule_set_archive(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}/archive",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/{rule_set_id}/preview")
+async def email_local_scheduler_rule_set_preview(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}/preview",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
+@router.post("/local/scheduler/rule-sets/{rule_set_id}/run-now")
+async def email_local_scheduler_rule_set_run_now(
+    rule_set_id: str, body: SchedulerRequest
+) -> dict[str, Any]:
+    return await _stack_post_json(
+        f"/local/scheduler/rule-sets/{rule_set_id}/run-now",
+        params=_stack_params(mailbox_id=body.mailbox_id),
+        json_body=body.model_dump(exclude_none=True),
+    )
+
+
 @router.get("/local/scheduler/schedules")
 async def email_local_scheduler_schedules(
     mailbox_id: str | None = Query(None, min_length=1, max_length=120),

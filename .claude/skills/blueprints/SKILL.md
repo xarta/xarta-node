@@ -119,6 +119,15 @@ increases in `/health`, `/api/v1/auth/time`, `x-blueprints-app-ms`,
 negative signals to report and review before commit/push; do not hide them with
 larger timeouts or stale caches.
 
+Persisted-log scans are sequential operations. The helper enforces a host-wide
+scan lock and streams filtered records through a temporary disk-backed SQLite
+projection with RAM, analyzer-RSS, disk-space, and trend-interval guards.
+Start with the smallest time window plus precise event/path/route/upstream
+filters, and use `--output /tmp/<proof>.json` so later `jq` work does not rescan
+the JSONL corpus. Never launch summary, trends, and extremes full scans in
+parallel. If the guard stops a scan, narrow the query; do not lower the safety
+floor during a host RAM warning.
+
 Specific 2026-07-09 lessons to preserve in event-loop reviews: PIM Email stack
 API timeouts can be Postgres connection churn, even for a single-user-facing
 system, so preserve bounded long-lived asyncpg pools and check `pg_stat_activity`
