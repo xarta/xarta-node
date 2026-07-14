@@ -13792,6 +13792,110 @@ def test_work_normalized_context_manifest_filters_resolved_blockers_and_tracks_d
     assert second["manifest_delta"]["delta_only"] is True
 
 
+def test_work_normalized_context_manifest_does_not_self_invalidate_on_preprocessing_decision(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-manifest-preprocessing-decision",
+                title="Manifest excludes its own processor output",
+                body="A processed readiness decision must not queue itself again.",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-manifest-preprocessing-decision'"
+    ).fetchone()
+    before = routes_personal._work_preprocessing_context_source(conn, row)
+    conn.execute(
+        """
+        INSERT INTO kanban_review_decisions (
+            decision_id, item_id, processor_kind, decision_type, summary,
+            proof_refs_json, status
+        ) VALUES (
+            'decision-preprocessing-self-output',
+            'work-manifest-preprocessing-decision',
+            'preprocessing',
+            'context_readiness_marked',
+            'The leaf is ready.',
+            '["proof:self-output"]',
+            'accepted'
+        )
+        """
+    )
+    conn.commit()
+
+    after = routes_personal._work_preprocessing_context_source(conn, row)
+
+    assert before["context_manifest"]["fingerprint"] == after["context_manifest"]["fingerprint"]
+    assert after["context_manifest"]["components"]["decision"] == []
+    assert after["context_manifest"]["components"]["proof"]["refs"] == []
+
+
+def test_work_context_manifest_read_detects_current_drift_while_item_is_doing(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-manifest-read",
+                title="Read current manifest",
+                body="Readiness drift must be visible outside the ToDo queue.",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    baseline = routes_personal._get_work_item_context_manifest_sync("work-manifest-read")
+    marker = {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "item_id": "work-manifest-read",
+        "context_hash": baseline["source_hash"],
+        "counts": baseline["counts"],
+        "source_refs": baseline["source_refs"],
+        "context_manifest": baseline["context_manifest"],
+    }
+    conn.execute(
+        """
+        INSERT INTO kanban_agent_hints (
+            hint_id, item_id, required_skills_json, metadata_json
+        ) VALUES ('hint-work-manifest-read', ?, '[]', ?)
+        """,
+        ("work-manifest-read", json.dumps({"context_readiness_marker": marker})),
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_discussions (
+            discussion_id, item_id, author, body_excerpt, status,
+            search_text, search_metadata_json, provenance_json,
+            created_at, updated_at
+        ) VALUES (
+            'discussion-manifest-read', 'work-manifest-read', 'codex-test',
+            'New implementation evidence.', 'open', '', '{}', '{}',
+            '2026-07-14T13:00:00Z', '2026-07-14T13:00:00Z'
+        )
+        """
+    )
+    conn.commit()
+
+    current = asyncio.run(routes_personal.get_work_item_context_manifest("work-manifest-read"))
+
+    assert current["schema"] == "xarta.kanban.context_manifest_read.v1"
+    assert current["source_hash"] != baseline["source_hash"]
+    assert current["reason"] == "readiness_marker_stale"
+    assert "discussion" in current["manifest_delta"]["changed_components"]
+
+
 def test_work_automation_status_compact_bounds_refresh_payload(monkeypatch):
     payload = {
         "ok": True,
